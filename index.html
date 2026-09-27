@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Apex Quant HFT — Workstation</title>
+    <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%2306b6d4' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><polyline points='22 7 13.5 15.5 8.5 10.5 2 17'/><polyline points='16 7 22 7 22 13'/></svg>" />
+    <meta name="description" content="Low-latency Solana memecoin trading research and execution workstation featuring event-driven market ingestion, pre-trade risk controls, Solana transaction builder, Jito bundle transport, verifiable paper trading, and telemetry." />
+    <meta property="og:title" content="Apex Quant HFT — Workstation" />
+    <meta property="og:description" content="Low-latency Solana memecoin trading research and execution workstation featuring event-driven market ingestion, pre-trade risk controls, Solana transaction builder, Jito bundle transport, verifiable paper trading, and telemetry." />
+    <meta property="og:type" content="website" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <script>
+      // Gracefully prevent unhandled promise rejections from sandbox WebSocket disconnections
+      window.addEventListener('unhandledrejection', function (event) {
+        if (
+          event &&
+          event.reason &&
+          (String(event.reason).includes('WebSocket closed without opened') ||
+            String(event.reason?.message).includes('WebSocket closed without opened'))
+        ) {
+          event.preventDefault();
+        }
+      });
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+

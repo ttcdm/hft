@@ -1,0 +1,628 @@
+import { DatabaseSync } from 'node:sqlite';
+import path from 'path';
+import { NormalizedPosition, ExecutionMode } from '../core/types';
+import { Logger } from '../middleware/enterprise';
+
+export interface PersistedOrder {
+  id: string;
+  clientOrderId: string;
+  correlationId: string;
+  mint: string;
+  symbol: string;
+  side: 'BUY' | 'SELL';
+  amountLamports: number;
+  expectedTokensRaw: string;
+  slippageBps: number;
+  status: 'PENDING' | 'SUBMITTED' | 'CONFIRMED' | 'FILLED' | 'REJECTED' | 'FAILED' | 'RECONCILED';
+  rejectionReason?: string;
+  quoteJson?: string;
+  executionMode: ExecutionMode;
+  createdAt: number;
+  updatedAt: number;
+  estimatedFeeLamports?: number;
+  jitoTipLamports?: number;
+  stage?: string;
+  orderType?: string;
+}
+
+export interface PersistedTransaction {
+  signature: string;
+  bundleId?: string;
+  orderId: string;
+  correlationId: string;
+  mint: string;
+  direction: 'BUY' | 'SELL';
+  submissionTransport: 'SOLANA_RPC' | 'JITO' | 'PAPER';
+  submissionTime: number;
+  landingSlot?: number;
+  confirmationTime?: number;
+  reconciliationState: 'PENDING' | 'RECONCILED' | 'RECONCILIATION_REQUIRED' | 'REVERTED' | 'TIMED_OUT' | 'ERROR';
+  networkFeeLamports: number;
+  jitoTipLamports: number;
+  executionMode: ExecutionMode;
+  error?: string;
+}
+
+export class WorkstationDatabase {
+  private db: DatabaseSync;
+  private dbPath: string;
+
+  constructor(customDbPath?: string) {
+    this.dbPath = customDbPath || process.env.TEST_DB_PATH || process.env.APEX_DB_PATH || path.join(process.cwd(), 'apex_workstation.db');
+    this.db = new DatabaseSync(this.dbPath);
+    this.db.exec('PRAGMA busy_timeout = 10000;');
+    this.db.exec('PRAGMA journal_mode = WAL;');
+    this.db.exec('PRAGMA synchronous = NORMAL;');
+    this.initSchema();
+  }
+
+  private ensureColumn(table: string, column: string, columnDef: string) {
+    try {
+      const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+      const exists = cols.some((c) => c.name === column);
+      if (!exists) {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${columnDef}`);
+        Logger.info(`Migrated database table ${table}: added column ${column}`);
+      }
+    } catch (err: any) {
+      Logger.warn(`Column check/migration failed for ${table}.${column}: ${err.message}`);
+    }
+  }
+
+  private initSchema() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS positions (
+        id TEXT PRIMARY KEY,
+        mint TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        name TEXT NOT NULL,
+        token_decimals INTEGER NOT NULL,
+        base_token_program TEXT NOT NULL DEFAULT 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+        token_quantity_raw TEXT NOT NULL,
+        cost_basis_lamports INTEGER NOT NULL,
+        entry_price_sol REAL NOT NULL,
+        current_price_sol REAL NOT NULL,
+        realized_pnl_lamports INTEGER NOT NULL DEFAULT 0,
+        entry_tx_signature TEXT NOT NULL,
+        entry_slot INTEGER NOT NULL DEFAULT 0,
+        entry_timestamp INTEGER NOT NULL,
+        entry_fee_lamports INTEGER NOT NULL DEFAULT 0,
+        priority_fee_lamports INTEGER NOT NULL DEFAULT 0,
+        jito_tip_lamports INTEGER NOT NULL DEFAULT 0,
+        execution_mode TEXT NOT NULL,
+        status TEXT NOT NULL,
+        exit_reason TEXT,
+        exit_tx_signature TEXT,
+        last_mark_timestamp INTEGER NOT NULL DEFAULT 0,
+        last_mark_source TEXT NOT NULL DEFAULT 'UNKNOWN',
+        venue TEXT DEFAULT 'PUMP_BONDING_CURVE',
+        pool_address TEXT,
+        migration_timestamp INTEGER,
+        high_water_mark_sol REAL DEFAULT 0.0,
+        trailing_stop_sol REAL DEFAULT 0.0,
+        exit_stage INTEGER DEFAULT 0,
+        record_updated_at INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS orders (
+        id TEXT PRIMARY KEY,
+        client_order_id TEXT NOT NULL,
+        correlation_id TEXT NOT NULL,
+        mint TEXT NOT NULL,
+        symbol TEXT NOT NULL,
+        side TEXT NOT NULL,
+        amount_lamports INTEGER NOT NULL,
+        expected_tokens TEXT,
+        slippage_bps INTEGER NOT NULL,
+        status TEXT NOT NULL,
+        rejection_reason TEXT,
+        quote_json TEXT,
+        execution_mode TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS transactions (
+        signature TEXT PRIMARY KEY,
+        bundle_id TEXT,
+        order_id TEXT NOT NULL,
+        correlation_id TEXT NOT NULL,
+        mint TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        submission_transport TEXT NOT NULL,
+        submission_time INTEGER NOT NULL,
+        landing_slot INTEGER,
+        confirmation_time INTEGER,
+        reconciliation_state TEXT NOT NULL,
+        network_fee_lamports INTEGER NOT NULL DEFAULT 0,
+        jito_tip_lamports INTEGER NOT NULL DEFAULT 0,
+        execution_mode TEXT NOT NULL,
+        error TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS risk_decisions (
+        id TEXT PRIMARY KEY,
+        mint TEXT NOT NULL,
+        approved INTEGER NOT NULL,
+        reason_code TEXT NOT NULL,
+        attempted_size_sol REAL NOT NULL,
+        current_exposure_sol REAL NOT NULL,
+        daily_loss_sol REAL NOT NULL,
+        execution_mode TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS system_journal (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        event_type TEXT NOT NULL,
+        correlation_id TEXT,
+        execution_mode TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+    `);
+
+    // Ensure all columns exist for existing databases
+    this.ensureColumn('positions', 'base_token_program', "TEXT NOT NULL DEFAULT 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA'");
+    this.ensureColumn('positions', 'last_mark_timestamp', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('positions', 'last_mark_source', "TEXT NOT NULL DEFAULT 'UNKNOWN'");
+    this.ensureColumn('positions', 'venue', "TEXT DEFAULT 'PUMP_BONDING_CURVE'");
+    this.ensureColumn('positions', 'pool_address', 'TEXT');
+    this.ensureColumn('positions', 'migration_timestamp', 'INTEGER');
+    this.ensureColumn('positions', 'high_water_mark_sol', 'REAL DEFAULT 0.0');
+    this.ensureColumn('positions', 'trailing_stop_sol', 'REAL DEFAULT 0.0');
+    this.ensureColumn('positions', 'exit_stage', 'INTEGER DEFAULT 0');
+    this.ensureColumn('positions', 'record_updated_at', 'INTEGER NOT NULL DEFAULT 0');
+
+    this.ensureColumn('orders', 'correlation_id', "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('orders', 'symbol', "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('orders', 'quote_json', 'TEXT');
+    this.ensureColumn('orders', 'updated_at', 'INTEGER NOT NULL DEFAULT 0');
+
+    this.ensureColumn('transactions', 'order_id', "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('transactions', 'correlation_id', "TEXT NOT NULL DEFAULT ''");
+    this.ensureColumn('transactions', 'submission_transport', "TEXT NOT NULL DEFAULT 'SOLANA_RPC'");
+    this.ensureColumn('transactions', 'submission_time', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('transactions', 'landing_slot', 'INTEGER');
+    this.ensureColumn('transactions', 'confirmation_time', 'INTEGER');
+    this.ensureColumn('transactions', 'reconciliation_state', "TEXT NOT NULL DEFAULT 'PENDING'");
+    this.ensureColumn('transactions', 'error', 'TEXT');
+
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
+      CREATE INDEX IF NOT EXISTS idx_positions_mint ON positions(mint);
+      CREATE INDEX IF NOT EXISTS idx_tx_reconciliation ON transactions(reconciliation_state);
+      CREATE INDEX IF NOT EXISTS idx_journal_created ON system_journal(created_at);
+    `);
+    Logger.info(`SQLite persistence initialized at ${this.dbPath}`);
+  }
+
+  public getDbPath(): string {
+    return this.dbPath;
+  }
+
+  public logJournal(eventType: string, correlationId: string, mode: ExecutionMode, payload: Record<string, any>) {
+    try {
+      const stmt = this.db.prepare(`
+        INSERT INTO system_journal (event_type, correlation_id, execution_mode, payload_json, created_at)
+        VALUES (?, ?, ?, ?, ?)
+      `);
+      stmt.run(eventType, correlationId, mode, JSON.stringify(payload), Date.now());
+    } catch (err: any) {
+      Logger.error(`Journal logging failed: ${err.message}`);
+    }
+  }
+
+  public saveOrder(order: PersistedOrder) {
+    try {
+      const stmt = this.db.prepare(`
+        INSERT INTO orders (
+          id, client_order_id, correlation_id, mint, symbol, side,
+          amount_lamports, expected_tokens, slippage_bps, status,
+          rejection_reason, quote_json, execution_mode, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          status = excluded.status,
+          rejection_reason = excluded.rejection_reason,
+          updated_at = excluded.updated_at
+      `);
+      stmt.run(
+        order.id,
+        order.clientOrderId,
+        order.correlationId,
+        order.mint,
+        order.symbol,
+        order.side,
+        order.amountLamports,
+        order.expectedTokensRaw,
+        order.slippageBps,
+        order.status,
+        order.rejectionReason || null,
+        order.quoteJson || null,
+        order.executionMode,
+        order.createdAt,
+        order.updatedAt
+      );
+    } catch (err: any) {
+      Logger.error(`Failed to save order ${order.id}: ${err.message}`);
+    }
+  }
+
+  public saveTransaction(tx: PersistedTransaction) {
+    try {
+      const stmt = this.db.prepare(`
+        INSERT INTO transactions (
+          signature, bundle_id, order_id, correlation_id, mint, direction,
+          submission_transport, submission_time, landing_slot, confirmation_time,
+          reconciliation_state, network_fee_lamports, jito_tip_lamports, execution_mode, error
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(signature) DO UPDATE SET
+          bundle_id = excluded.bundle_id,
+          landing_slot = excluded.landing_slot,
+          confirmation_time = excluded.confirmation_time,
+          reconciliation_state = excluded.reconciliation_state,
+          network_fee_lamports = excluded.network_fee_lamports,
+          jito_tip_lamports = excluded.jito_tip_lamports,
+          error = excluded.error
+      `);
+      stmt.run(
+        tx.signature,
+        tx.bundleId || null,
+        tx.orderId,
+        tx.correlationId,
+        tx.mint,
+        tx.direction,
+        tx.submissionTransport,
+        tx.submissionTime,
+        tx.landingSlot || null,
+        tx.confirmationTime || null,
+        tx.reconciliationState,
+        tx.networkFeeLamports,
+        tx.jitoTipLamports,
+        tx.executionMode,
+        tx.error || null
+      );
+    } catch (err: any) {
+      Logger.error(`Failed to save transaction ${tx.signature}: ${err.message}`);
+    }
+  }
+
+  public getPendingTransactions(): PersistedTransaction[] {
+    try {
+      const stmt = this.db.prepare(`
+        SELECT * FROM transactions WHERE reconciliation_state = 'PENDING'
+      `);
+      const rows = stmt.all() as any[];
+      return rows.map((r) => ({
+        signature: r.signature,
+        bundleId: r.bundle_id || undefined,
+        orderId: r.order_id,
+        correlationId: r.correlation_id,
+        mint: r.mint,
+        direction: r.direction as 'BUY' | 'SELL',
+        submissionTransport: r.submission_transport as 'SOLANA_RPC' | 'JITO' | 'PAPER',
+        submissionTime: r.submission_time,
+        landingSlot: r.landing_slot || undefined,
+        confirmationTime: r.confirmation_time || undefined,
+        reconciliationState: r.reconciliation_state,
+        networkFeeLamports: r.network_fee_lamports,
+        jitoTipLamports: r.jito_tip_lamports,
+        executionMode: r.execution_mode as ExecutionMode,
+        error: r.error || undefined,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  public loadTransactions(orderId?: string): PersistedTransaction[] {
+    try {
+      const stmt = orderId
+        ? this.db.prepare('SELECT * FROM transactions WHERE order_id = ?')
+        : this.db.prepare('SELECT * FROM transactions');
+      const rows = (orderId ? stmt.all(orderId) : stmt.all()) as any[];
+      return rows.map((r) => ({
+        signature: r.signature,
+        bundleId: r.bundle_id || undefined,
+        orderId: r.order_id,
+        correlationId: r.correlation_id,
+        mint: r.mint,
+        direction: r.direction as 'BUY' | 'SELL',
+        submissionTransport: r.submission_transport as 'SOLANA_RPC' | 'JITO' | 'PAPER',
+        submissionTime: r.submission_time,
+        landingSlot: r.landing_slot || undefined,
+        confirmationTime: r.confirmation_time || undefined,
+        reconciliationState: r.reconciliation_state,
+        networkFeeLamports: r.network_fee_lamports,
+        jitoTipLamports: r.jito_tip_lamports,
+        executionMode: r.execution_mode as ExecutionMode,
+        error: r.error || undefined,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  public savePosition(pos: NormalizedPosition) {
+    const markTimestamp = pos.lastMarkTimestamp && pos.lastMarkTimestamp > 0
+      ? pos.lastMarkTimestamp
+      : (pos.entryTimestamp || Date.now());
+    const markSource = pos.markSource || 'SOLANA_RPC';
+    const now = Date.now();
+
+    const stmt = this.db.prepare(`
+      INSERT INTO positions (
+        id, mint, symbol, name, token_decimals, base_token_program, token_quantity_raw,
+        cost_basis_lamports, entry_price_sol, current_price_sol, realized_pnl_lamports,
+        entry_tx_signature, entry_slot, entry_timestamp, entry_fee_lamports,
+        priority_fee_lamports, jito_tip_lamports, execution_mode, status,
+        exit_reason, exit_tx_signature, last_mark_timestamp, last_mark_source,
+        venue, pool_address, migration_timestamp, high_water_mark_sol, trailing_stop_sol, exit_stage,
+        record_updated_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        base_token_program = excluded.base_token_program,
+        token_quantity_raw = excluded.token_quantity_raw,
+        cost_basis_lamports = excluded.cost_basis_lamports,
+        current_price_sol = excluded.current_price_sol,
+        realized_pnl_lamports = excluded.realized_pnl_lamports,
+        status = excluded.status,
+        exit_reason = excluded.exit_reason,
+        exit_tx_signature = excluded.exit_tx_signature,
+        last_mark_timestamp = CASE WHEN excluded.last_mark_timestamp > 0 THEN excluded.last_mark_timestamp ELSE positions.last_mark_timestamp END,
+        last_mark_source = CASE WHEN excluded.last_mark_source != 'UNKNOWN' THEN excluded.last_mark_source ELSE positions.last_mark_source END,
+        venue = CASE WHEN excluded.venue IS NOT NULL THEN excluded.venue ELSE positions.venue END,
+        pool_address = CASE WHEN excluded.pool_address IS NOT NULL THEN excluded.pool_address ELSE positions.pool_address END,
+        migration_timestamp = CASE WHEN excluded.migration_timestamp IS NOT NULL THEN excluded.migration_timestamp ELSE positions.migration_timestamp END,
+        high_water_mark_sol = CASE WHEN excluded.high_water_mark_sol > 0 THEN excluded.high_water_mark_sol ELSE positions.high_water_mark_sol END,
+        trailing_stop_sol = CASE WHEN excluded.trailing_stop_sol > 0 THEN excluded.trailing_stop_sol ELSE positions.trailing_stop_sol END,
+        exit_stage = excluded.exit_stage,
+        record_updated_at = excluded.record_updated_at,
+        updated_at = excluded.updated_at
+    `);
+
+    stmt.run(
+      pos.id,
+      pos.mint,
+      pos.symbol,
+      pos.name,
+      pos.tokenDecimals ?? 6,
+      pos.baseTokenProgram || 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+      pos.tokenQuantityRaw,
+      pos.costBasisLamports ?? 0,
+      pos.entryPriceSol ?? 0,
+      pos.currentPriceSol ?? 0,
+      Math.round((pos.realizedPnLSol ?? 0) * 1e9),
+      pos.entryTxSignature || `sig-entry-${pos.id}-${now}`,
+      pos.entrySlot ?? 0,
+      pos.entryTimestamp ?? now,
+      pos.entryFeeLamports ?? 0,
+      pos.priorityFeeLamports ?? 0,
+      pos.jitoTipLamports ?? 0,
+      pos.executionMode,
+      pos.status,
+      pos.exitReason ?? null,
+      pos.exitTxSignature ?? null,
+      markTimestamp,
+      markSource,
+      pos.venue || 'PUMP_BONDING_CURVE',
+      pos.poolAddress ?? null,
+      pos.migrationTimestamp ?? null,
+      pos.highWaterMarkSol ?? 0,
+      pos.trailingStopSol ?? 0,
+      pos.exitStage ?? 0,
+      now,
+      now
+    );
+  }
+
+  public loadPositions(mode?: ExecutionMode, status?: 'OPEN' | 'PARTIALLY_CLOSED' | 'CLOSED' | 'ACTIVE'): NormalizedPosition[] {
+    let sql = 'SELECT * FROM positions';
+    const conditions: string[] = [];
+    const params: any[] = [];
+
+    if (mode) {
+      conditions.push('execution_mode = ?');
+      params.push(mode);
+    }
+    if (status === 'ACTIVE') {
+      conditions.push("(status = 'OPEN' OR status = 'PARTIALLY_CLOSED')");
+    } else if (status) {
+      conditions.push('status = ?');
+      params.push(status);
+    }
+    if (conditions.length > 0) {
+      sql += ' WHERE ' + conditions.join(' AND ');
+    }
+    sql += ' ORDER BY entry_timestamp DESC';
+
+    const stmt = this.db.prepare(sql);
+    const rows = stmt.all(...params) as any[];
+
+    return rows.map((r) => {
+      const costSol = r.cost_basis_lamports / 1e9;
+      const valSol = (Number(r.token_quantity_raw) / Math.pow(10, r.token_decimals)) * r.current_price_sol;
+      const unrealizedSol = valSol - costSol;
+      const unrealizedPct = costSol > 0 ? (unrealizedSol / costSol) * 100 : 0;
+
+      const markTs = (r.last_mark_timestamp && r.last_mark_timestamp > 0)
+        ? r.last_mark_timestamp
+        : (r.updated_at || r.entry_timestamp || Date.now());
+      const markAgeMs = Math.max(0, Date.now() - markTs);
+
+      return {
+        id: r.id,
+        mint: r.mint,
+        symbol: r.symbol,
+        name: r.name,
+        tokenDecimals: r.token_decimals,
+        baseTokenProgram: r.base_token_program || 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
+        tokenQuantityRaw: r.token_quantity_raw,
+        costBasisLamports: r.cost_basis_lamports,
+        entryPriceSol: r.entry_price_sol,
+        currentPriceSol: r.current_price_sol,
+        currentValueSol: Number(valSol.toFixed(6)),
+        unrealizedPnLSol: Number(unrealizedSol.toFixed(6)),
+        unrealizedPnLPct: Number(unrealizedPct.toFixed(2)),
+        realizedPnLSol: Number((r.realized_pnl_lamports / 1e9).toFixed(6)),
+        entryTxSignature: r.entry_tx_signature,
+        entrySlot: r.entry_slot,
+        entryTimestamp: r.entry_timestamp,
+        entryFeeLamports: r.entry_fee_lamports,
+        priorityFeeLamports: r.priority_fee_lamports,
+        jitoTipLamports: r.jito_tip_lamports,
+        markSource: (r.last_mark_source || 'SOLANA_RPC') as any,
+        markAgeMs,
+        lastMarkTimestamp: markTs,
+        venue: r.venue || 'PUMP_BONDING_CURVE',
+        poolAddress: r.pool_address || undefined,
+        migrationTimestamp: r.migration_timestamp || undefined,
+        executionMode: r.execution_mode as ExecutionMode,
+        status: r.status as 'OPEN' | 'PARTIALLY_CLOSED' | 'CLOSED',
+        lastUpdatedTimestamp: r.record_updated_at || r.updated_at,
+        exitReason: r.exit_reason || undefined,
+        exitTxSignature: r.exit_tx_signature || undefined,
+        highWaterMarkSol: r.high_water_mark_sol ?? 0,
+        trailingStopSol: r.trailing_stop_sol ?? 0,
+        exitStage: r.exit_stage ?? 0,
+      };
+    });
+  }
+
+  public saveRiskDecision(record: {
+    id: string;
+    mint: string;
+    approved: boolean;
+    reasonCode: string;
+    attemptedSizeSol: number;
+    currentExposureSol: number;
+    dailyLossSol: number;
+    executionMode: ExecutionMode;
+  }) {
+    const stmt = this.db.prepare(`
+      INSERT INTO risk_decisions (
+        id, mint, approved, reason_code, attempted_size_sol,
+        current_exposure_sol, daily_loss_sol, execution_mode, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    stmt.run(
+      record.id,
+      record.mint,
+      record.approved ? 1 : 0,
+      record.reasonCode,
+      record.attemptedSizeSol,
+      record.currentExposureSol,
+      record.dailyLossSol,
+      record.executionMode,
+      Date.now()
+    );
+  }
+
+  public getDailyRealizedPnLSol(mode: ExecutionMode = 'LIVE'): number {
+    const startOfDay = new Date();
+    startOfDay.setUTCHours(0, 0, 0, 0);
+    const startMs = startOfDay.getTime();
+
+    const stmt = this.db.prepare(`
+      SELECT COALESCE(SUM(realized_pnl_lamports), 0) as total_pnl_lamports
+      FROM positions
+      WHERE execution_mode = ? AND (status = 'CLOSED' OR status = 'PARTIALLY_CLOSED') AND updated_at >= ?
+    `);
+    const res = stmt.get(mode, startMs) as any;
+    return (res?.total_pnl_lamports || 0) / 1e9;
+  }
+
+  /**
+   * B20: Daily Total PnL (Realized Closed PnL + Open Unrealized PnL - Transaction Fees)
+   * Prevents unrealized drawdown blindness by accounting for mark-to-market open position losses.
+   */
+  public getDailyTotalPnLSol(mode: ExecutionMode = 'LIVE'): number {
+    const closedPnL = this.getDailyRealizedPnLSol(mode);
+    const openPositions = this.loadPositions().filter(
+      (p) => p.executionMode === mode && (p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED')
+    );
+    const openUnrealizedPnL = openPositions.reduce(
+      (sum, pos) => sum + (pos.unrealizedPnLSol ?? 0),
+      0
+    );
+    const feesPaidSol = this.getDailyFeesPaidLamports(mode) / 1e9;
+    return Number((closedPnL + openUnrealizedPnL - feesPaidSol).toFixed(6));
+  }
+
+  // Calculate actual daily fees from reconciled transactions
+  public getDailyFeesPaidLamports(mode: ExecutionMode): number {
+    const startOfDay = new Date();
+    startOfDay.setUTCHours(0, 0, 0, 0);
+    const startMs = startOfDay.getTime();
+
+    try {
+      const stmt = this.db.prepare(`
+        SELECT COALESCE(SUM(network_fee_lamports + jito_tip_lamports), 0) as total_fees
+        FROM transactions
+        WHERE execution_mode = ? AND submission_time >= ?
+      `);
+      const res = stmt.get(mode, startMs) as any;
+      return res?.total_fees || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  public getExecutionMetrics() {
+    const totalPositions = (this.db.prepare(`SELECT COUNT(*) as count FROM positions`).get() as any)?.count || 0;
+    const openPositions = (this.db.prepare(`SELECT COUNT(*) as count FROM positions WHERE status = 'OPEN' OR status = 'PARTIALLY_CLOSED'`).get() as any)?.count || 0;
+    const closedPositions = (this.db.prepare(`SELECT COUNT(*) as count FROM positions WHERE status = 'CLOSED'`).get() as any)?.count || 0;
+    const totalPnLLamports = (this.db.prepare(`SELECT COALESCE(SUM(realized_pnl_lamports), 0) as sum FROM positions WHERE status = 'CLOSED' OR status = 'PARTIALLY_CLOSED'`).get() as any)?.sum || 0;
+    return {
+      totalPositions,
+      openPositions,
+      closedPositions,
+      totalRealizedPnLSol: totalPnLLamports / 1e9,
+    };
+  }
+
+  public getEvents(limit: number = 50) {
+    const stmt = this.db.prepare(`
+      SELECT id, event_type as eventType, correlation_id as correlationId, execution_mode as executionMode, payload_json, created_at as timestamp
+      FROM system_journal
+      ORDER BY id DESC
+      LIMIT ?
+    `);
+    const rows = stmt.all(limit) as any[];
+    return rows.map((r) => {
+      let payload = {};
+      try {
+        payload = JSON.parse(r.payload_json);
+      } catch {}
+      return {
+        id: r.id,
+        eventType: r.eventType,
+        correlationId: r.correlationId,
+        executionMode: r.executionMode,
+        payload,
+        timestamp: r.timestamp,
+      };
+    });
+  }
+
+  public isWritable(): boolean {
+    try {
+      this.db.exec('BEGIN IMMEDIATE; ROLLBACK;');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  public getJournalMode(): string {
+    try {
+      const row = this.db.prepare('PRAGMA journal_mode;').get() as any;
+      return row ? String(row.journal_mode) : 'unknown';
+    } catch {
+      return 'error';
+    }
+  }
+}
+
+export const workstationDb = new WorkstationDatabase();

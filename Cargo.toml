@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/apex_hft_engine",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = false

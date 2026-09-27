@@ -213,6 +213,28 @@ export class PumpSwapVenueService {
     }
   }
 
+  private static normalizeBaseMintAccount(account: any) {
+    if (!account) {
+      return { decimals: 6, supply: 1_000_000_000_000_000n };
+    }
+    return {
+      supply: 1_000_000_000_000_000n,
+      ...account,
+    };
+  }
+
+  private static normalizeGlobalConfig(globalConfig: any) {
+    if (!globalConfig) {
+      return {
+        lpFeeBasisPoints: new BN(20),
+        protocolFeeBasisPoints: new BN(80),
+        coinCreatorFeeBasisPoints: new BN(0),
+        creatorFeeConfigurable: false,
+      };
+    }
+    return globalConfig;
+  }
+
   // Quoting helper 1: Buy with exact Quote (SOL) input -> Base tokens out
   public static quotePumpSwapBuyQuoteInput(params: {
     solAmountLamports: bigint;
@@ -220,15 +242,15 @@ export class PumpSwapVenueService {
     swapState: any;
   }) {
     const { solAmountLamports, slippageBps = 800, swapState } = params;
-    return buyQuoteInput({
+    const res = buyQuoteInput({
       quote: new BN(solAmountLamports.toString()),
       slippage: slippageBps / 100,
       baseReserve: swapState.poolBaseAmount,
       quoteReserve: swapState.poolQuoteAmount,
       virtualQuoteReserves: swapState.pool.virtualQuoteReserves || new BN(0),
-      globalConfig: swapState.globalConfig,
+      globalConfig: this.normalizeGlobalConfig(swapState.globalConfig),
       feeConfig: swapState.feeConfig,
-      baseMintAccount: swapState.baseMintAccount,
+      baseMintAccount: this.normalizeBaseMintAccount(swapState.baseMintAccount),
       baseMint: swapState.baseMint,
       coinCreator: swapState.pool.coinCreator,
       creator: swapState.pool.creator,
@@ -236,6 +258,12 @@ export class PumpSwapVenueService {
       isMayhemMode: Boolean(swapState.pool.isMayhemMode),
       creatorFeeBps: new BN(swapState.pool.creatorFeeBps ? swapState.pool.creatorFeeBps.toString() : '0'),
     });
+    const minBase = res.base.mul(new BN(10000 - slippageBps)).div(new BN(10000));
+    return {
+      ...res,
+      uiBase: res.base,
+      minBase,
+    };
   }
 
   // Quoting helper 2: Buy target Base tokens -> Quote (SOL) input required
@@ -251,9 +279,9 @@ export class PumpSwapVenueService {
       baseReserve: swapState.poolBaseAmount,
       quoteReserve: swapState.poolQuoteAmount,
       virtualQuoteReserves: swapState.pool.virtualQuoteReserves || new BN(0),
-      globalConfig: swapState.globalConfig,
+      globalConfig: this.normalizeGlobalConfig(swapState.globalConfig),
       feeConfig: swapState.feeConfig,
-      baseMintAccount: swapState.baseMintAccount,
+      baseMintAccount: this.normalizeBaseMintAccount(swapState.baseMintAccount),
       baseMint: swapState.baseMint,
       coinCreator: swapState.pool.coinCreator,
       creator: swapState.pool.creator,
@@ -276,9 +304,9 @@ export class PumpSwapVenueService {
       baseReserve: swapState.poolBaseAmount,
       quoteReserve: swapState.poolQuoteAmount,
       virtualQuoteReserves: swapState.pool.virtualQuoteReserves || new BN(0),
-      globalConfig: swapState.globalConfig,
+      globalConfig: this.normalizeGlobalConfig(swapState.globalConfig),
       feeConfig: swapState.feeConfig,
-      baseMintAccount: swapState.baseMintAccount,
+      baseMintAccount: this.normalizeBaseMintAccount(swapState.baseMintAccount),
       baseMint: swapState.baseMint,
       coinCreator: swapState.pool.coinCreator,
       creator: swapState.pool.creator,
@@ -301,9 +329,9 @@ export class PumpSwapVenueService {
       baseReserve: swapState.poolBaseAmount,
       quoteReserve: swapState.poolQuoteAmount,
       virtualQuoteReserves: swapState.pool.virtualQuoteReserves || new BN(0),
-      globalConfig: swapState.globalConfig,
+      globalConfig: this.normalizeGlobalConfig(swapState.globalConfig),
       feeConfig: swapState.feeConfig,
-      baseMintAccount: swapState.baseMintAccount,
+      baseMintAccount: this.normalizeBaseMintAccount(swapState.baseMintAccount),
       baseMint: swapState.baseMint,
       coinCreator: swapState.pool.coinCreator,
       creator: swapState.pool.creator,
@@ -354,21 +382,10 @@ export class PumpSwapVenueService {
       throw new Error(`PUMPSWAP_INSUFFICIENT_LIQUIDITY: Pool ${poolKey.toBase58()} has zero liquidity.`);
     }
 
-    const quoteResult = buyQuoteInput({
-      quote: new BN(solAmountLamports.toString()),
-      slippage: slippageBps / 100,
-      baseReserve: swapState.poolBaseAmount,
-      quoteReserve: swapState.poolQuoteAmount,
-      virtualQuoteReserves: swapState.pool.virtualQuoteReserves || new BN(0),
-      globalConfig: swapState.globalConfig,
-      feeConfig: swapState.feeConfig,
-      baseMintAccount: swapState.baseMintAccount,
-      baseMint: swapState.baseMint,
-      coinCreator: swapState.pool.coinCreator,
-      creator: swapState.pool.creator,
-      quoteMint: swapState.pool.quoteMint,
-      isMayhemMode: Boolean(swapState.pool.isMayhemMode),
-      creatorFeeBps: new BN(swapState.pool.creatorFeeBps ? swapState.pool.creatorFeeBps.toString() : '0'),
+    const quoteResult = this.quotePumpSwapBuyQuoteInput({
+      solAmountLamports,
+      slippageBps,
+      swapState,
     });
 
     const maxQuoteCost = new BN(solAmountLamports.toString());

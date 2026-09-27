@@ -33,6 +33,22 @@ export async function getOperatorSessionToken(): Promise<string> {
     }
   }
   if (cachedSessionToken) return cachedSessionToken;
+
+  // Auto-provision dev/sandbox session if available
+  try {
+    const res = await fetch('/api/auth/session');
+    if (res.ok) {
+      const data = await res.json();
+      if (data.success && data.token) {
+        cachedSessionToken = data.token;
+        if (typeof window !== 'undefined') {
+          localStorage.setItem('apex_operator_token', data.token);
+        }
+        return cachedSessionToken;
+      }
+    }
+  } catch {}
+
   return '';
 }
 

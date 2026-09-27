@@ -177,7 +177,7 @@ export class CreatorRiskScorer {
 
     // 5. Score calculation (0 - 100)
     // - Age Points (up to 40)
-    let agePoints = 0;
+    let agePoints: number;
     if (walletAgeSeconds >= 86400 * 30) {
       agePoints = 40; // > 30 days
     } else if (walletAgeSeconds >= 86400 * 7) {
@@ -193,7 +193,7 @@ export class CreatorRiskScorer {
     }
 
     // - Signature Volume Points (up to 40)
-    let volumePoints = 0;
+    let volumePoints: number;
     if (signatureCount >= 50) {
       volumePoints = 40;
     } else if (signatureCount >= 25) {
@@ -209,7 +209,7 @@ export class CreatorRiskScorer {
     }
 
     // - Reliability & History Points (up to 20)
-    let reliabilityPoints = 0;
+    let reliabilityPoints: number;
     if (failureRate < 0.1) {
       reliabilityPoints = 20;
     } else if (failureRate < 0.3) {
@@ -235,7 +235,7 @@ export class CreatorRiskScorer {
     const riskScore = Math.min(100, Math.max(0, rawScore));
 
     // Convert to ConfluenceEngine creator factor score (0 - 5)
-    let confluenceScore = 0;
+    let confluenceScore: number;
     if (isBurner || riskScore < 20) {
       confluenceScore = 0;
     } else if (riskScore >= 80) {
@@ -311,7 +311,7 @@ export class CreatorRiskScorer {
     else if (count >= 3) volumePoints = 5;
 
     const riskScore = Math.min(100, Math.max(0, agePoints + volumePoints + 15));
-    let confluenceScore = 0;
+    let confluenceScore: number;
     if (riskScore >= 80) confluenceScore = 5;
     else if (riskScore >= 60) confluenceScore = 4;
     else if (riskScore >= 40) confluenceScore = 3;

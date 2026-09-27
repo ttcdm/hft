@@ -1564,7 +1564,9 @@ export class ExecutionCoordinator {
         expectedTokensRaw: quote.tokenAmountRaw,
         slippageBps: quote.slippageBps,
         status: 'SUBMITTED',
-        quoteJson: JSON.stringify(quote),
+        quoteJson: JSON.stringify(quote, (_key, value) =>
+          typeof value === 'bigint' ? value.toString() : value
+        ),
         executionMode: 'LIVE',
         createdAt: now,
         updatedAt: now,

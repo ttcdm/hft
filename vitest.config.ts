@@ -25,5 +25,10 @@ export default defineConfig({
     alias: {
       '@': path.resolve(__dirname, '.'),
     },
+    server: {
+      deps: {
+        inline: ['@pump-fun/pump-sdk', '@pump-fun/agent-payments-sdk'],
+      },
+    },
   },
 });

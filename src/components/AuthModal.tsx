@@ -107,6 +107,33 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     setErrorMessage('Stored token cleared. Operator session terminated.');
   };
 
+  const handleAutoConnect = async () => {
+    setIsLoading(true);
+    setErrorMessage(null);
+    setSuccessMessage(null);
+    try {
+      const res = await fetch('/api/auth/session');
+      const data = await res.json();
+      if (res.ok && data.success && data.token) {
+        setTokenInput(data.token);
+        if (typeof window !== 'undefined') {
+          localStorage.setItem('apex_operator_token', data.token);
+        }
+        setOperatorSessionToken(data.token);
+        setCurrentlyStored(data.token);
+        setSuccessMessage('Operator session auto-connected successfully.');
+        if (onAuthenticated) onAuthenticated(data.token);
+        setTimeout(() => onClose(), 600);
+      } else {
+        throw new Error(data.error || 'No auto-provisioned session available.');
+      }
+    } catch (err: any) {
+      setErrorMessage(err.message || 'Auto-connect failed.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   return (
     <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
       <div className="bg-[#0D131F] border border-[#1E293B] rounded-xl max-w-lg w-full shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-200">
@@ -154,11 +181,21 @@ export const AuthModal: React.FC<AuthModalProps> = ({
               </button>
             </div>
           ) : (
-            <div className="p-3 rounded-lg bg-amber-950/30 border border-amber-500/30 text-xs text-amber-300 flex items-start space-x-2">
-              <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
-              <span>
-                No operator token configured. Enter the <code className="bg-black/40 px-1 py-0.5 rounded text-amber-200">OPERATOR_AUTH_TOKEN</code> from your <code className="text-white">.env</code> file or the startup terminal banner.
-              </span>
+            <div className="p-3 rounded-lg bg-amber-950/30 border border-amber-500/30 text-xs text-amber-300 flex items-start justify-between space-x-2">
+              <div className="flex items-start space-x-2">
+                <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                <span>
+                  No operator token configured in storage. Use Quick Connect to auto-authorize or enter token manually.
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={handleAutoConnect}
+                disabled={isLoading}
+                className="px-2.5 py-1 rounded bg-cyan-500/20 hover:bg-cyan-500/30 border border-cyan-400/40 text-cyan-300 font-bold text-[11px] whitespace-nowrap transition flex items-center space-x-1"
+              >
+                <span>⚡ Quick Connect</span>
+              </button>
             </div>
           )}
 

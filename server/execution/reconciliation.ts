@@ -60,7 +60,9 @@ export class TradeReconciler {
     } catch (e: any) {
       Logger.warn(`Failed to query pre-trade SOL balance: ${e.message}`);
       if (executionMode === 'LIVE') {
-        throw new Error(`PRE_TRADE_SNAPSHOT_FAILED: Cannot query wallet balance in LIVE mode: ${e.message}`);
+        throw new Error(`PRE_TRADE_SNAPSHOT_FAILED: Cannot query wallet balance in LIVE mode: ${e.message}`, {
+          cause: e,
+        });
       }
     }
 

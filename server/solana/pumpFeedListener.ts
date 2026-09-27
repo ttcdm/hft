@@ -133,7 +133,6 @@ export class PumpFeedListener extends EventEmitter {
     offset += 32;
 
     creatorPubkey.toBuffer().copy(buf, offset);
-    offset += 32;
 
     return `Program data: ${buf.toString('base64')}`;
   }
@@ -328,10 +327,18 @@ export class PumpFeedListener extends EventEmitter {
               this.totalParseLatencyMs += event.parseLatencyMs;
 
               // Record real feed freshness in central coordinator
-              executionCoordinator.recordPumpFeedEvent('SOLANA_WS_PUMP_CREATE', event.mint);
+              try {
+                executionCoordinator.recordPumpFeedEvent('SOLANA_WS_PUMP_CREATE', event.mint);
+              } catch (coordErr: any) {
+                Logger.warn(`PumpFeedListener coordinator record error: ${coordErr?.message || coordErr}`);
+              }
 
               // Emit event to subscribers
-              this.emit('create_event', event);
+              try {
+                this.emit('create_event', event);
+              } catch (emitErr: any) {
+                Logger.warn(`PumpFeedListener subscriber error: ${emitErr?.message || emitErr}`);
+              }
             }
           } catch (err: any) {
             Logger.warn(`PumpFeedListener error processing log: ${err.message}`);

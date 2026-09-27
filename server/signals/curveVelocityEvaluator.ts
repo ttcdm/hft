@@ -201,7 +201,7 @@ export class CurveVelocityEvaluator {
 
     // 3. Compute Curve Velocity Factor Score (0 - 15)
     // - Acceleration Component (up to 6 points)
-    let accelPoints = 0;
+    let accelPoints: number;
     if (slotAcceleration >= 0.5) {
       accelPoints = 6;
     } else if (slotAcceleration >= 0.2) {
@@ -217,7 +217,7 @@ export class CurveVelocityEvaluator {
     }
 
     // - Flow Volume Component (up to 5 points)
-    let volumePoints = 0;
+    let volumePoints: number;
     if (volume10sSol >= 2.0 || volume30sSol >= 5.0) {
       volumePoints = 5;
     } else if (volume10sSol >= 1.0 || volume30sSol >= 2.5) {
@@ -233,7 +233,7 @@ export class CurveVelocityEvaluator {
     }
 
     // - Buy Volume Surge Component (up to 4 points)
-    let surgePoints = 0;
+    let surgePoints: number;
     if (buyRatio10s >= 0.8 && buyVolume10sSol >= 0.5) {
       surgePoints = 4;
     } else if (buyRatio10s >= 0.65 && buyVolume10sSol >= 0.2) {

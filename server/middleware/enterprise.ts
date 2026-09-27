@@ -23,7 +23,13 @@ export class Logger {
       message,
       ...context,
     };
-    return JSON.stringify(entry);
+    try {
+      return JSON.stringify(entry, (_key, value) =>
+        typeof value === 'bigint' ? value.toString() : value
+      );
+    } catch {
+      return `{"timestamp":"${entry.timestamp}","level":"${level}","message":${JSON.stringify(String(message))}}`;
+    }
   }
 
   static info(message: string, context?: LogContext) {

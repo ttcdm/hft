@@ -292,7 +292,8 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
       const closeIx = compiledInstructions[3];
 
       expect(Array.from(closeIx.data)).toEqual([9]); // CloseAccount opcode = 9
-      expect(closeIx.programId.toBase58()).toBe(TOKEN_2022_PROGRAM_ID.toBase58());
+      const closeProgramId = tx.message.staticAccountKeys[closeIx.programIdIndex];
+      expect(closeProgramId.toBase58()).toBe(TOKEN_2022_PROGRAM_ID.toBase58());
     });
 
     it('B19: Dust gate boundary - exact behavior at netProceeds = 0, netProceeds < 0, and netProceeds > 0', async () => {

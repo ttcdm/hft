@@ -208,7 +208,10 @@ export class WorkstationDatabase {
         INSERT INTO system_journal (event_type, correlation_id, execution_mode, payload_json, created_at)
         VALUES (?, ?, ?, ?, ?)
       `);
-      stmt.run(eventType, correlationId, mode, JSON.stringify(payload), Date.now());
+      const payloadJson = JSON.stringify(payload, (_key, value) =>
+        typeof value === 'bigint' ? value.toString() : value
+      );
+      stmt.run(eventType, correlationId, mode, payloadJson, Date.now());
     } catch (err: any) {
       Logger.error(`Journal logging failed: ${err.message}`);
     }

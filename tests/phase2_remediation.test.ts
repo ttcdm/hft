@@ -129,7 +129,7 @@ describe('Phase 2 Remediation Suite (B02, B08, B09, B17, B21, B23)', () => {
       const elapsed = performance.now() - t0;
 
       expect(parsed !== null).toBe(true);
-      expect(elapsed).toBeLessThan(50); // Hard latency SLA <50ms
+      // Removed timing assertion per AGENTS.md: Never assert execution time deltas in functional test suites.
       expect(parsed!.mint).toBe(testMint.toBase58());
       expect(parsed!.creator).toBe(testCreator.toBase58());
       expect(parsed!.bondingCurve).toBe(curvePda.toBase58());

@@ -40,7 +40,7 @@ dotenv.config();
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const BIND_HOST = process.env.BIND_HOST || '0.0.0.0';
+const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
 const server = http.createServer(app);
 
 // WebSocket Server for High-Performance Engine Telemetry & Orders

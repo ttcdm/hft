@@ -22,13 +22,16 @@ export default defineConfig({
     environment: 'node',
     globals: true,
     testTimeout: 30000,
-    alias: {
-      '@': path.resolve(__dirname, '.'),
-    },
     server: {
       deps: {
-        inline: ['@pump-fun/pump-sdk', '@pump-fun/agent-payments-sdk'],
+      inline: [/@solana\//, /@pump-fun\//, /bs58/],
       },
+    },
+  },
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, '.'),
+      'bs58': path.resolve(__dirname, 'bs58-shim.mjs'),
     },
   },
 });

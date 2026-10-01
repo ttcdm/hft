@@ -13,6 +13,7 @@ export class MockSolanaRpc {
   private accounts: Map<string, MockAccountData> = new Map();
   private currentSlot: number = 280000000;
   private signatureStatuses: Map<string, { confirmationStatus: string; slot: number; err: any }> = new Map();
+  private transactionDetails: Map<string, any> = new Map();
   private submittedTransactions: Buffer[] = [];
   private simulateError: any = null;
 
@@ -53,6 +54,10 @@ export class MockSolanaRpc {
     });
   }
 
+  public setTransactionDetails(signature: string, details: any) {
+    this.transactionDetails.set(signature, details);
+  }
+
   public setSimulateError(err: any) {
     this.simulateError = err;
   }
@@ -64,6 +69,7 @@ export class MockSolanaRpc {
   public clear() {
     this.accounts.clear();
     this.signatureStatuses.clear();
+    this.transactionDetails.clear();
     this.submittedTransactions = [];
     this.simulateError = null;
   }
@@ -137,6 +143,9 @@ export class MockSolanaRpc {
         return acc ? acc.lamports : 70_000_000; // 0.07 SOL default
       },
       getTransaction: async (signature: string) => {
+        if (this.transactionDetails.has(signature)) {
+          return this.transactionDetails.get(signature);
+        }
         return {
           slot: this.currentSlot,
           meta: { fee: 5000, err: null },

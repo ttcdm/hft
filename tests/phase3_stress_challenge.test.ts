@@ -292,7 +292,9 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
       const closeIx = compiledInstructions[3];
 
       expect(Array.from(closeIx.data)).toEqual([9]); // CloseAccount opcode = 9
-      const closeProgramId = tx.message.staticAccountKeys[closeIx.programIdIndex];
+      const closeProgramId = (closeIx as any).programId || 
+        (tx.message as any).staticAccountKeys?.[(closeIx as any).programIdIndex] || 
+        (tx.message as any).accountKeys?.[(closeIx as any).programIdIndex];
       expect(closeProgramId.toBase58()).toBe(TOKEN_2022_PROGRAM_ID.toBase58());
     });
 

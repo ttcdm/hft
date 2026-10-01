@@ -30,7 +30,8 @@
     "@types/cors": "^2.8.19",
     "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^5.0.4",
-    "bs58": "^6.0.0",
+    "bn.js": "^5.2.5",
+    "bs58": "^5.0.0",
     "cors": "^2.8.6",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
@@ -44,6 +45,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@types/bn.js": "^5.2.0",
     "@types/express": "^4.17.21",
     "@types/node": "^22.14.0",
     "autoprefixer": "^10.4.21",
@@ -57,6 +59,7 @@
     "vitest": "^5.0.0"
   },
   "overrides": {
+    "bs58": "^5.0.0",
     "qs": "^6.16.0",
     "lru-cache": "^5.1.1"
   }

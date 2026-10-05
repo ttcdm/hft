@@ -239,8 +239,8 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     executionCoordinator.armLiveTrading(false);
     this.config.isLiveTradingActive = false;
 
-    // 2. Enumerate all active holdings (both OPEN and PARTIALLY_CLOSED)
-    const activePositions = executionCoordinator.getPositions(undefined, 'ACTIVE');
+    // 2. Enumerate all active holdings (both OPEN and PARTIALLY_CLOSED) across all modes
+    const activePositions = workstationDb.loadPositions(undefined, 'ACTIVE');
     const succeeded: Array<{ id: string; symbol: string; pnlSol: number; status?: string }> = [];
     const failed: Array<{ id: string; symbol: string; error: string }> = [];
     let totalRealized = 0;

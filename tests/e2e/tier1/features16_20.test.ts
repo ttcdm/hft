@@ -30,10 +30,11 @@ describe('Tier 1: Feature Coverage (Features 16 - 20)', () => {
       cooldownAfterFailedTradeMs: 0,
       maxAggregateExposureSol: 100,
     });
-    coordinator = new ExecutionCoordinator();
+    coordinator = new ExecutionCoordinator(mockRpc.createConnection());
   });
 
   afterEach(async () => {
+    coordinator?.cleanup();
     vi.restoreAllMocks();
     await mockJito.stop();
     testDb.close();

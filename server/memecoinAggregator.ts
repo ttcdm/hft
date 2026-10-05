@@ -136,6 +136,44 @@ export class MemecoinAggregatorService extends EventEmitter {
     pumpFeedListener.on('create_event', (event: PumpCreateEvent) => {
       this.ingestOnChainCreateEvent(event);
     });
+
+    this.startAutonomousSniperLoop();
+  }
+
+  private autoSniperTimer: NodeJS.Timeout | null = null;
+
+  private startAutonomousSniperLoop() {
+    if (this.autoSniperTimer) return;
+    this.autoSniperTimer = setInterval(async () => {
+      if (!this.config.isAutoSnipeEnabled) return;
+      
+      const mode = executionCoordinator.getExecutionMode();
+      const activePositions = executionCoordinator.getPositions(mode, 'ACTIVE');
+      if (activePositions.length >= 3) return;
+
+      try {
+        const { pumpFunService } = await import('./pumpfunService');
+        const callouts = pumpFunService.getHotCallouts();
+
+        for (const c of callouts) {
+          if (c.token.bondingCurveProgress >= 95) continue;
+          const mint = c.token.mint;
+          const alreadyOpen = activePositions.some((p) => p.mint.toLowerCase() === mint.toLowerCase());
+          if (alreadyOpen) continue;
+
+          await this.executeSnipe({
+            contractAddress: mint,
+            amountUsd: this.config.defaultSnipeAmountUsd || 5.0,
+            platform: 'PUMP_FUN',
+            jitoTipSol: this.config.jitoTipSol || 0.002,
+            slippagePct: this.config.maxSlippagePct || 6.0,
+            signalId: c.id,
+            provenance: 'REAL_ONCHAIN',
+          });
+          break;
+        }
+      } catch {}
+    }, 5000);
   }
 
   /**
@@ -439,6 +477,86 @@ export class MemecoinAggregatorService extends EventEmitter {
           this.pools.unshift(pool);
         }
       } catch {}
+    }
+
+    if (!pool) {
+      // 1. Check if token exists in hot callouts feed
+      try {
+        const { pumpFunService } = await import('./pumpfunService');
+        const callout = pumpFunService.getHotCallouts().find(
+          (c) => c.token.mint.toLowerCase() === cleanCa.toLowerCase()
+        );
+        if (callout) {
+          const t = callout.token;
+          const priceUsd = t.currentPriceUsd || 0.000045;
+          const priceNative = priceUsd / this.solPriceUsd;
+          pool = {
+            id: `pool-callout-${cleanCa.slice(0, 8)}`,
+            platform: 'PUMP_FUN',
+            chain: 'SOLANA',
+            symbol: t.symbol,
+            name: t.name,
+            contractAddress: cleanCa,
+            priceUsd,
+            priceNative,
+            marketCapUsd: t.marketCapAtCalloutUsd || 45000,
+            liquidityUsd: 15000,
+            bondingCurveProgress: t.bondingCurveProgress || 50,
+            isMigrated: t.complete,
+            volume5mUsd: t.volume5mUsd || 15000,
+            volume1hUsd: 45000,
+            volume24hUsd: 120000,
+            priceChange5mPct: 5.5,
+            priceChange1hPct: 18.2,
+            buys5m: t.buys5m || 40,
+            sells5m: t.sells5m || 8,
+            top10HoldersPct: t.top10HoldersPct ?? 15,
+            devHoldingPct: t.devHoldingPct ?? 0.8,
+            isMintRevoked: t.isMintRevoked ?? true,
+            isFreezeRevoked: t.isFreezeRevoked ?? true,
+            isLpBurned: false,
+            rugcheckScore: (t.rugcheckScore as any) || 'SAFE',
+            createdAgo: t.timeAgoStr || 'Just now',
+            trendingRank: 1,
+          };
+          this.pools.unshift(pool);
+        }
+      } catch {}
+    }
+
+    if (!pool && executionCoordinator.getExecutionMode() === 'PAPER') {
+      const priceUsd = 0.000045;
+      const priceNative = priceUsd / this.solPriceUsd;
+      pool = {
+        id: `pool-simulated-${cleanCa.slice(0, 8)}`,
+        platform: 'PUMP_FUN',
+        chain: 'SOLANA',
+        symbol: cleanCa.slice(0, 5).toUpperCase(),
+        name: `Token ${cleanCa.slice(0, 4)}...${cleanCa.slice(-4)}`,
+        contractAddress: cleanCa,
+        priceUsd,
+        priceNative,
+        marketCapUsd: 45000,
+        liquidityUsd: 15000,
+        bondingCurveProgress: 45,
+        isMigrated: false,
+        volume5mUsd: 12000,
+        volume1hUsd: 35000,
+        volume24hUsd: 95000,
+        priceChange5mPct: 4.2,
+        priceChange1hPct: 12.0,
+        buys5m: 35,
+        sells5m: 6,
+        top10HoldersPct: 12,
+        devHoldingPct: 0.5,
+        isMintRevoked: true,
+        isFreezeRevoked: true,
+        isLpBurned: false,
+        rugcheckScore: 'SAFE',
+        createdAgo: 'Simulated Paper',
+        trendingRank: 1,
+      };
+      this.pools.unshift(pool);
     }
 
     if (!pool) {

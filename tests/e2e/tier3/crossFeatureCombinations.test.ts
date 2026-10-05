@@ -43,10 +43,11 @@ describe('Tier 3: Cross-Feature Combinations (Pairwise Feature Interactions)', (
     });
     vi.spyOn(WorkstationDatabase.prototype, 'loadPositions').mockReturnValue([]);
     vi.spyOn(WorkstationDatabase.prototype, 'getDailyRealizedPnLSol').mockReturnValue(0);
-    coordinator = new ExecutionCoordinator();
+    coordinator = new ExecutionCoordinator(mockRpc.createConnection());
   });
 
   afterEach(async () => {
+    coordinator?.cleanup();
     vi.restoreAllMocks();
     await mockJito.stop();
     testDb.close();

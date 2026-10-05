@@ -33,10 +33,11 @@ describe('Tier 2: Boundary & Corner Cases (Features 6 - 10)', () => {
       cooldownAfterFailedTradeMs: 0,
       maxAggregateExposureSol: 100,
     });
-    coordinator = new ExecutionCoordinator();
+    coordinator = new ExecutionCoordinator(mockRpc.createConnection());
   });
 
   afterEach(async () => {
+    coordinator?.cleanup();
     vi.restoreAllMocks();
     await mockJito.stop();
     testDb.close();
@@ -50,7 +51,7 @@ describe('Tier 2: Boundary & Corner Cases (Features 6 - 10)', () => {
     function createTestTx(payerKey: PublicKey = new PublicKey(Buffer.alloc(32, 2))): VersionedTransaction {
       const msg = new TransactionMessage({
         payerKey,
-        recentBlockhash: 'MockBlockhash11111111111111111111111111111111',
+        recentBlockhash: PublicKey.default.toBase58(),
         instructions: [
           SystemProgram.transfer({
             fromPubkey: payerKey,

@@ -45,6 +45,7 @@ describe('Tier 5: Production Readiness — Live Production Readiness Gates & Cap
     };
 
     riskEngine.setKillSwitch(false);
+    (coordinator.getJitoTransport() as any).lastHealthStatus = 'HEALTHY';
     PumpCurveService.cachedGlobal = { feeRecipient: DUMMY_FEE_RECIPIENT.toBase58() };
     PumpCurveService.cachedFeeConfig = { feeBps: 100 };
   });

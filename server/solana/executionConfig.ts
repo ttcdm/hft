@@ -144,11 +144,18 @@ class ExecutionConfigManager {
     // 1. Explicit override if provided and within operator bounds
     if (explicitTipSol !== undefined && explicitTipSol !== null && explicitTipSol > 0) {
       const explicitLamports = Math.round(explicitTipSol * 1e9);
-      const boundedLamports = Math.min(Math.max(explicitLamports, minFloorLamports), maxCeilingLamports);
+      let boundedLamports = Math.min(Math.max(explicitLamports, minFloorLamports), maxCeilingLamports);
+      // Scale tip for micro-trades so execution cost stays strictly below risk threshold
+      if (notionalSol && notionalSol > 0) {
+        const maxMicroTipLamports = Math.round(notionalSol * 0.15 * 1e9);
+        if (maxMicroTipLamports >= 10_000 && boundedLamports > maxMicroTipLamports) {
+          boundedLamports = maxMicroTipLamports;
+        }
+      }
       return {
         tipLamports: boundedLamports,
         tipSol: boundedLamports / 1e9,
-        policyReason: `EXPLICIT_OVERRIDE (Bounded between ${this.config.minJitoTipSol} and ${operatorMaxSol ?? this.config.maxJitoTipSol} SOL)`,
+        policyReason: `EXPLICIT_OVERRIDE (Bounded between ${this.config.minJitoTipSol} and ${operatorMaxSol ?? this.config.maxJitoTipSol} SOL, scaled for order size)`,
         isDynamic: false,
       };
     }
@@ -185,13 +192,12 @@ class ExecutionConfigManager {
       reason += ` -> CAPPED by operator maximum (${(maxCeilingLamports / 1e9).toFixed(4)} SOL)`;
     }
 
-    // 4. Economic sanity check: tip should not exceed 25% of trade value (if tradeAmountSol provided)
+    // 4. Economic sanity check: tip should not exceed 15% of trade value (if tradeAmountSol provided)
     if (notionalSol && notionalSol > 0) {
-      const maxEconomicTipLamports = Math.round(notionalSol * 0.25 * 1e9);
-      // Only cap if maxEconomicTipLamports is at least the minFloorLamports
-      if (maxEconomicTipLamports >= minFloorLamports && calculatedLamports > maxEconomicTipLamports) {
+      const maxEconomicTipLamports = Math.round(notionalSol * 0.15 * 1e9);
+      if (maxEconomicTipLamports >= 10_000 && calculatedLamports > maxEconomicTipLamports) {
         calculatedLamports = maxEconomicTipLamports;
-        reason += ` -> CAPPED by economic sanity rule (25% of ${notionalSol.toFixed(4)} SOL trade)`;
+        reason += ` -> CAPPED by economic sanity rule (15% of ${notionalSol.toFixed(4)} SOL trade)`;
       }
     }
 

@@ -258,10 +258,10 @@ export class PumpSwapVenueService {
       isMayhemMode: Boolean(swapState.pool.isMayhemMode),
       creatorFeeBps: new BN(swapState.pool.creatorFeeBps ? swapState.pool.creatorFeeBps.toString() : '0'),
     });
-    const minBase = res.uiBase.mul(new BN(10000 - slippageBps)).div(new BN(10000));
+    const minBase = res.base.mul(new BN(10000 - slippageBps)).div(new BN(10000));
     return {
       ...res,
-      uiBase: res.uiBase,
+      uiBase: res.base,
       minBase,
     };
   }

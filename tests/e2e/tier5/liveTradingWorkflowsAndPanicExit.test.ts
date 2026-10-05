@@ -159,7 +159,7 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
         passed: false,
         status: 'FAIL',
         observedValue: 'TransferFee',
-        thresholdValue: 'No predatory extensions',
+        threshold: 'No predatory extensions',
         reason: 'Token has predatory TransferFee extension',
       });
 
@@ -448,6 +448,7 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
       expect(closeSpy).toHaveBeenCalled();
 
       // Verify that subsequent trade requests fail closed due to active kill switch
+      vi.spyOn(executionCoordinator, 'canExecuteLive').mockRestore();
       const blockedAttempt = executionCoordinator.canExecuteLive();
       expect(blockedAttempt.allowed).toBe(false);
       expect(blockedAttempt.reasons.some((r) => r.includes('Emergency risk kill switch is active'))).toBe(true);

@@ -767,7 +767,13 @@ export class PumpFunService extends EventEmitter {
     jitoTipSol: number = 0.005,
     maxSlippagePct: number = 6.0
   ): Promise<{ success: boolean; message: string; txHash?: string }> {
-    const callout = this.hotCallouts.find((c) => c.id === calloutId);
+    const target = calloutId.trim().toLowerCase();
+    const callout = this.hotCallouts.find(
+      (c) =>
+        c.id.toLowerCase() === target ||
+        c.calloutId.toLowerCase() === target ||
+        c.token.mint.toLowerCase() === target
+    );
     if (!callout) {
       return { success: false, message: 'Callout not found or expired' };
     }

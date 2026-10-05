@@ -22,6 +22,7 @@ import {
   Coins,
   Settings,
   Globe,
+  Bot,
 } from 'lucide-react';
 import {
   PumpFunHotCallout,
@@ -351,6 +352,37 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
       {/* ========================================================================= */}
       {subTab === 'CALLOUTS' && (
         <div className="space-y-3">
+          {/* Quick Auto-Sniper Status Bar */}
+          <div className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-xl bg-gradient-to-r from-[#0F172A] to-[#1E1B4B] border border-cyan-500/30 shadow-lg">
+            <div className="flex items-center space-x-2.5">
+              <Bot className="w-5 h-5 text-cyan-400 animate-pulse" />
+              <div>
+                <div className="text-xs font-mono font-bold text-white flex items-center space-x-2">
+                  <span>AUTONOMOUS CALLOUT SNIPER</span>
+                  <span className="text-[10px] px-1.5 py-0.2 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
+                    JITO MEV BUNDLES
+                  </span>
+                </div>
+                <div className="text-[11px] text-slate-400">
+                  Toggle Auto-Snipe on specific callers below or in the Leaderboard to automatically snipe their signals.
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center space-x-2">
+              <button
+                onClick={() => {
+                  setSubTab('LEADERBOARD');
+                  hftAudio.playClick();
+                }}
+                className="px-3 py-1.5 rounded-lg text-xs font-mono font-bold bg-cyan-600/30 hover:bg-cyan-600/50 text-cyan-300 border border-cyan-500/50 transition flex items-center space-x-1.5"
+              >
+                <Award className="w-3.5 h-3.5 text-amber-400" />
+                <span>Manage Subscriptions ({leaderboard.filter(c => c.isAutoSnipeSubscribed).length} Active)</span>
+              </button>
+            </div>
+          </div>
+
           {/* SEARCH & FILTER CONTROLS */}
           <div className="flex flex-wrap items-center justify-between gap-2 p-2 rounded-lg bg-[#0F1524] border border-[#1E293B]">
             <div className="flex items-center space-x-1.5 flex-wrap">
@@ -756,6 +788,20 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                         <div className="text-center text-[10px] font-mono text-slate-500">
                           Jito MEV {rules.jitoPriorityTipSol} SOL Tip
                         </div>
+
+                        {/* Caller Auto-Snipe Toggle */}
+                        <button
+                          onClick={() => handleToggleAutoSnipe(c.caller.userId)}
+                          className={`w-full py-1 px-2 rounded text-[10px] font-mono font-bold transition flex items-center justify-center space-x-1 border ${
+                            c.caller.isAutoSnipeSubscribed
+                              ? 'bg-rose-500/20 text-rose-300 border-rose-500/50 shadow-sm'
+                              : 'bg-[#141B2D] text-slate-400 border-[#1E293B] hover:text-white hover:border-slate-600'
+                          }`}
+                          title={c.caller.isAutoSnipeSubscribed ? 'Click to disable auto-snipe for this caller' : 'Click to automatically snipe all callouts from this caller'}
+                        >
+                          <Bot className="w-3 h-3 text-cyan-400" />
+                          <span>{c.caller.isAutoSnipeSubscribed ? 'AUTO-SNIPE: ON' : 'AUTO-SNIPE: OFF'}</span>
+                        </button>
                       </div>
                     </div>
 

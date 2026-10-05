@@ -571,12 +571,34 @@ export class PumpCurveService {
         this.cacheTimestamp = now;
       }
 
-      if (!mintAccountInfo) {
+      let finalMintInfo = mintAccountInfo;
+      let finalCurveInfo = curveAccountInfo;
+
+      if ((!finalMintInfo || !finalCurveInfo) && !isLiveMode) {
+        try {
+          const mainnetFallback = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
+          const fallbackAccounts = [mint, bondingCurve];
+          if (!this.cachedGlobal || !this.cachedFeeConfig) {
+            fallbackAccounts.push(GLOBAL_PDA, PUMP_FEE_CONFIG_PDA);
+          }
+          const fallbackInfos = await mainnetFallback.getMultipleAccountsInfo(fallbackAccounts);
+          if (fallbackInfos[0]) finalMintInfo = fallbackInfos[0];
+          if (fallbackInfos[1]) finalCurveInfo = fallbackInfos[1];
+          if (fallbackInfos[2] && !this.cachedGlobal) {
+            try { this.cachedGlobal = PUMP_SDK.decodeGlobal(fallbackInfos[2]); } catch {}
+          }
+          if (fallbackInfos[3] && !this.cachedFeeConfig) {
+            try { this.cachedFeeConfig = PUMP_SDK.decodeFeeConfig(fallbackInfos[3]); } catch {}
+          }
+        } catch {}
+      }
+
+      if (!finalMintInfo) {
         Logger.warn(`Mint account not found on Solana RPC: ${mint.toBase58()}`);
         return null;
       }
 
-      if (!curveAccountInfo) {
+      if (!finalCurveInfo) {
         Logger.warn(`Pump.fun bonding curve account not found: ${bondingCurve.toBase58()}`);
         return null;
       }
@@ -584,9 +606,9 @@ export class PumpCurveService {
       // Determine correct token program (SPL Token vs Token-2022)
       let baseTokenProgram = TOKEN_PROGRAM_ID;
       let token2022Report: Token2022ExtensionReport | undefined = undefined;
-      if (mintAccountInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+      if (finalMintInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {
         baseTokenProgram = TOKEN_2022_PROGRAM_ID;
-        token2022Report = inspectToken2022Extensions(mintAccountInfo.data);
+        token2022Report = inspectToken2022Extensions(finalMintInfo.data);
         if (!token2022Report.isSafe) {
           if (isLiveMode) {
             Logger.error(
@@ -607,20 +629,20 @@ export class PumpCurveService {
       let mintAuthorityStatus: TriState = 'UNKNOWN';
       let freezeAuthorityStatus: TriState = 'UNKNOWN';
 
-      if (mintAccountInfo.data.length >= 82) {
+      if (finalMintInfo.data.length >= 82) {
         // Offset 0..3: COption<Pubkey> for mint authority (0 = None/Revoked, 1 = Some/Active)
-        const mintAuthOption = mintAccountInfo.data.readUInt32LE(0);
+        const mintAuthOption = finalMintInfo.data.readUInt32LE(0);
         isMintAuthorityRevoked = mintAuthOption === 0;
         mintAuthorityStatus = isMintAuthorityRevoked ? 'PASS' : 'FAIL';
 
-        tokenDecimals = mintAccountInfo.data.readUInt8(44);
+        tokenDecimals = finalMintInfo.data.readUInt8(44);
 
         // Offset 46..49: COption<Pubkey> for freeze authority (0 = None/Revoked, 1 = Some/Active)
-        const freezeAuthOption = mintAccountInfo.data.readUInt32LE(46);
+        const freezeAuthOption = finalMintInfo.data.readUInt32LE(46);
         isFreezeAuthorityRevoked = freezeAuthOption === 0;
         freezeAuthorityStatus = isFreezeAuthorityRevoked ? 'PASS' : 'FAIL';
-      } else if (mintAccountInfo.data.length >= 45) {
-        tokenDecimals = mintAccountInfo.data.readUInt8(44);
+      } else if (finalMintInfo.data.length >= 45) {
+        tokenDecimals = finalMintInfo.data.readUInt8(44);
       }
 
       let creator: PublicKey = PublicKey.default;
@@ -637,7 +659,7 @@ export class PumpCurveService {
 
       // Try official Anchor SDK decode first
       try {
-        const decoded = PUMP_SDK.decodeBondingCurve(curveAccountInfo);
+        const decoded = PUMP_SDK.decodeBondingCurve(finalCurveInfo);
         virtualTokenReserves = BigInt(decoded.virtualTokenReserves.toString());
         virtualSolReserves = BigInt(decoded.virtualQuoteReserves.toString());
         realTokenReserves = BigInt(decoded.realTokenReserves.toString());
@@ -664,7 +686,7 @@ export class PumpCurveService {
         }
 
         // Retain manual binary offset fallback strictly for PAPER/TEST/RESEARCH diagnostics
-        const data = curveAccountInfo.data;
+        const data = finalCurveInfo.data;
         if (data.length < 49) {
           Logger.warn(`Bonding curve account data truncated: ${data.length} bytes`);
           return null;
@@ -858,11 +880,55 @@ export class PumpCurveService {
 
     // Try official SDK quote calculation if available
     let sdkQuoteSucceeded = false;
-    if (this.cachedGlobal && this.cachedFeeConfig && typeof getBuyTokenAmountFromSolAmount === 'function') {
+    const effectiveFeeConfig = Array.isArray(this.cachedFeeConfig?.feeTiers)
+      ? this.cachedFeeConfig
+      : (this.cachedFeeConfig ? {
+          feeTiers: [
+            {
+              marketCapLamportsThreshold: new BN(0),
+              fees: {
+                lpFeeBps: new BN(0),
+                protocolFeeBps: new BN(protocolFeeBps || (this.cachedFeeConfig as any).feeBps || 100),
+                creatorFeeBps: new BN(creatorFeeBps || 0),
+              },
+            },
+          ],
+          stableFeeTiers: [],
+          flatFees: {
+            lpFeeBps: new BN(0),
+            protocolFeeBps: new BN(protocolFeeBps || (this.cachedFeeConfig as any).feeBps || 100),
+            creatorFeeBps: new BN(creatorFeeBps || 0),
+          },
+          exoticFlatFees: {
+            lpFeeBps: new BN(0),
+            protocolFeeBps: new BN(protocolFeeBps || (this.cachedFeeConfig as any).feeBps || 100),
+            creatorFeeBps: new BN(creatorFeeBps || 0),
+          },
+        } : null);
+
+    const effectiveGlobal = {
+      tokenTotalSupply: new BN(state.tokenTotalSupply.toString()),
+      feeBasisPoints: new BN(protocolFeeBps || 100),
+      creatorFeeBasisPoints: new BN(creatorFeeBps || 0),
+      creatorFeeConfigurable: false,
+      feeRecipient: new PublicKey(this.cachedGlobal?.feeRecipient || CURRENT_FEE_RECIPIENTS[0]),
+      ...this.cachedGlobal,
+    };
+    if (!(effectiveGlobal.tokenTotalSupply instanceof BN)) {
+      effectiveGlobal.tokenTotalSupply = new BN(state.tokenTotalSupply.toString());
+    }
+    if (!(effectiveGlobal.feeBasisPoints instanceof BN)) {
+      effectiveGlobal.feeBasisPoints = new BN(protocolFeeBps || 100);
+    }
+    if (!(effectiveGlobal.creatorFeeBasisPoints instanceof BN)) {
+      effectiveGlobal.creatorFeeBasisPoints = new BN(creatorFeeBps || 0);
+    }
+
+    if (this.cachedGlobal && effectiveFeeConfig && typeof getBuyTokenAmountFromSolAmount === 'function') {
       try {
         const tokensOut = getBuyTokenAmountFromSolAmount({
-          global: this.cachedGlobal,
-          feeConfig: this.cachedFeeConfig,
+          global: effectiveGlobal as any,
+          feeConfig: effectiveFeeConfig,
           mintSupply: new BN(state.tokenTotalSupply.toString()),
           bondingCurve: {
             virtualTokenReserves: new BN(state.virtualTokenReserves.toString()),
@@ -902,20 +968,27 @@ export class PumpCurveService {
 
     // Mathematical constant-product model (used for cross-check and fallback in paper mode)
     const totalFeeBps = BigInt(protocolFeeBps + creatorFeeBps);
-    const totalFeeLamports = (solInputLamports * totalFeeBps) / 10000n;
-    protocolFeeLamports = totalFeeBps > 0n ? (totalFeeLamports * BigInt(protocolFeeBps)) / totalFeeBps : 0n;
-    creatorFeeLamports = totalFeeLamports - protocolFeeLamports;
-    const netSolForCurve = solInputLamports - totalFeeLamports;
+    protocolFeeLamports = (solInputLamports * BigInt(protocolFeeBps)) / 10000n;
+    creatorFeeLamports = (solInputLamports * BigInt(creatorFeeBps)) / 10000n;
+    const totalFeeLamports = protocolFeeLamports + creatorFeeLamports;
+    const netSolForCurve = (totalFeeBps > 0n && solInputLamports > 1n)
+      ? ((solInputLamports - 1n) * 10000n) / (10000n + totalFeeBps)
+      : solInputLamports;
 
     const k = state.virtualSolReserves * state.virtualTokenReserves;
     const newVirtualSol = state.virtualSolReserves + netSolForCurve;
     const newVirtualTokens = k / newVirtualSol + 1n;
 
+    let customTokensToReceiveRaw: bigint;
     if (newVirtualTokens >= state.virtualTokenReserves) {
-      throw new Error(`Insufficient bonding curve liquidity for requested buy size.`);
+      if (solInputLamports <= 1n) {
+        customTokensToReceiveRaw = 0n;
+      } else {
+        throw new Error(`Insufficient bonding curve liquidity for requested buy size.`);
+      }
+    } else {
+      customTokensToReceiveRaw = state.virtualTokenReserves - newVirtualTokens;
     }
-
-    const customTokensToReceiveRaw = state.virtualTokenReserves - newVirtualTokens;
 
     if (!sdkQuoteSucceeded) {
       tokensToReceiveRaw = customTokensToReceiveRaw;
@@ -928,7 +1001,7 @@ export class PumpCurveService {
       }
     }
 
-    if (tokensToReceiveRaw! <= 0n) {
+    if (tokensToReceiveRaw! < 0n || (tokensToReceiveRaw! === 0n && solInputLamports > 1n)) {
       throw new Error(`Calculated token output is zero.`);
     }
 
@@ -1032,12 +1105,57 @@ export class PumpCurveService {
 
     let grossSolOutLamports: bigint = 0n;
     let sdkQuoteSucceeded = false;
+    const protocolFeeBps = state.protocolFeeBps;
+    const creatorFeeBps = state.creatorFeeBps;
+    const effectiveFeeConfig = Array.isArray(this.cachedFeeConfig?.feeTiers)
+      ? this.cachedFeeConfig
+      : (this.cachedFeeConfig ? {
+          feeTiers: [
+            {
+              marketCapLamportsThreshold: new BN(0),
+              fees: {
+                lpFeeBps: new BN(0),
+                protocolFeeBps: new BN(protocolFeeBps || (this.cachedFeeConfig as any).feeBps || 100),
+                creatorFeeBps: new BN(creatorFeeBps || 0),
+              },
+            },
+          ],
+          stableFeeTiers: [],
+          flatFees: {
+            lpFeeBps: new BN(0),
+            protocolFeeBps: new BN(protocolFeeBps || (this.cachedFeeConfig as any).feeBps || 100),
+            creatorFeeBps: new BN(creatorFeeBps || 0),
+          },
+          exoticFlatFees: {
+            lpFeeBps: new BN(0),
+            protocolFeeBps: new BN(protocolFeeBps || (this.cachedFeeConfig as any).feeBps || 100),
+            creatorFeeBps: new BN(creatorFeeBps || 0),
+          },
+        } : null);
 
-    if (this.cachedGlobal && this.cachedFeeConfig && typeof getSellSolAmountFromTokenAmount === 'function') {
+    const effectiveGlobal = {
+      tokenTotalSupply: new BN(state.tokenTotalSupply.toString()),
+      feeBasisPoints: new BN(protocolFeeBps || 100),
+      creatorFeeBasisPoints: new BN(creatorFeeBps || 0),
+      creatorFeeConfigurable: false,
+      feeRecipient: new PublicKey(this.cachedGlobal?.feeRecipient || CURRENT_FEE_RECIPIENTS[0]),
+      ...this.cachedGlobal,
+    };
+    if (!(effectiveGlobal.tokenTotalSupply instanceof BN)) {
+      effectiveGlobal.tokenTotalSupply = new BN(state.tokenTotalSupply.toString());
+    }
+    if (!(effectiveGlobal.feeBasisPoints instanceof BN)) {
+      effectiveGlobal.feeBasisPoints = new BN(protocolFeeBps || 100);
+    }
+    if (!(effectiveGlobal.creatorFeeBasisPoints instanceof BN)) {
+      effectiveGlobal.creatorFeeBasisPoints = new BN(creatorFeeBps || 0);
+    }
+
+    if (this.cachedGlobal && effectiveFeeConfig && typeof getSellSolAmountFromTokenAmount === 'function') {
       try {
         const solOut = getSellSolAmountFromTokenAmount({
-          global: this.cachedGlobal,
-          feeConfig: this.cachedFeeConfig,
+          global: effectiveGlobal as any,
+          feeConfig: effectiveFeeConfig,
           mintSupply: new BN(state.tokenTotalSupply.toString()),
           bondingCurve: {
             virtualTokenReserves: new BN(state.virtualTokenReserves.toString()),
@@ -1090,8 +1208,6 @@ export class PumpCurveService {
       }
     }
 
-    const protocolFeeBps = state.protocolFeeBps;
-    const creatorFeeBps = state.creatorFeeBps;
     const totalFeeBps = BigInt(protocolFeeBps + creatorFeeBps);
     const totalFeeLamports = (grossSolOutLamports * totalFeeBps) / 10000n;
     const protocolFeeLamports = totalFeeBps > 0n ? (totalFeeLamports * BigInt(protocolFeeBps)) / totalFeeBps : 0n;

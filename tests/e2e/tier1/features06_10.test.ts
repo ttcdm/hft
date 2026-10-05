@@ -35,7 +35,7 @@ describe('Tier 1: Feature Coverage (Features 6 - 10)', () => {
       cooldownAfterFailedTradeMs: 0,
       maxAggregateExposureSol: 100,
     });
-    coordinator = new ExecutionCoordinator();
+    coordinator = new ExecutionCoordinator(mockRpc.createConnection());
   });
 
   afterEach(async () => {
@@ -52,7 +52,7 @@ describe('Tier 1: Feature Coverage (Features 6 - 10)', () => {
     function createTestTx(payerKey: PublicKey = new PublicKey(Buffer.alloc(32, 2))): VersionedTransaction {
       const msg = new TransactionMessage({
         payerKey,
-        recentBlockhash: 'MockBlockhash11111111111111111111111111111111',
+        recentBlockhash: PublicKey.default.toBase58(),
         instructions: [
           SystemProgram.transfer({
             fromPubkey: payerKey,
@@ -483,6 +483,7 @@ describe('Tier 1: Feature Coverage (Features 6 - 10)', () => {
         symbol: 'T22BAD',
         name: 'Bad T22',
         amountSol: 0.005,
+        currentPriceSol: 0.0001,
         source: 'AUTO_SNIPER',
         provenance: 'REAL_ONCHAIN',
         eligibilityReport: reportWithUnsupportedT22,

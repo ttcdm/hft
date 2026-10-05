@@ -253,11 +253,10 @@ export const Header: React.FC<HeaderProps> = ({
               ? 'bg-gradient-to-r from-amber-600 to-emerald-600 text-white shadow-md shadow-emerald-500/30 border border-emerald-400/40'
               : 'text-emerald-300 hover:text-white hover:bg-emerald-950/40'
           }`}
-          title="Open Plug & Play Live Solana Wallet & Auto-Pilot Profit Engine"
+          title="Open Plug & Play Live Solana Wallet & Autonomous Profit Engine"
         >
           <Zap className="w-3.5 h-3.5 text-amber-400" />
-          <span className="hidden sm:inline">Auto-Profit</span>
-          <span className="sm:hidden">Profit</span>
+          <span>Plug & Play</span>
           <span className="text-[9px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-black border border-emerald-500/30">
             LIVE ⚡
           </span>

@@ -668,16 +668,10 @@ class ExchangeWebSocketManager {
         ws.onmessage = null;
         ws.onerror = null;
         ws.onclose = null;
-        if (ws.readyState === WebSocket.OPEN) {
-          ws.close(1000, 'Stream disconnected');
-        } else if (ws.readyState === WebSocket.CONNECTING) {
-          // If still connecting, safely close once opened to prevent unhandled abort warnings
-          ws.onopen = () => {
-            try {
-              ws.close(1000, 'Stream disconnected');
-            } catch {}
-          };
-          ws.onerror = () => {};
+        if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+          try {
+            ws.close(1000, 'Stream disconnected');
+          } catch {}
         }
       } catch {}
     }

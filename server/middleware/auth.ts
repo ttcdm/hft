@@ -203,6 +203,16 @@ export function isAllowedClientOrigin(origin?: string | null, reqHost?: string |
       if (u.hostname === hostWithoutPort) return true;
     }
 
+    // Allow Google Cloud Run, AI Studio, and Google sandbox preview domains
+    if (
+      u.hostname.endsWith('.run.app') ||
+      u.hostname.endsWith('.googleusercontent.com') ||
+      u.hostname.endsWith('.google.com') ||
+      u.hostname.endsWith('.aistudio.google.com')
+    ) {
+      return true;
+    }
+
     // Check configured exact origins from environment
     const configuredRaw = process.env.ALLOWED_ORIGINS || process.env.CORS_ORIGIN || process.env.APP_URL || '';
     if (configuredRaw) {

@@ -36,7 +36,7 @@ describe('Empirical Adversarial Challenger Suite: Protocol & Execution Correctne
   function createDummyTx(payer: PublicKey): VersionedTransaction {
     const msg = new TransactionMessage({
       payerKey: payer,
-      recentBlockhash: 'MockBlockhash11111111111111111111111111111111',
+      recentBlockhash: PublicKey.default.toBase58(),
       instructions: [
         SystemProgram.transfer({
           fromPubkey: payer,
@@ -60,11 +60,11 @@ describe('Empirical Adversarial Challenger Suite: Protocol & Execution Correctne
       cooldownAfterFailedTradeMs: 0,
       maxAggregateExposureSol: 100,
     });
-    coordinator = new ExecutionCoordinator();
-    coordinator.setConnection(mockRpc.createConnection());
+    coordinator = new ExecutionCoordinator(mockRpc.createConnection());
   });
 
   afterEach(async () => {
+    coordinator?.cleanup();
     vi.restoreAllMocks();
     await mockJito.stop();
     testDb.close();

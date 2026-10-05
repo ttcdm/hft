@@ -1,3 +1,5 @@
+import dotenv from 'dotenv';
+dotenv.config({ override: true });
 import { Connection, PublicKey, SystemProgram, VersionedTransaction } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID, createCloseAccountInstruction } from '@solana/spl-token';
 import {
@@ -23,6 +25,7 @@ import { executionConfig } from '../solana/executionConfig';
 import { Logger } from '../middleware/enterprise';
 import { PumpCurveService, TradeQuote, fetchTokenHolderDistribution } from '../solana/pumpCurve';
 import { TradeReconciler, RealMarkPriceService, PreTradeSnapshot } from './reconciliation';
+export type { PreTradeSnapshot };
 import { CapitalSizer } from '../capital/capitalSizer';
 import { ExitEngine } from '../exits/exitEngine';
 
@@ -90,13 +93,24 @@ export class ExecutionCoordinator {
 
   private readonly isDefaultSingleton: boolean;
 
-  constructor(isDefaultSingleton: boolean = false) {
-    this.isDefaultSingleton = isDefaultSingleton;
-    this.rpcEndpoint = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
-    this.connection = new Connection(this.rpcEndpoint, {
-      commitment: 'confirmed',
-      confirmTransactionInitialTimeout: 30000,
-    });
+  constructor(connectionOrIsSingleton: Connection | boolean = false, isDefaultSingleton: boolean = false) {
+    const isConn = Boolean(
+      connectionOrIsSingleton &&
+      typeof connectionOrIsSingleton === 'object' &&
+      ('getSlot' in connectionOrIsSingleton || (connectionOrIsSingleton as any) instanceof Connection)
+    );
+    if (isConn) {
+      this.isDefaultSingleton = Boolean(isDefaultSingleton);
+      this.connection = connectionOrIsSingleton as Connection;
+      this.rpcEndpoint = (connectionOrIsSingleton as any)._rpcEndpoint || process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+    } else {
+      this.isDefaultSingleton = Boolean(connectionOrIsSingleton);
+      this.rpcEndpoint = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+      this.connection = new Connection(this.rpcEndpoint, {
+        commitment: 'confirmed',
+        confirmTransactionInitialTimeout: 30000,
+      });
+    }
     this.jitoTransport = new JitoTransport(this.connection);
     this.rpcTransport = new SolanaRpcTransport(this.connection);
     this.initializeConnection();
@@ -690,8 +704,7 @@ export class ExecutionCoordinator {
   }
 
   public getPositions(mode?: ExecutionMode, status?: 'OPEN' | 'PARTIALLY_CLOSED' | 'CLOSED' | 'ACTIVE'): NormalizedPosition[] {
-    const targetMode = mode || this.executionMode;
-    return workstationDb.loadPositions(targetMode, status);
+    return workstationDb.loadPositions(mode, status);
   }
 
   // Update real mark prices for active positions without random walk

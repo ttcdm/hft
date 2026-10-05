@@ -14,13 +14,23 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <script>
-      // Gracefully prevent unhandled promise rejections from sandbox WebSocket disconnections
+      // Gracefully prevent unhandled promise rejections or errors from sandbox WebSocket disconnections
       window.addEventListener('unhandledrejection', function (event) {
+        var str = String(event?.reason?.message || event?.reason || '');
         if (
-          event &&
-          event.reason &&
-          (String(event.reason).includes('WebSocket closed without opened') ||
-            String(event.reason?.message).includes('WebSocket closed without opened'))
+          str.includes('WebSocket') ||
+          str.includes('1006') ||
+          str.includes('ws error')
+        ) {
+          event.preventDefault();
+        }
+      });
+      window.addEventListener('error', function (event) {
+        var str = String(event?.message || event?.error?.message || '');
+        if (
+          str.includes('WebSocket') ||
+          str.includes('1006') ||
+          str.includes('ws error')
         ) {
           event.preventDefault();
         }

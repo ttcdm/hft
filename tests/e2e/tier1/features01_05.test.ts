@@ -29,10 +29,11 @@ describe('Tier 1: Feature Coverage (Features 1 - 5)', () => {
     mockJito = new MockJitoEngine();
     await mockJito.start();
     testDb = new TestDatabase();
-    coordinator = new ExecutionCoordinator();
+    coordinator = new ExecutionCoordinator(mockRpc.createConnection());
   });
 
   afterEach(async () => {
+    coordinator?.cleanup();
     await mockJito.stop();
     testDb.close();
     mockRpc.clear();

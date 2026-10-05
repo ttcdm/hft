@@ -569,12 +569,12 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                                 {pos.mode}
                               </span>
                             </td>
-                            <td className="p-2.5 font-mono">{(pos.costBasisLamports / 1e9).toFixed(4)} SOL</td>
-                            <td className="p-2.5 font-mono">{pos.currentValueSol.toFixed(4)} SOL</td>
+                            <td className="p-2.5 font-mono">{((pos.costBasisLamports ?? 0) / 1e9).toFixed(4)} SOL</td>
+                            <td className="p-2.5 font-mono">{(pos.currentValueSol ?? 0).toFixed(4)} SOL</td>
                             <td className="p-2.5 font-mono font-bold">
-                              <span className={pos.unrealizedPnlPct >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                                {pos.unrealizedPnlPct >= 0 ? '+' : ''}
-                                {pos.unrealizedPnlPct.toFixed(1)}%
+                              <span className={(pos.unrealizedPnlPct ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                                {(pos.unrealizedPnlPct ?? 0) >= 0 ? '+' : ''}
+                                {(pos.unrealizedPnlPct ?? 0).toFixed(1)}%
                               </span>
                             </td>
                             <td className="p-2.5">

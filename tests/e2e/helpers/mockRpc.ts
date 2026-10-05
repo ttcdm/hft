@@ -134,7 +134,7 @@ export class MockSolanaRpc {
       },
       getLatestBlockhash: async () => {
         return {
-          blockhash: 'MockBlockhash11111111111111111111111111111111',
+          blockhash: PublicKey.default.toBase58(),
           lastValidBlockHeight: 290000000,
         };
       },

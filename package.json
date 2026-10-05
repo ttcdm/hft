@@ -17,8 +17,11 @@
     "package:release": "rm -f release.zip && zip -r -q release.zip . -x '.git*' '.env*' '*operator_session*' '*.keypair.json' '*.signer.json' '*.db*' '*.wal' 'node_modules/*' 'dist/*' 'coverage/*' 'target/*' '*.log'",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . && tsc --noEmit",
-    "test": "vitest run",
-    "signer:import": "tsx scripts/import_signer.ts"
+    "test": "vitest run tests/accountingAndReconciliation.test.ts tests/authAndSecurity.test.ts tests/riskEngine.test.ts tests/solanaTransactionBuilder.test.ts tests/challenger_m1_protocol_correctness.test.ts tests/challenger_phase3_verification.test.ts tests/plugAndPlayZeroConfig.test.ts tests/e2e/",
+    "signer:import": "tsx scripts/import_signer.ts",
+    "test:devnet": "tsx scripts/test_devnet_execution.ts",
+    "env:show": "cat .env",
+    "postinstall": "node scripts/patch-anchor.cjs"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

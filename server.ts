@@ -1,13 +1,14 @@
+import dotenv from 'dotenv';
+dotenv.config({ override: true });
 import './suppress-warnings.cjs';
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'node:fs';
-import dotenv from 'dotenv';
 import crypto from 'crypto';
 import http from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
-import { createServer as createViteServer } from 'vite';
+import { createServer as createViteServer, createLogger } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import { hftEngine } from './server/engine/engine';
 import { socialScanner } from './server/socialScanner';
@@ -39,12 +40,20 @@ import {
 dotenv.config();
 
 const app = express();
-const PORT = parseInt(process.env.PORT || '3000', 10);
-const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';
+// Nginx/Cloud Run listens on 8080 in container; internal Node/Vite applet must listen on port 3000
+const PORT = parseInt(
+  process.env.APP_PORT || (process.env.PORT && process.env.PORT !== '8080' ? process.env.PORT : '3000'),
+  10
+);
+const BIND_HOST = process.env.BIND_HOST || '0.0.0.0';
 const server = http.createServer(app);
 
 // WebSocket Server for High-Performance Engine Telemetry & Orders
 const wss = new WebSocketServer({ server, path: '/ws/engine' });
+
+wss.on('error', (err: any) => {
+  Logger.warn(`WebSocketServer error: ${err?.message || err}`);
+});
 
 // Safe JSON stringify that serializes BigInt as string
 function safeJsonStringify(payload: any): string {
@@ -74,6 +83,14 @@ function broadcastWs(payload: any, sensitiveOnly: boolean = true) {
 }
 
 wss.on('connection', (ws: WebSocket, req: any) => {
+  ws.on('error', (err: any) => {
+    Logger.debug(`Client WebSocket error: ${err?.message || err}`);
+  });
+
+  ws.on('close', (code: number) => {
+    Logger.debug(`Client WebSocket closed with code ${code}`);
+  });
+
   // Origin verification for WebSocket connections (strict matching, no broad wildcards)
   const origin = (req?.headers?.origin || '') as string;
   const host = (req?.headers?.host || '') as string;
@@ -292,7 +309,7 @@ const corsPolicy: cors.CorsOptionsDelegate<cors.CorsRequest> = (req, callback) =
       allowedHeaders: ['Content-Type', 'Authorization', 'x-session-token', 'x-operator-auth', 'x-correlation-id'],
     });
   }
-  return callback(new Error('Blocked by restrictive cross-origin policy'));
+  return callback(null, { origin: false });
 };
 app.use(cors(corsPolicy));
 
@@ -1899,9 +1916,27 @@ app.use(errorHandler);
 // Vite middleware & Static SPA serving
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
+    const customLogger = createLogger();
+    const originalError = customLogger.error.bind(customLogger);
+    customLogger.error = (msg, options) => {
+      if (
+        msg.includes('ws error') ||
+        msg.includes('1006') ||
+        msg.includes('Invalid WebSocket frame') ||
+        (options?.error && String(options.error).includes('1006'))
+      ) {
+        return;
+      }
+      originalError(msg, options);
+    };
+
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: {
+        middlewareMode: true,
+        hmr: false,
+      },
       appType: 'spa',
+      customLogger,
     });
     app.use(vite.middlewares);
   } else {

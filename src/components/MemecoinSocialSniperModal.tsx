@@ -1234,11 +1234,11 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                     </div>
                                   </td>
                                   <td className="p-3 text-slate-300">{pos.platform}</td>
-                                  <td className="p-3 text-slate-300">${pos.entryPriceUsd.toFixed(6)}</td>
-                                  <td className="p-3 font-bold text-cyan-300">${pos.currentPriceUsd.toFixed(6)}</td>
+                                  <td className="p-3 text-slate-300">${(pos.entryPriceUsd ?? 0).toFixed(6)}</td>
+                                  <td className="p-3 font-bold text-cyan-300">${(pos.currentPriceUsd ?? 0).toFixed(6)}</td>
                                   <td className="p-3 text-slate-200">
-                                    ${pos.currentValueUsd.toFixed(2)}{' '}
-                                    <span className="text-slate-500 text-[10px]">(${pos.costBasisUsd.toFixed(2)} cost)</span>
+                                    ${(pos.currentValueUsd ?? 0).toFixed(2)}{' '}
+                                    <span className="text-slate-500 text-[10px]">(${(pos.costBasisUsd ?? 0).toFixed(2)} cost)</span>
                                   </td>
                                   <td className="p-3">
                                     <span
@@ -1248,7 +1248,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                           : 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
                                       }`}
                                     >
-                                      {isProfitable ? '+' : ''}${pos.unrealizedPnlUsd.toFixed(2)} ({isProfitable ? '+' : ''}{pos.unrealizedPnlPct.toFixed(1)}%)
+                                      {isProfitable ? '+' : ''}${(pos.unrealizedPnlUsd ?? 0).toFixed(2)} ({isProfitable ? '+' : ''}{(pos.unrealizedPnlPct ?? 0).toFixed(1)}%)
                                     </span>
                                   </td>
                                   <td className="p-3 text-right space-x-1.5">

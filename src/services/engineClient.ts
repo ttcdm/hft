@@ -53,13 +53,38 @@ export async function getOperatorSessionToken(): Promise<string> {
 }
 
 export async function authFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-  const token = await getOperatorSessionToken();
+  let token = await getOperatorSessionToken();
   const headers = new Headers(init?.headers || {});
   if (token) {
     headers.set('x-session-token', token);
     headers.set('Authorization', `Bearer ${token}`);
   }
-  return fetch(input, { ...init, headers });
+  let res = await fetch(input, { ...init, headers });
+
+  // Self-healing: If 401 Unauthorized, stale localStorage token is purged and refreshed
+  if (res.status === 401) {
+    try {
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem('apex_operator_token');
+      }
+      cachedSessionToken = null;
+      const sessionRes = await fetch('/api/auth/session');
+      if (sessionRes.ok) {
+        const sessionData = await sessionRes.json();
+        if (sessionData.token) {
+          token = sessionData.token;
+          cachedSessionToken = token;
+          if (typeof window !== 'undefined') {
+            localStorage.setItem('apex_operator_token', token);
+          }
+          headers.set('x-session-token', token);
+          headers.set('Authorization', `Bearer ${token}`);
+          res = await fetch(input, { ...init, headers });
+        }
+      }
+    } catch {}
+  }
+  return res;
 }
 
 export type EngineTelemetryCallback = (data: EngineTelemetryData) => void;

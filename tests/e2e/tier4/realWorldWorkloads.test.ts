@@ -57,10 +57,11 @@ describe('Tier 4: Real-World Workload Scenarios (Realistic Multi-Step Lifecycles
       });
     });
     vi.spyOn(WorkstationDatabase.prototype, 'getDailyRealizedPnLSol').mockReturnValue(0);
-    coordinator = new ExecutionCoordinator();
+    coordinator = new ExecutionCoordinator(mockRpc.createConnection());
   });
 
   afterEach(async () => {
+    coordinator?.cleanup();
     vi.restoreAllMocks();
     await mockJito.stop();
     testDb.close();

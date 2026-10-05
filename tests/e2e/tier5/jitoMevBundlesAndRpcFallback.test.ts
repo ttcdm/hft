@@ -5,7 +5,7 @@ import { executionConfig, calculateDynamicJitoTip, calculateDynamicJitoTipSol } 
 import { ExecutionCoordinator, PreTradeSnapshot } from '../../../server/execution/coordinator';
 import { localSigner } from '../../../server/solana/signer';
 import { workstationDb } from '../../../server/db/database';
-import { txBuilder } from '../../../server/solana/transactionBuilder';
+import { SolanaTransactionBuilder, txBuilder } from '../../../server/solana/transactionBuilder';
 import { MockSolanaRpc } from '../helpers/mockRpc';
 import { MockJitoEngine } from '../helpers/mockJito';
 import { TestDatabase } from '../helpers/testDb';
@@ -32,9 +32,9 @@ describe('Tier 5: Production Readiness — Jito MEV Bundles, Tip Policies & Zero
     coordinator = new ExecutionCoordinator(mockRpc.createConnection());
 
     // Build sample V0 transaction for transport testing
-    const [bondingCurve] = txBuilder.constructor.getBondingCurveAddress(VALID_PUMP_MINT_1);
-    const associatedBondingCurve = txBuilder.constructor.getAssociatedTokenAddress(VALID_PUMP_MINT_1, bondingCurve);
-    const associatedUser = txBuilder.constructor.getAssociatedTokenAddress(VALID_PUMP_MINT_1, testKeypair.publicKey);
+    const [bondingCurve] = SolanaTransactionBuilder.getBondingCurveAddress(VALID_PUMP_MINT_1);
+    const associatedBondingCurve = SolanaTransactionBuilder.getAssociatedTokenAddress(VALID_PUMP_MINT_1, bondingCurve);
+    const associatedUser = SolanaTransactionBuilder.getAssociatedTokenAddress(VALID_PUMP_MINT_1, testKeypair.publicKey);
 
     sampleV0Tx = await txBuilder.buildBuyTransaction(mockRpc.createConnection(), {
       buyer: testKeypair.publicKey,

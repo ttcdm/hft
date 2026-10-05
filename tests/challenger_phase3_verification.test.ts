@@ -25,6 +25,14 @@ import path from 'path';
 describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B20, B24)', () => {
   const CANONICAL_FEE_RECIPIENT = new PublicKey('62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV');
   const CANONICAL_BUYBACK_RECIPIENT = new PublicKey('5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD');
+  const mockConn = {
+    getLatestBlockhash: async () => ({
+      blockhash: Keypair.generate().publicKey.toBase58(),
+      lastValidBlockHeight: 99999,
+    }),
+    getAccountInfo: async () => null,
+    getMultipleAccountsInfo: async () => [],
+  } as unknown as Connection;
 
   // =========================================================================
   // TASK 1.1: B01 Boundary & Adversarial Cases
@@ -236,13 +244,6 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
   // TASK 1.2: B06 ATA Rent Recovery Verification
   // =========================================================================
   describe('B06: ATA Rent Recovery (Opcode 9, Program ID, Destination)', () => {
-    const mockConn = {
-      getLatestBlockhash: async () => ({
-        blockhash: Keypair.generate().publicKey.toBase58(),
-        lastValidBlockHeight: 99999,
-      }),
-    } as unknown as Connection;
-
     it('B06-ADV.1: Opcode 9 (CloseAccount) is appended ONLY when closeAta is true (100% position exits)', async () => {
       const seller = Keypair.generate().publicKey;
       const mint = Keypair.generate().publicKey;
@@ -329,7 +330,8 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
       expect(Array.from(closeIx.data)).toEqual([9]);
 
       // Direct verification of programId on compiledInstruction
-      expect((closeIx as any).programId.toBase58()).toBe(TOKEN_2022_PROGRAM_ID.toBase58());
+      const programId = tx.message.staticAccountKeys[closeIx.programIdIndex];
+      expect(programId.toBase58()).toBe(TOKEN_2022_PROGRAM_ID.toBase58());
     });
   });
 
@@ -415,7 +417,7 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
   // =========================================================================
   describe('B19 & B20: Dust Exits & Daily Loss Limits', () => {
     it('B19-ADV.1: Rejects exit when net proceeds <= 0 (uneconomical dust sell)', async () => {
-      const coordinator = new ExecutionCoordinator();
+      const coordinator = new ExecutionCoordinator(mockConn);
       const mint = Keypair.generate().publicKey.toBase58();
       const posId = `dust-adv-${Date.now()}`;
 
@@ -449,7 +451,7 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
     });
 
     it('B19-ADV.2: Allows 100% exit of zero/dust token when rent recovery yields net positive proceeds', async () => {
-      const coordinator = new ExecutionCoordinator();
+      const coordinator = new ExecutionCoordinator(mockConn);
       const mint = Keypair.generate().publicKey.toBase58();
       const posId = `reclaim-adv-${Date.now()}`;
 

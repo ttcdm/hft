@@ -41,10 +41,11 @@ describe('Tier 2: Boundary & Corner Cases (Features 1 - 5)', () => {
     vi.spyOn(WorkstationDatabase.prototype, 'loadPositions').mockReturnValue([]);
     vi.spyOn(WorkstationDatabase.prototype, 'getDailyRealizedPnLSol').mockReturnValue(0);
 
-    coordinator = new ExecutionCoordinator();
+    coordinator = new ExecutionCoordinator(mockRpc.createConnection());
   });
 
   afterEach(() => {
+    coordinator?.cleanup();
     mockJito.stop();
     vi.restoreAllMocks();
     testDb.close();

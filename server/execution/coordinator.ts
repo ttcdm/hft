@@ -2420,6 +2420,20 @@ export class ExecutionCoordinator {
         return { success: false, pnlSol: 0, error: 'Calculated sell quantity is zero' };
       }
 
+      // CloseAccount only succeeds on an empty token account. If the wallet holds more than this sell (dust, an airdrop) or the balance
+      // cannot be read, a close instruction would revert the whole sell and the stop-loss with it, so keep the account open (critique #9).
+      let closeAtaEffective = closeAta;
+      if (closeAta) {
+        closeAtaEffective = false;
+        try {
+          const tp = target.baseTokenProgram ? new PublicKey(target.baseTokenProgram) : TOKEN_PROGRAM_ID;
+          const ataBal = await this.connection.getTokenAccountBalance(PumpCurveService.getAssociatedTokenAddress(mintPubkey, seller, tp), 'confirmed');
+          closeAtaEffective = BigInt(ataBal?.value?.amount ?? '1') <= amountTokensToSell;
+        } catch {
+          // unreadable: keep the account
+        }
+      }
+
       const { PumpSwapVenueService } = await import('../solana/pumpSwapService');
       const posMode: ExecutionMode = target.executionMode === 'LIVE' ? 'LIVE' : 'PAPER';
       const venueInfo = await PumpSwapVenueService.resolveVenue(this.connection, mintPubkey, posMode);
@@ -2460,7 +2474,7 @@ export class ExecutionCoordinator {
         const instructions = [
           ...SolanaTransactionBuilder.createComputeBudgetInstructions(250000, executionConfig.getConfig().priorityFeeMicrolamports),
           ...pumpSwapSell.instructions,
-          ...(closeAta ? [createCloseAccountInstruction(associatedUser, seller, seller, [], tokenProgramToUse)] : []),
+          ...(closeAtaEffective ? [createCloseAccountInstruction(associatedUser, seller, seller, [], tokenProgramToUse)] : []),
           SystemProgram.transfer({
             fromPubkey: seller,
             toPubkey: jitoTipAccount,
@@ -2514,10 +2528,10 @@ export class ExecutionCoordinator {
           priorityFeeMicroLamports: executionConfig.getConfig().priorityFeeMicrolamports,
           jitoTipLamports: BigInt(sellQuote.expectedJitoTipLamports),
           jitoTipAccount: jitoTipAccount,
-          closeAta,
+          closeAta: closeAtaEffective,
         };
 
-        v0Tx = await txBuilder.buildSellTransaction(this.connection, sellParams, closeAta);
+        v0Tx = await txBuilder.buildSellTransaction(this.connection, sellParams, closeAtaEffective);
       } else {
         return { success: false, pnlSol: 0, error: `Trading venue for mint ${target.mint} cannot be resolved or migrated to unknown DEX` };
       }
@@ -2789,11 +2803,22 @@ export class ExecutionCoordinator {
       openPositionsCount: activePositions.length,
       dailyRealizedPnLSol: workstationDb.getDailyRealizedPnLSol(this.executionMode),
       dailyFeesPaidLamports: dailyFees,
-      totalTradesToday: activePositions.length,
-      lastConfirmedTradeTime: activePositions[0]?.entryTimestamp || null,
+      totalTradesToday: workstationDb.countReconciledTradesToday(this.executionMode),
+      lastConfirmedTradeTime: workstationDb.getLastConfirmedTradeTime(this.executionMode),
       dbPath: workstationDb.getDbPath(),
-      sqliteJournalOk: true,
+      sqliteJournalOk: this.checkSqliteJournalOk(),
     };
+  }
+
+  private sqliteOkCache: { at: number; ok: boolean } | null = null;
+
+  /** Real check: the DB takes a write lock and reports a known journal mode. Cached 30s so status polling never contends with writers. */
+  private checkSqliteJournalOk(now: number = Date.now()): boolean {
+    if (this.sqliteOkCache && now - this.sqliteOkCache.at < 30_000) return this.sqliteOkCache.ok;
+    const mode = workstationDb.getJournalMode();
+    const ok = workstationDb.isWritable() && mode !== 'error' && mode !== 'unknown' && mode.toLowerCase() !== 'off';
+    this.sqliteOkCache = { at: now, ok };
+    return ok;
   }
 
   public cleanup() {

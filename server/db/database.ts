@@ -683,6 +683,32 @@ export class WorkstationDatabase {
     }
   }
 
+  /** Landed (RECONCILED) trades since UTC midnight, matching getDailyFeesPaidLamports' day boundary. */
+  public countReconciledTradesToday(mode: ExecutionMode): number {
+    const startOfDay = new Date();
+    startOfDay.setUTCHours(0, 0, 0, 0);
+    try {
+      const row = this.db
+        .prepare(`SELECT COUNT(*) AS n FROM transactions WHERE execution_mode = ? AND reconciliation_state = 'RECONCILED' AND submission_time >= ?`)
+        .get(mode, startOfDay.getTime()) as any;
+      return row?.n || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Confirmation (else submission) time of the newest RECONCILED trade in this mode, or null. */
+  public getLastConfirmedTradeTime(mode: ExecutionMode): number | null {
+    try {
+      const row = this.db
+        .prepare(`SELECT MAX(COALESCE(NULLIF(confirmation_time, 0), submission_time)) AS t FROM transactions WHERE execution_mode = ? AND reconciliation_state = 'RECONCILED'`)
+        .get(mode) as any;
+      return row?.t || null;
+    } catch {
+      return null;
+    }
+  }
+
   public getExecutionMetrics() {
     const totalPositions = (this.db.prepare(`SELECT COUNT(*) as count FROM positions`).get() as any)?.count || 0;
     const openPositions = (this.db.prepare(`SELECT COUNT(*) as count FROM positions WHERE status = 'OPEN' OR status = 'PARTIALLY_CLOSED'`).get() as any)?.count || 0;

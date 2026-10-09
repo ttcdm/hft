@@ -101,6 +101,8 @@ const INITIAL_POOLS: MemecoinPool[] = [
   },
 ];
 
+const DEMO_POOL_IDS: ReadonlySet<string> = new Set(INITIAL_POOLS.map((p) => p.id));
+
 export class MemecoinAggregatorService extends EventEmitter {
   private pools: MemecoinPool[] = [];
   private solPriceUsd = 145.0;
@@ -145,14 +147,14 @@ export class MemecoinAggregatorService extends EventEmitter {
   private startAutonomousSniperLoop() {
     if (this.autoSniperTimer) return;
     this.autoSniperTimer = setInterval(async () => {
-      if (!this.config.isAutoSnipeEnabled) return;
+      if (!this.config.isAutoSnipeEnabled || process.env.AUTO_SNIPE_ENABLED !== 'true') return;
       
       const mode = executionCoordinator.getExecutionMode();
       const activePositions = executionCoordinator.getPositions(mode, 'ACTIVE');
       if (activePositions.length >= 3) return;
 
       try {
-        const { pumpFunService } = await import('./pumpfunService');
+        const { pumpFunService, calloutProvenance } = await import('./pumpfunService');
         const callouts = pumpFunService.getHotCallouts();
 
         for (const c of callouts) {
@@ -168,7 +170,7 @@ export class MemecoinAggregatorService extends EventEmitter {
             jitoTipSol: this.config.jitoTipSol || 0.002,
             slippagePct: this.config.maxSlippagePct || 6.0,
             signalId: c.id,
-            provenance: 'REAL_ONCHAIN',
+            provenance: calloutProvenance(c),
           });
           break;
         }
@@ -597,8 +599,12 @@ export class MemecoinAggregatorService extends EventEmitter {
     }
 
     // Assign REAL_ONCHAIN provenance to all on-chain events discovered via WebSocket or RPC (B09)
-    const isSyntheticPool = pool.id === 'pool-pump-01' || pool.id === 'pool-ray-02' || pool.id === 'pool-dex-03';
-    const provenance: SignalProvenance = params.provenance || (!isSyntheticPool ? 'REAL_ONCHAIN' : 'SYNTHETIC_TEST');
+    const isSyntheticPool =
+      DEMO_POOL_IDS.has(pool.id) || pool.id.startsWith('pool-simulated-');
+    // The synthetic-pool check always wins over an explicit provenance param (A5).
+    const provenance: SignalProvenance = isSyntheticPool
+      ? 'SYNTHETIC_TEST'
+      : params.provenance || 'REAL_ONCHAIN';
 
     // Dispatch execution strictly through central ExecutionCoordinator
     const execRes = await executionCoordinator.executeTrade({

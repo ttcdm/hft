@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair, PublicKey } from '@solana/web3.js';
 import {
   CurveVelocityEvaluator,
@@ -32,6 +32,11 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
     (pumpfunService as any).snipedMints = new Set();
     (pumpfunService as any).hotCallouts = [];
     vi.restoreAllMocks();
+    vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   // =========================================================================

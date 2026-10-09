@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair, PublicKey } from '@solana/web3.js';
 import {
   CurveVelocityEvaluator,
@@ -31,6 +31,11 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
     memecoinAggregator.setConfluenceGating(false);
     (pumpfunService as any).snipedMints.clear();
     vi.restoreAllMocks();
+    vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   // =========================================================================
@@ -792,7 +797,7 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
         expect.objectContaining({
           contractAddress: highQualityCallout.token.mint,
           enforceConfluence: true,
-          provenance: 'REAL_ONCHAIN',
+          provenance: 'REAL_SOCIAL',
         })
       );
       expect(highQualityCallout.status).toBe('SNIPED');

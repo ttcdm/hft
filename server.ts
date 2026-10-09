@@ -1592,7 +1592,8 @@ app.get('/api/pumpfun/status', (req, res) => {
 });
 
 app.post('/api/pumpfun/refresh', async (req, res) => {
-  await pumpFunService.syncRealWorldData();
+  // A manual refresh only reloads the feed; it must never evaluate auto-snipe triggers (A5).
+  await pumpFunService.syncRealWorldData({ evaluateTriggers: false });
   res.json({
     status: 'OK',
     calloutsCount: pumpFunService.getHotCallouts().length,

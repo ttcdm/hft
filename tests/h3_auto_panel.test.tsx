@@ -49,6 +49,7 @@ describe('H3: auto-snipe panel', () => {
     );
     expect(html).toContain('data-testid="auto-badge"');
     expect(html).not.toMatch(/CME AURORA|EQUINIX|BINANCE SPOT|TOKYO/);
+    expect(html).not.toMatch(/Kernel Bypass|PTP 1588/); // an unverifiable latency claim, removed
   });
 });
 

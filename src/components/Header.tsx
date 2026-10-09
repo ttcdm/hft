@@ -9,7 +9,6 @@ import {
   Sparkles,
   CheckCircle2,
   ShieldAlert,
-  Server,
   KeyRound,
   Lock,
   Coins,
@@ -166,11 +165,6 @@ export const Header: React.FC<HeaderProps> = ({
           </div>
 
           <div className="hidden lg:flex items-center space-x-2 text-[10px] text-slate-400 font-mono mt-0.5">
-            <span className="text-emerald-400 flex items-center space-x-1">
-              <Server className="w-2.5 h-2.5 inline mr-1 text-emerald-400" />
-              Direct Kernel Bypass • PTP 1588v2
-            </span>
-            <span className="text-slate-500">|</span>
             <span className="text-slate-400 font-semibold">{timeString}</span>
           </div>
         </div>

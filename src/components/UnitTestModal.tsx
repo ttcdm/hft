@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { authFetch } from '../services/engineClient';
 import {
   CheckCircle2,
   XCircle,
@@ -99,7 +100,7 @@ export const UnitTestModal: React.FC<UnitTestModalProps> = ({
   const runServerTests = async () => {
     setServerLoading(true);
     try {
-      const res = await fetch('/api/unit-tests');
+      const res = await authFetch('/api/unit-tests');
       if (res.ok) {
         const data = await res.json();
         setServerSuiteResult(data);

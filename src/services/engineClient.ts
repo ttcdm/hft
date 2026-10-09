@@ -347,8 +347,20 @@ class EngineClient {
     return null;
   }
 
-  public downloadWalJournal() {
-    window.location.href = '/api/engine/wal/export';
+  public async downloadWalJournal() {
+    // A plain navigation cannot carry the Authorization header, so fetch with auth and save the blob.
+    try {
+      const res = await authFetch('/api/engine/wal/export');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const url = URL.createObjectURL(await res.blob());
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `apex_engine_journal_${Date.now()}.wal`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      console.error('WAL export failed:', e);
+    }
   }
 
   // ---------------- SOCIAL SCANNER & TELEGRAM ALPHA ----------------

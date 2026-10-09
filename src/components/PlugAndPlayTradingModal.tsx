@@ -82,9 +82,9 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   const fetchSystemData = async () => {
     try {
       const [diagRes, posRes, evRes] = await Promise.all([
-        fetch('/api/diagnostics/system'),
-        fetch('/api/workstation/positions'),
-        fetch('/api/workstation/events?limit=25'),
+        authFetch('/api/diagnostics/system'),
+        authFetch('/api/workstation/positions'),
+        authFetch('/api/workstation/events?limit=25'),
       ]);
 
       if (diagRes.ok) {
@@ -336,7 +336,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
           <div className="p-2.5 rounded-lg bg-slate-900/80 border border-slate-800">
             <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-0.5">Wallet Balance</span>
             <span className="text-white font-bold text-sm">
-              {systemAudit?.walletSolBalance !== null ? `${systemAudit?.walletSolBalance} SOL` : 'Unconfirmed'}
+              {systemAudit?.walletSolBalance != null ? `${systemAudit.walletSolBalance} SOL` : 'Unconfirmed'}
             </span>
           </div>
 
@@ -368,7 +368,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
               <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-0.5">RPC Latency</span>
               <span className="text-cyan-400 font-bold text-sm flex items-center">
                 <Radio className="w-3.5 h-3.5 mr-1" />
-                {systemAudit?.rpcLatencyMs || 0} ms
+                {systemAudit?.rpcLatencyMs != null ? `${systemAudit.rpcLatencyMs} ms` : 'n/a'}
               </span>
             </div>
             <button
@@ -467,7 +467,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                   </div>
                   <div className="p-2.5 rounded-lg bg-slate-900/60 border border-slate-800 space-y-1">
                     <strong className="text-white block">3. Isolated Paper Engine:</strong>
-                    The HFT OrderBook/Avellaneda-Stoikov engine on BTC/ETH is purely simulated in-memory and isolated from real-money Solana wallet logic.
+                    The BTC/ETH engine console is a simulation and does not touch the Solana wallet. Paper snipes are modeled fills against the curve quote.
                   </div>
                   <div className="p-2.5 rounded-lg bg-slate-900/60 border border-slate-800 space-y-1">
                     <strong className="text-white block">4. Deterministic SQLite Storage:</strong>
@@ -675,7 +675,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
         <div className="p-4 border-t border-slate-800 bg-slate-950 flex flex-col sm:flex-row items-center justify-between gap-3">
           <div className="flex items-center space-x-2 text-xs text-slate-400">
             <Shield className="w-4 h-4 text-emerald-400" />
-            <span>Risk-governed execution. Jito MEV protection on all on-chain broadcasts.</span>
+            <span>Risk-governed execution. Jito bundles are used on mainnet-beta only; devnet and localnet send plain transactions.</span>
           </div>
 
           <div className="flex items-center space-x-2.5 w-full sm:w-auto">

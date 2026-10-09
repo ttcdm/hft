@@ -252,7 +252,7 @@ export const Header: React.FC<HeaderProps> = ({
           id="btn-auto-profit-ticker"
           onClick={() => handleNavClick('PLUG_AND_PLAY')}
           title="Real-Time Autonomous Profit Generator Active. Click to view live wallet positions and take profits."
-          className="hidden md:flex items-center space-x-1.5 px-2.5 py-1 rounded-lg bg-emerald-950/70 hover:bg-emerald-900/70 border border-emerald-500/40 text-[11px] font-mono text-emerald-300 transition shadow-sm shadow-emerald-500/15 group"
+          className="hidden min-[1500px]:flex items-center space-x-1.5 px-2.5 py-1 rounded-lg bg-emerald-950/70 hover:bg-emerald-900/70 border border-emerald-500/40 text-[11px] font-mono text-emerald-300 transition shadow-sm shadow-emerald-500/15 group"
         >
           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping inline-block" />
           <span className="font-bold tracking-tight text-emerald-200">
@@ -264,7 +264,7 @@ export const Header: React.FC<HeaderProps> = ({
         </button>
 
         {/* Direct Quant Tools (Expanded on 2XL screens) */}
-        <div className="hidden 2xl:flex items-center space-x-1.5">
+        <div className="hidden min-[1700px]:flex items-center space-x-1.5">
           <button
             id="btn-engine-console"
             onClick={onOpenEngineConsole}
@@ -299,7 +299,7 @@ export const Header: React.FC<HeaderProps> = ({
         </div>
 
         {/* Quant Tools Dropdown Menu (Guarantees clean layout on all screens < 1536px) */}
-        <div className="relative 2xl:hidden" ref={toolsMenuRef}>
+        <div className="relative min-[1700px]:hidden" ref={toolsMenuRef}>
           <button
             id="btn-quant-tools-dropdown"
             onClick={() => setIsToolsOpen(!isToolsOpen)}

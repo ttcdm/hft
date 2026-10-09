@@ -133,8 +133,8 @@ export class PumpFeedListener extends EventEmitter {
     const symbolBuf = Buffer.from(params.symbol, 'utf8');
     const uriBuf = Buffer.from(params.uri, 'utf8');
 
-    // 8 disc + (4+name) + (4+sym) + (4+uri) + 32 mint + 32 curve + 32 creator
-    const baseLen = 8 + 4 + nameBuf.length + 4 + symbolBuf.length + 4 + uriBuf.length + 32 + 32 + 32;
+    // IDL order: 8 disc + (4+name) + (4+sym) + (4+uri) + mint + bonding_curve + user + creator + i64 timestamp + 4 x u64 reserves
+    const baseLen = 8 + 4 + nameBuf.length + 4 + symbolBuf.length + 4 + uriBuf.length + 32 * 4 + 8 + 4 * 8;
     const buf = Buffer.alloc(baseLen);
     let offset = 0;
 
@@ -162,7 +162,23 @@ export class PumpFeedListener extends EventEmitter {
     curvePubkey.toBuffer().copy(buf, offset);
     offset += 32;
 
+    // user (signer of the create) then creator
     creatorPubkey.toBuffer().copy(buf, offset);
+    offset += 32;
+    creatorPubkey.toBuffer().copy(buf, offset);
+    offset += 32;
+
+    buf.writeBigInt64LE(BigInt(Math.floor(Date.now() / 1000)), offset);
+    offset += 8;
+    for (const v of [
+      params.virtualTokenReserves ?? 1_073_000_000_000_000n,
+      params.virtualSolReserves ?? 30_000_000_000n,
+      params.realTokenReserves ?? 793_100_000_000_000n,
+      params.tokenTotalSupply ?? 1_000_000_000_000_000n,
+    ]) {
+      buf.writeBigUInt64LE(v, offset);
+      offset += 8;
+    }
 
     return `Program data: ${buf.toString('base64')}`;
   }
@@ -280,7 +296,7 @@ export class PumpFeedListener extends EventEmitter {
         const b64Data = log.slice('Program data: '.length).trim();
         try {
           const buf = Buffer.from(b64Data, 'base64');
-          if (buf.length >= 116) {
+          if (buf.length >= 8 + 12 + 4 * 32 + 8 + 32) {
             // Verify Anchor discriminator
             const disc = buf.subarray(0, 8);
             if (disc.equals(PUMP_CREATE_EVENT_DISCRIMINATOR)) {
@@ -320,34 +336,24 @@ export class PumpFeedListener extends EventEmitter {
               const bondingCurvePubkey = new PublicKey(buf.subarray(offset, offset + 32));
               offset += 32;
 
-              // Read user/creator (32 bytes)
-              if (offset + 32 > buf.length) continue;
+              // IDL (pump-sdk 1.37) order after the strings: mint, bonding_curve, user, creator, timestamp(i64), then
+              // virtual_token_reserves, virtual_sol_reserves, real_token_reserves, token_total_supply (u64 each).
+              // The reserves are read, never assumed: an event too short to carry them is skipped, not filled with canonical numbers.
+              if (offset + 32 + 32 + 8 + 4 * 8 > buf.length) continue;
+              offset += 32; // user (the signer of the create; the token creator is the next field)
               const creatorPubkey = new PublicKey(buf.subarray(offset, offset + 32));
               offset += 32;
-
-              // Canonical initial reserves for Pump.fun V2 bonding curves
-              let virtualTokenReserves = 1_073_000_000_000_000n;
-              let virtualSolReserves = 30_000_000_000n;
-              let realTokenReserves = 793_100_000_000_000n;
-              const realSolReserves = 0n;
-              let tokenTotalSupply = 1_000_000_000_000_000n;
-
-              if (offset + 8 <= buf.length) {
-                virtualTokenReserves = buf.readBigUInt64LE(offset);
-                offset += 8;
-              }
-              if (offset + 8 <= buf.length) {
-                virtualSolReserves = buf.readBigUInt64LE(offset);
-                offset += 8;
-              }
-              if (offset + 8 <= buf.length) {
-                realTokenReserves = buf.readBigUInt64LE(offset);
-                offset += 8;
-              }
-              if (offset + 8 <= buf.length) {
-                tokenTotalSupply = buf.readBigUInt64LE(offset);
-                offset += 8;
-              }
+              offset += 8; // timestamp
+              const virtualTokenReserves = buf.readBigUInt64LE(offset);
+              offset += 8;
+              const virtualSolReserves = buf.readBigUInt64LE(offset);
+              offset += 8;
+              const realTokenReserves = buf.readBigUInt64LE(offset);
+              offset += 8;
+              const tokenTotalSupply = buf.readBigUInt64LE(offset);
+              offset += 8;
+              const realSolReserves = 0n; // a fresh curve holds no SOL; not part of the event
+              if (virtualTokenReserves === 0n) continue;
 
               const initialPriceSol = Number(virtualSolReserves) / Number(virtualTokenReserves) / 1000;
               const initialMarketCapSol = (Number(tokenTotalSupply) / 1e6) * initialPriceSol;

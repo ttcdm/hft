@@ -137,9 +137,12 @@ async function main() {
     const tx = new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }), ix);
     tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
     tx.feePayer = creator.publicKey;
-    await send(tx, [creator, mint]);
+    const sig = await send(tx, [creator, mint]);
+    const t = await conn.getTransaction(sig, { maxSupportedTransactionVersion: 0 });
+    lastCreate = { signature: sig, logs: t?.meta?.logMessages ?? [], mint: mint.publicKey };
     return mint.publicKey;
   }
+  let lastCreate: { signature: string; logs: string[]; mint: PublicKey } | undefined;
   async function marketBuy(kp: Keypair, mint: PublicKey, sol: number) {
     const state = (await PumpCurveService.fetchPumpMarketState({ connection: conn, mint, executionMode: 'LIVE' }))!;
     const q = PumpCurveService.calculateBuyQuote({ state, amountSol: sol, slippageBps: 2000, jitoTipSol: 0, priorityFeeLamports: 0, executionMode: 'LIVE' } as any);
@@ -193,6 +196,21 @@ async function main() {
   try {
     mint = await createCoin();
     rec('seed: create_v2', true, `mint ${mint.toBase58()} created by the real pump program`);
+    {
+      // L5: the pump feed decoder must agree with the program's own account for a REAL create_v2 event log.
+      const { PumpFeedListener } = await import('../../server/solana/pumpFeedListener');
+      const l = new PumpFeedListener();
+      const ev = l.parseLogs({ err: null, signature: lastCreate!.signature, logs: lastCreate!.logs } as any, { slot: 1 });
+      l.destroy();
+      const st = await PumpCurveService.fetchPumpMarketState({ connection: conn, mint, executionMode: 'LIVE' });
+      const same = !!ev && !!st && ev.mint === mint.toBase58() && ev.creator === creator.publicKey.toBase58() &&
+        ev.virtualTokenReserves === st.virtualTokenReserves && ev.virtualSolReserves === st.virtualSolReserves &&
+        ev.realTokenReserves === st.realTokenReserves && ev.tokenTotalSupply === st.tokenTotalSupply;
+      rec('pump feed decodes the real create_v2 log like the on-chain curve', same, ev ? `vTok ${ev.virtualTokenReserves} vSol ${ev.virtualSolReserves} real ${ev.realTokenReserves} vs chain ${st?.virtualTokenReserves}/${st?.virtualSolReserves}/${st?.realTokenReserves}` : 'parseLogs returned null');
+      if (process.env.LOCALNET_DUMP_CREATE_LOG) {
+        fs.writeFileSync(process.env.LOCALNET_DUMP_CREATE_LOG, JSON.stringify({ signature: lastCreate!.signature, mint: mint.toBase58(), creator: creator.publicKey.toBase58(), logs: lastCreate!.logs, chain: { virtualTokenReserves: String(st?.virtualTokenReserves), virtualSolReserves: String(st?.virtualSolReserves), realTokenReserves: String(st?.realTokenReserves), tokenTotalSupply: String(st?.tokenTotalSupply) } }, null, 1));
+      }
+    }
     await marketBuy(creator, mint, 0.2);
     for (let i = 0; i < 14; i++) {
       const w = Keypair.generate();

@@ -269,7 +269,7 @@ describe('Tier 1: Feature Coverage (Features 16 - 20)', () => {
         mint: '55555555555555555555555555555555',
         symbol: 'SOCIAL',
         name: 'Social Callout',
-        amountSol: 0.02,
+        amountSol: 0.005,
         jitoTipSol: 0.0005,
         source: 'HOT_CALLOUT',
         provenance: 'REAL_SOCIAL',

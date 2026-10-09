@@ -22,6 +22,10 @@ export interface AuthoritativeExecutionConfig {
   rpcFallbackTimeoutMs: number;
   bundleConfirmTimeoutMs: number;
   jitoProbeIntervalMs: number;
+  /** Paper bankroll used for sizing when no real wallet balance is known (C5). Default 0.07 SOL (~$10). */
+  paperBankrollSol: number;
+  /** PAPER_STRICT_GATES=1: paper trades reject on unverified (UNKNOWN) safety checks exactly like LIVE (C5). */
+  paperStrictGates: boolean;
 }
 
 /**
@@ -88,6 +92,8 @@ class ExecutionConfigManager {
       rpcFallbackTimeoutMs: parseInt(process.env.RPC_FALLBACK_TIMEOUT_MS || '15000', 10) || 15000,
       bundleConfirmTimeoutMs: parseInt(process.env.BUNDLE_CONFIRM_TIMEOUT_MS || '15000', 10) || 15000,
       jitoProbeIntervalMs: parseInt(process.env.JITO_PROBE_INTERVAL_MS || '15000', 10) || 15000,
+      paperBankrollSol: (() => { const v = parseFloat(process.env.PAPER_BANKROLL_SOL || ''); return Number.isFinite(v) && v > 0 ? v : 0.07; })(),
+      paperStrictGates: process.env.PAPER_STRICT_GATES === '1' || process.env.PAPER_STRICT_GATES === 'true',
     };
   }
 

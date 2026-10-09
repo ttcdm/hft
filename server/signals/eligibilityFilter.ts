@@ -193,17 +193,25 @@ export class EligibilityFilter {
 
     // 6. Minimum Liquidity Depth
     const MIN_LIQUIDITY_USD = 2000;
-    const liqPassed = token.liquidityUsd >= MIN_LIQUIDITY_USD;
+    // C5: a missing liquidity figure is UNKNOWN (LIVE rejects it, PAPER lets it through and records it), not "$NaN < min".
+    const hasLiq = typeof token.liquidityUsd === 'number' && Number.isFinite(token.liquidityUsd);
+    const liqStatus: TriState = !hasLiq ? 'UNKNOWN' : token.liquidityUsd >= MIN_LIQUIDITY_USD ? 'PASS' : 'FAIL';
+    const liqPassed = liqStatus === 'PASS' ? true : liqStatus === 'FAIL' ? false : !isLiveMode;
     checks.push({
       ruleId: 'MIN_LIQUIDITY_DEPTH',
       ruleName: 'Minimum Liquidity Depth',
       passed: liqPassed,
-      status: liqPassed ? 'PASS' : 'FAIL',
-      observedValue: `$${Math.round(token.liquidityUsd).toLocaleString()}`,
+      status: liqStatus,
+      observedValue: hasLiq ? `$${Math.round(token.liquidityUsd).toLocaleString()}` : 'Unknown',
       threshold: `> $${MIN_LIQUIDITY_USD}`,
-      reason: liqPassed
-        ? `Liquidity ($${Math.round(token.liquidityUsd)}) supports low slippage execution.`
-        : `Liquidity ($${Math.round(token.liquidityUsd)}) is below minimum safe execution threshold.`,
+      reason:
+        liqStatus === 'PASS'
+          ? `Liquidity ($${Math.round(token.liquidityUsd)}) supports low slippage execution.`
+          : liqStatus === 'FAIL'
+          ? `Liquidity ($${Math.round(token.liquidityUsd)}) is below minimum safe execution threshold.`
+          : isLiveMode
+          ? 'Liquidity is unknown. Fail-closed rejection on live trading.'
+          : 'Liquidity unverified in simulated execution.',
       source: 'PUMPFUN',
       timestamp: now,
     });

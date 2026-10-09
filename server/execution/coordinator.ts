@@ -65,6 +65,8 @@ export interface ExecutionResponse {
   executionMode: ExecutionMode;
   feesPaidLamports?: number;
   error?: string;
+  /** Which gates a PAPER fill passed (C5). */
+  gates?: Record<string, unknown>;
   correlationId: string;
 }
 
@@ -1185,6 +1187,142 @@ export class ExecutionCoordinator {
     };
   }
 
+  /** Shared by LIVE and PAPER (C5): the same on-chain facts become the same eligibility inputs. */
+  private eligibilityInputFromMarket(
+    req: ExecuteTradeRequest,
+    marketState: any,
+    holderDist: { devHoldingPct: number; top10HoldersPct: number } | null,
+    liquidityUsd: number | undefined
+  ) {
+    return {
+      mint: req.mint,
+      symbol: req.symbol,
+      name: req.name,
+      creator: marketState.creator.toBase58(),
+      priceSol:
+        Number(marketState.virtualSolReserves) /
+        Number(marketState.virtualTokenReserves) /
+        (1e9 / Math.pow(10, marketState.tokenDecimals)),
+      liquidityUsd,
+      bondingCurveProgress: Number(
+        Math.min(100, (Number(marketState.realSolReserves) / (85 * 1e9)) * 100).toFixed(1)
+      ),
+      isMigrated: marketState.complete,
+      isMintAuthorityRevoked: marketState.isMintAuthorityRevoked,
+      isFreezeAuthorityRevoked: marketState.isFreezeAuthorityRevoked,
+      hasToken2022Extensions: marketState.baseTokenProgram?.equals(TOKEN_2022_PROGRAM_ID) ?? false,
+      // Pass the extension inspection result through. LIVE already refuses unsafe mints in fetchPumpMarketState,
+      // so a Token-2022 mint that reaches here with a report is explicitly safe; without this it was UNKNOWN and rejected.
+      token2022Safe: marketState.token2022Report ? marketState.token2022Report.isSafe : undefined,
+      unsupportedToken2022Extension:
+        marketState.token2022Report && !marketState.token2022Report.isSafe
+          ? marketState.token2022Report.unsupportedExtensionNames.join(',') || true
+          : undefined,
+      devHoldingPct: holderDist ? holderDist.devHoldingPct : null,
+      top10HoldersPct: holderDist ? holderDist.top10HoldersPct : null,
+    };
+  }
+
+  /**
+   * The single eligibility verdict used by BOTH modes (C5), so the same report gives the same accept/reject.
+   * Strict (LIVE, or PAPER with PAPER_STRICT_GATES=1) also rejects holder checks that are unverified;
+   * non-strict PAPER lets UNKNOWN pass but the caller records it as unverified on the fill.
+   */
+  private eligibilityVerdict(
+    eligibility: TokenEligibilityReport,
+    now: number,
+    mode: ExecutionMode,
+    correlationId: string,
+    strict: boolean = mode === 'LIVE'
+  ): ExecutionResponse | null {
+    const reject = (error: string): ExecutionResponse => ({
+      success: false,
+      lifecycleState: 'FILTER_REJECTED',
+      executionMode: mode,
+      error,
+      correlationId,
+    });
+    if (now - eligibility.evaluatedAt > 60000) {
+      return reject(`ELIGIBILITY_REPORT_STALE: Eligibility report evaluated ${Math.round((now - eligibility.evaluatedAt) / 1000)}s ago exceeds 60s max age for live trading.`);
+    }
+
+    const unsupportedExtensionCheck = eligibility.checks.find(
+      (c) => c.ruleId === 'TOKEN_2022_POLICY' && !c.passed
+    );
+    if (unsupportedExtensionCheck) {
+      return reject(`UNSUPPORTED_TOKEN_EXTENSION: ${unsupportedExtensionCheck.reason}`);
+    }
+
+    if (!eligibility.isEligible) {
+      const failReasons = eligibility.checks.filter((c) => !c.passed).map((c) => c.reason).join('; ');
+      return reject(`ELIGIBILITY_CHECK_FAILED: Token failed ${eligibility.failedCount} safety check(s): ${failReasons}`);
+    }
+
+    const hasUnverifiedHolders = eligibility.checks.some(
+      (c) =>
+        (c.ruleId === 'MAX_CREATOR_EXPOSURE' || c.ruleId === 'TOP_10_CONCENTRATION') &&
+        (!c.passed || String(c.observedValue).toLowerCase().includes('unknown') || String(c.observedValue).toLowerCase().includes('unverified'))
+    );
+    if (strict && hasUnverifiedHolders) {
+      return reject('SAFETY_CHECK_UNVERIFIED: Dev holding or top 10 holders distribution is unverified. Live trade rejected.');
+    }
+
+    return null;
+  }
+
+  /**
+   * C5: PAPER runs the same eligibility gate as LIVE. With a report supplied it is used as-is; otherwise the on-chain
+   * facts are read (best effort, 4s cap) and evaluated. Facts that cannot be read stay UNKNOWN: strict mode
+   * (PAPER_STRICT_GATES=1) rejects them like LIVE, default mode lets them through but records them as unverified.
+   */
+  private async runPaperEligibility(req: ExecuteTradeRequest, quotePriceSol: number, now: number, correlationId: string) {
+    const strict = executionConfig.getConfig().paperStrictGates;
+    let eligibility = req.eligibilityReport;
+    const needsFacts = !eligibility || eligibility.checks.some(
+      (c) => (c.ruleId === 'TOP_10_CONCENTRATION' || c.ruleId === 'MAX_CREATOR_EXPOSURE') && c.status === 'UNKNOWN'
+    );
+    if (needsFacts) {
+      const within = <T>(p: Promise<T>) =>
+        Promise.race([p, new Promise<never>((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000))]);
+      let marketState: any = null;
+      let holderDist: { devHoldingPct: number; top10HoldersPct: number } | null = null;
+      try {
+        const mintPk = new PublicKey(req.mint);
+        marketState = await within(
+          PumpCurveService.fetchPumpMarketState({ connection: this.connection, mint: mintPk, executionMode: 'PAPER' })
+        );
+        if (marketState) {
+          holderDist = await within(
+            fetchTokenHolderDistribution(this.connection, mintPk, marketState.creator, marketState.bondingCurve)
+          );
+        }
+      } catch (err: any) {
+        Logger.debug(`[C5] Paper gate could not read on-chain facts for ${req.mint}: ${err.message}`);
+      }
+      const solUsd = solPriceService.lastKnownPrice();
+      if (marketState) {
+        const liquidityUsd = solUsd !== null ? (Number(marketState.realSolReserves) / 1e9) * solUsd * 2 : req.liquidityUsd;
+        eligibility = EligibilityFilter.evaluate(this.eligibilityInputFromMarket(req, marketState, holderDist, liquidityUsd), strict);
+      } else if (!eligibility) {
+        eligibility = EligibilityFilter.evaluate(
+          { mint: req.mint, symbol: req.symbol, name: req.name, priceSol: quotePriceSol, liquidityUsd: req.liquidityUsd },
+          strict
+        );
+      }
+    }
+    const verdict = this.eligibilityVerdict(eligibility!, now, 'PAPER', correlationId, strict);
+    const checks = eligibility!.checks;
+    const gates = {
+      strict,
+      eligibility: {
+        passed: checks.filter((c) => c.status === 'PASS' || (c.status === undefined && c.passed)).map((c) => c.ruleId),
+        failed: checks.filter((c) => c.status === 'FAIL' || (c.status === undefined && !c.passed)).map((c) => c.ruleId),
+        unverified: checks.filter((c) => c.status === 'UNKNOWN').map((c) => c.ruleId),
+      },
+    };
+    return { verdict, gates };
+  }
+
   // Authoritative Central Execution Entrypoint
   public async executeTrade(req: ExecuteTradeRequest): Promise<ExecutionResponse> {
     const correlationId = `exec-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
@@ -1261,6 +1399,15 @@ export class ExecutionCoordinator {
         };
       }
 
+      const paperEligibility = await this.runPaperEligibility(req, quotePriceSol, now, correlationId);
+      if (paperEligibility.verdict) {
+        workstationDb.logJournal('TRADE_FILTER_REJECTED', correlationId, 'PAPER', {
+          reason: paperEligibility.verdict.error,
+          gates: paperEligibility.gates,
+        });
+        return paperEligibility.verdict;
+      }
+
       // Resolve dynamic tip for paper mode to respect economic sanity bounds
       const paperTip = executionConfig.resolveDynamicJitoTip({
         tradeAmountSol: req.amountSol,
@@ -1268,9 +1415,12 @@ export class ExecutionCoordinator {
       });
 
       // Pre-trade capital sizing check: ensure order does not exceed 10% of spendable bankroll (B12)
-      const paperSpendable = this.realWalletBalanceSol !== null
-        ? CapitalSizer.calculateSpendableBankroll(this.realWalletBalanceSol, 0.015, this.inFlightReservedSol)
-        : 1.0;
+      // C5: the configured paper bankroll (default 0.07 SOL), never an invented 1.0
+      const paperSpendable = CapitalSizer.calculateSpendableBankroll(
+        this.realWalletBalanceSol !== null ? this.realWalletBalanceSol : executionConfig.getConfig().paperBankrollSol,
+        0.015,
+        this.inFlightReservedSol
+      );
       const maxPaperOrderSol = Number((paperSpendable * 0.10).toFixed(6));
       if (paperSpendable > 0 && req.amountSol > maxPaperOrderSol + 0.000001) {
         return {
@@ -1295,7 +1445,7 @@ export class ExecutionCoordinator {
         marketDataTimestamp: req.marketDataTimestamp || now,
         currentOpenPositionsCount: openPositions.length,
         currentTotalExposureSol: totalExposureSol,
-        walletSpendableSol: 1.0,
+        walletSpendableSol: paperSpendable,
         executionMode: 'PAPER',
       });
 
@@ -1336,8 +1486,16 @@ export class ExecutionCoordinator {
 
       riskEngine.recordTradeSuccess(req.mint);
 
+      const gates = {
+        ...paperEligibility.gates,
+        capitalCeiling: { maxOrderSol: maxPaperOrderSol, orderSol: req.amountSol, passed: true },
+        risk: { approved: true, tipLamports: paperTip.tipLamports, tipPolicy: paperTip.policyReason },
+      };
+      workstationDb.logJournal('PAPER_FILL_GATES', correlationId, 'PAPER', { mint: req.mint, orderId: paperRes.paperOrderId, gates });
+
       return {
         success: true,
+        gates,
         lifecycleState: 'CONFIRMED',
         positionId: paperRes.paperOrderId,
         txSignature: paperRes.paperOrderId,
@@ -1445,85 +1603,13 @@ export class ExecutionCoordinator {
       }
 
       eligibility = EligibilityFilter.evaluate(
-        {
-          mint: req.mint,
-          symbol: req.symbol,
-          name: req.name,
-          creator: marketState.creator.toBase58(),
-          priceSol:
-            Number(marketState.virtualSolReserves) /
-            Number(marketState.virtualTokenReserves) /
-            (1e9 / Math.pow(10, marketState.tokenDecimals)),
-          liquidityUsd: (Number(marketState.realSolReserves) / 1e9) * liveSolUsd * 2,
-          bondingCurveProgress: Number(
-            Math.min(100, (Number(marketState.realSolReserves) / (85 * 1e9)) * 100).toFixed(1)
-          ),
-          isMigrated: marketState.complete,
-          isMintAuthorityRevoked: marketState.isMintAuthorityRevoked,
-          isFreezeAuthorityRevoked: marketState.isFreezeAuthorityRevoked,
-          hasToken2022Extensions: marketState.baseTokenProgram?.equals(TOKEN_2022_PROGRAM_ID) ?? false,
-          // Pass the extension inspection result through. LIVE already refuses unsafe mints in fetchPumpMarketState,
-          // so a Token-2022 mint that reaches here with a report is explicitly safe; without this it was UNKNOWN and rejected.
-          token2022Safe: marketState.token2022Report ? marketState.token2022Report.isSafe : undefined,
-          unsupportedToken2022Extension:
-            marketState.token2022Report && !marketState.token2022Report.isSafe
-              ? marketState.token2022Report.unsupportedExtensionNames.join(',') || true
-              : undefined,
-          devHoldingPct: holderDist ? holderDist.devHoldingPct : null,
-          top10HoldersPct: holderDist ? holderDist.top10HoldersPct : null,
-        },
+        this.eligibilityInputFromMarket(req, marketState, holderDist, (Number(marketState.realSolReserves) / 1e9) * liveSolUsd * 2),
         true
       );
     }
 
-    if (now - eligibility.evaluatedAt > 60000) {
-      return {
-        success: false,
-        lifecycleState: 'FILTER_REJECTED',
-        executionMode: 'LIVE',
-        error: `ELIGIBILITY_REPORT_STALE: Eligibility report evaluated ${Math.round((now - eligibility.evaluatedAt) / 1000)}s ago exceeds 60s max age for live trading.`,
-        correlationId,
-      };
-    }
-
-    const unsupportedExtensionCheck = eligibility.checks.find(
-      (c) => c.ruleId === 'TOKEN_2022_POLICY' && !c.passed
-    );
-    if (unsupportedExtensionCheck) {
-      return {
-        success: false,
-        lifecycleState: 'FILTER_REJECTED',
-        executionMode: 'LIVE',
-        error: `UNSUPPORTED_TOKEN_EXTENSION: ${unsupportedExtensionCheck.reason}`,
-        correlationId,
-      };
-    }
-
-    if (!eligibility.isEligible) {
-      const failReasons = eligibility.checks.filter((c) => !c.passed).map((c) => c.reason).join('; ');
-      return {
-        success: false,
-        lifecycleState: 'FILTER_REJECTED',
-        executionMode: 'LIVE',
-        error: `ELIGIBILITY_CHECK_FAILED: Token failed ${eligibility.failedCount} safety check(s): ${failReasons}`,
-        correlationId,
-      };
-    }
-
-    const hasUnverifiedHolders = eligibility.checks.some(
-      (c) =>
-        (c.ruleId === 'MAX_CREATOR_EXPOSURE' || c.ruleId === 'TOP_10_CONCENTRATION') &&
-        (!c.passed || String(c.observedValue).toLowerCase().includes('unknown') || String(c.observedValue).toLowerCase().includes('unverified'))
-    );
-    if (hasUnverifiedHolders) {
-      return {
-        success: false,
-        lifecycleState: 'FILTER_REJECTED',
-        executionMode: 'LIVE',
-        error: 'SAFETY_CHECK_UNVERIFIED: Dev holding or top 10 holders distribution is unverified. Live trade rejected.',
-        correlationId,
-      };
-    }
+    const verdict = this.eligibilityVerdict(eligibility, now, 'LIVE', correlationId);
+    if (verdict) return verdict;
 
     // 3. Pre-Trade Capital Sizing (B12): spendable bankroll and 10% ceiling check
     const rawWalletBalance = this.realWalletBalanceSol ?? 0;

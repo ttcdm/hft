@@ -75,6 +75,8 @@ Key environment variables:
 - `SOLANA_RPC_URL`: Solana JSON-RPC node URL (e.g. Helius, QuickNode, Triton, or Solana mainnet)
 - `JITO_BLOCK_ENGINE_URL`: Jito MEV Block Engine endpoint for private bundle routing (e.g. `https://mainnet.block-engine.jito.wtf`)
 - `DEFAULT_JITO_TIP_SOL`: Base validator tip in SOL included with bundles (optional floor of the tip policy, default `0.00018`; explicit tips are bounded by `MIN_JITO_TIP_SOL`/`MAX_JITO_TIP_SOL` and capped at 15% of trade notional)
+- `PAPER_BANKROLL_SOL`: Paper-mode bankroll used for sizing when no real balance is known (default `0.07`)
+- `PAPER_STRICT_GATES`: `1` makes paper trades reject unverified safety checks exactly like LIVE (default off: unverified checks pass in paper but are recorded on the fill)
 - `CAPITAL_TIER`: `MICRO_10` (0.07 SOL / $10 risk-capped bankroll) or `INSTITUTIONAL` (3,500 SOL)
 - `OPERATOR_AUTH_TOKEN`: Operator API token (min 16 characters; generate with `openssl rand -hex 32`). If unset, a volatile token is generated and printed at startup. Never commit it.
 - `GEMINI_API_KEY`: Optional API key for AI Quant Diagnostics

@@ -24,7 +24,14 @@ import { executionCoordinator } from './server/execution/coordinator';
 import { localSigner } from './server/solana/signer';
 import { riskEngine } from './server/risk/riskEngine';
 import { workstationDb } from './server/db/database';
-import { authManager, requireOperatorAuth, isAllowedClientOrigin } from './server/middleware/auth';
+import {
+  authManager,
+  requireOperatorAuth,
+  apiAuthGate,
+  resolveBindHost,
+  isAllowedClientOrigin,
+  isAllowedWsConnection,
+} from './server/middleware/auth';
 export { isAllowedClientOrigin };
 import {
   Logger,
@@ -46,7 +53,11 @@ const PORT = parseInt(
   process.env.APP_PORT || (process.env.PORT && process.env.PORT !== '8080' ? process.env.PORT : '3000'),
   10
 );
-const BIND_HOST = process.env.BIND_HOST || '0.0.0.0';
+const bindResolution = resolveBindHost();
+const BIND_HOST = bindResolution.host;
+if (bindResolution.warning) {
+  Logger.warn(bindResolution.warning);
+}
 const server = http.createServer(app);
 
 // WebSocket Server for High-Performance Engine Telemetry & Orders
@@ -95,7 +106,7 @@ wss.on('connection', (ws: WebSocket, req: any) => {
   // Origin verification for WebSocket connections (strict matching, no broad wildcards)
   const origin = (req?.headers?.origin || '') as string;
   const host = (req?.headers?.host || '') as string;
-  if (origin && !isAllowedClientOrigin(origin, host)) {
+  if (!isAllowedWsConnection(origin, host, req?.socket?.remoteAddress)) {
     ws.close(4003, 'Unauthorized WebSocket Origin');
     return;
   }
@@ -317,6 +328,8 @@ app.use(cors(corsPolicy));
 app.use(express.json());
 app.get('/favicon.ico', (req, res) => res.status(204).end());
 app.use('/api', rateLimiter({ maxTokens: 120, refillRatePerSec: 30 }));
+// A1: deny-by-default. Only GET /api/health and POST /api/auth/login are reachable without an operator token.
+app.use(apiAuthGate);
 
 // ============================================================================
 // OPERATOR AUTHENTICATION & SESSION MANAGEMENT
@@ -355,17 +368,6 @@ app.get('/api/auth/session', (req, res) => {
       success: true,
       token: provided,
       role: 'OPERATOR',
-    });
-  }
-
-  // Seamless Plug & Play: In development, sandbox, or when no explicit secret token is forced
-  if (process.env.NODE_ENV !== 'production' || !process.env.OPERATOR_AUTH_TOKEN) {
-    const defaultToken = authManager.getPrimaryToken();
-    return res.json({
-      success: true,
-      token: defaultToken,
-      role: 'OPERATOR',
-      isAutoProvisioned: true,
     });
   }
 
@@ -1878,8 +1880,13 @@ app.get('/api/signer/status', (req, res) => {
 // Local wallet generation helper (imports must be done via CLI: npm run signer:import)
 app.post('/api/signer/generate', requireOperatorAuth, (req, res) => {
   try {
-    const forceOverwrite = Boolean(req.body?.forceOverwrite);
-    const pubkey = localSigner.generateNewKeypair(forceOverwrite);
+    if (req.body?.forceOverwrite) {
+      return res.status(403).json({
+        success: false,
+        error: 'Overwriting an existing keypair over HTTP is disabled. Back it up and replace it with: npm run signer:import',
+      });
+    }
+    const pubkey = localSigner.generateNewKeypair(false);
     res.json({
       success: true,
       publicKey: pubkey,

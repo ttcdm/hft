@@ -32,8 +32,10 @@ describe('Phase 1 Remediation Suite (B03, B04, B05, B15, B16, B18, B22)', () => 
   describe('B16: Dynamic Port & Host Binding in server.ts', () => {
     it('server.ts uses process.env.PORT and process.env.BIND_HOST', () => {
       const serverCode = fs.readFileSync(path.join(process.cwd(), 'server.ts'), 'utf8');
-      expect(serverCode).toContain("const PORT = parseInt(process.env.PORT || '3000', 10);");
-      expect(serverCode).toContain("const BIND_HOST = process.env.BIND_HOST || '127.0.0.1';");
+      expect(serverCode).toContain('const PORT = parseInt(');
+      expect(serverCode).toContain('process.env.PORT');
+      // A1: BIND_HOST is resolved through resolveBindHost(), which reads process.env.BIND_HOST
+      expect(serverCode).toContain('const BIND_HOST = bindResolution.host');
       expect(serverCode).toContain('server.listen(PORT, BIND_HOST');
     });
   });

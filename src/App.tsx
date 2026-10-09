@@ -288,6 +288,16 @@ export default function App() {
     checkAuthStatus();
   }, []);
 
+  // A1: the server never auto-issues tokens, so a 401 from any call re-opens the token prompt
+  useEffect(() => {
+    const onAuthRequired = () => {
+      setIsOperatorAuthenticated(false);
+      setIsAuthModalOpen(true);
+    };
+    window.addEventListener('apex:auth-required', onAuthRequired);
+    return () => window.removeEventListener('apex:auth-required', onAuthRequired);
+  }, []);
+
   const handleAuthenticated = (token: string) => {
     setIsOperatorAuthenticated(true);
     setIsAuthModalOpen(false);

@@ -256,6 +256,31 @@ describe('S1: Telegram / social integrations', () => {
     });
   });
 
+  describe('Telegram config never leaks the bot token', () => {
+    it('redacts the token, reports only whether one is set, and ignores unknown or mistyped keys', () => {
+      const s = new SocialAlphaScanner();
+      s.updateTelegramConfig({ botToken: '  123456:SECRET-TOKEN ', chatId: 42 as any, rogue: 'x', snipeThresholdScore: 9999 } as any);
+      const red = s.getTelegramConfigRedacted();
+      expect(JSON.stringify(red)).not.toContain('SECRET-TOKEN');
+      expect(red.botTokenSet).toBe(true);
+      expect(s.getTelegramConfig().botToken).toBe('123456:SECRET-TOKEN');
+      expect((s.getTelegramConfig() as any).rogue).toBeUndefined();
+      expect(s.getTelegramConfig().chatId).not.toBe(42);
+      expect(s.getTelegramConfig().snipeThresholdScore).toBe(100);
+    });
+
+    it('the config routes answer from the redacted view and the auth gate denies them without a token', async () => {
+      const { isPublicApiRoute } = await import('../server/middleware/auth');
+      const fs = await import('fs');
+      const src = fs.readFileSync('server.ts', 'utf8');
+      expect(src).not.toMatch(/config: socialScanner\.getTelegramConfig\(\)/);
+      expect(src.match(/getTelegramConfigRedacted\(\)/g)).toHaveLength(2);
+      for (const [m, p] of [['GET', '/api/telegram/config'], ['POST', '/api/telegram/config'], ['GET', '/api/connectivity/diagnostics']]) {
+        expect(isPublicApiRoute(m, p), `${m} ${p}`).toBe(false);
+      }
+    });
+  });
+
   describe('route wiring (static)', () => {
     it('the Telegram webhook, config and test routes require operator auth', async () => {
       const fs = await import('fs');

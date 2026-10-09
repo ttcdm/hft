@@ -1223,15 +1223,15 @@ app.post('/api/social/signals/snipe', requireOperatorAuth, validateTradeBody(Sig
 app.get('/api/telegram/config', (req, res) => {
   res.json({
     status: 'OK',
-    config: socialScanner.getTelegramConfig(),
+    config: socialScanner.getTelegramConfigRedacted(),
   });
 });
 
 app.post('/api/telegram/config', requireOperatorAuth, (req, res) => {
-  const updated = socialScanner.updateTelegramConfig(req.body);
+  socialScanner.updateTelegramConfig(req.body);
   res.json({
     status: 'OK',
-    config: updated,
+    config: socialScanner.getTelegramConfigRedacted(),
   });
 });
 

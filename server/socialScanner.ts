@@ -224,8 +224,23 @@ export class SocialAlphaScanner {
   }
 
   public updateTelegramConfig(cfg: Partial<TelegramBotConfig>): TelegramBotConfig {
-    this.telegramConfig = { ...this.telegramConfig, ...cfg };
+    // S1: only known keys with the right types are accepted (no mass assignment from the request body).
+    const next: Partial<TelegramBotConfig> = {};
+    if (typeof cfg?.botToken === 'string') next.botToken = cfg.botToken.trim();
+    if (typeof cfg?.chatId === 'string') next.chatId = cfg.chatId.trim();
+    if (typeof cfg?.webhookActive === 'boolean') next.webhookActive = cfg.webhookActive;
+    if (typeof cfg?.autoForwardAlerts === 'boolean') next.autoForwardAlerts = cfg.autoForwardAlerts;
+    if (typeof cfg?.snipeThresholdScore === 'number' && Number.isFinite(cfg.snipeThresholdScore)) {
+      next.snipeThresholdScore = Math.min(100, Math.max(0, cfg.snipeThresholdScore));
+    }
+    this.telegramConfig = { ...this.telegramConfig, ...next };
     return this.telegramConfig;
+  }
+
+  /** Config safe to return over HTTP: the bot token is never included, only whether one is set. */
+  public getTelegramConfigRedacted(): Omit<TelegramBotConfig, 'botToken'> & { botToken: ''; botTokenSet: boolean } {
+    const { botToken, ...rest } = this.telegramConfig;
+    return { ...rest, botToken: '', botTokenSet: !!botToken };
   }
 
   public markSniped(signalId: string): SocialSignal | undefined {

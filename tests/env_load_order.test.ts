@@ -50,3 +50,46 @@ describe('.env is loaded before import-time singletons (signer, config, db, coor
     }
   }, 60_000);
 });
+
+describe('K1: tests never read the repo .env (hermetic under vitest)', () => {
+  /** Run a bundle that imports loadEnv in a temp cwd containing a planted .env, with or without VITEST set. */
+  async function readVar(dir: string, name: string, vitest: boolean): Promise<string> {
+    const entry = path.join(dir, 'k1.ts');
+    fs.writeFileSync(entry, `import '${path.join(ROOT, 'server/loadEnv')}';\nconsole.log('VALUE=' + (process.env.${name} ?? 'UNSET'));\n`);
+    const out = path.join(dir, 'k1.cjs');
+    await build({ entryPoints: [entry], bundle: true, platform: 'node', format: 'cjs', packages: 'external', outfile: out, logLevel: 'silent', absWorkingDir: ROOT });
+    const env: Record<string, string> = { PATH: process.env.PATH ?? '', NODE_PATH: path.join(ROOT, 'node_modules') };
+    if (vitest) env.VITEST = 'true';
+    const text = execFileSync(process.execPath, [out], { cwd: dir, env, encoding: 'utf8' });
+    return text.split('\n').find((l) => l.startsWith('VALUE='))!.slice(6);
+  }
+
+  it('a planted .env with SOLANA_RPC_URL is invisible under VITEST, and visible without it (control)', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'k1-'));
+    try {
+      fs.writeFileSync(path.join(dir, '.env'), 'SOLANA_RPC_URL=https://example.invalid\n');
+      expect(await readVar(dir, 'SOLANA_RPC_URL', false)).toBe('https://example.invalid');
+      expect(await readVar(dir, 'SOLANA_RPC_URL', true)).toBe('UNSET');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('under VITEST a .env.test file is read instead', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'k1b-'));
+    try {
+      fs.writeFileSync(path.join(dir, '.env'), 'K1_VAR=from-dot-env\n');
+      fs.writeFileSync(path.join(dir, '.env.test'), 'K1_VAR=from-dot-env-test\n');
+      expect(await readVar(dir, 'K1_VAR', true)).toBe('from-dot-env-test');
+      expect(await readVar(dir, 'K1_VAR', false)).toBe('from-dot-env');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('this vitest process did not load the repo .env even if one exists next to package.json', () => {
+    // vitest.config.ts forces these; a loaded real .env would override or add to them
+    expect(process.env.VITEST).toBeTruthy();
+    expect(process.env.ALLOWED_CLUSTER).toBe('devnet');
+  });
+});

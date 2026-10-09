@@ -8,7 +8,14 @@
  * both tsx and the esbuild CJS bundle (the bundle initialises modules in import order).
  *
  * Semantics are unchanged from before: dotenv's default, so a variable already set in the real environment wins.
+ *
+ * Tests are hermetic: under vitest the repo `.env` is NEVER read (it can point at a real RPC and a real key, which turned
+ * startup reconciliation into network I/O on a machine with a populated `.env`). A `.env.test` file is read instead if it exists.
  */
 import dotenv from 'dotenv';
 
-dotenv.config();
+if (process.env.VITEST) {
+  dotenv.config({ path: '.env.test', quiet: true } as any);
+} else {
+  dotenv.config();
+}

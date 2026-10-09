@@ -639,6 +639,18 @@ export class ExecutionCoordinator {
       }
     }
 
+    // 6. Tokens in the wallet that no position covers (a lost buy record, a manual transfer) get a position so the exit engine watches them.
+    if (signerStatus === 'READY') {
+      try {
+        const scan = await this.scanUntrackedWalletTokens();
+        if (scan.untracked.length > 0) {
+          issues.push(`${scan.untracked.length} wallet token balance(s) had no position: ${scan.adopted.length} adopted for exit monitoring, ${scan.untracked.length - scan.adopted.length} unpriced`);
+        }
+      } catch (e: any) {
+        Logger.warn(`Untracked-balance scan failed: ${e.message}`);
+      }
+    }
+
     let status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE';
     if (this.rpcHealth === 'DISCONNECTED') {
       status = 'OFFLINE';
@@ -736,6 +748,86 @@ export class ExecutionCoordinator {
       }
     }
     return { recovered, stillOrphaned };
+  }
+
+  /**
+   * Scan the wallet's SPL and Token-2022 accounts for non-zero balances that no active LIVE position covers. Each one that has a readable
+   * pump curve / PumpSwap price gets a position flagged RECOVERED (entry price = current mark, cost basis unknown = 0) so stop-loss and
+   * trailing-stop run on it; every one raises an UNTRACKED_TOKEN_BALANCE alert. Balances with no pump price are only alerted, never traded.
+   */
+  public async scanUntrackedWalletTokens(): Promise<{ untracked: string[]; adopted: string[] }> {
+    const untracked: string[] = [];
+    const adopted: string[] = [];
+    if (localSigner.getStatus() !== 'READY') return { untracked, adopted };
+    const wallet = localSigner.getPublicKey();
+    const held = new Map<string, { raw: bigint; decimals: number; program: PublicKey }>();
+    for (const program of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
+      const res = await this.connection.getParsedTokenAccountsByOwner(wallet, { programId: program }, 'confirmed');
+      for (const acc of res.value) {
+        const info = (acc.account.data as any)?.parsed?.info;
+        const amount = BigInt(info?.tokenAmount?.amount ?? '0');
+        if (!info?.mint || amount <= 0n) continue;
+        const prev = held.get(info.mint);
+        held.set(info.mint, { raw: (prev?.raw ?? 0n) + amount, decimals: info.tokenAmount.decimals ?? 6, program });
+      }
+    }
+    const active = new Set(
+      workstationDb.loadPositions('LIVE', 'ACTIVE').map((p) => p.mint)
+    );
+    // A buy still waiting for recovery (RECONCILIATION_REQUIRED / PENDING) owns its mint: recoverOrphanedBuys handles it.
+    const inRecovery = new Set(
+      workstationDb.loadTransactions()
+        .filter((t) => t.direction === 'BUY' && t.executionMode === 'LIVE' && (t.reconciliationState === 'RECONCILIATION_REQUIRED' || t.reconciliationState === 'PENDING'))
+        .map((t) => t.mint)
+    );
+    const missing = [...held.keys()].filter((m) => !active.has(m) && !inRecovery.has(m));
+    if (missing.length === 0) return { untracked, adopted };
+    let marks: Record<string, { priceSol: number; source: string; timestamp: number; poolAddress?: string }> = {};
+    try {
+      marks = (await RealMarkPriceService.queryOnChainMarkPrices(this.connection, missing, 'LIVE')) as any;
+    } catch (e: any) {
+      Logger.warn(`Mark read for untracked balances failed: ${e.message}`);
+    }
+    for (const mint of missing) {
+      untracked.push(mint);
+      const h = held.get(mint)!;
+      const mark = marks[mint];
+      if (mark && mark.priceSol > 0) {
+        const now = Date.now();
+        const qty = Number(h.raw) / Math.pow(10, h.decimals);
+        workstationDb.savePosition({
+          id: `recovered-${mint}`,
+          mint,
+          symbol: mint.slice(0, 5).toUpperCase(),
+          name: 'RECOVERED untracked wallet balance',
+          tokenDecimals: h.decimals,
+          baseTokenProgram: h.program.toBase58(),
+          tokenQuantityRaw: h.raw.toString(),
+          costBasisLamports: 0, // unknown: PnL for this position is not meaningful
+          entryPriceSol: mark.priceSol,
+          currentPriceSol: mark.priceSol,
+          currentValueSol: Number((qty * mark.priceSol).toFixed(6)),
+          unrealizedPnLSol: 0,
+          unrealizedPnLPct: 0,
+          realizedPnLSol: 0,
+          entryTxSignature: `RECOVERED:${mint}`,
+          entryTimestamp: now,
+          markSource: 'RECONCILED_ON_CHAIN',
+          markAgeMs: 0,
+          lastMarkTimestamp: mark.timestamp || now,
+          venue: mark.source === 'ON_CHAIN_PUMPSWAP_POOL' ? 'PUMPSWAP' : 'PUMP_BONDING_CURVE',
+          poolAddress: mark.poolAddress,
+          executionMode: 'LIVE',
+          status: 'OPEN',
+          lastUpdatedTimestamp: now,
+        } as NormalizedPosition);
+        adopted.push(mint);
+        this.raiseOperatorAlert('UNTRACKED_TOKEN_BALANCE', `Wallet held ${h.raw} raw of ${mint} with no position. Adopted as RECOVERED with entry price = current mark; stop-loss now applies. Cost basis unknown.`, `recovered-${mint}`);
+      } else {
+        this.raiseOperatorAlert('UNTRACKED_TOKEN_BALANCE', `Wallet holds ${h.raw} raw of ${mint} with no position and no readable pump price. Not traded; sell manually if unwanted.`, `untracked-${mint}`);
+      }
+    }
+    return { untracked, adopted };
   }
 
   /** Delays (ms) at which a failed live-buy reconciliation is retried in the background. Tests set [] . */

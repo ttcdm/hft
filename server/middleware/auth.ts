@@ -55,12 +55,18 @@ export class AuthManager {
     };
     this.sessions.set(token, session);
 
-    // Prominently print generated fallback token to stdout in a highlighted banner (B04)
-    console.log('\n' + '='.repeat(80));
-    console.log('⚠️  NO OPERATOR_AUTH_TOKEN CONFIGURED IN ENVIRONMENT — GENERATED VOLATILE TOKEN:');
-    console.log(`🔑  ${token}`);
-    console.log('    Use this token to authenticate in the UI, or set OPERATOR_AUTH_TOKEN in .env');
-    console.log('='.repeat(80) + '\n');
+    if (process.env.APEX_CONTAINER === 'true') {
+      // Container logs are collected and shipped: never print a credential there. A volatile token nobody can read is useless,
+      // so tell the operator to set one (docker-compose.yml requires OPERATOR_AUTH_TOKEN).
+      console.log('NO OPERATOR_AUTH_TOKEN CONFIGURED: a volatile token was generated but is NOT printed in a container. Set OPERATOR_AUTH_TOKEN (16+ chars) and restart.');
+    } else {
+      // Prominently print generated fallback token to stdout in a highlighted banner (B04)
+      console.log('\n' + '='.repeat(80));
+      console.log('⚠️  NO OPERATOR_AUTH_TOKEN CONFIGURED IN ENVIRONMENT — GENERATED VOLATILE TOKEN:');
+      console.log(`🔑  ${token}`);
+      console.log('    Use this token to authenticate in the UI, or set OPERATOR_AUTH_TOKEN in .env');
+      console.log('='.repeat(80) + '\n');
+    }
 
     Logger.info('Operator session initialized in secure volatile memory (zero disk persistence).');
 

@@ -488,7 +488,9 @@ export class MemecoinAggregatorService extends EventEmitter {
       } catch {}
     }
 
-    if (!pool) {
+    // S1: the callout-derived pool fills unknown holder/authority fields with "safe" defaults, which is only
+    // acceptable for paper trading. In LIVE a token whose real curve state could not be read is not tradable here.
+    if (!pool && executionCoordinator.getExecutionMode() !== 'LIVE') {
       // 1. Check if token exists in hot callouts feed
       try {
         const { pumpFunService } = await import('./pumpfunService');

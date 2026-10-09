@@ -1,3 +1,4 @@
+import { PublicKey } from '@solana/web3.js';
 import { SocialSignal, SocialSource, AuthorTier, SignalPattern } from '../src/types';
 import { memecoinAggregator } from './memecoinAggregator';
 
@@ -324,9 +325,22 @@ export class SocialAlphaScanner {
     }
 
     if (trimmed.startsWith('/snipe') || trimmed.startsWith('/buy')) {
-      const parts = trimmed.split(' ');
-      const ca = parts[1] || 'CzLSujWBLFsSjncfkh59rQD4NJYsZUMffEFrNJfiBAGS';
-      const amount = parts[2] ? parseFloat(parts[2]) : 5.0;
+      const parts = trimmed.split(/\s+/);
+      const ca = parts[1] || '';
+      // S1: never fall back to a hardcoded token. A missing or malformed mint, or a bad amount, is rejected.
+      let validMint: boolean;
+      try {
+        validMint = !!ca && new PublicKey(ca).toBase58() === ca;
+      } catch {
+        validMint = false;
+      }
+      if (!validMint) {
+        return { reply: `❌ SNIPE REJECTED: usage is /snipe <mint address> [amount_usd]. "${ca.slice(0, 60)}" is not a valid Solana address.` };
+      }
+      const amount = parts[2] ? Number(parts[2]) : 5.0;
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return { reply: `❌ SNIPE REJECTED: amount must be a positive number.` };
+      }
 
       const snipeResult = await memecoinAggregator.executeSnipe({
         contractAddress: ca,

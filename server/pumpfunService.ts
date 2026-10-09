@@ -420,7 +420,11 @@ export class PumpFunService extends EventEmitter {
 
       let pumpCoins: any[] = [];
       if (pumpRes && pumpRes.ok) {
-        pumpCoins = await pumpRes.json();
+        const parsed = await pumpRes.json();
+        // S1: tolerate a non-array body and drop malformed entries so one bad element cannot abort the whole sync.
+        pumpCoins = Array.isArray(parsed)
+          ? parsed.filter((c: any) => c && typeof c === 'object' && typeof c.mint === 'string' && c.mint.length > 0)
+          : [];
       }
 
       // 2. Fetch real-time boosted tokens from DexScreener
@@ -428,7 +432,8 @@ export class PumpFunService extends EventEmitter {
       try {
         const dexRes = await fetch('https://api.dexscreener.com/token-boosts/top/v1').catch(() => null);
         if (dexRes && dexRes.ok) {
-          dexBoosted = await dexRes.json();
+          const parsedBoosts = await dexRes.json();
+        dexBoosted = Array.isArray(parsedBoosts) ? parsedBoosts : [];
         }
       } catch {}
 
@@ -489,7 +494,9 @@ export class PumpFunService extends EventEmitter {
     const activeTokens = [...pumpCoins].slice(0, 15);
 
     activeTokens.forEach((c, index) => {
-      const mint = c.mint || `mint-${index}`;
+      // S1: a coin without a mint cannot be traded or attributed; never invent a placeholder mint.
+      if (!c || typeof c.mint !== 'string' || !c.mint) return;
+      const mint = c.mint;
       const pair = pairMetricsMap.get(mint.toLowerCase());
 
       // Assign caller based on coin index & hash to maintain stable personality attribution

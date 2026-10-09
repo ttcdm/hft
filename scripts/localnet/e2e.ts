@@ -25,6 +25,19 @@ const rec = (step: string, ok: boolean, detail: string) => {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${step}: ${detail}`);
 };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Startup reconciliation (including the wallet token scan) finishes in the background; arming before it is refused by design. */
+async function waitCanArm(call: (m: string, p: string, b?: unknown) => Promise<any>, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  let last: any;
+  while (Date.now() < deadline) {
+    last = await call('GET', '/api/execution/can-arm');
+    if (last.body?.allowed === true) return last;
+    await sleep(500);
+  }
+  console.log(`can-arm still refused after ${timeoutMs} ms: ${JSON.stringify(last?.body?.reasons)}`);
+  return last;
+}
 const children: ChildProcess[] = [];
 const logs: Record<string, string[]> = {};
 
@@ -256,8 +269,8 @@ async function main() {
   rec('GET /api/execution/mode', mode0.status === 200, JSON.stringify(mode0.body));
   const syncRpc = await call('POST', '/api/wallet/sync-rpc', {});
   rec('POST /api/wallet/sync-rpc', syncRpc.status === 200, JSON.stringify(syncRpc.body).slice(0, 200));
-  const can = await call('GET', '/api/execution/can-arm');
-  rec('GET /api/execution/can-arm', can.status === 200, JSON.stringify({ allowed: can.body?.allowed, reasons: can.body?.reasons }).slice(0, 400));
+  const can = await waitCanArm(call);
+  rec('GET /api/execution/can-arm', can.status === 200 && can.body?.allowed === true, JSON.stringify({ allowed: can.body?.allowed, reasons: can.body?.reasons }).slice(0, 400));
   const arm = await call('POST', '/api/execution/arm', { arm: true, confirmationCode: 'CONFIRM_LIVE_TRADING_RISK' });
   rec('POST /api/execution/arm', arm.status === 200 && arm.body?.success, JSON.stringify(arm.body).slice(0, 300));
   if (!arm.body?.success) return finish();
@@ -337,6 +350,8 @@ async function main() {
   const chainAfterKill = await ata(mintF);
   ({ base, proc } = await startServer());
   call = api(base);
+  const canAgain = await waitCanArm(call);
+  rec('can-arm after restart', canAgain.body?.allowed === true, JSON.stringify({ allowed: canAgain.body?.allowed, reasons: canAgain.body?.reasons }).slice(0, 300));
   const armAgain = await call('POST', '/api/execution/arm', { arm: true, confirmationCode: 'CONFIRM_LIVE_TRADING_RISK' });
   const recon = await call('POST', '/api/execution/reconcile', {});
   // orphan recovery runs in the background after startup; give it a moment, then ask for the book

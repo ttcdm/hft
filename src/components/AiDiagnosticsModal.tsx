@@ -174,7 +174,7 @@ export const AiDiagnosticsModal: React.FC<AiDiagnosticsModalProps> = ({
             <button
               onClick={handleRunAnalysis}
               disabled={loading}
-              className="px-4 py-2 rounded-lg bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-500 hover:to-cyan-500 text-white font-bold text-xs flex items-center space-x-1.5 shadow-lg shadow-cyan-500/20 disabled:opacity-50"
+              className="px-4 py-2 rounded-lg whitespace-nowrap bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-500 hover:to-cyan-500 text-white font-bold text-xs flex items-center space-x-1.5 shadow-lg shadow-cyan-500/20 disabled:opacity-50"
             >
               {loading ? (
                 <>

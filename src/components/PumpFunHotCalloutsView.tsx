@@ -57,9 +57,9 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
     tokensTrackedCount: number;
     lastUpdated: number;
   }>({
-    liveSource: 'frontend-api-v3.pump.fun + DexScreener v1',
-    syncLatencyMs: 142,
-    tokensTrackedCount: 30,
+    liveSource: '—',
+    syncLatencyMs: 0,
+    tokensTrackedCount: 0,
     lastUpdated: Date.now(),
   });
 
@@ -90,9 +90,9 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
         setCallouts(data.callouts);
         setLeaderboard(data.leaderboard || []);
         setStatusInfo({
-          liveSource: data.liveSource || 'frontend-api-v3.pump.fun + DexScreener v1',
-          syncLatencyMs: data.syncLatencyMs || 120,
-          tokensTrackedCount: data.tokensTrackedCount || 30,
+          liveSource: data.liveSource || '—',
+          syncLatencyMs: data.syncLatencyMs ?? 0,
+          tokensTrackedCount: data.tokensTrackedCount ?? 0,
           lastUpdated: data.lastUpdated || Date.now(),
         });
         if (data.autoSnipeRules) {
@@ -114,9 +114,9 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
       if (data.leaderboard) setLeaderboard(data.leaderboard);
       if (data.status) {
         setStatusInfo({
-          liveSource: data.status.liveSource || 'frontend-api-v3.pump.fun + DexScreener v1',
-          syncLatencyMs: data.status.syncLatencyMs || 85,
-          tokensTrackedCount: data.status.tokensTrackedCount || 30,
+          liveSource: data.status.liveSource || '—',
+          syncLatencyMs: data.status.syncLatencyMs ?? 0,
+          tokensTrackedCount: data.status.tokensTrackedCount ?? 0,
           lastUpdated: data.status.lastSyncTimestamp || Date.now(),
         });
       }
@@ -270,7 +270,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               )}
             </div>
             <p className="text-[11px] text-slate-300 mt-0.5">
-              Live ingest: <span className="font-mono text-cyan-300">{statusInfo.liveSource}</span> • {statusInfo.tokensTrackedCount} on-chain tokens monitored • Latency: <span className="font-mono text-emerald-400">{statusInfo.syncLatencyMs}ms</span>
+              Live ingest: <span className="font-mono text-cyan-300">{statusInfo.liveSource}</span> • {statusInfo.tokensTrackedCount} on-chain tokens monitored • Latency: <span className="font-mono text-emerald-400">{statusInfo.syncLatencyMs > 0 ? `${statusInfo.syncLatencyMs}ms` : '—'}</span>
             </p>
           </div>
         </div>

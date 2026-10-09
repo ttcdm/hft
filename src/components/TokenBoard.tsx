@@ -30,6 +30,7 @@ export const fmt = (n: number | null | undefined, digits = 4, suffix = ''): stri
 const fmtPrice = (n: number | null | undefined) => (n === null || n === undefined || !(n > 0) ? DASH : n < 0.001 ? n.toExponential(3) : n.toFixed(6));
 const short = (m: string) => `${m.slice(0, 4)}…${m.slice(-4)}`;
 const cell = 'px-3 py-2 text-right font-mono tabular-nums';
+const headLeft = 'px-3 py-2 text-left text-[10px] uppercase tracking-wider text-slate-500 font-semibold';
 const head = 'px-3 py-2 text-right text-[10px] uppercase tracking-wider text-slate-500 font-semibold';
 
 export function WalletStrip({ wallet, mode }: { wallet: BoardData['wallet']; mode: string }) {
@@ -78,7 +79,7 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected }: {
       {!board && <div className="p-6 text-sm text-slate-500">Loading… (sign in as operator to read the board)</div>}
       {board && tab === 'launches' && (
         <table className="w-full text-xs">
-          <thead><tr><th className={`${head} text-left`}>Token</th><th className={head}>Price (SOL)</th><th className={head}>Curve</th><th className={head}>Top10 %</th><th className={head}>Creator %</th><th className={head}>Age</th></tr></thead>
+          <thead><tr><th className={headLeft}>Token</th><th className={head}>Price (SOL)</th><th className={head}>Curve</th><th className={head}>Top10 %</th><th className={head}>Creator %</th><th className={head}>Age</th></tr></thead>
           <tbody>
             {board.launches.length === 0 && <tr><td colSpan={6} className="p-6 text-center text-slate-500">No launches seen yet. The board fills from the Pump.fun create-event stream.</td></tr>}
             {board.launches.map((l) => (
@@ -96,7 +97,7 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected }: {
       )}
       {board && tab === 'watching' && (
         <table className="w-full text-xs">
-          <thead><tr><th className={`${head} text-left`}>Token</th><th className={head}>State</th><th className={head}>Net inflow</th><th className={head}>Buyers</th><th className={head}>Buy:sell</th><th className={head}>Top buyer</th><th className={head}>Creator sold</th></tr></thead>
+          <thead><tr><th className={headLeft}>Token</th><th className={head}>State</th><th className={head}>Net inflow</th><th className={head}>Buyers</th><th className={head}>Buy:sell</th><th className={head}>Top buyer</th><th className={head}>Creator sold</th></tr></thead>
           <tbody>
             {board.watching.length === 0 && <tr><td colSpan={7} className="p-6 text-center text-slate-500">Nothing in the watch window.</td></tr>}
             {board.watching.map((w) => (
@@ -115,7 +116,7 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected }: {
       )}
       {board && tab === 'holding' && (
         <table className="w-full text-xs">
-          <thead><tr><th className={`${head} text-left`}>Position</th><th className={head}>Entry</th><th className={head}>Mark</th><th className={head}>PnL (SOL)</th><th className={head}>Next exit</th></tr></thead>
+          <thead><tr><th className={headLeft}>Position</th><th className={head}>Entry</th><th className={head}>Mark</th><th className={head}>PnL (SOL)</th><th className={head}>Next exit</th></tr></thead>
           <tbody>
             {board.holding.length === 0 && <tr><td colSpan={5} className="p-6 text-center text-slate-500">No open positions.</td></tr>}
             {board.holding.map((h) => (

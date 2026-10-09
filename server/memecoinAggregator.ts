@@ -391,6 +391,11 @@ export class MemecoinAggregatorService extends EventEmitter {
     amountSol?: number;
     positionId?: string;
     feesPaidLamports?: number;
+    /** G3: quoted and filled price (SOL/token) and the slippage cap, so the auto controller can count slippage breaches. */
+    quotePriceSol?: number;
+    fillPriceSol?: number;
+    slippageBps?: number;
+    gates?: Record<string, unknown>;
   }> {
     const cleanCa = params.contractAddress.trim();
 
@@ -731,6 +736,10 @@ export class MemecoinAggregatorService extends EventEmitter {
       amountSol,
       positionId: execRes.positionId,
       feesPaidLamports: execRes.feesPaidLamports,
+      quotePriceSol: pool.priceNative,
+      fillPriceSol: execRes.fillPriceSol,
+      slippageBps,
+      gates: execRes.gates,
     };
   }
 

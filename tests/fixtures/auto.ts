@@ -11,3 +11,19 @@ export async function setAutoMode(mode: AutoMode): Promise<void> {
 export async function resetAuto(): Promise<void> {
   await autoSnipeController.setMode('OFF');
 }
+
+import { Keypair } from '@solana/web3.js';
+import { memecoinAggregator } from '../../server/memecoinAggregator';
+import { PumpFeedListener } from '../../server/solana/pumpFeedListener';
+
+/** A real pool for a fresh mint, created the way the feed creates one. */
+export function newPumpPool() {
+  const mint = Keypair.generate().publicKey.toBase58();
+  const creator = Keypair.generate().publicKey.toBase58();
+  const l = new PumpFeedListener();
+  const ev = l.parseLogs({ err: null, signature: 'g3', logs: [PumpFeedListener.encodeCreateEventLog({ name: 'G3', symbol: 'G3', uri: '', mint, creator })] } as any, { slot: 9 })!;
+  const pool = memecoinAggregator.ingestOnChainCreateEvent(ev);
+  pool.liquidityUsd = 15_000; // a created pool starts at $0, which the liquidity gate (correctly) rejects
+  l.destroy();
+  return { mint, pool };
+}

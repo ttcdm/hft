@@ -7,6 +7,8 @@ import { executionConfig } from '../solana/executionConfig';
 import { allowedCluster, assertClusterAllowed } from '../solana/clusterGuard';
 import { Logger } from '../middleware/enterprise';
 import type { SignalProvenance } from '../core/types';
+import { evaluateKillTriggers, auditWalletChange, type KillTrigger } from './killSwitch';
+import { riskEngine } from '../risk/riskEngine';
 
 /**
  * G1: the only owner of auto trading.
@@ -56,7 +58,7 @@ export interface AutoDecision {
   symbol?: string;
   source: AutoCandidate['source'];
   outcome: AutoOutcome;
-  /** Stage that decided: AUTO | BUDGET | EXECUTE | DRY_RUN */
+  /** Pipeline stage that decided (G3): queue | auto | budget | eligibility | score | size | risk | execute | fill | exit */
   stage: string;
   reason: string;
   amountSol?: number;
@@ -76,11 +78,26 @@ export interface AutoStatus {
   killed: boolean;
   killReason: string | null;
   downgradeReason: string | null;
+  /** G3: kill-switch triggers that dropped the controller to SHADOW, and the all-trading halt reason if one is set. */
+  triggers: KillTrigger[];
+  haltReason: string | null;
+  slippageBreaches: number;
   session: (AutoSession & { sessionPnlSol: number; budgetsLeft: { buys: number; spendSol: number; lossSol: number; msLeft: number } }) | null;
   budgets: typeof SESSION_BUDGETS;
 }
 
 const MAX_DECISIONS = 500;
+const MONITOR_INTERVAL_MS = 5_000;
+
+/** Map a rejection message to the pipeline stage that produced it. */
+export function classifyRejection(message: string): string {
+  const m = message || '';
+  if (/^(REJECTED: )?(ELIGIBILITY|UNSUPPORTED_TOKEN|SAFETY_CHECK|Freeze authority|Creator holds)/.test(m)) return 'eligibility';
+  if (/Confluence score/.test(m)) return 'score';
+  if (/^(REJECTED: )?(Capital sizing|WALLET_BALANCE_UNKNOWN|SOL_PRICE_UNAVAILABLE)|^(EXCEEDS_CAPITAL_CEILING|INSUFFICIENT_|EXPECTED_EDGE_BELOW|MARKET_DATA_UNAVAILABLE)/.test(m)) return 'size';
+  if (/^(CIRCUIT_BREAKER_OPEN|DAILY_LOSS_LIMIT|DUPLICATE_MINT|EXECUTION_DISABLED|FEE_TOO_HIGH|INSUFFICIENT_BALANCE|KILL_SWITCH_ACTIVE|MAX_EXPOSURE|MAX_POSITION_SIZE|PRICE_IMPACT_TOO_HIGH|SLIPPAGE_TOO_HIGH|STALE_MARKET_DATA|STALE_SIGNAL|TRADING_HALTED)/.test(m)) return 'risk';
+  return 'execute';
+}
 
 export class AutoSnipeController extends EventEmitter {
   private mode: AutoMode = 'OFF'; // never restored from disk: a restart is always OFF
@@ -91,6 +108,11 @@ export class AutoSnipeController extends EventEmitter {
   private decisions: AutoDecision[] = [];
   private attempted = new Set<string>();
   private busy = false;
+  private triggers: KillTrigger[] = [];
+  private slippageBreaches = 0;
+  private redSince = new Map<string, number>();
+  private monitorTimer: NodeJS.Timeout | null = null;
+  private walletMark: { sol: number; ts: number } | null = null;
 
   public getMode(): AutoMode {
     return this.mode;
@@ -100,10 +122,26 @@ export class AutoSnipeController extends EventEmitter {
     return this.decisions.slice(-limit).map((d) => ({ ...d }));
   }
 
-  private record(c: AutoCandidate, outcome: AutoOutcome, stage: string, reason: string, extra: Partial<AutoDecision> = {}): AutoDecision {
-    const d: AutoDecision = { ts: Date.now(), mode: this.mode, mint: c.mint, symbol: c.symbol, source: c.source, outcome, stage, reason, ...extra };
+  private record(c: AutoCandidate, outcome: AutoOutcome, stage: string, reason: string, extra: Partial<AutoDecision> & { feesSol?: number; inputs?: Record<string, any>; unverified?: boolean } = {}): AutoDecision {
+    const { feesSol: _f, inputs: _i, unverified: _u, ...pub } = extra;
+    const d: AutoDecision = { ts: Date.now(), mode: this.mode, mint: c.mint, symbol: c.symbol, source: c.source, outcome, stage, reason, ...pub };
     this.decisions.push(d);
     if (this.decisions.length > MAX_DECISIONS) this.decisions.shift();
+    const solDelta = outcome === 'BOUGHT' && extra.amountSol !== undefined ? -(extra.amountSol + (extra.feesSol ?? 0)) : undefined;
+    workstationDb.logDecision({
+      ts: d.ts,
+      autoMode: d.mode,
+      mint: d.mint,
+      symbol: d.symbol,
+      source: d.source,
+      stage: d.stage,
+      outcome: d.outcome,
+      reason: d.reason,
+      inputs: extra.inputs,
+      positionId: d.positionId,
+      solDelta,
+      unverified: extra.unverified,
+    });
     this.emit('decision', d);
     return d;
   }
@@ -134,7 +172,11 @@ export class AutoSnipeController extends EventEmitter {
         },
       };
     }
-    return { mode: this.mode, killed: this.killed, killReason: this.killReason, downgradeReason: this.downgradeReason, session, budgets: SESSION_BUDGETS };
+    return {
+      mode: this.mode, killed: this.killed, killReason: this.killReason, downgradeReason: this.downgradeReason,
+      triggers: [...this.triggers], haltReason: executionCoordinator.getHaltReason(), slippageBreaches: this.slippageBreaches,
+      session, budgets: SESSION_BUDGETS,
+    };
   }
 
   /** Drop to SHADOW when any session budget has run out. Called before every decision and status read. */
@@ -186,6 +228,10 @@ export class AutoSnipeController extends EventEmitter {
     this.killed = false;
     this.killReason = null;
     this.downgradeReason = null;
+    this.triggers = [];
+    this.slippageBreaches = 0;
+    this.redSince.clear();
+    this.walletMark = null;
     this.attempted.clear();
     this.mode = next;
     if (next === 'PAPER' || next === 'DEVNET_LIVE') {
@@ -218,22 +264,125 @@ export class AutoSnipeController extends EventEmitter {
     return { mode: this.mode, closed };
   }
 
+  // ---- G3: kill switch ---------------------------------------------------------------------------------------
+
+  /**
+   * Evaluate the kill-switch triggers. A hit drops PAPER / DEVNET_LIVE to SHADOW: buys stop, candidates are still
+   * journaled as "would buy", and exits keep running. Only an operator setting the mode again brings buys back.
+   */
+  public async checkTriggers(now = Date.now()): Promise<KillTrigger[]> {
+    if (this.mode !== 'PAPER' && this.mode !== 'DEVNET_LIVE') return [];
+    const live = this.mode === 'DEVNET_LIVE';
+    const execMode = live ? 'LIVE' : 'PAPER';
+
+    const comps = executionCoordinator.getLiveReadiness().components;
+    const watched: Array<[string, boolean]> = [['rpc', comps.rpc.healthy], ['markFeed', comps.markFeed.healthy], ['db', comps.db.healthy]];
+    for (const [name, healthy] of watched) {
+      if (healthy) this.redSince.delete(name);
+      else if (!this.redSince.has(name)) this.redSince.set(name, now);
+    }
+
+    const ctx = {
+      mode: this.mode,
+      closedNetPnlSol: workstationDb.loadEvidenceClosedTrades(execMode).map((p) => p.realizedPnLSol ?? 0),
+      dailyTotalPnlSol: riskEngine.getDailyTotalPnLSol(execMode),
+      maxDailyLossSol: riskEngine.effectiveMaxDailyLossSol(),
+      slippageBreaches: this.slippageBreaches,
+      readinessRed: [...this.redSince.entries()].map(([name, since]) => ({ name, redForMs: now - since })),
+      walletSol: executionCoordinator.getRealWalletBalanceSol(),
+      reserveSol: 0.015,
+      maxTradeSol: AUTO_DEVNET_ORDER_SOL,
+    };
+    const hits = evaluateKillTriggers(ctx);
+    if (hits.length === 0) return [];
+
+    const reason = `kill switch: ${hits.map((h) => `${h.code} (${h.message})`).join('; ')}`;
+    const from = this.mode;
+    this.triggers = hits;
+    this.mode = 'SHADOW';
+    this.downgradeReason = reason;
+    workstationDb.logDecision({ autoMode: from, mint: '-', stage: 'risk', outcome: 'KILL_TRIGGER', reason, inputs: { triggers: hits } });
+    Logger.warn(`[AUTO] ${reason}. Dropped ${from} -> SHADOW; exits keep running.`);
+    this.emit('mode', { mode: this.mode, reason });
+    return hits;
+  }
+
+  /**
+   * DEVNET_LIVE only: compare the real wallet balance with what the decision journal says moved since the last look.
+   * A change nothing in the journal explains (a drain, or an unknown spend) halts ALL trading, exits included.
+   */
+  public async auditWallet(now = Date.now()): Promise<{ explained: boolean; unexplainedSol: number } | null> {
+    if (this.mode !== 'DEVNET_LIVE') {
+      this.walletMark = null;
+      return null;
+    }
+    await executionCoordinator.syncRealWalletBalance();
+    const bal = executionCoordinator.getRealWalletBalanceSol();
+    if (bal === null || bal === undefined) return null;
+    const prev = this.walletMark;
+    this.walletMark = { sol: bal, ts: now };
+    if (!prev) return null;
+    const audit = auditWalletChange(prev.sol, bal, workstationDb.sumDecisionSolDelta(prev.ts, now));
+    if (!audit.explained) {
+      const reason = `wallet changed by an unexplained ${audit.unexplainedSol.toFixed(6)} SOL (tolerance ${audit.toleranceSol.toFixed(6)})`;
+      executionCoordinator.haltAll(reason);
+      this.mode = 'OFF';
+      this.killed = true;
+      this.killReason = reason;
+      this.session = null;
+      workstationDb.logDecision({ autoMode: 'DEVNET_LIVE', mint: '-', stage: 'risk', outcome: 'HALT_ALL', reason, inputs: { prevSol: prev.sol, nowSol: bal } });
+      Logger.error(`[AUTO] HALT ALL: ${reason}`);
+      this.emit('mode', { mode: this.mode, reason });
+    }
+    return { explained: audit.explained, unexplainedSol: audit.unexplainedSol };
+  }
+
+  /** Clear an all-trading halt. Does not turn auto trading back on: the operator still sets a mode. */
+  public resume(opts: { clearHalt?: boolean } = {}): { halted: boolean; mode: AutoMode } {
+    if (opts.clearHalt) executionCoordinator.clearHalt();
+    return { halted: executionCoordinator.getHaltReason() !== null, mode: this.mode };
+  }
+
+  public startMonitor(intervalMs = MONITOR_INTERVAL_MS): void {
+    if (this.monitorTimer) return;
+    let running = false;
+    this.monitorTimer = setInterval(async () => {
+      if (running) return;
+      running = true;
+      try {
+        await this.checkTriggers();
+        await this.auditWallet();
+      } catch (e: any) {
+        Logger.error(`[AUTO] monitor tick failed: ${e?.message || e}`);
+      } finally {
+        running = false;
+      }
+    }, intervalMs);
+    this.monitorTimer.unref?.();
+  }
+
+  public stopMonitor(): void {
+    if (this.monitorTimer) clearInterval(this.monitorTimer);
+    this.monitorTimer = null;
+  }
+
   /**
    * The single door into auto trading. Returns the decision it journaled.
    */
   public async submitCandidate(c: AutoCandidate): Promise<AutoDecision> {
     const key = c.mint.toLowerCase();
-    if (this.mode === 'OFF') return this.record(c, 'DROPPED', 'AUTO', 'AUTO_OFF');
+    workstationDb.logDecision({ autoMode: this.mode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'queue', outcome: 'QUEUED', reason: 'candidate received' });
+    if (this.mode === 'OFF') return this.record(c, 'DROPPED', 'auto', 'AUTO_OFF');
     const downgraded = this.enforceBudgets();
-    if (process.env.AUTO_SNIPE_ENABLED !== 'true') return this.record(c, 'DROPPED', 'AUTO', 'AUTO_SNIPE_ENABLED is not true');
-    if (this.attempted.has(key)) return this.record(c, 'DROPPED', 'AUTO', 'ALREADY_ATTEMPTED_THIS_SESSION');
-    if (this.busy) return this.record(c, 'DROPPED', 'AUTO', 'ANOTHER_CANDIDATE_IN_FLIGHT');
+    if (process.env.AUTO_SNIPE_ENABLED !== 'true') return this.record(c, 'DROPPED', 'auto', 'AUTO_SNIPE_ENABLED is not true');
+    if (this.attempted.has(key)) return this.record(c, 'DROPPED', 'auto', 'ALREADY_ATTEMPTED_THIS_SESSION');
+    if (this.busy) return this.record(c, 'DROPPED', 'auto', 'ANOTHER_CANDIDATE_IN_FLIGHT');
     const open = workstationDb.loadPositions(undefined, 'ACTIVE');
-    if (open.some((p) => p.mint.toLowerCase() === key)) return this.record(c, 'DROPPED', 'AUTO', 'POSITION_ALREADY_OPEN');
+    if (open.some((p) => p.mint.toLowerCase() === key)) return this.record(c, 'DROPPED', 'auto', 'POSITION_ALREADY_OPEN');
 
     const mode = this.mode;
     if (mode === 'DEVNET_LIVE' && open.length >= DEVNET_MAX_OPEN_POSITIONS) {
-      return this.record(c, 'DROPPED', 'BUDGET', `DEVNET_MAX_OPEN_POSITIONS (${DEVNET_MAX_OPEN_POSITIONS}) reached`);
+      return this.record(c, 'DROPPED', 'budget', `DEVNET_MAX_OPEN_POSITIONS (${DEVNET_MAX_OPEN_POSITIONS}) reached`);
     }
     if (downgraded) {
       // already moved to SHADOW by enforceBudgets; carry on as a shadow run
@@ -256,22 +405,31 @@ export class AutoSnipeController extends EventEmitter {
       };
       if (shadow) params.dryRun = true;
       if (this.mode === 'DEVNET_LIVE') {
-        if (solUsd === null) return this.record(c, 'REJECTED', 'EXECUTE', 'SOL_PRICE_UNAVAILABLE');
+        if (solUsd === null) return this.record(c, 'REJECTED', 'size', 'SOL_PRICE_UNAVAILABLE');
         params.amountSolOverride = AUTO_DEVNET_ORDER_SOL;
       }
       const res = await memecoinAggregator.executeSnipe(params);
-      if (!res.success) return this.record(c, 'REJECTED', shadow ? 'DRY_RUN' : 'EXECUTE', res.message);
-      if (shadow) return this.record(c, 'WOULD_BUY', 'DRY_RUN', res.message, { amountSol: res.amountSol });
+      if (!res.success) return this.record(c, 'REJECTED', classifyRejection(res.message), res.message, { inputs: { confluenceScore: res.confluenceScore, dryRun: shadow } });
+      if (shadow) return this.record(c, 'WOULD_BUY', 'fill', res.message, { amountSol: res.amountSol, inputs: { dryRun: true, confluenceScore: res.confluenceScore, gates: res.gates } });
       if (this.session) {
         this.session.buys += 1;
         this.session.spentSol += (res.amountSol ?? 0) + (res.feesPaidLamports ?? 0) / 1e9;
         if (res.positionId) this.session.positionIds.push(res.positionId);
       }
-      const d = this.record(c, 'BOUGHT', 'EXECUTE', res.message, { amountSol: res.amountSol, positionId: res.positionId });
+      const feesSol = (res.feesPaidLamports ?? 0) / 1e9;
+      const unverified = ((res.gates as any)?.eligibility?.unverified?.length ?? 0) > 0;
+      if (res.quotePriceSol && res.fillPriceSol && res.slippageBps !== undefined) {
+        const slipBps = (res.fillPriceSol / res.quotePriceSol - 1) * 10_000;
+        if (slipBps > res.slippageBps + 1) this.slippageBreaches += 1;
+      }
+      const d = this.record(c, 'BOUGHT', 'fill', res.message, {
+        amountSol: res.amountSol, positionId: res.positionId, feesSol, unverified,
+        inputs: { confluenceScore: res.confluenceScore, quotePriceSol: res.quotePriceSol, fillPriceSol: res.fillPriceSol, gates: res.gates },
+      });
       this.enforceBudgets();
       return d;
     } catch (e: any) {
-      return this.record(c, 'REJECTED', 'EXECUTE', `ERROR: ${e?.message || e}`);
+      return this.record(c, 'REJECTED', 'execute', `ERROR: ${e?.message || e}`);
     } finally {
       this.busy = false;
     }

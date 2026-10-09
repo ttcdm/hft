@@ -1464,6 +1464,10 @@ export class ExecutionCoordinator {
     const now = Date.now();
     this.recordMarketEvent();
 
+    if (this.haltReason) {
+      return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: this.executionMode, error: `TRADING_HALTED: ${this.haltReason}`, correlationId };
+    }
+
     workstationDb.logJournal('TRADE_REQUEST_RECEIVED', correlationId, this.executionMode, {
       ...req,
       executionMode: this.executionMode,
@@ -2029,10 +2033,57 @@ export class ExecutionCoordinator {
   }
 
   // Canonical Close Position supporting partial sells (1-100%) and real proceeds reconciliation
+  private haltReason: string | null = null;
+
+  /** G3: hard stop of ALL trading, exits included (used when the wallet balance changes for a reason the journal cannot explain). */
+  public haltAll(reason: string): void {
+    if (this.haltReason) return;
+    this.haltReason = reason;
+    this.raiseOperatorAlert('TRADING_HALTED', `All trading including exits is halted: ${reason}`);
+  }
+
+  public clearHalt(): void {
+    this.haltReason = null;
+    this.clearOperatorAlert('TRADING_HALTED');
+  }
+
+  public getHaltReason(): string | null {
+    return this.haltReason;
+  }
+
+  /** Close (part of) a position, and write the exit to the decision journal (G3). */
   public async closePosition(
     positionId: string,
     sellPct: number = 100,
     reason: string = 'Manual Close'
+  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string }> {
+    if (this.haltReason) {
+      return { success: false, pnlSol: 0, error: `TRADING_HALTED: ${this.haltReason}` };
+    }
+    const before = workstationDb.loadPositions().find((p) => p.id === positionId);
+    const res = await this.closePositionImpl(positionId, sellPct, reason);
+    if (res.success && before) {
+      const fraction = Math.min(100, Math.max(1, sellPct)) / 100;
+      workstationDb.logDecision({
+        autoMode: 'n/a',
+        mint: before.mint,
+        symbol: before.symbol,
+        source: 'EXIT_ENGINE',
+        stage: 'exit',
+        outcome: 'EXITED',
+        reason,
+        inputs: { sellPct, mode: before.executionMode, pnlSol: res.pnlSol },
+        positionId,
+        solDelta: (before.costBasisLamports / 1e9) * fraction + res.pnlSol,
+      });
+    }
+    return res;
+  }
+
+  private async closePositionImpl(
+    positionId: string,
+    sellPct: number,
+    reason: string
   ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string }> {
     if (this.inFlightPositionExits.has(positionId)) {
       return { success: false, pnlSol: 0, error: 'EXIT_IN_PROGRESS: An exit transaction for this position is already in progress.' };

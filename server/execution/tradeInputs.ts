@@ -161,6 +161,11 @@ export const AutoKillSchema = z.object({
   reason: z.string().trim().max(200).optional(),
 });
 
+/** POST /api/auto/resume (G3): clear an all-trading halt. It never turns auto trading back on. */
+export const AutoResumeSchema = z.object({
+  clearHalt: z.boolean().optional(),
+});
+
 /** WS TOGGLE_CALLER_SNIPE, POST /api/pumpfun/callouts/toggle-autosnipe. */
 export const ToggleCallerSchema = z.object({ userId: id }).loose().transform(({ userId }) => ({ userId }));
 

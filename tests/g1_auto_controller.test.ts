@@ -60,7 +60,7 @@ describe('G1: auto-snipe controller', () => {
     const before = workstationDb.loadPositions().length;
     const d = await autoSnipeController.submitCandidate(cand(newPool()));
     expect(d.outcome, d.reason).toBe('WOULD_BUY');
-    expect(d.stage).toBe('DRY_RUN');
+    expect(d.stage).toBe('fill');
     expect(d.amountSol).toBeGreaterThan(0);
     expect(exec).not.toHaveBeenCalled();
     expect(fill).not.toHaveBeenCalled();

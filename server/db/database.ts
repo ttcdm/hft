@@ -153,6 +153,23 @@ export class WorkstationDatabase {
         created_at INTEGER NOT NULL
       );
 
+      -- G3: one row per candidate per stage (queue, eligibility, score, size, risk, execute, reconcile, exit)
+      CREATE TABLE IF NOT EXISTS decisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        auto_mode TEXT NOT NULL,
+        mint TEXT NOT NULL,
+        symbol TEXT,
+        source TEXT,
+        stage TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        inputs_json TEXT,
+        position_id TEXT,
+        sol_delta REAL,
+        unverified INTEGER NOT NULL DEFAULT 0
+      );
+
       CREATE TABLE IF NOT EXISTS system_journal (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         event_type TEXT NOT NULL,
@@ -194,6 +211,8 @@ export class WorkstationDatabase {
       CREATE INDEX IF NOT EXISTS idx_positions_mint ON positions(mint);
       CREATE INDEX IF NOT EXISTS idx_tx_reconciliation ON transactions(reconciliation_state);
       CREATE INDEX IF NOT EXISTS idx_journal_created ON system_journal(created_at);
+      CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts);
+      CREATE INDEX IF NOT EXISTS idx_decisions_mint ON decisions(mint);
     `);
     Logger.info(`SQLite persistence initialized at ${this.dbPath}`);
   }
@@ -215,6 +234,98 @@ export class WorkstationDatabase {
     } catch (err: any) {
       Logger.error(`Journal logging failed: ${err.message}`);
     }
+  }
+
+  // ---- G3: decision journal -------------------------------------------------------------------------------------
+
+  public logDecision(d: {
+    ts?: number;
+    autoMode: string;
+    mint: string;
+    symbol?: string;
+    source?: string;
+    stage: string;
+    outcome: string;
+    reason: string;
+    inputs?: Record<string, any>;
+    positionId?: string;
+    solDelta?: number;
+    unverified?: boolean;
+  }): void {
+    try {
+      this.db
+        .prepare(
+          `INSERT INTO decisions (ts, auto_mode, mint, symbol, source, stage, outcome, reason, inputs_json, position_id, sol_delta, unverified)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          d.ts ?? Date.now(), d.autoMode, d.mint, d.symbol ?? null, d.source ?? null, d.stage, d.outcome, d.reason,
+          d.inputs ? JSON.stringify(d.inputs, (_k, v) => (typeof v === 'bigint' ? v.toString() : v)) : null,
+          d.positionId ?? null, d.solDelta ?? null, d.unverified ? 1 : 0
+        );
+    } catch (err: any) {
+      Logger.error(`Decision logging failed: ${err.message}`);
+    }
+  }
+
+  public loadDecisions(opts: { sinceTs?: number; mint?: string; stage?: string; outcome?: string; limit?: number } = {}): Array<{
+    id: number; ts: number; autoMode: string; mint: string; symbol: string | null; source: string | null; stage: string;
+    outcome: string; reason: string; inputs: any; positionId: string | null; solDelta: number | null; unverified: boolean;
+  }> {
+    const where: string[] = [];
+    const args: any[] = [];
+    if (opts.sinceTs !== undefined) { where.push('ts >= ?'); args.push(opts.sinceTs); }
+    if (opts.mint) { where.push('mint = ?'); args.push(opts.mint); }
+    if (opts.stage) { where.push('stage = ?'); args.push(opts.stage); }
+    if (opts.outcome) { where.push('outcome = ?'); args.push(opts.outcome); }
+    const sql = `SELECT * FROM decisions ${where.length ? 'WHERE ' + where.join(' AND ') : ''} ORDER BY id DESC LIMIT ?`;
+    args.push(opts.limit ?? 200);
+    const rows = this.db.prepare(sql).all(...args) as any[];
+    return rows.reverse().map((r) => ({
+      id: r.id, ts: r.ts, autoMode: r.auto_mode, mint: r.mint, symbol: r.symbol, source: r.source, stage: r.stage,
+      outcome: r.outcome, reason: r.reason, inputs: r.inputs_json ? JSON.parse(r.inputs_json) : null,
+      positionId: r.position_id, solDelta: r.sol_delta, unverified: !!r.unverified,
+    }));
+  }
+
+  /** Sum of the SOL each journaled fill moved in or out of the wallet between two timestamps (G3 wallet audit). */
+  public sumDecisionSolDelta(fromTs: number, toTs: number): { delta: number; gross: number; count: number } {
+    const rows = this.db
+      .prepare('SELECT sol_delta FROM decisions WHERE sol_delta IS NOT NULL AND ts > ? AND ts <= ?')
+      .all(fromTs, toTs) as Array<{ sol_delta: number }>;
+    return {
+      delta: rows.reduce((a, r) => a + r.sol_delta, 0),
+      gross: rows.reduce((a, r) => a + Math.abs(r.sol_delta), 0),
+      count: rows.length,
+    };
+  }
+
+  /**
+   * Closed positions that count as evidence (G3): paper fills with an unverified gate are left out (C5).
+   * Oldest first. Both CapitalSizer's win rate / payoff and the kill-switch expectancy read this one list.
+   */
+  public loadEvidenceClosedTrades(mode?: ExecutionMode): NormalizedPosition[] {
+    const closed = this.loadPositions(mode, 'CLOSED');
+    const unverified = this.getUnverifiedFillIds();
+    return closed.filter((p) => !unverified.has(p.id)).sort((a, b) => (a.updatedAt ?? 0) - (b.updatedAt ?? 0));
+  }
+
+  /**
+   * Order ids of paper fills where at least one safety gate stayed UNKNOWN (C5). Those fills are not evidence
+   * of an edge, so closed-trade statistics (CapitalSizer, kill-switch expectancy) leave them out.
+   */
+  public getUnverifiedFillIds(): Set<string> {
+    const ids = new Set<string>();
+    try {
+      const rows = this.db.prepare("SELECT payload_json FROM system_journal WHERE event_type = 'PAPER_FILL_GATES'").all() as Array<{ payload_json: string }>;
+      for (const r of rows) {
+        try {
+          const p = JSON.parse(r.payload_json);
+          if (p?.gates?.eligibility?.unverified?.length > 0 && p.orderId) ids.add(p.orderId);
+        } catch { /* skip */ }
+      }
+    } catch { /* no journal yet */ }
+    return ids;
   }
 
   public saveOrder(order: PersistedOrder) {

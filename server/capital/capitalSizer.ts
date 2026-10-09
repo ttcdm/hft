@@ -88,7 +88,8 @@ export class CapitalSizer {
    */
   public static getHistoricalTradeStats(mode?: ExecutionMode): HistoricalTradeStats {
     try {
-      const closed = workstationDb.loadPositions(mode, 'CLOSED');
+      // G3: paper fills with an unverified gate are not evidence of an edge and are left out of win rate and payoff
+      const closed = workstationDb.loadEvidenceClosedTrades(mode);
       if (closed.length === 0) {
         return {
           tradeCount: 0,

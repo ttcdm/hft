@@ -26,6 +26,7 @@ import {
   ArmSchema,
   AutoModeSchema,
   AutoKillSchema,
+  AutoResumeSchema,
   CalloutSnipeSchema,
   OPERATOR_PROVENANCE,
   OperatorCloseSchema,
@@ -1663,6 +1664,10 @@ app.post('/api/auto/kill', requireOperatorAuth, validateTradeBody(AutoKillSchema
   res.json({ success: true, ...result, status: autoSnipeController.getStatus() });
 });
 
+app.post('/api/auto/resume', requireOperatorAuth, validateTradeBody(AutoResumeSchema), (req, res) => {
+  res.json({ success: true, ...autoSnipeController.resume({ clearHalt: req.body.clearHalt }), status: autoSnipeController.getStatus() });
+});
+
 autoSnipeController.on('decision', (d) => broadcastWs({ type: 'AUTO_DECISION', data: d }));
 autoSnipeController.on('mode', (d) => broadcastWs({ type: 'AUTO_MODE', data: { ...d, status: autoSnipeController.getStatus() } }));
 
@@ -1816,6 +1821,7 @@ async function startServer() {
     });
   }
 
+  autoSnipeController.startMonitor(); // G3: kill-switch triggers and wallet audit (inert while the mode is OFF)
   server.listen(PORT, BIND_HOST, () => {
     console.log(`[APEX QUANT HFT] Autonomous Execution Engine running on ${BIND_HOST}:${PORT}`);
   });

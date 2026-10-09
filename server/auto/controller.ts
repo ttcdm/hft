@@ -225,7 +225,7 @@ export class AutoSnipeController extends EventEmitter {
       return { ok: false, mode: this.mode, error: 'PAPER auto mode needs the execution coordinator in PAPER' };
     }
     if (next === 'DEVNET_LIVE') {
-      if (allowedCluster() !== 'devnet') return { ok: false, mode: this.mode, error: 'DEVNET_LIVE is refused: ALLOWED_CLUSTER is not devnet. There is no mainnet auto mode.' };
+      if (allowedCluster() === 'mainnet-beta') return { ok: false, mode: this.mode, error: 'DEVNET_LIVE is refused: ALLOWED_CLUSTER is mainnet-beta (devnet or localnet only). There is no mainnet auto mode.' };
       if (coordMode !== 'LIVE') return { ok: false, mode: this.mode, error: 'DEVNET_LIVE needs the coordinator armed LIVE (on devnet)' };
       if (opts.confirmationCode !== DEVNET_CONFIRMATION_CODE) return { ok: false, mode: this.mode, error: 'DEVNET_LIVE needs the confirmation code' };
       try {

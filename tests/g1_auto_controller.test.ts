@@ -149,7 +149,7 @@ describe('G1: auto-snipe controller', () => {
     vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('LIVE');
     expect((await autoSnipeController.setMode('DEVNET_LIVE', { confirmationCode: 'nope' })).error).toMatch(/confirmation code/);
     vi.stubEnv('ALLOWED_CLUSTER', 'mainnet-beta');
-    expect((await autoSnipeController.setMode('DEVNET_LIVE', { confirmationCode: DEVNET_CONFIRMATION_CODE })).error).toMatch(/not devnet/);
+    expect((await autoSnipeController.setMode('DEVNET_LIVE', { confirmationCode: DEVNET_CONFIRMATION_CODE })).error).toMatch(/mainnet-beta/);
     vi.stubEnv('ALLOWED_CLUSTER', 'devnet');
     const ok = await autoSnipeController.setMode('DEVNET_LIVE', { confirmationCode: DEVNET_CONFIRMATION_CODE });
     expect(ok.ok, ok.error).toBe(true);

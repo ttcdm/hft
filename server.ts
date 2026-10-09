@@ -18,6 +18,7 @@ import { pumpFunService } from './server/pumpfunService';
 import { pumpFeedListener } from './server/solana/pumpFeedListener';
 import { autoSnipeController } from './server/auto/controller';
 import { watchWindow } from './server/signals/watchWindow';
+import { buildBoard } from './server/board';
 import { runComprehensiveTestSuite } from './server/unitTestCases';
 import { registerMarketRoutes } from './server/market/marketRoutes';
 import { run60DayBacktest } from './src/utils/backtestEngine';
@@ -1673,6 +1674,10 @@ app.post('/api/auto/mode', requireOperatorAuth, validateTradeBody(AutoModeSchema
 app.post('/api/auto/kill', requireOperatorAuth, validateTradeBody(AutoKillSchema), async (req, res) => {
   const result = await autoSnipeController.kill({ exitAll: req.body.exitAll, reason: req.body.reason });
   res.json({ success: true, ...result, status: autoSnipeController.getStatus() });
+});
+
+app.get('/api/board', requireOperatorAuth, (req, res) => {
+  res.json({ success: true, ...buildBoard() });
 });
 
 app.get('/api/watch', requireOperatorAuth, (req, res) => {

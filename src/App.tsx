@@ -40,7 +40,7 @@ import { BacktestModal } from './components/BacktestModal';
 import { PlugAndPlayTradingModal } from './components/PlugAndPlayTradingModal';
 import { AuthModal } from './components/AuthModal';
 import { engineClient, getOperatorSessionToken } from './services/engineClient';
-import { Coins } from 'lucide-react';
+import { TokenBoard } from './components/TokenBoard';
 
 // Bot configuration only. Performance fields (pnl, winRate, tradesCount, opsPerSec) start at zero and
 // must come from real fills; this UI never fabricates fills or PnL (B1).
@@ -155,6 +155,7 @@ export function makeEmptyKpis(startingEquity: number): PerformanceKPIs {
 export default function App() {
   // Master Kill Switch State
   const [isHalted, setIsHalted] = useState(false);
+  const [selectedMint, setSelectedMint] = useState<string | null>(null);
   const [activeFeed, setActiveFeed] = useState('CME_AURORA');
   const [selectedSymbol, setSelectedSymbol] = useState('BTC/USDT');
 
@@ -595,98 +596,12 @@ export default function App() {
         }}
       />
 
-      {/* 2. MAIN WORKSTATION DASHBOARD GRID */}
-      <main className="flex-1 p-4 lg:p-6 grid grid-cols-12 gap-5 max-w-[1920px] mx-auto w-full">
-        {/* $10 MICRO-CAPITAL ACCOUNT BANNER */}
-        {capitalTier === 'MICRO_10' && (
-          <div className="col-span-12 px-4 py-2.5 rounded-lg bg-gradient-to-r from-amber-950/60 via-[#16120B] to-[#0D1424] border border-amber-500/40 text-amber-300 font-mono text-xs flex flex-wrap items-center justify-between gap-3 shadow-md shadow-amber-950/20">
-            <div className="flex items-center space-x-2.5">
-              <div className="p-1 rounded bg-amber-500/20 text-amber-300">
-                <Coins className="w-4 h-4" />
-              </div>
-              <div>
-                <span className="font-bold uppercase tracking-wider text-amber-200">
-                  Micro-Capital Mode ($10.00 Starting Balance Active):
-                </span>
-                <span className="text-slate-300 ml-1.5 font-sans">
-                  Orders automatically scaled to 0.0001 BTC (~$6.89) to comply with Binance's 5.0 USDT minimum notional threshold. Max daily loss circuit breaker: $2.00 (20%).
-                </span>
-              </div>
-            </div>
-            <div className="flex items-center space-x-3 text-[11px]">
-              <span className="text-slate-400">
-                PnL Increments: <strong className="text-emerald-400">+$0.01 - $0.06 / trade</strong>
-              </span>
-              <button
-                onClick={toggleCapitalTier}
-                className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 font-bold transition"
-              >
-                Switch to $500k Institutional
-              </button>
-            </div>
-          </div>
-        )}
-
-        {/* LEFT COLUMN: PnL, Strategy Fleet, and Network Stress (5 columns on desktop) */}
-        <section className="col-span-12 lg:col-span-5 flex flex-col space-y-5">
-          {/* Realized/Unrealized P&L HUD & Canvas Equity Curve */}
-          <PnLEngine
-            kpis={kpis}
-            equityHistory={equityHistory}
-            drawdownHistory={drawdownHistory}
-            lastTickDelta={lastTickDelta}
-            isHalted={isHalted}
-          />
-
-          {/* Algorithmic Strategy Fleet Manager */}
-          <StrategyFleet
-            bots={bots}
-            onToggleBot={handleToggleBot}
-            onDeleteBot={handleDeleteBot}
-            onUpdateBot={handleUpdateBot}
-            onOpenDeployModal={() => setIsDeployModalOpen(true)}
-          />
-
-          {/* Network Stress & Jitter Injection Lab */}
-          <NetworkStressLab
-            stressConfig={stressConfig}
-            onUpdateConfig={setStressConfig}
-            currentEffectiveLatency={effectiveLatency}
-            currentSlippageMultiplier={slippageMultiplier}
-            fillRatePct={fillRatePct}
-            latencySamples={latencyHistory}
-            onExportPackets={handleExportPackets}
-          />
-        </section>
-
-        {/* RIGHT COLUMN: Order Book, Execution Tape, and Monte Carlo (7 columns on desktop) */}
-        <section className="col-span-12 lg:col-span-7 flex flex-col space-y-5">
-          {/* Split Top: Order Book & Execution Tape */}
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-5 min-h-[440px]">
-            {/* Microsecond Level 2 Order Depth */}
-            <OrderBook
-              orderBook={orderBook}
-              selectedSymbol={selectedSymbol}
-              onSelectSymbol={handleSelectSymbol}
-              lastTradedSide={orderBook.lastTradedSide}
-              flashTrigger={flashTrigger}
-            />
-
-            {/* Real-Time Execution Blotter Tape & Live Public Flow */}
-            <ExecutionTape
-              trades={trades}
-              publicTrades={publicTrades}
-              onExportPackets={handleExportPackets}
-              selectedSymbol={selectedSymbol}
-            />
-          </div>
-
-          {/* Institutional Analytics & Monte Carlo 1,000-Path Visualizer */}
-          <MonteCarloAnalytics
-            currentPrice={midPrice}
-            onOpenBacktest={() => setIsBacktestModalOpen(true)}
-          />
-        </section>
+      {/* 2. HOME: the token board (H1). Launches / Watching / Holding for Pump.fun on Solana. */}
+      <main className="flex-1 p-4 lg:p-6 grid grid-cols-12 gap-5 max-w-[1920px] mx-auto w-full content-start">
+        <TokenBoard onSelect={setSelectedMint} selected={selectedMint} />
+        <aside className="col-span-12 lg:col-span-4 flex flex-col space-y-5" data-testid="home-side">
+          {/* H2 / H3 panels mount here */}
+        </aside>
       </main>
 
       {/* 3. ALERT SYSTEM POPUPS */}

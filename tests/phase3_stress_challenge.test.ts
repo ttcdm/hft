@@ -440,15 +440,15 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
       });
       expect(tip2x.tipLamports).toBe(360_000);
 
-      // Scenario B: Extreme urgency multiplier bounded by economic sanity (25% of trade value)
-      // Trade: 0.010 SOL (10,000,000 lamports). 25% sanity ceiling = 2,500,000 lamports.
+      // Scenario B: Extreme urgency multiplier bounded by economic sanity (15% of trade value, planning decision #1)
+      // Trade: 0.010 SOL (10,000,000 lamports). 15% sanity ceiling = 1,500,000 lamports.
       // Base dynamic tip = 300,000 lamports. Urgency = 20x -> 6,000,000 lamports.
-      // Must be capped by operator ceiling (0.05 SOL = 50M) and economic sanity rule (25% = 2.5M).
+      // Must be capped by operator ceiling (0.05 SOL = 50M) and economic sanity rule (15% = 1.5M).
       const extremeTip = executionConfig.resolveDynamicJitoTip({
         tradeAmountSol: 0.010,
         urgencyMultiplier: 20.0,
       });
-      expect(extremeTip.tipLamports).toBe(2_500_000);
+      expect(extremeTip.tipLamports).toBe(1_500_000);
       expect(extremeTip.policyReason).toContain('CAPPED by economic sanity rule');
 
       // Scenario C: Live Jito floor with urgency multiplier

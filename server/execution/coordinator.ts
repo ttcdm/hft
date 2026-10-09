@@ -496,8 +496,25 @@ export class ExecutionCoordinator {
     this.recordSyntheticMarketEvent('LEGACY_DISPATCH');
   }
 
-  // Startup Reconciliation checking database, on-chain balances, and transport health
-  public async startupReconciliation(): Promise<{
+  private reconcileInFlight: Promise<{ status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE'; mismatchesCount: number; details: string }> | null = null;
+
+  // Startup Reconciliation checking database, on-chain balances, and transport health.
+  // Single-flight: a second call (e.g. POST /api/execution/reconcile during boot) joins the run in progress, so two
+  // passes never recover the same pending transaction or rewrite the same positions at once.
+  public startupReconciliation(): Promise<{
+    status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE';
+    mismatchesCount: number;
+    details: string;
+  }> {
+    if (!this.reconcileInFlight) {
+      this.reconcileInFlight = this.runStartupReconciliation().finally(() => {
+        this.reconcileInFlight = null;
+      });
+    }
+    return this.reconcileInFlight;
+  }
+
+  private async runStartupReconciliation(): Promise<{
     status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE';
     mismatchesCount: number;
     details: string;

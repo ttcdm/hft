@@ -19,8 +19,6 @@ const DEFAULT_MINTS = [
   'B1iVXZeMDYFzrYHXYwPh17n8cEkEM4bB4Mdd77N2osnp',
   'FxS38bTrPuaJxUCTrNEb6YpubJyKibfdUj7ScRjYkQkH',
 ];
-const BUY_SOL = 0.01;
-const MIN_BALANCE_SOL = 0.15;
 
 const phase = process.argv.includes('--phase=crash') ? 'crash' : process.argv.includes('--phase=recover') ? 'recover' : 'main';
 const scratch = process.env.APEX_E2E_SCRATCH || fs.mkdtempSync(path.join(os.tmpdir(), 'apex-e2e-'));
@@ -71,19 +69,23 @@ async function main() {
   // The only place the real-money flag is flipped, and only after the assertion above.
   process.env.ALLOW_LIVE_REAL_MONEY_TRADING = 'true';
 
+  // Faucet policy: never loop and never request repeatedly. By default no airdrop at all; the wallet uses what it has.
+  // DEVNET_AIRDROP_ONCE=1 sends exactly one 1 SOL request (no retry) for a brand-new throwaway wallet.
   let bal = await conn.getBalance(kp.publicKey);
-  for (let i = 0; i < 3 && bal < MIN_BALANCE_SOL * LAMPORTS_PER_SOL; i++) {
+  if (bal === 0 && process.env.DEVNET_AIRDROP_ONCE === '1') {
     try {
       const sig = await conn.requestAirdrop(kp.publicKey, 1 * LAMPORTS_PER_SOL);
       await conn.confirmTransaction(sig, 'confirmed');
     } catch (e: any) {
-      console.log(`airdrop attempt ${i + 1} failed: ${String(e.message).slice(0, 120)}`);
-      await sleep(2000);
+      console.log(`single airdrop request failed (not retried): ${String(e.message).slice(0, 120)}`);
     }
     bal = await conn.getBalance(kp.publicKey);
   }
-  const funded = bal >= MIN_BALANCE_SOL * LAMPORTS_PER_SOL;
-  rec('funding', funded, `${bal / LAMPORTS_PER_SOL} SOL at ${kp.publicKey.toBase58()}${funded ? '' : ' (UNFUNDED: fund this devnet address and re-run; the 10% spendable ceiling needs about 0.115 SOL for a 0.01 SOL buy)'}`);
+  // Sizes scale down to the balance: the 10% spendable ceiling means a buy of about 8% of the balance.
+  const balSol = bal / LAMPORTS_PER_SOL;
+  const BUY_SOL = Math.min(0.01, Number((balSol * 0.08).toFixed(5)));
+  const funded = balSol >= 0.03;
+  rec('funding', funded, `${balSol} SOL at ${kp.publicKey.toBase58()}; buy size ${BUY_SOL} SOL${funded ? '' : ' (too low to trade: fund this devnet address and re-run; only the simulate stage runs)'}`);
 
   const { PumpCurveService } = await import('../server/solana/pumpCurve');
   const { txBuilder } = await import('../server/solana/transactionBuilder');

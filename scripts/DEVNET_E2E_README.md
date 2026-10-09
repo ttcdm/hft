@@ -12,12 +12,13 @@ Optional env: `DEVNET_RPC_URL` (must not look like mainnet), `DEVNET_MINTS=<comm
 - It aborts unless `getGenesisHash()` equals the devnet hash `EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG`. Only then does it set
   `ALLOW_LIVE_REAL_MONEY_TRADING=true`, in-process.
 - The keypair is a throwaway generated in the temp directory. The repo keypair is never used. If the address cannot be
-  funded by airdrop the harness prints the address, runs only the simulate stage, and exits 1 (UNFUNDED).
-  A 0.01 SOL buy needs about 0.115 SOL or more because of the 10% spendable ceiling.
+  funded the harness prints the address, runs only the simulate stage, and exits 1 (UNFUNDED).
+- Faucet: no airdrop by default and never a retry loop. `DEVNET_AIRDROP_ONCE=1` sends exactly one request for an empty wallet.
+  Trade size scales to the balance (about 8% of it, max 0.01 SOL, because of the 10% spendable ceiling); below 0.03 SOL it does not trade.
 
 ## Stages
 1. Simulate BUY with `sigVerify:false, replaceRecentBlockhash:true` (PumpCurveService LIVE state, calculateBuyQuote, txBuilder).
-2. (a) BUY 0.01 SOL through the real ExecutionCoordinator: Jito fails, RPC fallback, CONFIRMED, db tokenQuantityRaw == on-chain ATA balance.
+2. (a) BUY (scaled, see above) through the real ExecutionCoordinator: Jito fails, RPC fallback, CONFIRMED, db tokenQuantityRaw == on-chain ATA balance.
 3. (b) close 50%. (c) close 100% (ATA closed, about 0.00203928 SOL rent back). Every signature is checked with getTransaction and printed as a Solscan `?cluster=devnet` link.
 4. (d) forced revert: a buy with maxSolCost of 1 lamport, sent with skipPreflight, must land with an error.
 5. (e) a second submit with an already recorded orderId must add no transaction row.

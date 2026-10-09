@@ -980,6 +980,10 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
     let coordinator: ExecutionCoordinator;
 
     beforeEach(() => {
+      // The coordinator probes RPC on construction. Answer from mocks so the
+      // test never depends on a reachable network or an SDK stub.
+      vi.spyOn(Connection.prototype, 'getSlot').mockResolvedValue(280005000);
+      vi.spyOn(Connection.prototype, 'getBalance').mockResolvedValue(5_000_000_000);
       coordinator = new ExecutionCoordinator();
     });
 

@@ -456,7 +456,7 @@ describe('Tier 1: Feature Coverage (Features 21 - 25)', () => {
 
     it('F25.5: project architecture and request contracts document all 25 features and milestone gates', () => {
       const projectMdPath = path.resolve(process.cwd(), 'PROJECT.md');
-      const originalRequestPath = path.resolve(process.cwd(), '.agents/ORIGINAL_REQUEST.md');
+      const originalRequestPath = path.resolve(process.cwd(), 'ORIGINAL_REQUEST.md');
 
       expect(fs.existsSync(projectMdPath)).toBe(true);
       expect(fs.existsSync(originalRequestPath)).toBe(true);

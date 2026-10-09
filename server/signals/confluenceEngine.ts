@@ -7,6 +7,7 @@ import {
 import {
   CreatorRiskReport,
   CreatorRiskScorer,
+  creatorRiskScorer,
 } from './creatorRiskScorer';
 
 export const MIN_CONFLUENCE_SCORE = 70;
@@ -102,16 +103,10 @@ export class ConfluenceEngine {
     } else if (input.mint && curveVelocityEvaluator.hasData(input.mint)) {
       curveScore = curveVelocityEvaluator.getMetrics(input.mint).velocityScore;
     } else {
-      // Fallback: sweet spot is 60% - 95% curve completion
-      if (input.bondingCurveProgress >= 90) {
-        curveScore = 15;
-      } else if (input.bondingCurveProgress >= 70) {
-        curveScore = 12;
-      } else if (input.bondingCurveProgress >= 40) {
-        curveScore = 8;
-      } else {
-        curveScore = 4;
-      }
+      // C2: no measured velocity means no velocity points. The old fallback awarded up to 15 points from curve
+      // progress alone (>= 90% got the maximum), which scored a nearly-finished curve as if it were accelerating.
+      curveScore = 0;
+      missing.push('velocity');
     }
 
     // 5. Buy/Sell Imbalance Score (0 - 20)
@@ -126,8 +121,10 @@ export class ConfluenceEngine {
     // 6. Creator Risk Score (0 - 5)
     // Priority: Real on-chain creator transaction history & burner wallet detection
     let creatorRiskScore = 0;
-    if (input.creatorRiskReport) {
-      creatorRiskScore = input.creatorRiskReport.confluenceScore;
+    const creatorReport =
+      input.creatorRiskReport ?? (input.creatorAddress ? creatorRiskScorer.getCachedReport(input.creatorAddress) : undefined);
+    if (creatorReport) {
+      creatorRiskScore = creatorReport.confluenceScore;
     } else if (input.isCreatorBurner === true) {
       creatorRiskScore = 0;
     } else if (input.creatorWalletAgeSeconds !== undefined || input.creatorSignatureCount !== undefined) {

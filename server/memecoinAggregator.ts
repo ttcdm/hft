@@ -127,7 +127,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     telegramChatId: '',
     telegramWebhookActive: false,
   };
-  private isConfluenceGatingEnabled: boolean = false;
+  // C2: on by default. Operators can still switch it off explicitly with setConfluenceGating(false).
+  private isConfluenceGatingEnabled: boolean = true;
 
   constructor() {
     super();
@@ -324,22 +325,25 @@ export class MemecoinAggregatorService extends EventEmitter {
     }
 
     const mint = pool ? pool.contractAddress : typeof poolOrMint === 'string' ? poolOrMint : '';
-    const priceChange5mPct = pool?.priceChange5mPct ?? 0;
-    const liquidityUsd = pool?.liquidityUsd ?? 0;
+    // C2: unknown stays null (scores 0 and is listed as missing), never a defaulted 0
+    const fin = (n: unknown): number | null => (typeof n === 'number' && Number.isFinite(n) ? n : null);
+    const priceChange5mPct = fin(pool?.priceChange5mPct);
+    const liquidityUsd = fin(pool?.liquidityUsd);
     // B3: -1 / undefined mean UNKNOWN. Unknown is passed as null and scores 0; it used to default to 20% (10 free points).
     const top10HoldersPct = pool?.top10HoldersPct !== undefined && pool.top10HoldersPct >= 0 ? pool.top10HoldersPct : null;
     const bondingCurveProgress = pool?.bondingCurveProgress ?? 0;
-    const buys5m = pool?.buys5m ?? 0;
-    const sells5m = pool?.sells5m ?? 0;
+    const buys5m = fin(pool?.buys5m);
+    const sells5m = fin(pool?.sells5m);
     // Unknown dev holding used to default to 0% (the full 5 dev-risk points).
     const devHoldingPct = pool?.devHoldingPct !== undefined && pool.devHoldingPct >= 0 ? pool.devHoldingPct : null;
-    const hasVerifiedSocialCall =
-      (pool?.trendingRank !== undefined && pool.trendingRank > 0) ||
-      (pool?.volume5mUsd !== undefined && pool.volume5mUsd > 10000);
-    const socialCallCount = pool?.trendingRank ? Math.max(1, 4 - pool.trendingRank) : 0;
+    // C2: a DexScreener trending rank or a volume figure is not a verified social call, so the social factor is
+    // not awarded here (it used to be inferred from trendingRank / volume > $10k).
+    const hasVerifiedSocialCall = false;
+    const socialCallCount = 0;
 
     const breakdown = ConfluenceEngine.calculate({
       mint,
+      creatorAddress: pumpFeedListener.getCreatorForMint(mint),
       priceChange5mPct,
       liquidityUsd,
       top10HoldersPct,

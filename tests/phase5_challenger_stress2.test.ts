@@ -278,7 +278,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
       expect(report).toBeDefined();
       expect(report.creatorAddress).toBe(VALID_CREATOR_BASE58);
       expect(report.riskScore).toBe(30);
-      expect(report.confluenceScore).toBe(1);
+      expect(report.confluenceScore).toBe(0); // C2: a failed lookup earns no points
       expect(report.isBurner).toBe(true);
       expect(report.riskFlags).toContain('RPC_HISTORY_QUERY_FAILED');
       expect(report.details).toContain('ETIMEDOUT');
@@ -294,7 +294,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
 
       const report = await scorer.evaluateCreator(rateLimitedRpc, VALID_CREATOR_BASE58);
       expect(report.riskScore).toBe(30);
-      expect(report.confluenceScore).toBe(1);
+      expect(report.confluenceScore).toBe(0); // C2: a failed lookup earns no points
       expect(report.isBurner).toBe(true);
       expect(report.riskFlags).toContain('RPC_HISTORY_QUERY_FAILED');
     });
@@ -309,7 +309,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
 
       const report = await scorer.evaluateCreator(throwingStringRpc, VALID_CREATOR_BASE58);
       expect(report.riskScore).toBe(30);
-      expect(report.confluenceScore).toBe(1);
+      expect(report.confluenceScore).toBe(0); // C2: a failed lookup earns no points
       expect(report.isBurner).toBe(true);
       expect(report.details).toContain('RPC socket terminated abruptly');
     });
@@ -335,7 +335,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
 
       const report = await scorer.evaluateCreator(dummyRpc, malformedAddress);
       expect(report.riskScore).toBe(30);
-      expect(report.confluenceScore).toBe(1);
+      expect(report.confluenceScore).toBe(0); // C2: a failed lookup earns no points
       expect(report.riskFlags).toContain('RPC_HISTORY_QUERY_FAILED');
     });
   });

@@ -20,6 +20,7 @@ describe('Phase 2 Remediation Suite (B02, B08, B09, B17, B21, B23)', () => {
   const origEnv = { ...process.env };
 
   beforeEach(() => {
+    memecoinAggregator.setConfluenceGating(false); // C2: gating is on by default; this test is about something else
     process.env.ALLOW_LIVE_REAL_MONEY_TRADING = 'true';
     delete process.env.ENABLE_BINANCE_FUTURES;
   });

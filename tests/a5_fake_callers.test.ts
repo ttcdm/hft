@@ -71,6 +71,7 @@ describe('A5: fake callers cannot drive auto-snipe', () => {
   // snipedMints is the one piece of private state the evaluator mutates; save and restore it around each test.
   let savedSniped: string[];
   beforeEach(() => {
+    memecoinAggregator.setConfluenceGating(false); // C2: gating is on by default; this test is about something else
     savedSniped = [...(pumpFunService as any).snipedMints];
     (pumpFunService as any).snipedMints.clear();
   });

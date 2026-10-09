@@ -1,3 +1,4 @@
+import { seedSurge } from './fixtures/velocity';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair, PublicKey } from '@solana/web3.js';
 import {
@@ -298,7 +299,7 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
 
       expect(report.creatorAddress).toBe(pubkey.toBase58());
       expect(report.isBurner).toBe(true);
-      expect(report.confluenceScore).toBe(1); // Penalized to conservative 1
+      expect(report.confluenceScore).toBe(0); // C2: a failed lookup earns no points
       expect(report.riskFlags).toContain('RPC_HISTORY_QUERY_FAILED');
       expect(report.details).toContain('Connection timeout');
     });
@@ -373,7 +374,7 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
         priceChange5mPct: -50,
         liquidityUsd: 0,
         top10HoldersPct: 100,
-        bondingCurveProgress: 0,
+        bondingCurveProgress: 0, curveVelocityMetrics: { velocityScore: 4 } as any, // C2: measured velocity stands in for the removed progress fallback
         buys5m: 0,
         sells5m: 50,
         devHoldingPct: 100,
@@ -428,7 +429,7 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
         priceChange5mPct: 30,
         liquidityUsd: 40000,
         top10HoldersPct: 25,
-        bondingCurveProgress: 95,
+        bondingCurveProgress: 95, curveVelocityMetrics: { velocityScore: 15 } as any, // C2: measured velocity stands in for the removed progress fallback
         buys5m: 70,
         sells5m: 30,
         devHoldingPct: 0,
@@ -442,7 +443,7 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
         priceChange5mPct: 30,
         liquidityUsd: 40000,
         top10HoldersPct: 25,
-        bondingCurveProgress: 95,
+        bondingCurveProgress: 95, curveVelocityMetrics: { velocityScore: 15 } as any, // C2: measured velocity stands in for the removed progress fallback
         buys5m: 70,
         sells5m: 30,
         devHoldingPct: 0,
@@ -456,7 +457,7 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
         priceChange5mPct: 30,
         liquidityUsd: 40000,
         top10HoldersPct: 25,
-        bondingCurveProgress: 95,
+        bondingCurveProgress: 95, curveVelocityMetrics: { velocityScore: 15 } as any, // C2: measured velocity stands in for the removed progress fallback
         buys5m: 75,
         sells5m: 25,
         devHoldingPct: 0,
@@ -470,7 +471,7 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
         priceChange5mPct: 30,
         liquidityUsd: 40000,
         top10HoldersPct: 25,
-        bondingCurveProgress: 95,
+        bondingCurveProgress: 95, curveVelocityMetrics: { velocityScore: 15 } as any, // C2: measured velocity stands in for the removed progress fallback
         buys5m: 75,
         sells5m: 25,
         devHoldingPct: 0,
@@ -502,7 +503,7 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
         priceChange5mPct: 10,
         liquidityUsd: 10000,
         top10HoldersPct: 20,
-        bondingCurveProgress: 10,
+        bondingCurveProgress: 10, curveVelocityMetrics: { velocityScore: 4 } as any, // C2: measured velocity stands in for the removed progress fallback
         buys5m: 10,
         sells5m: 5,
         devHoldingPct: 0.0, // fallback heuristic would give 5 pts
@@ -720,6 +721,7 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
       snipeSpy.mockClear();
 
       // Scenario 3: confluenceCount = 2 AND high composite score (>= 70) -> TRIGGERED!
+      seedSurge(calloutBase.token.mint); // C2: velocity must be measured, curve progress earns nothing
       (pumpfunService as any).hotCallouts = [{ ...calloutBase, confluenceCount: 2 }];
       await (pumpfunService as any).evaluateAutoSnipeTriggers();
       expect(snipeSpy.mock.calls.length).toBe(1);

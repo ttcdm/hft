@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import { memecoinAggregator } from '../server/memecoinAggregator';
@@ -10,6 +10,9 @@ import { OperatorSnipeSchema, CalloutSnipeSchema } from '../server/execution/tra
 import { MINT_A } from './fixtures/socialFeeds';
 
 describe('C6: one source for Jito tip defaults', () => {
+  beforeEach(() => {
+    memecoinAggregator.setConfluenceGating(false); // C2: gating is on by default; this test is about something else
+  });
   afterEach(() => vi.restoreAllMocks());
 
   it('executeSnipe with no operator tip passes NO explicit tip to the coordinator', async () => {

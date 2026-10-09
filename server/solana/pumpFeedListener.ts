@@ -3,10 +3,38 @@ import { EventEmitter } from 'events';
 import { PUMP_FUN_PROGRAM_ID } from './programs';
 import { Logger } from '../middleware/enterprise';
 import { executionCoordinator } from '../execution/coordinator';
+import { curveVelocityEvaluator } from '../signals/curveVelocityEvaluator';
+import { creatorRiskScorer } from '../signals/creatorRiskScorer';
 
 // Anchor CreateEvent 8-byte discriminator: sha256("event:CreateEvent")[0..8]
 // Hex: 1b72a94ddeeb6376
 export const PUMP_CREATE_EVENT_DISCRIMINATOR = Buffer.from('1b72a94ddeeb6376', 'hex');
+
+// Anchor TradeEvent 8-byte discriminator: sha256("event:TradeEvent")[0..8]
+export const PUMP_TRADE_EVENT_DISCRIMINATOR = Buffer.from('bddb7fd34ee661ee', 'hex');
+
+/** Hard cap on how long a create event waits for the creator-history lookup before scoring continues without it. */
+export const CREATOR_RISK_TIMEOUT_MS = 300;
+
+/**
+ * Decoded pump.fun TradeEvent (fixed prefix of the IDL in @pump-fun/pump-sdk 1.37:
+ * mint, sol_amount, token_amount, is_buy, user, timestamp, virtual/real reserves).
+ * UNVERIFIED against live logs: trades may be emitted through a self-CPI that logsSubscribe cannot see.
+ */
+export interface PumpTradeEvent {
+  signature: string;
+  slot: number;
+  mint: string;
+  solAmountLamports: bigint;
+  tokenAmount: bigint;
+  isBuy: boolean;
+  user: string;
+  timestampSec: number;
+  virtualSolReserves: bigint;
+  virtualTokenReserves: bigint;
+  realSolReserves: bigint;
+  realTokenReserves: bigint;
+}
 
 export interface PumpCreateEvent {
   signature: string;
@@ -35,6 +63,7 @@ export interface PumpFeedListenerTelemetry {
   subscriptionId: number | null;
   eventsReceived: number;
   eventsParsed: number;
+  tradesParsed: number;
   lastEventTimestamp: number;
   lastEventAgeMs: number;
   averageParseLatencyMs: number;
@@ -52,6 +81,7 @@ export class PumpFeedListener extends EventEmitter {
   private status: 'ACTIVE' | 'CONNECTING' | 'RECONNECTING' | 'DISCONNECTED' | 'ERROR' = 'DISCONNECTED';
   private eventsReceived: number = 0;
   private eventsParsed: number = 0;
+  private tradesParsed: number = 0;
   private lastEventTimestamp: number = 0;
   private totalParseLatencyMs: number = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
@@ -135,6 +165,104 @@ export class PumpFeedListener extends EventEmitter {
     creatorPubkey.toBuffer().copy(buf, offset);
 
     return `Program data: ${buf.toString('base64')}`;
+  }
+
+  /** Serialize a TradeEvent into Anchor log format. For deterministic tests and log-fixture replay. */
+  public static encodeTradeEventLog(params: {
+    mint: PublicKey | string;
+    solAmountLamports: bigint;
+    tokenAmount: bigint;
+    isBuy: boolean;
+    user: PublicKey | string;
+    timestampSec: number;
+    virtualSolReserves: bigint;
+    virtualTokenReserves: bigint;
+    realSolReserves: bigint;
+    realTokenReserves: bigint;
+  }): string {
+    const pk = (k: PublicKey | string) => (typeof k === 'string' ? new PublicKey(k) : k);
+    const buf = Buffer.alloc(8 + 32 + 8 + 8 + 1 + 32 + 8 + 8 + 8 + 8 + 8);
+    let o = 0;
+    PUMP_TRADE_EVENT_DISCRIMINATOR.copy(buf, o); o += 8;
+    pk(params.mint).toBuffer().copy(buf, o); o += 32;
+    buf.writeBigUInt64LE(params.solAmountLamports, o); o += 8;
+    buf.writeBigUInt64LE(params.tokenAmount, o); o += 8;
+    buf.writeUInt8(params.isBuy ? 1 : 0, o); o += 1;
+    pk(params.user).toBuffer().copy(buf, o); o += 32;
+    buf.writeBigInt64LE(BigInt(params.timestampSec), o); o += 8;
+    buf.writeBigUInt64LE(params.virtualSolReserves, o); o += 8;
+    buf.writeBigUInt64LE(params.virtualTokenReserves, o); o += 8;
+    buf.writeBigUInt64LE(params.realSolReserves, o); o += 8;
+    buf.writeBigUInt64LE(params.realTokenReserves, o);
+    return `Program data: ${buf.toString('base64')}`;
+  }
+
+  /** Decode every TradeEvent in a transaction's logs (a tx can contain several). Never throws. */
+  public parseTradeLogs(logs: Logs, ctx?: { slot: number }): PumpTradeEvent[] {
+    if (logs.err) return [];
+    const out: PumpTradeEvent[] = [];
+    for (const log of logs.logs) {
+      if (!log.startsWith('Program data: ')) continue;
+      try {
+        const buf = Buffer.from(log.slice('Program data: '.length).trim(), 'base64');
+        if (buf.length < 129 || !buf.subarray(0, 8).equals(PUMP_TRADE_EVENT_DISCRIMINATOR)) continue;
+        let o = 8;
+        const mint = new PublicKey(buf.subarray(o, o + 32)).toBase58(); o += 32;
+        const solAmountLamports = buf.readBigUInt64LE(o); o += 8;
+        const tokenAmount = buf.readBigUInt64LE(o); o += 8;
+        const isBuy = buf.readUInt8(o) === 1; o += 1;
+        const user = new PublicKey(buf.subarray(o, o + 32)).toBase58(); o += 32;
+        const timestampSec = Number(buf.readBigInt64LE(o)); o += 8;
+        const virtualSolReserves = buf.readBigUInt64LE(o); o += 8;
+        const virtualTokenReserves = buf.readBigUInt64LE(o); o += 8;
+        const realSolReserves = buf.readBigUInt64LE(o); o += 8;
+        const realTokenReserves = buf.readBigUInt64LE(o);
+        out.push({
+          signature: logs.signature, slot: ctx?.slot ?? 0, mint, solAmountLamports, tokenAmount, isBuy, user,
+          timestampSec, virtualSolReserves, virtualTokenReserves, realSolReserves, realTokenReserves,
+        });
+      } catch {
+        // malformed data: skip
+      }
+    }
+    return out;
+  }
+
+  /** Feed one decoded trade into the curve velocity evaluator and notify subscribers. */
+  public ingestTradeEvent(trade: PumpTradeEvent): void {
+    const ts = Date.now();
+    curveVelocityEvaluator.recordTradeFlow(trade.mint, Number(trade.solAmountLamports) / 1e9, trade.isBuy, ts, trade.slot);
+    curveVelocityEvaluator.recordTransition(trade.mint, trade.slot, Number(trade.realSolReserves) / 1e9, ts);
+    this.tradesParsed++;
+    try {
+      this.emit('trade_event', trade);
+    } catch (emitErr: any) {
+      Logger.warn(`PumpFeedListener trade subscriber error: ${emitErr?.message || emitErr}`);
+    }
+  }
+
+  /** Mint -> creator for tokens seen in create events, so later scoring can find the creator. */
+  private creatorByMint: Map<string, string> = new Map();
+  public getCreatorForMint(mint: string): string | undefined {
+    return this.creatorByMint.get(mint);
+  }
+
+  /**
+   * Score a new token's creator from their transaction history, capped at CREATOR_RISK_TIMEOUT_MS. On timeout the
+   * lookup keeps running and fills the scorer's per-creator cache, so a later confluence read still sees it.
+   * A creator with no report scores 0 creator-risk points (missing is never safe).
+   */
+  public async scoreCreator(event: PumpCreateEvent): Promise<boolean> {
+    this.creatorByMint.set(event.mint, event.creator);
+    if (this.creatorByMint.size > 5000) {
+      const first = this.creatorByMint.keys().next().value;
+      if (first !== undefined) this.creatorByMint.delete(first);
+    }
+    const conn = this.connection || executionCoordinator.getConnection();
+    if (!conn) return false;
+    const lookup = creatorRiskScorer.evaluateCreator(conn, event.creator).then(() => true).catch(() => false);
+    const timeout = new Promise<boolean>((resolve) => setTimeout(() => resolve(false), CREATOR_RISK_TIMEOUT_MS));
+    return Promise.race([lookup, timeout]);
   }
 
   /**
@@ -320,6 +448,7 @@ export class PumpFeedListener extends EventEmitter {
         (logs: Logs, ctx: Context) => {
           this.eventsReceived++;
           try {
+            for (const trade of this.parseTradeLogs(logs, ctx)) this.ingestTradeEvent(trade);
             const event = this.parseLogs(logs, ctx);
             if (event) {
               this.eventsParsed++;
@@ -332,6 +461,9 @@ export class PumpFeedListener extends EventEmitter {
               } catch (coordErr: any) {
                 Logger.warn(`PumpFeedListener coordinator record error: ${coordErr?.message || coordErr}`);
               }
+
+              // C2: look the creator up in the background (300ms cap) so the score is cached by the time it is needed
+              this.scoreCreator(event).catch(() => {});
 
               // Emit event to subscribers
               try {
@@ -405,6 +537,7 @@ export class PumpFeedListener extends EventEmitter {
       subscriptionId: this.subscriptionId,
       eventsReceived: this.eventsReceived,
       eventsParsed: this.eventsParsed,
+      tradesParsed: this.tradesParsed,
       lastEventTimestamp: this.lastEventTimestamp,
       lastEventAgeMs: this.lastEventTimestamp > 0 ? now - this.lastEventTimestamp : -1,
       averageParseLatencyMs:

@@ -11,6 +11,10 @@ const liveTokenInput = (over: Record<string, any> = {}) => ({
 });
 
 describe('S1: Telegram / social integrations', () => {
+  beforeEach(() => {
+    memecoinAggregator.setConfluenceGating(false); // C2: gating is on by default; this test is about something else
+  });
+
   afterEach(() => {
     vi.restoreAllMocks();
     riskEngine.setKillSwitch(false);

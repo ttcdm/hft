@@ -1,3 +1,4 @@
+import { seedSurge } from './fixtures/velocity';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { Keypair } from '@solana/web3.js';
 import {
@@ -308,7 +309,7 @@ describe('Phase 5 Master Remediation Suite: Alpha Pipeline Integration (B14)', (
         priceChange5mPct: 40.0,      // 20/20 momentum
         liquidityUsd: 60000,         // 15/15 liquidity
         top10HoldersPct: 10.0,       // 15/15 distribution
-        bondingCurveProgress: 95,    // 15/15 curve
+        bondingCurveProgress: 95, curveVelocityMetrics: { velocityScore: 15 } as any, // C2: measured velocity stands in for the removed progress fallback    // 15/15 curve
         buys5m: 80,                  // 80% buy ratio -> 16/20 imbalance
         sells5m: 20,
         devHoldingPct: 0.0,          // 5/5 dev risk
@@ -368,7 +369,7 @@ describe('Phase 5 Master Remediation Suite: Alpha Pipeline Integration (B14)', (
         priceChange5mPct: 25.0,
         liquidityUsd: 30000,
         top10HoldersPct: 18.0,
-        bondingCurveProgress: 75,
+        bondingCurveProgress: 75, curveVelocityMetrics: { velocityScore: 12 } as any, // C2: measured velocity stands in for the removed progress fallback
         buys5m: 40,
         sells5m: 10,
         devHoldingPct: 0.0,
@@ -385,7 +386,7 @@ describe('Phase 5 Master Remediation Suite: Alpha Pipeline Integration (B14)', (
         priceChange5mPct: 25.0,
         liquidityUsd: 30000,
         top10HoldersPct: 18.0,
-        bondingCurveProgress: 75,
+        bondingCurveProgress: 75, curveVelocityMetrics: { velocityScore: 12 } as any, // C2: measured velocity stands in for the removed progress fallback
         buys5m: 40,
         sells5m: 10,
         devHoldingPct: 0.0,
@@ -404,7 +405,7 @@ describe('Phase 5 Master Remediation Suite: Alpha Pipeline Integration (B14)', (
         priceChange5mPct: 35.0,
         liquidityUsd: 40000,
         top10HoldersPct: 12.0,
-        bondingCurveProgress: 85,
+        bondingCurveProgress: 85, curveVelocityMetrics: { velocityScore: 12 } as any, // C2: measured velocity stands in for the removed progress fallback
         buys5m: 50,
         sells5m: 10,
         devHoldingPct: 0.0,
@@ -418,7 +419,7 @@ describe('Phase 5 Master Remediation Suite: Alpha Pipeline Integration (B14)', (
         priceChange5mPct: 0.0,
         liquidityUsd: 1000,
         top10HoldersPct: 60.0,
-        bondingCurveProgress: 15,
+        bondingCurveProgress: 15, curveVelocityMetrics: { velocityScore: 4 } as any, // C2: measured velocity stands in for the removed progress fallback
         buys5m: 5,
         sells5m: 20,
         devHoldingPct: 8.0,
@@ -554,6 +555,7 @@ describe('Phase 5 Master Remediation Suite: Alpha Pipeline Integration (B14)', (
       };
 
       (memecoinAggregator as any).pools.unshift(strongPool);
+      seedSurge(strongPool.contractAddress); // C2: velocity must be measured
 
       // Mock coordinator execution success to isolate aggregator confluence gating
       vi.spyOn(executionCoordinator, 'executeTrade').mockResolvedValueOnce({
@@ -639,6 +641,7 @@ describe('Phase 5 Master Remediation Suite: Alpha Pipeline Integration (B14)', (
         status: 'ACTIVE',
       };
 
+      seedSurge(TEST_MINT_1); // C2: velocity must be measured
       const breakdown = pumpfunService.evaluateCalloutConfluence(mockCallout);
       expect(breakdown.compositeScore).toBeGreaterThanOrEqual(70);
       expect(isConfluencePassed(breakdown.compositeScore)).toBe(true);

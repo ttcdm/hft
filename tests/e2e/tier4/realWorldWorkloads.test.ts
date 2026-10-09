@@ -385,7 +385,7 @@ describe('Tier 4: Real-World Workload Scenarios (Realistic Multi-Step Lifecycles
       priceChange5mPct: 45.0,
       liquidityUsd: 28000,
       top10HoldersPct: 15.0,
-      bondingCurveProgress: 65,
+      bondingCurveProgress: 65, curveVelocityMetrics: { velocityScore: 8 } as any, // C2: measured velocity stands in for the removed progress fallback
       buys5m: 55,
       sells5m: 8,
       devHoldingPct: 0.0,

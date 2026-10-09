@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-dotenv.config({ override: true });
+dotenv.config();
 import { Connection, PublicKey, SystemProgram, VersionedTransaction } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID, createCloseAccountInstruction } from '@solana/spl-token';
 import {
@@ -23,6 +23,7 @@ import { workstationDb } from '../db/database';
 import { getRandomJitoTipAccount, TOKEN_2022_PROGRAM_ID } from '../solana/programs';
 import { executionConfig } from '../solana/executionConfig';
 import { Logger } from '../middleware/enterprise';
+import { assertClusterAllowed, resolveRpcUrl } from '../solana/clusterGuard';
 import { PumpCurveService, TradeQuote, fetchTokenHolderDistribution } from '../solana/pumpCurve';
 import { TradeReconciler, RealMarkPriceService, PreTradeSnapshot } from './reconciliation';
 export type { PreTradeSnapshot };
@@ -66,6 +67,7 @@ export class ExecutionCoordinator {
   private isLiveTradingArmed: boolean = false;
   private inFlightReservedSol: number = 0;
   private inFlightPositionExits: Set<string> = new Set<string>();
+  private inFlightBuyMints: Set<string> = new Set<string>();
   private connection: Connection;
   private rpcEndpoint: string;
   private rpcLatencyMs: number = 0;
@@ -85,6 +87,7 @@ export class ExecutionCoordinator {
   private lastSyntheticMarketEventTimestamp: number = 0;
   private autoTpSlInterval: NodeJS.Timeout | null = null;
   private feedHeartbeatInterval: NodeJS.Timeout | null = null;
+  private jitoProbeInterval: NodeJS.Timeout | null = null;
   private lastStartupReconciliation: {
     status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE';
     checkedAt: number;
@@ -102,10 +105,10 @@ export class ExecutionCoordinator {
     if (isConn) {
       this.isDefaultSingleton = Boolean(isDefaultSingleton);
       this.connection = connectionOrIsSingleton as Connection;
-      this.rpcEndpoint = (connectionOrIsSingleton as any)._rpcEndpoint || process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+      this.rpcEndpoint = (connectionOrIsSingleton as any)._rpcEndpoint || resolveRpcUrl();
     } else {
       this.isDefaultSingleton = Boolean(connectionOrIsSingleton);
-      this.rpcEndpoint = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+      this.rpcEndpoint = resolveRpcUrl();
       this.connection = new Connection(this.rpcEndpoint, {
         commitment: 'confirmed',
         confirmTransactionInitialTimeout: 30000,
@@ -156,6 +159,15 @@ export class ExecutionCoordinator {
     this.feedHeartbeatInterval = setInterval(checkFeed, 10000);
   }
 
+  /** Re-probe the block engine on an interval so readiness reflects current health, not boot-time health. */
+  private startJitoProbeLoop() {
+    if (this.jitoProbeInterval || !this.jitoTransport.isEnabled()) return;
+    const intervalMs = Math.max(1000, executionConfig.getConfig().jitoProbeIntervalMs);
+    this.jitoProbeInterval = setInterval(() => {
+      if (this.jitoTransport.isEnabled()) void this.jitoTransport.probe();
+    }, intervalMs);
+  }
+
   private async initializeConnection() {
     try {
       const t0 = performance.now();
@@ -164,6 +176,7 @@ export class ExecutionCoordinator {
       this.rpcHealth = this.rpcLatencyMs > 800 ? 'DEGRADED' : 'HEALTHY';
       Logger.info(`Solana RPC connected: Slot ${slot}, Latency ${this.rpcLatencyMs}ms`);
       await this.jitoTransport.probe();
+      this.startJitoProbeLoop();
       await this.syncRealWalletBalance();
       await this.startupReconciliation();
     } catch (err: any) {
@@ -247,9 +260,10 @@ export class ExecutionCoordinator {
     }
 
     const jitoTelemetry = this.jitoTransport.getTelemetry();
-    const jitoHealthy = jitoTelemetry.health === 'HEALTHY';
-    if (!jitoHealthy) {
-      reasons.push(`Jito Block Engine is ${jitoTelemetry.health} (Must be HEALTHY for live execution)`);
+    const jitoReadiness = this.getJitoReadiness();
+    const jitoHealthy = jitoReadiness.ready;
+    if (!jitoHealthy && jitoReadiness.reason) {
+      reasons.push(jitoReadiness.reason);
     }
 
     const realFeedAgeMs = this.lastRealMarketEventTimestamp > 0
@@ -341,6 +355,34 @@ export class ExecutionCoordinator {
   public setJitoBlockEngineUrl(url: string) {
     this.jitoTransport.setBlockEngineUrl(url);
     Logger.info(`Updated Jito Block Engine URL to ${url}`);
+  }
+
+  /**
+   * Jito readiness for live execution. With no block engine configured (devnet), RPC is the only transport
+   * and there is nothing to be healthy, so it is not a blocker. With a block engine configured it must be
+   * HEALTHY from a recent real probe, otherwise live execution fails closed.
+   */
+  public getJitoReadiness(): { ready: boolean; enabled: boolean; status: string; reason?: string } {
+    const telemetry = this.jitoTransport.getTelemetry();
+    if (!this.jitoTransport.isEnabled()) {
+      return { ready: true, enabled: false, status: 'NOT_CONFIGURED' };
+    }
+    const maxProbeAgeMs = Math.max(45_000, executionConfig.getConfig().jitoProbeIntervalMs * 3);
+    const probeAgeMs = this.jitoTransport.getProbeAgeMs();
+    if (telemetry.health !== 'HEALTHY') {
+      return { ready: false, enabled: true, status: telemetry.health, reason: `Jito Block Engine is ${telemetry.health} (Must be HEALTHY for live execution)` };
+    }
+    if (probeAgeMs === null || probeAgeMs > maxProbeAgeMs) {
+      return { ready: false, enabled: true, status: 'STALE', reason: 'Jito Block Engine health probe is stale (Must be HEALTHY for live execution)' };
+    }
+    return { ready: true, enabled: true, status: 'HEALTHY' };
+  }
+
+  /** Dynamic tip, forced to zero when Jito is not in use so no lamports are sent to a tip account. */
+  private resolveLiveTip(params: Parameters<typeof executionConfig.resolveDynamicJitoTip>[0]) {
+    const tip = executionConfig.resolveDynamicJitoTip(params);
+    if (this.jitoTransport.isEnabled()) return tip;
+    return { ...tip, tipLamports: 0, tipSol: 0, policyReason: `${tip.policyReason} -> Jito disabled, tip forced to 0 (RPC transport)` };
   }
 
   public getJitoTransport(): JitoTransport {
@@ -897,7 +939,39 @@ export class ExecutionCoordinator {
   }> {
     const { tx, orderId, correlationId, side, mint, mintPubkey, owner, tokenProgram, preSnapshot, jitoTipLamports } = params;
     const cfg = executionConfig.getConfig();
-    const maxRetries = Math.max(0, cfg.jitoMaxRetries);
+
+    // Cluster guard: every signed buy and sell passes through here. Refuse before anything is sent
+    // unless the RPC reports the allowed cluster's genesis hash (devnet unless Mike set ALLOWED_CLUSTER).
+    try {
+      await assertClusterAllowed(this.connection);
+    } catch (err: any) {
+      Logger.error(`[R1] ${side} for order ${orderId} blocked: ${err.message}`);
+      workstationDb.logJournal('CLUSTER_GUARD_BLOCK', correlationId, 'LIVE', { orderId, side, mint, error: err.message });
+      return {
+        success: false,
+        signature: '',
+        transport: 'SOLANA_RPC',
+        error: err.message,
+        lifecycleState: 'SUBMIT_FAILED',
+      };
+    }
+    const jitoEnabled = this.jitoTransport.isEnabled();
+    // Fail closed on Jito health: with a block engine configured, re-probe once if readiness is not current and
+    // only use Jito if it answers HEALTHY. An unhealthy engine is not retried; the order goes to RPC only when
+    // the operator enabled the RPC fallback, otherwise it is refused.
+    let jitoUsable = jitoEnabled;
+    let jitoUnhealthyReason: string | undefined;
+    if (jitoEnabled && !this.getJitoReadiness().ready) {
+      await this.jitoTransport.probe();
+      const readiness = this.getJitoReadiness();
+      jitoUsable = readiness.ready;
+      if (!jitoUsable) {
+        jitoUnhealthyReason = `Failed to submit: ${readiness.reason ?? 'Jito Block Engine is not healthy'} (fail closed)`;
+        Logger.warn(`[A4] ${side} for order ${orderId}: ${jitoUnhealthyReason}`);
+      }
+    }
+    // With no Jito block engine configured (always the case on devnet) there is nothing to retry: go straight to RPC.
+    const maxRetries = jitoUsable ? Math.max(0, cfg.jitoMaxRetries) : -1;
     const retryIntervalMs = Math.max(0, cfg.jitoRetryIntervalMs);
     const confirmTimeoutMs = Math.max(1000, cfg.bundleConfirmTimeoutMs);
 
@@ -919,7 +993,7 @@ export class ExecutionCoordinator {
 
     let lastSignature = '';
     let lastBundleId: string | undefined;
-    let lastError: string | undefined;
+    let lastError: string | undefined = jitoUnhealthyReason;
     let landedSlot: number | undefined;
     let jitoLanded = false;
 
@@ -1001,8 +1075,8 @@ export class ExecutionCoordinator {
       };
     }
 
-    // Direct RPC Fallback branch (if enabled and Jito retries did not land)
-    if (cfg.enableRpcFallback) {
+    // Direct RPC Fallback branch (if enabled and Jito retries did not land; always taken when Jito is disabled)
+    if (cfg.enableRpcFallback || !jitoEnabled) {
       // If Jito explicitly rejected with a fatal simulation error, do not fallback to RPC
       if (lastError && (lastError.includes('InstructionError') || lastError.includes('Transaction simulation failed'))) {
         return {
@@ -1367,6 +1441,13 @@ export class ExecutionCoordinator {
           isMintAuthorityRevoked: marketState.isMintAuthorityRevoked,
           isFreezeAuthorityRevoked: marketState.isFreezeAuthorityRevoked,
           hasToken2022Extensions: marketState.baseTokenProgram?.equals(TOKEN_2022_PROGRAM_ID) ?? false,
+          // Pass the extension inspection result through. LIVE already refuses unsafe mints in fetchPumpMarketState,
+          // so a Token-2022 mint that reaches here with a report is explicitly safe; without this it was UNKNOWN and rejected.
+          token2022Safe: marketState.token2022Report ? marketState.token2022Report.isSafe : undefined,
+          unsupportedToken2022Extension:
+            marketState.token2022Report && !marketState.token2022Report.isSafe
+              ? marketState.token2022Report.unsupportedExtensionNames.join(',') || true
+              : undefined,
           devHoldingPct: holderDist ? holderDist.devHoldingPct : null,
           top10HoldersPct: holderDist ? holderDist.top10HoldersPct : null,
         },
@@ -1450,8 +1531,8 @@ export class ExecutionCoordinator {
     }
 
     // 4. Resolve dynamic Jito tip from live floor telemetry and execution policy
-    const tipFloor = await this.jitoTransport.getTipFloorLamports().catch(() => 150_000);
-    const resolvedTip = executionConfig.resolveDynamicJitoTip({
+    const tipFloor = await this.jitoTransport.getTipFloorLamports();
+    const resolvedTip = this.resolveLiveTip({
       tipFloorLamports: tipFloor,
       tradeAmountSol: req.amountSol,
       explicitTipSol: req.jitoTipSol,
@@ -1496,6 +1577,7 @@ export class ExecutionCoordinator {
       orderSizeSol: req.amountSol,
       expectedPriceSol: quote.executionPriceSol,
       slippageBps: quote.slippageBps,
+      estimatedPriceImpactBps: quote.estimatedPriceImpactBps,
       estimatedFeeLamports: quote.expectedPriorityFeeLamports + 5000,
       jitoTipLamports: quote.expectedJitoTipLamports,
       signalTimestamp: req.signalTimestamp || marketState.marketDataTimestamp,
@@ -1520,6 +1602,21 @@ export class ExecutionCoordinator {
         correlationId,
       };
     }
+
+    // Cross-request dedupe: only one LIVE buy per mint may be in flight. The per-mint cooldown is only recorded
+    // after a fill, so two concurrent requests (double click, WS plus HTTP, auto-snipe plus operator) could both pass it.
+    // Check and add run in the same synchronous block as the reservation, so there is no await between them.
+    if (this.inFlightBuyMints.has(req.mint)) {
+      workstationDb.logJournal('TRADE_REJECTED_DUPLICATE_IN_FLIGHT', correlationId, 'LIVE', { mint: req.mint });
+      return {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'LIVE',
+        error: `DUPLICATE_MINT: A buy for ${req.mint} is already in flight.`,
+        correlationId,
+      };
+    }
+    this.inFlightBuyMints.add(req.mint);
 
     // Acquire in-flight balance reservation
     this.inFlightReservedSol += requiredSol;
@@ -1564,6 +1661,8 @@ export class ExecutionCoordinator {
       const v0Tx = await txBuilder.buildBuyTransaction(this.connection, buyParams);
       await localSigner.signTransaction(v0Tx);
 
+      // The tip transfer is an instruction inside the signed transaction, so it is paid on-chain whichever
+      // transport lands it (Jito bundle or the RPC fallback). Accounting uses resolvedTip.tipLamports for both.
       // Record order in SQLite
       const clientOrderId = `ord-${correlationId}`;
       workstationDb.saveOrder({
@@ -1612,7 +1711,7 @@ export class ExecutionCoordinator {
           submissionTime: Date.now(),
           reconciliationState: 'REVERTED',
           networkFeeLamports: 5000,
-          jitoTipLamports: subRes.transport === 'JITO' ? resolvedTip.tipLamports : 0,
+          jitoTipLamports: resolvedTip.tipLamports,
           executionMode: 'LIVE',
           error: subRes.error || 'Transaction unconfirmed or dropped across attempts',
         });
@@ -1637,7 +1736,7 @@ export class ExecutionCoordinator {
         mintPubkey,
         marketState.tokenProgram,
         preSnapshot,
-        subRes.transport === 'JITO' ? resolvedTip.tipLamports : 0
+        resolvedTip.tipLamports
       );
 
       if (!reconciliation.success || reconciliation.reconciliationState !== 'RECONCILED') {
@@ -1655,7 +1754,7 @@ export class ExecutionCoordinator {
           confirmationTime: Date.now(),
           reconciliationState: 'RECONCILIATION_REQUIRED',
           networkFeeLamports: reconciliation.actualNetworkFeeLamports || 5000,
-          jitoTipLamports: subRes.transport === 'JITO' ? resolvedTip.tipLamports : 0,
+          jitoTipLamports: resolvedTip.tipLamports,
           executionMode: 'LIVE',
           error: reconciliation.error || 'Token balance increase not verified',
         });
@@ -1695,7 +1794,7 @@ export class ExecutionCoordinator {
         entryTimestamp: Date.now(),
         entryFeeLamports: reconciliation.actualNetworkFeeLamports,
         priorityFeeLamports: quote.expectedPriorityFeeLamports,
-        jitoTipLamports: subRes.transport === 'JITO' ? resolvedTip.tipLamports : 0,
+        jitoTipLamports: resolvedTip.tipLamports,
         markSource: 'RECONCILED_ON_CHAIN',
         markAgeMs: 0,
         venue: 'PUMP_BONDING_CURVE',
@@ -1720,7 +1819,7 @@ export class ExecutionCoordinator {
         confirmationTime: Date.now(),
         reconciliationState: 'RECONCILED',
         networkFeeLamports: reconciliation.actualNetworkFeeLamports,
-        jitoTipLamports: subRes.transport === 'JITO' ? resolvedTip.tipLamports : 0,
+        jitoTipLamports: resolvedTip.tipLamports,
         executionMode: 'LIVE',
       });
 
@@ -1733,7 +1832,7 @@ export class ExecutionCoordinator {
         fillPriceSol: reconciliation.effectiveFillPriceSol,
         tokensReceived: reconciliation.tokensReceivedHuman,
         executionMode: 'LIVE',
-        feesPaidLamports: reconciliation.actualNetworkFeeLamports + (subRes.transport === 'JITO' ? quote.expectedJitoTipLamports : 0),
+        feesPaidLamports: reconciliation.actualNetworkFeeLamports + quote.expectedJitoTipLamports,
         correlationId,
       };
     } catch (err: any) {
@@ -1749,6 +1848,7 @@ export class ExecutionCoordinator {
     } finally {
       // Always release in-flight balance reservation
       this.inFlightReservedSol = Math.max(0, this.inFlightReservedSol - requiredSol);
+      this.inFlightBuyMints.delete(req.mint);
     }
   }
 
@@ -1776,8 +1876,8 @@ export class ExecutionCoordinator {
       const percentageToSell = safeSellPct;
       const closeAta = (percentageToSell === 100);
 
-      const tipFloor = await this.jitoTransport.getTipFloorLamports().catch(() => 150_000);
-      const resolvedTip = executionConfig.resolveDynamicJitoTip({
+      const tipFloor = await this.jitoTransport.getTipFloorLamports();
+      const resolvedTip = this.resolveLiveTip({
         tipFloorLamports: tipFloor,
         tradeAmountSol: (target.currentValueSol || 0.05) * fraction,
       });
@@ -1970,7 +2070,7 @@ export class ExecutionCoordinator {
         preSnapshot,
         target.costBasisLamports,
         fraction,
-        subRes.transport === 'JITO' ? expectedJitoTipLamports : 0
+        expectedJitoTipLamports
       );
 
       if (!sellRecon.success) {
@@ -2032,10 +2132,12 @@ export class ExecutionCoordinator {
         currentTimestamp: now,
       });
 
-      // Persist high_water_mark_sol, trailing_stop_sol, and exit_stage to SQLite (B13)
+      // Persist high_water_mark_sol and trailing_stop_sol to SQLite (B13). The exit stage only advances after the
+      // sell actually fills: advancing it first would skip a take-profit stage when the sell reverts or is refused.
+      const priorExitStage = pos.exitStage;
       pos.highWaterMarkSol = decision.newHighWaterMarkSol;
       pos.trailingStopSol = decision.newTrailingStopSol;
-      pos.exitStage = decision.newExitStage;
+      pos.exitStage = decision.shouldExit ? priorExitStage : decision.newExitStage;
       pos.lastUpdatedTimestamp = now;
       workstationDb.savePosition(pos);
 
@@ -2043,7 +2145,14 @@ export class ExecutionCoordinator {
         Logger.info(
           `[B13 ExitEngine] ${decision.reason} triggered for ${pos.symbol || pos.mint} (Sell ${decision.sellPercentage}%, PnL: ${decision.profitPct.toFixed(2)}%)`
         );
-        await this.closePosition(pos.id, decision.sellPercentage, decision.reason);
+        const exitRes = await this.closePosition(pos.id, decision.sellPercentage, decision.reason);
+        if (exitRes.success && decision.newExitStage !== priorExitStage) {
+          const after = workstationDb.loadPositions(undefined, 'ACTIVE').find((p) => p.id === pos.id);
+          if (after) {
+            after.exitStage = decision.newExitStage;
+            workstationDb.savePosition(after);
+          }
+        }
       }
     }
   }
@@ -2119,6 +2228,10 @@ export class ExecutionCoordinator {
     if (this.autoTpSlInterval) {
       clearInterval(this.autoTpSlInterval);
       this.autoTpSlInterval = null;
+    }
+    if (this.jitoProbeInterval) {
+      clearInterval(this.jitoProbeInterval);
+      this.jitoProbeInterval = null;
     }
     if (this.feedHeartbeatInterval) {
       clearInterval(this.feedHeartbeatInterval);

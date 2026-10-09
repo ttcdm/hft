@@ -34,54 +34,27 @@ export async function getOperatorSessionToken(): Promise<string> {
   }
   if (cachedSessionToken) return cachedSessionToken;
 
-  // Auto-provision dev/sandbox session if available
-  try {
-    const res = await fetch('/api/auth/session');
-    if (res.ok) {
-      const data = await res.json();
-      if (data.success && data.token) {
-        cachedSessionToken = data.token;
-        if (typeof window !== 'undefined') {
-          localStorage.setItem('apex_operator_token', data.token);
-        }
-        return cachedSessionToken;
-      }
-    }
-  } catch {}
-
   return '';
 }
 
 export async function authFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-  let token = await getOperatorSessionToken();
+  const token = await getOperatorSessionToken();
   const headers = new Headers(init?.headers || {});
   if (token) {
     headers.set('x-session-token', token);
     headers.set('Authorization', `Bearer ${token}`);
   }
-  let res = await fetch(input, { ...init, headers });
+  const res = await fetch(input, { ...init, headers });
 
-  // Self-healing: If 401 Unauthorized, stale localStorage token is purged and refreshed
+  // A1: a 401 means the stored token is stale or missing. Purge it and ask the operator to re-enter
+  // it; the server no longer hands out tokens automatically.
   if (res.status === 401) {
     try {
       if (typeof window !== 'undefined') {
         localStorage.removeItem('apex_operator_token');
+        window.dispatchEvent(new CustomEvent('apex:auth-required'));
       }
       cachedSessionToken = null;
-      const sessionRes = await fetch('/api/auth/session');
-      if (sessionRes.ok) {
-        const sessionData = await sessionRes.json();
-        if (sessionData.token) {
-          token = sessionData.token;
-          cachedSessionToken = token;
-          if (typeof window !== 'undefined') {
-            localStorage.setItem('apex_operator_token', token);
-          }
-          headers.set('x-session-token', token);
-          headers.set('Authorization', `Bearer ${token}`);
-          res = await fetch(input, { ...init, headers });
-        }
-      }
     } catch {}
   }
   return res;

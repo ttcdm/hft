@@ -76,7 +76,7 @@ Key environment variables:
 - `JITO_BLOCK_ENGINE_URL`: Jito MEV Block Engine endpoint for private bundle routing (e.g. `https://mainnet.block-engine.jito.wtf`)
 - `DEFAULT_JITO_TIP_SOL`: Base validator tip in SOL included with bundles (default: `0.005`)
 - `CAPITAL_TIER`: `MICRO_10` (0.07 SOL / $10 risk-capped bankroll) or `INSTITUTIONAL` (3,500 SOL)
-- `OPERATOR_SECRET_KEY`: Optional shared secret for generating operator session tokens
+- `OPERATOR_AUTH_TOKEN`: Operator API token (min 16 characters; generate with `openssl rand -hex 32`). If unset, a volatile token is generated and printed at startup. Never commit it.
 - `GEMINI_API_KEY`: Optional API key for AI Quant Diagnostics
 
 ---

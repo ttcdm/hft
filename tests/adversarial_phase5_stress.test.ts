@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair, PublicKey } from '@solana/web3.js';
 import {
   CurveVelocityEvaluator,
@@ -34,6 +34,11 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
     memecoinAggregator.setConfluenceGating(false);
     (pumpfunService as any).snipedMints.clear();
     vi.restoreAllMocks();
+    vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
   });
 
   // =========================================================================

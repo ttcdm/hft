@@ -1,5 +1,6 @@
 import { Connection, PublicKey } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID } from '../../../server/solana/programs';
+import { CLUSTER_GENESIS_HASH } from '../../../server/solana/clusterGuard';
 
 export interface MockAccountData {
   owner: PublicKey;
@@ -10,6 +11,7 @@ export interface MockAccountData {
 }
 
 export class MockSolanaRpc {
+  public genesisHash: string = CLUSTER_GENESIS_HASH.devnet;
   private accounts: Map<string, MockAccountData> = new Map();
   private currentSlot: number = 280000000;
   private signatureStatuses: Map<string, { confirmationStatus: string; slot: number; err: any }> = new Map();
@@ -80,6 +82,7 @@ export class MockSolanaRpc {
       rpcEndpoint: 'http://127.0.0.1:8899',
       commitment: 'confirmed',
       getSlot: async () => this.currentSlot,
+      getGenesisHash: async () => this.genesisHash,
       getAccountInfo: async (pubkey: PublicKey) => {
         const found = this.accounts.get(pubkey.toBase58());
         if (!found) return null;

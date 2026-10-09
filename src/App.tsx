@@ -6,7 +6,6 @@ import {
   NetworkStressConfig,
   PerformanceKPIs,
   AlertEvent,
-  OrderSide,
   PublicMarketTrade,
   ExchangeGatewayConfig,
   ActiveOrder,
@@ -43,18 +42,20 @@ import { AuthModal } from './components/AuthModal';
 import { engineClient, getOperatorSessionToken } from './services/engineClient';
 import { Coins } from 'lucide-react';
 
-const INITIAL_BOTS: TradingBot[] = [
+// Bot configuration only. Performance fields (pnl, winRate, tradesCount, opsPerSec) start at zero and
+// must come from real fills; this UI never fabricates fills or PnL (B1).
+export const INITIAL_BOTS: TradingBot[] = [
   {
     id: 'b1',
     name: 'Optiver Cointegration Arbitrage',
     archetype: 'STATISTICAL_ARBITRAGE',
     assetClass: 'CRYPTO',
     symbol: 'BTC/USDT',
-    isRunning: true,
-    winRate: 72.8,
-    pnl: 14280.5,
-    tradesCount: 842,
-    opsPerSec: 195,
+    isRunning: false,
+    winRate: 0,
+    pnl: 0,
+    tradesCount: 0,
+    opsPerSec: 0,
     maxDailyLoss: 5000,
     slippageLimitBps: 1.5,
     leverage: 10,
@@ -67,11 +68,11 @@ const INITIAL_BOTS: TradingBot[] = [
     archetype: 'MARKET_MAKING',
     assetClass: 'EQUITIES',
     symbol: 'NVDA/USD',
-    isRunning: true,
-    winRate: 68.4,
-    pnl: 9420.2,
-    tradesCount: 1120,
-    opsPerSec: 240,
+    isRunning: false,
+    winRate: 0,
+    pnl: 0,
+    tradesCount: 0,
+    opsPerSec: 0,
     maxDailyLoss: 7500,
     slippageLimitBps: 1.2,
     leverage: 8,
@@ -84,11 +85,11 @@ const INITIAL_BOTS: TradingBot[] = [
     archetype: 'ORDER_BOOK_IMBALANCE',
     assetClass: 'CRYPTO',
     symbol: 'ETH/USDT',
-    isRunning: true,
-    winRate: 66.5,
-    pnl: 5820.0,
-    tradesCount: 530,
-    opsPerSec: 160,
+    isRunning: false,
+    winRate: 0,
+    pnl: 0,
+    tradesCount: 0,
+    opsPerSec: 0,
     maxDailyLoss: 3000,
     slippageLimitBps: 2.0,
     leverage: 5,
@@ -101,11 +102,11 @@ const INITIAL_BOTS: TradingBot[] = [
     archetype: 'LATENCY_ARBITRAGE',
     assetClass: 'FX',
     symbol: 'EUR/USD',
-    isRunning: true,
-    winRate: 80.6,
-    pnl: 3840.4,
-    tradesCount: 390,
-    opsPerSec: 320,
+    isRunning: false,
+    winRate: 0,
+    pnl: 0,
+    tradesCount: 0,
+    opsPerSec: 0,
     maxDailyLoss: 10000,
     slippageLimitBps: 0.8,
     leverage: 20,
@@ -118,11 +119,11 @@ const INITIAL_BOTS: TradingBot[] = [
     archetype: 'MOMENTUM_SCALPING',
     assetClass: 'COMMODITIES',
     symbol: 'XAU/USD',
-    isRunning: true,
-    winRate: 67.1,
-    pnl: 1890.0,
-    tradesCount: 280,
-    opsPerSec: 110,
+    isRunning: false,
+    winRate: 0,
+    pnl: 0,
+    tradesCount: 0,
+    opsPerSec: 0,
     maxDailyLoss: 4500,
     slippageLimitBps: 2.5,
     leverage: 12,
@@ -130,6 +131,26 @@ const INITIAL_BOTS: TradingBot[] = [
     kappa: 1.2,
   },
 ];
+
+export function makeEmptyKpis(startingEquity: number): PerformanceKPIs {
+  return {
+    dailyPnL: 0,
+    unrealizedPnL: 0,
+    totalEquity: startingEquity,
+    winRate: 0,
+    totalTrades: 0,
+    sharpeRatio: 0,
+    sortinoRatio: 0,
+    profitFactor: 0,
+    maxDrawdownPct: 0,
+    var99Pct: 0,
+    averageLatencyMs: 0,
+    p99LatencyMs: 0,
+    systemThroughputOps: 0,
+    dailyVolumeUsd: 0,
+    peakEquity: startingEquity,
+  };
+}
 
 export default function App() {
   // Master Kill Switch State
@@ -162,31 +183,11 @@ export default function App() {
   const [capitalTier, setCapitalTier] = useState<'MICRO_10' | 'INSTITUTIONAL'>('MICRO_10');
 
   // KPIs & Risk Matrix (Initialized for $10 Micro Account)
-  const [kpis, setKpis] = useState<PerformanceKPIs>({
-    dailyPnL: 0.28,
-    unrealizedPnL: 0.04,
-    totalEquity: 10.28,
-    winRate: 68.4,
-    totalTrades: 42,
-    sharpeRatio: 2.85,
-    sortinoRatio: 3.42,
-    profitFactor: 2.18,
-    maxDrawdownPct: 0.0135, // -1.35%
-    var99Pct: 0.0195, // 1.95%
-    averageLatencyMs: 0.68,
-    p99LatencyMs: 1.24,
-    systemThroughputOps: 184,
-    dailyVolumeUsd: 84.5,
-    peakEquity: 10.35,
-  });
+  const [kpis, setKpis] = useState<PerformanceKPIs>(makeEmptyKpis(10));
 
-  const [lastTickDelta, setLastTickDelta] = useState(0.04);
-  const [equityHistory, setEquityHistory] = useState<number[]>([
-    10.0, 10.05, 10.12, 10.08, 10.18, 10.24, 10.28,
-  ]);
-  const [drawdownHistory, setDrawdownHistory] = useState<number[]>([
-    0.002, 0.004, 0.001, 0.003, 0.009, 0.002, 0.001, 0.005, 0.002, 0.003,
-  ]);
+  const [lastTickDelta] = useState(0);
+  const [equityHistory, setEquityHistory] = useState<number[]>([10]);
+  const [drawdownHistory] = useState<number[]>([0]);
 
   // L2 Order Book State
   const [midPrice, setMidPrice] = useState(68940.0);
@@ -204,7 +205,7 @@ export default function App() {
   const [flashTrigger, setFlashTrigger] = useState(0);
 
   // Execution Blotter Tape & Live Public Exchange Tape
-  const [trades, setTrades] = useState<ExecutedTrade[]>([]);
+  const [trades] = useState<ExecutedTrade[]>([]);
   const [publicTrades, setPublicTrades] = useState<PublicMarketTrade[]>([]);
   const [exchangePingMs, setExchangePingMs] = useState(0.85);
 
@@ -288,6 +289,16 @@ export default function App() {
     checkAuthStatus();
   }, []);
 
+  // A1: the server never auto-issues tokens, so a 401 from any call re-opens the token prompt
+  useEffect(() => {
+    const onAuthRequired = () => {
+      setIsOperatorAuthenticated(false);
+      setIsAuthModalOpen(true);
+    };
+    window.addEventListener('apex:auth-required', onAuthRequired);
+    return () => window.removeEventListener('apex:auth-required', onAuthRequired);
+  }, []);
+
   const handleAuthenticated = (token: string) => {
     setIsOperatorAuthenticated(true);
     setIsAuthModalOpen(false);
@@ -350,24 +361,8 @@ export default function App() {
     engineClient.setMicro10Mode(isMicro);
 
     if (isMicro) {
-      setKpis({
-        dailyPnL: 0.28,
-        unrealizedPnL: 0.04,
-        totalEquity: 10.28,
-        winRate: 68.4,
-        totalTrades: 42,
-        sharpeRatio: 2.85,
-        sortinoRatio: 3.42,
-        profitFactor: 2.18,
-        maxDrawdownPct: 0.0135,
-        var99Pct: 0.0195,
-        averageLatencyMs: 0.68,
-        p99LatencyMs: 1.24,
-        systemThroughputOps: 184,
-        dailyVolumeUsd: 84.5,
-        peakEquity: 10.35,
-      });
-      setEquityHistory([10.0, 10.05, 10.12, 10.08, 10.18, 10.24, 10.28]);
+      setKpis(makeEmptyKpis(10));
+      setEquityHistory([10]);
       setGatewayConfig((prev) => ({
         ...prev,
         maxOrderNotional: 10,
@@ -379,27 +374,8 @@ export default function App() {
         'All bot quotas and pre-trade risk checks scaled to Binance 5 USDT min notional. Max order: $10.00.'
       );
     } else {
-      setKpis({
-        dailyPnL: 35251.1,
-        unrealizedPnL: 420.5,
-        totalEquity: 535251.1,
-        winRate: 68.4,
-        totalTrades: 3162,
-        sharpeRatio: 2.85,
-        sortinoRatio: 3.42,
-        profitFactor: 2.18,
-        maxDrawdownPct: 0.0135,
-        var99Pct: 0.0195,
-        averageLatencyMs: 0.68,
-        p99LatencyMs: 1.24,
-        systemThroughputOps: 184,
-        dailyVolumeUsd: 5120000,
-        peakEquity: 536800.0,
-      });
-      setEquityHistory([
-        500000, 503200, 507400, 512100, 509800, 516400, 521900, 528400, 532100,
-        535251.1,
-      ]);
+      setKpis(makeEmptyKpis(500000));
+      setEquityHistory([500000]);
       setGatewayConfig((prev) => ({
         ...prev,
         maxOrderNotional: 50000,
@@ -453,120 +429,8 @@ export default function App() {
         // Add to real public tape
         setPublicTrades((prev) => [realTrade, ...prev.slice(0, 79)]);
 
-        // Realistic Limit Order Queue Matching against Real Exchange Flow
-        const currentBots = botsRef.current;
-        const currentHalted = isHaltedRef.current;
-        const activeBots = currentBots.filter((b) => b.isRunning);
-        if (activeBots.length === 0 || currentHalted) return;
-
-        // Pick bot whose quote matches the flow
-        const bot = activeBots[Math.floor(Math.random() * activeBots.length)];
-
-        // Compute network degradation for this fill attempt
-        const stress = stressConfigRef.current;
-        const deg = calculateNetworkDegradation(
-          stress.baseLatencyMs,
-          stress.jitterMs,
-          stress.packetLossPct,
-          stress.profile
-        );
-
-        const tradeStatus = deg.isDropped ? 'REJECTED' : 'FILLED';
-        const tradeSide: OrderSide = realTrade.isBuyerMaker ? 'BUY' : 'SELL';
-        const tradePrice = realTrade.price;
-        const isMicroCapital = capitalTierRef.current === 'MICRO_10';
-        const tradeSize = isMicroCapital
-          ? 0.0001 // Micro size (~$6.89 on BTC, meeting Binance 5 USDT min notional)
-          : Number((realTrade.size * 0.2 + 0.05).toFixed(3));
-
-        // Realized PnL based on real price action and bot win-rate edge
-        const degradationPenalty = deg.effectiveLatencyMs > 2.5 ? 0.25 : 0;
-        const baseWinProb = bot.winRate / 100 - degradationPenalty;
-        const isWin = Math.random() < Math.max(0.35, baseWinProb);
-        const tickPnl = isMicroCapital
-          ? (isWin ? 1 : -1) * (Math.random() * 0.05 + 0.01) // Micro PnL: $0.01 - $0.06 per trade
-          : (isWin ? 1 : -1) * (Math.random() * 85 + 20) * (bot.leverage / 8);
-
-        const executedTrade: ExecutedTrade = {
-          id: `tx-real-${realTrade.id}-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-          timestamp: realTrade.timestamp,
-          microsecondTime: realTrade.microsecondTime,
-          botId: bot.id,
-          botName: bot.name,
-          symbol: selectedSymbolRef.current,
-          side: tradeSide,
-          status: tradeStatus,
-          price: tradePrice,
-          size: tradeSize,
-          pnlDelta: tradeStatus === 'FILLED' ? Number(tickPnl.toFixed(2)) : 0,
-          slippageBps: deg.realizedSlippageBps,
-          executionLatencyMs: deg.effectiveLatencyMs,
-          rejectionReason: deg.isDropped
-            ? 'QUEUE TIMEOUT / PACKET DROP'
-            : undefined,
-        };
-
-        if (tradeStatus === 'FILLED') {
-          hftAudio.playTradeFill(tradeSide === 'BUY');
-        }
-
-        setTrades((prev) => [executedTrade, ...prev.slice(0, 99)]);
-
-        if (tradeStatus === 'FILLED') {
-          // Update Bot performance
-          setBots((prev) =>
-            prev.map((b) =>
-              b.id === bot.id
-                ? {
-                    ...b,
-                    pnl: Number((b.pnl + tickPnl).toFixed(2)),
-                    tradesCount: b.tradesCount + 1,
-                  }
-                : b
-            )
-          );
-
-          // Update Portfolio KPIs
-          setLastTickDelta(Number(tickPnl.toFixed(2)));
-          setKpis((prev) => {
-            const nextDaily = prev.dailyPnL + tickPnl;
-            const nextEquity = prev.totalEquity + tickPnl;
-            const newPeak = Math.max(prev.peakEquity, nextEquity);
-            const currentDd = (newPeak - nextEquity) / (newPeak || 1);
-
-            return {
-              ...prev,
-              dailyPnL: Number(nextDaily.toFixed(2)),
-              totalEquity: Number(nextEquity.toFixed(2)),
-              totalTrades: prev.totalTrades + 1,
-              winRate: Number(
-                (
-                  (prev.winRate * prev.totalTrades + (isWin ? 100 : 0)) /
-                  (prev.totalTrades + 1)
-                ).toFixed(1)
-              ),
-              averageLatencyMs: Number(
-                ((prev.averageLatencyMs * 9 + deg.effectiveLatencyMs) / 10).toFixed(2)
-              ),
-              p99LatencyMs: Number(
-                Math.max(prev.p99LatencyMs, deg.effectiveLatencyMs).toFixed(2)
-              ),
-              dailyVolumeUsd:
-                prev.dailyVolumeUsd + tradePrice * tradeSize * bot.leverage,
-              peakEquity: newPeak,
-              maxDrawdownPct: Math.max(prev.maxDrawdownPct, currentDd),
-            };
-          });
-
-          // History tracking
-          setEquityHistory((prev) => {
-            const lastVal = prev[prev.length - 1] || 10;
-            return [...prev.slice(-40), Number((lastVal + tickPnl).toFixed(2))];
-          });
-          setDrawdownHistory((prev) => {
-            return [...prev.slice(-40), Math.max(0, 0.001)];
-          });
-        }
+        // B1: no simulated bot fills here. Fills, PnL and blotter rows must come from real
+        // paper/live execution reported by the server.
       },
       // 3. Ping / Latency Probing Listener
       (pingMs) => {

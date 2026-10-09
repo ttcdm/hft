@@ -13,6 +13,7 @@ export class MockJitoEngine {
   private bundles: Map<string, MockBundleRecord> = new Map();
   private tipFloorLamports: number = 100_000; // 0.0001 SOL
   private shouldFailSubmissions: boolean = false;
+  private shouldFailProbe: boolean = false;
   private failureMessage: string = 'Simulated Jito Error';
   private mockUrl: string = 'https://mock-jito-engine.local';
 
@@ -23,6 +24,10 @@ export class MockJitoEngine {
   public setFailSubmissions(fail: boolean, message: string = 'Simulated Jito Error') {
     this.shouldFailSubmissions = fail;
     this.failureMessage = message;
+  }
+
+  public setFailProbe(fail: boolean) {
+    this.shouldFailProbe = fail;
   }
 
   public registerBundle(record: MockBundleRecord) {
@@ -83,6 +88,19 @@ export class MockJitoEngine {
           return new Response(
             JSON.stringify({ jsonrpc: '2.0', id, error: { message: this.failureMessage } }),
             { status: 500, headers: { 'Content-Type': 'application/json' } }
+          );
+        }
+
+        if (method === 'getTipAccounts') {
+          if (this.shouldFailProbe) {
+            return new Response(JSON.stringify({ jsonrpc: '2.0', id, error: { message: 'probe down' } }), {
+              status: 503,
+              headers: { 'Content-Type': 'application/json' },
+            });
+          }
+          return new Response(
+            JSON.stringify({ jsonrpc: '2.0', id, result: ['96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5'] }),
+            { status: 200, headers: { 'Content-Type': 'application/json' } }
           );
         }
 

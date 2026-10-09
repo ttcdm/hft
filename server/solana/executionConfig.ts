@@ -1,5 +1,6 @@
 import { PublicKey } from '@solana/web3.js';
 import { getRandomJitoTipAccount } from './programs';
+import { resolveJitoUrl } from './clusterGuard';
 
 export interface AuthoritativeExecutionConfig {
   jitoBlockEngineUrl: string;
@@ -57,7 +58,7 @@ class ExecutionConfigManager {
     const minTipSol = parseFloat(process.env.MIN_JITO_TIP_SOL || '0.00015');
 
     this.config = {
-      jitoBlockEngineUrl: (process.env.JITO_BLOCK_ENGINE_URL || 'https://mainnet.block-engine.jito.wtf').replace(/\/$/, ''),
+      jitoBlockEngineUrl: resolveJitoUrl(),
       jitoTipAccount: process.env.JITO_TIP_ACCOUNT || '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5',
       defaultJitoTipSol: Number.isFinite(defaultTipSol) && defaultTipSol > 0 ? defaultTipSol : 0.00018,
       maxJitoTipSol: Number.isFinite(maxTipSol) && maxTipSol > 0 ? maxTipSol : 0.05,

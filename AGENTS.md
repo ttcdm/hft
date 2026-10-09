@@ -21,3 +21,16 @@ All agents operating in this repository must strictly adhere to the following ar
 ## 4. Test Suite Integrity (Zero-Facade Policy)
 - **Never test local mock lambdas.** Unit and E2E tests must never implement local arithmetic or dummy functions that simulate production logic inside the test body.
 - **Always invoke real production modules.** Tests must import and exercise production classes (`CapitalSizer`, `ExitEngine`, `HardenedRiskEngine`, `PumpCurveService`, `EligibilityFilter`, `JitoTransport`) with realistic mock state.
+
+## 5. Active Application Runtime Verification
+- **Never certify code health or release readiness solely through unit tests.** Unit tests verify isolated modules, but do not prove that bundling, runtime dependency resolution, loopback networking, and process lifecycle function end-to-end.
+- **Always execute the production binary:**
+  1. Boot the compiled artifact (`node dist/server.cjs`) on an ephemeral test port (e.g., `PORT=3001`).
+  2. Verify clean startup logs with zero unhandled rejections, module resolution errors, or `ERR_INVALID_ARG_VALUE`.
+  3. Perform active HTTP smoke requests (`GET /` for UI assets, `GET /api/health`, `POST /api/auth/login`, and `GET /api/auth/session`).
+  4. Perform active WebSocket protocol verification (`ws://127.0.0.1:<PORT>/ws/engine`), completing the authentication handshake.
+  5. Cleanly terminate the background server process upon test completion.
+
+## 6. Test Suite Completeness & Lockfile Integrity
+- **Never narrow test script scopes to bypass failures.** The root `npm test` script must execute all test files across `tests/` (`vitest run`). Never filter the test runner in `package.json` to a subset of files to create the illusion of a passing build.
+- **Maintain hermetic package locking.** `package-lock.json` must always be committed and synchronized with `package.json`. Agents must never delete or omit the lockfile.

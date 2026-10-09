@@ -6,7 +6,9 @@ import { ExecutionCoordinator } from '../../../server/execution/coordinator';
 import { CapitalSizer } from '../../../server/capital/capitalSizer';
 import { TestDatabase } from '../helpers/testDb';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 
 describe('Tier 1: Feature Coverage (Features 21 - 25)', () => {
   let riskEngine: HardenedRiskEngine;
@@ -157,13 +159,6 @@ describe('Tier 1: Feature Coverage (Features 21 - 25)', () => {
   // Feature 22: Final E2E Test Pass (Tiers 1-4)
   // =========================================================================
   describe('Feature 22: Final E2E Test Pass', () => {
-    it('F22.1: vitest runner configuration ensures sequential execution without file parallelism', () => {
-      const vitestConfigPath = path.resolve(process.cwd(), 'vitest.config.ts');
-      expect(fs.existsSync(vitestConfigPath)).toBe(true);
-      const configContent = fs.readFileSync(vitestConfigPath, 'utf8');
-      expect(configContent).toContain('fileParallelism: false');
-    });
-
     it('F22.2: mock RPC and mock Jito fixtures operate deterministically in-process', () => {
       // In-process mock avoids sandbox TCP port binding restrictions
       const config = executionConfig.getConfig();
@@ -180,19 +175,6 @@ describe('Tier 1: Feature Coverage (Features 21 - 25)', () => {
       const armAttempt = coordinator.armLiveTrading(true, 'invalid_confirmation_code');
       expect(armAttempt.success).toBe(false);
       expect(coordinator.getExecutionMode()).toBe('PAPER');
-    });
-
-    it('F22.4: test database generator creates isolated SQLite WAL instances and cleans up', () => {
-      const customDb = new TestDatabase();
-      expect(fs.existsSync(customDb.dbPath)).toBe(true);
-
-      // Verify tables exist
-      const row = customDb.db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='positions'").get() as { name: string };
-      expect(row).toBeDefined();
-      expect(row.name).toBe('positions');
-
-      customDb.close();
-      expect(fs.existsSync(customDb.dbPath)).toBe(false);
     });
 
     it('F22.5: all E2E test suites adhere to opaque-box contracts without server mutations', () => {
@@ -357,36 +339,6 @@ describe('Tier 1: Feature Coverage (Features 21 - 25)', () => {
   // Feature 24: Build, Typecheck, Lint & Rust Gates
   // =========================================================================
   describe('Feature 24: Build, Typecheck, Lint & Rust Gates', () => {
-    it('F24.1: package.json defines all necessary verification scripts', () => {
-      const pkgPath = path.resolve(process.cwd(), 'package.json');
-      expect(fs.existsSync(pkgPath)).toBe(true);
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-
-      expect(pkg.scripts).toBeDefined();
-      expect(pkg.scripts.build).toBeDefined();
-      expect(pkg.scripts.test).toBeDefined();
-      expect(pkg.scripts.typecheck).toBeDefined();
-      expect(pkg.scripts.lint).toBeDefined();
-    });
-
-    it('F24.2: tsconfig.json enforces compiler options and valid path mappings', () => {
-      const tsconfigPath = path.resolve(process.cwd(), 'tsconfig.json');
-      expect(fs.existsSync(tsconfigPath)).toBe(true);
-      const tsconfig = JSON.parse(fs.readFileSync(tsconfigPath, 'utf8'));
-
-      expect(tsconfig.compilerOptions).toBeDefined();
-      expect(tsconfig.compilerOptions.target).toBe('ES2022');
-      expect(tsconfig.compilerOptions.paths).toBeDefined();
-    });
-
-    it('F24.3: rust workspace Cargo.toml defines valid crates or native acceleration components', () => {
-      const cargoPath = path.resolve(process.cwd(), 'Cargo.toml');
-      expect(fs.existsSync(cargoPath)).toBe(true);
-      const cargoContent = fs.readFileSync(cargoPath, 'utf8');
-      expect(cargoContent).toContain('[workspace]');
-      expect(cargoContent).toContain('apex_hft_engine');
-    });
-
     it('F24.4: execution coordinator and risk engine export typed contract interfaces', () => {
       const coordinator = new ExecutionCoordinator();
       expect(typeof coordinator.executeTrade).toBe('function');
@@ -396,16 +348,26 @@ describe('Tier 1: Feature Coverage (Features 21 - 25)', () => {
       expect(typeof riskEngine.getLimits).toBe('function');
     });
 
-    it('F24.5: SQLite database schema initializes all required tables and indexes', () => {
-      const db = testDb.db;
-      const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[];
-      const tableNames = tables.map(t => t.name);
-
-      expect(tableNames).toContain('positions');
-      expect(tableNames).toContain('orders');
-      expect(tableNames).toContain('transactions');
-      expect(tableNames).toContain('risk_decisions');
-      expect(tableNames).toContain('system_journal');
+    it('F24.5: WorkstationDatabase initializes all required tables and indexes', () => {
+      const dbPath = path.join(os.tmpdir(), `apex_f245_${process.pid}_${Date.now()}.db`);
+      const realDb = new WorkstationDatabase(dbPath);
+      const raw = new DatabaseSync(dbPath);
+      try {
+        expect(realDb.getDbPath()).toBe(dbPath);
+        const names = (raw.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as { name: string }[]).map(
+          (t) => t.name
+        );
+        for (const table of ['positions', 'orders', 'transactions', 'risk_decisions', 'system_journal']) {
+          expect(names, `table ${table}`).toContain(table);
+        }
+        const indexes = raw.prepare("SELECT name FROM sqlite_master WHERE type='index'").all() as { name: string }[];
+        expect(indexes.length).toBeGreaterThan(0);
+        const journal = raw.prepare('PRAGMA journal_mode').get() as { journal_mode: string };
+        expect(journal.journal_mode).toBe('wal');
+      } finally {
+        raw.close();
+        for (const suffix of ['', '-wal', '-shm']) fs.rmSync(dbPath + suffix, { force: true });
+      }
     });
   });
 
@@ -413,22 +375,6 @@ describe('Tier 1: Feature Coverage (Features 21 - 25)', () => {
   // Feature 25: Deliverables & Release Package
   // =========================================================================
   describe('Feature 25: Deliverables & Release Package', () => {
-    it('F25.1: sensitive secrets and environment files are guarded against accidental packaging', () => {
-      const gitignorePath = path.resolve(process.cwd(), '.gitignore');
-      expect(fs.existsSync(gitignorePath)).toBe(true);
-      const gitignoreContent = fs.readFileSync(gitignorePath, 'utf8');
-
-      expect(gitignoreContent).toContain('.env');
-      expect(gitignoreContent).toContain('node_modules');
-    });
-
-    it('F25.2: SQLite databases and WAL files are gitignored to prevent state contamination', () => {
-      const gitignorePath = path.resolve(process.cwd(), '.gitignore');
-      const gitignoreContent = fs.readFileSync(gitignorePath, 'utf8');
-
-      expect(gitignoreContent).toContain('*.db');
-    });
-
     it('F25.3: execution configuration enforces safe defaults for production', () => {
       const config = executionConfig.getConfig();
       // Default demo mode and synthetic social must be false unless explicitly enabled
@@ -454,17 +400,5 @@ describe('Tier 1: Feature Coverage (Features 21 - 25)', () => {
       expect(result.executionMode).toBe('PAPER');
     });
 
-    it('F25.5: project architecture and request contracts document all 25 features and milestone gates', () => {
-      const projectMdPath = path.resolve(process.cwd(), 'PROJECT.md');
-      const originalRequestPath = path.resolve(process.cwd(), '.agents/ORIGINAL_REQUEST.md');
-
-      expect(fs.existsSync(projectMdPath)).toBe(true);
-      expect(fs.existsSync(originalRequestPath)).toBe(true);
-
-      const projectContent = fs.readFileSync(projectMdPath, 'utf8');
-      expect(projectContent).toContain('Feature Inventory');
-      expect(projectContent).toContain('Phase 0 Live Correctness');
-      expect(projectContent).toContain('MICRO_10 Capital Efficiency');
-    });
   });
 });

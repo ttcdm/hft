@@ -59,6 +59,8 @@ describe('Phase 2 Remediation Suite (B02, B08, B09, B17, B21, B23)', () => {
       vi.spyOn((executionCoordinator as any).jitoTransport, 'getTelemetry').mockReturnValue({
         health: 'HEALTHY',
       } as any);
+      // A4 also requires a recent probe; this test is about the feed grace period, so make the probe current.
+      vi.spyOn((executionCoordinator as any).jitoTransport, 'getProbeAgeMs').mockReturnValue(0);
 
       const armRes = executionCoordinator.armLiveTrading(true, 'CONFIRM_LIVE_TRADING_RISK');
       expect(armRes.success).toBe(true);

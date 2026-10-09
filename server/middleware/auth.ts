@@ -153,34 +153,89 @@ export class AuthManager {
 
 export const authManager = new AuthManager();
 
+// Extract an operator token from the Authorization / x-session-token / x-operator-auth headers.
+// Tokens are never read from query strings.
+export function extractOperatorToken(req: Request): string | undefined {
+  const authHeader = req.headers['authorization'];
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    return authHeader.slice(7).trim();
+  }
+  if (req.headers['x-session-token']) {
+    return String(req.headers['x-session-token']).trim();
+  }
+  if (req.headers['x-operator-auth']) {
+    return String(req.headers['x-operator-auth']).trim();
+  }
+  return undefined;
+}
+
+function sendUnauthorized(req: Request, res: Response) {
+  return res.status(401).json({
+    success: false,
+    error: {
+      code: 'UNAUTHORIZED_MUTATION',
+      message: 'Cryptographic operator session token is missing or invalid. Provide a valid Bearer token or x-session-token header.',
+      correlationId: (req as any).correlationId || crypto.randomUUID(),
+      timestamp: new Date().toISOString(),
+    },
+  });
+}
+
 // Express middleware to protect mutation and sensitive endpoints
 export function requireOperatorAuth(req: Request, res: Response, next: NextFunction) {
-  // Check authorization header or x-session-token or x-operator-auth header
-  const authHeader = req.headers['authorization'];
-  let token: string | undefined;
-
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    token = authHeader.slice(7).trim();
-  } else if (req.headers['x-session-token']) {
-    token = String(req.headers['x-session-token']).trim();
-  } else if (req.headers['x-operator-auth']) {
-    token = String(req.headers['x-operator-auth']).trim();
-  }
+  const token = extractOperatorToken(req);
 
   if (!token || !authManager.validateToken(token)) {
     Logger.warn(`Unauthorized mutation attempt blocked on ${req.method} ${req.originalUrl} from ${req.ip}`);
-    return res.status(401).json({
-      success: false,
-      error: {
-        code: 'UNAUTHORIZED_MUTATION',
-        message: 'Cryptographic operator session token is missing or invalid. Provide a valid Bearer token or x-session-token header.',
-        correlationId: (req as any).correlationId || crypto.randomUUID(),
-        timestamp: new Date().toISOString(),
-      },
-    });
+    return sendUnauthorized(req, res);
   }
 
   next();
+}
+
+// A1: the only /api routes reachable without an operator token. Everything else is denied by default.
+export const PUBLIC_API_ALLOWLIST: ReadonlyArray<{ method: string; path: string }> = [
+  { method: 'GET', path: '/api/health' },
+  { method: 'POST', path: '/api/auth/login' },
+  { method: 'OPTIONS', path: '*' },
+];
+
+export function isPublicApiRoute(method: string, pathname: string): boolean {
+  const m = method.toUpperCase();
+  const p = pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
+  return PUBLIC_API_ALLOWLIST.some((r) => r.method === m && (r.path === '*' || r.path === p));
+}
+
+// Deny-by-default gate for every /api route. Mount it with app.use(apiAuthGate) before any route.
+export function apiAuthGate(req: Request, res: Response, next: NextFunction) {
+  const pathname = (req.originalUrl || req.url || '').split('?')[0];
+  if (!pathname.startsWith('/api')) return next();
+  if (isPublicApiRoute(req.method, pathname)) return next();
+  const token = extractOperatorToken(req);
+  if (!token || !authManager.validateToken(token)) {
+    Logger.warn(`Unauthenticated API request blocked: ${req.method} ${pathname} from ${req.ip}`);
+    return sendUnauthorized(req, res);
+  }
+  next();
+}
+
+// A1: bind to loopback unless a public bind is explicitly allowed with ALLOW_PUBLIC_BIND=true.
+export function resolveBindHost(env: NodeJS.ProcessEnv = process.env): { host: string; warning?: string } {
+  const requested = (env.BIND_HOST || '').trim();
+  const isLoopback = requested === '' || requested === '127.0.0.1' || requested === '::1' || requested === 'localhost';
+  if (isLoopback) {
+    return { host: requested || '127.0.0.1' };
+  }
+  if (env.ALLOW_PUBLIC_BIND === 'true') {
+    return {
+      host: requested,
+      warning: `BIND_HOST=${requested} exposes the operator API beyond this machine (ALLOW_PUBLIC_BIND=true).`,
+    };
+  }
+  return {
+    host: '127.0.0.1',
+    warning: `BIND_HOST=${requested} ignored: set ALLOW_PUBLIC_BIND=true to bind beyond loopback. Binding 127.0.0.1.`,
+  };
 }
 
 // WebSocket connection token validator
@@ -189,42 +244,32 @@ export function verifyWsAuth(token?: string | null): boolean {
   return authManager.validateToken(token);
 }
 
-// Helper function: strictly validate client origin against host or configured exact origins
+// Helper function: strictly validate client origin against the server's own origin, loopback,
+// or exact origins listed in ALLOWED_ORIGINS. No wildcard cloud domains are trusted (A1).
 export function isAllowedClientOrigin(origin?: string | null, reqHost?: string | null): boolean {
-  if (!origin) return true;
+  if (!origin) return true; // REST only; WebSockets use isAllowedWsConnection
   try {
     const u = new URL(origin);
-    // Allow loopback / localhost for development & test suites
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+    // Allow loopback / localhost for local workstation operation
     if (u.hostname === 'localhost' || u.hostname === '127.0.0.1') return true;
 
-    // Check same-origin against current HTTP request Host header
-    if (reqHost) {
-      const hostWithoutPort = reqHost.split(':')[0];
-      if (u.hostname === hostWithoutPort) return true;
-    }
+    // Same-origin: scheme-agnostic host:port match against the request Host header
+    if (reqHost && u.host.toLowerCase() === reqHost.toLowerCase()) return true;
 
-    // Allow Google Cloud Run, AI Studio, and Google sandbox preview domains
-    if (
-      u.hostname.endsWith('.run.app') ||
-      u.hostname.endsWith('.googleusercontent.com') ||
-      u.hostname.endsWith('.google.com') ||
-      u.hostname.endsWith('.aistudio.google.com')
-    ) {
-      return true;
-    }
-
-    // Check configured exact origins from environment
+    // Exact origins configured from environment
     const configuredRaw = process.env.ALLOWED_ORIGINS || process.env.CORS_ORIGIN || process.env.APP_URL || '';
     if (configuredRaw) {
       const allowedList = configuredRaw.split(',').map((s) => s.trim()).filter(Boolean);
       for (const entry of allowedList) {
         try {
-          const entryUrl = entry.includes('://') ? new URL(entry) : new URL(`https://${entry}`);
-          if (u.origin === entryUrl.origin || u.hostname === entryUrl.hostname) {
+          if (entry.includes('://')) {
+            if (u.origin === new URL(entry).origin) return true;
+          } else if (u.hostname === entry || u.host === entry) {
             return true;
           }
         } catch {
-          if (origin === entry || u.hostname === entry) return true;
+          if (origin === entry) return true;
         }
       }
     }
@@ -235,3 +280,18 @@ export function isAllowedClientOrigin(origin?: string | null, reqHost?: string |
   }
 }
 
+function isLoopbackAddress(addr?: string | null): boolean {
+  if (!addr) return false;
+  return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+}
+
+// WebSocket upgrade check: browsers always send Origin, so a missing Origin is only accepted
+// from a loopback peer (local tooling and smoke checks). Anything else must pass the origin allowlist.
+export function isAllowedWsConnection(
+  origin?: string | null,
+  reqHost?: string | null,
+  remoteAddress?: string | null
+): boolean {
+  if (!origin) return isLoopbackAddress(remoteAddress);
+  return isAllowedClientOrigin(origin, reqHost);
+}

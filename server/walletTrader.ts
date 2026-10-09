@@ -6,6 +6,7 @@ import { workstationDb } from './db/database';
 import { riskEngine } from './risk/riskEngine';
 import { ExecutionMode, NormalizedPosition } from './core/types';
 import { executionConfig } from './solana/executionConfig';
+import { resolveRpcUrl } from './solana/clusterGuard';
 
 export interface WalletTraderConfig {
   walletAddress: string;
@@ -72,7 +73,7 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     const execCfg = executionConfig.getConfig();
     this.config = {
       walletAddress: '',
-      rpcEndpoint: process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
+      rpcEndpoint: resolveRpcUrl(),
       jitoBlockEngineUrl: execCfg.jitoBlockEngineUrl,
       jitoTipAccount: execCfg.jitoTipAccount,
       jitoTipSol: execCfg.defaultJitoTipSol,
@@ -195,8 +196,9 @@ class PlugAndPlayWalletTrader extends EventEmitter {
       currentPriceSol: order.currentPriceSol, // No invented fallback price! Coordinator queries on-chain bonding curve
       slippageBps: Math.round((order.slippagePct || 8.0) * 100),
       jitoTipSol: order.jitoTipSol || this.config.jitoTipSol,
-      source: 'AUTO_SNIPER',
-      provenance: 'REAL_ONCHAIN',
+      source: 'MANUAL',
+      // Only the operator route calls this; it does not carry an on-chain signal of its own.
+      provenance: 'MANUAL_OPERATOR',
       liquidityUsd: order.liquidityUsd,
       signalTimestamp: order.signalTimestamp,
     });

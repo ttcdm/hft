@@ -40,6 +40,7 @@ describe('Tier 1: Feature Coverage (Features 6 - 10)', () => {
 
   afterEach(async () => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     await mockJito.stop();
     testDb.close();
     mockRpc.clear();
@@ -563,15 +564,17 @@ describe('Tier 1: Feature Coverage (Features 6 - 10)', () => {
     });
 
     it('F9.5: logs provenance in SQLite audit journal', () => {
-      testDb.logJournal('SIGNAL_PROVENANCE_AUDIT', 'corr_prov_1', 'PAPER', {
+      const db = new WorkstationDatabase(':memory:');
+      db.logJournal('SIGNAL_PROVENANCE_AUDIT', 'corr_prov_1', 'PAPER', {
         provenance: 'REAL_ONCHAIN',
         source: 'SOLANA_RPC',
       });
 
-      const events = testDb.getEvents(5);
-      const audit = events.find((e) => e.eventType === 'SIGNAL_PROVENANCE_AUDIT');
+      const audit = db.getEvents(5).find((e) => e.eventType === 'SIGNAL_PROVENANCE_AUDIT');
       expect(audit).toBeDefined();
-      expect(audit?.payload.provenance).toBe('REAL_ONCHAIN');
+      expect(audit?.correlationId).toBe('corr_prov_1');
+      expect(audit?.executionMode).toBe('PAPER');
+      expect((audit?.payload as any).provenance).toBe('REAL_ONCHAIN');
     });
   });
 
@@ -586,8 +589,11 @@ describe('Tier 1: Feature Coverage (Features 6 - 10)', () => {
     });
 
     it('F10.2: synthetic trades are saved with PAPER executionMode in database', () => {
+      // beforeEach stubs loadPositions on the prototype; restore the real implementation for this DB test
+      vi.mocked(WorkstationDatabase.prototype.loadPositions).mockRestore();
+      const db = new WorkstationDatabase(':memory:');
       const posId = `synth_pos_${Date.now()}`;
-      testDb.savePosition({
+      db.savePosition({
         id: posId,
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'SYNTH',
@@ -614,10 +620,10 @@ describe('Tier 1: Feature Coverage (Features 6 - 10)', () => {
         lastUpdatedTimestamp: Date.now(),
       });
 
-      const livePositions = testDb.loadPositions('LIVE', 'OPEN');
+      const livePositions = db.loadPositions('LIVE', 'OPEN');
       expect(livePositions.some((p) => p.id === posId)).toBe(false);
 
-      const paperPositions = testDb.loadPositions('PAPER', 'OPEN');
+      const paperPositions = db.loadPositions('PAPER', 'OPEN');
       expect(paperPositions.some((p) => p.id === posId)).toBe(true);
     });
 
@@ -630,8 +636,11 @@ describe('Tier 1: Feature Coverage (Features 6 - 10)', () => {
     });
 
     it('F10.4: synthetic PnL is isolated from LIVE daily realized PnL in database', () => {
+      // beforeEach stubs loadPositions on the prototype; restore the real implementation for this DB test
+      vi.mocked(WorkstationDatabase.prototype.loadPositions).mockRestore();
+      const db = new WorkstationDatabase(':memory:');
       const posId = `synth_closed_${Date.now()}`;
-      testDb.savePosition({
+      db.savePosition({
         id: posId,
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'SYNTH_CLOSED',
@@ -658,15 +667,28 @@ describe('Tier 1: Feature Coverage (Features 6 - 10)', () => {
         lastUpdatedTimestamp: Date.now(),
       });
 
-      const liveDailyPnl = testDb.getDailyRealizedPnLSol('LIVE');
+      const liveDailyPnl = db.getDailyRealizedPnLSol('LIVE');
       expect(liveDailyPnl).toBe(0);
 
-      const paperDailyPnl = testDb.getDailyRealizedPnLSol('PAPER');
+      const paperDailyPnl = db.getDailyRealizedPnLSol('PAPER');
       expect(paperDailyPnl).toBe(0.01);
     });
 
-    it('F10.5: demo mode flag is false by default in production and CI', () => {
-      expect(process.env.DEMO_MODE !== 'true').toBe(true);
+    it('F10.5: demo mode flag is false by default in production and CI', async () => {
+      vi.stubEnv('DEMO_MODE', undefined as any);
+      vi.resetModules();
+      const unset = await import('../../../server/solana/executionConfig');
+      expect(unset.executionConfig.getConfig().demoMode).toBe(false);
+
+      vi.stubEnv('DEMO_MODE', 'false');
+      vi.resetModules();
+      const off = await import('../../../server/solana/executionConfig');
+      expect(off.executionConfig.getConfig().demoMode).toBe(false);
+
+      vi.stubEnv('DEMO_MODE', 'true');
+      vi.resetModules();
+      const on = await import('../../../server/solana/executionConfig');
+      expect(on.executionConfig.getConfig().demoMode).toBe(true);
     });
   });
 });

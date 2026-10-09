@@ -299,10 +299,17 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       }
 
       const results = await Promise.all(promises);
+      // All must have failed cleanly. C7 allows one in-flight buy per mint, so one request reaches the injected
+      // chain error and every concurrent duplicate for the same mint is refused up front.
       for (const res of results) {
         expect(res.success).toBe(false);
-        expect(res.lifecycleState).toBe('CHAIN_ERROR');
+        if (res.lifecycleState === 'RISK_REJECTED') {
+          expect(res.error).toMatch(/DUPLICATE_MINT/);
+        } else {
+          expect(res.lifecycleState).toBe('CHAIN_ERROR');
+        }
       }
+      expect(results.filter((res) => res.lifecycleState === 'CHAIN_ERROR').length).toBeGreaterThanOrEqual(1);
 
       // Crucial empirical invariant: zero reserved SOL leakage
       expect((coordinator as any).inFlightReservedSol).toBe(0);
@@ -979,8 +986,14 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
   describe('Probe 5: Crash Recovery & SQLite Startup Reconciliation', () => {
     let coordinator: ExecutionCoordinator;
 
-    beforeEach(() => {
+    beforeEach(async () => {
+      // The coordinator probes RPC and runs a startup reconciliation on construction. Answer from mocks so
+      // the test never depends on a reachable network or an SDK stub, then let that background pass finish
+      // before the test seeds its own pending transactions.
+      vi.spyOn(Connection.prototype, 'getSlot').mockResolvedValue(280005000);
+      vi.spyOn(Connection.prototype, 'getBalance').mockResolvedValue(5_000_000_000);
       coordinator = new ExecutionCoordinator();
+      await vi.waitFor(() => expect((coordinator as any).lastStartupReconciliation).toBeTruthy());
     });
 
     afterEach(() => {

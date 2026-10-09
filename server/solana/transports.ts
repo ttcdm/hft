@@ -1,6 +1,7 @@
 import { Connection, VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { Logger } from '../middleware/enterprise';
+import { jitoTipFloorAllowed, resolveJitoUrl } from './clusterGuard';
 import { executionConfig } from './executionConfig';
 
 export type BundleLifecycleState =
@@ -188,6 +189,7 @@ export class JitoTransport implements ExecutionTransport {
   private lastLatencyMs: number | null = null;
   private lastHealthStatus: 'HEALTHY' | 'DEGRADED' | 'OFFLINE' | 'NOT_CONFIGURED' = 'NOT_CONFIGURED';
   private lastErrorMessage: string | null = null;
+  private lastProbeTimestamp: number | null = null;
   private cachedTipFloor: { lamports: number; timestamp: number } | null = null;
 
   constructor(
@@ -195,11 +197,21 @@ export class JitoTransport implements ExecutionTransport {
     blockEngineUrl?: string
   ) {
     const configUrl = executionConfig.getConfig().jitoBlockEngineUrl;
-    this.blockEngineUrl = (blockEngineUrl || configUrl || 'https://mainnet.block-engine.jito.wtf').replace(/\/$/, '');
+    // '' means Jito is disabled. There is no default block engine.
+    this.blockEngineUrl = resolveJitoUrl(blockEngineUrl || configUrl || '');
+  }
+
+  /** True only when a non-mainnet-guarded block engine URL is configured. */
+  public isEnabled(): boolean {
+    return this.blockEngineUrl !== '';
   }
 
   public setBlockEngineUrl(url: string) {
-    this.blockEngineUrl = url.replace(/\/$/, '');
+    const resolved = resolveJitoUrl(url);
+    if (url.trim() !== '' && resolved === '') {
+      throw new Error('CLUSTER_GUARD: refusing to configure a mainnet Jito block engine URL');
+    }
+    this.blockEngineUrl = resolved;
     executionConfig.updateConfig({ jitoBlockEngineUrl: this.blockEngineUrl });
     this.lastHealthStatus = 'NOT_CONFIGURED';
   }
@@ -208,6 +220,10 @@ export class JitoTransport implements ExecutionTransport {
     const now = Date.now();
     if (this.cachedTipFloor && now - this.cachedTipFloor.timestamp < 15000) {
       return this.cachedTipFloor.lamports;
+    }
+    // The public tip-floor service is mainnet-only: never call it unless mainnet was explicitly allowed.
+    if (!this.isEnabled() || !jitoTipFloorAllowed()) {
+      return this.cachedTipFloor?.lamports ?? null;
     }
 
     try {
@@ -246,17 +262,46 @@ export class JitoTransport implements ExecutionTransport {
     };
   }
 
+  /**
+   * Real health probe: asks the block engine for its tip accounts (a cheap authenticated-free JSON-RPC call)
+   * and requires a non-empty array back. HEALTHY only on that answer; an HTTP error or unexpected body is
+   * DEGRADED; a network error or timeout is OFFLINE. The tip-floor lookup no longer decides health.
+   */
   public async probe(): Promise<{ healthy: boolean; tipFloorLamports: number | null; latencyMs: number }> {
     const t0 = performance.now();
-    try {
-      const tipFloor = await this.getTipFloorLamports();
-      const latencyMs = Math.round(performance.now() - t0);
-      this.lastHealthStatus = 'HEALTHY';
-      this.lastLatencyMs = latencyMs;
+    if (!this.isEnabled()) {
+      this.lastHealthStatus = 'NOT_CONFIGURED';
       this.lastErrorMessage = null;
+      return { healthy: false, tipFloorLamports: null, latencyMs: 0 };
+    }
+    try {
+      const res = await fetch(`${this.blockEngineUrl}/api/v1/bundles`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getTipAccounts', params: [] }),
+        signal: AbortSignal.timeout(3000),
+      });
+      const latencyMs = Math.round(performance.now() - t0);
+      this.lastProbeTimestamp = Date.now();
+      this.lastLatencyMs = latencyMs;
+      if (!res.ok) {
+        this.lastHealthStatus = 'DEGRADED';
+        this.lastErrorMessage = `Probe HTTP ${res.status}`;
+        return { healthy: false, tipFloorLamports: null, latencyMs };
+      }
+      const body: any = await res.json().catch(() => null);
+      if (!Array.isArray(body?.result) || body.result.length === 0) {
+        this.lastHealthStatus = 'DEGRADED';
+        this.lastErrorMessage = 'Probe returned no tip accounts';
+        return { healthy: false, tipFloorLamports: null, latencyMs };
+      }
+      this.lastHealthStatus = 'HEALTHY';
+      this.lastErrorMessage = null;
+      const tipFloor = await this.getTipFloorLamports();
       return { healthy: true, tipFloorLamports: tipFloor, latencyMs };
     } catch (err: any) {
       const latencyMs = Math.round(performance.now() - t0);
+      this.lastProbeTimestamp = Date.now();
       this.lastHealthStatus = 'OFFLINE';
       this.lastLatencyMs = latencyMs;
       this.lastErrorMessage = err.message;
@@ -264,8 +309,14 @@ export class JitoTransport implements ExecutionTransport {
     }
   }
 
+  /** Milliseconds since the last completed probe, or null if none ran. */
+  public getProbeAgeMs(): number | null {
+    return this.lastProbeTimestamp === null ? null : Date.now() - this.lastProbeTimestamp;
+  }
+
   // Check inflight status for bundles submitted within the last ~5 minutes
   public async getInflightBundleStatus(bundleId: string): Promise<{ status: string; landedSlot?: number; error?: string } | null> {
+    if (!this.isEnabled()) return null;
     try {
       const res = await fetch(`${this.blockEngineUrl}/api/v1/getInflightBundleStatuses`, {
         method: 'POST',
@@ -310,6 +361,7 @@ export class JitoTransport implements ExecutionTransport {
 
   // Check bundle confirmation status across processed / confirmed / finalized
   public async getBundleStatus(bundleId: string): Promise<{ status: string; landedSlot?: number; error?: string } | null> {
+    if (!this.isEnabled()) return null;
     try {
       const res = await fetch(`${this.blockEngineUrl}/api/v1/getBundleStatuses`, {
         method: 'POST',
@@ -353,6 +405,17 @@ export class JitoTransport implements ExecutionTransport {
 
   public async submit(tx: VersionedTransaction): Promise<SubmitResult> {
     const t0 = performance.now();
+    if (!this.isEnabled()) {
+      this.lastHealthStatus = 'NOT_CONFIGURED';
+      return {
+        signature: '',
+        transport: 'JITO',
+        success: false,
+        submitDurationMs: 0,
+        lifecycleState: 'SUBMIT_FAILED',
+        error: 'JITO_DISABLED: no block engine URL configured',
+      };
+    }
     const raw = tx.serialize();
     // Modern official Jito format: Base64 encoding
     const b64Tx = Buffer.from(raw).toString('base64');

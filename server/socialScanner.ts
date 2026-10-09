@@ -1,3 +1,4 @@
+import { PublicKey } from '@solana/web3.js';
 import { SocialSignal, SocialSource, AuthorTier, SignalPattern } from '../src/types';
 import { memecoinAggregator } from './memecoinAggregator';
 
@@ -223,8 +224,23 @@ export class SocialAlphaScanner {
   }
 
   public updateTelegramConfig(cfg: Partial<TelegramBotConfig>): TelegramBotConfig {
-    this.telegramConfig = { ...this.telegramConfig, ...cfg };
+    // S1: only known keys with the right types are accepted (no mass assignment from the request body).
+    const next: Partial<TelegramBotConfig> = {};
+    if (typeof cfg?.botToken === 'string') next.botToken = cfg.botToken.trim();
+    if (typeof cfg?.chatId === 'string') next.chatId = cfg.chatId.trim();
+    if (typeof cfg?.webhookActive === 'boolean') next.webhookActive = cfg.webhookActive;
+    if (typeof cfg?.autoForwardAlerts === 'boolean') next.autoForwardAlerts = cfg.autoForwardAlerts;
+    if (typeof cfg?.snipeThresholdScore === 'number' && Number.isFinite(cfg.snipeThresholdScore)) {
+      next.snipeThresholdScore = Math.min(100, Math.max(0, cfg.snipeThresholdScore));
+    }
+    this.telegramConfig = { ...this.telegramConfig, ...next };
     return this.telegramConfig;
+  }
+
+  /** Config safe to return over HTTP: the bot token is never included, only whether one is set. */
+  public getTelegramConfigRedacted(): Omit<TelegramBotConfig, 'botToken'> & { botToken: ''; botTokenSet: boolean } {
+    const { botToken, ...rest } = this.telegramConfig;
+    return { ...rest, botToken: '', botTokenSet: !!botToken };
   }
 
   public markSniped(signalId: string): SocialSignal | undefined {
@@ -324,9 +340,22 @@ export class SocialAlphaScanner {
     }
 
     if (trimmed.startsWith('/snipe') || trimmed.startsWith('/buy')) {
-      const parts = trimmed.split(' ');
-      const ca = parts[1] || 'CzLSujWBLFsSjncfkh59rQD4NJYsZUMffEFrNJfiBAGS';
-      const amount = parts[2] ? parseFloat(parts[2]) : 5.0;
+      const parts = trimmed.split(/\s+/);
+      const ca = parts[1] || '';
+      // S1: never fall back to a hardcoded token. A missing or malformed mint, or a bad amount, is rejected.
+      let validMint: boolean;
+      try {
+        validMint = !!ca && new PublicKey(ca).toBase58() === ca;
+      } catch {
+        validMint = false;
+      }
+      if (!validMint) {
+        return { reply: `❌ SNIPE REJECTED: usage is /snipe <mint address> [amount_usd]. "${ca.slice(0, 60)}" is not a valid Solana address.` };
+      }
+      const amount = parts[2] ? Number(parts[2]) : 5.0;
+      if (!Number.isFinite(amount) || amount <= 0) {
+        return { reply: `❌ SNIPE REJECTED: amount must be a positive number.` };
+      }
 
       const snipeResult = await memecoinAggregator.executeSnipe({
         contractAddress: ca,

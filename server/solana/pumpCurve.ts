@@ -571,27 +571,8 @@ export class PumpCurveService {
         this.cacheTimestamp = now;
       }
 
-      let finalMintInfo = mintAccountInfo;
-      let finalCurveInfo = curveAccountInfo;
-
-      if ((!finalMintInfo || !finalCurveInfo) && !isLiveMode) {
-        try {
-          const mainnetFallback = new Connection('https://api.mainnet-beta.solana.com', 'confirmed');
-          const fallbackAccounts = [mint, bondingCurve];
-          if (!this.cachedGlobal || !this.cachedFeeConfig) {
-            fallbackAccounts.push(GLOBAL_PDA, PUMP_FEE_CONFIG_PDA);
-          }
-          const fallbackInfos = await mainnetFallback.getMultipleAccountsInfo(fallbackAccounts);
-          if (fallbackInfos[0]) finalMintInfo = fallbackInfos[0];
-          if (fallbackInfos[1]) finalCurveInfo = fallbackInfos[1];
-          if (fallbackInfos[2] && !this.cachedGlobal) {
-            try { this.cachedGlobal = PUMP_SDK.decodeGlobal(fallbackInfos[2]); } catch {}
-          }
-          if (fallbackInfos[3] && !this.cachedFeeConfig) {
-            try { this.cachedFeeConfig = PUMP_SDK.decodeFeeConfig(fallbackInfos[3]); } catch {}
-          }
-        } catch {}
-      }
+      const finalMintInfo = mintAccountInfo;
+      const finalCurveInfo = curveAccountInfo;
 
       if (!finalMintInfo) {
         Logger.warn(`Mint account not found on Solana RPC: ${mint.toBase58()}`);

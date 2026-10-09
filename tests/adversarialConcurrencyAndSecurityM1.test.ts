@@ -234,6 +234,8 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
 
       vi.spyOn(txBuilder, 'buildBuyTransaction').mockResolvedValue({} as any);
       vi.spyOn(localSigner, 'signTransaction').mockResolvedValue({} as any);
+      // A4 fails closed on an unhealthy block engine, so declare it healthy to reach the submit path under test.
+      vi.spyOn(coordinator, 'getJitoReadiness').mockReturnValue({ ready: true, enabled: true, status: 'HEALTHY' });
       vi.spyOn((coordinator as any).jitoTransport, 'submit').mockRejectedValue(
         new Error('Block Engine connection reset by peer')
       );
@@ -267,6 +269,7 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
 
       vi.spyOn(txBuilder, 'buildBuyTransaction').mockResolvedValue({} as any);
       vi.spyOn(localSigner, 'signTransaction').mockResolvedValue({} as any);
+      vi.spyOn(coordinator, 'getJitoReadiness').mockReturnValue({ ready: true, enabled: true, status: 'HEALTHY' });
       vi.spyOn((coordinator as any).jitoTransport, 'submit').mockResolvedValue({
         success: true,
         signature: 'simulated_sig_123',
@@ -324,11 +327,17 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
 
       const results = await Promise.all(promises);
 
-      // All must have failed cleanly
+      // All must have failed cleanly. C7 allows one in-flight buy per mint, so one request reaches the injected
+      // chain error and every concurrent duplicate for the same mint is refused up front.
       for (const res of results) {
         expect(res.success).toBe(false);
-        expect(res.lifecycleState).toBe('CHAIN_ERROR');
+        if (res.lifecycleState === 'RISK_REJECTED') {
+          expect(res.error).toMatch(/DUPLICATE_MINT/);
+        } else {
+          expect(res.lifecycleState).toBe('CHAIN_ERROR');
+        }
       }
+      expect(results.filter((res) => res.lifecycleState === 'CHAIN_ERROR').length).toBeGreaterThanOrEqual(1);
 
       // Invariant: Zero lamport leakage across all concurrent failures
       expect((coordinator as any).inFlightReservedSol).toBe(0);

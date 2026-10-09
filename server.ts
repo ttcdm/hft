@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-dotenv.config({ override: true });
+dotenv.config();
 import './suppress-warnings.cjs';
 import express from 'express';
 import cors from 'cors';
@@ -19,11 +19,37 @@ import { pumpFeedListener } from './server/solana/pumpFeedListener';
 import { runComprehensiveTestSuite } from './server/unitTestCases';
 import { run60DayBacktest } from './src/utils/backtestEngine';
 import { walletTrader } from './server/walletTrader';
+import { resolveRpcUrl } from './server/solana/clusterGuard';
+import {
+  ArmSchema,
+  CalloutSnipeSchema,
+  OPERATOR_PROVENANCE,
+  OperatorCloseSchema,
+  OperatorExecuteTradeSchema,
+  OperatorSnipeSchema,
+  SignalSnipeSchema,
+  SniperConfigPatchSchema,
+  ToggleCallerSchema,
+  validateTradeBody,
+  validateTradeInput,
+} from './server/execution/tradeInputs';
 import { executionCoordinator } from './server/execution/coordinator';
 import { localSigner } from './server/solana/signer';
 import { riskEngine } from './server/risk/riskEngine';
 import { workstationDb } from './server/db/database';
-import { authManager, requireOperatorAuth, isAllowedClientOrigin } from './server/middleware/auth';
+import {
+  authManager,
+  requireOperatorAuth,
+  apiAuthGate,
+  resolveBindHost,
+  isAllowedClientOrigin,
+  isAllowedWsConnection,
+} from './server/middleware/auth';
+import {
+  findLoosePermissions,
+  defaultSecretFilePaths,
+  loosePermissionWarnings,
+} from './server/middleware/filePermissions';
 export { isAllowedClientOrigin };
 import {
   Logger,
@@ -45,7 +71,14 @@ const PORT = parseInt(
   process.env.APP_PORT || (process.env.PORT && process.env.PORT !== '8080' ? process.env.PORT : '3000'),
   10
 );
-const BIND_HOST = process.env.BIND_HOST || '0.0.0.0';
+const bindResolution = resolveBindHost();
+const BIND_HOST = bindResolution.host;
+if (bindResolution.warning) {
+  Logger.warn(bindResolution.warning);
+}
+for (const warning of loosePermissionWarnings(findLoosePermissions(defaultSecretFilePaths()))) {
+  Logger.warn(warning);
+}
 const server = http.createServer(app);
 
 // WebSocket Server for High-Performance Engine Telemetry & Orders
@@ -94,7 +127,7 @@ wss.on('connection', (ws: WebSocket, req: any) => {
   // Origin verification for WebSocket connections (strict matching, no broad wildcards)
   const origin = (req?.headers?.origin || '') as string;
   const host = (req?.headers?.host || '') as string;
-  if (origin && !isAllowedClientOrigin(origin, host)) {
+  if (!isAllowedWsConnection(origin, host, req?.socket?.remoteAddress)) {
     ws.close(4003, 'Unauthorized WebSocket Origin');
     return;
   }
@@ -202,17 +235,24 @@ wss.on('connection', (ws: WebSocket, req: any) => {
       if (parsed.action === 'SET_CONFIG' && parsed.config) hftEngine.updateConfig(parsed.config);
 
       // Real-time sniper actions via WebSocket routed through authoritative coordinator
-      if (parsed.action === 'SNIPE_PUMP_CALLOUT' && parsed.calloutId) {
+      const rejectWsInput = (issues: Array<{ path: string; message: string }>) =>
+        ws.send(JSON.stringify({ type: 'VALIDATION_ERROR', action: parsed.action, error: 'INVALID_REQUEST', issues }));
+
+      if (parsed.action === 'SNIPE_PUMP_CALLOUT') {
+        const input = validateTradeInput(CalloutSnipeSchema, parsed);
+        if (input.status === 'invalid') return rejectWsInput(input.issues);
         const result = await pumpFunService.snipeCallout(
-          parsed.calloutId,
-          parsed.amountUsd || 5.0,
-          parsed.jitoTipSol || 0.005,
-          parsed.slippagePct || 6.0
+          input.data.calloutId,
+          input.data.amountUsd,
+          input.data.jitoTipSol,
+          input.data.slippagePct
         );
         ws.send(JSON.stringify({ type: 'CALLOUT_SNIPE_RESULT', data: result }));
       }
-      if (parsed.action === 'TOGGLE_CALLER_SNIPE' && parsed.userId) {
-        const updated = pumpFunService.toggleCallerAutoSnipe(parsed.userId);
+      if (parsed.action === 'TOGGLE_CALLER_SNIPE') {
+        const input = validateTradeInput(ToggleCallerSchema, parsed);
+        if (input.status === 'invalid') return rejectWsInput(input.issues);
+        const updated = pumpFunService.toggleCallerAutoSnipe(input.data.userId);
         if (updated) {
           broadcastWs({
             type: 'CALLER_SUBSCRIPTION_UPDATED',
@@ -220,12 +260,16 @@ wss.on('connection', (ws: WebSocket, req: any) => {
           });
         }
       }
-      if (parsed.action === 'SNIPE_MEMECOIN' && parsed.contractAddress) {
-        const result = await memecoinAggregator.executeSnipe(parsed);
+      if (parsed.action === 'SNIPE_MEMECOIN') {
+        const input = validateTradeInput(OperatorSnipeSchema, parsed);
+        if (input.status === 'invalid') return rejectWsInput(input.issues);
+        const result = await memecoinAggregator.executeSnipe({ ...input.data, provenance: OPERATOR_PROVENANCE });
         ws.send(JSON.stringify({ type: 'MEMECOIN_SNIPE_RESULT', data: result }));
       }
-      if (parsed.action === 'CLOSE_POSITION' && parsed.positionId) {
-        const result = await memecoinAggregator.closePosition(parsed.positionId, parsed.sellPct || 100);
+      if (parsed.action === 'CLOSE_POSITION') {
+        const input = validateTradeInput(OperatorCloseSchema, parsed);
+        if (input.status === 'invalid') return rejectWsInput(input.issues);
+        const result = await memecoinAggregator.closePosition(input.data.positionId, input.data.sellPct);
         ws.send(JSON.stringify({ type: 'POSITION_CLOSED_RESULT', data: result }));
       }
       if (parsed.action === 'PANIC_LIQUIDATE') {
@@ -316,6 +360,8 @@ app.use(cors(corsPolicy));
 app.use(express.json());
 app.get('/favicon.ico', (req, res) => res.status(204).end());
 app.use('/api', rateLimiter({ maxTokens: 120, refillRatePerSec: 30 }));
+// A1: deny-by-default. Only GET /api/health and POST /api/auth/login are reachable without an operator token.
+app.use(apiAuthGate);
 
 // ============================================================================
 // OPERATOR AUTHENTICATION & SESSION MANAGEMENT
@@ -354,17 +400,6 @@ app.get('/api/auth/session', (req, res) => {
       success: true,
       token: provided,
       role: 'OPERATOR',
-    });
-  }
-
-  // Seamless Plug & Play: In development, sandbox, or when no explicit secret token is forced
-  if (process.env.NODE_ENV !== 'production' || !process.env.OPERATOR_AUTH_TOKEN) {
-    const defaultToken = authManager.getPrimaryToken();
-    return res.json({
-      success: true,
-      token: defaultToken,
-      role: 'OPERATOR',
-      isAutoProvisioned: true,
     });
   }
 
@@ -1159,7 +1194,7 @@ app.get('/api/social/signals', (req, res) => {
   });
 });
 
-app.post('/api/social/signals/snipe', requireOperatorAuth, async (req, res) => {
+app.post('/api/social/signals/snipe', requireOperatorAuth, validateTradeBody(SignalSnipeSchema), async (req, res) => {
   const { signalId } = req.body;
   const sig = socialScanner.markSniped(signalId);
   if (!sig) {
@@ -1169,11 +1204,13 @@ app.post('/api/social/signals/snipe', requireOperatorAuth, async (req, res) => {
   // Trigger sniper trade on the aggregator
   const tradeResult = await memecoinAggregator.executeSnipe({
     contractAddress: sig.contractAddress,
-    amountUsd: req.body.amountUsd || 5.0,
+    amountUsd: req.body.amountUsd,
     platform: req.body.platform,
-    jitoTipSol: req.body.jitoTipSol || 0.005,
-    slippagePct: req.body.slippagePct || 8.0,
+    jitoTipSol: req.body.jitoTipSol,
+    slippagePct: req.body.slippagePct,
     signalId: sig.id,
+    // Provenance comes from the stored signal (set when it was ingested), never from the request.
+    provenance: sig.provenance,
   });
 
   res.json({
@@ -1186,15 +1223,15 @@ app.post('/api/social/signals/snipe', requireOperatorAuth, async (req, res) => {
 app.get('/api/telegram/config', (req, res) => {
   res.json({
     status: 'OK',
-    config: socialScanner.getTelegramConfig(),
+    config: socialScanner.getTelegramConfigRedacted(),
   });
 });
 
 app.post('/api/telegram/config', requireOperatorAuth, (req, res) => {
-  const updated = socialScanner.updateTelegramConfig(req.body);
+  socialScanner.updateTelegramConfig(req.body);
   res.json({
     status: 'OK',
-    config: updated,
+    config: socialScanner.getTelegramConfigRedacted(),
   });
 });
 
@@ -1280,7 +1317,7 @@ app.get('/api/connectivity/diagnostics', async (req, res) => {
   const tSol = performance.now();
   const solanaTest: any = { reachable: false, latencyMs: 0, health: null, slot: null };
   try {
-    const rpcRes = await fetch('https://api.mainnet-beta.solana.com', {
+    const rpcRes = await fetch(resolveRpcUrl(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify([
@@ -1346,7 +1383,7 @@ app.get('/api/connectivity/diagnostics', async (req, res) => {
         testResult: dexTest,
       },
       solanaRpc: {
-        service: 'Solana Mainnet Validator Cluster (api.mainnet-beta.solana.com)',
+        service: `Solana RPC (${new URL(resolveRpcUrl()).host})`,
         isLiveExternal: true,
         testResult: solanaTest,
       },
@@ -1462,20 +1499,8 @@ app.get('/api/memecoins/positions', (req, res) => {
   });
 });
 
-app.post('/api/memecoins/trade', requireOperatorAuth, async (req, res) => {
-  const { contractAddress, amountUsd, platform, jitoTipSol, slippagePct, signalId } = req.body;
-  if (!contractAddress) {
-    return res.status(400).json({ error: 'contractAddress is required' });
-  }
-
-  const result = await memecoinAggregator.executeSnipe({
-    contractAddress,
-    amountUsd: Number(amountUsd) || 5.0,
-    platform,
-    jitoTipSol: Number(jitoTipSol) || 0.005,
-    slippagePct: Number(slippagePct) || 8.0,
-    signalId,
-  });
+app.post('/api/memecoins/trade', requireOperatorAuth, validateTradeBody(OperatorSnipeSchema), async (req, res) => {
+  const result = await memecoinAggregator.executeSnipe({ ...req.body, provenance: OPERATOR_PROVENANCE });
 
   res.json({
     status: result.success ? 'OK' : 'REJECTED',
@@ -1483,12 +1508,8 @@ app.post('/api/memecoins/trade', requireOperatorAuth, async (req, res) => {
   });
 });
 
-app.post('/api/memecoins/close', requireOperatorAuth, async (req, res) => {
-  const { positionId, sellPct = 100 } = req.body;
-  if (!positionId) {
-    return res.status(400).json({ error: 'positionId is required' });
-  }
-
+app.post('/api/memecoins/close', requireOperatorAuth, validateTradeBody(OperatorCloseSchema), async (req, res) => {
+  const { positionId, sellPct } = req.body;
   const result = await memecoinAggregator.closePosition(positionId, sellPct);
   res.json({
     status: result.success ? 'OK' : 'ERROR',
@@ -1503,7 +1524,7 @@ app.get('/api/memecoins/config', (req, res) => {
   });
 });
 
-app.post('/api/memecoins/config', requireOperatorAuth, (req, res) => {
+app.post('/api/memecoins/config', requireOperatorAuth, validateTradeBody(SniperConfigPatchSchema), (req, res) => {
   const updated = memecoinAggregator.updateConfig(req.body);
   res.json({
     status: 'OK',
@@ -1535,18 +1556,10 @@ app.get('/api/pumpfun/leaderboard', (req, res) => {
   });
 });
 
-app.post('/api/pumpfun/callouts/snipe', requireOperatorAuth, async (req, res) => {
+app.post('/api/pumpfun/callouts/snipe', requireOperatorAuth, validateTradeBody(CalloutSnipeSchema), async (req, res) => {
   const { calloutId, amountUsd, jitoTipSol, slippagePct } = req.body;
-  if (!calloutId) {
-    return res.status(400).json({ error: 'calloutId is required' });
-  }
 
-  const result = await pumpFunService.snipeCallout(
-    calloutId,
-    amountUsd ? Number(amountUsd) : 5.0,
-    jitoTipSol ? Number(jitoTipSol) : 0.005,
-    slippagePct ? Number(slippagePct) : 6.0
-  );
+  const result = await pumpFunService.snipeCallout(calloutId, amountUsd, jitoTipSol, slippagePct);
 
   res.json({
     status: result.success ? 'OK' : 'REJECTED',
@@ -1554,11 +1567,8 @@ app.post('/api/pumpfun/callouts/snipe', requireOperatorAuth, async (req, res) =>
   });
 });
 
-app.post('/api/pumpfun/callouts/toggle-autosnipe', requireOperatorAuth, (req, res) => {
+app.post('/api/pumpfun/callouts/toggle-autosnipe', requireOperatorAuth, validateTradeBody(ToggleCallerSchema), (req, res) => {
   const { userId } = req.body;
-  if (!userId) {
-    return res.status(400).json({ error: 'userId is required' });
-  }
 
   const caller = pumpFunService.toggleCallerAutoSnipe(userId);
   if (!caller) {
@@ -1591,7 +1601,8 @@ app.get('/api/pumpfun/status', (req, res) => {
 });
 
 app.post('/api/pumpfun/refresh', async (req, res) => {
-  await pumpFunService.syncRealWorldData();
+  // A manual refresh only reloads the feed; it must never evaluate auto-snipe triggers (A5).
+  await pumpFunService.syncRealWorldData({ evaluateTriggers: false });
   res.json({
     status: 'OK',
     calloutsCount: pumpFunService.getHotCallouts().length,
@@ -1669,7 +1680,7 @@ app.post('/api/wallet/config', requireOperatorAuth, validateBody(WalletConfigSch
   });
 });
 
-app.post('/api/wallet/toggle-trading', requireOperatorAuth, (req, res) => {
+app.post('/api/wallet/toggle-trading', requireOperatorAuth, validateTradeBody(ArmSchema), (req, res) => {
   const { active, confirmationCode } = req.body;
   if (active) {
     const armRes = executionCoordinator.armLiveTrading(true, confirmationCode);
@@ -1750,7 +1761,7 @@ app.get('/api/diagnostics/system', (req, res) => {
       walletSolBalance: diag.walletSolBalance,
       walletPubkey: diag.activeWalletAddress,
       signerStatus,
-      rpcEndpoint: process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
+      rpcEndpoint: resolveRpcUrl(),
       rpcLatencyMs: diag.rpcLatencyMs,
       databaseFile: 'apex_workstation.db',
       dbDriver: 'node:sqlite (WAL mode enabled)',
@@ -1792,7 +1803,7 @@ app.get('/api/execution/readiness', (req, res) => {
   });
 });
 
-app.post('/api/execution/arm', requireOperatorAuth, (req, res) => {
+app.post('/api/execution/arm', requireOperatorAuth, validateTradeBody(ArmSchema), (req, res) => {
   const { arm, confirmationCode } = req.body;
   const result = executionCoordinator.armLiveTrading(Boolean(arm), confirmationCode);
   if (!result.success) {
@@ -1814,21 +1825,14 @@ app.post('/api/execution/kill-switch', requireOperatorAuth, (req, res) => {
   });
 });
 
-app.post('/api/execution/trade', requireOperatorAuth, async (req, res) => {
+app.post('/api/execution/trade', requireOperatorAuth, validateTradeBody(OperatorExecuteTradeSchema), async (req, res) => {
   try {
-    const validProvenances = ['LIVE_PUMP_STREAM', 'REAL_ONCHAIN', 'REAL_SOCIAL', 'COPY_TRADE', 'MANUAL_OPERATOR', 'PAPER_REPLAY', 'SIMULATED_TEST'];
-    if (!req.body || !req.body.provenance || !validProvenances.includes(req.body.provenance)) {
-      return res.status(400).json({
-        success: false,
-        lifecycleState: 'RISK_REJECTED',
-        error: `MANDATORY_PROVENANCE_REQUIRED: Execution requests must explicitly specify valid signal provenance (${validProvenances.join(', ')}).`,
-      });
-    }
-    const tradeReq = {
+    // Provenance and source are set here. A client cannot choose them (the schema rejects them).
+    const result = await executionCoordinator.executeTrade({
       ...req.body,
-      provenance: req.body.provenance,
-    };
-    const result = await executionCoordinator.executeTrade(tradeReq);
+      source: 'MANUAL',
+      provenance: OPERATOR_PROVENANCE,
+    });
     if (!result.success) {
       return res.status(400).json(result);
     }
@@ -1838,12 +1842,9 @@ app.post('/api/execution/trade', requireOperatorAuth, async (req, res) => {
   }
 });
 
-app.post('/api/execution/close', requireOperatorAuth, async (req, res) => {
+app.post('/api/execution/close', requireOperatorAuth, validateTradeBody(OperatorCloseSchema), async (req, res) => {
   try {
-    const { positionId, sellPct = 100, reason = 'Operator close' } = req.body || {};
-    if (!positionId) {
-      return res.status(400).json({ success: false, error: 'positionId is required' });
-    }
+    const { positionId, sellPct, reason = 'Operator close' } = req.body;
     const result = await executionCoordinator.closePosition(positionId, sellPct, reason);
     if (!result.success) {
       return res.status(400).json(result);
@@ -1876,8 +1877,13 @@ app.get('/api/signer/status', (req, res) => {
 // Local wallet generation helper (imports must be done via CLI: npm run signer:import)
 app.post('/api/signer/generate', requireOperatorAuth, (req, res) => {
   try {
-    const forceOverwrite = Boolean(req.body?.forceOverwrite);
-    const pubkey = localSigner.generateNewKeypair(forceOverwrite);
+    if (req.body?.forceOverwrite) {
+      return res.status(403).json({
+        success: false,
+        error: 'Overwriting an existing keypair over HTTP is disabled. Back it up and replace it with: npm run signer:import',
+      });
+    }
+    const pubkey = localSigner.generateNewKeypair(false);
     res.json({
       success: true,
       publicKey: pubkey,

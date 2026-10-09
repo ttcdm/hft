@@ -65,7 +65,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const [pools, setPools] = useState<MemecoinPool[]>([]);
   const [positions, setPositions] = useState<SniperPosition[]>([]);
   const [sniperConfig, setSniperConfig] = useState<SniperBotConfig>({
-    isAutoSnipeEnabled: true,
+    isAutoSnipeEnabled: false,
     minConfidenceScore: 85,
     defaultSnipeAmountUsd: capitalTier === 'MICRO_10' ? 5.0 : 50.0,
     maxSlippagePct: 8.0,

@@ -16,7 +16,7 @@ import {
   isConfluencePassed,
   ConfluenceFactorsInput,
 } from './signals/confluenceEngine';
-import { ConfluenceBreakdown } from './core/types';
+import { ConfluenceBreakdown, SignalProvenance } from './core/types';
 
 interface AutoSnipeRules {
   minCallerWinRate2x: number;
@@ -272,8 +272,45 @@ function normalizeSocialLinks(
   return { twitter, telegram, website };
 }
 
+// Placeholder attribution for real-feed tokens when no real caller data exists.
+// Zeroed stats and never auto-snipe subscribed, so it can't satisfy any caller-based trigger.
+const UNATTRIBUTED_CALLER: PumpFunCaller = {
+  userId: 'unattributed',
+  userUuid: 'unattributed',
+  primaryWallet: '',
+  totalCallouts: 0,
+  avgMultiple: 0,
+  medianMultiple: 0,
+  winRate1_2x: 0,
+  winRate1_5x: 0,
+  winRate2x: 0,
+  avgTimeToPeakMs: 0,
+  followersCount: 0,
+  totalVolumeDrivenUsd: 0,
+  reputationTier: 'EMERGING_CALLER',
+  topCallouts: [],
+  isAutoSnipeSubscribed: false,
+};
+
+const DEMO_CALLER_IDS: ReadonlySet<string> = new Set(INITIAL_CALLERS.map((c) => c.userId));
+
+/** Fake hardcoded callers are only loaded when DEMO_MODE=true (A5). */
+function isDemoMode(): boolean {
+  return process.env.DEMO_MODE === 'true';
+}
+
+/** Auto-snipe is off unless explicitly enabled via AUTO_SNIPE_ENABLED=true (A5). */
+export function isAutoSnipeEnvEnabled(): boolean {
+  return process.env.AUTO_SNIPE_ENABLED === 'true';
+}
+
+/** Demo and unattributed callers never carry a REAL_* provenance. */
+export function calloutProvenance(callout: PumpFunHotCallout): SignalProvenance {
+  return DEMO_CALLER_IDS.has(callout.caller.userId) ? 'SYNTHETIC_TEST' : 'REAL_SOCIAL';
+}
+
 export class PumpFunService extends EventEmitter {
-  private callers: PumpFunCaller[] = [...INITIAL_CALLERS];
+  private callers: PumpFunCaller[] = isDemoMode() ? [...INITIAL_CALLERS] : [];
   private hotCallouts: PumpFunHotCallout[] = [];
   private lastSyncTimestamp: number = 0;
   private lastSyncLatencyMs: number = 0;
@@ -364,7 +401,8 @@ export class PumpFunService extends EventEmitter {
   }
 
   // Real-world API synchronization: pump.fun + DexScreener
-  public async syncRealWorldData(): Promise<void> {
+  // `evaluateTriggers: false` refreshes the feed without ever evaluating auto-snipe (used by the manual refresh route).
+  public async syncRealWorldData(opts: { evaluateTriggers?: boolean } = {}): Promise<void> {
     if (this.isPolling) return;
     this.isPolling = true;
     const t0 = performance.now();
@@ -382,7 +420,11 @@ export class PumpFunService extends EventEmitter {
 
       let pumpCoins: any[] = [];
       if (pumpRes && pumpRes.ok) {
-        pumpCoins = await pumpRes.json();
+        const parsed = await pumpRes.json();
+        // S1: tolerate a non-array body and drop malformed entries so one bad element cannot abort the whole sync.
+        pumpCoins = Array.isArray(parsed)
+          ? parsed.filter((c: any) => c && typeof c === 'object' && typeof c.mint === 'string' && c.mint.length > 0)
+          : [];
       }
 
       // 2. Fetch real-time boosted tokens from DexScreener
@@ -390,7 +432,8 @@ export class PumpFunService extends EventEmitter {
       try {
         const dexRes = await fetch('https://api.dexscreener.com/token-boosts/top/v1').catch(() => null);
         if (dexRes && dexRes.ok) {
-          dexBoosted = await dexRes.json();
+          const parsedBoosts = await dexRes.json();
+        dexBoosted = Array.isArray(parsedBoosts) ? parsedBoosts : [];
         }
       } catch {}
 
@@ -426,7 +469,7 @@ export class PumpFunService extends EventEmitter {
       this.lastSyncTimestamp = Date.now();
 
       // 4. Construct Live Hot Callouts feed with caller attribution & HFT decay
-      this.rebuildHotCallouts(pumpCoins, pairMetricsMap, solanaBoostedMints);
+      this.rebuildHotCallouts(pumpCoins, pairMetricsMap, solanaBoostedMints, opts.evaluateTriggers !== false);
     } catch (e) {
       console.error('Error syncing real-world pump.fun / dexscreener data:', e);
     } finally {
@@ -435,7 +478,12 @@ export class PumpFunService extends EventEmitter {
   }
 
   // Transform real-world tokens into Hot Callouts with caller attribution
-  private rebuildHotCallouts(pumpCoins: any[], pairMetricsMap: Map<string, any>, boostedMints: string[]) {
+  private rebuildHotCallouts(
+    pumpCoins: any[],
+    pairMetricsMap: Map<string, any>,
+    boostedMints: string[],
+    evaluateTriggers: boolean = true,
+  ) {
     const now = Date.now();
     if (pumpCoins.length > 0) {
       executionCoordinator.recordPumpFeedEvent('PUMPFUN_SERVICE');
@@ -446,12 +494,14 @@ export class PumpFunService extends EventEmitter {
     const activeTokens = [...pumpCoins].slice(0, 15);
 
     activeTokens.forEach((c, index) => {
-      const mint = c.mint || `mint-${index}`;
+      // S1: a coin without a mint cannot be traded or attributed; never invent a placeholder mint.
+      if (!c || typeof c.mint !== 'string' || !c.mint) return;
+      const mint = c.mint;
       const pair = pairMetricsMap.get(mint.toLowerCase());
 
       // Assign caller based on coin index & hash to maintain stable personality attribution
-      const callerIndex = index % this.callers.length;
-      const caller = this.callers[callerIndex];
+      const callerIndex = this.callers.length > 0 ? index % this.callers.length : -1;
+      const caller = callerIndex >= 0 ? this.callers[callerIndex] : UNATTRIBUTED_CALLER;
 
       // Production Confluence Detection:
       // When a token appears on both the live Pump.fun high-velocity feed and DexScreener boosted list simultaneously,
@@ -629,11 +679,14 @@ export class PumpFunService extends EventEmitter {
     });
 
     // Check autonomous auto-snipe execution
-    this.evaluateAutoSnipeTriggers();
+    if (evaluateTriggers) {
+      this.evaluateAutoSnipeTriggers();
+    }
   }
 
   // Evaluate if any fresh hot callouts trigger the auto-snipe rules
   private async evaluateAutoSnipeTriggers() {
+    if (!isAutoSnipeEnvEnabled()) return;
     const rules = this.autoSnipeRules;
 
     for (const callout of this.hotCallouts) {
@@ -659,9 +712,10 @@ export class PumpFunService extends EventEmitter {
       const withinPriceLimit = callout.token.currentMultiple <= rules.maxEntryMultiple;
       const withinTimeLimit = (Date.now() - callout.calloutTimestamp) / 1000 <= rules.maxElapsedSeconds;
 
-      // Trigger if caller is subscribed OR (meets win rate AND price limit AND time limit) OR strong confluence (>= 70)
+      // Trigger on (caller stats) OR strong confluence (>= 70), within price and time limits.
+      // A caller subscription alone is not a signal (A5).
       const shouldSnipe =
-        (caller.isAutoSnipeSubscribed || (meetsCallerWinRate && meetsAvgMultiple) || meetsConfluence) &&
+        ((meetsCallerWinRate && meetsAvgMultiple) || meetsConfluence) &&
         withinPriceLimit &&
         withinTimeLimit &&
         callout.hftAction === 'INSTANT_SNIPE';
@@ -678,7 +732,7 @@ export class PumpFunService extends EventEmitter {
           jitoTipSol: rules.jitoPriorityTipSol,
           slippagePct: 6.0,
           signalId: callout.id,
-          provenance: 'REAL_ONCHAIN',
+          provenance: calloutProvenance(callout),
           enforceConfluence: rules.autoSnipeOnConfluence,
         });
 

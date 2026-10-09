@@ -1,15 +1,20 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { PublicKey } from '@solana/web3.js';
-import { PumpCurveService } from '../../../server/solana/pumpCurve';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { PublicKey, Keypair } from '@solana/web3.js';
+import { AccountLayout } from '@solana/spl-token';
+import { PUMP_AMM_SDK, canonicalPumpPoolPda } from '@pump-fun/pump-swap-sdk';
+import BN from 'bn.js';
+import { Logger } from '../../../server/middleware/enterprise';
+import { PumpCurveService, resolvePumpFeeRecipients } from '../../../server/solana/pumpCurve';
+import { TOKEN_PROGRAM_ID } from '../../../server/solana/programs';
 import { PumpSwapVenueService } from '../../../server/solana/pumpSwapService';
 import { JitoTransport } from '../../../server/solana/transports';
 import { ExecutionCoordinator } from '../../../server/execution/coordinator';
 import {
   createSimulatedBondingCurveState,
-  createSimulatedPumpSwapState,
   VALID_PUMP_MINT_1,
   GRADUATED_PUMP_MINT,
   NON_SOL_QUOTE_MINT,
+  SOL_NATIVE_MINT,
   DUMMY_FEE_RECIPIENT,
   DUMMY_RESERVED_FEE_RECIPIENT,
   DUMMY_BUYBACK_FEE_RECIPIENT,
@@ -32,7 +37,59 @@ describe('Tier 1: Feature Coverage (Features 1 - 5)', () => {
     coordinator = new ExecutionCoordinator(mockRpc.createConnection());
   });
 
+
+  // Seeds the mock RPC with the accounts PumpSwapVenueService.getPoolState reads for a mint's canonical pool.
+  // PUMP_AMM_SDK.decodePool is spied (restored in afterEach) so the raw Anchor layout need not be hand-encoded.
+  function seedPumpSwapPool(
+    mint: PublicKey,
+    opts: { quoteMint: PublicKey; baseReserve: bigint; quoteReserve: bigint; virtualQuoteReserves: bigint; creatorFeeBps: number }
+  ): void {
+    const poolKey = canonicalPumpPoolPda(mint);
+    const poolBaseTokenAccount = Keypair.generate().publicKey;
+    const poolQuoteTokenAccount = Keypair.generate().publicKey;
+    const owner = Keypair.generate().publicKey;
+    const tokenAccountData = (tokenMint: PublicKey, amount: bigint): Buffer => {
+      const buf = Buffer.alloc(AccountLayout.span);
+      AccountLayout.encode(
+        {
+          mint: tokenMint,
+          owner,
+          amount,
+          delegateOption: 0,
+          delegate: PublicKey.default,
+          state: 1,
+          isNativeOption: 0,
+          isNative: 0n,
+          delegatedAmount: 0n,
+          closeAuthorityOption: 0,
+          closeAuthority: PublicKey.default,
+        },
+        buf
+      );
+      return buf;
+    };
+    const mintData = Buffer.alloc(82);
+    mintData.writeUInt8(6, 44);
+    mockRpc.setAccount(poolKey, { owner: Keypair.generate().publicKey, lamports: 1_000_000, data: Buffer.alloc(300, 1), executable: false });
+    mockRpc.setAccount(poolBaseTokenAccount, { owner: TOKEN_PROGRAM_ID, lamports: 2_039_280, data: tokenAccountData(mint, opts.baseReserve), executable: false });
+    mockRpc.setAccount(poolQuoteTokenAccount, { owner: TOKEN_PROGRAM_ID, lamports: 2_039_280, data: tokenAccountData(opts.quoteMint, opts.quoteReserve), executable: false });
+    mockRpc.setAccount(mint, { owner: TOKEN_PROGRAM_ID, lamports: 1_000_000, data: mintData, executable: false });
+    vi.spyOn(PUMP_AMM_SDK, 'decodePool').mockReturnValue({
+      baseMint: mint,
+      quoteMint: opts.quoteMint,
+      poolBaseTokenAccount,
+      poolQuoteTokenAccount,
+      virtualQuoteReserves: new BN(opts.virtualQuoteReserves.toString()),
+      creatorFeeBps: new BN(opts.creatorFeeBps),
+      creator: Keypair.generate().publicKey,
+      coinCreator: Keypair.generate().publicKey,
+      isCashbackCoin: false,
+      isMayhemMode: false,
+    } as any);
+  }
+
   afterEach(async () => {
+    vi.restoreAllMocks();
     coordinator?.cleanup();
     await mockJito.stop();
     testDb.close();
@@ -133,16 +190,20 @@ describe('Tier 1: Feature Coverage (Features 1 - 5)', () => {
     });
 
     it('F2.4: distinguishes standard fee recipient vs Mayhem vs buyback fee recipients', () => {
-      expect(DUMMY_FEE_RECIPIENT.equals(DUMMY_RESERVED_FEE_RECIPIENT)).toBe(false);
-      expect(DUMMY_FEE_RECIPIENT.equals(DUMMY_BUYBACK_FEE_RECIPIENT)).toBe(false);
+      const global = {
+        feeRecipient: DUMMY_FEE_RECIPIENT.toBase58(),
+        reservedFeeRecipient: DUMMY_RESERVED_FEE_RECIPIENT.toBase58(),
+        buybackFeeRecipients: [DUMMY_BUYBACK_FEE_RECIPIENT.toBase58()],
+      };
+      const standard = resolvePumpFeeRecipients(global, false, 'LIVE');
+      const mayhem = resolvePumpFeeRecipients(global, true, 'LIVE');
 
-      const standardState = createSimulatedBondingCurveState({ isMayhemMode: false });
-      const mayhemState = createSimulatedBondingCurveState({ isMayhemMode: true });
-
-      expect(standardState.isMayhemMode).toBe(false);
-      expect(mayhemState.isMayhemMode).toBe(true);
-      expect(standardState.feeRecipient.toBase58()).toBe(DUMMY_FEE_RECIPIENT.toBase58());
-      expect(standardState.buybackFeeRecipient.toBase58()).toBe(DUMMY_BUYBACK_FEE_RECIPIENT.toBase58());
+      expect(standard.feeRecipient.equals(DUMMY_FEE_RECIPIENT)).toBe(true);
+      expect(mayhem.feeRecipient.equals(DUMMY_RESERVED_FEE_RECIPIENT)).toBe(true);
+      expect(standard.feeRecipient.equals(mayhem.feeRecipient)).toBe(false);
+      expect(standard.buybackFeeRecipient.equals(DUMMY_BUYBACK_FEE_RECIPIENT)).toBe(true);
+      expect(mayhem.buybackFeeRecipient.equals(DUMMY_BUYBACK_FEE_RECIPIENT)).toBe(true);
+      expect(standard.buybackFeeRecipient.equals(standard.feeRecipient)).toBe(false);
     });
 
     it('F2.5: fails closed in LIVE mode when authoritative fee recipient is missing', () => {
@@ -164,13 +225,22 @@ describe('Tier 1: Feature Coverage (Features 1 - 5)', () => {
   // Feature 3: R0.3 PumpSwap Correctness
   // ===========================================================================
   describe('Feature 3: R0.3 PumpSwap Correctness', () => {
-    it('F3.1: calculates effective quote reserves as actual + virtual reserves', () => {
-      const state = createSimulatedPumpSwapState({
+    it('F3.1: calculates effective quote reserves as actual + virtual reserves', async () => {
+      const mint = Keypair.generate().publicKey;
+      seedPumpSwapPool(mint, {
+        quoteMint: SOL_NATIVE_MINT,
+        baseReserve: 200_000_000_000_000n,
         quoteReserve: 80_000_000_000n,
         virtualQuoteReserves: 30_000_000_000n,
+        creatorFeeBps: 0,
       });
-      expect(state.effectiveQuoteReserve).toBe(110_000_000_000n);
-      expect(state.effectiveQuoteReserve).toBe(state.quoteReserve + state.virtualQuoteReserves);
+      const state = await PumpSwapVenueService.getPoolState(mockRpc.createConnection(), mint, 'LIVE');
+      expect(state).not.toBeNull();
+      expect(state!.quoteReserve).toBe(80_000_000_000n);
+      expect(state!.virtualQuoteReserves).toBe(30_000_000_000n);
+      expect(state!.effectiveQuoteReserve).toBe(110_000_000_000n);
+      // spot price is derived from the effective (not actual) quote reserve: 110 SOL / 200M tokens
+      expect(state!.spotPriceSol).toBeCloseTo(110 / 200_000_000, 12);
     });
 
     it('F3.2: rejects non-SOL quote mint in LIVE PumpSwap resolution', async () => {
@@ -180,11 +250,29 @@ describe('Tier 1: Feature Coverage (Features 1 - 5)', () => {
       expect(res.isMigrated).toBe(true);
     });
 
-    it('F3.3: recognizes dynamic fee schedule and distinguishes creator fee', () => {
-      const zeroCreatorFeeState = createSimulatedPumpSwapState({ creatorFeeBps: 0n });
-      const creatorFeeState = createSimulatedPumpSwapState({ creatorFeeBps: 50n });
-      expect(zeroCreatorFeeState.creatorFeeBps).toBe(0n);
-      expect(creatorFeeState.creatorFeeBps).toBe(50n);
+    it('F3.3: recognizes dynamic fee schedule and distinguishes creator fee', async () => {
+      const zeroMint = Keypair.generate().publicKey;
+      seedPumpSwapPool(zeroMint, {
+        quoteMint: SOL_NATIVE_MINT,
+        baseReserve: 200_000_000_000_000n,
+        quoteReserve: 85_000_000_000n,
+        virtualQuoteReserves: 0n,
+        creatorFeeBps: 0,
+      });
+      const zeroState = await PumpSwapVenueService.getPoolState(mockRpc.createConnection(), zeroMint, 'LIVE');
+
+      const feeMint = Keypair.generate().publicKey;
+      seedPumpSwapPool(feeMint, {
+        quoteMint: SOL_NATIVE_MINT,
+        baseReserve: 200_000_000_000_000n,
+        quoteReserve: 85_000_000_000n,
+        virtualQuoteReserves: 0n,
+        creatorFeeBps: 50,
+      });
+      const feeState = await PumpSwapVenueService.getPoolState(mockRpc.createConnection(), feeMint, 'LIVE');
+
+      expect(zeroState?.creatorFeeBps).toBe(0n);
+      expect(feeState?.creatorFeeBps).toBe(50n);
     });
 
     it('F3.4: throws PUMPSWAP_POOL_NOT_FOUND when attempting instruction build on nonexistent pool', async () => {
@@ -201,11 +289,30 @@ describe('Tier 1: Feature Coverage (Features 1 - 5)', () => {
       ).rejects.toThrow(/PUMPSWAP_POOL_NOT_FOUND/);
     });
 
-    it('F3.5: restricts quote mint strictly to Native SOL in LIVE execution state', () => {
-      const validSolState = createSimulatedPumpSwapState({ quoteMint: new PublicKey('So11111111111111111111111111111111111111112') });
-      const usdcState = createSimulatedPumpSwapState({ quoteMint: NON_SOL_QUOTE_MINT });
-      expect(validSolState.quoteMint.toBase58()).toContain('111111111111111111111111111111112');
-      expect(usdcState.quoteMint.equals(NON_SOL_QUOTE_MINT)).toBe(true);
+    it('F3.5: restricts quote mint strictly to Native SOL in LIVE execution state', async () => {
+      const solMint = Keypair.generate().publicKey;
+      seedPumpSwapPool(solMint, {
+        quoteMint: SOL_NATIVE_MINT,
+        baseReserve: 200_000_000_000_000n,
+        quoteReserve: 85_000_000_000n,
+        virtualQuoteReserves: 0n,
+        creatorFeeBps: 0,
+      });
+      const solState = await PumpSwapVenueService.getPoolState(mockRpc.createConnection(), solMint, 'LIVE');
+      expect(solState?.quoteMint.equals(SOL_NATIVE_MINT)).toBe(true);
+
+      const usdcMint = Keypair.generate().publicKey;
+      seedPumpSwapPool(usdcMint, {
+        quoteMint: NON_SOL_QUOTE_MINT,
+        baseReserve: 200_000_000_000_000n,
+        quoteReserve: 85_000_000n,
+        virtualQuoteReserves: 0n,
+        creatorFeeBps: 0,
+      });
+      const warnSpy = vi.spyOn(Logger, 'warn').mockImplementation(() => undefined as any);
+      const usdcState = await PumpSwapVenueService.getPoolState(mockRpc.createConnection(), usdcMint, 'LIVE');
+      expect(usdcState).toBeNull();
+      expect(warnSpy.mock.calls.some((c) => String(c[0]).includes('UNSUPPORTED_PUMPSWAP_QUOTE_MINT'))).toBe(true);
     });
   });
 
@@ -213,15 +320,30 @@ describe('Tier 1: Feature Coverage (Features 1 - 5)', () => {
   // Feature 4: R0.4 Migration Safety
   // ===========================================================================
   describe('Feature 4: R0.4 Migration Safety', () => {
-    it('F4.1: detects active bonding curve state before graduation', () => {
-      const state = createSimulatedBondingCurveState({ complete: false });
-      expect(state.complete).toBe(false);
-      expect(state.realSolReserves).toBeLessThan(85_000_000_000n);
+    it('F4.1: detects active bonding curve state before graduation', async () => {
+      vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockResolvedValue(
+        createSimulatedBondingCurveState({ complete: false, realSolReserves: 12_500_000_000n })
+      );
+      const res = await PumpSwapVenueService.resolveVenue(mockRpc.createConnection(), VALID_PUMP_MINT_1, 'LIVE');
+      expect(res.venue).toBe('PUMP_BONDING_CURVE');
+      expect(res.isMigrated).toBe(false);
     });
 
-    it('F4.2: detects completed bonding curve marking graduation', () => {
-      const state = createSimulatedBondingCurveState({ complete: true, realSolReserves: 85_000_000_000n });
-      expect(state.complete).toBe(true);
+    it('F4.2: detects completed bonding curve marking graduation', async () => {
+      vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockResolvedValue(
+        createSimulatedBondingCurveState({ mint: GRADUATED_PUMP_MINT, complete: true, realSolReserves: 85_000_000_000n })
+      );
+      seedPumpSwapPool(GRADUATED_PUMP_MINT, {
+        quoteMint: SOL_NATIVE_MINT,
+        baseReserve: 200_000_000_000_000n,
+        quoteReserve: 85_000_000_000n,
+        virtualQuoteReserves: 0n,
+        creatorFeeBps: 0,
+      });
+      const res = await PumpSwapVenueService.resolveVenue(mockRpc.createConnection(), GRADUATED_PUMP_MINT, 'LIVE');
+      expect(res.venue).toBe('PUMPSWAP');
+      expect(res.isMigrated).toBe(true);
+      expect(res.poolAddress?.equals(canonicalPumpPoolPda(GRADUATED_PUMP_MINT))).toBe(true);
     });
 
     it('F4.3: blocks autonomous exit with UNKNOWN route when migrated pool is unresolvable', async () => {

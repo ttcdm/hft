@@ -2,7 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { Logger } from './enterprise';
+import { Logger, redactUrl } from './enterprise';
 
 export interface OperatorSession {
   token: string;
@@ -186,7 +186,7 @@ export function requireOperatorAuth(req: Request, res: Response, next: NextFunct
   const token = extractOperatorToken(req);
 
   if (!token || !authManager.validateToken(token)) {
-    Logger.warn(`Unauthorized mutation attempt blocked on ${req.method} ${req.originalUrl} from ${req.ip}`);
+    Logger.warn(`Unauthorized mutation attempt blocked on ${req.method} ${redactUrl(req.originalUrl)} from ${req.ip}`);
     return sendUnauthorized(req, res);
   }
 

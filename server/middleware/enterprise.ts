@@ -52,6 +52,30 @@ export class Logger {
   }
 }
 
+const SENSITIVE_QUERY_PARAM = /secret|key|token|signature|sig|password|passwd|auth|credential|private|mnemonic|seed/i;
+
+/** URL safe to log: values of query parameters whose names look like credentials are replaced with [REDACTED]. */
+export function redactUrl(url: string | undefined): string {
+  if (!url) return '';
+  const q = url.indexOf('?');
+  if (q < 0) return url;
+  const base = url.slice(0, q);
+  const hash = url.indexOf('#', q);
+  const query = url.slice(q + 1, hash < 0 ? undefined : hash);
+  const tail = hash < 0 ? '' : url.slice(hash);
+  const out = query
+    .split('&')
+    .map((pair) => {
+      const eq = pair.indexOf('=');
+      const rawName = eq < 0 ? pair : pair.slice(0, eq);
+      let name = rawName;
+      try { name = decodeURIComponent(rawName.replace(/\+/g, ' ')); } catch { /* keep raw */ }
+      return SENSITIVE_QUERY_PARAM.test(name) ? `${rawName}=[REDACTED]` : pair;
+    })
+    .join('&');
+  return `${base}?${out}${tail}`;
+}
+
 // Correlation ID Middleware
 export function correlationIdMiddleware(req: Request, res: Response, next: NextFunction) {
   const correlationId = (req.headers['x-correlation-id'] as string) || crypto.randomUUID();
@@ -61,9 +85,9 @@ export function correlationIdMiddleware(req: Request, res: Response, next: NextF
   const start = performance.now();
   res.on('finish', () => {
     const durationMs = Number((performance.now() - start).toFixed(2));
-    Logger.info(`${req.method} ${req.originalUrl} [${res.statusCode}] - ${durationMs}ms`, {
+    Logger.info(`${req.method} ${redactUrl(req.originalUrl)} [${res.statusCode}] - ${durationMs}ms`, {
       correlationId,
-      endpoint: req.originalUrl,
+      endpoint: redactUrl(req.originalUrl),
       method: req.method,
       statusCode: res.statusCode,
       durationMs,
@@ -121,7 +145,7 @@ export function errorHandler(err: any, req: Request, res: Response, next: NextFu
 
   Logger.error(`Error processing request: ${message}`, {
     correlationId,
-    endpoint: req.originalUrl,
+    endpoint: redactUrl(req.originalUrl),
     method: req.method,
     statusCode,
     code,

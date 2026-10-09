@@ -1,5 +1,6 @@
 import '../suppress-warnings.cjs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fs from 'fs';
 import { Keypair } from '@solana/web3.js';
 import { ExecutionCoordinator } from '../server/execution/coordinator';
 import { localSigner } from '../server/solana/signer';
@@ -95,5 +96,16 @@ describe('K4 #7: the auto controller passes the watch-window release time', () =
     expect(released).toBeGreaterThan(0);
     expect(spy).toHaveBeenCalled();
     expect(spy.mock.calls[0][0].signalTimestamp).toBe(released);
+  });
+});
+
+describe('K4: every HTTP route that reaches executeTrade supplies the signal time', () => {
+  // Found by the localnet end-to-end run: POST /api/execution/trade spread the body and never set signalTimestamp, so every
+  // operator trade through it was rejected MISSING_SIGNAL_TIMESTAMP in LIVE. Cheap contract guard; the e2e is the real check.
+  it('each executionCoordinator.executeTrade( call in server.ts carries signalTimestamp', () => {
+    const src = fs.readFileSync('server.ts', 'utf8');
+    const calls = [...src.matchAll(/executionCoordinator\.executeTrade\(\{([\s\S]*?)\}\);/g)];
+    expect(calls.length).toBeGreaterThan(0);
+    for (const c of calls) expect(c[1]).toMatch(/signalTimestamp/);
   });
 });

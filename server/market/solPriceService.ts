@@ -6,6 +6,8 @@
  * - Fail closed: LIVE code calls requireFreshPrice(), which throws if the price is missing or older than maxAgeMs.
  *   PAPER code may use the last known price with `stale: true`.
  */
+import { allowedCluster } from '../solana/clusterGuard';
+
 export interface SolPriceReading {
   usd: number | null;
   /** Age of the reading in ms, or null if there has never been one. */
@@ -69,6 +71,24 @@ export class SolPriceService {
     this.source = null;
   }
 
+  private timer: NodeJS.Timeout | null = null;
+
+  /**
+   * Keeps the price fresh in the background. Before this existed only the wallet snipe route refreshed it, so a cold-start
+   * LIVE trade through any other route failed SOL_PRICE_UNAVAILABLE (found by the localnet end-to-end run).
+   */
+  public startAutoRefresh(intervalMs = 30_000) {
+    if (this.timer) return;
+    void this.refresh();
+    this.timer = setInterval(() => void this.refresh(), intervalMs);
+    this.timer.unref?.();
+  }
+
+  public stopAutoRefresh() {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+  }
+
   /** Reads from the public sources in order. Concurrent calls share one request. Never throws. */
   public refresh(): Promise<SolPriceReading> {
     if (this.inFlight) return this.inFlight;
@@ -79,6 +99,15 @@ export class SolPriceService {
   }
 
   private async doRefresh(): Promise<SolPriceReading> {
+    // A local validator has no market: when (and only when) ALLOWED_CLUSTER=localnet, an operator-chosen price labelled
+    // LOCALNET_FIXED stands in so LIVE sizing can run offline. It is never read on devnet or mainnet.
+    if (allowedCluster() === 'localnet') {
+      const fixed = parse(process.env.LOCALNET_SOL_PRICE_USD);
+      if (fixed !== null) {
+        this.setPrice(fixed, 'LOCALNET_FIXED');
+        return this.getPrice();
+      }
+    }
     const sources: Array<[string, () => Promise<number | null>]> = [
       ['COINBASE', async () => parse((await this.getJson('https://api.coinbase.com/v2/prices/SOL-USD/spot'))?.data?.amount)],
       ['COINGECKO', async () => parse((await this.getJson('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd'))?.solana?.usd)],

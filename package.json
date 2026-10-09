@@ -21,6 +21,7 @@
     "test:filtered": "vitest run tests/accountingAndReconciliation.test.ts tests/authAndSecurity.test.ts tests/riskEngine.test.ts tests/solanaTransactionBuilder.test.ts tests/challenger_m1_protocol_correctness.test.ts tests/challenger_phase3_verification.test.ts tests/plugAndPlayZeroConfig.test.ts tests/e2e/",
     "signer:import": "tsx scripts/import_signer.ts",
     "smoke": "tsx scripts/smoke.ts",
+    "localnet:e2e": "tsx scripts/localnet/e2e.ts",
     "test:devnet": "tsx scripts/test_devnet_execution.ts",
     "devnet:e2e": "node --require ./scripts/devnet_guard.cjs --import tsx scripts/devnet_e2e.ts",
     "postinstall": "node scripts/patch-anchor.cjs"
@@ -56,6 +57,7 @@
     "autoprefixer": "^10.4.21",
     "esbuild": "^0.25.0",
     "eslint": "^10.10.0",
+    "litesvm": "1.6.0",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",

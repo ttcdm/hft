@@ -1700,6 +1700,8 @@ app.post('/api/execution/trade', requireOperatorAuth, validateTradeBody(Operator
     const result = await executionCoordinator.executeTrade({
       ...req.body,
       source: 'MANUAL',
+      // The operator's request is the signal (K4a). The schema rejects a client-supplied signalTimestamp.
+      signalTimestamp: Date.now(),
       provenance: OPERATOR_PROVENANCE,
     });
     if (!result.success) {
@@ -1821,6 +1823,7 @@ async function startServer() {
     });
   }
 
+  solPriceService.startAutoRefresh();
   autoSnipeController.startMonitor(); // G3: kill-switch triggers and wallet audit (inert while the mode is OFF)
   server.listen(PORT, BIND_HOST, () => {
     console.log(`[APEX QUANT HFT] Autonomous Execution Engine running on ${BIND_HOST}:${PORT}`);

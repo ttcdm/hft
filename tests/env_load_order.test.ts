@@ -53,13 +53,14 @@ describe('.env is loaded before import-time singletons (signer, config, db, coor
 
 describe('K1: tests never read the repo .env (hermetic under vitest)', () => {
   /** Run a bundle that imports loadEnv in a temp cwd containing a planted .env, with or without VITEST set. */
-  async function readVar(dir: string, name: string, vitest: boolean): Promise<string> {
+  async function readVar(dir: string, name: string, vitest: boolean, extra: Record<string, string> = {}): Promise<string> {
     const entry = path.join(dir, 'k1.ts');
     fs.writeFileSync(entry, `import '${path.join(ROOT, 'server/loadEnv')}';\nconsole.log('VALUE=' + (process.env.${name} ?? 'UNSET'));\n`);
     const out = path.join(dir, 'k1.cjs');
     await build({ entryPoints: [entry], bundle: true, platform: 'node', format: 'cjs', packages: 'external', outfile: out, logLevel: 'silent', absWorkingDir: ROOT });
     const env: Record<string, string> = { PATH: process.env.PATH ?? '', NODE_PATH: path.join(ROOT, 'node_modules') };
     if (vitest) env.VITEST = 'true';
+    Object.assign(env, extra);
     const text = execFileSync(process.execPath, [out], { cwd: dir, env, encoding: 'utf8' });
     return text.split('\n').find((l) => l.startsWith('VALUE='))!.slice(6);
   }
@@ -82,6 +83,19 @@ describe('K1: tests never read the repo .env (hermetic under vitest)', () => {
       fs.writeFileSync(path.join(dir, '.env.test'), 'K1_VAR=from-dot-env-test\n');
       expect(await readVar(dir, 'K1_VAR', true)).toBe('from-dot-env-test');
       expect(await readVar(dir, 'K1_VAR', false)).toBe('from-dot-env');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('APEX_ENV_FILE replaces .env outside tests; set to empty it loads no file at all', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'k1c-'));
+    try {
+      fs.writeFileSync(path.join(dir, '.env'), 'K1_VAR=from-dot-env\nK1_OTHER=real\n');
+      fs.writeFileSync(path.join(dir, 'scratch.env'), 'K1_VAR=from-scratch\n');
+      expect(await readVar(dir, 'K1_VAR', false, { APEX_ENV_FILE: path.join(dir, 'scratch.env') })).toBe('from-scratch');
+      expect(await readVar(dir, 'K1_OTHER', false, { APEX_ENV_FILE: path.join(dir, 'scratch.env') })).toBe('UNSET');
+      expect(await readVar(dir, 'K1_VAR', false, { APEX_ENV_FILE: '' })).toBe('UNSET');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }

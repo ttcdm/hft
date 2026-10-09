@@ -985,6 +985,14 @@ export class PumpCurveService {
       customTokensToReceiveRaw = state.virtualTokenReserves - newVirtualTokens;
     }
 
+    if (isLiveMode && customTokensToReceiveRaw > state.realTokenReserves) {
+      // The program caps a buy at what is left on the curve (and completes it). That is not a math error, but this app
+      // does not size final-fill buys: refuse with a plain reason instead of tripping the discrepancy alarm below.
+      throw new Error(
+        `CURVE_NEARLY_COMPLETE: a ${solAmountSol} SOL buy needs ${customTokensToReceiveRaw} tokens but only ${state.realTokenReserves} remain on the curve. Use a smaller size.`
+      );
+    }
+
     if (!sdkQuoteSucceeded) {
       tokensToReceiveRaw = customTokensToReceiveRaw;
     } else if (isLiveMode) {
@@ -1192,22 +1200,23 @@ export class PumpCurveService {
 
     const customGrossSolOut = state.virtualSolReserves - newVirtualSol;
 
-    if (!sdkQuoteSucceeded) {
-      grossSolOutLamports = customGrossSolOut;
-    } else if (isLiveMode) {
-      // R0.2: Cross-check custom quote math against official SDK and require exact integer-semantic agreement
-      if (customGrossSolOut !== grossSolOutLamports) {
+    // The official SDK function returns the NET amount (curve output minus protocol and creator fee, each fee rounded up).
+    // Comparing the app's GROSS curve output to it made every LIVE sell fail QUOTE_MATH_DISCREPANCY whenever the fee is
+    // non-zero, and treating the SDK value as gross charged the fee twice (found by the localnet end-to-end run).
+    const ceilFee = (amount: bigint, bps: number) => (amount * BigInt(bps) + 9999n) / 10000n;
+    const grossSolOut = customGrossSolOut;
+    const protocolFeeLamports = ceilFee(grossSolOut, protocolFeeBps);
+    const creatorFeeLamports = state.creator.equals(PublicKey.default) ? 0n : ceilFee(grossSolOut, creatorFeeBps);
+    const netSolOutLamports = grossSolOut - protocolFeeLamports - creatorFeeLamports;
+
+    if (sdkQuoteSucceeded && isLiveMode) {
+      // R0.2: cross-check the app's net proceeds against the official SDK's and require exact integer agreement.
+      if (netSolOutLamports !== grossSolOutLamports) {
         throw new Error(
-          `QUOTE_MATH_DISCREPANCY: Custom sell math (${customGrossSolOut}) diverges from official SDK (${grossSolOutLamports}) in LIVE mode. Failing closed.`
+          `QUOTE_MATH_DISCREPANCY: Custom sell math (${netSolOutLamports} net) diverges from official SDK (${grossSolOutLamports} net) in LIVE mode. Failing closed.`
         );
       }
     }
-
-    const totalFeeBps = BigInt(protocolFeeBps + creatorFeeBps);
-    const totalFeeLamports = (grossSolOutLamports * totalFeeBps) / 10000n;
-    const protocolFeeLamports = totalFeeBps > 0n ? (totalFeeLamports * BigInt(protocolFeeBps)) / totalFeeBps : 0n;
-    const creatorFeeLamports = totalFeeLamports - protocolFeeLamports;
-    const netSolOutLamports = grossSolOutLamports - totalFeeLamports;
 
     // Spot price in SOL per human token
     const spotPriceSol =

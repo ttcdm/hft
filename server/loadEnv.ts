@@ -11,11 +11,15 @@
  *
  * Tests are hermetic: under vitest the repo `.env` is NEVER read (it can point at a real RPC and a real key, which turned
  * startup reconciliation into network I/O on a machine with a populated `.env`). A `.env.test` file is read instead if it exists.
+ * APEX_ENV_FILE (set, even to '') replaces `.env` outside tests so scripts that spawn the server never pick up the real one.
  */
 import dotenv from 'dotenv';
 
 if (process.env.VITEST) {
   dotenv.config({ path: '.env.test', quiet: true } as any);
+} else if (process.env.APEX_ENV_FILE !== undefined) {
+  // Hermetic runs (smoke, localnet e2e) name the env file explicitly; an empty value means "load no file at all".
+  if (process.env.APEX_ENV_FILE) dotenv.config({ path: process.env.APEX_ENV_FILE, quiet: true } as any);
 } else {
   dotenv.config();
 }

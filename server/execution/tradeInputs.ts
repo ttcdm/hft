@@ -28,6 +28,8 @@ const FORBIDDEN_TRADE_KEYS = [
   'signalTimestamp',
   'marketDataTimestamp',
   'source',
+  'dryRun',
+  'amountSolOverride',
 ] as const;
 
 function rejectForbiddenKeys(value: unknown, ctx: z.RefinementCtx) {
@@ -145,6 +147,18 @@ export const ArmSchema = z.object({
   arm: z.coerce.boolean().optional(),
   active: z.coerce.boolean().optional(),
   confirmationCode: z.string().max(64).optional(),
+});
+
+/** POST /api/auto/mode (G1). */
+export const AutoModeSchema = z.object({
+  mode: z.enum(['OFF', 'SHADOW', 'PAPER', 'DEVNET_LIVE']),
+  confirmationCode: z.string().max(64).optional(),
+});
+
+/** POST /api/auto/kill (G1). */
+export const AutoKillSchema = z.object({
+  exitAll: z.coerce.boolean().optional(),
+  reason: z.string().trim().max(200).optional(),
 });
 
 /** WS TOGGLE_CALLER_SNIPE, POST /api/pumpfun/callouts/toggle-autosnipe. */

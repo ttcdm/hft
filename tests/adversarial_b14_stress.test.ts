@@ -1,3 +1,4 @@
+import { setAutoMode } from './fixtures/auto';
 import { seedSurge, clearVelocity } from './fixtures/velocity';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair, PublicKey } from '@solana/web3.js';
@@ -26,13 +27,14 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
   const MINT_B = 'MintAdversarial2222222222222222222222222222222';
   const CREATOR_ADDR = 'CreatorStressTestWallet11111111111111111111111';
 
-  beforeEach(() => {
+  beforeEach(async () => {
     curveVelocityEvaluator.clear();
     creatorRiskScorer.clearCache();
     memecoinAggregator.setConfluenceGating(false);
     (pumpfunService as any).snipedMints.clear();
     vi.restoreAllMocks();
     vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
+    await setAutoMode('PAPER'); // G1: the controller owns auto trading; PAPER sends candidates on to executeSnipe
   });
 
   afterEach(() => {

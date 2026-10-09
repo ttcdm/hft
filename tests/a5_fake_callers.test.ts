@@ -1,3 +1,4 @@
+import { setAutoMode, resetAuto } from './fixtures/auto';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { memecoinAggregator } from '../server/memecoinAggregator';
 import { pumpFunService, calloutProvenance } from '../server/pumpfunService';
@@ -76,7 +77,8 @@ describe('A5: fake callers cannot drive auto-snipe', () => {
     (pumpFunService as any).snipedMints.clear();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await resetAuto();
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
     (pumpFunService as any).snipedMints.clear();
@@ -90,6 +92,7 @@ describe('A5: fake callers cannot drive auto-snipe', () => {
   });
 
   it('never fires a snipe when AUTO_SNIPE_ENABLED is unset, even for a strong caller', async () => {
+    await setAutoMode('PAPER'); // the controller is armed; the env flag is one of its inputs and is now turned off
     vi.stubEnv('AUTO_SNIPE_ENABLED', '');
     const snipeSpy = vi.spyOn(memecoinAggregator, 'executeSnipe');
     const callout = makeCallout(makeCaller({ isAutoSnipeSubscribed: true }), 'A5MintDisabled1111111111111111111111111111');
@@ -102,7 +105,7 @@ describe('A5: fake callers cannot drive auto-snipe', () => {
   });
 
   it('does not treat a caller subscription as a standalone trigger', async () => {
-    vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
+    await setAutoMode('PAPER');
     const snipeSpy = vi.spyOn(memecoinAggregator, 'executeSnipe');
     const weakSubscribed = makeCaller({
       isAutoSnipeSubscribed: true,

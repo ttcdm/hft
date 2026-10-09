@@ -152,14 +152,17 @@ export class MemecoinAggregatorService extends EventEmitter {
   private startAutonomousSniperLoop() {
     if (this.autoSniperTimer) return;
     this.autoSniperTimer = setInterval(async () => {
-      if (!this.config.isAutoSnipeEnabled || process.env.AUTO_SNIPE_ENABLED !== 'true') return;
-      
+      // G1: this loop is a candidate source. The controller owns the mode, budgets and execution.
+      if (!this.config.isAutoSnipeEnabled) return;
+
       const mode = executionCoordinator.getExecutionMode();
       const activePositions = executionCoordinator.getPositions(mode, 'ACTIVE');
       if (activePositions.length >= 3) return;
 
       try {
         const { pumpFunService, calloutProvenance } = await import('./pumpfunService');
+        const { autoSnipeController } = await import('./auto/controller');
+        if (autoSnipeController.getMode() === 'OFF') return;
         const callouts = pumpFunService.getHotCallouts();
 
         for (const c of callouts) {
@@ -168,10 +171,11 @@ export class MemecoinAggregatorService extends EventEmitter {
           const alreadyOpen = activePositions.some((p) => p.mint.toLowerCase() === mint.toLowerCase());
           if (alreadyOpen) continue;
 
-          await this.executeSnipe({
-            contractAddress: mint,
+          await autoSnipeController.submitCandidate({
+            mint,
+            symbol: c.token.symbol,
+            source: 'AGGREGATOR_LOOP',
             amountUsd: this.config.defaultSnipeAmountUsd || 5.0,
-            platform: 'PUMP_FUN',
             jitoTipSol: this.config.jitoTipSol,
             slippagePct: this.config.maxSlippagePct || 6.0,
             signalId: c.id,
@@ -373,7 +377,21 @@ export class MemecoinAggregatorService extends EventEmitter {
     provenance?: SignalProvenance;
     enforceConfluence?: boolean;
     minConfluenceScore?: number;
-  }): Promise<{ success: boolean; message: string; txHash: string; position?: SniperPosition; confluenceScore?: number }> {
+    /** G1: run every gate and report what would be bought, without sending or filling anything. */
+    dryRun?: boolean;
+    /** G1: fixed order size in SOL (auto-snipe Devnet mode). Overrides sizing; the 10% ceiling still applies downstream. */
+    amountSolOverride?: number;
+  }): Promise<{
+    success: boolean;
+    message: string;
+    txHash: string;
+    position?: SniperPosition;
+    confluenceScore?: number;
+    dryRun?: boolean;
+    amountSol?: number;
+    positionId?: string;
+    feesPaidLamports?: number;
+  }> {
     const cleanCa = params.contractAddress.trim();
 
     // Sizing via CapitalSizer (B12): determine spendable bankroll and 10% ceiling
@@ -641,6 +659,37 @@ export class MemecoinAggregatorService extends EventEmitter {
       ? 'SYNTHETIC_TEST'
       : params.provenance || 'REAL_ONCHAIN';
 
+    if (params.amountSolOverride && params.amountSolOverride > 0) {
+      amountSol = params.amountSolOverride;
+      amountUsd = amountSol * this.solPriceUsd;
+    }
+
+    if (params.dryRun) {
+      const preview = await executionCoordinator.previewBuy({
+        mint: pool.contractAddress,
+        symbol: pool.symbol,
+        name: pool.name,
+        amountSol,
+        currentPriceSol: pool.priceNative,
+        slippageBps,
+        jitoTipSol,
+        source: 'AUTO_SNIPER',
+        provenance,
+        liquidityUsd: pool.liquidityUsd,
+      });
+      if (preview.status === 'REJECTED') {
+        return { success: false, message: preview.error, txHash: '', confluenceScore: confluenceEval.score, dryRun: true };
+      }
+      return {
+        success: true,
+        message: `DRY_RUN would buy $${pool.symbol}: ${amountSol} SOL at ${preview.quotePriceSol} SOL/token, tip ${preview.tipLamports} lamports`,
+        txHash: '',
+        confluenceScore: confluenceEval.score,
+        dryRun: true,
+        amountSol,
+      };
+    }
+
     // Dispatch execution strictly through central ExecutionCoordinator
     const execRes = await executionCoordinator.executeTrade({
       mint: pool.contractAddress,
@@ -679,6 +728,9 @@ export class MemecoinAggregatorService extends EventEmitter {
       message,
       txHash: execRes.txSignature || execRes.positionId || '',
       confluenceScore: confluenceEval.score,
+      amountSol,
+      positionId: execRes.positionId,
+      feesPaidLamports: execRes.feesPaidLamports,
     };
   }
 

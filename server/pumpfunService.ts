@@ -18,6 +18,7 @@ import {
   ConfluenceFactorsInput,
 } from './signals/confluenceEngine';
 import { ConfluenceBreakdown, SignalProvenance } from './core/types';
+import { autoSnipeController } from './auto/controller';
 
 interface AutoSnipeRules {
   minCallerWinRate2x: number;
@@ -301,7 +302,10 @@ function isDemoMode(): boolean {
   return process.env.DEMO_MODE === 'true';
 }
 
-/** Auto-snipe is off unless explicitly enabled via AUTO_SNIPE_ENABLED=true (A5). */
+/**
+ * Auto-snipe is off unless explicitly enabled via AUTO_SNIPE_ENABLED=true (A5).
+ * PLACEHOLDER: no caller left after G1; the auto-snipe controller reads the env itself. Kept, not removed, until the removal audit (H4).
+ */
 export function isAutoSnipeEnvEnabled(): boolean {
   return process.env.AUTO_SNIPE_ENABLED === 'true';
 }
@@ -698,7 +702,8 @@ export class PumpFunService extends EventEmitter {
 
   // Evaluate if any fresh hot callouts trigger the auto-snipe rules
   private async evaluateAutoSnipeTriggers() {
-    if (!isAutoSnipeEnvEnabled()) return;
+    // G1: candidate source only. With the controller OFF there is nothing to evaluate for.
+    if (autoSnipeController.getMode() === 'OFF') return;
     const rules = this.autoSnipeRules;
 
     for (const callout of this.getHotCallouts()) {
@@ -737,18 +742,26 @@ export class PumpFunService extends EventEmitter {
         callout.status = 'SNIPED';
 
         // Execute snipe routed through the central canonical coordinator
-        const tradeRes = await memecoinAggregator.executeSnipe({
-          contractAddress: callout.token.mint,
-          amountUsd: rules.snipeAmountUsd,
-          platform: 'PUMP_FUN',
-          jitoTipSol: rules.jitoPriorityTipSol,
-          slippagePct: 6.0,
+        // G1: this is a candidate source only. The auto-snipe controller owns the decision and the execution.
+        const decision = await autoSnipeController.submitCandidate({
+          mint: callout.token.mint,
+          symbol: callout.token.symbol,
+          source: 'PUMPFUN_CALLOUT',
           signalId: callout.id,
           provenance: calloutProvenance(callout),
+          amountUsd: rules.snipeAmountUsd,
+          slippagePct: 6.0,
+          jitoTipSol: rules.jitoPriorityTipSol,
           enforceConfluence: rules.autoSnipeOnConfluence,
         });
 
-        this.emit('callout_sniped', { callout, tradeRes, confluence });
+        if (decision.outcome === 'DROPPED' && !['POSITION_ALREADY_OPEN', 'ALREADY_ATTEMPTED_THIS_SESSION'].includes(decision.reason)) {
+          // Nothing was tried (controller said no for a session-level reason): keep the candidate available.
+          this.snipedMints.delete(mintKey);
+          callout.status = 'ACTIVE';
+          continue;
+        }
+        this.emit('callout_sniped', { callout, decision, confluence });
       }
     }
   }

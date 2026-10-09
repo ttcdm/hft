@@ -1271,6 +1271,141 @@ export class ExecutionCoordinator {
   }
 
   /**
+   * Everything a PAPER buy must pass before a fill: price, the shared eligibility gate, capital ceiling and risk.
+   * Used by the paper fill itself and by previewBuy (auto-snipe Shadow mode), so a dry run runs the same gates.
+   */
+  private async evaluatePaperBuy(
+    req: ExecuteTradeRequest,
+    correlationId: string,
+    now: number,
+    openPositions: NormalizedPosition[],
+    totalExposureSol: number
+  ): Promise<
+    | { rejection: ExecutionResponse }
+    | { quotePriceSol: number; paperEligibility: { gates: Record<string, unknown> }; paperTip: ReturnType<typeof executionConfig.resolveDynamicJitoTip>; maxPaperOrderSol: number }
+  > {
+    let quotePriceSol = req.currentPriceSol;
+
+    // If price not provided, attempt querying real on-chain bonding curve
+    if (!quotePriceSol || quotePriceSol <= 0) {
+      try {
+        const mintPubkey = new PublicKey(req.mint);
+        const state = await PumpCurveService.fetchPumpMarketState({
+          connection: this.connection,
+          mint: mintPubkey,
+          executionMode: 'PAPER',
+        });
+        if (state && !state.complete) {
+          quotePriceSol =
+            Number(state.virtualSolReserves) /
+            Number(state.virtualTokenReserves) /
+            (1e9 / Math.pow(10, state.tokenDecimals));
+        }
+      } catch {}
+    }
+
+    if (!quotePriceSol || quotePriceSol <= 0) {
+      return { rejection: {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'PAPER',
+        error: 'MARKET_DATA_UNAVAILABLE: No valid market price available to execute paper order',
+        correlationId,
+      } };
+    }
+
+    const paperEligibility = await this.runPaperEligibility(req, quotePriceSol, now, correlationId);
+    if (paperEligibility.verdict) {
+      workstationDb.logJournal('TRADE_FILTER_REJECTED', correlationId, 'PAPER', {
+        reason: paperEligibility.verdict.error,
+        gates: paperEligibility.gates,
+      });
+      return { rejection: paperEligibility.verdict };
+    }
+
+    // Resolve dynamic tip for paper mode to respect economic sanity bounds
+    const paperTip = executionConfig.resolveDynamicJitoTip({
+      tradeAmountSol: req.amountSol,
+      explicitTipSol: req.jitoTipSol,
+    });
+
+    // Pre-trade capital sizing check: ensure order does not exceed 10% of spendable bankroll (B12)
+    // C5: the configured paper bankroll (default 0.07 SOL), never an invented 1.0
+    const paperSpendable = CapitalSizer.calculateSpendableBankroll(
+      this.realWalletBalanceSol !== null ? this.realWalletBalanceSol : executionConfig.getConfig().paperBankrollSol,
+      0.015,
+      this.inFlightReservedSol
+    );
+    const maxPaperOrderSol = Number((paperSpendable * 0.10).toFixed(6));
+    if (paperSpendable > 0 && req.amountSol > maxPaperOrderSol + 0.000001) {
+      return { rejection: {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'PAPER',
+        error: `EXCEEDS_CAPITAL_CEILING: Trade size ${req.amountSol} SOL exceeds 10% spendable bankroll ceiling (${maxPaperOrderSol} SOL).`,
+        correlationId,
+      } };
+    }
+
+    // Evaluate Risk in Paper Mode
+    const riskDecision = riskEngine.evaluateOrder({
+      mint: req.mint,
+      orderSizeSol: req.amountSol,
+      expectedPriceSol: quotePriceSol,
+      slippageBps: req.slippageBps || 800,
+      estimatedPriceImpactBps: PaperExecutionEngine.estimateImpactBps(req.amountSol, req.liquidityUsd),
+      estimatedFeeLamports: 15000,
+      jitoTipLamports: paperTip.tipLamports,
+      signalTimestamp: req.signalTimestamp || now,
+      marketDataTimestamp: req.marketDataTimestamp || now,
+      currentOpenPositionsCount: openPositions.length,
+      currentTotalExposureSol: totalExposureSol,
+      walletSpendableSol: paperSpendable,
+      executionMode: 'PAPER',
+    });
+
+    if (!riskDecision.approved) {
+      workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'PAPER', {
+        reason: riskDecision.reasonCode,
+        message: riskDecision.message,
+      });
+      return { rejection: {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'PAPER',
+        error: `${riskDecision.reasonCode}: ${riskDecision.message}`,
+        correlationId,
+      } };
+    }
+    return { quotePriceSol, paperEligibility, paperTip, maxPaperOrderSol };
+  }
+
+
+  /**
+   * G1: run every PAPER-side gate for a buy (price, eligibility, capital ceiling, risk) and stop before any fill.
+   * Never touches the signer or the paper ledger, whatever the coordinator mode is. Used by auto-snipe Shadow mode.
+   */
+  public async previewBuy(req: ExecuteTradeRequest): Promise<
+    | { status: 'OK'; quotePriceSol: number; tipLamports: number; amountSol: number; gates: Record<string, unknown> }
+    | { status: 'REJECTED'; error: string; lifecycleState: ExecutionResponse['lifecycleState'] }
+  > {
+    const correlationId = `preview-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    const openPositions = workstationDb.loadPositions('PAPER', 'ACTIVE');
+    const totalExposureSol = openPositions.reduce((acc, p) => acc + p.costBasisLamports / 1e9, 0);
+    const evaluated = await this.evaluatePaperBuy(req, correlationId, Date.now(), openPositions, totalExposureSol);
+    if ('rejection' in evaluated) {
+      return { status: 'REJECTED', error: evaluated.rejection.error || 'REJECTED', lifecycleState: evaluated.rejection.lifecycleState };
+    }
+    return {
+      status: 'OK',
+      quotePriceSol: evaluated.quotePriceSol,
+      tipLamports: evaluated.paperTip.tipLamports,
+      amountSol: req.amountSol,
+      gates: evaluated.paperEligibility.gates,
+    };
+  }
+
+  /**
    * C5: PAPER runs the same eligibility gate as LIVE. With a report supplied it is used as-is; otherwise the on-chain
    * facts are read (best effort, 4s cap) and evaluated. Facts that cannot be read stay UNKNOWN: strict mode
    * (PAPER_STRICT_GATES=1) rejects them like LIVE, default mode lets them through but records them as unverified.
@@ -1369,99 +1504,9 @@ export class ExecutionCoordinator {
     // BRANCH A: PAPER EXECUTION
     // =========================================================================
     if (this.executionMode === 'PAPER') {
-      let quotePriceSol = req.currentPriceSol;
-
-      // If price not provided, attempt querying real on-chain bonding curve
-      if (!quotePriceSol || quotePriceSol <= 0) {
-        try {
-          const mintPubkey = new PublicKey(req.mint);
-          const state = await PumpCurveService.fetchPumpMarketState({
-            connection: this.connection,
-            mint: mintPubkey,
-            executionMode: 'PAPER',
-          });
-          if (state && !state.complete) {
-            quotePriceSol =
-              Number(state.virtualSolReserves) /
-              Number(state.virtualTokenReserves) /
-              (1e9 / Math.pow(10, state.tokenDecimals));
-          }
-        } catch {}
-      }
-
-      if (!quotePriceSol || quotePriceSol <= 0) {
-        return {
-          success: false,
-          lifecycleState: 'RISK_REJECTED',
-          executionMode: 'PAPER',
-          error: 'MARKET_DATA_UNAVAILABLE: No valid market price available to execute paper order',
-          correlationId,
-        };
-      }
-
-      const paperEligibility = await this.runPaperEligibility(req, quotePriceSol, now, correlationId);
-      if (paperEligibility.verdict) {
-        workstationDb.logJournal('TRADE_FILTER_REJECTED', correlationId, 'PAPER', {
-          reason: paperEligibility.verdict.error,
-          gates: paperEligibility.gates,
-        });
-        return paperEligibility.verdict;
-      }
-
-      // Resolve dynamic tip for paper mode to respect economic sanity bounds
-      const paperTip = executionConfig.resolveDynamicJitoTip({
-        tradeAmountSol: req.amountSol,
-        explicitTipSol: req.jitoTipSol,
-      });
-
-      // Pre-trade capital sizing check: ensure order does not exceed 10% of spendable bankroll (B12)
-      // C5: the configured paper bankroll (default 0.07 SOL), never an invented 1.0
-      const paperSpendable = CapitalSizer.calculateSpendableBankroll(
-        this.realWalletBalanceSol !== null ? this.realWalletBalanceSol : executionConfig.getConfig().paperBankrollSol,
-        0.015,
-        this.inFlightReservedSol
-      );
-      const maxPaperOrderSol = Number((paperSpendable * 0.10).toFixed(6));
-      if (paperSpendable > 0 && req.amountSol > maxPaperOrderSol + 0.000001) {
-        return {
-          success: false,
-          lifecycleState: 'RISK_REJECTED',
-          executionMode: 'PAPER',
-          error: `EXCEEDS_CAPITAL_CEILING: Trade size ${req.amountSol} SOL exceeds 10% spendable bankroll ceiling (${maxPaperOrderSol} SOL).`,
-          correlationId,
-        };
-      }
-
-      // Evaluate Risk in Paper Mode
-      const riskDecision = riskEngine.evaluateOrder({
-        mint: req.mint,
-        orderSizeSol: req.amountSol,
-        expectedPriceSol: quotePriceSol,
-        slippageBps: req.slippageBps || 800,
-        estimatedPriceImpactBps: PaperExecutionEngine.estimateImpactBps(req.amountSol, req.liquidityUsd),
-        estimatedFeeLamports: 15000,
-        jitoTipLamports: paperTip.tipLamports,
-        signalTimestamp: req.signalTimestamp || now,
-        marketDataTimestamp: req.marketDataTimestamp || now,
-        currentOpenPositionsCount: openPositions.length,
-        currentTotalExposureSol: totalExposureSol,
-        walletSpendableSol: paperSpendable,
-        executionMode: 'PAPER',
-      });
-
-      if (!riskDecision.approved) {
-        workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'PAPER', {
-          reason: riskDecision.reasonCode,
-          message: riskDecision.message,
-        });
-        return {
-          success: false,
-          lifecycleState: 'RISK_REJECTED',
-          executionMode: 'PAPER',
-          error: `${riskDecision.reasonCode}: ${riskDecision.message}`,
-          correlationId,
-        };
-      }
+      const evaluated = await this.evaluatePaperBuy(req, correlationId, now, openPositions, totalExposureSol);
+      if ('rejection' in evaluated) return evaluated.rejection;
+      const { quotePriceSol, paperEligibility, paperTip, maxPaperOrderSol } = evaluated;
 
       const paperRes = paperEngine.executePaperBuy({
         mint: req.mint,

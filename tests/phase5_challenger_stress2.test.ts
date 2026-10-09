@@ -1,3 +1,4 @@
+import { setAutoMode } from './fixtures/auto';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair, PublicKey } from '@solana/web3.js';
 import {
@@ -25,7 +26,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
   // Valid Base58 address (generated via Keypair)
   const VALID_CREATOR_BASE58 = '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';
 
-  beforeEach(() => {
+  beforeEach(async () => {
     curveVelocityEvaluator.clear();
     creatorRiskScorer.clearCache();
     memecoinAggregator.setConfluenceGating(false);
@@ -33,6 +34,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
     (pumpfunService as any).hotCallouts = [];
     vi.restoreAllMocks();
     vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
+    await setAutoMode('PAPER'); // G1: the controller owns auto trading; PAPER sends candidates on to executeSnipe
   });
 
   afterEach(() => {

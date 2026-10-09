@@ -16,6 +16,7 @@ import { memecoinAggregator } from './server/memecoinAggregator';
 import { realismEngine } from './server/realismEngine';
 import { pumpFunService } from './server/pumpfunService';
 import { pumpFeedListener } from './server/solana/pumpFeedListener';
+import { autoSnipeController } from './server/auto/controller';
 import { runComprehensiveTestSuite } from './server/unitTestCases';
 import { registerMarketRoutes } from './server/market/marketRoutes';
 import { run60DayBacktest } from './src/utils/backtestEngine';
@@ -23,6 +24,8 @@ import { walletTrader } from './server/walletTrader';
 import { resolveRpcUrl } from './server/solana/clusterGuard';
 import {
   ArmSchema,
+  AutoModeSchema,
+  AutoKillSchema,
   CalloutSnipeSchema,
   OPERATOR_PROVENANCE,
   OperatorCloseSchema,
@@ -1643,6 +1646,25 @@ app.get('/api/execution/readiness', (req, res) => {
     ...executionCoordinator.getLiveReadiness(),
   });
 });
+
+// G1: auto-snipe controller. Mode lives in memory only, so every restart comes back OFF.
+app.get('/api/auto/status', requireOperatorAuth, (req, res) => {
+  res.json({ success: true, ...autoSnipeController.getStatus(), decisions: autoSnipeController.getDecisions(100) });
+});
+
+app.post('/api/auto/mode', requireOperatorAuth, validateTradeBody(AutoModeSchema), async (req, res) => {
+  const { mode, confirmationCode } = req.body;
+  const result = await autoSnipeController.setMode(mode, { confirmationCode });
+  res.status(result.ok ? 200 : 409).json({ success: result.ok, ...result, status: autoSnipeController.getStatus() });
+});
+
+app.post('/api/auto/kill', requireOperatorAuth, validateTradeBody(AutoKillSchema), async (req, res) => {
+  const result = await autoSnipeController.kill({ exitAll: req.body.exitAll, reason: req.body.reason });
+  res.json({ success: true, ...result, status: autoSnipeController.getStatus() });
+});
+
+autoSnipeController.on('decision', (d) => broadcastWs({ type: 'AUTO_DECISION', data: d }));
+autoSnipeController.on('mode', (d) => broadcastWs({ type: 'AUTO_MODE', data: { ...d, status: autoSnipeController.getStatus() } }));
 
 app.post('/api/execution/arm', requireOperatorAuth, validateTradeBody(ArmSchema), (req, res) => {
   const { arm, confirmationCode } = req.body;

@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
-import { isShippable, dockerignoreLines } from '../scripts/releaseFilter';
+import { isShippable, dockerignoreLines } from '../server/security/secretPaths';
 
 const ROOT = process.cwd();
 

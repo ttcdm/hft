@@ -1,4 +1,4 @@
-# Generated from scripts/releaseFilter.ts (tests/k2_release_hygiene.test.ts checks it). Edit the lists there.
+# Generated from server/security/secretPaths.ts (tests/k2_release_hygiene.test.ts checks it). Edit the lists there.
 .dockerignore
 **/.git
 **/.agents

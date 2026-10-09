@@ -8,6 +8,7 @@ import crypto from 'crypto';
 import http from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer, createLogger } from 'vite';
+import { secretPathGuard, viteDevServerOptions } from './server/security/secretPaths';
 import { GoogleGenAI } from '@google/genai';
 import { hftEngine } from './server/engine/engine';
 import { socialScanner } from './server/socialScanner';
@@ -1803,13 +1804,12 @@ async function startServer() {
     };
 
     const vite = await createViteServer({
-      server: {
-        middlewareMode: true,
-        hmr: false,
-      },
+      server: viteDevServerOptions(),
       appType: 'spa',
       customLogger,
     });
+    // The project root is the Vite root: refuse secret and state files (env.txt, *.db, *.wal, *.log, keypairs, .overnight/...) before Vite sees the URL.
+    app.use(secretPathGuard(process.cwd()));
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');

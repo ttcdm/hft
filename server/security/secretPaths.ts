@@ -38,3 +38,43 @@ export function dockerignoreLines(): string[] {
     ...ALLOW_FILE_GLOBS.map((g) => `!${g}`),
   ];
 }
+
+/** Vite `server.fs.deny` globs from the same lists (replaces Vite's default list, so its own defaults are repeated). */
+export function viteFsDeny(): string[] {
+  return [
+    '.env', '.env.*', '*.{crt,pem}',
+    ...DENY_DIRS.map((d) => `**/${d}/**`),
+    ...DENY_FILE_GLOBS.filter((g) => !ALLOW_FILE_GLOBS.includes(g)).map((g) => `**/${g}`),
+  ];
+}
+
+export function viteDevServerOptions() {
+  return { middlewareMode: true as const, hmr: false as const, fs: { strict: true, deny: viteFsDeny() } };
+}
+
+/**
+ * Express middleware placed BEFORE the Vite dev middleware: answers 404 for any URL whose path is a secret or state file
+ * (decoded up to twice, backslashes and `/@fs/` prefixes handled), whatever Vite's own deny list does.
+ * `npm run dev` serves the project root, and the /api auth gate does not cover static paths.
+ */
+export function secretPathGuard(root: string) {
+  const rootPosix = root.replace(/\\/g, '/').replace(/\/+$/, '');
+  return (req: { url?: string }, res: { statusCode: number; end: (s?: string) => void }, next: () => void) => {
+    let p = (req.url || '/').split('?')[0].split('#')[0];
+    for (let i = 0; i < 2; i++) {
+      try { p = decodeURIComponent(p); } catch { break; }
+    }
+    p = p.replace(/\\/g, '/');
+    if (p.startsWith('/@fs/')) p = p.slice(4);
+    if (p.startsWith(rootPosix + '/')) p = p.slice(rootPosix.length);
+    const segments = p.split('/').filter((s) => s && s !== '.');
+    const normalized: string[] = [];
+    for (const s of segments) { if (s === '..') normalized.pop(); else normalized.push(s); }
+    if (normalized.length > 0 && !isShippable(normalized.join('/'))) {
+      res.statusCode = 404;
+      res.end('Not found');
+      return;
+    }
+    next();
+  };
+}

@@ -67,6 +67,7 @@ export class ExecutionCoordinator {
   private isLiveTradingArmed: boolean = false;
   private inFlightReservedSol: number = 0;
   private inFlightPositionExits: Set<string> = new Set<string>();
+  private inFlightBuyMints: Set<string> = new Set<string>();
   private connection: Connection;
   private rpcEndpoint: string;
   private rpcLatencyMs: number = 0;
@@ -1440,6 +1441,13 @@ export class ExecutionCoordinator {
           isMintAuthorityRevoked: marketState.isMintAuthorityRevoked,
           isFreezeAuthorityRevoked: marketState.isFreezeAuthorityRevoked,
           hasToken2022Extensions: marketState.baseTokenProgram?.equals(TOKEN_2022_PROGRAM_ID) ?? false,
+          // Pass the extension inspection result through. LIVE already refuses unsafe mints in fetchPumpMarketState,
+          // so a Token-2022 mint that reaches here with a report is explicitly safe; without this it was UNKNOWN and rejected.
+          token2022Safe: marketState.token2022Report ? marketState.token2022Report.isSafe : undefined,
+          unsupportedToken2022Extension:
+            marketState.token2022Report && !marketState.token2022Report.isSafe
+              ? marketState.token2022Report.unsupportedExtensionNames.join(',') || true
+              : undefined,
           devHoldingPct: holderDist ? holderDist.devHoldingPct : null,
           top10HoldersPct: holderDist ? holderDist.top10HoldersPct : null,
         },
@@ -1569,6 +1577,7 @@ export class ExecutionCoordinator {
       orderSizeSol: req.amountSol,
       expectedPriceSol: quote.executionPriceSol,
       slippageBps: quote.slippageBps,
+      estimatedPriceImpactBps: quote.estimatedPriceImpactBps,
       estimatedFeeLamports: quote.expectedPriorityFeeLamports + 5000,
       jitoTipLamports: quote.expectedJitoTipLamports,
       signalTimestamp: req.signalTimestamp || marketState.marketDataTimestamp,
@@ -1593,6 +1602,21 @@ export class ExecutionCoordinator {
         correlationId,
       };
     }
+
+    // Cross-request dedupe: only one LIVE buy per mint may be in flight. The per-mint cooldown is only recorded
+    // after a fill, so two concurrent requests (double click, WS plus HTTP, auto-snipe plus operator) could both pass it.
+    // Check and add run in the same synchronous block as the reservation, so there is no await between them.
+    if (this.inFlightBuyMints.has(req.mint)) {
+      workstationDb.logJournal('TRADE_REJECTED_DUPLICATE_IN_FLIGHT', correlationId, 'LIVE', { mint: req.mint });
+      return {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'LIVE',
+        error: `DUPLICATE_MINT: A buy for ${req.mint} is already in flight.`,
+        correlationId,
+      };
+    }
+    this.inFlightBuyMints.add(req.mint);
 
     // Acquire in-flight balance reservation
     this.inFlightReservedSol += requiredSol;
@@ -1637,6 +1661,8 @@ export class ExecutionCoordinator {
       const v0Tx = await txBuilder.buildBuyTransaction(this.connection, buyParams);
       await localSigner.signTransaction(v0Tx);
 
+      // The tip transfer is an instruction inside the signed transaction, so it is paid on-chain whichever
+      // transport lands it (Jito bundle or the RPC fallback). Accounting uses resolvedTip.tipLamports for both.
       // Record order in SQLite
       const clientOrderId = `ord-${correlationId}`;
       workstationDb.saveOrder({
@@ -1685,7 +1711,7 @@ export class ExecutionCoordinator {
           submissionTime: Date.now(),
           reconciliationState: 'REVERTED',
           networkFeeLamports: 5000,
-          jitoTipLamports: subRes.transport === 'JITO' ? resolvedTip.tipLamports : 0,
+          jitoTipLamports: resolvedTip.tipLamports,
           executionMode: 'LIVE',
           error: subRes.error || 'Transaction unconfirmed or dropped across attempts',
         });
@@ -1710,7 +1736,7 @@ export class ExecutionCoordinator {
         mintPubkey,
         marketState.tokenProgram,
         preSnapshot,
-        subRes.transport === 'JITO' ? resolvedTip.tipLamports : 0
+        resolvedTip.tipLamports
       );
 
       if (!reconciliation.success || reconciliation.reconciliationState !== 'RECONCILED') {
@@ -1728,7 +1754,7 @@ export class ExecutionCoordinator {
           confirmationTime: Date.now(),
           reconciliationState: 'RECONCILIATION_REQUIRED',
           networkFeeLamports: reconciliation.actualNetworkFeeLamports || 5000,
-          jitoTipLamports: subRes.transport === 'JITO' ? resolvedTip.tipLamports : 0,
+          jitoTipLamports: resolvedTip.tipLamports,
           executionMode: 'LIVE',
           error: reconciliation.error || 'Token balance increase not verified',
         });
@@ -1768,7 +1794,7 @@ export class ExecutionCoordinator {
         entryTimestamp: Date.now(),
         entryFeeLamports: reconciliation.actualNetworkFeeLamports,
         priorityFeeLamports: quote.expectedPriorityFeeLamports,
-        jitoTipLamports: subRes.transport === 'JITO' ? resolvedTip.tipLamports : 0,
+        jitoTipLamports: resolvedTip.tipLamports,
         markSource: 'RECONCILED_ON_CHAIN',
         markAgeMs: 0,
         venue: 'PUMP_BONDING_CURVE',
@@ -1793,7 +1819,7 @@ export class ExecutionCoordinator {
         confirmationTime: Date.now(),
         reconciliationState: 'RECONCILED',
         networkFeeLamports: reconciliation.actualNetworkFeeLamports,
-        jitoTipLamports: subRes.transport === 'JITO' ? resolvedTip.tipLamports : 0,
+        jitoTipLamports: resolvedTip.tipLamports,
         executionMode: 'LIVE',
       });
 
@@ -1806,7 +1832,7 @@ export class ExecutionCoordinator {
         fillPriceSol: reconciliation.effectiveFillPriceSol,
         tokensReceived: reconciliation.tokensReceivedHuman,
         executionMode: 'LIVE',
-        feesPaidLamports: reconciliation.actualNetworkFeeLamports + (subRes.transport === 'JITO' ? quote.expectedJitoTipLamports : 0),
+        feesPaidLamports: reconciliation.actualNetworkFeeLamports + quote.expectedJitoTipLamports,
         correlationId,
       };
     } catch (err: any) {
@@ -1822,6 +1848,7 @@ export class ExecutionCoordinator {
     } finally {
       // Always release in-flight balance reservation
       this.inFlightReservedSol = Math.max(0, this.inFlightReservedSol - requiredSol);
+      this.inFlightBuyMints.delete(req.mint);
     }
   }
 
@@ -2043,7 +2070,7 @@ export class ExecutionCoordinator {
         preSnapshot,
         target.costBasisLamports,
         fraction,
-        subRes.transport === 'JITO' ? expectedJitoTipLamports : 0
+        expectedJitoTipLamports
       );
 
       if (!sellRecon.success) {
@@ -2105,10 +2132,12 @@ export class ExecutionCoordinator {
         currentTimestamp: now,
       });
 
-      // Persist high_water_mark_sol, trailing_stop_sol, and exit_stage to SQLite (B13)
+      // Persist high_water_mark_sol and trailing_stop_sol to SQLite (B13). The exit stage only advances after the
+      // sell actually fills: advancing it first would skip a take-profit stage when the sell reverts or is refused.
+      const priorExitStage = pos.exitStage;
       pos.highWaterMarkSol = decision.newHighWaterMarkSol;
       pos.trailingStopSol = decision.newTrailingStopSol;
-      pos.exitStage = decision.newExitStage;
+      pos.exitStage = decision.shouldExit ? priorExitStage : decision.newExitStage;
       pos.lastUpdatedTimestamp = now;
       workstationDb.savePosition(pos);
 
@@ -2116,7 +2145,14 @@ export class ExecutionCoordinator {
         Logger.info(
           `[B13 ExitEngine] ${decision.reason} triggered for ${pos.symbol || pos.mint} (Sell ${decision.sellPercentage}%, PnL: ${decision.profitPct.toFixed(2)}%)`
         );
-        await this.closePosition(pos.id, decision.sellPercentage, decision.reason);
+        const exitRes = await this.closePosition(pos.id, decision.sellPercentage, decision.reason);
+        if (exitRes.success && decision.newExitStage !== priorExitStage) {
+          const after = workstationDb.loadPositions(undefined, 'ACTIVE').find((p) => p.id === pos.id);
+          if (after) {
+            after.exitStage = decision.newExitStage;
+            workstationDb.savePosition(after);
+          }
+        }
       }
     }
   }

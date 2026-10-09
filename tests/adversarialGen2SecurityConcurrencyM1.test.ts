@@ -299,10 +299,17 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       }
 
       const results = await Promise.all(promises);
+      // All must have failed cleanly. C7 allows one in-flight buy per mint, so one request reaches the injected
+      // chain error and every concurrent duplicate for the same mint is refused up front.
       for (const res of results) {
         expect(res.success).toBe(false);
-        expect(res.lifecycleState).toBe('CHAIN_ERROR');
+        if (res.lifecycleState === 'RISK_REJECTED') {
+          expect(res.error).toMatch(/DUPLICATE_MINT/);
+        } else {
+          expect(res.lifecycleState).toBe('CHAIN_ERROR');
+        }
       }
+      expect(results.filter((res) => res.lifecycleState === 'CHAIN_ERROR').length).toBeGreaterThanOrEqual(1);
 
       // Crucial empirical invariant: zero reserved SOL leakage
       expect((coordinator as any).inFlightReservedSol).toBe(0);

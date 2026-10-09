@@ -377,7 +377,14 @@ export class MemecoinAggregatorService extends EventEmitter {
       winLossRatio: historicalStats.winLossRatio,
     });
 
-    if (executionMode === 'LIVE' && !sizingResult.approved) {
+    // Cold start: with no closed-trade history Kelly is 0 (p=0.5, b=1), which would reject every first LIVE trade and
+    // so never create any history. Until CapitalSizer.SHRINKAGE_PRIOR_WEIGHT (25) closed trades exist, a zero-expectancy
+    // rejection falls through to the fixed-size path below: the requested or default amount, capped at 10% of spendable
+    // bankroll, and still subject to every RiskEngine limit. Real negative expectancy (25+ trades) still rejects.
+    const isColdStart =
+      historicalStats.tradeCount < CapitalSizer.SHRINKAGE_PRIOR_WEIGHT &&
+      sizingResult.rejectionReason === 'NEGATIVE_OR_ZERO_EXPECTANCY';
+    if (executionMode === 'LIVE' && !sizingResult.approved && !isColdStart) {
       return {
         success: false,
         message: `REJECTED: Capital sizing failed (${sizingResult.rejectionReason})`,

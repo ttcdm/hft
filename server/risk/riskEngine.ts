@@ -13,6 +13,8 @@ export interface RiskEvaluationRequest {
   orderSizeSol: number;
   expectedPriceSol: number;
   slippageBps: number;
+  /** Quote price impact. When provided it is checked against limits.maxPriceImpactBps. */
+  estimatedPriceImpactBps?: number;
   estimatedFeeLamports: number;
   jitoTipLamports: number;
   expectedEdgeSol?: number;
@@ -250,6 +252,15 @@ export class HardenedRiskEngine {
         false,
         'SLIPPAGE_TOO_HIGH',
         `Slippage ${req.slippageBps} bps exceeds max limit ${this.limits.maxSlippageBps} bps`
+      );
+    }
+
+    // 11b. Price Impact Limit (maxPriceImpactBps existed but nothing enforced it)
+    if (req.estimatedPriceImpactBps !== undefined && req.estimatedPriceImpactBps > this.limits.maxPriceImpactBps) {
+      return logAndReturn(
+        false,
+        'PRICE_IMPACT_TOO_HIGH',
+        `Price impact ${req.estimatedPriceImpactBps} bps exceeds max limit ${this.limits.maxPriceImpactBps} bps`
       );
     }
 

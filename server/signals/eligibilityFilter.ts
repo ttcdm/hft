@@ -1,3 +1,4 @@
+import { MAX_TOP10_HOLDERS_PCT } from '../solana/executionConfig';
 import { TokenEligibilityReport, EligibilityCheckResult, TriState, ExecutionMode } from '../core/types';
 
 export type AuthorityStatus = 'ACTIVE' | 'REVOKED' | 'UNKNOWN';
@@ -125,7 +126,7 @@ export class EligibilityFilter {
     });
 
     // 4. Top 10 Holders Concentration (Tri-State: PASS / FAIL / UNKNOWN; in LIVE: critical UNKNOWN -> REJECT)
-    const MAX_TOP10_PCT = 40.0;
+    const MAX_TOP10_PCT = MAX_TOP10_HOLDERS_PCT;
     const hasTop10Data = token.top10HoldersPct !== null && token.top10HoldersPct !== undefined;
     const top10Status: TriState = hasTop10Data
       ? token.top10HoldersPct! <= MAX_TOP10_PCT

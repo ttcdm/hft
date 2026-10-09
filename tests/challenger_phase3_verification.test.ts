@@ -205,11 +205,11 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
       expect(dist.nonBondingCirculatingSupply).toBe(10000000000000n); // Exactly 10M tokens
       expect(dist.creatorBalance).toBe(500000000000n); // 500k tokens
 
-      // 500,000 / 10,000,000 = 5.0%
-      expect(dist.devHoldingPct).toBe(5.0);
+      // C1: share of TOTAL supply (1B tokens): 500,000 / 1,000,000,000 = 0.05%
+      expect(dist.devHoldingPct).toBe(0.05);
 
-      // Top non-curve accounts = 500k + 1.5M = 2,000,000 tokens out of 10M = 20.0%
-      expect(dist.top10HoldersPct).toBe(20.0);
+      // C1: creator excluded from top 10; remaining 1.5M of 1B total = 0.15%
+      expect(dist.top10HoldersPct).toBe(0.15);
     });
 
     it('B01-ADV.5: Token-2022 bonding curve ATA is correctly recognized and excluded from circulating supply', async () => {

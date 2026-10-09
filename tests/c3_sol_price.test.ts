@@ -30,7 +30,7 @@ describe('C3: single SOL/USD price service', () => {
     expect(s.requireFreshPrice()).toBe(201);
   });
 
-  it('refresh cascades Binance -> Coinbase -> CoinGecko and rejects non-positive or junk values', async () => {
+  it('refresh cascades Coinbase -> CoinGecko -> Binance (Binance last: it refuses US IPs) and rejects non-positive or junk values', async () => {
     const calls: string[] = [];
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (u: any) => {
       const url = String(u);
@@ -43,7 +43,9 @@ describe('C3: single SOL/USD price service', () => {
     const r = await s.refresh();
     expect(r.usd).toBe(171.5);
     expect(r.source).toBe('COINGECKO');
-    expect(calls).toHaveLength(3);
+    expect(calls).toHaveLength(2);
+    expect(calls[0]).toContain('coinbase');
+    expect(calls.some((c) => c.includes('binance'))).toBe(false);
   });
 
   it('refresh never throws when every source is down and keeps the previous price', async () => {
@@ -54,7 +56,7 @@ describe('C3: single SOL/USD price service', () => {
   });
 
   it('concurrent refreshes share one request set', async () => {
-    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => json({ price: '160' }));
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => json({ data: { amount: '160' } }));
     const s = new SolPriceService();
     await Promise.all([s.refresh(), s.refresh(), s.refresh()]);
     expect(spy).toHaveBeenCalledTimes(1);

@@ -33,6 +33,9 @@ export interface AuthoritativeExecutionConfig {
 /** Max Jito tip as a fraction of trade notional. Planning decision #1: 15% (the conservative option), not 25%. */
 export const ECONOMIC_TIP_CAP_FRACTION = 0.15;
 
+/** Max share of TOTAL supply the top 10 non-curve, non-creator holders may own (C1). */
+export const MAX_TOP10_HOLDERS_PCT = 40;
+
 export function calculateDynamicJitoTip(tradeNotionalSol: number): number {
   if (!Number.isFinite(tradeNotionalSol) || tradeNotionalSol <= 0) {
     return 180_000;

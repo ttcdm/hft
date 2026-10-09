@@ -1,7 +1,7 @@
 /**
  * Single source of the SOL/USD price (C3). Read-only public market data; no chain access.
  *
- * - Sources are tried in order: Binance SOLUSDT, Coinbase SOL-USD spot, CoinGecko. (Jupiter price API v6 was removed: deprecated.)
+ * - Sources are tried in order: Coinbase SOL-USD spot, CoinGecko, Binance SOLUSDT (last: api.binance.com refuses US connections). (Jupiter price API v6 was removed: deprecated.)
  * - No numeric fallback price exists. Until a price has been read, getPrice() reports null.
  * - Fail closed: LIVE code calls requireFreshPrice(), which throws if the price is missing or older than maxAgeMs.
  *   PAPER code may use the last known price with `stale: true`.
@@ -80,9 +80,9 @@ export class SolPriceService {
 
   private async doRefresh(): Promise<SolPriceReading> {
     const sources: Array<[string, () => Promise<number | null>]> = [
-      ['BINANCE', async () => parse((await this.getJson('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT'))?.price)],
       ['COINBASE', async () => parse((await this.getJson('https://api.coinbase.com/v2/prices/SOL-USD/spot'))?.data?.amount)],
       ['COINGECKO', async () => parse((await this.getJson('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd'))?.solana?.usd)],
+      ['BINANCE', async () => parse((await this.getJson('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT'))?.price)],
     ];
     for (const [name, read] of sources) {
       try {

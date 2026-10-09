@@ -414,17 +414,11 @@ export async function fetchTokenHolderDistribution(
     nonBondingCirculatingSupply = nonCurveAccounts.reduce((sum, acc) => sum + BigInt(acc.amount), 0n);
   }
 
-  // Calculate top 10 holders concentration (excluding bonding curve)
-  const top10Accounts = nonCurveAccounts.slice(0, 10);
-  const top10Amount = top10Accounts.reduce((sum, acc) => sum + BigInt(acc.amount), 0n);
-  const top10HoldersPct = nonBondingCirculatingSupply > 0n
-    ? Number(((Number(top10Amount) / Number(nonBondingCirculatingSupply)) * 100).toFixed(2))
-    : 0;
-
   // Calculate creator holding
   let creatorBalance = 0n;
+  const creatorAddrsForExclusion = new Set<string>();
   if (creator) {
-    const creatorAddresses = new Set<string>();
+    const creatorAddresses = creatorAddrsForExclusion;
     creatorAddresses.add(creator.toBase58());
     try {
       const creatorAtaSpl = PumpCurveService.getAssociatedTokenAddress(mint, creator, TOKEN_PROGRAM_ID);
@@ -455,15 +449,20 @@ export async function fetchTokenHolderDistribution(
     }
   }
 
-  const devHoldingPct = nonBondingCirculatingSupply > 0n
-    ? Number(((Number(creatorBalance) / Number(nonBondingCirculatingSupply)) * 100).toFixed(2))
-    : 0;
+  // C1: concentration is a share of TOTAL supply. The bonding curve and the
+  // creator are excluded from the top-10 list (creator is scored via devHoldingPct).
+  const holderAddrs = new Set<string>(creatorAddrsForExclusion);
+  const top10Accounts = nonCurveAccounts.filter((acc) => !holderAddrs.has(acc.address.toBase58())).slice(0, 10);
+  const top10Amount = top10Accounts.reduce((sum, acc) => sum + BigInt(acc.amount), 0n);
+  const pctOfTotal = (amt: bigint) =>
+    totalSupply > 0n ? Number(((Number(amt) / Number(totalSupply)) * 100).toFixed(2)) : 0;
+  const top10HoldersPct = pctOfTotal(top10Amount);
+
+  const devHoldingPct = pctOfTotal(creatorBalance);
 
   const topHolders = nonCurveAccounts.map((acc) => {
     const amountBig = BigInt(acc.amount);
-    const pct = nonBondingCirculatingSupply > 0n
-      ? Number(((Number(amountBig) / Number(nonBondingCirculatingSupply)) * 100).toFixed(2))
-      : 0;
+    const pct = pctOfTotal(amountBig);
     return {
       address: acc.address.toBase58(),
       amount: amountBig,

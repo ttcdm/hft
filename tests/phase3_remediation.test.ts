@@ -81,12 +81,12 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
       expect(dist.nonBondingCirculatingSupply).toBe(300000000000000n);
       expect(dist.creatorBalance).toBe(24000000000000n);
 
-      // Creator holds 24M / 300M non-bonding supply = 8.00%
-      expect(dist.devHoldingPct).toBe(8.0);
+      // C1: creator holds 24M / 1B total supply = 2.4%
+      expect(dist.devHoldingPct).toBe(2.4);
 
       // Top 10 non-bonding accounts:
-      // Creator (24M) + 9 holders * 6M (54M) = 78M tokens out of 300M = 26.00%
-      expect(dist.top10HoldersPct).toBe(26.0);
+      // C1: creator excluded; 10 non-creator holders = 56M of 1B total = 5.6%
+      expect(dist.top10HoldersPct).toBe(5.6);
     });
 
     it('B01.2: EligibilityFilter passes when verified metrics satisfy thresholds and rejects when exceeded', () => {
@@ -161,7 +161,7 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
       } as unknown as Connection;
 
       const dist = await PumpCurveService.fetchTokenHolderDistribution(mockConn, mint, creator, bondingCurve);
-      expect(dist.devHoldingPct).toBe(3.0);
+      expect(dist.devHoldingPct).toBe(0.9); // C1: share of total supply
       expect(dist.devHoldingPct).toBeLessThanOrEqual(10.0);
       expect(dist.top10HoldersPct).toBeLessThanOrEqual(40.0);
     });

@@ -281,6 +281,15 @@ describe('S1: Telegram / social integrations', () => {
     });
   });
 
+  describe('diagnostics text matches reality (S1c)', () => {
+    it('says plainly that setWebhook, polling and alert forwarding are not implemented', async () => {
+      const fs = await import('fs');
+      const src = fs.readFileSync('server.ts', 'utf8');
+      expect(src).toContain('NOT implemented: setWebhook registration with Telegram, getUpdates polling, and alert forwarding');
+      expect(src).not.toContain('broadcasts real messages when a live BotFather token is saved');
+    });
+  });
+
   describe('route wiring (static)', () => {
     it('the Telegram webhook, config and test routes require operator auth', async () => {
       const fs = await import('fs');

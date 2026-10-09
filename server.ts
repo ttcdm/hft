@@ -1277,9 +1277,9 @@ app.get('/api/connectivity/diagnostics', async (req, res) => {
       },
       {
         subsystem: 'Telegram Bot API Link',
-        nature: 'LIVE_READY',
+        nature: 'PARTIAL',
         details:
-          'Outbound HTTPS routing to api.telegram.org is verified. Webhook dispatcher processes /snipe, /signals, /positions, and broadcasts real messages when a live BotFather token is saved.',
+          'The command handler (/snipe, /signals, /positions, /status, /panic_sell) runs when something posts to the operator-authenticated /api/telegram/webhook. NOT implemented: setWebhook registration with Telegram, getUpdates polling, and alert forwarding (autoForwardAlerts is stored but never used). Outbound connectivity can be tested with a bot token; nothing is sent automatically.',
       },
       {
         subsystem: 'X.com / Twitter Feed & Social Ingestion',

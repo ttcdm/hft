@@ -296,7 +296,7 @@ describe('Tier 1: Feature Coverage (Features 6 - 10)', () => {
         isFreezeAuthorityRevoked: true,
         isMintAuthorityRevoked: true,
         devHoldingPct: 1.5,
-        top10HoldersPct: 22.0,
+        top10HoldersPct: 12.0,
         liquidityUsd: 15000,
       });
 

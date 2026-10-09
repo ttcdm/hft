@@ -1,4 +1,4 @@
-import { MAX_TOP10_HOLDERS_PCT } from '../solana/executionConfig';
+import { MAX_TOP10_HOLDERS_PCT, MAX_CREATOR_HOLDING_PCT } from '../solana/executionConfig';
 import { TokenEligibilityReport, EligibilityCheckResult, TriState, ExecutionMode } from '../core/types';
 
 export type AuthorityStatus = 'ACTIVE' | 'REVOKED' | 'UNKNOWN';
@@ -95,7 +95,7 @@ export class EligibilityFilter {
     });
 
     // 3. Creator Holding Exposure (Tri-State: PASS / FAIL / UNKNOWN; in LIVE: critical UNKNOWN -> REJECT)
-    const MAX_DEV_PCT = 10.0;
+    const MAX_DEV_PCT = MAX_CREATOR_HOLDING_PCT;
     const hasDevData = token.devHoldingPct !== null && token.devHoldingPct !== undefined;
     const devStatus: TriState = hasDevData
       ? token.devHoldingPct! <= MAX_DEV_PCT

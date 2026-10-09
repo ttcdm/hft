@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { Keypair, PublicKey } from '@solana/web3.js';
 import { fetchTokenHolderDistribution, PumpCurveService } from '../server/solana/pumpCurve';
 import { EligibilityFilter } from '../server/signals/eligibilityFilter';
-import { MAX_TOP10_HOLDERS_PCT } from '../server/solana/executionConfig';
+import { MAX_TOP10_HOLDERS_PCT, MAX_CREATOR_HOLDING_PCT } from '../server/solana/executionConfig';
 import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
 
 const SUPPLY = 1_000_000_000n;
@@ -35,7 +35,7 @@ async function gate(rows: Array<[PublicKey, number]>) {
 }
 
 describe('C1: holder concentration is a share of TOTAL supply', () => {
-  it('healthy: curve holds most supply, top 10 hold 12% of total -> passes', async () => {
+  it('healthy: curve holds 70%, top 10 hold 12% of total -> passes', async () => {
     const { d, rule } = await gate([[curveAta, 70], ...holders(10, 1.2)]);
     expect(d.top10HoldersPct).toBe(12);
     expect(rule.passed).toBe(true);
@@ -54,9 +54,31 @@ describe('C1: holder concentration is a share of TOTAL supply', () => {
     expect(rule.status).toBe('FAIL');
   });
 
+  it('cartel: curve holds 75%, ten wallets hold the other 25% -> REJECTED', async () => {
+    const { d, rule } = await gate([[curveAta, 75], ...holders(10, 2.5)]);
+    expect(d.top10HoldersPct).toBe(25);
+    expect(rule.passed).toBe(false);
+    expect(rule.status).toBe('FAIL');
+  });
+
+  it('thresholds are the conservative C1b values (20% top 10, 5% creator, shares of total)', () => {
+    expect(MAX_TOP10_HOLDERS_PCT).toBe(20);
+    expect(MAX_CREATOR_HOLDING_PCT).toBe(5);
+  });
+
+  it('creator holding above the cap is rejected by the real filter; below it passes', async () => {
+    const heavy = await fetchTokenHolderDistribution(conn([[curveAta, 50], [creatorAta, 8], ...holders(10, 1)]), mint, creator, curve);
+    const report = EligibilityFilter.evaluate({ mint: mint.toBase58(), symbol: 'T', name: 'T', top10HoldersPct: heavy.top10HoldersPct, devHoldingPct: heavy.devHoldingPct } as any, 'PAPER');
+    expect(report.checks.find((c) => c.ruleId === 'MAX_CREATOR_EXPOSURE')!.passed).toBe(false);
+    const ok = await fetchTokenHolderDistribution(conn([[curveAta, 50], [creatorAta, 4], ...holders(10, 1)]), mint, creator, curve);
+    const r2 = EligibilityFilter.evaluate({ mint: mint.toBase58(), symbol: 'T', name: 'T', top10HoldersPct: ok.top10HoldersPct, devHoldingPct: ok.devHoldingPct } as any, 'PAPER');
+    expect(r2.checks.find((c) => c.ruleId === 'MAX_CREATOR_EXPOSURE')!.passed).toBe(true);
+  });
+
   it('creator is excluded from top 10 and scored separately as devHoldingPct', async () => {
     const { d, rule } = await gate([[curveAta, 50], [creatorAta, 20], ...holders(10, 1)]);
     expect(d.devHoldingPct).toBe(20);
+    expect(rule.passed).toBe(true); // top-10 rule only; the creator cap is a separate rule
     expect(d.top10HoldersPct).toBe(10);
     expect(rule.passed).toBe(true);
   });

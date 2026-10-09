@@ -97,8 +97,8 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
           symbol: 'SAFE',
           name: 'Safe Token',
           liquidityUsd: 15000,
-          devHoldingPct: 4.5, // <= 10.0% threshold
-          top10HoldersPct: 22.0, // <= 40.0% threshold
+          devHoldingPct: 4.5, // <= 5.0% threshold (C1b)
+          top10HoldersPct: 12.0, // <= 20.0% threshold (C1b)
           isMintAuthorityRevoked: true,
           isFreezeAuthorityRevoked: true,
         },
@@ -119,8 +119,8 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
           symbol: 'RUG',
           name: 'Rug Token',
           liquidityUsd: 15000,
-          devHoldingPct: 18.5, // > 10.0% -> Excessive creator exposure
-          top10HoldersPct: 62.0, // > 40.0% -> High cartel dump risk
+          devHoldingPct: 18.5, // > 5.0% -> Excessive creator exposure
+          top10HoldersPct: 62.0, // > 20.0% -> High cartel dump risk
           isMintAuthorityRevoked: true,
           isFreezeAuthorityRevoked: true,
         },

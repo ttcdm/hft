@@ -486,40 +486,6 @@ app.get('/api/health', (req, res) => {
 // 3. Market data proxy routes (orderbook, trades, ticker) live in server/market/marketRoutes.ts (B2).
 registerMarketRoutes(app);
 
-// 3d. Atomic Exchange Clock Synchronization & RTT Probe
-app.get('/api/exchange/time', async (req, res) => {
-  const tStart = performance.now();
-  try {
-    const apiRes = await fetch('https://api.binance.com/api/v3/time');
-    const tEnd = performance.now();
-    const rtt = tEnd - tStart;
-    if (apiRes.ok) {
-      const data = await apiRes.json();
-      const localTime = Date.now();
-      const serverTime = data.serverTime;
-      const clockDriftMs = localTime - (serverTime + rtt / 2);
-      return res.json({
-        status: 'SYNCED',
-        exchangeServerTime: serverTime,
-        localSystemTime: localTime,
-        rttMs: Number(rtt.toFixed(2)),
-        clockDriftMs: Number(clockDriftMs.toFixed(2)),
-        ntpAccuracy: 'HTTP RTT Binance Server-Time Estimation',
-      });
-    }
-  } catch {
-    // Fallback
-  }
-  res.json({
-    status: 'LOCAL_SYNC',
-    exchangeServerTime: Date.now(),
-    localSystemTime: Date.now(),
-    rttMs: 0.85,
-    clockDriftMs: 0,
-    ntpAccuracy: 'Local System Clock (Fallback)',
-  });
-});
-
 // 3e. In-Memory Store for Real-Flow Active Paper Orders
 interface StoredOrder {
   orderId: string;

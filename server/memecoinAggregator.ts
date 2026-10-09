@@ -328,11 +328,13 @@ export class MemecoinAggregatorService extends EventEmitter {
     const mint = pool ? pool.contractAddress : typeof poolOrMint === 'string' ? poolOrMint : '';
     const priceChange5mPct = pool?.priceChange5mPct ?? 0;
     const liquidityUsd = pool?.liquidityUsd ?? 0;
-    const top10HoldersPct = pool?.top10HoldersPct !== undefined && pool.top10HoldersPct >= 0 ? pool.top10HoldersPct : 20;
+    // B3: -1 / undefined mean UNKNOWN. Unknown is passed as null and scores 0; it used to default to 20% (10 free points).
+    const top10HoldersPct = pool?.top10HoldersPct !== undefined && pool.top10HoldersPct >= 0 ? pool.top10HoldersPct : null;
     const bondingCurveProgress = pool?.bondingCurveProgress ?? 0;
     const buys5m = pool?.buys5m ?? 0;
     const sells5m = pool?.sells5m ?? 0;
-    const devHoldingPct = pool?.devHoldingPct !== undefined && pool.devHoldingPct >= 0 ? pool.devHoldingPct : 0;
+    // Unknown dev holding used to default to 0% (the full 5 dev-risk points).
+    const devHoldingPct = pool?.devHoldingPct !== undefined && pool.devHoldingPct >= 0 ? pool.devHoldingPct : null;
     const hasVerifiedSocialCall =
       (pool?.trendingRank !== undefined && pool.trendingRank > 0) ||
       (pool?.volume5mUsd !== undefined && pool.volume5mUsd > 10000);

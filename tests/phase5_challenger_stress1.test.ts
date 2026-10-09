@@ -777,6 +777,7 @@ describe('Adversarial Stress & Empirical Challenge Suite: Alpha Pipeline Integra
           currentMultiple: 2.5,
           complete: false,
           volume5mUsd: 25000,
+          priceChange5mPct: 40, // B3: measured 5m change; missing data scores 0 and is no longer derived from the multiple
           buys5m: 85,
           sells5m: 15,
           top10HoldersPct: 14.0,

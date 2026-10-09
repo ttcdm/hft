@@ -544,25 +544,28 @@ export class PumpFunService extends EventEmitter {
       } else if (c.market_cap) {
         curveProgress = Math.min(99.5, Number(((c.market_cap / 85) * 100).toFixed(1)));
       } else {
-        curveProgress = Math.min(95, 30 + (index * 7) % 65);
+        // B3: no market-cap field means the progress is unknown, not 30-95%. 0 earns the lowest curve score.
+        curveProgress = 0;
       }
 
       // Real-world pricing & multiples
+      // B3: unknown price is 0 (never an invented number)
       const currentPriceUsd = pair?.priceUsd
         ? parseFloat(pair.priceUsd)
         : c.usd_market_cap
         ? c.usd_market_cap / 1_000_000_000
-        : 0.000085 + (index * 0.000015);
+        : 0;
 
       const currentMarketCapUsd = pair?.fdv
         ? pair.fdv
         : c.usd_market_cap || c.market_cap_usd || currentPriceUsd * 1_000_000_000;
 
       // Token trade & creation timestamp from on-chain data
-      const tokenTradeTime = c.last_trade_timestamp || c.created_timestamp || now - 45000;
-      const elapsedMs = Math.max(2000, now - tokenTradeTime);
+      // B3: with no timestamp the age is unknown; treat it as stale so it can never qualify as a fresh INSTANT_SNIPE.
+      const tokenTradeTime = c.last_trade_timestamp || c.created_timestamp || 0;
+      const elapsedMs = tokenTradeTime > 0 ? Math.max(2000, now - tokenTradeTime) : 3_600_000;
       const elapsedSeconds = Math.floor(elapsedMs / 1000);
-      const calloutTimestamp = tokenTradeTime;
+      const calloutTimestamp = tokenTradeTime > 0 ? tokenTradeTime : now - elapsedMs;
 
       // Base launch valuation floor on Pump.fun is ~30 SOL virtual reserve ($5,000 USD)
       const baseLaunchMarketCapUsd = 5000;
@@ -589,13 +592,13 @@ export class PumpFunService extends EventEmitter {
       // Callout note generated from real on-chain metrics
       let calloutNote: string;
       if (confluenceCount >= 2) {
-        calloutNote = `🚨 MULTI-CALLER CONFLUENCE (Pump.fun Velocity + DexScreener Boosted): Called by @${caller.userId}${otherCallers.length > 0 ? ' & ' + otherCallers.join(', ') : ''}. Curve: ${curveProgress}% | 5m Vol: $${(pair?.volume?.m5 || 8500).toLocaleString()}. Elevated to INSTANT_SNIPE.`;
+        calloutNote = `🚨 MULTI-CALLER CONFLUENCE (Pump.fun Velocity + DexScreener Boosted): Called by @${caller.userId}${otherCallers.length > 0 ? ' & ' + otherCallers.join(', ') : ''}. Curve: ${curveProgress}% | 5m Vol: ${pair?.volume?.m5 != null ? '$' + Number(pair.volume.m5).toLocaleString() : 'n/a'}. Elevated to INSTANT_SNIPE.`;
       } else if (curveProgress >= 80) {
         calloutNote = `⚡ GRADUATION IMMINENT: Bonding curve is ${curveProgress}% filled. Raydium/PumpSwap AMM migration trigger at 85 SOL.`;
       } else if (isBoosted) {
-        calloutNote = `🔥 DEXSCREENER BOOSTED: High social velocity detected with ${pair?.txns?.m5?.buys || 45} buys in last 5m.`;
+        calloutNote = `🔥 DEXSCREENER BOOSTED: ${pair?.txns?.m5?.buys !== undefined ? `${pair.txns.m5.buys} buys in the last 5m` : 'order flow not available'}.`;
       } else {
-        calloutNote = `On-chain accumulation by top wallet. Dev holding is ${c.complete ? '0.0%' : '0.8%'}, freeze revoked. Rapid momentum expansion.`;
+        calloutNote = `Live pump.fun token. Curve ${curveProgress}%. Holder, dev and authority data: ${c.top10_holders_pct != null || c.dev_holding_pct != null ? 'partial' : 'not provided by the feed'}.`;
       }
 
       const isAlreadySniped = this.snipedMints.has(mint.toLowerCase());
@@ -611,21 +614,23 @@ export class PumpFunService extends EventEmitter {
           imageUri: c.image_uri || 'https://images.unsplash.com/photo-1622979135225-d2ba269bc1df?w=120&auto=format&fit=crop&q=80',
           description: c.description || 'Verified token from Pump.fun hot callouts discovery engine.',
           bondingCurveProgress: curveProgress,
-          bondingCurveAddress: c.bonding_curve || 'CN35wYHmtBB6G8oPfTtUadQfMELytTsxUyEr3CTPsTka',
+          bondingCurveAddress: c.bonding_curve || '',
           associatedBondingCurve: c.associated_bonding_curve,
-          creator: c.creator || 'AHuDJooRChxq4B8X6GmzSfVmJTaVLq4',
+          creator: c.creator || '',
           calloutPriceUsd,
           currentPriceUsd,
           marketCapAtCalloutUsd,
           currentMarketCapUsd,
           athPriceSol: (c.ath_market_cap || currentMarketCapUsd) / 185,
-          peakMultiple: Math.max(currentMultiple, Number((currentMultiple * 1.35).toFixed(2))),
+          peakMultiple: currentMultiple, // B3: the true peak is not in the feed; never invent a 1.35x
           currentMultiple,
           complete: c.complete || curveProgress >= 100,
           raydiumPool: c.raydium_pool,
-          volume5mUsd: pair?.volume?.m5 || 12400 + index * 1500,
-          buys5m: pair?.txns?.m5?.buys || 64 + index * 8,
-          sells5m: pair?.txns?.m5?.sells || 12 + index * 2,
+          // B3: null means "not provided". Never filled with invented numbers.
+          volume5mUsd: pair?.volume?.m5 ?? null,
+          buys5m: pair?.txns?.m5?.buys ?? null,
+          sells5m: pair?.txns?.m5?.sells ?? null,
+          priceChange5mPct: pair?.priceChange?.m5 ?? null,
           top10HoldersPct: c.top10_holders_pct ?? null,
           devHoldingPct: c.complete ? 0.0 : (c.dev_holding_pct ?? null),
           isMintRevoked: c.is_mint_revoked ?? null,
@@ -751,30 +756,22 @@ export class PumpFunService extends EventEmitter {
    * Evaluate multi-factor confluence score for a callout using ConfluenceEngine (B14)
    */
   public evaluateCalloutConfluence(callout: PumpFunHotCallout): ConfluenceBreakdown {
-    const t = callout.token;
-    const priceChange5mPct = t.currentMultiple > 1 ? Math.min(100, (t.currentMultiple - 1) * 35) : 0;
-    const liquidityUsd = t.bondingCurveProgress > 0 ? (t.bondingCurveProgress / 100) * 85 * 145 * 2 : 10000;
-    const top10HoldersPct =
-      t.top10HoldersPct !== null && t.top10HoldersPct !== undefined && t.top10HoldersPct >= 0
-        ? t.top10HoldersPct
-        : 15;
-    const devHoldingPct =
-      t.devHoldingPct !== null && t.devHoldingPct !== undefined && t.devHoldingPct >= 0
-        ? t.devHoldingPct
-        : 0.0;
-
+    const t = callout.token as any;
+    const num = (n: unknown): number | null => (typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : null);
+    // B3: only measured values go in. Unknown stays null and earns no points. There is no real social call yet,
+    // so the social factor is not awarded (it used to be hardcoded to true).
     const input: ConfluenceFactorsInput = {
       mint: t.mint,
       creatorAddress: t.creator,
-      priceChange5mPct,
-      liquidityUsd,
-      top10HoldersPct,
+      priceChange5mPct: typeof t.priceChange5mPct === 'number' ? t.priceChange5mPct : null,
+      liquidityUsd: null, // no measured liquidity in the callout feed (the old value was a curve-progress x 145 guess)
+      top10HoldersPct: num(t.top10HoldersPct),
       bondingCurveProgress: t.bondingCurveProgress,
-      buys5m: t.buys5m,
-      sells5m: t.sells5m,
-      devHoldingPct,
-      hasVerifiedSocialCall: true,
-      socialCallCount: Math.max(1, callout.confluenceCount),
+      buys5m: num(t.buys5m),
+      sells5m: num(t.sells5m),
+      devHoldingPct: num(t.devHoldingPct),
+      hasVerifiedSocialCall: false,
+      socialCallCount: 0,
     };
 
     return ConfluenceEngine.calculate(input);

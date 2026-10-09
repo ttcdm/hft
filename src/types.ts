@@ -448,9 +448,11 @@ export interface PumpFunHotCallout {
     currentMultiple: number;
     complete: boolean; // Raydium / PumpSwap migration status
     raydiumPool?: string;
-    volume5mUsd: number;
-    buys5m: number;
-    sells5m: number;
+    // null = not provided by the feed (never an invented value)
+    volume5mUsd: number | null;
+    buys5m: number | null;
+    sells5m: number | null;
+    priceChange5mPct?: number | null;
     top10HoldersPct: number;
     devHoldingPct: number;
     isMintRevoked: boolean;

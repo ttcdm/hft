@@ -668,6 +668,7 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
           currentMultiple: 1.2, // <= maxEntryMultiple (1.35)
           complete: false,
           volume5mUsd: 50000,
+          priceChange5mPct: 40, // B3: measured 5m change; missing data scores 0 and is no longer derived from the multiple
           buys5m: 90,
           sells5m: 10,
           top10HoldersPct: 12.0,

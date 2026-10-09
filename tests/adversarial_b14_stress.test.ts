@@ -764,6 +764,7 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
           currentMultiple: 1.25,
           complete: false,
           volume5mUsd: 30000,
+          priceChange5mPct: 40, // B3: measured 5m change; missing data scores 0 and is no longer derived from the multiple
           buys5m: 90,
           sells5m: 10,
           top10HoldersPct: 12.0,

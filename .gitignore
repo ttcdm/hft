@@ -55,3 +55,7 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# local env copies (contain secrets)
+env.txt
+.env.bak-*

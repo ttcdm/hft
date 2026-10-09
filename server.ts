@@ -17,6 +17,7 @@ import { realismEngine } from './server/realismEngine';
 import { pumpFunService } from './server/pumpfunService';
 import { pumpFeedListener } from './server/solana/pumpFeedListener';
 import { autoSnipeController } from './server/auto/controller';
+import { watchWindow } from './server/signals/watchWindow';
 import { runComprehensiveTestSuite } from './server/unitTestCases';
 import { registerMarketRoutes } from './server/market/marketRoutes';
 import { run60DayBacktest } from './src/utils/backtestEngine';
@@ -302,6 +303,16 @@ pumpFunService.on('callouts_updated', (data) => {
 pumpFunService.on('callout_sniped', (data) => {
   broadcastWs({ type: 'CALLOUT_SNIPED', data });
 });
+
+// G2: watch window. Create events start a watch, decoded TradeEvents feed it. A release is information for the board;
+// it does not trade (the auto controller's own gates still decide).
+watchWindow.setScoreFn((mint) => {
+  const pool = memecoinAggregator.getPools().find((p) => p.contractAddress === mint);
+  return pool ? memecoinAggregator.evaluateTokenConfluence(pool).score : null;
+});
+watchWindow.attach(pumpFeedListener);
+watchWindow.on('release', (r) => broadcastWs({ type: 'WATCH_RELEASE', data: r }));
+watchWindow.start();
 
 // Broadcast real-time Pump.fun V2 WebSocket CreateEvents (B08)
 pumpFeedListener.on('create_event', (data) => {
@@ -1662,6 +1673,10 @@ app.post('/api/auto/mode', requireOperatorAuth, validateTradeBody(AutoModeSchema
 app.post('/api/auto/kill', requireOperatorAuth, validateTradeBody(AutoKillSchema), async (req, res) => {
   const result = await autoSnipeController.kill({ exitAll: req.body.exitAll, reason: req.body.reason });
   res.json({ success: true, ...result, status: autoSnipeController.getStatus() });
+});
+
+app.get('/api/watch', requireOperatorAuth, (req, res) => {
+  res.json({ success: true, ...watchWindow.getSnapshot() });
 });
 
 app.post('/api/auto/resume', requireOperatorAuth, validateTradeBody(AutoResumeSchema), (req, res) => {

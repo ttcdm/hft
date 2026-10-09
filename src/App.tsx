@@ -13,7 +13,7 @@ import { MicrostructureRealismModal } from './components/MicrostructureRealismMo
 import { BacktestModal } from './components/BacktestModal';
 import { PlugAndPlayTradingModal } from './components/PlugAndPlayTradingModal';
 import { AuthModal } from './components/AuthModal';
-import { engineClient, getOperatorSessionToken } from './services/engineClient';
+import { engineClient, getOperatorSessionToken, authFetch } from './services/engineClient';
 import { TokenBoard } from './components/TokenBoard';
 import { CurvePanel } from './components/CurvePanel';
 import { AutoPanel } from './components/AutoPanel';
@@ -256,23 +256,35 @@ export default function App() {
     []
   );
 
-  // Toggle Emergency Kill Switch
-  const toggleKillSwitch = () => {
+  // Emergency kill switch: the server decides. The UI only shows "halted" after the server confirmed it.
+  const toggleKillSwitch = async () => {
     const nextHalted = !isHalted;
-    setIsHalted(nextHalted);
     hftAudio.playKillSwitch();
-
-    if (nextHalted) {
+    try {
+      const res = await authFetch('/api/execution/kill-switch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ activate: nextHalted }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok || body.killSwitchActive !== nextHalted) {
+        throw new Error(body.error || `server answered HTTP ${res.status}`);
+      }
+      setIsHalted(nextHalted);
+      if (nextHalted) {
+        triggerAlert(
+          'CRITICAL',
+          'KILL SWITCH ENGAGED',
+          'The server refuses new orders and has disarmed LIVE trading. Open positions are NOT sold: close them from the Plug & Play panel.'
+        );
+      } else {
+        triggerAlert('INFO', 'KILL SWITCH RESET', 'New orders are allowed again. LIVE trading stays disarmed until you arm it.');
+      }
+    } catch (err: any) {
       triggerAlert(
         'CRITICAL',
-        'EMERGENCY KILL SWITCH ENGAGED',
-        'All matching engine threads halted. Real-time order routing frozen. Safe liquidation armed.'
-      );
-    } else {
-      triggerAlert(
-        'INFO',
-        'MATCHING ENGINE RESUMED',
-        'Trading bots re-initialized. Order feeds reconnected to CME/NY4 core.'
+        'KILL SWITCH NOT CONFIRMED',
+        `The server did not confirm the kill switch (${err?.message || 'request failed'}). Assume trading is NOT halted; sign in as operator and retry.`
       );
     }
   };

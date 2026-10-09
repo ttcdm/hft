@@ -26,7 +26,6 @@ import { buildCurveDepth } from './server/market/curveDepth';
 import { TradeTape } from './server/market/tradeTape';
 import { runComprehensiveTestSuite } from './server/unitTestCases';
 import { registerMarketRoutes } from './server/market/marketRoutes';
-import { run60DayBacktest } from './src/utils/backtestEngine';
 import { walletTrader } from './server/walletTrader';
 import { resolveRpcUrl } from './server/solana/clusterGuard';
 import {
@@ -1204,35 +1203,6 @@ app.post('/api/pumpfun/refresh', async (req, res) => {
   });
 });
 
-
-// ============================================================================
-// 13c. 60-DAY (LAST 2 MONTHS) COMPREHENSIVE BACKTESTING ENGINE
-// ============================================================================
-app.post('/api/backtest/run', (req, res) => {
-  try {
-    const config = req.body || {};
-    const result = run60DayBacktest(config);
-    res.json({
-      status: 'OK',
-      result,
-    });
-  } catch (err: any) {
-    res.status(500).json({ status: 'ERROR', message: err?.message || 'Backtest failed' });
-  }
-});
-
-app.get('/api/backtest/run', (req, res) => {
-  try {
-    const capitalTier = (req.query.capitalTier as any) || 'MICRO_10';
-    const result = run60DayBacktest({ capitalTier });
-    res.json({
-      status: 'OK',
-      result,
-    });
-  } catch (err: any) {
-    res.status(500).json({ status: 'ERROR', message: err?.message || 'Backtest failed' });
-  }
-});
 
 // ============================================================================
 // 14. REALISM & CO-LOCATION MICROSTRUCTURE CONFIG ENDPOINTS

@@ -24,7 +24,9 @@ describe('.env is loaded before import-time singletons (signer, config, db, coor
   it('server.ts, the coordinator and the devnet script import loadEnv first', () => {
     expect(firstImport('server.ts')).toMatch(/^import '\.\/server\/loadEnv'/);
     expect(firstImport('server/execution/coordinator.ts')).toMatch(/^import '\.\.\/loadEnv'/);
-    expect(firstImport('scripts/test_devnet_execution.ts')).toMatch(/^import '\.\.\/server\/loadEnv'/);
+    // L3: the devnet script first pins an empty env file (hermeticEnv), then loads loadEnv, so no .env is read.
+    expect(firstImport('scripts/test_devnet_execution.ts')).toMatch(/^import '\.\/hermeticEnv'/);
+    expect(fs.readFileSync('scripts/test_devnet_execution.ts', 'utf8')).toMatch(/import '\.\/hermeticEnv'[^\n]*\nimport '\.\.\/server\/loadEnv'/);
     expect(fs.readFileSync('server.ts', 'utf8')).not.toMatch(/dotenv/); // no late dotenv.config() left behind
   });
 

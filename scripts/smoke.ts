@@ -8,7 +8,8 @@
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { createServer } from 'node:net';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import WebSocket from 'ws';
 
@@ -89,6 +90,7 @@ async function main(): Promise<void> {
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
   const password = randomBytes(12).toString('hex');
+  const scratchDir = mkdtempSync(path.join(tmpdir(), 'apex-smoke-'));
 
   // Sanitized env: nothing inherited except what node needs. No RPC, Jito, signer or API keys.
   const env: NodeJS.ProcessEnv = {
@@ -97,6 +99,10 @@ async function main(): Promise<void> {
     NODE_ENV: 'production',
     APP_PORT: String(port),
     OPERATOR_PASSWORD: password,
+    // Hermetic: no .env, a scratch DB and a keypair path that does not exist, so a populated checkout is never touched.
+    APEX_ENV_FILE: '',
+    APEX_DB_PATH: path.join(scratchDir, 'smoke.db'),
+    SIGNER_KEYPAIR_PATH: path.join(scratchDir, 'no-keypair.json'),
   };
 
   const out: string[] = [];

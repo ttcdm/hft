@@ -7,6 +7,7 @@
  * RPC fallback is exercised. ALLOW_LIVE_REAL_MONEY_TRADING is set true in-process ONLY after the cluster's genesis hash
  * equals the devnet hash. It never reads .env, the repo keypair, or any real RPC URL.
  */
+import './hermeticEnv'; // no .env is ever loaded by this script
 import fs from 'fs';
 import os from 'os';
 import path from 'path';

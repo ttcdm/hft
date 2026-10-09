@@ -1,4 +1,7 @@
-import '../server/loadEnv'; // must stay the first import
+import './hermeticEnv'; // must stay the first import: no .env is loaded, the signer must be a throwaway key given explicitly
+import '../server/loadEnv';
+import fs from 'fs';
+import path from 'path';
 
 import {
   Connection,
@@ -18,12 +21,14 @@ async function runDevnetVerification() {
   console.log('🧪 APEX WORKSTATION — DEVNET ON-CHAIN EXECUTION VERIFICATION');
   console.log('================================================================');
 
-  const rpcUrl = process.env.SOLANA_RPC_URL;
-  if (!rpcUrl) {
-    throw new Error('SOLANA_RPC_URL is not configured in .env');
+  const rpcUrl = process.env.SOLANA_RPC_URL || 'https://api.devnet.solana.com';
+  const keyPath = process.env.SIGNER_KEYPAIR_PATH;
+  if (!keyPath || path.resolve(keyPath) === path.resolve('.apex_trading_keypair.json') || !fs.existsSync(keyPath)) {
+    throw new Error('Set SIGNER_KEYPAIR_PATH to a throwaway devnet keypair file (not the repo keypair). This script never reads .env.');
   }
 
-  console.log(`[1/6] Connecting to RPC endpoint: ${rpcUrl.slice(0, 45)}...`);
+  // The RPC URL can carry a provider token, so no part of it is printed.
+  console.log('[1/6] Connecting to the configured RPC endpoint (not printed)');
   const connection = new Connection(rpcUrl, 'confirmed');
 
   // Hard safety invariant: Verify genesis hash to guarantee we NEVER execute on Mainnet
@@ -36,10 +41,10 @@ async function runDevnetVerification() {
   }
 
   if (genesisHash !== DEVNET_GENESIS_HASH) {
-    console.warn(`⚠️ Warning: Genesis hash does not match standard devnet (${DEVNET_GENESIS_HASH}), but confirmed NOT mainnet.`);
-  } else {
-    console.log('✅ SAFETY VERIFIED: Cluster is 100% SOLANA DEVNET (Mainnet strictly blocked).');
+    console.error(`⛔ FATAL: genesis hash ${genesisHash} is not devnet. This script runs on devnet only.`);
+    process.exit(1);
   }
+  console.log('✅ SAFETY VERIFIED: Cluster is SOLANA DEVNET.');
 
   // Verify Signer
   const signerStatus = localSigner.getStatus();

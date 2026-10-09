@@ -419,6 +419,8 @@ export class AutoSnipeController extends EventEmitter {
         provenance: c.provenance,
         enforceConfluence: verdict.state === 'READY' ? true : c.enforceConfluence,
         minConfluenceScore: verdict.state === 'READY' ? HOT_MIN_SCORE : undefined,
+        // The signal behind an auto buy is the watch window's release; LIVE refuses a trade without one.
+        signalTimestamp: verdict.releasedAt,
       };
       if (shadow) params.dryRun = true;
       if (this.mode === 'DEVNET_LIVE') {

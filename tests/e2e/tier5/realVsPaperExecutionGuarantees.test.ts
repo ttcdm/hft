@@ -105,6 +105,7 @@ describe('Tier 5: Production Readiness — Real vs Paper Execution Guarantees (Z
       // Attempting to execute in LIVE mode without arming
       (coordinator as any).executionMode = 'LIVE';
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'TEST1',
         name: 'Test Token 1',
@@ -143,6 +144,7 @@ describe('Tier 5: Production Readiness — Real vs Paper Execution Guarantees (Z
       vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockResolvedValue(null);
 
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'TEST1',
         name: 'Test Token 1',
@@ -162,6 +164,7 @@ describe('Tier 5: Production Readiness — Real vs Paper Execution Guarantees (Z
 
       // In PAPER mode, an explicit currentPriceSol can be used for simulation
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'TEST1',
         name: 'Test Token 1',
@@ -211,6 +214,7 @@ describe('Tier 5: Production Readiness — Real vs Paper Execution Guarantees (Z
 
     it('RPG-6: rejects SYNTHETIC provenance signals in LIVE mode with PROVENANCE_VIOLATION', async () => {
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'TEST1',
         name: 'Test Token 1',
@@ -226,6 +230,7 @@ describe('Tier 5: Production Readiness — Real vs Paper Execution Guarantees (Z
 
     it('RPG-7: rejects BACKTEST provenance signals in LIVE mode with PROVENANCE_VIOLATION', async () => {
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'TEST1',
         name: 'Test Token 1',
@@ -248,6 +253,7 @@ describe('Tier 5: Production Readiness — Real vs Paper Execution Guarantees (Z
       for (const prov of approvedProvenances) {
         // Will pass provenance check (may fail later on mock rpc/reconciliation, but NOT on provenance)
         const result = await coordinator.executeTrade({
+          signalTimestamp: Date.now(),
           mint: VALID_PUMP_MINT_1.toBase58(),
           symbol: 'TEST1',
           name: 'Test Token 1',

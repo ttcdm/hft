@@ -360,6 +360,7 @@ export class SocialAlphaScanner {
       const snipeResult = await memecoinAggregator.executeSnipe({
         contractAddress: ca,
         amountUsd: amount,
+        signalTimestamp: Date.now(), // an operator command is its own signal
       });
 
       if (snipeResult.success) {

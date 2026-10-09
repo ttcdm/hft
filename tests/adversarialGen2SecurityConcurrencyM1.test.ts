@@ -138,6 +138,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       );
 
       const req: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'LEAK1',
         name: 'Leak Probe 1',
@@ -166,6 +167,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       );
 
       const req: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'LEAK2',
         name: 'Leak Probe 2',
@@ -195,6 +197,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       );
 
       const req: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'LEAK3',
         name: 'Leak Probe 3',
@@ -224,6 +227,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       );
 
       const req: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'LEAK4',
         name: 'Leak Probe 4',
@@ -260,6 +264,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       );
 
       const req: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'LEAK5',
         name: 'Leak Probe 5',
@@ -288,6 +293,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       for (let i = 0; i < burstSize; i++) {
         promises.push(
           coordinator.executeTrade({
+            signalTimestamp: Date.now(),
             mint: testMintStr,
             symbol: `BURST_${i}`,
             name: `Burst Token ${i}`,
@@ -559,6 +565,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       const actualMint = testMintStr;
 
       const tradeReq: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: actualMint,
         symbol: 'MISMATCH',
         name: 'Mismatch Token',
@@ -590,6 +597,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       const lowercasedMint = 'czLSujWBLFsSjncfkh59rQD4NJYsZUMffEFrNJfiBAGS';
 
       const tradeReq: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'CASE',
         name: 'Case Test Token',
@@ -622,6 +630,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       const signSpy = vi.spyOn(localSigner, 'signTransaction');
 
       const tradeReq: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'NOPROCEED',
         name: 'No Proceed Token',
@@ -755,6 +764,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       );
 
       const tradeReq: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'LIVE_FAIL',
         name: 'Live Fail Token',
@@ -803,6 +813,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       };
 
       const tradeReq: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'SPOOF_DEV',
         name: 'Spoofed Dev Token',

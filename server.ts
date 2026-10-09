@@ -274,7 +274,7 @@ wss.on('connection', (ws: WebSocket, req: any) => {
       if (parsed.action === 'SNIPE_MEMECOIN') {
         const input = validateTradeInput(OperatorSnipeSchema, parsed);
         if (input.status === 'invalid') return rejectWsInput(input.issues);
-        const result = await memecoinAggregator.executeSnipe({ ...input.data, provenance: OPERATOR_PROVENANCE });
+        const result = await memecoinAggregator.executeSnipe({ ...input.data, provenance: OPERATOR_PROVENANCE, signalTimestamp: Date.now() });
         ws.send(JSON.stringify({ type: 'MEMECOIN_SNIPE_RESULT', data: result }));
       }
       if (parsed.action === 'CLOSE_POSITION') {
@@ -1010,6 +1010,7 @@ app.post('/api/social/signals/snipe', requireOperatorAuth, validateTradeBody(Sig
     signalId: sig.id,
     // Provenance comes from the stored signal (set when it was ingested), never from the request.
     provenance: sig.provenance,
+    signalTimestamp: sig.timestamp,
   });
 
   res.json({
@@ -1299,7 +1300,7 @@ app.get('/api/memecoins/positions', (req, res) => {
 });
 
 app.post('/api/memecoins/trade', requireOperatorAuth, validateTradeBody(OperatorSnipeSchema), async (req, res) => {
-  const result = await memecoinAggregator.executeSnipe({ ...req.body, provenance: OPERATOR_PROVENANCE });
+  const result = await memecoinAggregator.executeSnipe({ ...req.body, provenance: OPERATOR_PROVENANCE, signalTimestamp: Date.now() });
 
   res.json({
     status: result.success ? 'OK' : 'REJECTED',
@@ -1498,7 +1499,8 @@ app.post('/api/wallet/toggle-trading', requireOperatorAuth, validateTradeBody(Ar
 });
 
 app.post('/api/wallet/snipe', requireOperatorAuth, validateBody(LiveSnipeOrderSchema), async (req, res) => {
-  const result = await walletTrader.executeLiveSnipe(req.body);
+  // The operator's request is the signal; a client-supplied signalTimestamp is ignored so the age check cannot be dodged.
+  const result = await walletTrader.executeLiveSnipe({ ...req.body, signalTimestamp: Date.now() });
   if (!result.success) {
     return res.status(400).json({ success: false, error: result.error });
   }

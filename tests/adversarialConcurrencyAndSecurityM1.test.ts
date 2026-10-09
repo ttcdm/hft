@@ -140,6 +140,7 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
       );
 
       const req: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'LEAKTEST',
         name: 'Leak Test Token',
@@ -174,6 +175,7 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
       );
 
       const req: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'LEAKTEST2',
         name: 'Leak Test Token 2',
@@ -206,6 +208,7 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
       );
 
       const req: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'LEAKTEST3',
         name: 'Leak Test Token 3',
@@ -241,6 +244,7 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
       );
 
       const req: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'LEAKTEST4',
         name: 'Leak Test Token 4',
@@ -284,6 +288,7 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
       );
 
       const req: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'LEAKTEST5',
         name: 'Leak Test Token 5',
@@ -315,6 +320,7 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
       for (let i = 0; i < burstCount; i++) {
         promises.push(
           coordinator.executeTrade({
+            signalTimestamp: Date.now(),
             mint: testMintStr,
             symbol: `BURST_${i}`,
             name: `Burst Token ${i}`,
@@ -594,6 +600,7 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
       (coordinator as any).executionMode = 'PAPER';
 
       const tradeReq: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: 'CzLSujWBLFsSjncfkh59rQD4NJYsZUMffEFrNJfiBAGS',
         symbol: 'LEGIT',
         name: 'Legit Token',
@@ -627,6 +634,7 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
       (coordinator as any).isLiveTradingArmed = true;
 
       const tradeReq: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: 'CzLSujWBLFsSjncfkh59rQD4NJYsZUMffEFrNJfiBAGS',
         symbol: 'LEGIT_LIVE',
         name: 'Legit Token Live',
@@ -659,6 +667,7 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
       const signSpy = vi.spyOn(localSigner, 'signTransaction');
 
       const tradeReq: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: 'CzLSujWBLFsSjncfkh59rQD4NJYsZUMffEFrNJfiBAGS',
         symbol: 'BYPASS_TEST',
         name: 'Bypass Test',
@@ -692,6 +701,7 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
       const lowercasedMint = 'czLSujWBLFsSjncfkh59rQD4NJYsZUMffEFrNJfiBAGS';
 
       const tradeReq: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'CASE_TEST',
         name: 'Case Test',
@@ -719,6 +729,7 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
 
     it('3.5: allows trade past eligibility verification when mint matches exactly', async () => {
       const tradeReq: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'MATCH_TEST',
         name: 'Match Test',

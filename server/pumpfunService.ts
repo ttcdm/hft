@@ -857,6 +857,7 @@ export class PumpFunService extends EventEmitter {
       jitoTipSol,
       slippagePct: maxSlippagePct,
       signalId: callout.id,
+      signalTimestamp: callout.calloutTimestamp,
     });
 
     if (tradeRes.success) {

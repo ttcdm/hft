@@ -222,6 +222,7 @@ describe('Tier 3: Cross-Feature Combinations (Pairwise Feature Interactions)', (
 
     // Attempting LIVE trade without configured signer rejects before transport
     const res = await coordinator.executeTrade({
+      signalTimestamp: Date.now(),
       mint: VALID_PUMP_MINT_1.toBase58(),
       symbol: 'RPCSIGNER',
       name: 'RPC Signer Fallback',
@@ -286,6 +287,7 @@ describe('Tier 3: Cross-Feature Combinations (Pairwise Feature Interactions)', (
     (coordinator as any).executionMode = 'LIVE';
 
     const syntheticTrade = await coordinator.executeTrade({
+      signalTimestamp: Date.now(),
       mint: VALID_PUMP_MINT_1.toBase58(),
       symbol: 'SYNTH',
       name: 'Synthetic Signal',
@@ -342,6 +344,7 @@ describe('Tier 3: Cross-Feature Combinations (Pairwise Feature Interactions)', (
     expect(coordinator.getExecutionMode()).toBe('PAPER');
 
     const result = await coordinator.executeTrade({
+      signalTimestamp: Date.now(),
       mint: VALID_PUMP_MINT_1.toBase58(),
       symbol: 'MAINNET_PROHIBIT',
       name: 'Real Money Gate',

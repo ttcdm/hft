@@ -242,6 +242,7 @@ describe('Tier 5: Production Readiness — Live Production Readiness Gates & Cap
 
       // Order size 0.06 SOL exceeds 10% ceiling
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'TEST1',
         name: 'Test Token 1',
@@ -266,6 +267,7 @@ describe('Tier 5: Production Readiness — Live Production Readiness Gates & Cap
       (coordinator as any).inFlightReservedSol = 0;
 
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'TEST1',
         name: 'Test Token 1',
@@ -295,6 +297,7 @@ describe('Tier 5: Production Readiness — Live Production Readiness Gates & Cap
 
       // Execute trade
       await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'TEST1',
         name: 'Test Token 1',

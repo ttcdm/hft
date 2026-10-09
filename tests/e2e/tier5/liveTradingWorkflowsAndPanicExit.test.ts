@@ -101,6 +101,7 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
       staleReport.evaluatedAt = Date.now() - 65_000; // 65 seconds ago (exceeds 60s max age)
 
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'STALE',
         name: 'Stale Report Token',
@@ -134,6 +135,7 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
       unverifiedReport.failedCount = 1;
 
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'UNVER',
         name: 'Unverified Dev Token',
@@ -164,6 +166,7 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
       });
 
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'T2022',
         name: 'Token 2022 Token',
@@ -185,6 +188,7 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
       vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockResolvedValue(graduatedState);
 
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'GRAD',
         name: 'Graduated Token',
@@ -201,6 +205,7 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
 
     it('LWP-5: Live Buy fails closed if eligibility report mint does not match trade mint', async () => {
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'MISMATCH',
         name: 'Mismatch Token',
@@ -266,6 +271,7 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
 
       const scheduled = vi.spyOn(coordinator as any, 'scheduleOrphanRecovery').mockImplementation(() => {});
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'ZEROTOK',
         name: 'Zero Tokens Token',

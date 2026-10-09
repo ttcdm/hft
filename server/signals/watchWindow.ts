@@ -247,9 +247,9 @@ export class WatchWindow extends EventEmitter {
   }
 
   /** What the window has decided about a mint: its verdict if released, WATCHING if still held, null if never watched. */
-  public getVerdict(mint: string): { state: WatchState; reason: string } | null {
+  public getVerdict(mint: string): { state: WatchState; reason: string; releasedAt?: number } | null {
     const done = this.released.get(mint);
-    if (done) return { state: done.state, reason: done.reason };
+    if (done) return { state: done.state, reason: done.reason, releasedAt: done.releasedAt ?? undefined };
     if (this.active.has(mint)) return { state: 'WATCHING', reason: 'still in the watch window' };
     return null;
   }

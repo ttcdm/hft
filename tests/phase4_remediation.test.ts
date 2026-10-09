@@ -306,6 +306,7 @@ describe('Phase 4 Master Remediation Suite (B12 & B13)', () => {
 
       // Attempt to trade 0.010 SOL (> 10% ceiling of 0.0055 SOL)
       const oversizedReq: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: dummyMint,
         symbol: 'OVERSIZED',
         name: 'Oversized Token',
@@ -393,6 +394,7 @@ describe('Phase 4 Master Remediation Suite (B12 & B13)', () => {
       } as any);
 
       const req: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: dummyMint,
         symbol: 'DEPLETED',
         name: 'Depleted Bankroll Token',
@@ -415,6 +417,7 @@ describe('Phase 4 Master Remediation Suite (B12 & B13)', () => {
       const dummyMint = Keypair.generate().publicKey.toBase58();
 
       const oversizedReq: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: dummyMint,
         symbol: 'PAPER_OVER',
         name: 'Paper Oversized Token',

@@ -1685,6 +1685,19 @@ export class ExecutionCoordinator {
       }
     }
 
+    // The risk engine's signal-age limit only means something if the timestamp is the SOURCE event's. LIVE never defaults it to "now"
+    // (or to the market-data fetch time, which is also "now"): a caller that cannot say when the signal happened is refused.
+    if (this.executionMode === 'LIVE' && !(Number.isFinite(req.signalTimestamp) && (req.signalTimestamp as number) > 0 && (req.signalTimestamp as number) <= now + 5_000)) {
+      workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'LIVE', { reason: 'MISSING_SIGNAL_TIMESTAMP', signalTimestamp: req.signalTimestamp ?? null });
+      return {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'LIVE',
+        error: 'MISSING_SIGNAL_TIMESTAMP: LIVE trades must carry the time of the signal that triggered them (not in the future); it is never defaulted to now.',
+        correlationId,
+      };
+    }
+
     const openPositions = workstationDb.loadPositions(this.executionMode, 'ACTIVE');
     const totalExposureSol = openPositions.reduce((acc, p) => acc + p.costBasisLamports / 1e9, 0);
 
@@ -1944,7 +1957,7 @@ export class ExecutionCoordinator {
       estimatedPriceImpactBps: quote.estimatedPriceImpactBps,
       estimatedFeeLamports: quote.expectedPriorityFeeLamports + 5000,
       jitoTipLamports: quote.expectedJitoTipLamports,
-      signalTimestamp: req.signalTimestamp || marketState.marketDataTimestamp,
+      signalTimestamp: req.signalTimestamp as number,
       marketDataTimestamp: marketState.marketDataTimestamp,
       currentOpenPositionsCount: openPositions.length,
       currentTotalExposureSol: totalExposureSol,

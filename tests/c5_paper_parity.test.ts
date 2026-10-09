@@ -64,7 +64,7 @@ describe('C5: PAPER runs the same gate as LIVE', () => {
 
   const req = (mint: string, eligibilityReport: any, amountSol = 0.005) => ({
     mint, symbol: 'P', name: 'P', amountSol, jitoTipSol: 0.0001, source: 'AUTO_SNIPER' as const,
-    provenance: 'REAL_ONCHAIN' as const, currentPriceSol: 0.0001, eligibilityReport,
+    provenance: 'REAL_ONCHAIN' as const, currentPriceSol: 0.0001, eligibilityReport, signalTimestamp: Date.now(),
   });
 
   it('a concentrated token is rejected by the eligibility gate in BOTH modes', async () => {
@@ -144,7 +144,7 @@ describe('C5: PAPER runs the same gate as LIVE', () => {
   it('the tip the risk engine approved is the tip the paper fill is charged', async () => {
     const mint = Keypair.generate().publicKey.toBase58();
     const spy = vi.spyOn(riskEngine, 'evaluateOrder');
-    const r = await executionCoordinator.executeTrade({ ...req(mint, known(mint)), jitoTipSol: 0.0004 });
+    const r = await executionCoordinator.executeTrade({ signalTimestamp: Date.now(), ...req(mint, known(mint)), jitoTipSol: 0.0004 });
     expect(r.success, r.error).toBe(true);
     const approvedTip = spy.mock.calls[0][0].jitoTipLamports;
     expect((r.gates as any).risk.tipLamports).toBe(approvedTip);

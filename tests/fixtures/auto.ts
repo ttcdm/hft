@@ -40,7 +40,8 @@ watchWindow.setScoreFn((m) => (hotMints.has(m) ? 80 : null));
  * is released HOT (30 de-clustered buyers, rising velocity, score 80), READY (window elapsed, no score) or DEAD (creator sold).
  */
 export function releaseAs(mint: string, verdict: 'HOT' | 'READY' | 'DEAD', creator: string = walletFx()): void {
-  const start = Date.now() - 200_000;
+  // The release happens "now": LIVE/PAPER risk checks the signal's age, and the release is the signal behind an auto buy.
+  const start = Date.now() - (verdict === 'HOT' ? 28_000 : verdict === 'READY' ? 120_000 : 6_000);
   watchWindow.watch(mint, creator, start);
   if (verdict === 'HOT') {
     hotMints.add(mint);

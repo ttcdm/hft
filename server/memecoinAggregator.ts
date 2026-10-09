@@ -381,6 +381,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     dryRun?: boolean;
     /** G1: fixed order size in SOL (auto-snipe Devnet mode). Overrides sizing; the 10% ceiling still applies downstream. */
     amountSolOverride?: number;
+    /** When the signal behind this trade happened (ms). Required for LIVE: the coordinator never defaults it to now. */
+    signalTimestamp?: number;
   }): Promise<{
     success: boolean;
     message: string;
@@ -707,6 +709,7 @@ export class MemecoinAggregatorService extends EventEmitter {
       source: 'AUTO_SNIPER',
       provenance,
       liquidityUsd: pool.liquidityUsd,
+      signalTimestamp: params.signalTimestamp,
     });
 
     if (!execRes.success) {

@@ -126,17 +126,19 @@ describe('Accounting & Reconciliation — Curve Math and PnL', () => {
     expect(inspectToken2022Extensions(cleanMint).isSafe).toBe(true);
 
     // Token-2022 with TransferFee (extension type 1)
-    const feeMint = Buffer.alloc(100);
-    feeMint.writeUInt16LE(1, 83); // extension type = 1
-    feeMint.writeUInt16LE(12, 85); // length = 12
+    const feeMint = Buffer.alloc(166 + 4 + 12);
+    feeMint[165] = 1; // account type = Mint
+    feeMint.writeUInt16LE(1, 166); // extension type = 1
+    feeMint.writeUInt16LE(12, 168); // length = 12
     const feeResult = inspectToken2022Extensions(feeMint);
     expect(feeResult.hasTransferFee).toBe(true);
     expect(feeResult.isSafe).toBe(false);
 
     // Token-2022 with TransferHook (extension type 14)
-    const hookMint = Buffer.alloc(100);
-    hookMint.writeUInt16LE(14, 83); // extension type = 14
-    hookMint.writeUInt16LE(12, 85);
+    const hookMint = Buffer.alloc(166 + 4 + 12);
+    hookMint[165] = 1;
+    hookMint.writeUInt16LE(14, 166); // extension type = 14
+    hookMint.writeUInt16LE(12, 168);
     const hookResult = inspectToken2022Extensions(hookMint);
     expect(hookResult.hasTransferHook).toBe(true);
     expect(hookResult.isSafe).toBe(false);

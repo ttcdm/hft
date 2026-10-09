@@ -67,6 +67,10 @@ export interface Token2022ExtensionReport {
   isSafe: boolean;
 }
 
+/**
+ * Token-2022 ExtensionType numbers, as in the installed @solana/spl-token (ExtensionType enum).
+ * Note 16/17 are the confidential transfer FEE extensions and MetadataPointer is 18; a test cross-checks these against the library.
+ */
 export const EXTENSION_TYPE_NAMES: Record<number, string> = {
   0: 'Uninitialized',
   1: 'TransferFeeConfig',
@@ -84,20 +88,27 @@ export const EXTENSION_TYPE_NAMES: Record<number, string> = {
   13: 'NonTransferableAccount',
   14: 'TransferHook',
   15: 'TransferHookAccount',
-  16: 'MetadataPointer',
-  17: 'TokenMetadata',
-  18: 'GroupPointer',
-  19: 'TokenGroup',
-  20: 'GroupMemberPointer',
-  21: 'TokenGroupMember',
-  22: 'ConfidentialTransferFeeConfig',
-  23: 'ConfidentialTransferFeeAmount',
-  24: 'ScaledUiAmountMint',
-  25: 'Pausable',
-  26: 'PausableAccount',
+  16: 'ConfidentialTransferFeeConfig',
+  17: 'ConfidentialTransferFeeAmount',
+  18: 'MetadataPointer',
+  19: 'TokenMetadata',
+  20: 'GroupPointer',
+  21: 'TokenGroup',
+  22: 'GroupMemberPointer',
+  23: 'TokenGroupMember',
+  24: 'ConfidentialMintBurn',
+  25: 'ScaledUiAmountMint',
+  26: 'Pausable',
+  27: 'PausableAccount',
+  28: 'PermissionedBurn',
 };
 
-export const ALLOWED_SAFE_EXTENSIONS = new Set<number>([16, 17, 18, 19, 20, 21]);
+export const ALLOWED_SAFE_EXTENSIONS = new Set<number>([18, 19, 20, 21, 22, 23]);
+
+/** A base SPL Mint is 82 bytes. Token-2022 pads mints with extensions to the 165-byte Account size, then 1 account-type byte (1 = Mint), then TLV. */
+export const MINT_BASE_LEN = 82;
+export const TOKEN_ACCOUNT_BASE_LEN = 165;
+export const ACCOUNT_TYPE_MINT = 1;
 
 export interface PumpMarketState {
   mint: PublicKey;
@@ -190,35 +201,38 @@ export function inspectToken2022Extensions(data: Buffer | Uint8Array): Token2022
   let hasCorruptTlv = false;
 
   const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  if (buf.length > 82) {
-    let offset = 82;
-    if (offset < buf.length) {
-      offset += 1;
-    }
-    while (offset + 4 <= buf.length) {
-      const extensionType = buf.readUInt16LE(offset);
-      const extensionLength = buf.readUInt16LE(offset + 2);
+  if (buf.length > MINT_BASE_LEN) {
+    if (buf.length <= TOKEN_ACCOUNT_BASE_LEN || buf[TOKEN_ACCOUNT_BASE_LEN] !== ACCOUNT_TYPE_MINT) {
+      // Longer than a base mint but without the padded account-type marker: not a layout we understand.
+      hasCorruptTlv = true;
+    } else {
+      let offset = TOKEN_ACCOUNT_BASE_LEN + 1;
+      while (offset + 4 <= buf.length) {
+        const extensionType = buf.readUInt16LE(offset);
+        const extensionLength = buf.readUInt16LE(offset + 2);
+        if (extensionType === 0) break; // Uninitialized: zero padding, end of TLV (same rule as spl-token)
 
-      if (offset + 4 + extensionLength > buf.length) {
-        hasCorruptTlv = true;
-        break;
+        if (offset + 4 + extensionLength > buf.length) {
+          hasCorruptTlv = true;
+          break;
+        }
+
+        detectedExtensionTypes.push(extensionType);
+        if (!ALLOWED_SAFE_EXTENSIONS.has(extensionType)) {
+          unsupportedExtensionTypes.push(extensionType);
+          unsupportedExtensionNames.push(EXTENSION_TYPE_NAMES[extensionType] || `UnknownExtension(${extensionType})`);
+        }
+
+        if (extensionType === 1 || extensionType === 2) hasTransferFee = true;
+        if (extensionType === 9 || extensionType === 13) isNonTransferable = true;
+        if (extensionType === 12) hasPermanentDelegate = true;
+        if (extensionType === 14 || extensionType === 15) hasTransferHook = true;
+        if (extensionType === 6) hasDefaultAccountState = true;
+        if (extensionType === 4 || extensionType === 5 || extensionType === 16 || extensionType === 17 || extensionType === 24) hasConfidentialTransfers = true;
+        if (extensionType === 26 || extensionType === 27) isPausable = true;
+
+        offset += 4 + extensionLength;
       }
-
-      detectedExtensionTypes.push(extensionType);
-      if (!ALLOWED_SAFE_EXTENSIONS.has(extensionType)) {
-        unsupportedExtensionTypes.push(extensionType);
-        unsupportedExtensionNames.push(EXTENSION_TYPE_NAMES[extensionType] || `UnknownExtension(${extensionType})`);
-      }
-
-      if (extensionType === 1 || extensionType === 2 || extensionType === 22 || extensionType === 23) hasTransferFee = true;
-      if (extensionType === 9 || extensionType === 13) isNonTransferable = true;
-      if (extensionType === 12) hasPermanentDelegate = true;
-      if (extensionType === 14 || extensionType === 15) hasTransferHook = true;
-      if (extensionType === 6) hasDefaultAccountState = true;
-      if (extensionType === 4 || extensionType === 5) hasConfidentialTransfers = true;
-      if (extensionType === 25 || extensionType === 26) isPausable = true;
-
-      offset += 4 + extensionLength;
     }
   }
 

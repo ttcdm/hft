@@ -194,8 +194,8 @@ describe('Milestone 1 Empirical Adversarial Challenge Suite', () => {
 
     // Helper to build a Token-2022 buffer with arbitrary TLV records
     function createToken2022Buffer(tlvs: Array<{ type: number; data: Buffer }>): Buffer {
-      const base = createBaseMintAccount();
-      // Token-2022 extension section starts at byte 82 with account type byte: 1 = Mint
+      // Real Token-2022 layout: 82-byte mint, zero padding to 165, account-type byte (1 = Mint) at 165, TLV from 166.
+      const base = Buffer.concat([createBaseMintAccount(), Buffer.alloc(165 - 82)]);
       const accountTypeByte = Buffer.from([1]);
       const tlvBuffers: Buffer[] = [];
 
@@ -218,14 +218,14 @@ describe('Milestone 1 Empirical Adversarial Challenge Suite', () => {
       expect(report.hasCorruptTlv).toBe(false);
     });
 
-    it('M2.2: accepts safe Token-2022 extensions (MetadataPointer 16 & TokenMetadata 17)', () => {
+    it('M2.2: accepts safe Token-2022 extensions (MetadataPointer 18 & TokenMetadata 19)', () => {
       const safeBuffer = createToken2022Buffer([
-        { type: 16, data: Buffer.alloc(36) }, // MetadataPointer
-        { type: 17, data: Buffer.alloc(64) }, // TokenMetadata
+        { type: 18, data: Buffer.alloc(36) }, // MetadataPointer
+        { type: 19, data: Buffer.alloc(64) }, // TokenMetadata
       ]);
       const report = inspectToken2022Extensions(safeBuffer);
       expect(report.isSafe).toBe(true);
-      expect(report.detectedExtensionTypes).toEqual([16, 17]);
+      expect(report.detectedExtensionTypes).toEqual([18, 19]);
       expect(report.unsupportedExtensionTypes.length).toBe(0);
       expect(report.hasCorruptTlv).toBe(false);
     });
@@ -308,10 +308,10 @@ describe('Milestone 1 Empirical Adversarial Challenge Suite', () => {
 
     it('M2.10: detects corrupt TLV when declared extension length overflows buffer', () => {
       // Build buffer where extension header claims 100 bytes, but buffer only has 10 bytes remaining
-      const base = createBaseMintAccount();
+      const base = Buffer.concat([createBaseMintAccount(), Buffer.alloc(165 - 82)]);
       const accountTypeByte = Buffer.from([1]);
       const header = Buffer.alloc(4);
-      header.writeUInt16LE(16, 0); // MetadataPointer
+      header.writeUInt16LE(18, 0); // MetadataPointer
       header.writeUInt16LE(100, 2); // Claims 100 bytes of data
       const partialData = Buffer.alloc(10); // Only 10 bytes provided
 
@@ -341,29 +341,29 @@ describe('Milestone 1 Empirical Adversarial Challenge Suite', () => {
 
     it('M2.13: multi-TLV sequence — safe extension followed by TransferHook must be rejected', () => {
       const buffer = createToken2022Buffer([
-        { type: 16, data: Buffer.alloc(36) }, // Safe: MetadataPointer
+        { type: 18, data: Buffer.alloc(36) }, // Safe: MetadataPointer
         { type: 14, data: Buffer.alloc(64) }, // Unsafe: TransferHook
       ]);
       const report = inspectToken2022Extensions(buffer);
       expect(report.isSafe).toBe(false);
-      expect(report.detectedExtensionTypes).toEqual([16, 14]);
+      expect(report.detectedExtensionTypes).toEqual([18, 14]);
       expect(report.unsupportedExtensionTypes).toEqual([14]);
       expect(report.hasTransferHook).toBe(true);
     });
 
     it('M2.14: multi-TLV sequence — first TLV valid, second TLV length overflows buffer triggers hasCorruptTlv', () => {
-      const base = createBaseMintAccount();
+      const base = Buffer.concat([createBaseMintAccount(), Buffer.alloc(165 - 82)]);
       const accountType = Buffer.from([1]);
 
       // TLV 1: Valid MetadataPointer (len 36)
       const header1 = Buffer.alloc(4);
-      header1.writeUInt16LE(16, 0);
+      header1.writeUInt16LE(18, 0);
       header1.writeUInt16LE(36, 2);
       const data1 = Buffer.alloc(36);
 
       // TLV 2: Corrupted header claiming 500 bytes when only 8 bytes remain
       const header2 = Buffer.alloc(4);
-      header2.writeUInt16LE(17, 0);
+      header2.writeUInt16LE(19, 0);
       header2.writeUInt16LE(500, 2);
       const data2 = Buffer.alloc(8);
 
@@ -372,19 +372,19 @@ describe('Milestone 1 Empirical Adversarial Challenge Suite', () => {
 
       expect(report.hasCorruptTlv).toBe(true);
       expect(report.isSafe).toBe(false);
-      expect(report.detectedExtensionTypes).toEqual([16]); // Only the first was fully unpacked
+      expect(report.detectedExtensionTypes).toEqual([18]); // Only the first was fully unpacked
     });
 
     it('M2.15: rejects scaled UI amount and confidential transfer extensions', () => {
       const buffer = createToken2022Buffer([
         { type: 4, data: Buffer.alloc(32) }, // ConfidentialTransferMint
-        { type: 24, data: Buffer.alloc(8) }, // ScaledUiAmountMint
+        { type: 25, data: Buffer.alloc(8) }, // ScaledUiAmountMint
       ]);
       const report = inspectToken2022Extensions(buffer);
       expect(report.isSafe).toBe(false);
       expect(report.hasConfidentialTransfers).toBe(true);
       expect(report.unsupportedExtensionTypes).toContain(4);
-      expect(report.unsupportedExtensionTypes).toContain(24);
+      expect(report.unsupportedExtensionTypes).toContain(25);
     });
   });
 

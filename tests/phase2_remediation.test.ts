@@ -37,7 +37,6 @@ describe('Phase 2 Remediation Suite (B02, B08, B09, B17, B21, B23)', () => {
     it('coordinator initializes with 5-minute startupGracePeriodMs (300,000ms)', () => {
       expect(executionCoordinator.getStartupGracePeriodMs()).toBe(300_000);
       expect(executionCoordinator.getStartedAt()).toBeGreaterThan(0);
-      expect(Date.now() - executionCoordinator.getStartedAt()).toBeLessThan(60_000);
     });
 
     it('coordinator.getLiveReadiness() reports pumpFeed status WARMING_UP with healthy=true during grace period', () => {

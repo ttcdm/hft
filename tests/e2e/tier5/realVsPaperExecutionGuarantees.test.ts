@@ -57,7 +57,7 @@ function mockPassingLiveReadiness(coord: ExecutionCoordinator, liveKeypair: Keyp
   });
 }
 
-describe('Tier 5: Production Readiness — Real vs Paper Execution Guarantees (Zero-Emulation Invariants)', () => {
+describe('Tier 5 [mock-level]: Real vs Paper Execution Guarantees (Zero-Emulation Invariants)', () => {
   let mockRpc: MockSolanaRpc;
   let mockJito: MockJitoEngine;
   let testDb: TestDatabase;

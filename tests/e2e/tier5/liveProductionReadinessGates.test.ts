@@ -12,7 +12,7 @@ import { TestDatabase } from '../helpers/testDb';
 import { PumpCurveService } from '../../../server/solana/pumpCurve';
 import { VALID_PUMP_MINT_1, DUMMY_FEE_RECIPIENT, createSimulatedBondingCurveState, createPassingEligibilityReport } from '../helpers/simulatedStates';
 
-describe('Tier 5: Production Readiness — Live Production Readiness Gates & Capital Safety Limits', () => {
+describe('Tier 5 [mock-level]: Live Production Readiness Gates & Capital Safety Limits', () => {
   let mockRpc: MockSolanaRpc;
   let mockJito: MockJitoEngine;
   let testDb: TestDatabase;

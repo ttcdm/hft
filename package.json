@@ -18,7 +18,6 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint . && tsc --noEmit",
     "test": "vitest run",
-    "test:filtered": "vitest run tests/accountingAndReconciliation.test.ts tests/authAndSecurity.test.ts tests/riskEngine.test.ts tests/solanaTransactionBuilder.test.ts tests/challenger_m1_protocol_correctness.test.ts tests/challenger_phase3_verification.test.ts tests/plugAndPlayZeroConfig.test.ts tests/e2e/",
     "signer:import": "tsx scripts/import_signer.ts",
     "smoke": "tsx scripts/smoke.ts",
     "localnet:e2e": "tsx scripts/localnet/e2e.ts",

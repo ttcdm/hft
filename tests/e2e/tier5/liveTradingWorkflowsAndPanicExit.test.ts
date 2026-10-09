@@ -44,7 +44,7 @@ function mockPassingLiveReadiness(coord: ExecutionCoordinator, liveKeypair: Keyp
   });
 }
 
-describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety & Panic Exit', () => {
+describe('Tier 5 [mock-level]: Live Trading Workflows, Token Safety & Panic Exit', () => {
   let mockRpc: MockSolanaRpc;
   let mockJito: MockJitoEngine;
   let testDb: TestDatabase;

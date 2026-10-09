@@ -15,6 +15,14 @@ import {
   isLiveApprovedProvenance,
 } from '../core/types';
 /** C4: a mark older than this is not trusted for exits; the position is re-read directly first. */
+/** Sell slippage by number of consecutive failed exit attempts on a position (critique #4). A stop-loss in a fast dump must eventually clear. */
+export const SELL_SLIPPAGE_LADDER_BPS = [800, 1500, 2500, 4000];
+/** Auto-exit retry backoff after a failed attempt: base * 2^(n-1), capped. Each failed LIVE send can pay fees. */
+export const EXIT_RETRY_BASE_MS = 3_000;
+export const EXIT_RETRY_MAX_MS = 30_000;
+/** Consecutive failed exits before an operator alert is raised. */
+export const EXIT_FAILURE_ALERT_AFTER = 4;
+
 export const MARK_STALE_MS = 15_000;
 /** C4: if a direct read still fails after this long, raise an operator alert. */
 export const MARK_ALERT_AFTER_MS = 60_000;
@@ -2137,6 +2145,44 @@ export class ExecutionCoordinator {
     return this.haltReason;
   }
 
+  private exitFailures = new Map<string, { count: number; nextAttemptAt: number; lastError: string }>();
+
+  /** Sell slippage for the next attempt on this position: starts at 800 bps and widens after each consecutive failure. */
+  public exitSlippageBps(positionId: string): number {
+    const n = this.exitFailures.get(positionId)?.count ?? 0;
+    return SELL_SLIPPAGE_LADDER_BPS[Math.min(n, SELL_SLIPPAGE_LADDER_BPS.length - 1)];
+  }
+
+  /** ms until the auto-exit loop may try this position again (0 when free). */
+  public exitRetryWaitMs(positionId: string, now: number = Date.now()): number {
+    const f = this.exitFailures.get(positionId);
+    return f ? Math.max(0, f.nextAttemptAt - now) : 0;
+  }
+
+  public getExitFailureCount(positionId: string): number {
+    return this.exitFailures.get(positionId)?.count ?? 0;
+  }
+
+  /** Errors that mean no send was attempted, so they neither cost fees nor count toward backoff. */
+  private static isNonAttemptExitError(error?: string): boolean {
+    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found)/.test(error);
+  }
+
+  private recordExitOutcome(positionId: string, res: { success: boolean; error?: string }, mode?: string): void {
+    if (res.success) {
+      this.exitFailures.delete(positionId);
+      this.clearOperatorAlert('EXIT_FAILING', positionId);
+      return;
+    }
+    if (mode !== 'LIVE' || ExecutionCoordinator.isNonAttemptExitError(res.error)) return;
+    const count = (this.exitFailures.get(positionId)?.count ?? 0) + 1;
+    const wait = Math.min(EXIT_RETRY_MAX_MS, EXIT_RETRY_BASE_MS * 2 ** (count - 1));
+    this.exitFailures.set(positionId, { count, nextAttemptAt: Date.now() + wait, lastError: res.error || 'unknown' });
+    if (count >= EXIT_FAILURE_ALERT_AFTER) {
+      this.raiseOperatorAlert('EXIT_FAILING', `Exit for position ${positionId.slice(0, 8)} failed ${count} times in a row (last: ${res.error}). Retrying every ${Math.round(wait / 1000)}s with wider slippage; consider closing manually.`, positionId);
+    }
+  }
+
   /** Close (part of) a position, and write the exit to the decision journal (G3). */
   public async closePosition(
     positionId: string,
@@ -2148,6 +2194,7 @@ export class ExecutionCoordinator {
     }
     const before = workstationDb.loadPositions().find((p) => p.id === positionId);
     const res = await this.closePositionImpl(positionId, sellPct, reason);
+    this.recordExitOutcome(positionId, res, before?.executionMode);
     if (res.success && before) {
       const fraction = Math.min(100, Math.max(1, sellPct)) / 100;
       workstationDb.logDecision({
@@ -2260,6 +2307,7 @@ export class ExecutionCoordinator {
         };
       }
 
+      const sellSlippageBps = this.exitSlippageBps(positionId);
       let v0Tx: any;
       let expectedJitoTipLamports = resolvedTip.tipLamports;
       const jitoTipAccount = executionConfig.getJitoTipAccountPublicKey();
@@ -2279,7 +2327,7 @@ export class ExecutionCoordinator {
           seller,
           mintPubkey,
           amountTokensToSell,
-          800,
+          sellSlippageBps,
           posMode
         );
 
@@ -2310,7 +2358,7 @@ export class ExecutionCoordinator {
         const sellQuote = PumpCurveService.calculateSellQuote({
           state: marketState,
           tokenAmountRaw: amountTokensToSell,
-          slippageBps: 800,
+          slippageBps: sellSlippageBps,
           jitoTipSol: resolvedTip.tipSol,
           priorityFeeLamports: Math.round(executionConfig.getConfig().priorityFeeMicrolamports * 0.25),
           executionMode: posMode,
@@ -2358,6 +2406,13 @@ export class ExecutionCoordinator {
       );
 
       await localSigner.signTransaction(v0Tx);
+
+      // A sell that would revert (slippage breached, bad account) costs fees every time it lands. Simulate first and only send one that passes.
+      // If the simulation call itself fails, send anyway: a stop-loss must not be blocked by a flaky RPC.
+      const sim = await this.simulateSell(v0Tx);
+      if (!sim.ok) {
+        return { success: false, pnlSol: 0, error: `SELL_SIMULATION_FAILED: ${sim.error} (slippage ${sellSlippageBps} bps)` };
+      }
 
       const exitOrderId = `ord-exit-${positionId.slice(0, 8)}-${Date.now()}`;
       const subRes = await this.submitAndConfirmWithRetry({
@@ -2421,6 +2476,19 @@ export class ExecutionCoordinator {
       return { success: false, pnlSol: 0, error: err.message };
     } finally {
       this.inFlightPositionExits.delete(positionId);
+    }
+  }
+
+  private async simulateSell(tx: any): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await this.connection.simulateTransaction(tx, { sigVerify: false, commitment: 'processed' });
+      if (res?.value?.err) {
+        return { ok: false, error: JSON.stringify(res.value.err) };
+      }
+      return { ok: true };
+    } catch (e: any) {
+      Logger.warn(`Sell simulation unavailable (${e.message}); sending without it`);
+      return { ok: true };
     }
   }
 
@@ -2518,6 +2586,8 @@ export class ExecutionCoordinator {
       workstationDb.savePosition(pos);
 
       if (decision.shouldExit) {
+        const waitMs = this.exitRetryWaitMs(pos.id, now);
+        if (waitMs > 0) continue; // backing off after a failed attempt; the next tick past the deadline retries
         Logger.info(
           `[B13 ExitEngine] ${decision.reason} triggered for ${pos.symbol || pos.mint} (Sell ${decision.sellPercentage}%, PnL: ${decision.profitPct.toFixed(2)}%)`
         );

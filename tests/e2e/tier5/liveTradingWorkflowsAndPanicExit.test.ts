@@ -318,6 +318,29 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
       expect(res.error).toBe('DUST_POSITION_EXIT_UNECONOMICAL');
     });
 
+    it('LWP-7b: hard-stop and trailing-stop exits bypass the dust check; take-profit and stale exits do not (C7b)', async () => {
+      const mkDust = (suffix: string) => {
+        const id = `dust_bypass_${suffix}_${Date.now()}`;
+        workstationDb.savePosition({
+          id, mint: VALID_PUMP_MINT_1.toBase58(), symbol: 'DUST', name: 'Dust Coin', tokenDecimals: 6,
+          tokenQuantityRaw: '100', entryPriceSol: 0.000001, currentPriceSol: 0.0000001, currentValueSol: 0.00000001,
+          costBasisLamports: 1_000_000, realizedPnLSol: 0, status: 'OPEN', venue: 'PUMP_BONDING_CURVE',
+          executionMode: 'LIVE', entryTxSignature: `sig_dust_${suffix}`, entryTimestamp: Date.now(),
+          recordUpdatedAt: Date.now(), updatedAt: Date.now(),
+        } as any);
+        return id;
+      };
+      for (const reason of ['STOP_LOSS', 'TRAILING_STOP']) {
+        // 50%: a partial exit gets no ATA rent credit, so only the bypass keeps it from the dust check
+        const res = await coordinator.closePosition(mkDust(reason), 50, reason);
+        expect(res.error, reason).not.toBe('DUST_POSITION_EXIT_UNECONOMICAL');
+      }
+      for (const reason of ['TAKE_PROFIT_1', 'STALE_POSITION']) {
+        const res = await coordinator.closePosition(mkDust(reason), 50, reason);
+        expect(res.error, reason).toBe('DUST_POSITION_EXIT_UNECONOMICAL');
+      }
+    });
+
     it('LWP-8: prevents concurrent duplicate exit submissions for the same position with EXIT_IN_PROGRESS', async () => {
       const posId = `mutex_pos_${Date.now()}`;
       workstationDb.savePosition({

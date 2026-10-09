@@ -301,3 +301,22 @@ export class HardenedRiskEngine {
 }
 
 export const riskEngine = new HardenedRiskEngine();
+
+/** Max share of an order that may go to round-trip execution cost before the entry is refused. */
+export const MAX_ROUND_TRIP_COST_FRACTION = 0.2;
+
+/**
+ * Round-trip cost in lamports: buy tip + one expected sell tip + 2 x (base 5,000 + priority fee) + pump fees on both sides.
+ * The sell-side pump fee is taken equal to the buy-side fee (same bps on a notional of about the order size).
+ */
+export function estimateRoundTripCostLamports(p: {
+  buyTipLamports: number;
+  sellTipLamports: number;
+  priorityFeeLamports: number;
+  buyProtocolFeeLamports: number;
+  buyCreatorFeeLamports: number;
+}): number {
+  const baseFees = 2 * (5_000 + p.priorityFeeLamports);
+  const pumpFees = 2 * (p.buyProtocolFeeLamports + p.buyCreatorFeeLamports);
+  return p.buyTipLamports + p.sellTipLamports + baseFees + pumpFees;
+}

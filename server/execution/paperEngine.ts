@@ -30,6 +30,14 @@ export interface PaperExecutionResult {
 }
 
 export class PaperExecutionEngine {
+  /** Uncapped modeled price impact in bps for an order against pool liquidity (same model the fill uses). */
+  public static estimateImpactBps(amountSol: number, liquidityUsd?: number, solPriceUsd?: number): number {
+    const poolLiq = Math.max(2000, liquidityUsd || 15000);
+    const solUsd = solPriceUsd || 150;
+    const participationRate = (amountSol * solUsd) / poolLiq;
+    return Math.max(10, Math.round(Math.sqrt(participationRate) * 1200));
+  }
+
   // Execute a simulated buy based strictly on observed market prices and market impact
   public executePaperBuy(req: PaperOrderRequest): PaperExecutionResult {
     const paperOrderId = `PAPER-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
@@ -50,13 +58,9 @@ export class PaperExecutionEngine {
     }
 
     // Realistic slippage model based on order size vs pool liquidity
-    const poolLiq = Math.max(2000, req.liquidityUsd || 15000);
-    const solUsd = req.solPriceUsd || 150;
-    const orderUsd = req.amountSol * solUsd;
-    const participationRate = orderUsd / poolLiq;
     const impactBps = Math.min(
       req.slippageBps,
-      Math.max(10, Math.round(Math.sqrt(participationRate) * 1200))
+      PaperExecutionEngine.estimateImpactBps(req.amountSol, req.liquidityUsd, req.solPriceUsd)
     );
 
     // Fill price derived honestly from market price + calculated impact

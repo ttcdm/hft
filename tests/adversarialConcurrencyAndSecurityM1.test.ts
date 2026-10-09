@@ -92,7 +92,7 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
         slippageBps: 800,
         protocolFeeLamports: 100_000,
         creatorFeeLamports: 0,
-        expectedJitoTipLamports: 1_000_000,
+        expectedJitoTipLamports: 100_000, // C7b: 10% per side would trip the 20% round-trip cost floor
         expectedPriorityFeeLamports: 25_000,
         estimatedPriceImpactBps: 50,
         marketDataSource: 'ON_CHAIN',

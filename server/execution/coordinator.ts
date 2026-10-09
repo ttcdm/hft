@@ -17,8 +17,8 @@ import { EligibilityFilter } from '../signals/eligibilityFilter';
 import { localSigner } from '../solana/signer';
 import { txBuilder, SolanaTransactionBuilder, PumpBuyParams, PumpSellParams } from '../solana/transactionBuilder';
 import { SolanaRpcTransport, JitoTransport } from '../solana/transports';
-import { riskEngine } from '../risk/riskEngine';
-import { paperEngine } from './paperEngine';
+import { riskEngine, estimateRoundTripCostLamports, MAX_ROUND_TRIP_COST_FRACTION } from '../risk/riskEngine';
+import { paperEngine, PaperExecutionEngine } from './paperEngine';
 import { workstationDb } from '../db/database';
 import { getRandomJitoTipAccount, TOKEN_2022_PROGRAM_ID } from '../solana/programs';
 import { executionConfig } from '../solana/executionConfig';
@@ -1282,6 +1282,7 @@ export class ExecutionCoordinator {
         orderSizeSol: req.amountSol,
         expectedPriceSol: quotePriceSol,
         slippageBps: req.slippageBps || 800,
+        estimatedPriceImpactBps: PaperExecutionEngine.estimateImpactBps(req.amountSol, req.liquidityUsd),
         estimatedFeeLamports: 15000,
         jitoTipLamports: paperTip.tipLamports,
         signalTimestamp: req.signalTimestamp || now,
@@ -1568,6 +1569,30 @@ export class ExecutionCoordinator {
         lifecycleState: 'RISK_REJECTED',
         executionMode: 'LIVE',
         error: `INSUFFICIENT_FUNDS_CONCURRENCY: Wallet balance (${rawWalletBalance.toFixed(4)} SOL) minus in-flight reservations (${this.inFlightReservedSol.toFixed(4)} SOL) cannot cover required ${requiredSol.toFixed(4)} SOL plus 0.015 SOL reserve.`,
+        correlationId,
+      };
+    }
+
+    // C7b: an entry whose round-trip execution cost (both tips, both base+priority fees, pump fees both sides)
+    // exceeds 20% of the order cannot realistically be profitable. The size is never rounded up to make it pass.
+    const roundTripCostLamports = estimateRoundTripCostLamports({
+      buyTipLamports: quote.expectedJitoTipLamports,
+      sellTipLamports: resolvedTip.tipLamports,
+      priorityFeeLamports: quote.expectedPriorityFeeLamports,
+      buyProtocolFeeLamports: quote.protocolFeeLamports,
+      buyCreatorFeeLamports: quote.creatorFeeLamports,
+    });
+    if (roundTripCostLamports > MAX_ROUND_TRIP_COST_FRACTION * req.amountSol * 1e9) {
+      workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'LIVE', {
+        reason: 'EXPECTED_EDGE_BELOW_EXECUTION_COST',
+        roundTripCostLamports,
+        orderLamports: Math.round(req.amountSol * 1e9),
+      });
+      return {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'LIVE',
+        error: `EXPECTED_EDGE_BELOW_EXECUTION_COST: Round-trip cost ${roundTripCostLamports} lamports exceeds ${MAX_ROUND_TRIP_COST_FRACTION * 100}% of the ${req.amountSol} SOL order.`,
         correlationId,
       };
     }
@@ -1895,7 +1920,11 @@ export class ExecutionCoordinator {
         const fees = estimatedFeeLamports / 1e9;
         const netProceeds = residualValue + (closeAta ? 0.00203928 : 0) - fees;
 
-        if (netProceeds <= 0) {
+        // Hard-stop and trailing-stop exits are never blocked by the dust check: a full exit closes the ATA and returns
+        // about 0.002 SOL of rent, and holding a falling position to avoid a tip is worse. The check only gates
+        // take-profit partials, the stale-position exit and manual closes.
+        const isProtectiveExit = reason === 'STOP_LOSS' || reason === 'TRAILING_STOP';
+        if (netProceeds <= 0 && !isProtectiveExit) {
           return {
             success: false,
             pnlSol: 0,

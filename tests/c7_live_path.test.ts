@@ -1,7 +1,8 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import { HardenedRiskEngine, RiskEvaluationRequest } from '../server/risk/riskEngine';
+import { HardenedRiskEngine, RiskEvaluationRequest, estimateRoundTripCostLamports, MAX_ROUND_TRIP_COST_FRACTION } from '../server/risk/riskEngine';
+import { PaperExecutionEngine } from '../server/execution/paperEngine';
 import { EligibilityFilter } from '../server/signals/eligibilityFilter';
 import { CapitalSizer } from '../server/capital/capitalSizer';
 
@@ -91,6 +92,38 @@ describe('C7: live-path correctness', () => {
       const agg = fs.readFileSync(path.resolve(process.cwd(), 'server/memecoinAggregator.ts'), 'utf8');
       expect(agg).toContain('historicalStats.tradeCount < CapitalSizer.SHRINKAGE_PRIOR_WEIGHT');
       expect(agg).toContain("rejectionReason === 'NEGATIVE_OR_ZERO_EXPECTANCY'");
+    });
+  });
+
+  describe('C7b: round-trip cost floor and paper price impact', () => {
+    const base = { buyTipLamports: 150_000, sellTipLamports: 150_000, priorityFeeLamports: 25_000, buyProtocolFeeLamports: 95_000, buyCreatorFeeLamports: 0 };
+
+    it('sums buy tip + sell tip + 2 x (5,000 + priority) + pump fees on both sides', () => {
+      expect(estimateRoundTripCostLamports(base)).toBe(150_000 + 150_000 + 2 * (5_000 + 25_000) + 2 * 95_000);
+    });
+
+    it('a 0.01 SOL order is above the 20% floor at these costs and a 0.1 SOL order is below it', () => {
+      const cost = estimateRoundTripCostLamports(base);
+      expect(cost > MAX_ROUND_TRIP_COST_FRACTION * 0.01 * 1e9).toBe(false);
+      expect(cost > MAX_ROUND_TRIP_COST_FRACTION * 0.001 * 1e9).toBe(true);
+      expect(MAX_ROUND_TRIP_COST_FRACTION).toBe(0.2);
+    });
+
+    it('the coordinator rejects with EXPECTED_EDGE_BELOW_EXECUTION_COST and never rounds the size up (static)', () => {
+      const src = fs.readFileSync(path.resolve(process.cwd(), 'server/execution/coordinator.ts'), 'utf8');
+      expect(src).toContain("EXPECTED_EDGE_BELOW_EXECUTION_COST");
+      expect(src).toMatch(/roundTripCostLamports > MAX_ROUND_TRIP_COST_FRACTION \* req\.amountSol/);
+    });
+
+    it('paper price impact: the modeled impact grows with order size and the paper risk check receives it', () => {
+      const small = PaperExecutionEngine.estimateImpactBps(0.01, 15_000, 150);
+      const huge = PaperExecutionEngine.estimateImpactBps(50, 15_000, 150);
+      expect(huge).toBeGreaterThan(small);
+      expect(huge).toBeGreaterThan(600); // over the default maxPriceImpactBps
+      const src = fs.readFileSync(path.resolve(process.cwd(), 'server/execution/coordinator.ts'), 'utf8');
+      expect(src).toContain('estimatedPriceImpactBps: PaperExecutionEngine.estimateImpactBps(');
+      const res = new HardenedRiskEngine().evaluateOrder({ ...baseReq(), executionMode: 'PAPER', estimatedPriceImpactBps: huge });
+      expect(res.reasonCode).toBe('PRICE_IMPACT_TOO_HIGH');
     });
   });
 });

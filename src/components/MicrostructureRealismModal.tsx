@@ -111,7 +111,7 @@ export const MicrostructureRealismModal: React.FC<MicrostructureRealismModalProp
             <div className="flex items-center justify-between border-b border-[#1E293B] pb-2">
               <span className="font-bold text-white flex items-center space-x-2">
                 <Server className="w-4 h-4 text-cyan-400" />
-                <span>Co-Location &amp; Network Infrastructure Topology</span>
+                <span>Co-Location &amp; Network Infrastructure Topology (assumed latencies, not measured)</span>
               </span>
               <span className="text-slate-400">Current RTT: <strong className="text-cyan-300">{config.networkLatencyMs.toFixed(2)} ms</strong></span>
             </div>

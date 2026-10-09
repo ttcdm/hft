@@ -106,7 +106,7 @@ export const DeployBotModal: React.FC<DeployBotModalProps> = ({
       assetClass: formData.assetClass,
       symbol: formData.symbol,
       isRunning: true,
-      winRate: 65 + Math.random() * 8,
+      winRate: 0, // no trades yet; nothing to measure
       pnl: 0,
       tradesCount: 0,
       opsPerSec: formData.opsPerSec,

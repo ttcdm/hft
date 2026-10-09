@@ -539,17 +539,20 @@ export class PumpFunService extends EventEmitter {
               .map((u) => `@${u.userId}`)
           : [];
 
-      // Calculate bonding curve progress
-      // Pump.fun bonding curves reach completion (~100%) when ~85 SOL is collected
+      // Bonding curve progress comes from the curve's own reserves: tokens sold out of the 793.1M
+      // that sit on the curve. Market cap is NOT a proxy (it moves with SOL price and supply).
+      // With no reserve fields the progress is unknown and reported as 0 (lowest curve score).
+      const CURVE_TOKENS = 793_100_000_000_000; // initial real token reserves, 6 decimals
+      const INITIAL_VIRTUAL_TOKENS = 1_073_000_000_000_000;
       let curveProgress: number;
       if (c.complete) {
         curveProgress = 100;
-      } else if (c.market_cap_quote) {
-        curveProgress = Math.min(99.5, Number(((c.market_cap_quote / 85) * 100).toFixed(1)));
-      } else if (c.market_cap) {
-        curveProgress = Math.min(99.5, Number(((c.market_cap / 85) * 100).toFixed(1)));
+      } else if (Number(c.real_token_reserves) > 0 || c.real_token_reserves === 0) {
+        curveProgress = Math.min(99.5, Math.max(0, Number(((1 - Number(c.real_token_reserves) / CURVE_TOKENS) * 100).toFixed(1))));
+      } else if (Number(c.virtual_token_reserves) > 0) {
+        const realTokens = Number(c.virtual_token_reserves) - (INITIAL_VIRTUAL_TOKENS - CURVE_TOKENS);
+        curveProgress = Math.min(99.5, Math.max(0, Number(((1 - realTokens / CURVE_TOKENS) * 100).toFixed(1))));
       } else {
-        // B3: no market-cap field means the progress is unknown, not 30-95%. 0 earns the lowest curve score.
         curveProgress = 0;
       }
 
@@ -599,7 +602,7 @@ export class PumpFunService extends EventEmitter {
       if (confluenceCount >= 2) {
         calloutNote = `🚨 MULTI-CALLER CONFLUENCE (Pump.fun Velocity + DexScreener Boosted): Called by @${caller.userId}${otherCallers.length > 0 ? ' & ' + otherCallers.join(', ') : ''}. Curve: ${curveProgress}% | 5m Vol: ${pair?.volume?.m5 != null ? '$' + Number(pair.volume.m5).toLocaleString() : 'n/a'}. Elevated to INSTANT_SNIPE.`;
       } else if (curveProgress >= 80) {
-        calloutNote = `⚡ GRADUATION IMMINENT: Bonding curve is ${curveProgress}% filled. Raydium/PumpSwap AMM migration trigger at 85 SOL.`;
+        calloutNote = `⚡ GRADUATION IMMINENT: Bonding curve is ${curveProgress}% filled. PumpSwap AMM migration happens when the curve's tokens are sold out.`;
       } else if (isBoosted) {
         calloutNote = `🔥 DEXSCREENER BOOSTED: ${pair?.txns?.m5?.buys !== undefined ? `${pair.txns.m5.buys} buys in the last 5m` : 'order flow not available'}.`;
       } else {

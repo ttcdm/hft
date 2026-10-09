@@ -380,48 +380,6 @@ export class PumpFeedListener extends EventEmitter {
           // ignore invalid base64 or buffer reads
         }
       }
-
-      // 2. Structured text log fallback (for simulations, custom RPC log filters, or test fixtures)
-      if (log.includes('CreateEvent:') || (log.includes('Instruction: Create') && log.includes('mint='))) {
-        const mintMatch = log.match(/mint=([1-9A-HJ-NP-Za-km-z]{32,44})/);
-        const creatorMatch = log.match(/(?:creator|user)=([1-9A-HJ-NP-Za-km-z]{32,44})/);
-        const curveMatch = log.match(/(?:bonding_curve|curve)=([1-9A-HJ-NP-Za-km-z]{32,44})/);
-        const symbolMatch = log.match(/symbol=([A-Za-z0-9_$]+)/);
-        const nameMatch = log.match(/name=([^,;]+)/);
-
-        if (mintMatch) {
-          const mint = mintMatch[1];
-          const creator = creatorMatch ? creatorMatch[1] : '11111111111111111111111111111111';
-          const bondingCurve = curveMatch
-            ? curveMatch[1]
-            : PumpFeedListener.deriveBondingCurvePda(mint).toBase58();
-          const symbol = symbolMatch ? symbolMatch[1] : mint.slice(0, 5).toUpperCase();
-          const name = nameMatch ? nameMatch[1].trim() : `Token ${symbol}`;
-          const parseLatencyMs = Number((performance.now() - t0).toFixed(3));
-
-          return {
-            signature,
-            slot,
-            mint,
-            creator,
-            bondingCurve,
-            name,
-            symbol,
-            uri: '',
-            virtualTokenReserves: 1_073_000_000_000_000n,
-            virtualSolReserves: 30_000_000_000n,
-            realTokenReserves: 793_100_000_000_000n,
-            realSolReserves: 0n,
-            tokenTotalSupply: 1_000_000_000_000_000n,
-            initialPriceSol: 30 / 1_073_000_000,
-            initialMarketCapSol: 27.958993,
-            receivedAt: Date.now(),
-            parsedAt: Date.now(),
-            parseLatencyMs,
-            source: 'RPC_LOGS',
-          };
-        }
-      }
     }
 
     return null;

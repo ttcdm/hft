@@ -557,7 +557,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
               <div className="grid grid-cols-1 gap-3">
                 {signals.map((sig, sIdx) => {
                   const isTelegram = sig.source === 'TELEGRAM';
-                  const isHighConf = sig.confidenceScore >= 90;
+                  const isHighConf = sig.confidenceScore !== null && sig.confidenceScore >= 90;
 
                   return (
                     <div
@@ -604,7 +604,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                 : 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
                             }`}
                           >
-                            Confidence: {sig.confidenceScore}%
+                            Confidence: {sig.confidenceScore === null ? 'not scored' : `${sig.confidenceScore}%`}
                           </span>
                         </div>
                       </div>
@@ -942,18 +942,18 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                   authorHandle: pool.platform,
                                   authorDisplayName: pool.name,
                                   authorTier: 'MARKET_MAKER_BOT',
-                                  verified: true,
+                                  verified: false,
                                   timestamp: Date.now(),
                                   timeStr: 'Now',
-                                  rawText: `Direct Snipe on ${pool.platform}`,
+                                  rawText: `Manual snipe of ${pool.symbol} from the ${pool.platform} pool list (operator-initiated, no signal scoring)`,
                                   tokenTicker: `$${pool.symbol}`,
                                   tokenName: pool.name,
                                   contractAddress: pool.contractAddress,
                                   chain: pool.chain,
                                   signalPattern: 'STEALTH_ACCUMULATION',
-                                  confidenceScore: 92,
-                                  sentimentScore: 0.85,
-                                  actionSuggested: 'SNIPE_IMMEDIATE',
+                                  confidenceScore: null,
+                                  sentimentScore: null,
+                                  actionSuggested: 'REVIEW',
                                   status: 'NEW',
                                   metrics: {},
                                 });

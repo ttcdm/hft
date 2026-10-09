@@ -287,7 +287,7 @@ export class SocialAlphaScanner {
       const text = top3
         .map(
           (s) =>
-            `🎯 ${s.tokenTicker} (${s.source}) - Confidence: ${s.confidenceScore}%\nCA: ${s.contractAddress}\n${s.rawText.slice(0, 90)}...`
+            `🎯 ${s.tokenTicker} (${s.source}) - Confidence: ${s.confidenceScore === null ? 'n/a' : s.confidenceScore + '%'}\nCA: ${s.contractAddress}\n${s.rawText.slice(0, 90)}...`
         )
         .join('\n\n');
       return { reply: `📊 Top Social & MM Signals:\n\n${text}` };
@@ -611,6 +611,9 @@ export class SocialAlphaScanner {
     const hasTwitter = !!tokenData.twitter;
     const hasTelegram = !!tokenData.telegram;
 
+    // K5 (#15): this is a token discovered on the pump.fun feed, not a post by a known account. Nothing is invented about
+    // the author, the audience, the confidence or the intent: tier, confidence, sentiment and engagement metrics are
+    // unknown, the signal is unverified, and the suggested action is to review it, never SNIPE_IMMEDIATE.
     const source: SocialSource = hasTwitter ? 'X_TWITTER' : 'TELEGRAM';
     const authorHandle = tokenData.callerHandle
       ? tokenData.callerHandle
@@ -618,22 +621,21 @@ export class SocialAlphaScanner {
       ? `@${tokenData.twitter!.split('/').filter(Boolean).pop()}`
       : hasTelegram
       ? tokenData.telegram!.split('/').filter(Boolean).pop()!
-      : '@pump_velocity_bot';
+      : '@pump_feed';
 
-    const authorDisplayName = hasTwitter
-      ? `${tokenData.name} (X Official)`
-      : hasTelegram
-      ? `${tokenData.name} Telegram Community`
-      : 'Pump.fun High Velocity Bot';
+    const authorDisplayName = tokenData.name;
 
-    const rawText = tokenData.isBoosted
-      ? `🚨 DEXSCREENER BOOSTED & PUMP.FUN CONFLUENCE: $${tokenData.symbol} curve at ${tokenData.curveProgress}%. Verified socials: ${hasTwitter ? 'X.com' : ''} ${hasTelegram ? 'Telegram' : ''}. Volume: $${(tokenData.volume5mUsd || 5000).toLocaleString()}.`
-      : `🔥 NEW REAL ON-CHAIN LAUNCH: $${tokenData.symbol} on Pump.fun bonding curve. Curve progress: ${tokenData.curveProgress}%. Market cap: $${(tokenData.marketCapUsd || 7500).toLocaleString()}. Active community links verified.`;
+    const facts = [
+      `$${tokenData.symbol} is on the pump.fun bonding curve`,
+      `curve progress ${tokenData.curveProgress}%`,
+      tokenData.marketCapUsd !== undefined ? `market cap $${Math.round(tokenData.marketCapUsd).toLocaleString()}` : null,
+      tokenData.volume5mUsd !== undefined ? `5m volume $${Math.round(tokenData.volume5mUsd).toLocaleString()}` : null,
+      tokenData.isBoosted ? 'DexScreener boost active' : null,
+      hasTwitter || hasTelegram ? `links listed by the token (not checked): ${[hasTwitter ? 'X' : '', hasTelegram ? 'Telegram' : ''].filter(Boolean).join(', ')}` : 'no social links listed',
+    ].filter(Boolean);
+    const rawText = `${facts.join('. ')}.`;
 
-    const externalUrl =
-      tokenData.twitter ||
-      tokenData.telegram ||
-      `https://pump.fun/coin/${tokenData.mint}`;
+    const externalUrl = tokenData.twitter || tokenData.telegram || `https://pump.fun/coin/${tokenData.mint}`;
 
     const newSignal: SocialSignal = {
       id: `sig-live-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
@@ -641,8 +643,8 @@ export class SocialAlphaScanner {
       source,
       authorHandle,
       authorDisplayName,
-      authorTier: tokenData.isBoosted ? 'TOP_KOL' : 'CABAL_TRACKER',
-      verified: true,
+      authorTier: 'UNVERIFIED',
+      verified: false,
       timestamp: Date.now(),
       timeStr: 'Just now',
       rawText,
@@ -650,23 +652,18 @@ export class SocialAlphaScanner {
       tokenName: tokenData.name,
       contractAddress: tokenData.mint,
       chain: 'SOLANA',
-      signalPattern: tokenData.curveProgress >= 80 ? 'MIGRATION_SNIPE' : 'CABAL_LAUNCH',
-      confidenceScore: tokenData.isBoosted ? 95 : 88,
-      sentimentScore: 0.85,
-      liquidityUsd: Math.floor((tokenData.marketCapUsd || 8000) * 0.22),
-      marketCapUsd: tokenData.marketCapUsd || 8000,
-      metrics: {
-        views: tokenData.isBoosted ? 38500 : 12400,
-        reposts: tokenData.isBoosted ? 412 : 86,
-        subscribers: 15200,
-      },
-      actionSuggested: 'SNIPE_IMMEDIATE',
+      signalPattern: tokenData.curveProgress >= 80 ? 'MIGRATION_SNIPE' : 'UNCLASSIFIED',
+      confidenceScore: null,
+      sentimentScore: null,
+      ...(tokenData.marketCapUsd !== undefined ? { marketCapUsd: tokenData.marketCapUsd } : {}),
+      metrics: {},
+      actionSuggested: 'REVIEW',
       status: 'NEW',
       externalUrl,
       socials: {
-        twitter: tokenData.twitter || `https://x.com/search?q=%24${tokenData.symbol}+solana`,
-        telegram: tokenData.telegram,
-        website: tokenData.website,
+        ...(tokenData.twitter ? { twitter: tokenData.twitter } : {}),
+        ...(tokenData.telegram ? { telegram: tokenData.telegram } : {}),
+        ...(tokenData.website ? { website: tokenData.website } : {}),
         pumpFun: `https://pump.fun/coin/${tokenData.mint}`,
         dexScreener: `https://dexscreener.com/solana/${tokenData.mint}`,
       },

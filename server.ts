@@ -995,10 +995,15 @@ app.get('/api/social/signals', (req, res) => {
 
 app.post('/api/social/signals/snipe', requireOperatorAuth, validateTradeBody(SignalSnipeSchema), async (req, res) => {
   const { signalId } = req.body;
-  const sig = socialScanner.markSniped(signalId);
-  if (!sig) {
+  const existing = socialScanner.getSignals().find((s) => s.id === signalId);
+  if (!existing) {
     return res.status(404).json({ error: 'Signal not found' });
   }
+  // An unverified signal (live-ingested, no real scoring) must never reach a live trade.
+  if (executionCoordinator.isLiveArmed() && existing.verified !== true) {
+    return res.status(409).json({ error: 'UNVERIFIED_SIGNAL: refusing to snipe an unverified signal while LIVE is armed' });
+  }
+  const sig = socialScanner.markSniped(signalId)!;
 
   // Trigger sniper trade on the aggregator
   const tradeResult = await memecoinAggregator.executeSnipe({
@@ -1253,27 +1258,28 @@ app.get('/api/connectivity/diagnostics', async (req, res) => {
       },
       {
         subsystem: 'Order Execution & Paper Trading',
-        nature: 'SIMULATED',
-        details:
-          'All buy/sell snipes are paper-traded in-memory. Zero real Solana funds or private keys are exposed to the network.',
+        nature: executionCoordinator.isLiveArmed() ? 'LIVE_ARMED' : 'PAPER_BY_DEFAULT',
+        details: executionCoordinator.isLiveArmed()
+          ? 'LIVE is ARMED: snipes are signed with the configured wallet and submitted to the configured cluster RPC. Real funds on that cluster are at risk.'
+          : 'LIVE is not armed: snipes are paper-traded in memory against the curve quote. No transaction is signed or sent.',
       },
       {
         subsystem: 'Jito MEV Bundles & Priority Tips',
-        nature: 'SIMULATED_MODEL',
+        nature: executionCoordinator.isLiveArmed() ? 'LIVE_CLUSTER_DEPENDENT' : 'PAPER_ONLY',
         details:
-          'Priority tips (sized by the executionConfig dynamic tip policy) and front-running protection are modeled with realistic slippage, fee deductions, and slot inclusion latencies rather than sending raw serialized transactions to Jito block engines.',
+          'Priority tips follow the executionConfig tip policy. Bundles go to Jito only on mainnet-beta (never enabled by default); on devnet or localnet the transaction goes to the cluster RPC with a priority fee and no bundle. In paper mode nothing is sent.',
       },
       {
         subsystem: 'Caller Persona Historical Track Records',
-        nature: 'STATISTICAL_ATTRIBUTION',
+        nature: 'NOT_VERIFIED',
         details:
-          'Caller win rates (1.2x, 1.5x, 2x) and wallet reputations are high-fidelity quantitative track records attributed algorithmically to live on-chain tokens.',
+          'Caller personas and their win rates are static configuration, not measured track records. Do not treat them as evidence about a caller.',
       },
       {
         subsystem: 'Microstructure & Latency Stress',
         nature: 'MATHEMATICAL_MODEL',
         details:
-          'Colocation delays (AWS Tokyo TY2 1.15ms vs AWS Oregon 94.8ms), FIFO queue priority, and market impact slippage follow the Avellaneda-Stoikov and Square-Root Law formulas.',
+          'Standalone formula calculators (Avellaneda-Stoikov, square-root impact). Their latency inputs are assumptions, not measurements, and they do not drive live order routing.',
       },
     ],
   });

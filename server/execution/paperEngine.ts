@@ -68,15 +68,17 @@ export class PaperExecutionEngine {
 
     // Fill price derived honestly from market price + calculated impact
     const fillPriceSol = req.currentPriceSol * (1 + impactBps / 10000);
-    const tokensReceived = req.amountSol / fillPriceSol;
+    // Pump.fun charges the 1% protocol fee on the SOL spent; only the remainder buys tokens.
+    const protocolFeeSol = req.amountSol * 0.01;
+    const tokensReceived = (req.amountSol - protocolFeeSol) / fillPriceSol;
     const tokenDecimals = req.tokenDecimals || 6;
     const tokenQtyRaw = BigInt(Math.floor(tokensReceived * Math.pow(10, tokenDecimals))).toString();
 
     // Fees: base network fee ~5000 lamports + Jito tip
     const networkFeeLamports = 5000;
     const jitoTipLamports = Math.round(req.jitoTipSol * 1e9);
-    // Realistic end-to-end simulated latency: network RTT + bundle building + block inclusion
-    const simulatedLatencyMs = Math.round(420 + Math.random() * 180);
+    // Latency is not modeled: a paper fill is instantaneous. Reported as 0 rather than an invented range.
+    const simulatedLatencyMs = 0;
 
     const position: NormalizedPosition = {
       id: paperOrderId,
@@ -85,11 +87,12 @@ export class PaperExecutionEngine {
       name: req.name,
       tokenDecimals,
       tokenQuantityRaw: tokenQtyRaw,
-      costBasisLamports: Math.round(req.amountSol * 1e9),
+      // Cost basis is everything paid to enter: the SOL spent (fee included) plus network fee and tip.
+      costBasisLamports: Math.round(req.amountSol * 1e9) + networkFeeLamports + jitoTipLamports,
       entryPriceSol: fillPriceSol,
       currentPriceSol: fillPriceSol,
-      currentValueSol: req.amountSol,
-      unrealizedPnLSol: 0,
+      currentValueSol: tokensReceived * fillPriceSol,
+      unrealizedPnLSol: tokensReceived * fillPriceSol - (req.amountSol * 1e9 + networkFeeLamports + jitoTipLamports) / 1e9,
       unrealizedPnLPct: 0,
       realizedPnLSol: 0,
       entryTxSignature: paperOrderId,
@@ -190,7 +193,7 @@ export class PaperExecutionEngine {
 
     const tokensSoldHuman = Number(tokensSoldRaw) / Math.pow(10, pos.tokenDecimals);
 
-    // Model sell slippage (-0.3% to -0.8%)
+    // Modeled flat 0.5% sell-side price concession (not derived from pool depth)
     const exitPriceSol = currentMarketPriceSol * 0.995;
     const grossProceedsSol = tokensSoldHuman * exitPriceSol;
 

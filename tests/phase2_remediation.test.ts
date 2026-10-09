@@ -150,7 +150,7 @@ describe('Phase 2 Remediation Suite (B02, B08, B09, B17, B21, B23)', () => {
       expect(parsed!.initialPriceSol).toBeCloseTo(0.000000028, 8);
     });
 
-    it('parseLogs parses structured text fallback log format', () => {
+    it('parseLogs ignores free-text logs: only the Anchor binary CreateEvent produces a token (no invented reserves)', () => {
       const mockLogs = {
         err: null,
         logs: [
@@ -161,12 +161,7 @@ describe('Phase 2 Remediation Suite (B02, B08, B09, B17, B21, B23)', () => {
         signature: 'mockSignature123',
       };
 
-      const parsed = pumpFeedListener.parseLogs(mockLogs, { slot: 100 });
-      expect(parsed !== null).toBe(true);
-      expect(parsed!.mint).toBe('9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump');
-      expect(parsed!.creator).toBe('7xK9nMQk3mPzV1W8L5tG7yD2jX4vB6nS8cF9eR3tY1uQ');
-      expect(parsed!.symbol).toBe('FARTCOIN');
-      expect(parsed!.name).toBe('Fartcoin AI');
+      expect(pumpFeedListener.parseLogs(mockLogs, { slot: 100 })).toBeNull();
     });
 
     it('pumpFeedListener.start() subscribes to onLogs with processed commitment', async () => {

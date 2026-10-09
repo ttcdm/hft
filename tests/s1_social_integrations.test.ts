@@ -302,5 +302,13 @@ describe('S1: Telegram / social integrations', () => {
         expect(src, route).toMatch(new RegExp(`app\\.post\\('${route}', requireOperatorAuth`));
       }
     });
+
+    it('the snipe route refuses unverified signals while LIVE is armed (route-level; static check, no HTTP harness)', async () => {
+      const fs = await import('fs');
+      const src = fs.readFileSync('server.ts', 'utf8');
+      const block = src.slice(src.indexOf("'/api/social/signals/snipe'"), src.indexOf("'/api/telegram/config'"));
+      expect(block).toMatch(/isLiveArmed\(\)\s*&&\s*existing\.verified !== true/);
+      expect(block.indexOf('UNVERIFIED_SIGNAL')).toBeLessThan(block.indexOf('markSniped'));
+    });
   });
 });

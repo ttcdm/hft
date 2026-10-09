@@ -2,6 +2,8 @@
 
 A hardened, full-stack quantitative high-frequency trading (HFT) workstation and autonomous Solana execution engine with Jito MEV bundle protection, strict risk controls, and on-chain post-trade reconciliation.
 
+> **Status: not live-ready. Devnet unverified.** Everything below runs in PAPER mode and is covered by tests, but no real transaction has been sent from this build: the devnet end-to-end harness (`npm run devnet:e2e`) has not been run against a live cluster. Do not fund a wallet for this system. See `FINAL-SUMMARY.md` and `FEATURE-MATRIX.md` for what is tested, partial or untestable.
+
 ---
 
 ## 🔒 Critical Safety & Architecture Principles
@@ -122,11 +124,28 @@ Final Reconciliation & Ledger Audit
 
 ---
 
+## 🏠 Home page and auto-snipe
+
+- The home page is the Pump.fun token board: **New launches / Watching / Holding**, a SOL wallet strip, a bonding-curve depth ladder and trade tape for the selected token, and the auto-snipe panel. Unknown values show "—".
+- Auto trading is owned by one controller (`server/auto/controller.ts`), **OFF on every start**. Modes: `OFF`, `SHADOW` (all gates, journals "would buy", nothing sent), `PAPER`, `DEVNET_LIVE` (devnet only, fixed 0.005 SOL, one open position, needs `ALLOWED_CLUSTER=devnet`, the coordinator armed LIVE and the confirmation code). There is no mainnet auto mode. It needs `AUTO_SNIPE_ENABLED=true`.
+- Candidates must come out of the watch window (20-120s of real trade events) before any gate runs. Every decision, accept or reject, is a row in the `decisions` table with its reason.
+- Kill switch: session budgets (5 buys, 0.02 SOL incl. fees, 15% loss, 4h), negative expectancy over the last 20 verified closed trades, 8 losses in a row, 2 slippage breaches, readiness red over 10s, and low wallet drop to SHADOW; an unexplained wallet balance change halts all trading including exits.
+- Thresholds (holder concentration 20% top-10 / 5% creator, kill-switch limits, watch-window numbers) are conservative overnight defaults, **not validated on real launches**.
+
 ## 🛠️ Verification & Health
+
+Commands (all run from the repo root; Node 22.5+ because of `node:sqlite`):
+
+| Command | What it does |
+| --- | --- |
+| `npm ci` | install from the lockfile |
+| `npm test` | the full suite (`vitest run`): **1049 tests in 68 files**, all passing at the time of writing |
+| `npm run lint` | ESLint (0 errors, 172 warnings) plus `tsc --noEmit` |
+| `npm run build` | frontend + `dist/server.cjs` |
+| `npm run smoke` | boots `dist/server.cjs` on a random port and checks `/`, `/api/health`, login, session and the `/ws/engine` handshake |
+| `npm run devnet:e2e` | the devnet end-to-end harness. **Not run in CI or in the build sandbox (no devnet access).** Devnet only; refuses mainnet |
 
 - **Health Check Endpoint**: `GET /api/health`
 - **System Diagnostics**: `GET /api/execution/diagnostics`
 - **Engine Status**: `GET /api/engine/status`
-- **TypeScript Check**: `npm run lint`
-- **Build Verification**: `npm run build`
-
+- **Auto-snipe**: `GET /api/auto/status`

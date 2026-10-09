@@ -1090,22 +1090,22 @@ export class ExecutionCoordinator {
         }
       } catch {}
 
-      // 5. Check wallet native SOL balance delta
-      try {
-        const currentSol = await this.connection.getBalance(owner, 'confirmed');
-        const prevSol = preSnapshot.walletSolLamports;
-        if (prevSol > 0) {
-          if (side === 'BUY' && prevSol - currentSol > 100_000) {
-            return { landed: true };
-          }
-          if (side === 'SELL' && currentSol - prevSol > 100_000) {
-            return { landed: true };
-          }
-        }
-      } catch {}
+      // The wallet's native SOL balance is deliberately NOT used: a drop of 100k lamports can come from a concurrent buy of another
+      // mint or any fee, and calling that "landed" would stop retries and the RPC fallback for a transaction that never landed (critique #5).
+      // Resubmitting the same signed transaction cannot double-fill (same signature), so "not landed" is the safe answer when unsure.
     }
 
     return { landed: false };
+  }
+
+  /** true only when the cluster says this transaction's blockhash can no longer land. Unknown (RPC error) counts as not expired. */
+  private async isBlockhashExpired(tx: VersionedTransaction): Promise<boolean> {
+    try {
+      const res = await this.connection.isBlockhashValid(tx.message.recentBlockhash, { commitment: 'processed' });
+      return res?.value === false;
+    } catch {
+      return false;
+    }
   }
 
   // Idempotent, bounded Jito retry loop with pre-checks and zero-double-fill RPC fallback (R0.6)
@@ -1188,6 +1188,7 @@ export class ExecutionCoordinator {
     let lastError: string | undefined = jitoUnhealthyReason;
     let landedSlot: number | undefined;
     let jitoLanded = false;
+    let blockhashExpired = false;
 
     // Bounded Idempotent Jito Retry Loop
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -1202,6 +1203,13 @@ export class ExecutionCoordinator {
             landedSlot = check.slot;
             break;
           }
+        }
+        // The same signed transaction is resent on each retry (same signature, so it cannot fill twice). Once its blockhash has
+        // expired and it has not landed, every further resend is wasted time, so stop and let the caller build a new transaction.
+        if (await this.isBlockhashExpired(tx)) {
+          blockhashExpired = true;
+          lastError = 'BLOCKHASH_EXPIRED: the transaction did not land and its blockhash is no longer valid; safe to retry with a new transaction';
+          break;
         }
         if (retryIntervalMs > 0) {
           await new Promise((r) => setTimeout(r, retryIntervalMs));
@@ -1296,6 +1304,18 @@ export class ExecutionCoordinator {
             lifecycleState: 'CONFIRMED',
           };
         }
+      }
+
+      // Sending an expired transaction through the RPC fallback cannot land. Checked after the landed check above, so "expired and not landed" is definitive.
+      if (blockhashExpired || ((lastSignature || lastBundleId) && (await this.isBlockhashExpired(tx)))) {
+        return {
+          success: false,
+          signature: lastSignature,
+          bundleId: lastBundleId,
+          transport: 'SOLANA_RPC',
+          error: 'BLOCKHASH_EXPIRED: the transaction did not land and its blockhash is no longer valid; safe to retry with a new transaction',
+          lifecycleState: 'SUBMIT_FAILED',
+        };
       }
 
       workstationDb.logJournal('FALLBACK_RPC_ATTEMPT', correlationId, 'LIVE', {

@@ -10,7 +10,8 @@ import { solPriceService } from '../server/market/solPriceService';
 import { riskEngine } from '../server/risk/riskEngine';
 import { PumpFeedListener } from '../server/solana/pumpFeedListener';
 import { AutoModeSchema } from '../server/execution/tradeInputs';
-import { setAutoMode, resetAuto } from './fixtures/auto';
+import { setAutoMode, resetAuto, releaseAs, newPumpPool } from './fixtures/auto';
+import { watchWindow } from '../server/signals/watchWindow';
 
 // A real pool for a fresh mint, created the way the feed creates one.
 function newPool() {
@@ -21,6 +22,7 @@ function newPool() {
   const pool = memecoinAggregator.ingestOnChainCreateEvent(ev);
   pool.liquidityUsd = 15_000; // a created pool starts at $0, which the liquidity gate (correctly) rejects
   l.destroy();
+  releaseAs(mint, 'HOT'); // G2b: auto candidates come out of the watch window
   return mint;
 }
 const cand = (mint: string) => ({ mint, symbol: 'G1', source: 'TEST' as const, amountUsd: 0.7, provenance: 'REAL_ONCHAIN' as const });
@@ -208,5 +210,44 @@ describe('G1: auto-snipe controller', () => {
     for (const route of ["'/api/auto/mode'", "'/api/auto/kill'", "'/api/auto/status'"]) {
       expect(server).toContain(`${route}, requireOperatorAuth`);
     }
+  });
+});
+
+describe('G2b: the controller accepts only watch-window releases', () => {
+  beforeEach(() => { memecoinAggregator.setConfluenceGating(false); solPriceService.setPrice(150, 'TEST_FIXTURE'); });
+  afterEach(async () => { await resetAuto(); vi.restoreAllMocks(); vi.unstubAllEnvs(); });
+
+  it('a candidate the window never saw, or still holds, or declared DEAD, is dropped before any execution call', async () => {
+    await setAutoMode('PAPER');
+    const snipe = vi.spyOn(memecoinAggregator, 'executeSnipe');
+    const never = newPumpPool('NONE');
+    const d1 = await autoSnipeController.submitCandidate(cand(never.mint));
+    expect([d1.outcome, d1.stage, d1.reason]).toEqual(['DROPPED', 'watch', 'NOT_IN_WATCH_WINDOW']);
+
+    const pending = newPumpPool('NONE');
+    watchWindow.watch(pending.mint, Keypair.generate().publicKey.toBase58());
+    const d2 = await autoSnipeController.submitCandidate(cand(pending.mint));
+    expect(d2.reason).toMatch(/^WATCH_PENDING/);
+
+    const dead = newPumpPool('DEAD');
+    const d3 = await autoSnipeController.submitCandidate(cand(dead.mint));
+    expect([d3.outcome, d3.stage]).toEqual(['DROPPED', 'watch']);
+    expect(d3.reason).toMatch(/^WATCH_DEAD: CREATOR_SOLD/);
+    expect(snipe).not.toHaveBeenCalled();
+    // every drop is journaled with its reason
+    for (const m of [never.mint, pending.mint, dead.mint]) {
+      const rows = workstationDb.loadDecisions({ mint: m });
+      expect(rows.map((r) => r.stage)).toEqual(['queue', 'watch']);
+    }
+  });
+
+  it('HOT goes straight on to the execution stages; READY must also clear the confluence score (70)', async () => {
+    await setAutoMode('PAPER');
+    const snipe = vi.spyOn(memecoinAggregator, 'executeSnipe').mockResolvedValue({ success: false, message: 'stub', txHash: '' });
+    await autoSnipeController.submitCandidate(cand(newPumpPool('HOT').mint));
+    expect(snipe.mock.calls[0][0].enforceConfluence).toBeFalsy();
+    await autoSnipeController.submitCandidate(cand(newPumpPool('READY').mint));
+    expect(snipe.mock.calls[1][0].enforceConfluence).toBe(true);
+    expect(snipe.mock.calls[1][0].minConfluenceScore).toBe(70);
   });
 });

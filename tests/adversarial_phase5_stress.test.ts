@@ -1,4 +1,4 @@
-import { setAutoMode } from './fixtures/auto';
+import { setAutoMode, releaseHotCallouts } from './fixtures/auto';
 import { seedSurge } from './fixtures/velocity';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair, PublicKey } from '@solana/web3.js';
@@ -698,6 +698,7 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
 
       // Scenario 1: High composite score (> 80) BUT confluenceCount = 1 -> REJECTED
       (pumpfunService as any).hotCallouts = [{ ...calloutBase, confluenceCount: 1 }];
+      releaseHotCallouts(pumpfunService);
       await (pumpfunService as any).evaluateAutoSnipeTriggers();
       expect(snipeSpy.mock.calls.length).toBe(0);
 
@@ -717,6 +718,7 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
           devHoldingPct: 15.0,
         },
       }];
+      releaseHotCallouts(pumpfunService);
       await (pumpfunService as any).evaluateAutoSnipeTriggers();
       expect(snipeSpy.mock.calls.length).toBe(0);
 
@@ -725,6 +727,7 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
       // Scenario 3: confluenceCount = 2 AND high composite score (>= 70) -> TRIGGERED!
       seedSurge(calloutBase.token.mint); // C2: velocity must be measured, curve progress earns nothing
       (pumpfunService as any).hotCallouts = [{ ...calloutBase, confluenceCount: 2 }];
+      releaseHotCallouts(pumpfunService);
       await (pumpfunService as any).evaluateAutoSnipeTriggers();
       expect(snipeSpy.mock.calls.length).toBe(1);
       expect(snipeSpy).toHaveBeenCalledWith(expect.objectContaining({

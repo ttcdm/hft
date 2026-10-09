@@ -9,6 +9,7 @@ import { Logger } from '../middleware/enterprise';
 import type { SignalProvenance } from '../core/types';
 import { evaluateKillTriggers, auditWalletChange, type KillTrigger } from './killSwitch';
 import { riskEngine } from '../risk/riskEngine';
+import { watchWindow, HOT_MIN_SCORE } from '../signals/watchWindow';
 
 /**
  * G1: the only owner of auto trading.
@@ -58,7 +59,7 @@ export interface AutoDecision {
   symbol?: string;
   source: AutoCandidate['source'];
   outcome: AutoOutcome;
-  /** Pipeline stage that decided (G3): queue | auto | budget | eligibility | score | size | risk | execute | fill | exit */
+  /** Pipeline stage that decided (G3): queue | auto | watch | budget | eligibility | score | size | risk | execute | fill | exit */
   stage: string;
   reason: string;
   amountSol?: number;
@@ -380,6 +381,13 @@ export class AutoSnipeController extends EventEmitter {
     const open = workstationDb.loadPositions(undefined, 'ACTIVE');
     if (open.some((p) => p.mint.toLowerCase() === key)) return this.record(c, 'DROPPED', 'auto', 'POSITION_ALREADY_OPEN');
 
+    // G2b: only watch-window releases get this far. HOT goes straight to the execution stages; READY must also clear
+    // the confluence score (>= 70) here; DEAD, still-watching and never-watched candidates are dropped.
+    const verdict = watchWindow.getVerdict(c.mint);
+    if (!verdict) return this.record(c, 'DROPPED', 'watch', 'NOT_IN_WATCH_WINDOW');
+    if (verdict.state === 'WATCHING') return this.record(c, 'DROPPED', 'watch', 'WATCH_PENDING: still in the watch window');
+    if (verdict.state === 'DEAD') return this.record(c, 'DROPPED', 'watch', `WATCH_DEAD: ${verdict.reason}`);
+
     const mode = this.mode;
     if (mode === 'DEVNET_LIVE' && open.length >= DEVNET_MAX_OPEN_POSITIONS) {
       return this.record(c, 'DROPPED', 'budget', `DEVNET_MAX_OPEN_POSITIONS (${DEVNET_MAX_OPEN_POSITIONS}) reached`);
@@ -401,7 +409,8 @@ export class AutoSnipeController extends EventEmitter {
         slippagePct: c.slippagePct ?? 6.0,
         signalId: c.signalId,
         provenance: c.provenance,
-        enforceConfluence: c.enforceConfluence,
+        enforceConfluence: verdict.state === 'READY' ? true : c.enforceConfluence,
+        minConfluenceScore: verdict.state === 'READY' ? HOT_MIN_SCORE : undefined,
       };
       if (shadow) params.dryRun = true;
       if (this.mode === 'DEVNET_LIVE') {

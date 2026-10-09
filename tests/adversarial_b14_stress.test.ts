@@ -1,4 +1,4 @@
-import { setAutoMode } from './fixtures/auto';
+import { setAutoMode, releaseHotCallouts } from './fixtures/auto';
 import { seedSurge, clearVelocity } from './fixtures/velocity';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair, PublicKey } from '@solana/web3.js';
@@ -722,6 +722,7 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
       (pumpfunService as any).hotCallouts = [mockCallout];
       const snipeSpy = vi.spyOn(memecoinAggregator, 'executeSnipe');
 
+      releaseHotCallouts(pumpfunService);
       await (pumpfunService as any).evaluateAutoSnipeTriggers();
 
       // Even with 5 callers, composite score is poor (< 70) so snipe is BLOCKED
@@ -796,6 +797,7 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
         txHash: 'tx-snipe-confluence-ok',
       });
 
+      releaseHotCallouts(pumpfunService);
       await (pumpfunService as any).evaluateAutoSnipeTriggers();
 
       // Triggered snipe through confluence path

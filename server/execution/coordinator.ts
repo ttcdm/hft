@@ -86,6 +86,7 @@ export class ExecutionCoordinator {
   private lastSyntheticMarketEventTimestamp: number = 0;
   private autoTpSlInterval: NodeJS.Timeout | null = null;
   private feedHeartbeatInterval: NodeJS.Timeout | null = null;
+  private jitoProbeInterval: NodeJS.Timeout | null = null;
   private lastStartupReconciliation: {
     status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE';
     checkedAt: number;
@@ -157,6 +158,15 @@ export class ExecutionCoordinator {
     this.feedHeartbeatInterval = setInterval(checkFeed, 10000);
   }
 
+  /** Re-probe the block engine on an interval so readiness reflects current health, not boot-time health. */
+  private startJitoProbeLoop() {
+    if (this.jitoProbeInterval || !this.jitoTransport.isEnabled()) return;
+    const intervalMs = Math.max(1000, executionConfig.getConfig().jitoProbeIntervalMs);
+    this.jitoProbeInterval = setInterval(() => {
+      if (this.jitoTransport.isEnabled()) void this.jitoTransport.probe();
+    }, intervalMs);
+  }
+
   private async initializeConnection() {
     try {
       const t0 = performance.now();
@@ -165,6 +175,7 @@ export class ExecutionCoordinator {
       this.rpcHealth = this.rpcLatencyMs > 800 ? 'DEGRADED' : 'HEALTHY';
       Logger.info(`Solana RPC connected: Slot ${slot}, Latency ${this.rpcLatencyMs}ms`);
       await this.jitoTransport.probe();
+      this.startJitoProbeLoop();
       await this.syncRealWalletBalance();
       await this.startupReconciliation();
     } catch (err: any) {
@@ -248,9 +259,10 @@ export class ExecutionCoordinator {
     }
 
     const jitoTelemetry = this.jitoTransport.getTelemetry();
-    const jitoHealthy = jitoTelemetry.health === 'HEALTHY';
-    if (!jitoHealthy) {
-      reasons.push(`Jito Block Engine is ${jitoTelemetry.health} (Must be HEALTHY for live execution)`);
+    const jitoReadiness = this.getJitoReadiness();
+    const jitoHealthy = jitoReadiness.ready;
+    if (!jitoHealthy && jitoReadiness.reason) {
+      reasons.push(jitoReadiness.reason);
     }
 
     const realFeedAgeMs = this.lastRealMarketEventTimestamp > 0
@@ -342,6 +354,34 @@ export class ExecutionCoordinator {
   public setJitoBlockEngineUrl(url: string) {
     this.jitoTransport.setBlockEngineUrl(url);
     Logger.info(`Updated Jito Block Engine URL to ${url}`);
+  }
+
+  /**
+   * Jito readiness for live execution. With no block engine configured (devnet), RPC is the only transport
+   * and there is nothing to be healthy, so it is not a blocker. With a block engine configured it must be
+   * HEALTHY from a recent real probe, otherwise live execution fails closed.
+   */
+  public getJitoReadiness(): { ready: boolean; enabled: boolean; status: string; reason?: string } {
+    const telemetry = this.jitoTransport.getTelemetry();
+    if (!this.jitoTransport.isEnabled()) {
+      return { ready: true, enabled: false, status: 'NOT_CONFIGURED' };
+    }
+    const maxProbeAgeMs = Math.max(45_000, executionConfig.getConfig().jitoProbeIntervalMs * 3);
+    const probeAgeMs = this.jitoTransport.getProbeAgeMs();
+    if (telemetry.health !== 'HEALTHY') {
+      return { ready: false, enabled: true, status: telemetry.health, reason: `Jito Block Engine is ${telemetry.health} (Must be HEALTHY for live execution)` };
+    }
+    if (probeAgeMs === null || probeAgeMs > maxProbeAgeMs) {
+      return { ready: false, enabled: true, status: 'STALE', reason: 'Jito Block Engine health probe is stale (Must be HEALTHY for live execution)' };
+    }
+    return { ready: true, enabled: true, status: 'HEALTHY' };
+  }
+
+  /** Dynamic tip, forced to zero when Jito is not in use so no lamports are sent to a tip account. */
+  private resolveLiveTip(params: Parameters<typeof executionConfig.resolveDynamicJitoTip>[0]) {
+    const tip = executionConfig.resolveDynamicJitoTip(params);
+    if (this.jitoTransport.isEnabled()) return tip;
+    return { ...tip, tipLamports: 0, tipSol: 0, policyReason: `${tip.policyReason} -> Jito disabled, tip forced to 0 (RPC transport)` };
   }
 
   public getJitoTransport(): JitoTransport {
@@ -915,8 +955,22 @@ export class ExecutionCoordinator {
       };
     }
     const jitoEnabled = this.jitoTransport.isEnabled();
+    // Fail closed on Jito health: with a block engine configured, re-probe once if readiness is not current and
+    // only use Jito if it answers HEALTHY. An unhealthy engine is not retried; the order goes to RPC only when
+    // the operator enabled the RPC fallback, otherwise it is refused.
+    let jitoUsable = jitoEnabled;
+    let jitoUnhealthyReason: string | undefined;
+    if (jitoEnabled && !this.getJitoReadiness().ready) {
+      await this.jitoTransport.probe();
+      const readiness = this.getJitoReadiness();
+      jitoUsable = readiness.ready;
+      if (!jitoUsable) {
+        jitoUnhealthyReason = `Failed to submit: ${readiness.reason ?? 'Jito Block Engine is not healthy'} (fail closed)`;
+        Logger.warn(`[A4] ${side} for order ${orderId}: ${jitoUnhealthyReason}`);
+      }
+    }
     // With no Jito block engine configured (always the case on devnet) there is nothing to retry: go straight to RPC.
-    const maxRetries = this.jitoTransport.isEnabled() ? Math.max(0, cfg.jitoMaxRetries) : -1;
+    const maxRetries = jitoUsable ? Math.max(0, cfg.jitoMaxRetries) : -1;
     const retryIntervalMs = Math.max(0, cfg.jitoRetryIntervalMs);
     const confirmTimeoutMs = Math.max(1000, cfg.bundleConfirmTimeoutMs);
 
@@ -938,7 +992,7 @@ export class ExecutionCoordinator {
 
     let lastSignature = '';
     let lastBundleId: string | undefined;
-    let lastError: string | undefined;
+    let lastError: string | undefined = jitoUnhealthyReason;
     let landedSlot: number | undefined;
     let jitoLanded = false;
 
@@ -1469,8 +1523,8 @@ export class ExecutionCoordinator {
     }
 
     // 4. Resolve dynamic Jito tip from live floor telemetry and execution policy
-    const tipFloor = await this.jitoTransport.getTipFloorLamports().catch(() => 150_000);
-    const resolvedTip = executionConfig.resolveDynamicJitoTip({
+    const tipFloor = await this.jitoTransport.getTipFloorLamports();
+    const resolvedTip = this.resolveLiveTip({
       tipFloorLamports: tipFloor,
       tradeAmountSol: req.amountSol,
       explicitTipSol: req.jitoTipSol,
@@ -1795,8 +1849,8 @@ export class ExecutionCoordinator {
       const percentageToSell = safeSellPct;
       const closeAta = (percentageToSell === 100);
 
-      const tipFloor = await this.jitoTransport.getTipFloorLamports().catch(() => 150_000);
-      const resolvedTip = executionConfig.resolveDynamicJitoTip({
+      const tipFloor = await this.jitoTransport.getTipFloorLamports();
+      const resolvedTip = this.resolveLiveTip({
         tipFloorLamports: tipFloor,
         tradeAmountSol: (target.currentValueSol || 0.05) * fraction,
       });
@@ -2138,6 +2192,10 @@ export class ExecutionCoordinator {
     if (this.autoTpSlInterval) {
       clearInterval(this.autoTpSlInterval);
       this.autoTpSlInterval = null;
+    }
+    if (this.jitoProbeInterval) {
+      clearInterval(this.jitoProbeInterval);
+      this.jitoProbeInterval = null;
     }
     if (this.feedHeartbeatInterval) {
       clearInterval(this.feedHeartbeatInterval);

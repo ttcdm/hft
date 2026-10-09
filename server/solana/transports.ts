@@ -189,6 +189,7 @@ export class JitoTransport implements ExecutionTransport {
   private lastLatencyMs: number | null = null;
   private lastHealthStatus: 'HEALTHY' | 'DEGRADED' | 'OFFLINE' | 'NOT_CONFIGURED' = 'NOT_CONFIGURED';
   private lastErrorMessage: string | null = null;
+  private lastProbeTimestamp: number | null = null;
   private cachedTipFloor: { lamports: number; timestamp: number } | null = null;
 
   constructor(
@@ -261,6 +262,11 @@ export class JitoTransport implements ExecutionTransport {
     };
   }
 
+  /**
+   * Real health probe: asks the block engine for its tip accounts (a cheap authenticated-free JSON-RPC call)
+   * and requires a non-empty array back. HEALTHY only on that answer; an HTTP error or unexpected body is
+   * DEGRADED; a network error or timeout is OFFLINE. The tip-floor lookup no longer decides health.
+   */
   public async probe(): Promise<{ healthy: boolean; tipFloorLamports: number | null; latencyMs: number }> {
     const t0 = performance.now();
     if (!this.isEnabled()) {
@@ -269,19 +275,43 @@ export class JitoTransport implements ExecutionTransport {
       return { healthy: false, tipFloorLamports: null, latencyMs: 0 };
     }
     try {
-      const tipFloor = await this.getTipFloorLamports();
+      const res = await fetch(`${this.blockEngineUrl}/api/v1/bundles`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getTipAccounts', params: [] }),
+        signal: AbortSignal.timeout(3000),
+      });
       const latencyMs = Math.round(performance.now() - t0);
-      this.lastHealthStatus = 'HEALTHY';
+      this.lastProbeTimestamp = Date.now();
       this.lastLatencyMs = latencyMs;
+      if (!res.ok) {
+        this.lastHealthStatus = 'DEGRADED';
+        this.lastErrorMessage = `Probe HTTP ${res.status}`;
+        return { healthy: false, tipFloorLamports: null, latencyMs };
+      }
+      const body: any = await res.json().catch(() => null);
+      if (!Array.isArray(body?.result) || body.result.length === 0) {
+        this.lastHealthStatus = 'DEGRADED';
+        this.lastErrorMessage = 'Probe returned no tip accounts';
+        return { healthy: false, tipFloorLamports: null, latencyMs };
+      }
+      this.lastHealthStatus = 'HEALTHY';
       this.lastErrorMessage = null;
+      const tipFloor = await this.getTipFloorLamports();
       return { healthy: true, tipFloorLamports: tipFloor, latencyMs };
     } catch (err: any) {
       const latencyMs = Math.round(performance.now() - t0);
+      this.lastProbeTimestamp = Date.now();
       this.lastHealthStatus = 'OFFLINE';
       this.lastLatencyMs = latencyMs;
       this.lastErrorMessage = err.message;
       return { healthy: false, tipFloorLamports: null, latencyMs };
     }
+  }
+
+  /** Milliseconds since the last completed probe, or null if none ran. */
+  public getProbeAgeMs(): number | null {
+    return this.lastProbeTimestamp === null ? null : Date.now() - this.lastProbeTimestamp;
   }
 
   // Check inflight status for bundles submitted within the last ~5 minutes

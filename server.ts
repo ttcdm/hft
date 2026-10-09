@@ -76,6 +76,8 @@ import {
 
 
 const app = express();
+// Defense in depth with the normalized auth gate: `/API/...` must not reach a route at all.
+app.set('case sensitive routing', true);
 // Nginx/Cloud Run listens on 8080 in container; internal Node/Vite applet must listen on port 3000
 const PORT = parseInt(
   process.env.APP_PORT || (process.env.PORT && process.env.PORT !== '8080' ? process.env.PORT : '3000'),
@@ -1110,18 +1112,26 @@ app.post('/api/memecoins/close', requireOperatorAuth, validateTradeBody(Operator
   });
 });
 
+/** The bot token is write-only: it never leaves the server once stored. */
+function redactSniperConfig<T extends { telegramBotToken?: string }>(c: T) {
+  return { ...c, telegramBotToken: '', telegramBotTokenSet: Boolean(c.telegramBotToken) };
+}
+
 app.get('/api/memecoins/config', (req, res) => {
   res.json({
     status: 'OK',
-    config: memecoinAggregator.getConfig(),
+    config: redactSniperConfig(memecoinAggregator.getConfig()),
   });
 });
 
 app.post('/api/memecoins/config', requireOperatorAuth, validateTradeBody(SniperConfigPatchSchema), (req, res) => {
-  const updated = memecoinAggregator.updateConfig(req.body);
+  // The UI never sees the stored token, so an empty field means "unchanged", not "erase".
+  const patch = { ...req.body };
+  if (!patch.telegramBotToken) delete patch.telegramBotToken;
+  const updated = memecoinAggregator.updateConfig(patch);
   res.json({
     status: 'OK',
-    config: updated,
+    config: redactSniperConfig(updated),
   });
 });
 

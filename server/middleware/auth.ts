@@ -206,15 +206,30 @@ export const PUBLIC_API_ALLOWLIST: ReadonlyArray<{ method: string; path: string 
   { method: 'OPTIONS', path: '*' },
 ];
 
+/**
+ * The path as the router will see it: percent-decoded, duplicate slashes collapsed, lower-cased. Express matches routes
+ * case-insensitively, so an auth check that compares case-sensitively (`/API/...`) is bypassed.
+ */
+export function normalizeApiPath(raw: string): string {
+  let p = raw.split('?')[0];
+  try {
+    p = decodeURIComponent(p);
+  } catch {
+    // an undecodable path cannot match a route, but keep checking the raw text
+  }
+  return p.replace(/\/{2,}/g, '/').toLowerCase();
+}
+
 export function isPublicApiRoute(method: string, pathname: string): boolean {
   const m = method.toUpperCase();
-  const p = pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
+  const norm = normalizeApiPath(pathname);
+  const p = norm.length > 1 && norm.endsWith('/') ? norm.slice(0, -1) : norm;
   return PUBLIC_API_ALLOWLIST.some((r) => r.method === m && (r.path === '*' || r.path === p));
 }
 
 // Deny-by-default gate for every /api route. Mount it with app.use(apiAuthGate) before any route.
 export function apiAuthGate(req: Request, res: Response, next: NextFunction) {
-  const pathname = (req.originalUrl || req.url || '').split('?')[0];
+  const pathname = normalizeApiPath(req.originalUrl || req.url || '');
   if (!pathname.startsWith('/api')) return next();
   if (isPublicApiRoute(req.method, pathname)) return next();
   const token = extractOperatorToken(req);

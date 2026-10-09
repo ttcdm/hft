@@ -552,45 +552,13 @@ export class ExecutionCoordinator {
                 const recovery = await TradeReconciler.recoverInterruptedTransaction(
                   this.connection,
                   pTx.signature,
-                  walletPubkey
+                  walletPubkey,
+                  pTx.jitoTipLamports
                 );
 
                 if (recovery.recovered && recovery.mint) {
                   if (recovery.type === 'BUY' && recovery.tokenQuantityRaw) {
-                    const tokenQty = Number(recovery.tokenQuantityRaw) / Math.pow(10, recovery.tokenDecimals ?? 6);
-                    const effectivePrice =
-                      (recovery.solSpentLamports ?? 0) > 0 && tokenQty > 0
-                        ? ((recovery.solSpentLamports ?? 0) / 1e9) / tokenQty
-                        : 0;
-
-                    const recoveredPos: NormalizedPosition = {
-                      id: pTx.signature,
-                      mint: recovery.mint,
-                      symbol: pTx.mint ? pTx.mint.slice(0, 5).toUpperCase() : recovery.mint.slice(0, 5).toUpperCase(),
-                      name: `Recovered ${recovery.mint.slice(0, 4)}...${recovery.mint.slice(-4)}`,
-                      tokenDecimals: recovery.tokenDecimals ?? 6,
-                      baseTokenProgram: recovery.baseTokenProgram,
-                      tokenQuantityRaw: recovery.tokenQuantityRaw,
-                      costBasisLamports: recovery.solSpentLamports ?? 0,
-                      entryPriceSol: effectivePrice,
-                      currentPriceSol: effectivePrice,
-                      currentValueSol: (recovery.solSpentLamports ?? 0) / 1e9,
-                      unrealizedPnLSol: 0,
-                      unrealizedPnLPct: 0,
-                      realizedPnLSol: 0,
-                      entryTxSignature: pTx.signature,
-                      entrySlot: recovery.slot ?? txDetails.slot,
-                      entryTimestamp: recovery.blockTime ?? Date.now(),
-                      entryFeeLamports: recovery.networkFeeLamports ?? 5000,
-                      priorityFeeLamports: 0,
-                      jitoTipLamports: pTx.jitoTipLamports,
-                      markSource: 'RECONCILED_ON_CHAIN',
-                      markAgeMs: 0,
-                      executionMode: pTx.executionMode,
-                      status: 'OPEN',
-                      lastUpdatedTimestamp: Date.now(),
-                    };
-                    workstationDb.savePosition(recoveredPos);
+                    workstationDb.savePosition(this.positionFromRecoveredBuy(pTx, recovery, txDetails.slot));
                     pTx.reconciliationState = 'RECONCILED';
                     Logger.info(`Successfully recovered interrupted BUY position for ${recovery.mint} (${pTx.signature})`);
                   } else if (recovery.type === 'SELL') {
@@ -654,6 +622,15 @@ export class ExecutionCoordinator {
       }
     }
 
+    // 5. Landed LIVE buys whose fill could not be read earlier (RECONCILIATION_REQUIRED) still hold tokens with no stop-loss.
+    if (signerStatus === 'READY') {
+      const orphans = await this.recoverOrphanedBuys();
+      if (orphans.stillOrphaned.length > 0) {
+        mismatchesCount += orphans.stillOrphaned.length;
+        issues.push(`${orphans.stillOrphaned.length} landed buy(s) have no position record: ${orphans.stillOrphaned.map((x) => x.slice(0, 8)).join(',')}`);
+      }
+    }
+
     let status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE';
     if (this.rpcHealth === 'DISCONNECTED') {
       status = 'OFFLINE';
@@ -670,6 +647,105 @@ export class ExecutionCoordinator {
 
     Logger.info(`Startup Reconciliation result: ${status} (${details})`);
     return { status, mismatchesCount, details };
+  }
+
+  /** Position for a buy rebuilt from confirmed on-chain data. Entry price is the curve price paid; cost basis is the whole wallet delta. */
+  private positionFromRecoveredBuy(
+    pTx: { signature: string; mint: string; jitoTipLamports: number; executionMode: ExecutionMode },
+    recovery: Awaited<ReturnType<typeof TradeReconciler.recoverInterruptedTransaction>>,
+    fallbackSlot: number
+  ): NormalizedPosition {
+    const tokenQty = Number(recovery.tokenQuantityRaw) / Math.pow(10, recovery.tokenDecimals ?? 6);
+    const spent = recovery.solSpentLamports ?? 0;
+    const curveSpend = recovery.curveSpendLamports ?? spent;
+    const effectivePrice = curveSpend > 0 && tokenQty > 0 ? curveSpend / 1e9 / tokenQty : 0;
+    return {
+      id: pTx.signature,
+      mint: recovery.mint!,
+      symbol: pTx.mint ? pTx.mint.slice(0, 5).toUpperCase() : recovery.mint!.slice(0, 5).toUpperCase(),
+      name: `Recovered ${recovery.mint!.slice(0, 4)}...${recovery.mint!.slice(-4)}`,
+      tokenDecimals: recovery.tokenDecimals ?? 6,
+      baseTokenProgram: recovery.baseTokenProgram,
+      tokenQuantityRaw: recovery.tokenQuantityRaw!,
+      costBasisLamports: spent,
+      entryPriceSol: effectivePrice,
+      currentPriceSol: effectivePrice,
+      currentValueSol: spent / 1e9,
+      unrealizedPnLSol: 0,
+      unrealizedPnLPct: 0,
+      realizedPnLSol: 0,
+      entryTxSignature: pTx.signature,
+      entrySlot: recovery.slot ?? fallbackSlot,
+      entryTimestamp: recovery.blockTime ?? Date.now(),
+      entryFeeLamports: recovery.networkFeeLamports ?? 5000,
+      priorityFeeLamports: 0,
+      jitoTipLamports: pTx.jitoTipLamports,
+      markSource: 'RECONCILED_ON_CHAIN',
+      markAgeMs: 0,
+      executionMode: pTx.executionMode,
+      status: 'OPEN',
+      lastUpdatedTimestamp: Date.now(),
+    };
+  }
+
+  /**
+   * Orphaned buys (critique #3): a LIVE buy confirmed but its fill could not be read (getTransaction null at that moment), so the row sits
+   * at RECONCILIATION_REQUIRED with tokens in the wallet and no position, hence no stop-loss. Re-read each such signature and open the position.
+   * Idempotent: a signature that already has a position is just marked RECONCILED.
+   */
+  public async recoverOrphanedBuys(): Promise<{ recovered: string[]; stillOrphaned: string[] }> {
+    const recovered: string[] = [];
+    const stillOrphaned: string[] = [];
+    if (localSigner.getStatus() !== 'READY') return { recovered, stillOrphaned };
+    const wallet = localSigner.getPublicKey();
+    const candidates = workstationDb
+      .loadTransactions()
+      .filter((t) => t.direction === 'BUY' && t.executionMode === 'LIVE' && t.reconciliationState === 'RECONCILIATION_REQUIRED');
+    for (const t of candidates) {
+      try {
+        if (workstationDb.loadPositions().some((p) => p.entryTxSignature === t.signature)) {
+          t.reconciliationState = 'RECONCILED';
+          workstationDb.saveTransaction(t);
+          continue;
+        }
+        const recovery = await TradeReconciler.recoverInterruptedTransaction(this.connection, t.signature, wallet, t.jitoTipLamports);
+        if (recovery.recovered && recovery.type === 'BUY' && recovery.mint && recovery.tokenQuantityRaw) {
+          workstationDb.savePosition(this.positionFromRecoveredBuy(t, recovery, t.landingSlot ?? 0));
+          t.reconciliationState = 'RECONCILED';
+          workstationDb.saveTransaction(t);
+          recovered.push(t.signature);
+          Logger.warn(`Recovered orphaned LIVE buy ${t.signature} for ${recovery.mint}: position opened with stop-loss coverage`);
+        } else if (recovery.error && /reverted/i.test(recovery.error)) {
+          t.reconciliationState = 'REVERTED';
+          t.error = recovery.error;
+          workstationDb.saveTransaction(t);
+        } else {
+          stillOrphaned.push(t.signature);
+        }
+      } catch (e: any) {
+        Logger.warn(`Orphaned buy recovery failed for ${t.signature}: ${e.message}`);
+        stillOrphaned.push(t.signature);
+      }
+    }
+    return { recovered, stillOrphaned };
+  }
+
+  /** Delays (ms) at which a failed live-buy reconciliation is retried in the background. Tests set [] . */
+  public orphanRecoveryDelaysMs: number[] = [5_000, 15_000, 45_000, 120_000, 300_000];
+
+  private scheduleOrphanRecovery(delays: number[] = this.orphanRecoveryDelaysMs): void {
+    if (delays.length === 0) return;
+    const [next, ...rest] = delays;
+    const timer = setTimeout(async () => {
+      try {
+        const r = await this.recoverOrphanedBuys();
+        if (r.stillOrphaned.length > 0) this.scheduleOrphanRecovery(rest);
+      } catch (e: any) {
+        Logger.warn(`Background orphan recovery error: ${e.message}`);
+        this.scheduleOrphanRecovery(rest);
+      }
+    }, next);
+    (timer as any).unref?.();
   }
 
   public async syncRealWalletBalance(): Promise<number | null> {
@@ -1946,6 +2022,8 @@ export class ExecutionCoordinator {
           executionMode: 'LIVE',
           error: reconciliation.error || 'Token balance increase not verified',
         });
+        // The buy landed but its fill is unread: keep retrying so the tokens get a position (and a stop-loss).
+        if (reconciliation.reconciliationState === 'RECONCILIATION_REQUIRED') this.scheduleOrphanRecovery();
 
         return {
           success: false,

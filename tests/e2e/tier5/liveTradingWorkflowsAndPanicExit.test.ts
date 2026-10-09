@@ -264,6 +264,7 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
         error: 'Confirmed transaction resulted in zero token balance increase',
       });
 
+      const scheduled = vi.spyOn(coordinator as any, 'scheduleOrphanRecovery').mockImplementation(() => {});
       const result = await coordinator.executeTrade({
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'ZEROTOK',
@@ -277,6 +278,8 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
       expect(result.success).toBe(false);
       expect(result.lifecycleState).toBe('RECONCILIATION_REQUIRED');
       expect(result.error).toMatch(/RECONCILIATION FAILED/);
+      // P3: an unread landed buy schedules background recovery so its tokens cannot stay without a position
+      expect(scheduled).toHaveBeenCalledTimes(1);
 
       // Invariant: Position MUST NOT be marked OPEN in SQLite
       const positions = workstationDb.loadPositions('LIVE');

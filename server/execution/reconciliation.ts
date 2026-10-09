@@ -49,6 +49,29 @@ export interface SellReconciliationResult {
 }
 
 export class TradeReconciler {
+  /**
+   * Delays between getTransaction retries when the RPC has not indexed a just-confirmed signature yet (returns null) or errors.
+   * About 12s in total. Tests set this to [] to skip waiting.
+   */
+  public static txFetchRetryDelaysMs: number[] = [400, 800, 1600, 3200, 6400];
+
+  private static async fetchConfirmedTx(connection: Connection, signature: string) {
+    const delays = TradeReconciler.txFetchRetryDelaysMs;
+    let lastErr: any = null;
+    for (let attempt = 0; attempt <= delays.length; attempt++) {
+      try {
+        const tx = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
+        if (tx && tx.meta) return tx;
+        lastErr = null;
+      } catch (e: any) {
+        lastErr = e;
+      }
+      if (attempt < delays.length) await new Promise((r) => setTimeout(r, delays[attempt]));
+    }
+    if (lastErr) throw lastErr;
+    return null;
+  }
+
   // Capture pre-trade on-chain state
   public static async capturePreTradeSnapshot(
     connection: Connection,
@@ -108,10 +131,7 @@ export class TradeReconciler {
     const mintStr = mint.toBase58();
 
     try {
-      const tx = await connection.getTransaction(signature, {
-        maxSupportedTransactionVersion: 0,
-        commitment: 'confirmed',
-      });
+      const tx = await TradeReconciler.fetchConfirmedTx(connection, signature);
 
       if (!tx || !tx.meta) {
         return {
@@ -290,10 +310,7 @@ export class TradeReconciler {
     const mintStr = mint.toBase58();
 
     try {
-      const tx = await connection.getTransaction(signature, {
-        maxSupportedTransactionVersion: 0,
-        commitment: 'confirmed',
-      });
+      const tx = await TradeReconciler.fetchConfirmedTx(connection, signature);
 
       if (!tx || !tx.meta) {
         return {
@@ -426,7 +443,8 @@ export class TradeReconciler {
   public static async recoverInterruptedTransaction(
     connection: Connection,
     signature: string,
-    wallet: PublicKey
+    wallet: PublicKey,
+    expectedJitoTipLamports: number = 0
   ): Promise<{
     recovered: boolean;
     type: 'BUY' | 'SELL';
@@ -443,15 +461,15 @@ export class TradeReconciler {
     solSpentLamports?: number;
     solReceivedLamports?: number;
     networkFeeLamports?: number;
+    /** BUY only: SOL that went to the curve (wallet delta minus fee, tip and rent of the token account this tx opened). */
+    curveSpendLamports?: number;
+    tokenAccountRentLamports?: number;
     slot?: number;
     blockTime?: number;
     error?: string;
   }> {
     try {
-      const txDetails = await connection.getTransaction(signature, {
-        maxSupportedTransactionVersion: 0,
-        commitment: 'confirmed',
-      });
+      const txDetails = await TradeReconciler.fetchConfirmedTx(connection, signature);
 
       if (!txDetails) {
         return { recovered: false, type: 'BUY', error: 'Transaction not found on-chain' };
@@ -534,6 +552,16 @@ export class TradeReconciler {
         }
       }
 
+      let tokenAccountRentLamports = 0;
+      if (type === 'BUY' && matchedMint) {
+        const tb = postTokens.find((p) => p.mint === matchedMint);
+        if (tb && txDetails.meta?.preBalances && txDetails.meta?.postBalances) {
+          tokenAccountRentLamports = Math.max(0, (txDetails.meta.postBalances[tb.accountIndex] ?? 0) - (txDetails.meta.preBalances[tb.accountIndex] ?? 0));
+        }
+      }
+      let curveSpendLamports = solSpentLamports - networkFeeLamports - expectedJitoTipLamports - tokenAccountRentLamports;
+      if (!(curveSpendLamports > 0)) curveSpendLamports = solSpentLamports;
+
       if (matchedMint && tokenDelta > 0n) {
         return {
           recovered: true,
@@ -551,6 +579,8 @@ export class TradeReconciler {
           solSpentLamports,
           solReceivedLamports,
           networkFeeLamports,
+          curveSpendLamports,
+          tokenAccountRentLamports,
           slot: txDetails.slot,
           blockTime: txDetails.blockTime ? txDetails.blockTime * 1000 : Date.now(),
         };

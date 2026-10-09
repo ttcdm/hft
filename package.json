@@ -14,7 +14,7 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "package:clean": "rm -rf .env .operator_session* *.keypair.json *.signer.json *.db *.db-wal *.db-shm *.wal node_modules dist coverage",
-    "package:release": "rm -f release.zip && zip -r -q release.zip . -x '.git*' '.env*' '*operator_session*' '*.keypair.json' '*.signer.json' '*.db*' '*.wal' 'node_modules/*' 'dist/*' 'coverage/*' 'target/*' '*.log'",
+    "package:release": "tsx scripts/package_release.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . && tsc --noEmit",
     "test": "vitest run",

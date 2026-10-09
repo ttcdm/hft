@@ -18,6 +18,8 @@ export const OrderBook: React.FC<OrderBookProps> = ({
   flashTrigger,
 }) => {
   const { asks, bids, midPrice, spread, microPrice, imbalanceRatio } = orderBook;
+  // B2: no generated levels. With no real book the panel says so instead of drawing numbers.
+  const hasData = asks.length > 0 || bids.length > 0;
   const spreadBps = midPrice > 0 ? ((spread / midPrice) * 10000).toFixed(1) : '0.0';
 
   // OFI gauge representation
@@ -58,6 +60,17 @@ export const OrderBook: React.FC<OrderBookProps> = ({
         </div>
       </div>
 
+      {!hasData && (
+        <div
+          id="orderbook-no-data"
+          className="flex-1 flex items-center justify-center text-xs font-mono text-slate-500"
+        >
+          No market data
+        </div>
+      )}
+
+      {hasData && (
+        <>
       {/* OFI IMBALANCE INDICATOR BAR */}
       <div className="mb-2 p-2 rounded-lg bg-[#06080D] border border-[#1E293B] text-[11px] font-mono">
         <div className="flex items-center justify-between mb-1">
@@ -176,6 +189,8 @@ export const OrderBook: React.FC<OrderBookProps> = ({
           </div>
         ))}
       </div>
+        </>
+      )}
     </div>
   );
 };

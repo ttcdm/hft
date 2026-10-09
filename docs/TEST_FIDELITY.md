@@ -11,3 +11,6 @@ Passing `npm test` means the units behave as specified **against mocks of their 
 Nothing here has run on a real cluster from CI. The devnet harness (`npm run devnet:e2e`) is the only path to that and needs network and a funded throwaway key.
 
 Tests no longer share mutated singleton state: `tests/setup/devnetGuard.ts` snapshots and restores the coordinator's private fields, the pump curve caches and the planted callouts around every test.
+
+## Network hermeticity (K1b)
+Under vitest `SOLANA_RPC_URL`, `SOLANA_WS_URL` and `JITO_BLOCK_ENGINE_URL` all point at the closed loopback port 9, and `tests/setup/devnetGuard.ts` refuses every non-loopback `net.Socket.connect` (fetch, node-fetch, ws and tls all end there). A refused connection is recorded, and the `afterEach` hook fails the test that caused it even if the code under test swallowed the error. This is what makes a leak visible on an offline machine; before it, tests that silently reached `api.devnet`, DexScreener, pump.fun or Coinbase passed offline and failed (or hung) on a networked machine. The guard found one real cause: the `pumpFunService` singleton started its WebSocket feed and 5 s HTTP poll on import. It now starts only through `pumpFunService.startBackground()`, called by `startServer`.

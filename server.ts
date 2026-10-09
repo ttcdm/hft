@@ -1592,6 +1592,7 @@ async function startServer() {
   }
 
   solPriceService.startAutoRefresh();
+  pumpFunService.startBackground();
   autoSnipeController.startMonitor(); // G3: kill-switch triggers and wallet audit (inert while the mode is OFF)
   server.listen(PORT, BIND_HOST, () => {
     console.log(`[APEX QUANT HFT] Autonomous Execution Engine running on ${BIND_HOST}:${PORT}`);

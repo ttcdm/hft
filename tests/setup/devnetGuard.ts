@@ -1,3 +1,4 @@
+import net from 'node:net';
 import { beforeEach, afterEach, vi } from 'vitest';
 import { executionCoordinator } from '../../server/execution/coordinator';
 import { PumpCurveService } from '../../server/solana/pumpCurve';
@@ -5,6 +6,30 @@ import { pumpfunService } from '../../server/pumpfunService';
 import { Connection } from '@solana/web3.js';
 import { CLUSTER_GENESIS_HASH } from '../../server/solana/clusterGuard';
 import { solPriceService } from '../../server/market/solPriceService';
+
+// No test may reach a non-loopback host. Every outbound connection (fetch, node-fetch, ws, tls) ends in
+// net.Socket.connect, so refusing there makes a leak to a real RPC fail loudly instead of passing on a
+// machine that happens to be offline. This file runs before any test module is imported.
+(globalThis as any).__networkGuardHits = [] as string[];
+const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '0.0.0.0', '']);
+const realConnect = net.Socket.prototype.connect;
+(net.Socket.prototype as any).connect = function (this: net.Socket, ...args: any[]) {
+  const first = args[0];
+  let host: string | undefined;
+  if (first && typeof first === 'object') {
+    if (typeof first.path === 'string') return (realConnect as any).apply(this, args);
+    host = first.host;
+  } else if (typeof first === 'string' && Number.isNaN(Number(first))) {
+    return (realConnect as any).apply(this, args); // unix socket path
+  } else {
+    host = typeof args[1] === 'string' ? args[1] : undefined;
+  }
+  if (!LOOPBACK.has(host ?? '')) {
+    (globalThis as any).__networkGuardHits.push(String(host) + ' @ ' + (new Error().stack || '').split('\n').filter((l) => l.includes('/server') && !l.includes('node_modules')).slice(0, 2).map((l) => l.trim().replace(/.*macgit\//, '')).join(' <- '));
+    throw new Error(`TEST_NETWORK_GUARD: a test tried to connect to non-loopback host "${host}"`);
+  }
+  return (realConnect as any).apply(this, args);
+};
 
 // Hermetic defaults for every test file:
 // - the RPC answers as devnet, so the cluster guard (R1) lets mocked LIVE sends through. Tests that
@@ -35,6 +60,12 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // A refused connection that the code under test swallowed is still a leak: fail the test that caused it.
+  const hits = (globalThis as any).__networkGuardHits as string[];
+  const leaked = hits.splice(0, hits.length);
+  if (leaked.length && !(globalThis as any).__expectNetworkGuardHits) {
+    throw new Error(`TEST_NETWORK_GUARD: test attempted non-loopback connections: ${[...new Set(leaked)].join(', ')}`);
+  }
   if (!snapshot) return;
   for (const f of COORDINATOR_FIELDS) (executionCoordinator as any)[f] = snapshot.coord[f];
   PumpCurveService.cachedGlobal = snapshot.global;

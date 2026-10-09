@@ -339,12 +339,20 @@ export class PumpFunService extends EventEmitter {
     snipeAmountUsd: 5.0, // Scaled for $10 Micro Account
   };
 
+  private backgroundStarted = false;
+
   constructor() {
     super();
     // Wire real Solana WebSocket listener for Pump.fun V2 CreateEvents (B08)
     pumpFeedListener.on('create_event', (event: PumpCreateEvent) => {
       this.handleOnChainCreateEvent(event);
     });
+  }
+
+  /** Begin the on-chain feed and the HTTP fallback poll. Called once by the server, never on import. */
+  public startBackground(): void {
+    if (this.backgroundStarted) return;
+    this.backgroundStarted = true;
     pumpFeedListener.start().catch(() => {});
     this.initPolling();
   }

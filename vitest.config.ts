@@ -14,8 +14,11 @@ export default defineConfig({
       SIGNER_KEYPAIR_PATH: path.resolve(__dirname, '.nonexistent_test_keypair.json'),
       OPERATOR_PRIVATE_KEY: '',
       SOLANA_PRIVATE_KEY: '',
-      JITO_BLOCK_ENGINE_URL: 'https://mock-jito-engine.local',
+      JITO_BLOCK_ENGINE_URL: 'http://127.0.0.1:9',
       ALLOWED_CLUSTER: 'devnet',
+      // Hermetic: any Connection built from the default env points at a closed loopback port, never a real cluster.
+      SOLANA_RPC_URL: 'http://127.0.0.1:9',
+      SOLANA_WS_URL: 'ws://127.0.0.1:9',
     },
     setupFiles: ['./tests/setup/devnetGuard.ts'],
     fileParallelism: false,

@@ -1,3 +1,4 @@
+import { solPriceService } from '../server/market/solPriceService';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { Connection } from '@solana/web3.js';
 import { ExecutionCoordinator } from '../server/execution/coordinator';
@@ -124,6 +125,7 @@ describe('K6: POST /api/wallet/config path', () => {
 
   it('a config save without rpcEndpoint does not touch the connection', async () => {
     const setSpy = vi.spyOn(executionCoordinator, 'setRpcEndpoint');
+    vi.spyOn(solPriceService, 'refresh').mockResolvedValue(solPriceService.getPrice());
     await walletTrader.updateConfig({ allocatedSol: 0.07 } as any);
     expect(setSpy).not.toHaveBeenCalled();
   });

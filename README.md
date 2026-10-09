@@ -139,7 +139,7 @@ Commands (all run from the repo root; Node 22.5+ because of `node:sqlite`):
 | Command | What it does |
 | --- | --- |
 | `npm ci` | install from the lockfile |
-| `npm test` | the full suite (`vitest run`): **1049 tests in 68 files**, all passing at the time of writing |
+| `npm test` | the full suite (`vitest run`): **1052 tests in 69 files**, all passing at the time of writing |
 | `npm run lint` | ESLint (0 errors, 172 warnings) plus `tsc --noEmit` |
 | `npm run build` | frontend + `dist/server.cjs` |
 | `npm run smoke` | boots `dist/server.cjs` on a random port and checks `/`, `/api/health`, login, session and the `/ws/engine` handshake |

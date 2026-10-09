@@ -55,12 +55,16 @@ export class CapitalSizer {
    * Calculates spendable bankroll:
    * spendable = Math.max(0, walletBalanceSol - (reserveBalanceSol ?? 0.015) - (inFlightOrdersSol ?? 0))
    */
+  /** Rent-exempt minimum of an SPL token account (165 bytes). Token-2022 accounts with extensions are larger; this is a labelled FLOOR for them. */
+  public static readonly SPL_TOKEN_ACCOUNT_RENT_LAMPORTS = 2_039_280;
+
   public static calculateSpendableBankroll(
     walletBalanceSol: number,
     reserveBalanceSol: number = CapitalSizer.DEFAULT_RESERVE_SOL,
-    inFlightOrdersSol: number = 0
+    inFlightOrdersSol: number = 0,
+    rentLockedSol: number = 0
   ): number {
-    return Math.max(0, walletBalanceSol - reserveBalanceSol - inFlightOrdersSol);
+    return Math.max(0, walletBalanceSol - reserveBalanceSol - inFlightOrdersSol - rentLockedSol);
   }
 
   /**

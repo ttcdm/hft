@@ -704,9 +704,18 @@ export class ExecutionCoordinator {
     return this.realWalletBalanceSol;
   }
 
+  /**
+   * C7c: SOL locked as rent in the token accounts of open LIVE positions (paper positions have no account). Uses the
+   * SPL rent-exempt minimum for every account; a Token-2022 account with extensions needs more, so for those it is a floor.
+   */
+  public getRentLockedSol(): number {
+    const open = workstationDb.loadPositions(undefined, 'ACTIVE').filter((p) => p.executionMode === 'LIVE');
+    return (open.length * CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS) / 1e9;
+  }
+
   public getSpendableBankrollSol(): number {
     const raw = this.realWalletBalanceSol ?? 0;
-    return CapitalSizer.calculateSpendableBankroll(raw, 0.015, this.inFlightReservedSol);
+    return CapitalSizer.calculateSpendableBankroll(raw, 0.015, this.inFlightReservedSol, this.getRentLockedSol());
   }
 
   public isLiveArmed(): boolean {
@@ -1662,7 +1671,7 @@ export class ExecutionCoordinator {
 
     // 3. Pre-Trade Capital Sizing (B12): spendable bankroll and 10% ceiling check
     const rawWalletBalance = this.realWalletBalanceSol ?? 0;
-    const spendable = CapitalSizer.calculateSpendableBankroll(rawWalletBalance, 0.015, this.inFlightReservedSol);
+    const spendable = CapitalSizer.calculateSpendableBankroll(rawWalletBalance, 0.015, this.inFlightReservedSol, this.getRentLockedSol());
 
     if (spendable <= 0) {
       return {

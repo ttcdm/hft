@@ -86,8 +86,8 @@ export function buildBoard(now = Date.now()) {
     wallet: {
       balanceSol: balance,
       reserveSol: WALLET_RESERVE_SOL,
-      /** Rent locked in token accounts is not read from chain yet. */
-      rentLockedSol: null as number | null,
+      /** Rent of open LIVE positions' token accounts (SPL minimum; a floor for Token-2022). Computed, not read from chain. */
+      rentLockedSol: balance === null ? null : executionCoordinator.getRentLockedSol(),
       spendableSol: balance === null ? null : executionCoordinator.getSpendableBankrollSol(),
       solUsd: sol,
     },

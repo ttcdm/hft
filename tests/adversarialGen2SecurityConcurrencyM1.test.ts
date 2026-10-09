@@ -979,12 +979,14 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
   describe('Probe 5: Crash Recovery & SQLite Startup Reconciliation', () => {
     let coordinator: ExecutionCoordinator;
 
-    beforeEach(() => {
-      // The coordinator probes RPC on construction. Answer from mocks so the
-      // test never depends on a reachable network or an SDK stub.
+    beforeEach(async () => {
+      // The coordinator probes RPC and runs a startup reconciliation on construction. Answer from mocks so
+      // the test never depends on a reachable network or an SDK stub, then let that background pass finish
+      // before the test seeds its own pending transactions.
       vi.spyOn(Connection.prototype, 'getSlot').mockResolvedValue(280005000);
       vi.spyOn(Connection.prototype, 'getBalance').mockResolvedValue(5_000_000_000);
       coordinator = new ExecutionCoordinator();
+      await vi.waitFor(() => expect((coordinator as any).lastStartupReconciliation).toBeTruthy());
     });
 
     afterEach(() => {

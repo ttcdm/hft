@@ -14,7 +14,10 @@ export default defineConfig({
       SIGNER_KEYPAIR_PATH: path.resolve(__dirname, '.nonexistent_test_keypair.json'),
       OPERATOR_PRIVATE_KEY: '',
       SOLANA_PRIVATE_KEY: '',
+      JITO_BLOCK_ENGINE_URL: 'https://mock-jito-engine.local',
+      ALLOWED_CLUSTER: 'devnet',
     },
+    setupFiles: ['./tests/setup/devnetGuard.ts'],
     fileParallelism: false,
     sequence: {
       concurrent: false,

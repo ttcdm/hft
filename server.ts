@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-dotenv.config({ override: true });
+dotenv.config();
 import './suppress-warnings.cjs';
 import express from 'express';
 import cors from 'cors';
@@ -19,6 +19,7 @@ import { pumpFeedListener } from './server/solana/pumpFeedListener';
 import { runComprehensiveTestSuite } from './server/unitTestCases';
 import { run60DayBacktest } from './src/utils/backtestEngine';
 import { walletTrader } from './server/walletTrader';
+import { resolveRpcUrl } from './server/solana/clusterGuard';
 import { executionCoordinator } from './server/execution/coordinator';
 import { localSigner } from './server/solana/signer';
 import { riskEngine } from './server/risk/riskEngine';
@@ -1280,7 +1281,7 @@ app.get('/api/connectivity/diagnostics', async (req, res) => {
   const tSol = performance.now();
   const solanaTest: any = { reachable: false, latencyMs: 0, health: null, slot: null };
   try {
-    const rpcRes = await fetch('https://api.mainnet-beta.solana.com', {
+    const rpcRes = await fetch(resolveRpcUrl(), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify([
@@ -1346,7 +1347,7 @@ app.get('/api/connectivity/diagnostics', async (req, res) => {
         testResult: dexTest,
       },
       solanaRpc: {
-        service: 'Solana Mainnet Validator Cluster (api.mainnet-beta.solana.com)',
+        service: `Solana RPC (${new URL(resolveRpcUrl()).host})`,
         isLiveExternal: true,
         testResult: solanaTest,
       },
@@ -1750,7 +1751,7 @@ app.get('/api/diagnostics/system', (req, res) => {
       walletSolBalance: diag.walletSolBalance,
       walletPubkey: diag.activeWalletAddress,
       signerStatus,
-      rpcEndpoint: process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
+      rpcEndpoint: resolveRpcUrl(),
       rpcLatencyMs: diag.rpcLatencyMs,
       databaseFile: 'apex_workstation.db',
       dbDriver: 'node:sqlite (WAL mode enabled)',

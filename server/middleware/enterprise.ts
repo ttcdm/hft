@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import { z } from 'zod';
+import { DEFAULT_RPC_URL } from '../solana/clusterGuard';
 
 // ============================================================================
 // 1. CORRELATION ID & STRUCTURED LOGGING
@@ -188,17 +189,20 @@ export const WalletConfigSchema = z.object({
     .string()
     .url('RPC Endpoint must be a valid HTTP or HTTPS URL')
     .refine(isSafeExternalUrl, 'RPC Endpoint cannot point to private metadata services or use embedded credentials')
-    .default('https://api.mainnet-beta.solana.com'),
+    .default(DEFAULT_RPC_URL),
   wsRpcEndpoint: z
     .string()
     .url('WebSocket RPC must be a valid WS or WSS URL')
     .refine(isSafeExternalUrl, 'WebSocket RPC cannot point to private metadata services')
     .optional(),
+  // '' means Jito is disabled (the fail-closed default). There is no mainnet default.
   jitoBlockEngineUrl: z
     .string()
-    .url('Jito Block Engine must be a valid URL')
-    .refine(isSafeExternalUrl, 'Jito Block Engine URL cannot point to private metadata services')
-    .default('https://mainnet.block-engine.jito.wtf'),
+    .refine(
+      (v) => v === '' || (z.string().url().safeParse(v).success && isSafeExternalUrl(v)),
+      'Jito Block Engine must be empty (disabled) or a valid URL that does not point to private metadata services'
+    )
+    .default(''),
   jitoTipAccount: z
     .string()
     .regex(SOLANA_ADDRESS_REGEX, 'Invalid Jito tip account public key')

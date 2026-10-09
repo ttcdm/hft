@@ -6,6 +6,7 @@ import { workstationDb } from './db/database';
 import { riskEngine } from './risk/riskEngine';
 import { ExecutionMode, NormalizedPosition } from './core/types';
 import { executionConfig } from './solana/executionConfig';
+import { resolveRpcUrl } from './solana/clusterGuard';
 
 export interface WalletTraderConfig {
   walletAddress: string;
@@ -72,7 +73,7 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     const execCfg = executionConfig.getConfig();
     this.config = {
       walletAddress: '',
-      rpcEndpoint: process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com',
+      rpcEndpoint: resolveRpcUrl(),
       jitoBlockEngineUrl: execCfg.jitoBlockEngineUrl,
       jitoTipAccount: execCfg.jitoTipAccount,
       jitoTipSol: execCfg.defaultJitoTipSol,

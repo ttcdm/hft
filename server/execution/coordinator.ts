@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-dotenv.config({ override: true });
+dotenv.config();
 import { Connection, PublicKey, SystemProgram, VersionedTransaction } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID, createCloseAccountInstruction } from '@solana/spl-token';
 import {
@@ -23,6 +23,7 @@ import { workstationDb } from '../db/database';
 import { getRandomJitoTipAccount, TOKEN_2022_PROGRAM_ID } from '../solana/programs';
 import { executionConfig } from '../solana/executionConfig';
 import { Logger } from '../middleware/enterprise';
+import { assertClusterAllowed, resolveRpcUrl } from '../solana/clusterGuard';
 import { PumpCurveService, TradeQuote, fetchTokenHolderDistribution } from '../solana/pumpCurve';
 import { TradeReconciler, RealMarkPriceService, PreTradeSnapshot } from './reconciliation';
 export type { PreTradeSnapshot };
@@ -102,10 +103,10 @@ export class ExecutionCoordinator {
     if (isConn) {
       this.isDefaultSingleton = Boolean(isDefaultSingleton);
       this.connection = connectionOrIsSingleton as Connection;
-      this.rpcEndpoint = (connectionOrIsSingleton as any)._rpcEndpoint || process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+      this.rpcEndpoint = (connectionOrIsSingleton as any)._rpcEndpoint || resolveRpcUrl();
     } else {
       this.isDefaultSingleton = Boolean(connectionOrIsSingleton);
-      this.rpcEndpoint = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+      this.rpcEndpoint = resolveRpcUrl();
       this.connection = new Connection(this.rpcEndpoint, {
         commitment: 'confirmed',
         confirmTransactionInitialTimeout: 30000,
@@ -897,7 +898,25 @@ export class ExecutionCoordinator {
   }> {
     const { tx, orderId, correlationId, side, mint, mintPubkey, owner, tokenProgram, preSnapshot, jitoTipLamports } = params;
     const cfg = executionConfig.getConfig();
-    const maxRetries = Math.max(0, cfg.jitoMaxRetries);
+
+    // Cluster guard: every signed buy and sell passes through here. Refuse before anything is sent
+    // unless the RPC reports the allowed cluster's genesis hash (devnet unless Mike set ALLOWED_CLUSTER).
+    try {
+      await assertClusterAllowed(this.connection);
+    } catch (err: any) {
+      Logger.error(`[R1] ${side} for order ${orderId} blocked: ${err.message}`);
+      workstationDb.logJournal('CLUSTER_GUARD_BLOCK', correlationId, 'LIVE', { orderId, side, mint, error: err.message });
+      return {
+        success: false,
+        signature: '',
+        transport: 'SOLANA_RPC',
+        error: err.message,
+        lifecycleState: 'SUBMIT_FAILED',
+      };
+    }
+    const jitoEnabled = this.jitoTransport.isEnabled();
+    // With no Jito block engine configured (always the case on devnet) there is nothing to retry: go straight to RPC.
+    const maxRetries = this.jitoTransport.isEnabled() ? Math.max(0, cfg.jitoMaxRetries) : -1;
     const retryIntervalMs = Math.max(0, cfg.jitoRetryIntervalMs);
     const confirmTimeoutMs = Math.max(1000, cfg.bundleConfirmTimeoutMs);
 
@@ -1001,8 +1020,8 @@ export class ExecutionCoordinator {
       };
     }
 
-    // Direct RPC Fallback branch (if enabled and Jito retries did not land)
-    if (cfg.enableRpcFallback) {
+    // Direct RPC Fallback branch (if enabled and Jito retries did not land; always taken when Jito is disabled)
+    if (cfg.enableRpcFallback || !jitoEnabled) {
       // If Jito explicitly rejected with a fatal simulation error, do not fallback to RPC
       if (lastError && (lastError.includes('InstructionError') || lastError.includes('Transaction simulation failed'))) {
         return {

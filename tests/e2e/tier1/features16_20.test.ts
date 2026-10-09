@@ -46,12 +46,19 @@ describe('Tier 1: Feature Coverage (Features 16 - 20)', () => {
   // ===========================================================================
   describe('Feature 16: R4 Jito / MEV Dynamic Tip & Fallback', () => {
     it('F16.1: resolves live Jito tip floor from tip floor endpoint', async () => {
-      const conn = mockRpc.createConnection();
-      const jito = new JitoTransport(conn, mockJito.getUrl());
-      mockJito.setTipFloorLamports(200_000); // 0.0002 SOL
+      // The tip-floor service is mainnet-only, so the cluster guard (R1) blocks it on devnet. This test only
+      // exercises parsing against the mock endpoint, so allow it explicitly for the duration of the test.
+      vi.stubEnv('ALLOWED_CLUSTER', 'mainnet-beta');
+      try {
+        const conn = mockRpc.createConnection();
+        const jito = new JitoTransport(conn, mockJito.getUrl());
+        mockJito.setTipFloorLamports(200_000); // 0.0002 SOL
 
-      const floor = await jito.getTipFloorLamports();
-      expect(floor).toBe(200_000);
+        const floor = await jito.getTipFloorLamports();
+        expect(floor).toBe(200_000);
+      } finally {
+        vi.unstubAllEnvs();
+      }
     });
 
     it('F16.2: enforces bounded tip escalation capped within policy max limit', () => {

@@ -24,6 +24,7 @@ import {
 import { PerformanceKPIs } from '../types';
 import { hftAudio } from '../utils/audio';
 import { authFetch } from '../services/engineClient';
+import { AutoHeaderBadge } from './AutoPanel';
 
 interface HeaderProps {
   kpis: PerformanceKPIs;
@@ -162,40 +163,8 @@ export const Header: React.FC<HeaderProps> = ({
               APEX QUANT
             </span>
 
-            {/* LIVE FEED SELECTOR */}
-            <div className="flex items-center space-x-1.5 px-2 py-0.5 rounded bg-[#0D131F] border border-[#1E293B]">
-              <span className="relative flex h-2 w-2">
-                <span
-                  className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
-                    isHalted ? 'bg-red-500' : 'bg-[#00E676]'
-                  }`}
-                />
-                <span
-                  className={`relative inline-flex rounded-full h-2 w-2 ${
-                    isHalted ? 'bg-red-500' : 'bg-[#00E676]'
-                  }`}
-                />
-              </span>
-              <select
-                aria-label="Active Exchange Feed"
-                value={activeFeed}
-                onChange={(e) => onSelectFeed(e.target.value)}
-                className="bg-transparent text-[10px] sm:text-[11px] font-mono font-bold text-cyan-400 outline-none cursor-pointer"
-              >
-                <option value="CME_AURORA" className="bg-[#0D131F] text-white">
-                  CME AURORA (0.42ms)
-                </option>
-                <option value="EQUINIX_NY4" className="bg-[#0D131F] text-white">
-                  EQUINIX NY4 (0.68ms)
-                </option>
-                <option value="BINANCE_CROSS" className="bg-[#0D131F] text-white">
-                  BINANCE SPOT (L2)
-                </option>
-                <option value="TOKYO_TY3" className="bg-[#0D131F] text-white">
-                  TOKYO TY3 (1.12ms)
-                </option>
-              </select>
-            </div>
+            {/* H3: the auto-snipe mode replaces the exchange selector */}
+            <AutoHeaderBadge />
           </div>
 
           <div className="hidden lg:flex items-center space-x-2 text-[10px] text-slate-400 font-mono mt-0.5">

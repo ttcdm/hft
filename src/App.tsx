@@ -42,6 +42,7 @@ import { AuthModal } from './components/AuthModal';
 import { engineClient, getOperatorSessionToken } from './services/engineClient';
 import { TokenBoard } from './components/TokenBoard';
 import { CurvePanel } from './components/CurvePanel';
+import { AutoPanel } from './components/AutoPanel';
 
 // Bot configuration only. Performance fields (pnl, winRate, tradesCount, opsPerSec) start at zero and
 // must come from real fills; this UI never fabricates fills or PnL (B1).
@@ -602,7 +603,7 @@ export default function App() {
         <TokenBoard onSelect={setSelectedMint} selected={selectedMint} />
         <aside className="col-span-12 lg:col-span-4 flex flex-col space-y-5" data-testid="home-side">
           <CurvePanel mint={selectedMint} />
-          {/* H3 panel mounts here */}
+          <AutoPanel />
         </aside>
       </main>
 

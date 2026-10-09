@@ -1667,7 +1667,7 @@ app.get('/api/execution/readiness', (req, res) => {
 
 // G1: auto-snipe controller. Mode lives in memory only, so every restart comes back OFF.
 app.get('/api/auto/status', requireOperatorAuth, (req, res) => {
-  res.json({ success: true, ...autoSnipeController.getStatus(), decisions: autoSnipeController.getDecisions(100) });
+  res.json({ success: true, ...autoSnipeController.getStatus(), stats: autoSnipeController.getJournalStats(), decisions: autoSnipeController.getDecisions(100) });
 });
 
 app.post('/api/auto/mode', requireOperatorAuth, validateTradeBody(AutoModeSchema), async (req, res) => {

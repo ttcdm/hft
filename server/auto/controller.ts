@@ -7,6 +7,7 @@ import { executionConfig } from '../solana/executionConfig';
 import { allowedCluster, assertClusterAllowed } from '../solana/clusterGuard';
 import { Logger } from '../middleware/enterprise';
 import type { SignalProvenance } from '../core/types';
+import { computeJournalStats, type JournalStats } from './journalStats';
 import { evaluateKillTriggers, auditWalletChange, type KillTrigger } from './killSwitch';
 import { riskEngine } from '../risk/riskEngine';
 import { watchWindow, HOT_MIN_SCORE } from '../signals/watchWindow';
@@ -117,6 +118,13 @@ export class AutoSnipeController extends EventEmitter {
 
   public getMode(): AutoMode {
     return this.mode;
+  }
+
+  /** Session stats straight from the decision journal. Journal rows since the current session started (or all rows when OFF). */
+  public getJournalStats(): JournalStats {
+    const rows = workstationDb.loadDecisions({ sinceTs: this.session?.startedAt, limit: 5000 });
+    const status = new Map(workstationDb.loadPositions().map((p) => [p.id, p.status as string]));
+    return computeJournalStats(rows, (id) => status.get(id));
   }
 
   public getDecisions(limit = 100): AutoDecision[] {
@@ -433,7 +441,7 @@ export class AutoSnipeController extends EventEmitter {
       }
       const d = this.record(c, 'BOUGHT', 'fill', res.message, {
         amountSol: res.amountSol, positionId: res.positionId, feesSol, unverified,
-        inputs: { confluenceScore: res.confluenceScore, quotePriceSol: res.quotePriceSol, fillPriceSol: res.fillPriceSol, gates: res.gates },
+        inputs: { confluenceScore: res.confluenceScore, quotePriceSol: res.quotePriceSol, fillPriceSol: res.fillPriceSol, feesSol, gates: res.gates },
       });
       this.enforceBudgets();
       return d;

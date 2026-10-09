@@ -175,6 +175,7 @@ describe('G1: auto-snipe controller', () => {
     const d2 = await autoSnipeController.submitCandidate(cand(newPool()));
     expect(d2.outcome).toBe('DROPPED');
     expect(d2.reason).toMatch(/MAX_OPEN_POSITIONS/);
+    workstationDb.savePosition({ ...workstationDb.loadPositions().find((p) => p.id === 'dv-open')!, status: 'CLOSED' } as any); // do not leak an open LIVE row into later tests
   });
 
   it('L2: every candidate re-checks the coordinator mode (PAPER auto with LIVE armed, DEVNET_LIVE with the coordinator in PAPER)', async () => {
@@ -202,6 +203,21 @@ describe('G1: auto-snipe controller', () => {
     expect(d2.outcome).toBe('REJECTED');
     expect(d2.reason).toMatch(/DEVNET_LIVE auto refused/);
     expect(snipe2).not.toHaveBeenCalled();
+  });
+
+  it('L9: a DEVNET_LIVE buy that would pass the real-SOL session spend limit is refused before it is sent', async () => {
+    vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
+    vi.stubEnv('ALLOWED_CLUSTER', 'devnet');
+    vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('LIVE');
+    vi.spyOn(executionCoordinator, 'isLiveArmed').mockReturnValue(true);
+    await autoSnipeController.setMode('DEVNET_LIVE', { confirmationCode: DEVNET_CONFIRMATION_CODE });
+    (autoSnipeController as any).session.spentSol = 0.02 - AUTO_DEVNET_ORDER_SOL / 2;
+    const snipe = vi.spyOn(memecoinAggregator, 'executeSnipe');
+    const d = await autoSnipeController.submitCandidate(cand(newPool()));
+    expect(d.outcome).toBe('REJECTED');
+    expect(d.stage).toBe('budget');
+    expect(d.reason).toMatch(/exceed the session spend limit/);
+    expect(snipe).not.toHaveBeenCalled();
   });
 
   it('kill drops to OFF and can exit what the session opened; later candidates are dropped', async () => {

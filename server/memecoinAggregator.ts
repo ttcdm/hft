@@ -443,6 +443,12 @@ export class MemecoinAggregatorService extends EventEmitter {
       };
     }
 
+    // A LIVE buy sized against a bankroll with nothing spendable would skip the 10% cap below (it only applies when spendable > 0)
+    // and go out at the full requested size. Refuse instead.
+    if (executionMode === 'LIVE' && !params.dryRun && !(sizingResult.spendableBankrollSol > 0)) {
+      return { success: false, message: 'REJECTED: NO_SPENDABLE_BANKROLL: the wallet has nothing spendable after the reserve, rent and in-flight orders', txHash: '' };
+    }
+
     let amountSol: number;
     let amountUsd: number;
 

@@ -414,6 +414,16 @@ export class AutoSnipeController extends EventEmitter {
       // already moved to SHADOW by enforceBudgets; carry on as a shadow run
     }
 
+    // Budgets are checked BEFORE spending: a buy that would take the session past its spend limit is refused, not allowed
+    // and then noticed on the next candidate.
+    // DEVNET_LIVE only: the cap is a real-SOL cap (0.02), a paper $5 order (~0.033 SOL) would never fit it.
+    if (this.session && mode === 'DEVNET_LIVE') {
+      const plannedSol = AUTO_DEVNET_ORDER_SOL;
+      if (this.session.spentSol + plannedSol > SESSION_BUDGETS.maxSpendSol) {
+        return this.record(c, 'REJECTED', 'budget', `would exceed the session spend limit (${this.session.spentSol.toFixed(4)} + ${plannedSol.toFixed(4)} > ${SESSION_BUDGETS.maxSpendSol} SOL)`);
+      }
+    }
+
     this.busy = true;
     this.attempted.add(key);
     try {

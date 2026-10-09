@@ -221,6 +221,19 @@ export class WorkstationDatabase {
     return this.dbPath;
   }
 
+  /** The last recorded all-trading halt state: a halt survives a restart until an operator clears it. */
+  public getPersistedHaltReason(): string | null {
+    try {
+      const row = this.db
+        .prepare(`SELECT event_type, payload_json FROM system_journal WHERE event_type IN ('TRADING_HALTED','TRADING_HALT_CLEARED') ORDER BY id DESC LIMIT 1`)
+        .get() as { event_type: string; payload_json: string } | undefined;
+      if (!row || row.event_type !== 'TRADING_HALTED') return null;
+      return String(JSON.parse(row.payload_json)?.reason ?? 'halted before restart');
+    } catch {
+      return null;
+    }
+  }
+
   public logJournal(eventType: string, correlationId: string, mode: ExecutionMode, payload: Record<string, any>) {
     try {
       const stmt = this.db.prepare(`

@@ -133,6 +133,14 @@ export class ExecutionCoordinator {
     }
     this.jitoTransport = new JitoTransport(this.connection);
     this.rpcTransport = new SolanaRpcTransport(this.connection);
+    if (this.isDefaultSingleton) {
+      // A halt (for example an unexplained wallet drain) must outlive a restart; only an operator clears it.
+      const persisted = workstationDb.getPersistedHaltReason();
+      if (persisted) {
+        this.haltReason = persisted;
+        Logger.error(`[HALT] Trading is still halted from before the restart: ${persisted}`);
+      }
+    }
     this.initializeConnection();
     this.startAutoPositionMonitor();
     this.startMarketFeedHeartbeat();
@@ -2280,10 +2288,12 @@ export class ExecutionCoordinator {
   public haltAll(reason: string): void {
     if (this.haltReason) return;
     this.haltReason = reason;
+    workstationDb.logJournal('TRADING_HALTED', 'halt', this.executionMode, { reason });
     this.raiseOperatorAlert('TRADING_HALTED', `All trading including exits is halted: ${reason}`);
   }
 
   public clearHalt(): void {
+    if (this.haltReason) workstationDb.logJournal('TRADING_HALT_CLEARED', 'halt', this.executionMode, {});
     this.haltReason = null;
     this.clearOperatorAlert('TRADING_HALTED');
   }
@@ -2722,9 +2732,14 @@ export class ExecutionCoordinator {
               pos.id
             );
           }
+          // A position nobody can price must age the mark feed from its entry, or an empty history would read as healthy.
+          if (this.lastPositionMarkTimestamp === 0) this.lastPositionMarkTimestamp = pos.entryTimestamp || now;
           continue;
         }
         this.clearOperatorAlert('POSITION_MARK_UNAVAILABLE', pos.id);
+        this.recordPositionMarkEvent();
+      } else {
+        this.recordPositionMarkEvent(); // a real mark within the staleness window
       }
 
       let decision = ExitEngine.evaluate({

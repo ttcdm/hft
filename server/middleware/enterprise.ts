@@ -213,7 +213,9 @@ export const WalletConfigSchema = z.object({
     .string()
     .url('RPC Endpoint must be a valid HTTP or HTTPS URL')
     .refine(isSafeExternalUrl, 'RPC Endpoint cannot point to private metadata services or use embedded credentials')
-    .default(DEFAULT_RPC_URL),
+    // Absent leaves the current endpoint alone. (A default here silently re-pointed the RPC at the public devnet URL on every
+    // config save, which also fails the cluster check when running against a local validator.)
+    .optional(),
   wsRpcEndpoint: z
     .string()
     .url('WebSocket RPC must be a valid WS or WSS URL')

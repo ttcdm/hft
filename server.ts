@@ -1471,13 +1471,17 @@ app.get('/api/wallet/state', (req, res) => {
   });
 });
 
-app.post('/api/wallet/config', requireOperatorAuth, validateBody(WalletConfigSchema), (req, res) => {
-  const updated = walletTrader.updateConfig(req.body);
-  res.json({
-    success: true,
-    config: updated,
-    state: walletTrader.getState(),
-  });
+app.post('/api/wallet/config', requireOperatorAuth, validateBody(WalletConfigSchema), async (req, res) => {
+  try {
+    const updated = await walletTrader.updateConfig(req.body);
+    res.json({
+      success: true,
+      config: updated,
+      state: walletTrader.getState(),
+    });
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message, state: walletTrader.getState() });
+  }
 });
 
 app.post('/api/wallet/toggle-trading', requireOperatorAuth, validateTradeBody(ArmSchema), (req, res) => {

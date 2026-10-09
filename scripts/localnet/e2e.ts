@@ -57,8 +57,9 @@ async function freePortPair(): Promise<number> {
 function startProc(name: string, args: string[], env: NodeJS.ProcessEnv): ChildProcess {
   const c = spawn(process.execPath, args, { cwd: ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
   logs[name] = [];
-  c.stdout!.on('data', (d) => logs[name].push(String(d)));
-  c.stderr!.on('data', (d) => logs[name].push(String(d)));
+  const logFile = path.join(scratch, `${name}.log`);
+  c.stdout!.on('data', (d) => { logs[name].push(String(d)); fs.appendFileSync(logFile, d); });
+  c.stderr!.on('data', (d) => { logs[name].push(String(d)); fs.appendFileSync(logFile, d); });
   children.push(c);
   return c;
 }
@@ -146,12 +147,40 @@ async function main() {
     return { tx, sig };
   }
 
+  async function marketBuyTx(kp: Keypair, m: PublicKey, sol: number) {
+    const state = (await PumpCurveService.fetchPumpMarketState({ connection: conn, mint: m, executionMode: 'LIVE' }))!;
+    const q = PumpCurveService.calculateBuyQuote({ state, amountSol: sol, slippageBps: 2000, jitoTipSol: 0, priorityFeeLamports: 0, executionMode: 'LIVE' } as any);
+    const tx = await txBuilder.buildBuyTransaction(conn, {
+      buyer: kp.publicKey, mint: m, bondingCurve: state.bondingCurve, associatedBondingCurve: state.associatedBondingCurve,
+      associatedUser: PumpCurveService.getAssociatedTokenAddress(m, kp.publicKey, state.tokenProgram), creator: state.creator,
+      feeRecipient: state.feeRecipient, buybackFeeRecipient: state.buybackFeeRecipient, quoteMint: state.quoteMint,
+      tokenProgram: state.tokenProgram, quoteTokenProgram: state.quoteTokenProgram, amountTokens: BigInt(q.tokenAmountRaw),
+      maxSolCostLamports: BigInt(q.maxInputLamports), computeUnits: 300_000, priorityFeeMicroLamports: 1000, jitoTipLamports: 0n,
+    } as any);
+    tx.sign([kp]);
+    return tx;
+  }
+
+  /** create_v2 + a small creator buy + 14 other buyers, so the app's own safety filters (creator share, top-10, liquidity) pass honestly. */
+  async function seedCoin(): Promise<PublicKey> {
+    const m = await createCoin();
+    await marketBuy(creator, m, 0.2);
+    for (let i = 0; i < 14; i++) {
+      const w = Keypair.generate();
+      await conn.requestAirdrop(w.publicKey, 2 * LAMPORTS_PER_SOL);
+      await marketBuy(w, m, 0.6);
+    }
+    return m;
+  }
+
   let mint: PublicKey;
+  let mintD: PublicKey;
+  let mintE: PublicKey;
+  let mintF: PublicKey;
   try {
     mint = await createCoin();
     rec('seed: create_v2', true, `mint ${mint.toBase58()} created by the real pump program`);
     await marketBuy(creator, mint, 0.2);
-    // A realistic distribution so the app's own safety filters (creator share, top-10 share, liquidity) have something to judge.
     for (let i = 0; i < 14; i++) {
       const w = Keypair.generate();
       await conn.requestAirdrop(w.publicKey, 2 * LAMPORTS_PER_SOL);
@@ -159,6 +188,11 @@ async function main() {
     }
     const st = (await PumpCurveService.fetchPumpMarketState({ connection: conn, mint, executionMode: 'LIVE' }))!;
     rec('seed: 15 buyers', st.realSolReserves > 0n && !st.complete, `real SOL reserves ${Number(st.realSolReserves) / 1e9}, virtual ${Number(st.virtualSolReserves) / 1e9}`);
+    // The app has a per-mint cooldown, so each failure scenario gets its own coin.
+    mintD = await seedCoin();
+    mintE = await seedCoin();
+    mintF = await seedCoin();
+    rec('seed: 3 more coins (revert, failed-send, restart scenarios)', true, [mintD, mintE, mintF].map((m) => m.toBase58()).join(' '));
   } catch (e: any) {
     rec('seed market', false, String(e?.stack || e).slice(0, 600));
     return finish();
@@ -210,8 +244,8 @@ async function main() {
   const signer = await call('GET', '/api/signer/status');
   rec('signer', signer.body?.pubkey === trader.publicKey.toBase58() || signer.body?.publicKey === trader.publicKey.toBase58(), JSON.stringify(signer.body).slice(0, 200));
 
-  const ata = async () => {
-    const accts = await conn.getTokenAccountsByOwner(trader.publicKey, { mint });
+  const ata = async (m: PublicKey = mint) => {
+    const accts = await conn.getTokenAccountsByOwner(trader.publicKey, { mint: m });
     if (!accts.value.length) return null;
     return BigInt((await conn.getTokenAccountBalance(accts.value[0].pubkey)).value.amount);
   };
@@ -247,6 +281,86 @@ async function main() {
   const after = await ata();
   const rentBack = (await conn.getBalance(trader.publicKey)) - balBefore100;
   rec('(c) ATA closed and rent reclaimed', after === null, `ATA ${after === null ? 'closed' : 'still open ' + after}; wallet delta ${rentBack / LAMPORTS_PER_SOL} SOL (includes sale proceeds)`);
+
+  // ---- read endpoints and guards over HTTP ----
+  for (const ep of ['/api/execution/readiness', '/api/wallet/state', '/api/memecoins/positions', '/api/workstation/positions', '/api/diagnostics/system']) {
+    const r = await call('GET', ep);
+    rec(`GET ${ep}`, r.status === 200 && r.body?.success !== false, `status ${r.status}`);
+  }
+  const curve = await call('GET', `/api/market/curve/${mint.toBase58()}`);
+  rec('GET /api/market/curve/:mint (real reserves)', curve.status === 200 && curve.body?.success === true, JSON.stringify(curve.body).slice(0, 220));
+  const mainnetCfg = await call('POST', '/api/wallet/config', { walletAddress: trader.publicKey.toBase58(), rpcEndpoint: 'https://api.mainnet-beta.solana.com', enabledStrategies: { pumpFunSniper: true }, riskLimits: {} });
+  rec('K6: POST /api/wallet/config with a mainnet RPC is refused', mainnetCfg.status === 400 && /CLUSTER_GUARD/.test(JSON.stringify(mainnetCfg.body)), JSON.stringify(mainnetCfg.body).slice(0, 260));
+  const connAfter = await call('GET', '/api/wallet/state');
+  rec('K6: RPC endpoint unchanged after the refused switch', JSON.stringify(connAfter.body).includes('mainnet') === false, 'wallet state mentions no mainnet endpoint');
+
+  // ---- (d) forced on-chain revert: a competing buy lands between the app's quote and its send ----
+  const rivalFund = Keypair.generate();
+  await conn.requestAirdrop(rivalFund.publicKey, 5 * LAMPORTS_PER_SOL);
+  const rival = await marketBuyTx(rivalFund, mintD, 1.5);
+  await rpcCall(info.url, 'localnet_frontrunNext', [Buffer.from(rival.serialize()).toString('base64')]);
+  const posBefore = ((await positions()) as any);
+  const revert = await call('POST', '/api/execution/trade', { mint: mintD.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02, slippageBps: 1 });
+  const posAfterList: any[] = Array.isArray(await positions()) ? ((await positions()) as any) : ((await positions()) as any)?.positions || [];
+  const openLcl = posAfterList.filter((x) => x.mint === mintD.toBase58() && (x.status === 'ACTIVE' || x.status === 'PARTIALLY_CLOSED'));
+  rec('(d) forced revert: app reports failure, no phantom position', revert.body?.success === false && openLcl.length === 0, `${revert.status} ${JSON.stringify(revert.body).slice(0, 330)}; open positions on mint: ${openLcl.length}`);
+  void posBefore;
+  const ataAfterRevert = await ata(mintD);
+  rec('(d) wallet holds no tokens after the revert', ataAfterRevert === null || ataAfterRevert === 0n, `ATA ${ataAfterRevert}`);
+
+  // The app pauses all execution for 15 s after a failure (EXECUTION_DISABLED: cooling down); that is itself behaviour worth seeing.
+  const cooling = await call('POST', '/api/execution/trade', { mint: mintE.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02 });
+  rec('(d) failure cooldown blocks the next trade', cooling.body?.success === false && /Cooling down/.test(JSON.stringify(cooling.body)), JSON.stringify(cooling.body).slice(0, 200));
+  await sleep(16_000);
+  // ---- (e) transient send failure: the app must not double-buy ----
+  await rpcCall(info.url, 'localnet_failNextSends', [1]);
+  const flaky = await call('POST', '/api/execution/trade', { mint: mintE.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02 });
+  const flakyList: any[] = (await positions()) as any;
+  const flat = Array.isArray(flakyList) ? flakyList : (flakyList as any)?.positions || [];
+  const openFlaky = flat.filter((x: any) => x.mint === mintE.toBase58() && (x.status === 'ACTIVE' || x.status === 'PARTIALLY_CLOSED'));
+  const chainFlaky = await ata(mintE);
+  rec('(e) one failed send: at most one position, db qty == chain qty', openFlaky.length <= 1 && (openFlaky.length === 0 ? (chainFlaky ?? 0n) === 0n : BigInt(openFlaky[0].tokenQuantityRaw) === chainFlaky), `trade -> ${flaky.status} ${JSON.stringify(flaky.body).slice(0, 220)}; positions ${openFlaky.length}; chain ${chainFlaky}`);
+
+  await sleep(16_000);
+  // ---- (f) kill the app right after a buy lands on-chain, restart it on the same database ----
+  await rpcCall(info.url, 'localnet_holdNextResponse', []);
+  const inFlight = fetch(`${base}/api/execution/trade`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ mint: mintF.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02 }) }).catch(() => null);
+  let held: string[] = [];
+  for (let i = 0; i < 60 && !held.length; i++) {
+    await sleep(250);
+    held = (await rpcCall(info.url, 'localnet_stats', [])).held;
+  }
+  rec('(f) buy landed on-chain with its response withheld', held.length === 1, `signature ${held[0] ?? 'none'}`);
+  proc.kill('SIGKILL');
+  await inFlight;
+  await sleep(500);
+  const chainAfterKill = await ata(mintF);
+  ({ base, proc } = await startServer());
+  call = api(base);
+  const armAgain = await call('POST', '/api/execution/arm', { arm: true, confirmationCode: 'CONFIRM_LIVE_TRADING_RISK' });
+  const recon = await call('POST', '/api/execution/reconcile', {});
+  // orphan recovery runs in the background after startup; give it a moment, then ask for the book
+  let recovered: any = null;
+  for (let i = 0; i < 40 && !recovered; i++) {
+    const list: any = await positions();
+    const arr = Array.isArray(list) ? list : list?.positions || [];
+    recovered = arr.find((x: any) => x.mint === mintF.toBase58() && x.status !== 'CLOSED' && BigInt(x.tokenQuantityRaw) > 0n) ?? null;
+    if (!recovered) await sleep(500);
+  }
+  rec('(f) restart: position recovered from the chain', !!recovered && chainAfterKill !== null && BigInt(recovered.tokenQuantityRaw) === chainAfterKill, `reconcile ${recon.status} ${JSON.stringify(recon.body).slice(0, 160)}; db=${recovered?.tokenQuantityRaw} chain=${chainAfterKill}; re-arm ${armAgain.status} ${JSON.stringify(armAgain.body).slice(0, 900)}`);
+  if (recovered) {
+    const closeRecovered = await call('POST', '/api/execution/close', { positionId: recovered.id, sellPct: 100, reason: 'localnet recovered position' });
+    rec('(f) recovered position can be sold', closeRecovered.status === 200 && closeRecovered.body?.success, JSON.stringify(closeRecovered.body).slice(0, 260));
+  }
+
+  // ---- kill switch over HTTP ----
+  const ks = await call('POST', '/api/execution/kill-switch', { activate: true });
+  const blocked = await call('POST', '/api/execution/trade', { mint: mintE.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02 });
+  rec('kill switch blocks new buys', ks.status === 200 && blocked.body?.success === false, `${blocked.status} ${JSON.stringify(blocked.body).slice(0, 200)}`);
+  await call('POST', '/api/execution/kill-switch', { activate: false });
+
+  const stats = await rpcCall(info.url, 'localnet_stats', []);
+  rec('RPC surface: no unsupported method was called', stats.unsupported.length === 0, `calls: ${JSON.stringify(stats.methods)}; unsupported: ${JSON.stringify(stats.unsupported)}`);
 
   return finish();
 

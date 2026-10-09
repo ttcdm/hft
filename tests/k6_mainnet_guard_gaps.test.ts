@@ -2,6 +2,9 @@ import { describe, it, expect, afterEach, vi } from 'vitest';
 import { Connection } from '@solana/web3.js';
 import { ExecutionCoordinator } from '../server/execution/coordinator';
 import { CLUSTER_GENESIS_HASH } from '../server/solana/clusterGuard';
+import { walletTrader } from '../server/walletTrader';
+import { executionCoordinator } from '../server/execution/coordinator';
+import { WalletConfigSchema } from '../server/middleware/enterprise';
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -100,5 +103,28 @@ describe('K6: mainnet-guard gaps', () => {
         c.cleanup();
       }
     });
+  });
+});
+
+describe('K6: POST /api/wallet/config path', () => {
+  it('the schema no longer defaults rpcEndpoint (a save used to re-point the RPC at the public devnet URL)', () => {
+    const parsed = WalletConfigSchema.parse({ walletAddress: 'So11111111111111111111111111111111111111112', enabledStrategies: {}, riskLimits: {} });
+    expect(parsed.rpcEndpoint).toBeUndefined();
+  });
+
+  it('updateConfig rejects a mainnet RPC and leaves the stored endpoint and connection alone', async () => {
+    const before = walletTrader.getState();
+    const beforeEndpoint = (walletTrader as any).config.rpcEndpoint;
+    const setSpy = vi.spyOn(executionCoordinator, 'setRpcEndpoint');
+    await expect(walletTrader.updateConfig({ rpcEndpoint: 'https://api.mainnet-beta.solana.com' } as any)).rejects.toThrow(/RPC endpoint rejected: CLUSTER_GUARD/);
+    expect(setSpy).toHaveBeenCalledTimes(1);
+    expect((walletTrader as any).config.rpcEndpoint).toBe(beforeEndpoint);
+    expect(walletTrader.getState().walletAddress).toBe(before.walletAddress);
+  });
+
+  it('a config save without rpcEndpoint does not touch the connection', async () => {
+    const setSpy = vi.spyOn(executionCoordinator, 'setRpcEndpoint');
+    await walletTrader.updateConfig({ allocatedSol: 0.07 } as any);
+    expect(setSpy).not.toHaveBeenCalled();
   });
 });

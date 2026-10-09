@@ -1067,6 +1067,8 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
         value: { amount: '500000000000', decimals: 6, uiAmount: 500000 },
       } as any);
 
+      // No wallet token balances to find; the scan itself is covered in p3b. (Without this stub it hit the real network.)
+      vi.spyOn(Connection.prototype, 'getParsedTokenAccountsByOwner').mockResolvedValue({ context: { slot: 280005000 }, value: [] } as any);
       const reconResult = await coordinator.startupReconciliation();
 
       // Transaction must now be marked RECONCILED
@@ -1164,6 +1166,8 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
         value: { amount: '500000000000', decimals: 6, uiAmount: 500000 },
       } as any);
 
+      // No wallet token balances to find; the scan itself is covered in p3b. (Without this stub it hit the real network.)
+      vi.spyOn(Connection.prototype, 'getParsedTokenAccountsByOwner').mockResolvedValue({ context: { slot: 280005000 }, value: [] } as any);
       const reconResult = await coordinator.startupReconciliation();
 
       const savedTx = workstationDb.loadTransactions().find((t) => t.signature === partSellSig);

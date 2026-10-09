@@ -227,10 +227,12 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     };
   }
 
-  public updateConfig(newConfig: Partial<WalletTraderConfig>): WalletTraderConfig {
-    if (newConfig.rpcEndpoint) {
+  /** Throws (before changing anything) when the new RPC endpoint is refused by the cluster guard or unreachable. */
+  public async updateConfig(newConfig: Partial<WalletTraderConfig>): Promise<WalletTraderConfig> {
+    if (newConfig.rpcEndpoint && newConfig.rpcEndpoint !== this.config.rpcEndpoint) {
+      const switched = await executionCoordinator.setRpcEndpoint(newConfig.rpcEndpoint);
+      if (!switched.success) throw new Error(`RPC endpoint rejected: ${switched.error ?? 'unknown error'}`);
       this.config.rpcEndpoint = newConfig.rpcEndpoint;
-      executionCoordinator.setRpcEndpoint(newConfig.rpcEndpoint);
     }
     if (newConfig.jitoBlockEngineUrl) {
       this.config.jitoBlockEngineUrl = newConfig.jitoBlockEngineUrl;

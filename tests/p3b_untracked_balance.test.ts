@@ -144,4 +144,11 @@ describe('P3b: untracked wallet token balances', () => {
     // an adopted balance is reported in the details but does not by itself count as a mismatch (the DB is shared with earlier tests, so the overall status is not asserted)
     expect(res.mismatchesCount).toBe(res.details.split('; ').filter((d) => /have no position record|recorded active|Failed to verify|confirmed but/.test(d)).length);
   });
+  it('a failed wallet scan is not "all clear": startup reconciliation reports a mismatch and arming stays blocked', async () => {
+    vi.mocked(Connection.prototype.getParsedTokenAccountsByOwner).mockRejectedValue(new Error('rpc refused'));
+    const r = await coordinator.startupReconciliation();
+    expect(r.status).toBe('RECONCILIATION_MISMATCH');
+    expect(r.details).toMatch(/Wallet token scan failed/);
+    expect(coordinator.canExecuteLive().reasons.join(' ')).toMatch(/Startup reconciliation has unresolved issues/);
+  });
 });

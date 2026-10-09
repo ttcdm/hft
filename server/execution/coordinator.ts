@@ -666,7 +666,10 @@ export class ExecutionCoordinator {
           issues.push(`${scan.untracked.length} wallet token balance(s) had no position: ${scan.adopted.length} adopted for exit monitoring, ${scan.untracked.length - scan.adopted.length} unpriced`);
         }
       } catch (e: any) {
+        // Unknown is not "fine": a wallet balance with no stop-loss is exactly what this scan exists to find.
         Logger.warn(`Untracked-balance scan failed: ${e.message}`);
+        mismatchesCount++;
+        issues.push(`Wallet token scan failed (${String(e.message).slice(0, 80)}); untracked balances cannot be ruled out`);
       }
     }
 
@@ -2623,6 +2626,7 @@ export class ExecutionCoordinator {
       }
 
       workstationDb.savePosition(target);
+      workstationDb.markTransactionReconciled(subRes.signature, { slot: sellRecon.slot, networkFeeLamports: sellRecon.actualNetworkFeeLamports });
       await this.syncRealWalletBalance();
 
       return {

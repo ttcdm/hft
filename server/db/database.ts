@@ -402,6 +402,25 @@ export class WorkstationDatabase {
     }
   }
 
+  /**
+   * A submitted transaction is saved PENDING. The BUY path promoted it to RECONCILED after reconciliation but the SELL path
+   * never did, so after any restart startup reconciliation re-examined every old sell and flagged the earlier part of a
+   * partial-sell sequence as "could not match open position", blocking arming (found by the localnet end-to-end run).
+   */
+  public markTransactionReconciled(signature: string, landing: { slot?: number; networkFeeLamports?: number } = {}) {
+    try {
+      this.db
+        .prepare(
+          `UPDATE transactions SET reconciliation_state = 'RECONCILED', confirmation_time = ?,
+             landing_slot = COALESCE(?, landing_slot), network_fee_lamports = COALESCE(?, network_fee_lamports)
+           WHERE signature = ?`
+        )
+        .run(Date.now(), landing.slot || null, landing.networkFeeLamports ?? null, signature);
+    } catch (err: any) {
+      Logger.error(`Failed to mark transaction ${signature} reconciled: ${err.message}`);
+    }
+  }
+
   public getPendingTransactions(): PersistedTransaction[] {
     try {
       const stmt = this.db.prepare(`

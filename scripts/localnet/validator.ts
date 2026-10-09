@@ -474,7 +474,8 @@ export class LocalnetValidator {
           if (filter.programId && t.programId !== filter.programId) return false;
           return true;
         });
-        if (method === 'getTokenAccountsByOwner') {
+        // web3.js sends getParsedTokenAccountsByOwner as getTokenAccountsByOwner with encoding jsonParsed.
+        if (method === 'getTokenAccountsByOwner' && params[2]?.encoding !== 'jsonParsed') {
           return this.ctx(rows.map((k) => ({ pubkey: k, account: this.acct(new PublicKey(k), 'base64') })));
         }
         return this.ctx(rows.map((k) => this.parsedTokenEntry(k)));

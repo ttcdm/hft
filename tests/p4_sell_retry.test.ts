@@ -108,6 +108,23 @@ describe('P4: sell preflight, slippage ladder and retry backoff', () => {
     expect(coordinator.getExitFailureCount(posId)).toBe(0);
   });
 
+  it('a landed sell promotes its PENDING transaction row to RECONCILED (else every restart re-flags it)', async () => {
+    simulate.mockImplementation(async () => ({ context: { slot: 1 }, value: { err: null, logs: [] } }));
+    const sig = `sellsig_${posId}`;
+    submit.mockResolvedValue({ success: true, signature: sig, transport: 'SOLANA_RPC', slot: 5, lifecycleState: 'CONFIRMED' });
+    workstationDb.saveTransaction({
+      signature: sig, orderId: `o_${posId}`, correlationId: `c_${posId}`, mint: VALID_PUMP_MINT_1.toBase58(), direction: 'SELL',
+      submissionTransport: 'SOLANA_RPC', submissionTime: Date.now(), reconciliationState: 'PENDING', networkFeeLamports: 5000, jitoTipLamports: 0, executionMode: 'LIVE',
+    });
+    expect(workstationDb.getPendingTransactions().some((t) => t.signature === sig)).toBe(true);
+    const res = await coordinator.closePosition(posId, 100, 'MANUAL');
+    expect(res.success).toBe(true);
+    expect(workstationDb.getPendingTransactions().some((t) => t.signature === sig)).toBe(false);
+    const row = workstationDb.loadTransactions(`o_${posId}`).find((t) => t.signature === sig)!;
+    expect(row.reconciliationState).toBe('RECONCILED');
+    expect(row.landingSlot).toBe(6);
+  });
+
   it('if the simulation call itself fails the sell is still sent', async () => {
     simulate.mockImplementation(async () => { throw new Error('rpc down'); });
     const res = await coordinator.closePosition(posId, 100, 'STOP_LOSS');

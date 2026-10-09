@@ -206,7 +206,8 @@ describe('R1: cluster guard', () => {
           else if (/\.(ts|cjs|mjs)$/.test(entry.name)) {
             const text = read(rel);
             const hits = text.match(/https?:\/\/[^\s'"`)]*(mainnet|jito\.wtf)[^\s'"`)]*/gi) || [];
-            if (hits.length && rel !== path.join('server', 'solana', 'transports.ts')) offenders.push(`${rel}: ${hits.join(', ')}`);
+            // the localnet e2e harness names a mainnet URL on purpose, to prove the app refuses it
+            if (hits.length && rel !== path.join('server', 'solana', 'transports.ts') && rel !== path.join('scripts', 'localnet', 'e2e.ts')) offenders.push(`${rel}: ${hits.join(', ')}`);
           }
         }
       };

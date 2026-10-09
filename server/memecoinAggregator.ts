@@ -385,7 +385,13 @@ export class MemecoinAggregatorService extends EventEmitter {
     } else if (solPriceService.lastKnownPrice() === null) {
       return { success: false, message: 'REJECTED: SOL_PRICE_UNAVAILABLE: no SOL/USD price has been read yet', txHash: '' };
     }
-    const walletBalanceSol = executionCoordinator.getRealWalletBalanceSol() ?? 0.07;
+    // C3: LIVE never assumes a wallet balance. With no real balance read, reject; PAPER keeps the 0.07 SOL paper default
+    // (C5 moves that default into the configured paper bankroll).
+    const realWalletBalanceSol = executionCoordinator.getRealWalletBalanceSol();
+    if (executionMode === 'LIVE' && (realWalletBalanceSol === null || realWalletBalanceSol === undefined)) {
+      return { success: false, message: 'REJECTED: WALLET_BALANCE_UNKNOWN: no real wallet balance has been read', txHash: '' };
+    }
+    const walletBalanceSol = realWalletBalanceSol ?? 0.07;
     const historicalStats = CapitalSizer.getHistoricalTradeStats(executionMode);
     const sizingResult = CapitalSizer.calculateOrderSize({
       walletBalanceSol,

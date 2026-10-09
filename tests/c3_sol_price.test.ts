@@ -76,6 +76,16 @@ describe('C3: single SOL/USD price service', () => {
     expect(exec).not.toHaveBeenCalled();
   });
 
+  it('LIVE never assumes a wallet balance: an unread balance rejects the snipe', async () => {
+    const exec = vi.spyOn(executionCoordinator, 'executeTrade');
+    vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('LIVE');
+    vi.spyOn(executionCoordinator, 'getRealWalletBalanceSol').mockReturnValue(null);
+    const r = await memecoinAggregator.executeSnipe({ contractAddress: MINT_A, amountUsd: 5 });
+    expect(r.success).toBe(false);
+    expect(r.message).toContain('WALLET_BALANCE_UNKNOWN');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
   it('the risk engine derives the daily-loss SOL cap from the live price unless one is pinned', () => {
     const r = new HardenedRiskEngine();
     solPriceService.setPrice(100, 'TEST');

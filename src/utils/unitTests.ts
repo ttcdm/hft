@@ -805,7 +805,7 @@ export function runAllHighStakesTests(): HighStakesSuiteSummary {
   const totalDurationMs = performance.now() - start;
 
   return {
-    suite: `Apex Quant High-Stakes Microsecond Unit Test Suite (${UNIT_TESTS.length} Tests)`,
+    suite: `Apex Quant Built-in self-checks on toy data; not the repo test suite (${UNIT_TESTS.length} checks)`,
     status: failed === 0 ? 'ALL_TESTS_PASSED' : 'TESTS_FAILED',
     totalTests: results.length,
     passed,
@@ -873,7 +873,7 @@ export function streamHighStakesTests(
     } else {
       const totalDurationMs = performance.now() - start;
       onComplete({
-        suite: `Apex Quant High-Stakes Microsecond Unit Test Suite (${results.length} Tests)`,
+        suite: `Apex Quant Built-in self-checks on toy data; not the repo test suite (${results.length} checks)`,
         status: failedCount === 0 ? 'ALL_TESTS_PASSED' : 'TESTS_FAILED',
         totalTests: results.length,
         passed: passedCount,

@@ -1,12 +1,15 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { PublicKey } from '@solana/web3.js';
+import { Keypair, PublicKey, SystemProgram, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
+import bs58 from 'bs58';
 import { ConfluenceEngine } from '../../../server/signals/confluenceEngine';
 import { ExecutionCoordinator } from '../../../server/execution/coordinator';
 import { WorkstationDatabase } from '../../../server/db/database';
 import { riskEngine } from '../../../server/risk/riskEngine';
 import { JitoTransport } from '../../../server/solana/transports';
-import { executionConfig } from '../../../server/solana/executionConfig';
 import { NormalizedPosition } from '../../../server/core/types';
+import { CapitalSizer } from '../../../server/capital/capitalSizer';
+import { SocialAlphaScanner } from '../../../server/socialScanner';
+import { isLiveApprovedProvenance } from '../../../server/core/types';
 import { ExitEngine } from '../../../server/exits/exitEngine';
 import { VALID_PUMP_MINT_1 } from '../helpers/simulatedStates';
 import { MockSolanaRpc } from '../helpers/mockRpc';
@@ -62,7 +65,6 @@ describe('Tier 1: Feature Coverage (Features 16 - 20)', () => {
     });
 
     it('F16.2: enforces bounded tip escalation capped within policy max limit', () => {
-      const limits = riskEngine.getLimits();
       const attemptedTipLamports = 60_000_000; // > 50_000_000 max
 
       const res = riskEngine.evaluateOrder({
@@ -126,56 +128,48 @@ describe('Tier 1: Feature Coverage (Features 16 - 20)', () => {
       expect(['INSUFFICIENT_BALANCE', 'EXPECTED_EDGE_BELOW_EXECUTION_COST']).toContain(res.reasonCode);
     });
 
-    it('F16.5: preserves single logical clientOrderId on transport retry / fallback', () => {
-      const orderId = `unique_client_order_${Date.now()}`;
-      testDb.saveOrder({
-        id: orderId,
-        clientOrderId: orderId,
-        correlationId: 'corr_fb_1',
-        mint: VALID_PUMP_MINT_1.toBase58(),
-        symbol: 'FALLBACK',
-        side: 'BUY',
-        amountLamports: 10_000_000,
-        expectedTokensRaw: '1000000000',
-        slippageBps: 500,
-        status: 'SUBMITTED',
-        executionMode: 'PAPER',
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      });
+    it('F16.5: preserves single logical clientOrderId on transport retry / fallback', async () => {
+      const jito = new JitoTransport(mockRpc.createConnection(), mockJito.getUrl());
+      const payer = Keypair.generate().publicKey;
+      const msg = new TransactionMessage({
+        payerKey: payer,
+        recentBlockhash: PublicKey.default.toBase58(),
+        instructions: [
+          SystemProgram.transfer({ fromPubkey: payer, toPubkey: Keypair.generate().publicKey, lamports: 5000 }),
+        ],
+      }).compileToV0Message();
+      const tx = new VersionedTransaction(msg);
+      tx.signatures = [new Uint8Array(64).fill(7)];
+      const logicalSignature = bs58.encode(tx.signatures[0]);
 
-      testDb.saveTransaction({
-        signature: 'jito_tx_sig_timeout',
-        bundleId: 'jito_bundle_timeout',
-        orderId,
-        correlationId: 'corr_fb_1',
-        mint: VALID_PUMP_MINT_1.toBase58(),
-        direction: 'BUY',
-        submissionTransport: 'JITO',
-        submissionTime: Date.now() - 5000,
-        reconciliationState: 'TIMED_OUT',
-        networkFeeLamports: 5000,
-        jitoTipLamports: 100_000,
-        executionMode: 'PAPER',
-      });
+      const submitSpy = vi
+        .spyOn(jito, 'submit')
+        .mockResolvedValueOnce({
+          signature: logicalSignature,
+          transport: 'JITO',
+          success: false,
+          submitDurationMs: 1,
+          lifecycleState: 'SUBMIT_FAILED',
+          error: 'Jito submit exception: timeout',
+        })
+        .mockResolvedValueOnce({
+          signature: logicalSignature,
+          transport: 'JITO',
+          success: true,
+          bundleId: 'bundle_retry_ok',
+          submitDurationMs: 1,
+          lifecycleState: 'SUBMITTED_TO_JITO',
+        });
 
-      testDb.saveTransaction({
-        signature: 'rpc_tx_sig_fallback_landed',
-        orderId,
-        correlationId: 'corr_fb_1',
-        mint: VALID_PUMP_MINT_1.toBase58(),
-        direction: 'BUY',
-        submissionTransport: 'SOLANA_RPC',
-        submissionTime: Date.now(),
-        reconciliationState: 'RECONCILED',
-        networkFeeLamports: 5000,
-        jitoTipLamports: 0,
-        executionMode: 'PAPER',
-      });
+      const res = await jito.submitWithRetry(tx, 2, 0);
 
-      testDb.logJournal('FALLBACK_PROCESSED', 'corr_fb_1', 'PAPER', { orderId, fallbackSignature: 'rpc_tx_sig_fallback_landed' });
-      const events = testDb.getEvents(5);
-      expect(events.some((e) => e.eventType === 'FALLBACK_PROCESSED')).toBe(true);
+      expect(res.success).toBe(true);
+      expect(res.attempts).toBe(2);
+      // Every retry re-submits the very same signed transaction: one logical signature, never re-signed.
+      expect(submitSpy).toHaveBeenCalledTimes(2);
+      expect(submitSpy.mock.calls[0][0]).toBe(tx);
+      expect(submitSpy.mock.calls[1][0]).toBe(tx);
+      expect(res.signature).toBe(logicalSignature);
     });
   });
 
@@ -183,53 +177,22 @@ describe('Tier 1: Feature Coverage (Features 16 - 20)', () => {
   // Feature 17: R5 Copy Trading
   // ===========================================================================
   describe('Feature 17: R5 Copy Trading', () => {
-    it('F17.1: decodes and recognizes tracked wallet buy event on Pump.fun', () => {
-      const mockTrackedBuyEvent = {
-        wallet: '7xK9JU1bJJE96TLNxzbVjyD3bV71jVj1v9SmartTrader',
-        type: 'BUY',
-        mint: VALID_PUMP_MINT_1.toBase58(),
-        solAmount: 5.0, // Copied wallet buys 5 SOL
-        timestamp: Date.now(),
-      };
-
-      expect(mockTrackedBuyEvent.type).toBe('BUY');
-      expect(mockTrackedBuyEvent.mint).toBe(VALID_PUMP_MINT_1.toBase58());
-    });
-
-    it('F17.2: tags extracted candidate signal with mandatory COPY_TRADE provenance', () => {
-      const candidate = {
-        mint: VALID_PUMP_MINT_1.toBase58(),
-        symbol: 'COPY',
-        name: 'Copied Token',
-        provenance: 'COPY_TRADE' as const,
-        detectedAt: Date.now(),
-      };
-
-      expect(candidate.provenance).toBe('COPY_TRADE');
-    });
-
     it('F17.3: APEX sizes its trade independently decoupling from copied wallet size (MICRO_10 cap)', () => {
-      const copiedTradeSizeSol = 50.0; // Whale buys 50 SOL
-      const apexBankrollSol = 0.07;
-      const spendableBankrollSol = apexBankrollSol - 0.015; // 0.055 SOL
-      const maxApexSizeSol = spendableBankrollSol * 0.10;   // 0.0055 SOL <= 0.007 SOL hard cap
+      const sizer = new CapitalSizer();
+      const sizing = sizer.calculateOrderSize({
+        walletBalanceSol: 0.07,
+        winProbability: 0.8,
+        winLossRatio: 3,
+        historicalTradeCount: 100,
+      });
 
-      const determinedSize = Math.min(maxApexSizeSol, 0.007);
-      expect(determinedSize).toBeLessThanOrEqual(0.007);
-      expect(determinedSize).toBeLessThan(copiedTradeSizeSol);
-    });
-
-    it('F17.4: deduplicates concurrent copy signals for the same mint across multiple tracked wallets', () => {
-      const candidateCache = new Set<string>();
-      const candidate1 = VALID_PUMP_MINT_1.toBase58();
-      const candidate2 = VALID_PUMP_MINT_1.toBase58();
-
-      const isFirstNew = !candidateCache.has(candidate1);
-      candidateCache.add(candidate1);
-
-      const isSecondNew = !candidateCache.has(candidate2);
-      expect(isFirstNew).toBe(true);
-      expect(isSecondNew).toBe(false); // Deduped!
+      // Sizing derives only from APEX's own spendable bankroll (0.07 - 0.015 reserve), never from the copied wallet's trade.
+      expect(sizing.approved).toBe(true);
+      expect(sizing.spendableBankrollSol).toBeCloseTo(0.055, 6);
+      expect(sizing.isHardCapped).toBe(true);
+      expect(sizing.appliedFraction).toBe(CapitalSizer.DEFAULT_MAX_CAPITAL_PCT_CEILING);
+      expect(sizing.orderSizeSol).toBeCloseTo(0.0055, 6);
+      expect(sizing.orderSizeSol).toBeLessThanOrEqual(0.007);
     });
 
     it('F17.5: copy trade candidate enters canonical execution path and respects risk rejection', async () => {
@@ -258,45 +221,47 @@ describe('Tier 1: Feature Coverage (Features 16 - 20)', () => {
   // Feature 18: R6 Social Signals
   // ===========================================================================
   describe('Feature 18: R6 Social Signals', () => {
-    it('F18.1: extracts valid Solana base58 contract address from social post text using regex', () => {
-      const text = '🚨 GEM CALL! Check out this launch: CzLSujWBLFsSjncfkh59rQD4NJYsZUMffEFrNJfiBAGS to the moon!';
-      const solanaAddressRegex = /\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/g;
-      const matches = text.match(solanaAddressRegex);
-
-      expect(matches).toBeDefined();
-      expect(matches?.[0]).toBe('CzLSujWBLFsSjncfkh59rQD4NJYsZUMffEFrNJfiBAGS');
-    });
-
     it('F18.2: assigns mandatory REAL_SOCIAL provenance to social candidates', () => {
-      const socialCandidate = {
-        mint: VALID_PUMP_MINT_1.toBase58(),
-        source: 'TELEGRAM',
-        provenance: 'REAL_SOCIAL' as const,
-        extractedAt: Date.now(),
+      const scanner = new SocialAlphaScanner();
+      const base = {
+        source: 'TELEGRAM' as const,
+        authorHandle: '@alpha_caller',
+        authorDisplayName: 'Alpha Caller',
+        authorTier: 'CABAL_TRACKER' as const,
+        verified: true,
+        rawText: 'Fresh launch',
+        tokenTicker: '$SOC',
+        tokenName: 'Social Token',
+        contractAddress: VALID_PUMP_MINT_1.toBase58(),
+        chain: 'SOLANA' as const,
+        signalPattern: 'CABAL_LAUNCH' as const,
+        confidenceScore: 80,
+        sentimentScore: 0.7,
+        liquidityUsd: 5000,
+        marketCapUsd: 10000,
+        metrics: { views: 10, reposts: 1, subscribers: 100 },
+        actionSuggested: 'WATCH' as const,
       };
 
-      expect(socialCandidate.provenance).toBe('REAL_SOCIAL');
+      const added = scanner.addSignal({ ...base, provenance: 'REAL_SOCIAL' } as any);
+      expect(added.provenance).toBe('REAL_SOCIAL');
+      expect(scanner.getSignals()[0].provenance).toBe('REAL_SOCIAL');
+      expect(isLiveApprovedProvenance(added.provenance)).toBe(true);
+
+      expect(() => scanner.addSignal({ ...base } as any)).toThrow('MANDATORY_PROVENANCE_REQUIRED');
     });
 
-    it('F18.3: ticker-only social call without contract address is blocked from autonomous execution', () => {
-      const tickerOnlyText = 'Buy $BONK right now guys, huge momentum incoming!';
-      const solanaAddressRegex = /\b[1-9A-HJ-NP-Za-km-z]{32,44}\b/g;
-      const matches = tickerOnlyText.match(solanaAddressRegex);
+    it('F18.4: failure isolation prevents social feed errors from crashing engine', async () => {
+      const scanner = new SocialAlphaScanner();
+      vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('ECONNRESET'));
 
-      expect(matches).toBeNull(); // No CA found
-      const canAutonomousTrade = matches !== null && matches.length > 0;
-      expect(canAutonomousTrade).toBe(false);
-    });
+      const res = await scanner.testTelegramConnection('123456:FAKE_TOKEN');
 
-    it('F18.4: rate limiting and failure isolation prevent social feed errors from crashing engine', () => {
-      const isEngineHealthy = true;
-      try {
-        // Simulate malformed social payload
-        JSON.parse('{ invalid_json');
-      } catch {
-        // Isolated catch
-      }
-      expect(isEngineHealthy).toBe(true);
+      expect(res.reachable).toBe(false);
+      expect(res.botAuthorized).toBe(false);
+      expect(res.errorMessage).toContain('ECONNRESET');
+      // Scanner state remains usable after the feed failure.
+      expect(scanner.getSignals()).toEqual([]);
     });
 
     it('F18.5: social signal enters full canonical pipeline through ExecutionCoordinator', async () => {
@@ -457,19 +422,12 @@ describe('Tier 1: Feature Coverage (Features 16 - 20)', () => {
       expect(phase2.newTrailingStopSol).toBeGreaterThanOrEqual(phase1.newTrailingStopSol);
     });
 
-    it('F20.2: fee-aware partial take-profit ladder prevents dust sells dominated by fees', () => {
-      const positionValueSol = 0.05;
-      const estimatedFeeSol = 0.0015;
-
-      // Sells smaller than 0.005 SOL would lose > 30% to fees
-      const minPartialSellSol = 0.01;
-      const feePct = (estimatedFeeSol / minPartialSellSol) * 100;
-      expect(feePct).toBeLessThanOrEqual(20.0); // Within 20% limit
-    });
-
     it('F20.3: persists position high-water mark, current mark, and exit stage to SQLite', () => {
-      const posId = `exit_ladder_${Date.now()}`;
-      testDb.savePosition({
+      // Undo the suite-wide loadPositions stub so the real SQLite round trip is exercised.
+      vi.mocked(WorkstationDatabase.prototype.loadPositions).mockRestore();
+      const db = new WorkstationDatabase(':memory:');
+      const posId = `exit_ladder_${VALID_PUMP_MINT_1.toBase58().slice(0, 6)}`;
+      db.savePosition({
         id: posId,
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'LADDER',
@@ -478,27 +436,32 @@ describe('Tier 1: Feature Coverage (Features 16 - 20)', () => {
         tokenQuantityRaw: '1000000000',
         costBasisLamports: 100_000_000,
         entryPriceSol: 0.0001,
-        currentPriceSol: 0.00016, // Up 60%
+        currentPriceSol: 0.00016,
         currentValueSol: 0.16,
         unrealizedPnLSol: 0.06,
         unrealizedPnLPct: 60.0,
         realizedPnLSol: 0,
         entryTxSignature: 'ladder_sig_1',
         entrySlot: 280000000,
-        entryTimestamp: Date.now() - 30000,
+        entryTimestamp: 1_700_000_000_000,
         entryFeeLamports: 5000,
         priorityFeeLamports: 25000,
         jitoTipLamports: 100_000,
         executionMode: 'PAPER',
-        status: 'OPEN',
+        status: 'PARTIALLY_CLOSED',
         markAgeMs: 0,
         markSource: 'SOLANA_RPC',
-        lastUpdatedTimestamp: Date.now(),
-      });
+        lastUpdatedTimestamp: 1_700_000_100_000,
+        highWaterMarkSol: 0.00018,
+        trailingStopSol: 0.000153,
+        exitStage: 1,
+      } as NormalizedPosition);
 
-      const pos = testDb.loadPositions('PAPER', 'OPEN').find((p) => p.id === posId);
+      const pos = db.loadPositions('PAPER', 'ACTIVE').find((p) => p.id === posId);
       expect(pos?.currentPriceSol).toBe(0.00016);
-      expect(pos?.unrealizedPnLPct).toBe(60.0);
+      expect(pos?.highWaterMarkSol).toBe(0.00018);
+      expect(pos?.trailingStopSol).toBe(0.000153);
+      expect(pos?.exitStage).toBe(1);
     });
 
     it('F20.4: re-entry safeguard defaults to OFF and enforces post-exit cooldown', () => {

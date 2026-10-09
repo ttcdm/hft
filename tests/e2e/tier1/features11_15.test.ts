@@ -1,8 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { PublicKey } from '@solana/web3.js';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { AuthManager, isAllowedClientOrigin } from '../../../server/middleware/auth';
 import { ExecutionCoordinator } from '../../../server/execution/coordinator';
-import { TradeReconciler } from '../../../server/execution/reconciliation';
 import { PumpCurveService } from '../../../server/solana/pumpCurve';
 import { WorkstationDatabase } from '../../../server/db/database';
 import { riskEngine } from '../../../server/risk/riskEngine';
@@ -10,27 +11,24 @@ import { localSigner } from '../../../server/solana/signer';
 import { NormalizedPosition } from '../../../server/core/types';
 import {
   VALID_PUMP_MINT_1,
-  SOL_NATIVE_MINT,
   createSimulatedBondingCurveState,
 } from '../helpers/simulatedStates';
 import { MockSolanaRpc } from '../helpers/mockRpc';
 import { MockJitoEngine } from '../helpers/mockJito';
-import { TestDatabase } from '../helpers/testDb';
 
 describe('Tier 1: Feature Coverage (Features 11 - 15)', () => {
   let mockRpc: MockSolanaRpc;
   let mockJito: MockJitoEngine;
-  let testDb: TestDatabase;
   let coordinator: ExecutionCoordinator;
   let auth: AuthManager;
+  let loadPositionsSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(async () => {
     mockRpc = new MockSolanaRpc();
     mockJito = new MockJitoEngine();
     await mockJito.start();
-    testDb = new TestDatabase();
     auth = new AuthManager();
-    vi.spyOn(WorkstationDatabase.prototype, 'loadPositions').mockReturnValue([]);
+    loadPositionsSpy = vi.spyOn(WorkstationDatabase.prototype, 'loadPositions').mockReturnValue([]);
     riskEngine.updateLimits({
       cooldownPerMintMs: 0,
       cooldownAfterFailedTradeMs: 0,
@@ -43,7 +41,6 @@ describe('Tier 1: Feature Coverage (Features 11 - 15)', () => {
     coordinator?.cleanup();
     vi.restoreAllMocks();
     await mockJito.stop();
-    testDb.close();
     mockRpc.clear();
   });
 
@@ -138,9 +135,26 @@ describe('Tier 1: Feature Coverage (Features 11 - 15)', () => {
   // Feature 13: R0.13 Crash Recovery
   // ===========================================================================
   describe('Feature 13: R0.13 Crash Recovery', () => {
-    it('F13.1: SQLite database enforces WAL journal mode and normal synchronous mode', () => {
-      const modeRow = testDb.db.prepare('PRAGMA journal_mode;').get() as any;
-      expect(modeRow.journal_mode.toLowerCase()).toBe('wal');
+    let prodDb: WorkstationDatabase;
+    let prodDbPath: string;
+
+    beforeEach(() => {
+      // Real production database on an isolated temp file (WAL requires a file-backed DB).
+      loadPositionsSpy.mockRestore();
+      prodDbPath = path.join(os.tmpdir(), `apex_f13_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.db`);
+      prodDb = new WorkstationDatabase(prodDbPath);
+    });
+
+    afterEach(() => {
+      for (const suffix of ['', '-wal', '-shm']) {
+        try { fs.rmSync(prodDbPath + suffix, { force: true }); } catch { /* best effort */ }
+      }
+    });
+
+    it('F13.1: WorkstationDatabase enforces WAL journal mode', () => {
+      expect(prodDb.getDbPath()).toBe(prodDbPath);
+      expect(prodDb.getJournalMode().toLowerCase()).toBe('wal');
+      expect(prodDb.isWritable()).toBe(true);
     });
 
     it('F13.2: reconciles interrupted partial SELL without loss of remaining inventory', () => {
@@ -172,7 +186,7 @@ describe('Tier 1: Feature Coverage (Features 11 - 15)', () => {
         lastUpdatedTimestamp: Date.now(),
       };
 
-      testDb.savePosition(originalPosition);
+      prodDb.savePosition(originalPosition);
 
       const soldTokensRaw = 400_000_000n;
       const remainingTokensRaw = (BigInt(originalPosition.tokenQuantityRaw) - soldTokensRaw).toString();
@@ -189,9 +203,9 @@ describe('Tier 1: Feature Coverage (Features 11 - 15)', () => {
         lastUpdatedTimestamp: Date.now(),
       };
 
-      testDb.savePosition(updatedPosition);
+      prodDb.savePosition(updatedPosition);
 
-      const loaded = testDb.loadPositions('PAPER', 'PARTIALLY_CLOSED');
+      const loaded = prodDb.loadPositions('PAPER', 'PARTIALLY_CLOSED');
       const found = loaded.find((p) => p.id === posId);
       expect(found).toBeDefined();
       expect(found?.status).toBe('PARTIALLY_CLOSED');
@@ -202,7 +216,7 @@ describe('Tier 1: Feature Coverage (Features 11 - 15)', () => {
 
     it('F13.3: updates position status to CLOSED on complete exit without orphaned records', () => {
       const posId = `full_exit_${Date.now()}`;
-      testDb.savePosition({
+      prodDb.savePosition({
         id: posId,
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'FULL',
@@ -231,26 +245,30 @@ describe('Tier 1: Feature Coverage (Features 11 - 15)', () => {
         lastUpdatedTimestamp: Date.now(),
       });
 
-      const openPositions = testDb.loadPositions('PAPER', 'OPEN');
+      const openPositions = prodDb.loadPositions('PAPER', 'OPEN');
       expect(openPositions.some((p) => p.id === posId)).toBe(false);
 
-      const closedPositions = testDb.loadPositions('PAPER', 'CLOSED');
+      const closedPositions = prodDb.loadPositions('PAPER', 'CLOSED');
       expect(closedPositions.some((p) => p.id === posId)).toBe(true);
     });
 
-    it('F13.4: records system journal audit events during crash recovery', () => {
-      testDb.logJournal('STARTUP_RECOVERY_BEGIN', 'corr_rec_1', 'PAPER', { timestamp: Date.now() });
-      testDb.logJournal('STARTUP_RECOVERY_COMPLETE', 'corr_rec_1', 'PAPER', { positionsReconciled: 2 });
+    it('F13.4: persists system journal audit events (recovery begin/complete) retrievable via getEvents', () => {
+      prodDb.logJournal('STARTUP_RECOVERY_BEGIN', 'corr_rec_1', 'PAPER', { timestamp: Date.now() });
+      prodDb.logJournal('STARTUP_RECOVERY_COMPLETE', 'corr_rec_1', 'PAPER', { positionsReconciled: 2 });
 
-      const events = testDb.getEvents(10);
+      const events = prodDb.getEvents(10);
       expect(events.some((e) => e.eventType === 'STARTUP_RECOVERY_BEGIN')).toBe(true);
       expect(events.some((e) => e.eventType === 'STARTUP_RECOVERY_COMPLETE')).toBe(true);
+      const complete = events.find((e) => e.eventType === 'STARTUP_RECOVERY_COMPLETE');
+      expect(complete?.correlationId).toBe('corr_rec_1');
+      expect(complete?.executionMode).toBe('PAPER');
+      expect(complete?.payload).toMatchObject({ positionsReconciled: 2 });
     });
 
     it('F13.5: crash recovery preserves separate record_updated_at and last_mark_timestamp', () => {
       const posId = `mark_ts_test_${Date.now()}`;
       const markTimestamp = Date.now() - 5000;
-      testDb.savePosition({
+      prodDb.savePosition({
         id: posId,
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'MARKTS',
@@ -278,8 +296,10 @@ describe('Tier 1: Feature Coverage (Features 11 - 15)', () => {
         lastUpdatedTimestamp: Date.now(),
       });
 
-      const loaded = testDb.loadPositions('PAPER', 'OPEN').find((p) => p.id === posId);
+      const loaded = prodDb.loadPositions('PAPER', 'OPEN').find((p) => p.id === posId);
       expect(loaded?.lastMarkTimestamp).toBe(markTimestamp);
+      expect(loaded?.lastUpdatedTimestamp).toBeGreaterThan(markTimestamp);
+      expect(loaded?.lastUpdatedTimestamp).not.toBe(loaded?.lastMarkTimestamp);
     });
   });
 

@@ -134,6 +134,42 @@ describe('P3b: untracked wallet token balances', () => {
     expect(close.mock.calls.some((c) => c[0] === p.id && c[2] === 'STOP_LOSS')).toBe(true);
   });
 
+  describe('RECOVERED positions get the hard stop only', () => {
+    const setup = async () => {
+      const mint = Keypair.generate().publicKey;
+      listing.spl.push(acct(mint, '1000000'));
+      mark(mint, 0.001);
+      await coordinator.scanUntrackedWalletTokens();
+      vi.spyOn(coordinator as any, 'updatePositionMarkPrices').mockResolvedValue(undefined);
+      const p = posFor(mint)!;
+      return { p, close: vi.spyOn(coordinator, 'closePosition').mockResolvedValue({ success: true, pnlSol: 0 }) };
+    };
+    const reprice = (p: any, price: number, ageMs = 0) => {
+      p.currentPriceSol = price;
+      p.lastMarkTimestamp = Date.now();
+      p.entryTimestamp = Date.now() - ageMs;
+      workstationDb.savePosition(p);
+    };
+
+    it('a +40% mark does not take profit and a 31-minute-old flat position is not sold as stale', async () => {
+      const { p, close } = await setup();
+      reprice(p, 0.0014);
+      await coordinator.evaluateAndProcessExits();
+      reprice(p, 0.001, 31 * 60_000);
+      await coordinator.evaluateAndProcessExits();
+      expect(close.mock.calls.filter((c) => c[0] === p.id)).toEqual([]);
+    });
+
+    it('AUTO_MANAGE_RECOVERED=true opts back into the full exit engine', async () => {
+      vi.stubEnv('AUTO_MANAGE_RECOVERED', 'true');
+      const { p, close } = await setup();
+      reprice(p, 0.0014);
+      await coordinator.evaluateAndProcessExits();
+      expect(close.mock.calls.some((c) => c[0] === p.id && /TAKE_PROFIT/.test(String(c[2])))).toBe(true);
+      vi.unstubAllEnvs();
+    });
+  });
+
   it('startup reconciliation runs the scan and mentions it', async () => {
     const mint = Keypair.generate().publicKey;
     listing.spl.push(acct(mint, '31337'));

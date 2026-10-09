@@ -78,3 +78,22 @@ describe('K9: a LIVE buy larger than what is left on the curve is refused plainl
     expect(() => PumpCurveService.calculateBuyQuote({ state, amountSol: 3, executionMode: 'LIVE' } as any)).toThrow(/CURVE_NEARLY_COMPLETE/);
   });
 });
+
+describe('R0.1: LIVE quotes never fall back to the custom math when the official SDK quote fails', () => {
+  // A fee schedule with no tiers makes the official call throw; the custom constant-product math could still
+  // price it, so a silent fallback would be reachable here if it existed.
+  it('buy: throws OFFICIAL_PUMP_QUOTE_FAILED in LIVE, still prices in PAPER', () => {
+    (PumpCurveService as any).cachedFeeConfig = { feeTiers: [] };
+    const state = liveState();
+    expect(() => PumpCurveService.calculateBuyQuote({ state, amountSol: 0.01, executionMode: 'LIVE', slippageBps: 300 } as any)).toThrow(/OFFICIAL_PUMP_QUOTE_FAILED/);
+    expect(PumpCurveService.calculateBuyQuote({ state, amountSol: 0.01, executionMode: 'PAPER', slippageBps: 300 } as any).tokenAmountRaw).toBeDefined();
+  });
+
+  it('sell: throws OFFICIAL_PUMP_QUOTE_FAILED in LIVE, still prices in PAPER', () => {
+    (PumpCurveService as any).cachedFeeConfig = { feeTiers: [] };
+    const state = liveState();
+    const args = { state, tokenAmountRaw: 40_000_000_000_000n, slippageBps: 300 };
+    expect(() => PumpCurveService.calculateSellQuote({ ...args, executionMode: 'LIVE' } as any)).toThrow(/OFFICIAL_PUMP_QUOTE_FAILED/);
+    expect(PumpCurveService.calculateSellQuote({ ...args, executionMode: 'PAPER' } as any).expectedSolAmountLamports).toBeGreaterThan(0);
+  });
+});

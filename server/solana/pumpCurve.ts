@@ -598,7 +598,11 @@ export class PumpCurveService {
         return null;
       }
 
-      // Determine correct token program (SPL Token vs Token-2022)
+      // The token program is the mint account's owner, never inferred from its contents. Any other owner is not a mint.
+      if (!finalMintInfo.owner.equals(TOKEN_PROGRAM_ID) && !finalMintInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+        Logger.error(`Mint ${mint.toBase58()} is owned by ${finalMintInfo.owner.toBase58()}, not a token program`);
+        return null;
+      }
       let baseTokenProgram = TOKEN_PROGRAM_ID;
       let token2022Report: Token2022ExtensionReport | undefined = undefined;
       if (finalMintInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {

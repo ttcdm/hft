@@ -2727,7 +2727,7 @@ export class ExecutionCoordinator {
         this.clearOperatorAlert('POSITION_MARK_UNAVAILABLE', pos.id);
       }
 
-      const decision = ExitEngine.evaluate({
+      let decision = ExitEngine.evaluate({
         positionId: pos.id,
         entryPriceSol: pos.entryPriceSol,
         currentPriceSol: pos.currentPriceSol,
@@ -2737,6 +2737,18 @@ export class ExecutionCoordinator {
         entryTimestamp: pos.entryTimestamp,
         currentTimestamp: now,
       });
+
+      // A RECOVERED position (a balance found in the wallet that this app never bought) has an entry price that is just the mark at
+      // adoption, so take-profit, trailing and stale exits would sell whatever lands in the wallet on an invented schedule. Only the
+      // hard stop applies, unless the operator opts in with AUTO_MANAGE_RECOVERED=true.
+      if (
+        decision.shouldExit &&
+        decision.reason !== 'STOP_LOSS' &&
+        pos.entryTxSignature?.startsWith('RECOVERED:') &&
+        process.env.AUTO_MANAGE_RECOVERED !== 'true'
+      ) {
+        decision = { ...decision, shouldExit: false, newExitStage: pos.exitStage ?? 0 };
+      }
 
       // Persist high_water_mark_sol and trailing_stop_sol to SQLite (B13). The exit stage only advances after the
       // sell actually fills: advancing it first would skip a take-profit stage when the sell reverts or is refused.

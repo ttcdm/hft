@@ -19,7 +19,14 @@ export interface BuyReconciliationResult {
   tokensReceivedHuman: number;
   actualNetworkFeeLamports: number;
   actualJitoTipLamports: number;
+  /** Price the curve charged per token: SOL that went to the curve (fees included) / tokens. Excludes rent, tip and network fees. This is what marks are comparable with, so it is the exit engine's entry price. */
   effectiveFillPriceSol: number;
+  /** Whole wallet SOL delta per token (rent, tip and fees included). The true cost; PnL accounting uses actualSolSpentLamports. */
+  allInFillPriceSol?: number;
+  /** SOL that went to the curve: wallet delta minus network fee, tip and token-account rent opened by this tx. */
+  curveSpendLamports?: number;
+  /** Lamports locked in token accounts this tx created (the buyer's ATA). */
+  tokenAccountRentLamports?: number;
   slot: number;
   error?: string;
 }
@@ -214,7 +221,23 @@ export class TradeReconciler {
       }
 
       const tokensReceivedHuman = Number(tokensReceivedBigInt) / Math.pow(10, tokenDecimals);
-      const effectiveFillPriceSol = (actualSolSpentLamports / 1e9) / tokensReceivedHuman;
+      // Split the wallet delta: rent opened for the buyer's token account, the tip and the network/priority fee are not
+      // what the curve charged. Marks come from the curve, so the stop-loss must compare against the curve price paid.
+      let tokenAccountRentLamports = 0;
+      const ataKey = PumpCurveService.getAssociatedTokenAddress(mint, wallet, tokenProgram).toBase58();
+      for (let i = 0; i < accountKeys.length; i++) {
+        if (accountKeys.get(i)?.toBase58() === ataKey) {
+          const pre = tx.meta.preBalances[i] ?? 0;
+          const post = tx.meta.postBalances[i] ?? 0;
+          tokenAccountRentLamports = Math.max(0, post - pre);
+          break;
+        }
+      }
+      const nonCurveLamports = actualNetworkFeeLamports + expectedJitoTipLamports + tokenAccountRentLamports;
+      let curveSpendLamports = actualSolSpentLamports - nonCurveLamports;
+      if (!(curveSpendLamports > 0)) curveSpendLamports = actualSolSpentLamports; // cannot split: fall back to the whole delta
+      const effectiveFillPriceSol = (curveSpendLamports / 1e9) / tokensReceivedHuman;
+      const allInFillPriceSol = (actualSolSpentLamports / 1e9) / tokensReceivedHuman;
 
       Logger.info(`Reconciled BUY fill for ${mintStr}: ${tokensReceivedHuman.toFixed(4)} tokens for ${(actualSolSpentLamports / 1e9).toFixed(5)} SOL (effective price: ${effectiveFillPriceSol.toFixed(8)} SOL)`);
 
@@ -228,6 +251,9 @@ export class TradeReconciler {
         actualNetworkFeeLamports,
         actualJitoTipLamports: expectedJitoTipLamports,
         effectiveFillPriceSol,
+        allInFillPriceSol,
+        curveSpendLamports,
+        tokenAccountRentLamports,
         slot,
       };
     } catch (err: any) {

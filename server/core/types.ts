@@ -190,7 +190,7 @@ export interface LiveReadiness {
   reasons: string[];
   components: {
     rpc: { healthy: boolean; latencyMs: number; status: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' };
-    pumpFeed: { healthy: boolean; lastEventAgeMs: number; status: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' | 'WARMING_UP' };
+    pumpFeed: { healthy: boolean; lastEventAgeMs: number; status: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' | 'WARMING_UP'; required?: boolean; mainnetApiLastEventAgeMs?: number };
     markFeed: { healthy: boolean; lastMarkAgeMs: number; status: 'HEALTHY' | 'DEGRADED' | 'STALE' };
     jito: { healthy: boolean; status: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' | 'OFFLINE' | 'NOT_CONFIGURED' };
     db: { healthy: boolean; status: 'HEALTHY' | 'DEGRADED' | 'ERROR' };

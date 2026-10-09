@@ -36,7 +36,7 @@ import { workstationDb } from '../db/database';
 import { getRandomJitoTipAccount, TOKEN_2022_PROGRAM_ID } from '../solana/programs';
 import { executionConfig } from '../solana/executionConfig';
 import { Logger } from '../middleware/enterprise';
-import { assertClusterAllowed, resolveRpcUrl } from '../solana/clusterGuard';
+import { allowedCluster, assertClusterAllowed, resolveRpcUrl } from '../solana/clusterGuard';
 import { PumpCurveService, TradeQuote, fetchTokenHolderDistribution } from '../solana/pumpCurve';
 import { TradeReconciler, RealMarkPriceService, PreTradeSnapshot } from './reconciliation';
 export type { PreTradeSnapshot };
@@ -89,6 +89,8 @@ export class ExecutionCoordinator {
   private rpcHealth: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' = 'DISCONNECTED';
   private pumpFeedHealth: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' = 'DISCONNECTED';
   private lastPumpFeedTimestamp: number = 0;
+  /** Last time the (mainnet-only) pump.fun HTTP API answered while trading on another cluster. */
+  private lastMainnetApiTimestamp: number = 0;
   private readonly startedAt: number = Date.now();
   private readonly startupGracePeriodMs: number = parseInt(process.env.STARTUP_GRACE_PERIOD_MS || '300000', 10); // 5-minute initialization grace period (B02)
   private positionMarkHealth: 'HEALTHY' | 'DEGRADED' | 'STALE' = 'HEALTHY';
@@ -249,7 +251,10 @@ export class ExecutionCoordinator {
     const pumpFeedStatus: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' | 'WARMING_UP' = isPumpFeedWarmingUp
       ? 'WARMING_UP'
       : this.pumpFeedHealth;
-    const pumpFeedHealthy = (this.pumpFeedHealth === 'HEALTHY' && pumpFeedAgeMs <= 120000) || isPumpFeedWarmingUp;
+    // The pump event stream and "real market events" are mainnet-activity signals. On devnet/localnet a quiet network is normal and the
+    // pump.fun HTTP API is a MAINNET data source (see recordPumpFeedEvent), so neither blocks readiness there.
+    const feedRequired = allowedCluster() === 'mainnet-beta';
+    const pumpFeedHealthy = !feedRequired || (this.pumpFeedHealth === 'HEALTHY' && pumpFeedAgeMs <= 120000) || isPumpFeedWarmingUp;
 
     if (!pumpFeedHealthy) {
       const feedAgeSec = this.lastPumpFeedTimestamp > 0 ? Math.round(pumpFeedAgeMs / 1000) : null;
@@ -285,7 +290,7 @@ export class ExecutionCoordinator {
       ? now - this.lastRealMarketEventTimestamp
       : Infinity;
     const isRealMarketWarmingUp = this.lastRealMarketEventTimestamp === 0 && inGracePeriod;
-    if (realFeedAgeMs > 120000 && !isRealMarketWarmingUp) {
+    if (feedRequired && realFeedAgeMs > 120000 && !isRealMarketWarmingUp) {
       reasons.push(
         `Real on-chain market feed has no recent events (${
           realFeedAgeMs === Infinity ? 'never received' : Math.round(realFeedAgeMs / 1000) + 's ago'
@@ -306,6 +311,8 @@ export class ExecutionCoordinator {
           healthy: pumpFeedHealthy,
           lastEventAgeMs: pumpFeedAgeMs === Infinity ? -1 : pumpFeedAgeMs,
           status: pumpFeedStatus,
+          required: feedRequired,
+          mainnetApiLastEventAgeMs: this.lastMainnetApiTimestamp > 0 ? now - this.lastMainnetApiTimestamp : -1,
         },
         markFeed: {
           healthy: markFeedHealthy,
@@ -342,10 +349,14 @@ export class ExecutionCoordinator {
   // Update RPC endpoint with safe re-instantiation
   public async setRpcEndpoint(newEndpoint: string): Promise<{ success: boolean; latencyMs: number; error?: string }> {
     try {
+      if (resolveRpcUrl(newEndpoint) !== newEndpoint.trim()) {
+        throw new Error(`CLUSTER_GUARD: RPC endpoint rejected (looks like mainnet while ALLOWED_CLUSTER=${allowedCluster()})`);
+      }
       const newConn = new Connection(newEndpoint, {
         commitment: 'confirmed',
         confirmTransactionInitialTimeout: 30000,
       });
+      await assertClusterAllowed(newConn);
       const t0 = performance.now();
       await newConn.getSlot('processed');
       const latency = Math.round(performance.now() - t0);
@@ -429,8 +440,16 @@ export class ExecutionCoordinator {
     this.lastMarketEventTimestamp = now;
   }
 
+  /**
+   * The pump.fun HTTP API (source 'PUMPFUN_SERVICE') is a MAINNET data source. Polling it says nothing about the cluster being traded, so
+   * off mainnet it is recorded separately and never makes the pump feed or the real-market-event clock look healthy (critique K6).
+   */
   public recordPumpFeedEvent(source = 'PUMPFUN_STREAM', mint?: string) {
     const now = Date.now();
+    if (source === 'PUMPFUN_SERVICE' && allowedCluster() !== 'mainnet-beta') {
+      this.lastMainnetApiTimestamp = now;
+      return;
+    }
     this.lastPumpFeedTimestamp = now;
     this.pumpFeedHealth = 'HEALTHY';
     this.lastRealMarketEventTimestamp = now;

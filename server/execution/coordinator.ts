@@ -7,6 +7,7 @@ import {
   ExecutionMode,
   NormalizedPosition,
   SystemDiagnostics,
+  OperatorAlert,
   ExecutionLifecycleState,
   DataSource,
   SignalProvenance,
@@ -14,6 +15,10 @@ import {
   LiveReadiness,
   isLiveApprovedProvenance,
 } from '../core/types';
+/** C4: a mark older than this is not trusted for exits; the position is re-read directly first. */
+export const MARK_STALE_MS = 15_000;
+/** C4: if a direct read still fails after this long, raise an operator alert. */
+export const MARK_ALERT_AFTER_MS = 60_000;
 import { EligibilityFilter } from '../signals/eligibilityFilter';
 import { localSigner } from '../solana/signer';
 import { txBuilder, SolanaTransactionBuilder, PumpBuyParams, PumpSellParams } from '../solana/transactionBuilder';
@@ -2151,6 +2156,49 @@ export class ExecutionCoordinator {
     }
   }
 
+  /** C4: isolated per-position price read used when the shared mark feed has gone stale. */
+  private async refreshStaleMark(pos: NormalizedPosition): Promise<boolean> {
+    try {
+      const marks = await RealMarkPriceService.queryOnChainMarkPrices(
+        this.connection,
+        [pos.mint],
+        pos.executionMode === 'LIVE' ? 'LIVE' : 'PAPER'
+      );
+      const mark = marks[pos.mint];
+      if (!mark || !(mark.priceSol > 0)) return false;
+      this.applyMarkPrice(pos, mark.priceSol, mark.source, mark.timestamp, mark.poolAddress);
+      return true;
+    } catch (err: any) {
+      Logger.debug(`Direct mark read failed for ${pos.mint}: ${err.message}`);
+      return false;
+    }
+  }
+
+  private operatorAlerts: OperatorAlert[] = [];
+
+  /** Recent operator alerts (newest last). Surfaced in diagnostics. */
+  public getOperatorAlerts(): OperatorAlert[] {
+    return this.operatorAlerts.filter((a) => !a.cleared).map((a) => ({ ...a }));
+  }
+
+  private raiseOperatorAlert(code: string, message: string, positionId?: string) {
+    const now = Date.now();
+    const existing = this.operatorAlerts.find((a) => a.code === code && a.positionId === positionId && !a.cleared);
+    if (existing) {
+      existing.lastSeenAt = now;
+      return;
+    }
+    this.operatorAlerts.push({ code, message, positionId, raisedAt: now, lastSeenAt: now, cleared: false });
+    if (this.operatorAlerts.length > 50) this.operatorAlerts.shift();
+    Logger.error(`[OPERATOR ALERT] ${code}: ${message}`);
+  }
+
+  private clearOperatorAlert(code: string, positionId?: string) {
+    for (const a of this.operatorAlerts) {
+      if (a.code === code && a.positionId === positionId) a.cleared = true;
+    }
+  }
+
   // Evaluate dynamic exit conditions for all active positions and execute exits via ExitEngine (B13)
   public async evaluateAndProcessExits(): Promise<void> {
     try {
@@ -2161,9 +2209,25 @@ export class ExecutionCoordinator {
     const now = Date.now();
 
     for (const pos of positions) {
-      // Do not trigger exits on stale marks older than 15 seconds
-      const markAge = now - (pos.lastMarkTimestamp || pos.lastUpdatedTimestamp);
-      if (markAge > 15000) continue;
+      // C4: staleness is measured from the last real mark only. lastUpdatedTimestamp is rewritten on every tick
+      // and would hide a dead feed, so it is never a fallback; a never-marked position ages from its entry.
+      const markAge = now - (pos.lastMarkTimestamp || pos.entryTimestamp || now);
+      if (markAge > MARK_STALE_MS) {
+        // Before skipping, read this position's curve/pool directly. A fresh read lets the stop-loss run.
+        const refreshed = await this.refreshStaleMark(pos);
+        if (!refreshed) {
+          // Missing data is never "safe": exits cannot be priced, so say so loudly once the gap is long enough.
+          if (markAge > MARK_ALERT_AFTER_MS) {
+            this.raiseOperatorAlert(
+              'POSITION_MARK_UNAVAILABLE',
+              `No price for ${pos.symbol || pos.mint} for ${Math.round(markAge / 1000)}s and a direct curve/pool read failed. Stop-loss and take-profit cannot fire until a mark returns; consider closing manually.`,
+              pos.id
+            );
+          }
+          continue;
+        }
+        this.clearOperatorAlert('POSITION_MARK_UNAVAILABLE', pos.id);
+      }
 
       const decision = ExitEngine.evaluate({
         positionId: pos.id,
@@ -2249,6 +2313,7 @@ export class ExecutionCoordinator {
         ? 'WARMING_UP'
         : this.pumpFeedHealth,
       positionMarkHealth: this.positionMarkHealth,
+      operatorAlerts: this.getOperatorAlerts(),
       marketFeedHealth,
       marketFeedLastEventMsAgo: marketFeedLastEventMsAgo ?? 0,
       jitoHealth: jitoTelemetry.health === 'OFFLINE' ? 'DISCONNECTED' : jitoTelemetry.health,

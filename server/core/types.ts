@@ -199,6 +199,15 @@ export interface LiveReadiness {
   checkedAt: number;
 }
 
+export interface OperatorAlert {
+  code: string;
+  message: string;
+  positionId?: string;
+  raisedAt: number;
+  lastSeenAt: number;
+  cleared: boolean;
+}
+
 export interface SystemDiagnostics {
   executionMode: ExecutionMode;
   liveTradingActive: boolean;
@@ -211,6 +220,7 @@ export interface SystemDiagnostics {
   rpcHealth: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED';
   pumpFeedHealth: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' | 'WARMING_UP';
   positionMarkHealth: 'HEALTHY' | 'DEGRADED' | 'STALE';
+  operatorAlerts?: OperatorAlert[];
   marketFeedHealth: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' | 'WARMING_UP';
   marketFeedLastEventMsAgo: number;
   jitoHealth: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' | 'NOT_CONFIGURED';

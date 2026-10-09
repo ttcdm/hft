@@ -397,6 +397,16 @@ export class AutoSnipeController extends EventEmitter {
     if (verdict.state === 'DEAD') return this.record(c, 'DROPPED', 'watch', `WATCH_DEAD: ${verdict.reason}`);
 
     const mode = this.mode;
+    // The coordinator's mode can change after the auto mode was set (someone arms LIVE, or disarms it). Every candidate
+    // re-checks it, so PAPER auto can never place a real trade and DEVNET_LIVE never journals paper fills as wallet deltas.
+    const coordMode = executionCoordinator.getExecutionMode();
+    const armed = executionCoordinator.isLiveArmed();
+    if (mode === 'PAPER' && (coordMode !== 'PAPER' || armed)) {
+      return this.record(c, 'REJECTED', 'mode', `PAPER auto refused: the coordinator is ${coordMode}${armed ? ' and LIVE is armed' : ''}; PAPER auto needs the coordinator in PAPER and disarmed`);
+    }
+    if (mode === 'DEVNET_LIVE' && (coordMode !== 'LIVE' || !armed)) {
+      return this.record(c, 'REJECTED', 'mode', `DEVNET_LIVE auto refused: the coordinator is ${coordMode} and LIVE is ${armed ? 'armed' : 'not armed'}; it must be LIVE and armed`);
+    }
     if (mode === 'DEVNET_LIVE' && open.length >= DEVNET_MAX_OPEN_POSITIONS) {
       return this.record(c, 'DROPPED', 'budget', `DEVNET_MAX_OPEN_POSITIONS (${DEVNET_MAX_OPEN_POSITIONS}) reached`);
     }

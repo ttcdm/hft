@@ -160,6 +160,7 @@ describe('G1: auto-snipe controller', () => {
     vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
     vi.stubEnv('ALLOWED_CLUSTER', 'devnet');
     vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('LIVE');
+    vi.spyOn(executionCoordinator, 'isLiveArmed').mockReturnValue(true);
     await autoSnipeController.setMode('DEVNET_LIVE', { confirmationCode: DEVNET_CONFIRMATION_CODE });
     const snipe = vi.spyOn(memecoinAggregator, 'executeSnipe').mockResolvedValue({ success: true, message: 'ok', txHash: 't', amountSol: AUTO_DEVNET_ORDER_SOL, positionId: 'dv1', feesPaidLamports: 0 });
     const d = await autoSnipeController.submitCandidate(cand(newPool()));
@@ -174,6 +175,33 @@ describe('G1: auto-snipe controller', () => {
     const d2 = await autoSnipeController.submitCandidate(cand(newPool()));
     expect(d2.outcome).toBe('DROPPED');
     expect(d2.reason).toMatch(/MAX_OPEN_POSITIONS/);
+  });
+
+  it('L2: every candidate re-checks the coordinator mode (PAPER auto with LIVE armed, DEVNET_LIVE with the coordinator in PAPER)', async () => {
+    // PAPER auto was started while the coordinator was PAPER; afterwards someone arms LIVE.
+    await setAutoMode('PAPER');
+    const snipe = vi.spyOn(memecoinAggregator, 'executeSnipe');
+    vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('LIVE');
+    vi.spyOn(executionCoordinator, 'isLiveArmed').mockReturnValue(true);
+    const d = await autoSnipeController.submitCandidate(cand(newPool()));
+    expect(d.outcome).toBe('REJECTED');
+    expect(d.stage).toBe('mode');
+    expect(d.reason).toMatch(/PAPER auto refused/);
+    expect(snipe).not.toHaveBeenCalled();
+    snipe.mockRestore();
+
+    // DEVNET_LIVE started LIVE and armed; afterwards the coordinator drops to PAPER (kill switch, disarm).
+    vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
+    vi.stubEnv('ALLOWED_CLUSTER', 'devnet');
+    const setDevnet = await autoSnipeController.setMode('DEVNET_LIVE', { confirmationCode: DEVNET_CONFIRMATION_CODE });
+    expect(setDevnet.ok, setDevnet.error).toBe(true);
+    vi.mocked(executionCoordinator.getExecutionMode).mockReturnValue('PAPER');
+    vi.mocked(executionCoordinator.isLiveArmed).mockReturnValue(false);
+    const snipe2 = vi.spyOn(memecoinAggregator, 'executeSnipe');
+    const d2 = await autoSnipeController.submitCandidate(cand(newPool()));
+    expect(d2.outcome).toBe('REJECTED');
+    expect(d2.reason).toMatch(/DEVNET_LIVE auto refused/);
+    expect(snipe2).not.toHaveBeenCalled();
   });
 
   it('kill drops to OFF and can exit what the session opened; later candidates are dropped', async () => {

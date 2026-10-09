@@ -1,5 +1,4 @@
-import dotenv from 'dotenv';
-dotenv.config();
+import './server/loadEnv'; // must stay the FIRST import: singletons built at import time read process.env
 import './suppress-warnings.cjs';
 import express from 'express';
 import cors from 'cors';
@@ -75,7 +74,6 @@ import {
   ClosePositionSchema,
 } from './server/middleware/enterprise';
 
-dotenv.config();
 
 const app = express();
 // Nginx/Cloud Run listens on 8080 in container; internal Node/Vite applet must listen on port 3000

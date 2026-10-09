@@ -1,6 +1,5 @@
+import '../loadEnv'; // must stay the first import
 import { solPriceService } from '../market/solPriceService';
-import dotenv from 'dotenv';
-dotenv.config();
 import { Connection, PublicKey, SystemProgram, VersionedTransaction } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID, createCloseAccountInstruction } from '@solana/spl-token';
 import {

@@ -1,5 +1,4 @@
-import dotenv from 'dotenv';
-dotenv.config();
+import '../server/loadEnv'; // must stay the first import
 
 import {
   Connection,

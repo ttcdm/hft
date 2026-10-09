@@ -304,9 +304,15 @@ export function isAutoSnipeEnvEnabled(): boolean {
   return process.env.AUTO_SNIPE_ENABLED === 'true';
 }
 
-/** Demo and unattributed callers never carry a REAL_* provenance. */
+/**
+ * Demo callers are SYNTHETIC_TEST. A real-feed token with no attributed caller comes from pump.fun/DexScreener market
+ * data, not from a social post, so it is REAL_ONCHAIN. REAL_SOCIAL is reserved for a callout traced to an actual
+ * social post, which no code path produces yet.
+ */
 export function calloutProvenance(callout: PumpFunHotCallout): SignalProvenance {
-  return DEMO_CALLER_IDS.has(callout.caller.userId) ? 'SYNTHETIC_TEST' : 'REAL_SOCIAL';
+  if (DEMO_CALLER_IDS.has(callout.caller.userId)) return 'SYNTHETIC_TEST';
+  if (callout.caller.userId === UNATTRIBUTED_CALLER.userId) return 'REAL_ONCHAIN';
+  return 'REAL_SOCIAL';
 }
 
 export class PumpFunService extends EventEmitter {
@@ -689,7 +695,7 @@ export class PumpFunService extends EventEmitter {
     if (!isAutoSnipeEnvEnabled()) return;
     const rules = this.autoSnipeRules;
 
-    for (const callout of this.hotCallouts) {
+    for (const callout of this.getHotCallouts()) {
       if (callout.status !== 'ACTIVE') continue;
       const mintKey = callout.token.mint.toLowerCase();
       if (this.snipedMints.has(mintKey)) {

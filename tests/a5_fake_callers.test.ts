@@ -68,16 +68,22 @@ function makeCallout(caller: PumpFunCaller, mint: string, confluenceCount = 1): 
 }
 
 describe('A5: fake callers cannot drive auto-snipe', () => {
+  // snipedMints is the one piece of private state the evaluator mutates; save and restore it around each test.
+  let savedSniped: string[];
   beforeEach(() => {
+    savedSniped = [...(pumpFunService as any).snipedMints];
     (pumpFunService as any).snipedMints.clear();
   });
 
   afterEach(() => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
+    (pumpFunService as any).snipedMints.clear();
+    for (const m of savedSniped) (pumpFunService as any).snipedMints.add(m);
   });
 
   it('starts with no callers when DEMO_MODE is not true', () => {
+    vi.stubEnv('DEMO_MODE', '');
     expect(process.env.DEMO_MODE).not.toBe('true');
     expect(pumpFunService.getLeaderboard()).toEqual([]);
   });
@@ -86,7 +92,7 @@ describe('A5: fake callers cannot drive auto-snipe', () => {
     vi.stubEnv('AUTO_SNIPE_ENABLED', '');
     const snipeSpy = vi.spyOn(memecoinAggregator, 'executeSnipe');
     const callout = makeCallout(makeCaller({ isAutoSnipeSubscribed: true }), 'A5MintDisabled1111111111111111111111111111');
-    (pumpFunService as any).hotCallouts = [callout];
+    vi.spyOn(pumpFunService, 'getHotCallouts').mockReturnValue([callout]);
 
     await (pumpFunService as any).evaluateAutoSnipeTriggers();
 
@@ -103,7 +109,7 @@ describe('A5: fake callers cannot drive auto-snipe', () => {
       avgMultiple: 1,
     });
     const callout = makeCallout(weakSubscribed, 'A5MintSubscribed111111111111111111111111111', 1);
-    (pumpFunService as any).hotCallouts = [callout];
+    vi.spyOn(pumpFunService, 'getHotCallouts').mockReturnValue([callout]);
 
     await (pumpFunService as any).evaluateAutoSnipeTriggers();
 
@@ -111,7 +117,12 @@ describe('A5: fake callers cannot drive auto-snipe', () => {
     expect(callout.status).toBe('ACTIVE');
   });
 
-  it('labels a demo caller SYNTHETIC_TEST and a real-feed caller REAL_SOCIAL', () => {
+  it('labels an unattributed real-feed token REAL_ONCHAIN, never REAL_SOCIAL', () => {
+    const unattributed = makeCallout(makeCaller({ userId: 'unattributed' }), 'A5MintUnattr1111111111111111111111111111');
+    expect(calloutProvenance(unattributed)).toBe('REAL_ONCHAIN');
+  });
+
+  it('labels a demo caller SYNTHETIC_TEST and a named real caller REAL_SOCIAL', () => {
     const demo = makeCallout(makeCaller({ userId: 'sol_cabal_insider' }), 'A5MintDemo11111111111111111111111111111111');
     const real = makeCallout(makeCaller({ userId: 'real_feed_caller' }), 'A5MintReal11111111111111111111111111111111');
     expect(calloutProvenance(demo)).toBe('SYNTHETIC_TEST');

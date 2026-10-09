@@ -128,3 +128,20 @@ describe('H1: board read model (real modules)', () => {
     expect(nextExitFor({ ...base, entryPriceSol: 0 })).toBeNull();
   });
 });
+
+import { CurvePanelView } from '../src/components/CurvePanel';
+describe('H2: curve panel', () => {
+  it('shows the ladder, the sell side only with a position, and honest empty states', () => {
+    const curve = { spotPriceSol: 2.8e-8, priceUsd: 4.1e-6, curveProgressPct: 4.7, complete: false, note: null,
+      buy: [{ upPct: 1, solNeeded: 0.1505, tokensOut: 5e6, feesSol: 0.0015 }, { upPct: 5, solNeeded: null, tokensOut: null, feesSol: null }], sell: null };
+    const html = renderToStaticMarkup(<CurvePanelView mint="Mint1111111111111111111111111111111111111111" curve={curve} tape={{ source: 'NO_DATA', trades: [] }} error={null} />);
+    expect(html).toContain('+1%');
+    expect(html).toContain('0.1505');
+    expect(html).toContain('4.7% to migration');
+    expect(html).toContain('No open position');
+    expect(html).toContain('No trades seen');
+    expect(html).toMatch(/\+5%<\/td><td[^>]*>—/); // unknown rung is a dash
+    expect(renderToStaticMarkup(<CurvePanelView mint={null} curve={null} tape={null} error={null} />)).toContain('Select a token');
+    expect(renderToStaticMarkup(<CurvePanelView mint="M1111111111" curve={null} tape={null} error="503 UNAVAILABLE" />)).toContain('No market data');
+  });
+});

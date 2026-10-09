@@ -19,6 +19,11 @@ import { pumpFeedListener } from './server/solana/pumpFeedListener';
 import { autoSnipeController } from './server/auto/controller';
 import { watchWindow } from './server/signals/watchWindow';
 import { buildBoard } from './server/board';
+import { PublicKey } from '@solana/web3.js';
+import { solPriceService } from './server/market/solPriceService';
+import { PumpCurveService } from './server/solana/pumpCurve';
+import { buildCurveDepth } from './server/market/curveDepth';
+import { TradeTape } from './server/market/tradeTape';
 import { runComprehensiveTestSuite } from './server/unitTestCases';
 import { registerMarketRoutes } from './server/market/marketRoutes';
 import { run60DayBacktest } from './src/utils/backtestEngine';
@@ -1674,6 +1679,43 @@ app.post('/api/auto/mode', requireOperatorAuth, validateTradeBody(AutoModeSchema
 app.post('/api/auto/kill', requireOperatorAuth, validateTradeBody(AutoKillSchema), async (req, res) => {
   const result = await autoSnipeController.kill({ exitAll: req.body.exitAll, reason: req.body.reason });
   res.json({ success: true, ...result, status: autoSnipeController.getStatus() });
+});
+
+// H2: bonding-curve depth ladder and the selected mint's trade tape. When the source fails: 503, no generated rows.
+const tradeTape = new TradeTape(
+  (mint) => pumpFeedListener.getCreatorForMint(mint),
+  () => {
+    try {
+      return localSigner.getStatus() === 'READY' ? localSigner.getPublicKey().toBase58() : null;
+    } catch {
+      return null;
+    }
+  }
+);
+tradeTape.attach(pumpFeedListener);
+
+app.get('/api/market/curve/:mint', requireOperatorAuth, async (req, res) => {
+  try {
+    const mint = new PublicKey(String(req.params.mint));
+    const mode = executionCoordinator.getExecutionMode();
+    const state = await PumpCurveService.fetchPumpMarketState({ connection: executionCoordinator.getConnection(), mint, executionMode: mode });
+    if (!state) return res.status(503).json({ success: false, source: 'UNAVAILABLE', error: 'bonding curve state could not be read' });
+    const held = workstationDb.loadPositions(undefined, 'ACTIVE').find((p) => p.mint === mint.toBase58());
+    const depth = buildCurveDepth(state, { mode, positionTokensRaw: held ? BigInt(held.tokenQuantityRaw) : null });
+    const sol = solPriceService.lastKnownPrice();
+    res.json({
+      success: true, ...depth, priceUsd: sol === null ? null : depth.spotPriceSol * sol, solUsd: sol,
+      note: state.complete ? 'Migrated to PumpSwap: pool reserves are not read yet, so no ladder.' : null,
+    });
+  } catch (e: any) {
+    res.status(503).json({ success: false, source: 'UNAVAILABLE', error: e?.message || 'curve unavailable' });
+  }
+});
+
+app.get('/api/market/trades/:mint', requireOperatorAuth, (req, res) => {
+  const mint = String(req.params.mint);
+  const rows = tradeTape.get(mint, 50);
+  res.json({ success: true, mint, source: rows.length ? 'PUMP_TRADE_EVENTS' : 'NO_DATA', trades: rows });
 });
 
 app.get('/api/board', requireOperatorAuth, (req, res) => {

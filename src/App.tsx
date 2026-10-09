@@ -41,6 +41,7 @@ import { PlugAndPlayTradingModal } from './components/PlugAndPlayTradingModal';
 import { AuthModal } from './components/AuthModal';
 import { engineClient, getOperatorSessionToken } from './services/engineClient';
 import { TokenBoard } from './components/TokenBoard';
+import { CurvePanel } from './components/CurvePanel';
 
 // Bot configuration only. Performance fields (pnl, winRate, tradesCount, opsPerSec) start at zero and
 // must come from real fills; this UI never fabricates fills or PnL (B1).
@@ -600,7 +601,8 @@ export default function App() {
       <main className="flex-1 p-4 lg:p-6 grid grid-cols-12 gap-5 max-w-[1920px] mx-auto w-full content-start">
         <TokenBoard onSelect={setSelectedMint} selected={selectedMint} />
         <aside className="col-span-12 lg:col-span-4 flex flex-col space-y-5" data-testid="home-side">
-          {/* H2 / H3 panels mount here */}
+          <CurvePanel mint={selectedMint} />
+          {/* H3 panel mounts here */}
         </aside>
       </main>
 

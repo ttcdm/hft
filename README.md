@@ -74,8 +74,8 @@ cp .env.example .env
 
 Key environment variables:
 - `PORT=3000`: Port bound by server (default: 3000)
-- `SOLANA_RPC_URL`: Solana JSON-RPC node URL (e.g. Helius, QuickNode, Triton, or Solana mainnet)
-- `JITO_BLOCK_ENGINE_URL`: Jito MEV Block Engine endpoint for private bundle routing (e.g. `https://mainnet.block-engine.jito.wtf`)
+- `SOLANA_RPC_URL`: Solana JSON-RPC node URL (this build is devnet/localnet only: `https://api.devnet.solana.com`, or a loopback URL for the local validator; mainnet is refused by the cluster guard)
+- `JITO_BLOCK_ENGINE_URL`: Jito MEV Block Engine endpoint for private bundle routing (leave unset on devnet/localnet; there is no devnet block engine and mainnet endpoints are not supported)
 - `DEFAULT_JITO_TIP_SOL`: Base validator tip in SOL included with bundles (optional floor of the tip policy, default `0.00018`; explicit tips are bounded by `MIN_JITO_TIP_SOL`/`MAX_JITO_TIP_SOL` and capped at 15% of trade notional)
 - `PAPER_BANKROLL_SOL`: Paper-mode bankroll used for sizing when no real balance is known (default `0.07`)
 - `PAPER_STRICT_GATES`: `1` makes paper trades reject unverified safety checks exactly like LIVE (default off: unverified checks pass in paper but are recorded on the fill)

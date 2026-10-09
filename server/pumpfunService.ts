@@ -1,3 +1,4 @@
+import { solPriceService } from './market/solPriceService';
 import {
   PumpFunCaller,
   PumpFunHotCallout,
@@ -372,8 +373,8 @@ export class PumpFunService extends EventEmitter {
       total_supply: Number(event.tokenTotalSupply),
       virtual_sol_reserves: Number(event.virtualSolReserves),
       virtual_token_reserves: Number(event.virtualTokenReserves),
-      usd_market_cap: event.initialMarketCapSol * 145,
-      market_cap_usd: event.initialMarketCapSol * 145,
+      usd_market_cap: event.initialMarketCapSol * (solPriceService.lastKnownPrice() ?? 0),
+      market_cap_usd: event.initialMarketCapSol * (solPriceService.lastKnownPrice() ?? 0),
       reply_count: 0,
       last_reply: null,
       nsfw: false,
@@ -621,7 +622,7 @@ export class PumpFunService extends EventEmitter {
           currentPriceUsd,
           marketCapAtCalloutUsd,
           currentMarketCapUsd,
-          athPriceSol: (c.ath_market_cap || currentMarketCapUsd) / 185,
+          athPriceSol: solPriceService.lastKnownPrice() ? (c.ath_market_cap || currentMarketCapUsd) / solPriceService.lastKnownPrice()! : 0,
           peakMultiple: currentMultiple, // B3: the true peak is not in the feed; never invent a 1.35x
           currentMultiple,
           complete: c.complete || curveProgress >= 100,

@@ -1,3 +1,4 @@
+import { solPriceService } from '../market/solPriceService';
 import crypto from 'crypto';
 import { NormalizedPosition } from '../core/types';
 import { workstationDb } from '../db/database';
@@ -33,7 +34,9 @@ export class PaperExecutionEngine {
   /** Uncapped modeled price impact in bps for an order against pool liquidity (same model the fill uses). */
   public static estimateImpactBps(amountSol: number, liquidityUsd?: number, solPriceUsd?: number): number {
     const poolLiq = Math.max(2000, liquidityUsd || 15000);
-    const solUsd = solPriceUsd || 150;
+    const solUsd = solPriceUsd || solPriceService.lastKnownPrice();
+    // C3: with no SOL/USD price the order's size against the pool is unknown; report unbounded impact (fail closed).
+    if (!solUsd) return Number.POSITIVE_INFINITY;
     const participationRate = (amountSol * solUsd) / poolLiq;
     return Math.max(10, Math.round(Math.sqrt(participationRate) * 1200));
   }

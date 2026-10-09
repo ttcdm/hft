@@ -1,3 +1,4 @@
+import { solPriceService } from '../market/solPriceService';
 import {
   PreTradeRiskLimits,
   RiskReasonCode,
@@ -48,7 +49,9 @@ export class HardenedRiskEngine {
     this.limits = {
       maxPositionSol: cfg.maxPositionSizeSol,
       maxAggregateExposureSol: cfg.maxPositionSizeSol * 3,
-      maxDailyLossSol: cfg.maxDailyLossUsd / 145.0,
+      // C3: the SOL value of the USD daily-loss cap follows the live SOL price (see effectiveMaxDailyLossSol).
+      // Until a price is known this is the aggregate exposure cap, which is the most that can be at risk.
+      maxDailyLossSol: cfg.maxPositionSizeSol * 3,
       maxSimultaneousPositions: 3,
       maxSlippageBps: cfg.maxSlippageBps,
       maxPriceImpactBps: 600,
@@ -67,7 +70,18 @@ export class HardenedRiskEngine {
     return { ...this.limits };
   }
 
+  /** True once an operator or test sets maxDailyLossSol explicitly; then the live-price derivation is not applied. */
+  private dailyLossLimitPinned = false;
+
+  /** Daily loss stop in SOL: pinned value if set explicitly, else maxDailyLossUsd / live SOL price, else the safe default. */
+  public effectiveMaxDailyLossSol(): number {
+    if (this.dailyLossLimitPinned) return this.limits.maxDailyLossSol;
+    const px = solPriceService.lastKnownPrice();
+    return px ? executionConfig.getConfig().maxDailyLossUsd / px : this.limits.maxDailyLossSol;
+  }
+
   public updateLimits(partial: Partial<PreTradeRiskLimits>) {
+    if (partial.maxDailyLossSol !== undefined) this.dailyLossLimitPinned = true;
     this.limits = { ...this.limits, ...partial };
     Logger.info('Risk engine limits updated', this.limits);
   }
@@ -238,11 +252,12 @@ export class HardenedRiskEngine {
 
     // 10. Daily Total Loss Limit (B20: Closed PnL + Open Unrealized PnL - Fees)
     const dailyTotalPnL = this.getDailyTotalPnLSol(req.executionMode);
-    if (dailyTotalPnL <= -this.limits.maxDailyLossSol) {
+    const maxDailyLossSol = this.effectiveMaxDailyLossSol();
+    if (dailyTotalPnL <= -maxDailyLossSol) {
       return logAndReturn(
         false,
         'DAILY_LOSS_LIMIT',
-        `Daily total loss ${Math.abs(dailyTotalPnL).toFixed(4)} SOL reached daily stop limit ${this.limits.maxDailyLossSol} SOL`
+        `Daily total loss ${Math.abs(dailyTotalPnL).toFixed(4)} SOL reached daily stop limit ${maxDailyLossSol} SOL`
       );
     }
 

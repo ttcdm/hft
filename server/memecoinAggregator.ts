@@ -3,7 +3,7 @@ import { EventEmitter } from 'events';
 import { PublicKey } from '@solana/web3.js';
 import { PumpCurveService } from './solana/pumpCurve';
 import { executionCoordinator } from './execution/coordinator';
-import { walletTrader } from './walletTrader';
+import { solPriceService } from './market/solPriceService';
 import { workstationDb } from './db/database';
 import { evaluateTokenSafety } from './risk/tokenSafety';
 import { pumpFeedListener, PumpCreateEvent } from './solana/pumpFeedListener';
@@ -106,11 +106,10 @@ const DEMO_POOL_IDS: ReadonlySet<string> = new Set(INITIAL_POOLS.map((p) => p.id
 
 export class MemecoinAggregatorService extends EventEmitter {
   private pools: MemecoinPool[] = [];
-  // S2: this used to be a constant 145.0 that nothing ever updated, so USD->SOL sizing ignored the real price.
-  // The wallet trader fetches the live SOL/USD rate (and starts from the same 145 fallback), so read it from there.
+  // C3: the SOL/USD price comes from the single SolPriceService. 0 here means "no price known"; every code path that
+  // converts USD to SOL is guarded in executeSnipe (LIVE needs a fresh price, PAPER needs a last known one).
   private get solPriceUsd(): number {
-    const px = walletTrader.getState().solPriceUsd;
-    return px > 0 ? px : 145.0;
+    return solPriceService.lastKnownPrice() ?? 0;
   }
   private simulationTimer: NodeJS.Timeout | null = null;
   private config: SniperBotConfig = {
@@ -376,6 +375,16 @@ export class MemecoinAggregatorService extends EventEmitter {
 
     // Sizing via CapitalSizer (B12): determine spendable bankroll and 10% ceiling
     const executionMode = executionCoordinator.getExecutionMode();
+    // C3: LIVE needs a fresh SOL/USD price (fail closed). PAPER may use the last known one, but not none.
+    if (executionMode === 'LIVE') {
+      try {
+        solPriceService.requireFreshPrice();
+      } catch (e: any) {
+        return { success: false, message: `REJECTED: ${e.message}`, txHash: '' };
+      }
+    } else if (solPriceService.lastKnownPrice() === null) {
+      return { success: false, message: 'REJECTED: SOL_PRICE_UNAVAILABLE: no SOL/USD price has been read yet', txHash: '' };
+    }
     const walletBalanceSol = executionCoordinator.getRealWalletBalanceSol() ?? 0.07;
     const historicalStats = CapitalSizer.getHistoricalTradeStats(executionMode);
     const sizingResult = CapitalSizer.calculateOrderSize({
@@ -700,7 +709,7 @@ export class MemecoinAggregatorService extends EventEmitter {
       this.pools.forEach((pool) => {
         const deltaPct = (Math.random() - 0.5) * 1.2;
         pool.priceUsd = Math.max(0.000001, pool.priceUsd * (1 + deltaPct / 100));
-        pool.priceNative = pool.priceUsd / this.solPriceUsd;
+        if (this.solPriceUsd > 0) pool.priceNative = pool.priceUsd / this.solPriceUsd;
         pool.marketCapUsd = Math.round(pool.priceUsd * 1000000000);
       });
 

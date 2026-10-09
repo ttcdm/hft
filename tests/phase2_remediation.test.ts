@@ -344,65 +344,40 @@ describe('Phase 2 Remediation Suite (B02, B08, B09, B17, B21, B23)', () => {
     });
   });
 
-  describe('B23: Fallback Pricing Resilience in walletTrader', () => {
-    it('walletTrader falls back to Jupiter DEX Price API or CoinGecko if Binance fails or is geo-blocked', async () => {
-      // Mock fetch: Binance fails, Jupiter succeeds
+  describe('B23: Fallback Pricing Resilience (SolPriceService, C3)', () => {
+    // C3: Jupiter price API v6 is deprecated and was replaced by Coinbase spot; the cascade is Binance -> Coinbase -> CoinGecko.
+    it('walletTrader falls back to Coinbase or CoinGecko if Binance fails or is geo-blocked', async () => {
       const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
         const urlStr = url.toString();
         if (urlStr.includes('api.binance.com')) {
-          // Simulate geo-block 451 or network failure
-          return new Response(JSON.stringify({ code: 0, msg: 'Service unavailable from restricted location' }), {
-            status: 451,
-          });
+          return new Response(JSON.stringify({ code: 0, msg: 'Service unavailable from restricted location' }), { status: 451 });
         }
-        if (urlStr.includes('price.jup.ag')) {
-          // Jupiter v6 response
-          return new Response(
-            JSON.stringify({
-              data: {
-                SOL: {
-                  id: 'SOL',
-                  mintSymbol: 'SOL',
-                  vsToken: 'USDC',
-                  price: 152.75,
-                },
-              },
-            }),
-            { status: 200 }
-          );
+        if (urlStr.includes('api.coinbase.com')) {
+          return new Response(JSON.stringify({ data: { base: 'SOL', currency: 'USD', amount: '152.75' } }), { status: 200 });
         }
         return new Response('{}', { status: 404 });
       });
 
       await walletTrader.syncRpcBalance();
-      const state = walletTrader.getState();
-      expect(state.solPriceUsd).toBe(152.75);
+      expect(walletTrader.getState().solPriceUsd).toBe(152.75);
 
       fetchSpy.mockRestore();
     });
 
-    it('walletTrader falls back to CoinGecko if both Binance and Jupiter fail', async () => {
+    it('walletTrader falls back to CoinGecko if both Binance and Coinbase fail', async () => {
       const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {
         const urlStr = url.toString();
-        if (urlStr.includes('api.binance.com') || urlStr.includes('price.jup.ag')) {
+        if (urlStr.includes('api.binance.com') || urlStr.includes('api.coinbase.com')) {
           return new Response('Network error', { status: 500 });
         }
         if (urlStr.includes('coingecko.com')) {
-          return new Response(
-            JSON.stringify({
-              solana: {
-                usd: 154.2,
-              },
-            }),
-            { status: 200 }
-          );
+          return new Response(JSON.stringify({ solana: { usd: 154.2 } }), { status: 200 });
         }
         return new Response('{}', { status: 404 });
       });
 
       await walletTrader.syncRpcBalance();
-      const state = walletTrader.getState();
-      expect(state.solPriceUsd).toBe(154.2);
+      expect(walletTrader.getState().solPriceUsd).toBe(154.2);
 
       fetchSpy.mockRestore();
     });

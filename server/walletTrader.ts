@@ -7,6 +7,7 @@ import { riskEngine } from './risk/riskEngine';
 import { ExecutionMode, NormalizedPosition } from './core/types';
 import { executionConfig } from './solana/executionConfig';
 import { resolveRpcUrl } from './solana/clusterGuard';
+import { solPriceService } from './market/solPriceService';
 
 export interface WalletTraderConfig {
   walletAddress: string;
@@ -65,7 +66,6 @@ export interface PanicLiquidationReport {
 class PlugAndPlayWalletTrader extends EventEmitter {
   private config: WalletTraderConfig;
 
-  private solPriceUsd = 145.0;
   private syncIntervalTimer: NodeJS.Timeout | null = null;
 
   constructor() {
@@ -118,57 +118,8 @@ class PlugAndPlayWalletTrader extends EventEmitter {
   public async syncRpcBalance(): Promise<number | null> {
     const bal = await executionCoordinator.syncRealWalletBalance();
 
-    let fetchedPrice: number | null = null;
-
-    // 1. Primary: Binance SOLUSDT (if available / non-geoblocked)
-    try {
-      const priceRes = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', {
-        signal: AbortSignal.timeout(3000),
-      });
-      if (priceRes.ok) {
-        const pData = (await priceRes.json()) as any;
-        if (pData?.price) {
-          const parsed = parseFloat(pData.price);
-          if (parsed > 0) fetchedPrice = parsed;
-        }
-      }
-    } catch {}
-
-    // 2. Secondary: Jupiter DEX Price API v6 (Solana-native, non-geoblocked) (B23)
-    if (!fetchedPrice) {
-      try {
-        const jupRes = await fetch('https://price.jup.ag/v6/price?ids=SOL', {
-          signal: AbortSignal.timeout(3000),
-        });
-        if (jupRes.ok) {
-          const jData = (await jupRes.json()) as any;
-          if (jData?.data?.SOL?.price) {
-            const parsed = parseFloat(jData.data.SOL.price);
-            if (parsed > 0) fetchedPrice = parsed;
-          }
-        }
-      } catch {}
-    }
-
-    // 3. Tertiary: CoinGecko SOL/USD Price API
-    if (!fetchedPrice) {
-      try {
-        const cgRes = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', {
-          signal: AbortSignal.timeout(3000),
-        });
-        if (cgRes.ok) {
-          const cgData = (await cgRes.json()) as any;
-          if (cgData?.solana?.usd) {
-            const parsed = parseFloat(cgData.solana.usd);
-            if (parsed > 0) fetchedPrice = parsed;
-          }
-        }
-      } catch {}
-    }
-
-    if (fetchedPrice && fetchedPrice > 0) {
-      this.solPriceUsd = fetchedPrice;
-    }
+    // C3: the single SolPriceService owns fetching, caching and staleness.
+    await solPriceService.refresh();
 
     this.emit('wallet_state_updated', this.getState());
     return bal;
@@ -295,10 +246,8 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     }
     if (newConfig.riskLimits) {
       this.config.riskLimits = { ...this.config.riskLimits, ...newConfig.riskLimits };
-      riskEngine.updateLimits({
-        maxDailyLossSol: newConfig.riskLimits.maxDailyLossUsd / this.solPriceUsd,
-        maxPositionSol: newConfig.riskLimits.maxPositionSizeSol,
-      });
+      // C3: the daily-loss limit stays derived from the live SOL price inside the risk engine; only the size is pushed.
+      riskEngine.updateLimits({ maxPositionSol: newConfig.riskLimits.maxPositionSizeSol });
     }
 
     Logger.info('Wallet Trader configuration updated', {
@@ -323,9 +272,10 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     const totalOpenValue = activePositions.reduce((s, p) => s + p.currentValueSol, 0);
     const availableSol = Math.max(0, this.config.allocatedSol - totalOpenCost);
 
-    const totalPortfolioValueUsd = (availableSol + totalOpenValue) * this.solPriceUsd;
+    const solPriceUsd = solPriceService.lastKnownPrice(); // null when no price has ever been read
+    const totalPortfolioValueUsd = solPriceUsd === null ? null : (availableSol + totalOpenValue) * solPriceUsd;
     const totalRealizedPnLSol = workstationDb.getDailyRealizedPnLSol(mode);
-    const totalRealizedPnLUsd = totalRealizedPnLSol * this.solPriceUsd;
+    const totalRealizedPnLUsd = solPriceUsd === null ? null : totalRealizedPnLSol * solPriceUsd;
 
     const totalJitoTipsPaidSol = activePositions.reduce((s, p) => s + p.jitoTipLamports / 1e9, 0);
 
@@ -343,12 +293,12 @@ class PlugAndPlayWalletTrader extends EventEmitter {
       solBalance: diag.walletSolBalance,
       allocatedSol: this.config.allocatedSol,
       availableSol: Number(availableSol.toFixed(4)),
-      solPriceUsd: Number(this.solPriceUsd.toFixed(2)),
-      totalPortfolioValueUsd: Number(totalPortfolioValueUsd.toFixed(2)),
+      solPriceUsd: solPriceUsd === null ? null : Number(solPriceUsd.toFixed(2)),
+      totalPortfolioValueUsd: totalPortfolioValueUsd === null ? null : Number(totalPortfolioValueUsd.toFixed(2)),
       activePositions,
       closedPositionsCount: closedPositions.length,
       totalRealizedPnLSol: Number(totalRealizedPnLSol.toFixed(4)),
-      totalRealizedPnLUsd: Number(totalRealizedPnLUsd.toFixed(2)),
+      totalRealizedPnLUsd: totalRealizedPnLUsd === null ? null : Number(totalRealizedPnLUsd.toFixed(2)),
       totalJitoTipsPaidSol: Number(totalJitoTipsPaidSol.toFixed(4)),
       executionMode: mode,
       isLiveTradingActive: executionCoordinator.isLiveArmed(),

@@ -1,3 +1,4 @@
+import { solPriceService } from '../market/solPriceService';
 import dotenv from 'dotenv';
 dotenv.config();
 import { Connection, PublicKey, SystemProgram, VersionedTransaction } from '@solana/web3.js';
@@ -1424,6 +1425,20 @@ export class ExecutionCoordinator {
         Logger.warn(`Could not fetch token holder distribution for ${req.mint}: ${err.message}`);
       }
 
+      // C3: the liquidity gate needs the SOL/USD price. A missing or stale price fails closed in LIVE.
+      let liveSolUsd: number;
+      try {
+        liveSolUsd = solPriceService.requireFreshPrice();
+      } catch (e: any) {
+        return {
+          success: false,
+          lifecycleState: 'RISK_REJECTED',
+          executionMode: 'LIVE',
+          error: e.message,
+          correlationId,
+        };
+      }
+
       eligibility = EligibilityFilter.evaluate(
         {
           mint: req.mint,
@@ -1434,7 +1449,7 @@ export class ExecutionCoordinator {
             Number(marketState.virtualSolReserves) /
             Number(marketState.virtualTokenReserves) /
             (1e9 / Math.pow(10, marketState.tokenDecimals)),
-          liquidityUsd: (Number(marketState.realSolReserves) / 1e9) * 150 * 2,
+          liquidityUsd: (Number(marketState.realSolReserves) / 1e9) * liveSolUsd * 2,
           bondingCurveProgress: Number(
             Math.min(100, (Number(marketState.realSolReserves) / (85 * 1e9)) * 100).toFixed(1)
           ),

@@ -9,7 +9,7 @@
 
 ```ini
 # 1. Operator Dashboard Security (Generated)
-OPERATOR_AUTH_TOKEN=b88a8cbd55a6173a2a3d13e1988774960266efa089a058f7549df730390d5905
+OPERATOR_AUTH_TOKEN=<generate with: openssl rand -hex 32>
 
 # 2. Local Hot Signer Path (POSIX 0600 protected)
 SIGNER_KEYPAIR_PATH=/app/applet/.apex_trading_keypair.json
@@ -19,11 +19,13 @@ ALLOW_LIVE_REAL_MONEY_TRADING=false
 
 # 4. Solana RPC Configuration
 # Get a free fast RPC key at: https://dev.helius.xyz/ or https://www.quicknode.com/
-SOLANA_RPC_URL=https://attentive-cosmopolitan-uranium.solana-devnet.quiknode.pro/8ba82ff391e72763132b1fec0aa829151ef27f6b/
-SOLANA_WS_URL=wss://attentive-cosmopolitan-uranium.solana-devnet.quiknode.pro/8ba82ff391e72763132b1fec0aa829151ef27f6b/
+# Never commit a real RPC URL: it embeds your API key.
+SOLANA_RPC_URL=<your devnet RPC URL, including its API key>
+SOLANA_WS_URL=<your devnet WebSocket URL, including its API key>
 
-# 5. Jito MEV Bundle Transport (Mainnet)
-JITO_BLOCK_ENGINE_URL=https://mainnet.block-engine.jito.wtf
+# 5. Jito MEV Bundle Transport
+# Devnet has no Jito block engine: leave JITO_BLOCK_ENGINE_URL unset until you deliberately move to mainnet.
+# JITO_BLOCK_ENGINE_URL=
 MIN_JITO_TIP_SOL=0.002
 MAX_JITO_TIP_SOL=0.050
 

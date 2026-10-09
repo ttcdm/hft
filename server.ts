@@ -32,6 +32,11 @@ import {
   isAllowedClientOrigin,
   isAllowedWsConnection,
 } from './server/middleware/auth';
+import {
+  findLoosePermissions,
+  defaultSecretFilePaths,
+  loosePermissionWarnings,
+} from './server/middleware/filePermissions';
 export { isAllowedClientOrigin };
 import {
   Logger,
@@ -57,6 +62,9 @@ const bindResolution = resolveBindHost();
 const BIND_HOST = bindResolution.host;
 if (bindResolution.warning) {
   Logger.warn(bindResolution.warning);
+}
+for (const warning of loosePermissionWarnings(findLoosePermissions(defaultSecretFilePaths()))) {
+  Logger.warn(warning);
 }
 const server = http.createServer(app);
 

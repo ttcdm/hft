@@ -134,30 +134,7 @@ describe('Tier 5 [mock-level]: Real vs Paper Execution Guarantees (Zero-Emulatio
   // 2. Market Data Truthfulness & Fallback Prohibition in LIVE Mode
   // =========================================================================
   describe('Market Data Truthfulness & Fallback Prohibition in LIVE Mode', () => {
-    it('RPG-3: LIVE mode strictly disallows synthetic pricing: fails closed if on-chain bonding curve RPC fails', async () => {
-      process.env.ALLOW_LIVE_REAL_MONEY_TRADING = 'true';
-      mockPassingLiveReadiness(coordinator, liveTradingKeypair);
-      coordinator.armLiveTrading(true, 'CONFIRM_LIVE_TRADING_RISK');
-      expect(coordinator.isLiveArmed()).toBe(true);
-
-      // On-chain RPC returns null (cannot fetch curve state)
-      vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockResolvedValue(null);
-
-      const result = await coordinator.executeTrade({
-        signalTimestamp: Date.now(),
-        mint: VALID_PUMP_MINT_1.toBase58(),
-        symbol: 'TEST1',
-        name: 'Test Token 1',
-        amountSol: 0.005,
-        currentPriceSol: 0.0001, // Caller suggests price, but coordinator MUST query on-chain
-        source: 'AUTO_SNIPER',
-        provenance: 'REAL_ONCHAIN',
-      });
-
-      expect(result.success).toBe(false);
-      expect(result.lifecycleState).toBe('RISK_REJECTED');
-      expect(result.error).toMatch(/MARKET_DATA_UNAVAILABLE: Could not fetch real Pump\.fun bonding curve/);
-    });
+    // RPG-3 (LIVE fails closed when the curve cannot be read, and ignores the caller's price) moved to tests/behaviour_http.test.ts.
 
     it('RPG-4: PAPER mode permits documented fallback pricing when dynamic market state is unavailable', async () => {
       expect(coordinator.getExecutionMode()).toBe('PAPER');

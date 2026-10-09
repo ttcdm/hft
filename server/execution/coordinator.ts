@@ -198,10 +198,15 @@ export class ExecutionCoordinator {
       const t0 = performance.now();
       const slot = await this.connection.getSlot('processed');
       this.rpcLatencyMs = Math.round(performance.now() - t0);
-      this.rpcHealth = this.rpcLatencyMs > 800 ? 'DEGRADED' : 'HEALTHY';
-      Logger.info(`Solana RPC connected: Slot ${slot}, Latency ${this.rpcLatencyMs}ms`);
+      // An RPC that answers for a cluster other than the allowed one is not "healthy": readiness must refuse to arm on it,
+      // not wait for the first send to find out (the send path still re-checks). Started now, awaited after the Jito probe.
+      const clusterCheck = assertClusterAllowed(this.connection);
+      clusterCheck.catch(() => undefined); // the await below reports it; this stops an early rejection being unhandled
       await this.jitoTransport.probe();
       this.startJitoProbeLoop();
+      await clusterCheck;
+      this.rpcHealth = this.rpcLatencyMs > 800 ? 'DEGRADED' : 'HEALTHY';
+      Logger.info(`Solana RPC connected: Slot ${slot}, Latency ${this.rpcLatencyMs}ms`);
       await this.syncRealWalletBalance();
       await this.startupReconciliation();
     } catch (err: any) {

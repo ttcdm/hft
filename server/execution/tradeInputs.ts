@@ -142,10 +142,16 @@ export const OperatorExecuteTradeSchema = z
     liquidityUsd,
   }));
 
+/**
+ * A boolean from JSON or a form: true/false or the strings "true"/"false". `z.coerce.boolean()` turns the STRING "false"
+ * into true (any non-empty string is truthy), which would arm, or sell everything, on a request that said the opposite.
+ */
+const strictBool = z.preprocess((v) => (v === 'true' ? true : v === 'false' ? false : v), z.boolean());
+
 /** POST /api/execution/arm and POST /api/wallet/toggle-trading. */
 export const ArmSchema = z.object({
-  arm: z.coerce.boolean().optional(),
-  active: z.coerce.boolean().optional(),
+  arm: strictBool.optional(),
+  active: strictBool.optional(),
   confirmationCode: z.string().max(64).optional(),
 });
 
@@ -157,7 +163,7 @@ export const AutoModeSchema = z.object({
 
 /** POST /api/auto/kill (G1). */
 export const AutoKillSchema = z.object({
-  exitAll: z.coerce.boolean().optional(),
+  exitAll: strictBool.optional(),
   reason: z.string().trim().max(200).optional(),
 });
 

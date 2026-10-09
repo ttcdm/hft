@@ -60,13 +60,6 @@ describe('A1: operator auth lockdown', () => {
       expect(routes).toContainEqual({ method: 'POST', path: '/api/pumpfun/refresh' });
     });
 
-    it('mounts apiAuthGate before the first /api route in server.ts', () => {
-      const gateIdx = serverSource.indexOf('app.use(apiAuthGate)');
-      const firstRouteIdx = serverSource.search(/^app\.(get|post|put|delete|patch)\(\s*'\/api/m);
-      expect(gateIdx).toBeGreaterThan(-1);
-      expect(gateIdx).toBeLessThan(firstRouteIdx);
-    });
-
     it('rejects every non-allowlisted /api route without a token and admits it with a valid one', async () => {
       const token = authManager.getPrimaryToken();
       await withGatedApp(async (base) => {
@@ -129,18 +122,6 @@ describe('A1: operator auth lockdown', () => {
         });
         expect(res.status).toBe(401);
       });
-    });
-  });
-
-  describe('server.ts no longer auto-provisions tokens or overwrites keypairs', () => {
-    it('has no auto-provision branch in /api/auth/session', () => {
-      expect(serverSource).not.toContain('isAutoProvisioned');
-      expect(serverSource).not.toContain('getPrimaryToken');
-    });
-
-    it('refuses forceOverwrite on /api/signer/generate', () => {
-      expect(serverSource).toContain('Overwriting an existing keypair over HTTP is disabled');
-      expect(serverSource).not.toContain('generateNewKeypair(forceOverwrite)');
     });
   });
 

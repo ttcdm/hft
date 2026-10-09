@@ -61,50 +61,8 @@ describe('Tier 5 [mock-level]: Live Production Readiness Gates & Capital Safety 
     mockRpc.clear();
   });
 
-  // =========================================================================
-  // 1. ALLOW_LIVE_REAL_MONEY_TRADING Environment & Confirmation Guards
-  // =========================================================================
-  describe('Environment & Confirmation Code Safety Gates', () => {
-    it('PRG-1: armLiveTrading(true) is strictly rejected when ALLOW_LIVE_REAL_MONEY_TRADING !== "true"', () => {
-      delete process.env.ALLOW_LIVE_REAL_MONEY_TRADING;
-
-      const result = coordinator.armLiveTrading(true, 'CONFIRM_LIVE_TRADING_RISK');
-      expect(result.success).toBe(false);
-      expect(result.message).toMatch(/REAL_MONEY_PROHIBITED/);
-      expect(coordinator.isLiveArmed()).toBe(false);
-      expect(coordinator.getExecutionMode()).toBe('PAPER');
-
-      process.env.ALLOW_LIVE_REAL_MONEY_TRADING = 'false';
-      const result2 = coordinator.armLiveTrading(true, 'CONFIRM_LIVE_TRADING_RISK');
-      expect(result2.success).toBe(false);
-      expect(coordinator.isLiveArmed()).toBe(false);
-    });
-
-    it('PRG-2: armLiveTrading(true) requires exact confirmation code CONFIRM_LIVE_TRADING_RISK', () => {
-      process.env.ALLOW_LIVE_REAL_MONEY_TRADING = 'true';
-
-      const invalidCodes = ['', 'CONFIRM', 'CONFIRM_LIVE_TRADING', 'YES_ARM', '123456'];
-      for (const code of invalidCodes) {
-        const result = coordinator.armLiveTrading(true, code);
-        expect(result.success).toBe(false);
-        expect(result.message).toMatch(/Invalid confirmation code/);
-        expect(coordinator.isLiveArmed()).toBe(false);
-      }
-    });
-
-    it('PRG-3: armLiveTrading(false) instantly disarms live trading and resets mode to PAPER', () => {
-      process.env.ALLOW_LIVE_REAL_MONEY_TRADING = 'true';
-      const armRes = coordinator.armLiveTrading(true, 'CONFIRM_LIVE_TRADING_RISK');
-      expect(armRes.success).toBe(true);
-      expect(coordinator.isLiveArmed()).toBe(true);
-      expect(coordinator.getExecutionMode()).toBe('LIVE');
-
-      const disarmRes = coordinator.armLiveTrading(false);
-      expect(disarmRes.success).toBe(true);
-      expect(coordinator.isLiveArmed()).toBe(false);
-      expect(coordinator.getExecutionMode()).toBe('PAPER');
-    });
-  });
+  // PRG-1, 2, 3, 5, 8, 10 (environment gate, confirmation code, disarm, empty wallet, RPC down, kill switch) moved to
+  // tests/behaviour_http.test.ts, which asserts the same rules through the real server's HTTP API (see docs/TEST_FIDELITY.md).
 
   // =========================================================================
   // 2. Comprehensive Subsystem Live Readiness Invariants (canExecuteLive)
@@ -124,21 +82,6 @@ describe('Tier 5 [mock-level]: Live Production Readiness Gates & Capital Safety 
       const checkLocked = coordinator.canExecuteLive();
       expect(checkLocked.allowed).toBe(false);
       expect(checkLocked.reasons.some((r) => r.includes('Signer status is LOCKED'))).toBe(true);
-    });
-
-    it('PRG-5: fails closed if wallet balance <= 0.015 SOL minimum reserve', () => {
-      (coordinator as any).realWalletBalanceSol = 0.015;
-      const checkFloor = coordinator.canExecuteLive();
-      expect(checkFloor.allowed).toBe(false);
-      expect(checkFloor.reasons.some((r) => r.includes('minimum 0.015 SOL reserve required'))).toBe(true);
-
-      (coordinator as any).realWalletBalanceSol = 0.010;
-      const checkBelow = coordinator.canExecuteLive();
-      expect(checkBelow.allowed).toBe(false);
-
-      (coordinator as any).realWalletBalanceSol = null;
-      const checkNull = coordinator.canExecuteLive();
-      expect(checkNull.allowed).toBe(false);
     });
 
     it('PRG-6: fails closed if database is not writable', () => {
@@ -163,18 +106,6 @@ describe('Tier 5 [mock-level]: Live Production Readiness Gates & Capital Safety 
       expect(checkMismatch.reasons.some((r) => r.includes('unresolved issues'))).toBe(true);
     });
 
-    it('PRG-8: fails closed if Solana RPC health is not HEALTHY', () => {
-      (coordinator as any).rpcHealth = 'DISCONNECTED';
-      const checkDisc = coordinator.canExecuteLive();
-      expect(checkDisc.allowed).toBe(false);
-      expect(checkDisc.reasons.some((r) => r.includes('Solana RPC health is DISCONNECTED'))).toBe(true);
-
-      (coordinator as any).rpcHealth = 'DEGRADED';
-      const checkDeg = coordinator.canExecuteLive();
-      expect(checkDeg.allowed).toBe(false);
-      expect(checkDeg.reasons.some((r) => r.includes('Solana RPC health is DEGRADED'))).toBe(true);
-    });
-
     it('PRG-9: fails closed if Jito Block Engine health is not HEALTHY', () => {
       vi.spyOn((coordinator as any).jitoTransport, 'getTelemetry').mockReturnValue({
         health: 'DEGRADED',
@@ -188,13 +119,6 @@ describe('Tier 5 [mock-level]: Live Production Readiness Gates & Capital Safety 
       const check = coordinator.canExecuteLive();
       expect(check.allowed).toBe(false);
       expect(check.reasons.some((r) => r.includes('Jito Block Engine is DEGRADED'))).toBe(true);
-    });
-
-    it('PRG-10: fails closed if emergency risk kill switch is active', () => {
-      riskEngine.setKillSwitch(true);
-      const check = coordinator.canExecuteLive();
-      expect(check.allowed).toBe(false);
-      expect(check.reasons.some((r) => r.includes('Emergency risk kill switch is active'))).toBe(true);
     });
 
     it('PRG-11: fails closed if risk circuit breaker is tripped', () => {

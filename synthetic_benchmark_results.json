@@ -1,4 +1,5 @@
 {
+  "_note": "SYNTHETIC. The replay inputs are a hand-written scenario table driven by a seeded pseudo-random generator, and the latency series uses a sine wave. These are not historical launches and not measured live performance.",
   "r1": {
     "controllable": {
       "p50": 10.698,

@@ -481,11 +481,23 @@ async function main() {
   console.table(r1.summary);
 
   const replay = runOutOfSampleStrategyReplay(300);
-  console.log('\n--- OUT-OF-SAMPLE STRATEGY REPLAY COMPARISON ---');
+  console.log('\n--- SYNTHETIC STRATEGY REPLAY COMPARISON (hand-written inputs, not historical) ---');
   console.log(JSON.stringify(replay.comparison, null, 2));
 
-  fs.writeFileSync('benchmark_results.json', JSON.stringify({ r1: r1.summary, replay: replay.comparison }, null, 2));
-  console.log('\nBenchmark results persisted to benchmark_results.json.');
+  fs.writeFileSync(
+    'synthetic_benchmark_results.json',
+    JSON.stringify(
+      {
+        _note:
+          'SYNTHETIC. The replay inputs are a hand-written scenario table driven by a seeded pseudo-random generator, and the latency series uses a sine wave. These are not historical launches and not measured live performance.',
+        r1: r1.summary,
+        replay: replay.comparison,
+      },
+      null,
+      2
+    )
+  );
+  console.log('\nSynthetic benchmark results persisted to synthetic_benchmark_results.json (hand-written inputs, not historical).');
 }
 
 main().catch(console.error);

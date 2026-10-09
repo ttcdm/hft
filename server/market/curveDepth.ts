@@ -50,7 +50,7 @@ export function solForPriceMove(state: PumpMarketState, upPct: number, mode: Exe
   }
   while (hi - lo > 1) {
     const mid = Math.floor((lo + hi) / 2);
-    let reached = false;
+    let reached: boolean;
     try { reached = postBuySpot(state, quoteAt(mid)) >= target; } catch { reached = false; }
     if (reached) hi = mid; else lo = mid;
   }

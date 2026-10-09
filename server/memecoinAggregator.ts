@@ -117,7 +117,6 @@ export class MemecoinAggregatorService extends EventEmitter {
     minConfidenceScore: 80,
     defaultSnipeAmountUsd: 5.0,
     maxSlippagePct: 6.0,
-    jitoTipSol: 0.002,
     takeProfitPct: 45.0,
     stopLossPct: 20.0,
     trailingStopEnabled: true,
@@ -172,7 +171,7 @@ export class MemecoinAggregatorService extends EventEmitter {
             contractAddress: mint,
             amountUsd: this.config.defaultSnipeAmountUsd || 5.0,
             platform: 'PUMP_FUN',
-            jitoTipSol: this.config.jitoTipSol || 0.002,
+            jitoTipSol: this.config.jitoTipSol,
             slippagePct: this.config.maxSlippagePct || 6.0,
             signalId: c.id,
             provenance: calloutProvenance(c),
@@ -444,7 +443,7 @@ export class MemecoinAggregatorService extends EventEmitter {
     }
 
     const slippageBps = Math.round((params.slippagePct || this.config.maxSlippagePct) * 100);
-    const jitoTipSol = params.jitoTipSol || this.config.jitoTipSol;
+    const jitoTipSol = params.jitoTipSol || this.config.jitoTipSol || undefined;
 
     let pool = this.pools.find((p) => p.contractAddress.toLowerCase() === cleanCa.toLowerCase());
 

@@ -1302,7 +1302,7 @@ app.get('/api/connectivity/diagnostics', async (req, res) => {
         subsystem: 'Jito MEV Bundles & Priority Tips',
         nature: 'SIMULATED_MODEL',
         details:
-          'Priority tips (e.g. 0.005 SOL) and front-running protection are modeled with realistic slippage, fee deductions, and slot inclusion latencies rather than sending raw serialized transactions to Jito block engines.',
+          'Priority tips (sized by the executionConfig dynamic tip policy) and front-running protection are modeled with realistic slippage, fee deductions, and slot inclusion latencies rather than sending raw serialized transactions to Jito block engines.',
       },
       {
         subsystem: 'Caller Persona Historical Track Records',

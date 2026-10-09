@@ -94,10 +94,10 @@ describe('A3: trade entry point validation', () => {
       expect(res.json.error).toBe('INVALID_REQUEST');
     });
 
-    it('snipe applies defaults, coerces numeric strings and drops unknown keys', async () => {
+    it('snipe applies defaults (no tip default: absent means dynamic policy), coerces numeric strings and drops unknown keys', async () => {
       const res = await post(OperatorSnipeSchema, { contractAddress: ` ${MINT} `, amountUsd: '7.5', extra: 'x', action: 'SNIPE_MEMECOIN', sessionToken: 't' });
       expect(res.status).toBe(200);
-      expect(res.seen).toEqual({ contractAddress: MINT, amountUsd: 7.5, platform: undefined, jitoTipSol: 0.005, slippagePct: 8, signalId: undefined });
+      expect(res.seen).toEqual({ contractAddress: MINT, amountUsd: 7.5, platform: undefined, jitoTipSol: undefined, slippagePct: 8, signalId: undefined });
     });
 
     it('close requires a position id, bounds sellPct and defaults to 100', async () => {

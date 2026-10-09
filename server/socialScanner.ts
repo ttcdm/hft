@@ -360,7 +360,6 @@ export class SocialAlphaScanner {
       const snipeResult = await memecoinAggregator.executeSnipe({
         contractAddress: ca,
         amountUsd: amount,
-        jitoTipSol: 0.005,
       });
 
       if (snipeResult.success) {

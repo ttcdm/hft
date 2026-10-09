@@ -14,6 +14,7 @@ import {
 } from '@pump-fun/pump-sdk';
 import { PUMP_FUN_PROGRAM_ID, PUMP_FUN_FEE_RECIPIENT } from './programs';
 import { Logger } from '../middleware/enterprise';
+import { executionConfig } from './executionConfig';
 import { ExecutionMode, TriState } from '../core/types';
 
 export type { ExecutionMode };
@@ -813,14 +814,14 @@ export class PumpCurveService {
       state = paramsOrState.state;
       solAmountSol = paramsOrState.amountSol;
       slippageBps = paramsOrState.slippageBps ?? 800;
-      jitoTipSol = paramsOrState.jitoTipSol ?? 0.002;
+      jitoTipSol = paramsOrState.jitoTipSol ?? executionConfig.getConfig().defaultJitoTipSol;
       priorityFeeLamports = paramsOrState.priorityFeeLamports ?? 25000;
       executionMode = paramsOrState.executionMode;
     } else {
       state = paramsOrState;
       solAmountSol = solAmountArg!;
       slippageBps = slippageBpsArg ?? 800;
-      jitoTipSol = jitoTipSolArg ?? 0.002;
+      jitoTipSol = jitoTipSolArg ?? executionConfig.getConfig().defaultJitoTipSol;
       priorityFeeLamports = priorityFeeLamportsArg ?? 25000;
       if (modeArg !== 'LIVE' && modeArg !== 'PAPER') {
         throw new Error('CRITICAL_CONFIG_ERROR: executionMode ("LIVE" | "PAPER") is strictly required for calculateBuyQuote');
@@ -1049,14 +1050,14 @@ export class PumpCurveService {
       state = paramsOrState.state;
       tokenAmountRaw = paramsOrState.tokenAmountRaw;
       slippageBps = paramsOrState.slippageBps ?? 800;
-      jitoTipSol = paramsOrState.jitoTipSol ?? 0.002;
+      jitoTipSol = paramsOrState.jitoTipSol ?? executionConfig.getConfig().defaultJitoTipSol;
       priorityFeeLamports = paramsOrState.priorityFeeLamports ?? 25000;
       executionMode = paramsOrState.executionMode;
     } else {
       state = paramsOrState;
       tokenAmountRaw = tokenAmountRawArg!;
       slippageBps = slippageBpsArg ?? 800;
-      jitoTipSol = jitoTipSolArg ?? 0.002;
+      jitoTipSol = jitoTipSolArg ?? executionConfig.getConfig().defaultJitoTipSol;
       priorityFeeLamports = priorityFeeLamportsArg ?? 25000;
       if (modeArg !== 'LIVE' && modeArg !== 'PAPER') {
         throw new Error('CRITICAL_CONFIG_ERROR: executionMode ("LIVE" | "PAPER") is strictly required for calculateSellQuote');

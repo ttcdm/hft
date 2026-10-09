@@ -1315,7 +1315,7 @@ export class ExecutionCoordinator {
         amountSol: req.amountSol,
         currentPriceSol: quotePriceSol,
         slippageBps: req.slippageBps || 800,
-        jitoTipSol: req.jitoTipSol || 0.002,
+        jitoTipSol: paperTip.tipSol,
         liquidityUsd: req.liquidityUsd,
       });
 

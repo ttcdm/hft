@@ -26,7 +26,8 @@ interface AutoSnipeRules {
   maxEntryMultiple: number;
   maxElapsedSeconds: number;
   snipeAmountUsd: number;
-  jitoPriorityTipSol: number;
+  /** Explicit operator override only; absent means the dynamic tip policy decides (C6). */
+  jitoPriorityTipSol?: number;
 }
 
 // Canonical Top Callers Leaderboard modeled on Pump.fun's live API capture
@@ -332,7 +333,6 @@ export class PumpFunService extends EventEmitter {
     maxEntryMultiple: 1.35,
     maxElapsedSeconds: 60,
     snipeAmountUsd: 5.0, // Scaled for $10 Micro Account
-    jitoPriorityTipSol: 0.005,
   };
 
   constructor() {
@@ -822,7 +822,7 @@ export class PumpFunService extends EventEmitter {
   public async snipeCallout(
     calloutId: string,
     amountUsd: number = 5.0,
-    jitoTipSol: number = 0.005,
+    jitoTipSol?: number,
     maxSlippagePct: number = 6.0
   ): Promise<{ success: boolean; message: string; txHash?: string }> {
     const target = calloutId.trim().toLowerCase();

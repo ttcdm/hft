@@ -346,7 +346,7 @@ export interface SniperBotConfig {
   minConfidenceScore: number;
   defaultSnipeAmountUsd: number;
   maxSlippagePct: number;
-  jitoTipSol: number;
+  jitoTipSol?: number; // optional operator override; absent = dynamic policy (C6)
   takeProfitPct: number;
   stopLossPct: number;
   trailingStopEnabled: boolean;

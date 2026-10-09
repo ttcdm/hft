@@ -47,7 +47,8 @@ const address = z.string().trim().regex(SOLANA_ADDRESS, 'must be a valid Base58 
 const id = z.string().trim().min(1).max(128);
 
 const amountUsd = z.coerce.number().positive().max(100_000).default(5.0);
-const jitoTipSol = z.coerce.number().min(0).max(0.1).default(0.005);
+/** Optional: absent means the executionConfig dynamic tip policy decides (C6). */
+const jitoTipSol = z.coerce.number().min(0).max(0.1).optional();
 const slippagePct = z.coerce.number().min(0.5).max(50).default(8.0);
 const sellPct = z.coerce.number().min(1).max(100).default(100);
 

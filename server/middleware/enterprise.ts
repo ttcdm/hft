@@ -207,7 +207,7 @@ export const WalletConfigSchema = z.object({
     .string()
     .regex(SOLANA_ADDRESS_REGEX, 'Invalid Jito tip account public key')
     .default('96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5'),
-  jitoTipSol: z.number().min(0.0001).max(0.2).default(0.002),
+  jitoTipSol: z.number().min(0.0001).max(0.2).optional(), // absent leaves the stored value alone (C6)
   slippageToleranceBps: z.number().min(10).max(5000).default(600), // 6.0% default for meme volatility
   capitalTier: z.enum(['MICRO_10', 'INSTITUTIONAL', 'CUSTOM']).default('MICRO_10'),
   allocatedSol: z.number().min(0.01).max(5000).default(0.07), // ~0.07 SOL = ~$10
@@ -233,7 +233,7 @@ export const LiveSnipeOrderSchema = z.object({
     .regex(SOLANA_ADDRESS_REGEX, 'Target token mint must be a valid Base58 Solana address'),
   amountSol: z.number().positive('Snipe amount must be greater than 0').max(10.0),
   slippagePct: z.number().min(0.5).max(50.0).default(6.0),
-  jitoTipSol: z.number().min(0.0001).max(0.1).default(0.005),
+  jitoTipSol: z.number().min(0.0001).max(0.1).optional(), // absent -> dynamic tip policy (C6)
   callerHandle: z.string().optional(),
   confluenceScore: z.number().min(0).max(100).optional(),
 });
@@ -241,7 +241,8 @@ export const LiveSnipeOrderSchema = z.object({
 export const ClosePositionSchema = z.object({
   positionId: z.string().min(1, 'positionId is required'),
   sellPct: z.number().min(1).max(100).default(100),
-  priorityTipSol: z.number().min(0.0001).max(0.1).default(0.005),
+  // PLACEHOLDER: parsed but never read by the close-position handler; no default so nothing implies a tip is sent.
+  priorityTipSol: z.number().min(0.0001).max(0.1).optional(),
 });
 
 // Middleware factory for Zod validation

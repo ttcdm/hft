@@ -33,7 +33,6 @@ interface HeaderProps {
   onOpenDeployModal: () => void;
   onOpenAiDiagnostics: () => void;
   onOpenUnitTests: () => void;
-  onOpenGatewayModal: () => void;
   onOpenEngineConsole: () => void;
   onOpenMemecoinSniper?: () => void;
   onOpenRealismModal?: () => void;
@@ -58,7 +57,6 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenDeployModal,
   onOpenAiDiagnostics,
   onOpenUnitTests,
-  onOpenGatewayModal,
   onOpenEngineConsole,
   onOpenMemecoinSniper,
   onOpenRealismModal,
@@ -334,20 +332,6 @@ export const Header: React.FC<HeaderProps> = ({
                     <span>Core Engine</span>
                   </span>
                   <span className="text-[9px] px-1 rounded bg-emerald-500/20 text-emerald-300">ASYNC</span>
-                </button>
-
-                <button
-                  onClick={() => {
-                    onOpenGatewayModal();
-                    setIsToolsOpen(false);
-                  }}
-                  className="w-full text-left px-3 py-2 hover:bg-[#1A263D] flex items-center justify-between text-amber-300"
-                >
-                  <span className="flex items-center space-x-2">
-                    <KeyRound className="w-3.5 h-3.5" />
-                    <span>DMA Gateway & Risk</span>
-                  </span>
-                  <span className="text-[9px] px-1 rounded bg-amber-500/20 text-amber-300">DMA</span>
                 </button>
 
                 {onOpenBacktestModal && (

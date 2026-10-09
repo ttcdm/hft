@@ -484,68 +484,6 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// 2. Real API Latency Testing Under Synthetic & Real Conditions
-app.post('/api/latency-probe', async (req, res) => {
-  const { target, samples = 5, injectedJitterMs = 0, packetLossRate = 0 } = req.body;
-  
-  const endpoints: Record<string, string> = {
-    cme: 'https://www.cmegroup.com',
-    binance: 'https://api.binance.com/api/v3/ping',
-    coinbase: 'https://api.exchange.coinbase.com/time',
-    kraken: 'https://api.kraken.com/0/public/Time',
-    nyse: 'https://www.nyse.com',
-  };
-
-  const url = endpoints[target] || endpoints.binance;
-  const pings: number[] = [];
-  let dropped = 0;
-
-  for (let i = 0; i < Math.min(samples, 10); i++) {
-    // Check synthetic packet drop
-    if (Math.random() * 100 < packetLossRate) {
-      dropped++;
-      continue;
-    }
-
-    const start = performance.now();
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3500);
-      await fetch(url, { signal: controller.signal, method: 'HEAD', cache: 'no-store' }).catch(() => {});
-      clearTimeout(timeoutId);
-      const end = performance.now();
-      
-      // Calculate effective latency with synthetic jitter
-      const jitter = (Math.random() - 0.5) * injectedJitterMs;
-      const effectiveLatency = Math.max(0.18, (end - start) * 0.15 + jitter); // Scale to co-located speed
-      pings.push(Number(effectiveLatency.toFixed(3)));
-    } catch {
-      dropped++;
-    }
-  }
-
-  // Calculate p50, p90, p99
-  const sorted = [...pings].sort((a, b) => a - b);
-  const p50 = sorted[Math.floor(sorted.length * 0.5)] || 0.85;
-  const p90 = sorted[Math.floor(sorted.length * 0.9)] || 1.15;
-  const p99 = sorted[sorted.length - 1] || 1.42;
-  const avg = pings.length ? sorted.reduce((a, b) => a + b, 0) / pings.length : 0.88;
-
-  res.json({
-    target,
-    url,
-    totalSent: samples,
-    successfulFills: pings.length,
-    packetLossPct: Number(((dropped / samples) * 100).toFixed(1)),
-    avgLatencyMs: Number(avg.toFixed(3)),
-    p50Ms: Number(p50.toFixed(3)),
-    p90Ms: Number(p90.toFixed(3)),
-    p99Ms: Number(p99.toFixed(3)),
-    samples: pings,
-    timestamp: Date.now(),
-  });
-});
-
 // 3. Market data proxy routes (orderbook, trades, ticker) live in server/market/marketRoutes.ts (B2).
 registerMarketRoutes(app);
 

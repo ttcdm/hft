@@ -1,38 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import {
-  TradingBot,
-  OrderBook as OrderBookType,
-  ExecutedTrade,
-  NetworkStressConfig,
-  PerformanceKPIs,
-  AlertEvent,
-  PublicMarketTrade,
-  ExchangeGatewayConfig,
-  ActiveOrder,
-} from './types';
-import {
-  calculateReservationPrice,
-  calculateOptimalSpread,
-  calculateOFI,
-  calculateMicroPrice,
-  calculateNetworkDegradation,
-  formatMicrosecondTimestamp,
-} from './utils/math';
+import { TradingBot, NetworkStressConfig, PerformanceKPIs, AlertEvent } from './types';
 import { hftAudio } from './utils/audio';
-import { exchangeStream } from './services/exchangeStream';
 
 import { Header } from './components/Header';
-import { PnLEngine } from './components/PnLEngine';
-import { OrderBook } from './components/OrderBook';
-import { StrategyFleet } from './components/StrategyFleet';
-import { ExecutionTape } from './components/ExecutionTape';
-import { NetworkStressLab } from './components/NetworkStressLab';
-import { MonteCarloAnalytics } from './components/MonteCarloAnalytics';
 import { AlertSystem } from './components/AlertSystem';
 import { DeployBotModal } from './components/DeployBotModal';
 import { AiDiagnosticsModal } from './components/AiDiagnosticsModal';
 import { UnitTestModal } from './components/UnitTestModal';
-import { ExchangeGatewayModal } from './components/ExchangeGatewayModal';
 import { EngineConsoleModal } from './components/EngineConsoleModal';
 import { MemecoinSocialSniperModal } from './components/MemecoinSocialSniperModal';
 import { MicrostructureRealismModal } from './components/MicrostructureRealismModal';
@@ -165,7 +139,7 @@ export default function App() {
   const [bots, setBots] = useState<TradingBot[]>(INITIAL_BOTS);
 
   // Network Stress Config
-  const [stressConfig, setStressConfig] = useState<NetworkStressConfig>({
+  const [stressConfig] = useState<NetworkStressConfig>({
     isStressActive: false,
     profile: 'GAUSSIAN',
     baseLatencyMs: 0.65,
@@ -174,13 +148,6 @@ export default function App() {
     exchangeDisconnect: false,
   });
 
-  // Effective live network telemetry
-  const [effectiveLatency, setEffectiveLatency] = useState(0.68);
-  const [slippageMultiplier, setSlippageMultiplier] = useState(1.0);
-  const [fillRatePct, setFillRatePct] = useState(99.4);
-  const [latencyHistory, setLatencyHistory] = useState<number[]>([
-    0.62, 0.68, 0.71, 0.64, 0.78, 0.82, 0.69, 0.65, 0.74, 0.88,
-  ]);
 
   // Capital Tier State ($10 Micro Account vs $500,000 Institutional)
   const [capitalTier, setCapitalTier] = useState<'MICRO_10' | 'INSTITUTIONAL'>('MICRO_10');
@@ -188,52 +155,6 @@ export default function App() {
   // KPIs & Risk Matrix (Initialized for $10 Micro Account)
   const [kpis, setKpis] = useState<PerformanceKPIs>(makeEmptyKpis(10));
 
-  const [lastTickDelta] = useState(0);
-  const [equityHistory, setEquityHistory] = useState<number[]>([10]);
-  const [drawdownHistory] = useState<number[]>([0]);
-
-  // L2 Order Book State
-  const [midPrice, setMidPrice] = useState(68940.0);
-  const [orderBook, setOrderBook] = useState<OrderBookType>({
-    symbol: 'BTC/USDT',
-    midPrice: 68940.0,
-    spread: 0.5,
-    microPrice: 68940.25,
-    imbalanceRatio: 0.15,
-    asks: [],
-    bids: [],
-    lastTradedPrice: 68940.0,
-    lastTradedSide: 'BUY',
-  });
-  const [flashTrigger, setFlashTrigger] = useState(0);
-
-  // Execution Blotter Tape & Live Public Exchange Tape
-  const [trades] = useState<ExecutedTrade[]>([]);
-  const [publicTrades, setPublicTrades] = useState<PublicMarketTrade[]>([]);
-  const [exchangePingMs, setExchangePingMs] = useState(0.85);
-
-  // Exchange Gateway & Risk Settings
-  const [isGatewayModalOpen, setIsGatewayModalOpen] = useState(false);
-  const [gatewayConfig, setGatewayConfig] = useState<ExchangeGatewayConfig>({
-    mode: 'REAL_TAPE_PAPER_MATCHING',
-    apiKey: '',
-    apiSecret: '',
-    maxOrderNotional: 50000,
-    maxDailyLoss: 5000,
-    fatFingerBandPct: 2.5,
-    isConnected: true,
-    exchangePingMs: 0.85,
-    atomicClockDriftMs: -0.12,
-    accountBalances: [
-      { asset: 'USDT', free: 345250.0, locked: 12000.0, totalUsd: 357250.0 },
-      { asset: 'BTC', free: 2.154, locked: 0.25, totalUsd: 165645.0 },
-      { asset: 'ETH', free: 15.42, locked: 2.0, totalUsd: 49472.0 },
-      { asset: 'SOL', free: 85.0, locked: 0.0, totalUsd: 12087.0 },
-    ],
-  });
-
-  // Active Pending Orders in Queue
-  const activeOrdersRef = useRef<ActiveOrder[]>([]);
 
   // Stable references for stream callbacks to ensure persistent connection without reconnect churn
   const botsRef = useRef(bots);
@@ -365,12 +286,6 @@ export default function App() {
 
     if (isMicro) {
       setKpis(makeEmptyKpis(10));
-      setEquityHistory([10]);
-      setGatewayConfig((prev) => ({
-        ...prev,
-        maxOrderNotional: 10,
-        maxDailyLoss: 2,
-      }));
       triggerAlert(
         'INFO',
         'SWITCHED TO $10.00 MICRO ACCOUNT',
@@ -378,12 +293,6 @@ export default function App() {
       );
     } else {
       setKpis(makeEmptyKpis(500000));
-      setEquityHistory([500000]);
-      setGatewayConfig((prev) => ({
-        ...prev,
-        maxOrderNotional: 50000,
-        maxDailyLoss: 5000,
-      }));
       triggerAlert(
         'INFO',
         'SWITCHED TO $500K INSTITUTIONAL TIER',
@@ -392,99 +301,10 @@ export default function App() {
     }
   };
 
-  // Connect to Real Live Exchange Streams (Persistent WebSocket Stream Listener)
-  useEffect(() => {
-    if (isHalted || stressConfig.exchangeDisconnect) {
-      exchangeStream.disconnect();
-      return;
-    }
-
-    // Dedicated stream listener registration for depth, order flow, latency, and status
-    const unsubscribe = exchangeStream.connect(
-      selectedSymbol,
-      // 1. Level 2 Order Depth Listener
-      (newBook) => {
-        const stress = stressConfigRef.current;
-        const deg = calculateNetworkDegradation(
-          stress.baseLatencyMs,
-          stress.jitterMs,
-          stress.packetLossPct,
-          stress.profile
-        );
-
-        setEffectiveLatency(deg.effectiveLatencyMs);
-        setSlippageMultiplier(Number((deg.realizedSlippageBps / 1.2).toFixed(2)));
-        setLatencyHistory((prev) => [...prev.slice(-35), deg.effectiveLatencyMs]);
-
-        if (deg.isDropped) {
-          // Packet dropped under simulated loss
-          setFillRatePct((prev) => Math.max(40, Number((prev - 1.2).toFixed(1))));
-          return;
-        }
-
-        setFillRatePct((prev) => Math.min(99.9, Number((prev + 0.2).toFixed(1))));
-        setMidPrice(newBook.midPrice);
-        setOrderBook(newBook);
-        setFlashTrigger((prev) => prev + 1);
-      },
-      // 2. Real-Time Exchange Order Flow / Trade Tape Listener
-      (realTrade) => {
-        // Add to real public tape
-        setPublicTrades((prev) => [realTrade, ...prev.slice(0, 79)]);
-
-        // B1: no simulated bot fills here. Fills, PnL and blotter rows must come from real
-        // paper/live execution reported by the server.
-      },
-      // 3. Ping / Latency Probing Listener
-      (pingMs) => {
-        setExchangePingMs(pingMs);
-      }
-    );
-
-    return () => {
-      unsubscribe();
-      exchangeStream.disconnect();
-    };
-  }, [
-    isHalted,
-    selectedSymbol,
-    stressConfig.exchangeDisconnect,
-  ]);
-
   // Switch Symbol
   const handleSelectSymbol = (sym: string) => {
     setSelectedSymbol(sym);
     triggerAlert('INFO', 'DMA FEED SWITCHED', `Subscribed to live ${sym} order depth and trades.`);
-  };
-
-  // Update a bot configuration
-  const handleUpdateBot = (updatedBot: TradingBot) => {
-    setBots((prev) => prev.map((b) => (b.id === updatedBot.id ? updatedBot : b)));
-    triggerAlert('INFO', 'STRATEGY RECONFIGURED', `${updatedBot.name} parameters updated.`);
-  };
-
-  // Toggle Bot Pause/Resume
-  const handleToggleBot = (id: string) => {
-    setBots((prev) =>
-      prev.map((b) => {
-        if (b.id === id) {
-          const nextState = !b.isRunning;
-          triggerAlert(
-            'INFO',
-            nextState ? 'STRATEGY RESUMED' : 'STRATEGY PAUSED',
-            `${b.name} is now ${nextState ? 'RUNNING' : 'PAUSED'}.`
-          );
-          return { ...b, isRunning: nextState };
-        }
-        return b;
-      })
-    );
-  };
-
-  // Delete/Decommission Bot
-  const handleDeleteBot = (id: string) => {
-    setBots((prev) => prev.filter((b) => b.id !== id));
-    triggerAlert('WARNING', 'STRATEGY DECOMMISSIONED', `Bot ${id} removed from active fleet.`);
   };
 
   // Deploy New Bot
@@ -497,62 +317,6 @@ export default function App() {
     );
   };
 
-  // Export Packet Stream (JSON/PCAP format)
-  const handleExportPackets = () => {
-    const packetData = {
-      pcapHeader: {
-        magicNumber: '0xa1b2c3d4',
-        versionMajor: 2,
-        versionMinor: 4,
-        timezoneOffsetSeconds: 0,
-        snaplen: 65535,
-        networkLayer: 'LINKTYPE_ETHERNET',
-        clockSync: 'PTP IEEE 1588v2 Hardware Timestamps',
-      },
-      exportTimestamp: new Date().toISOString(),
-      networkStressConfig: stressConfig,
-      totalPacketsLogged: trades.length,
-      packets: trades.map((t, idx) => ({
-        packetIndex: idx + 1,
-        timestampEpochUs: t.timestamp * 1000,
-        microsecondTime: t.microsecondTime,
-        ethernet: {
-          srcMac: '00:1b:21:bb:cc:dd',
-          dstMac: '00:07:43:06:55:aa',
-          vlanId: 104,
-        },
-        ip: {
-          srcIp: '198.51.100.42',
-          dstIp: '203.0.113.88',
-          ttl: 64,
-          proto: 'UDP',
-        },
-        payloadOuchFix: {
-          msgType: t.side === 'BUY' ? 'ORDER_ENTER_BUY' : 'ORDER_ENTER_SELL',
-          orderId: t.id,
-          symbol: t.symbol,
-          price: t.price,
-          quantity: t.size,
-          executionLatencyMs: t.executionLatencyMs,
-          slippageBps: t.slippageBps,
-          status: t.status,
-          rejectionReason: t.rejectionReason,
-        },
-      })),
-    };
-
-    const blob = new Blob([JSON.stringify(packetData, null, 2)], {
-      type: 'application/json',
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `apex_hft_packet_stream_${Date.now()}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-    triggerAlert('INFO', 'PCAP STREAM EXPORTED', `Exported ${trades.length} raw packets.`);
-  };
-
   return (
     <div className="min-h-screen bg-[#06080D] text-slate-200 flex flex-col selection:bg-cyan-500 selection:text-white">
       {/* 1. INSTITUTIONAL HEADER BAR - PERMANENTLY DOCKED & ALWAYS ACCESSIBLE */}
@@ -563,7 +327,6 @@ export default function App() {
         onOpenDeployModal={() => setIsDeployModalOpen(true)}
         onOpenAiDiagnostics={() => setIsAiDiagnosticsOpen(true)}
         onOpenUnitTests={() => setIsUnitTestsOpen(true)}
-        onOpenGatewayModal={() => setIsGatewayModalOpen(true)}
         onOpenEngineConsole={() => setIsEngineConsoleOpen(true)}
         onOpenMemecoinSniper={() => {
           setIsPlugAndPlayOpen(false);
@@ -579,7 +342,6 @@ export default function App() {
         isOperatorAuthenticated={isOperatorAuthenticated}
         activeFeed={activeFeed}
         onSelectFeed={setActiveFeed}
-        exchangePingMs={exchangePingMs}
         capitalTier={capitalTier}
         onToggleCapitalTier={toggleCapitalTier}
         isMemecoinSniperOpen={isMemecoinSniperOpen}
@@ -632,18 +394,6 @@ export default function App() {
       <UnitTestModal
         isOpen={isUnitTestsOpen}
         onClose={() => setIsUnitTestsOpen(false)}
-      />
-
-      <ExchangeGatewayModal
-        isOpen={isGatewayModalOpen}
-        onClose={() => setIsGatewayModalOpen(false)}
-        config={gatewayConfig}
-        onUpdateConfig={(cfg) => {
-          setGatewayConfig(cfg);
-          triggerAlert('INFO', 'GATEWAY CONFIG APPLIED', `Execution mode set to ${cfg.mode}.`);
-        }}
-        currentMidPrice={midPrice}
-        selectedSymbol={selectedSymbol}
       />
 
       <EngineConsoleModal

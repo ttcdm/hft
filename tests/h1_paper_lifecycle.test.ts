@@ -3,6 +3,8 @@ import { executionCoordinator } from '../server/execution/coordinator';
 import { workstationDb } from '../server/db/database';
 import { riskEngine } from '../server/risk/riskEngine';
 import { MINT_A, MINT_B } from './fixtures/socialFeeds';
+import { walletTrader } from '../server/walletTrader';
+import { memecoinAggregator } from '../server/memecoinAggregator';
 
 // Holistic paper-mode lifecycles through the real coordinator, ExitEngine and SQLite (no ExitEngine or DB stubs).
 const open = (mint: string) => workstationDb.loadPositions().find((p) => p.mint === mint);
@@ -103,5 +105,12 @@ describe('H1: paper-mode holistic lifecycles', () => {
     });
     expect(again.success).toBe(false);
     expect(workstationDb.loadPositions().filter((x) => x.mint === mint)).toHaveLength(1);
+  });
+
+  it('S2: the aggregator converts USD to SOL with the wallet trader live SOL price, not a constant', () => {
+    vi.spyOn(walletTrader, 'getState').mockReturnValue({ solPriceUsd: 290 } as any);
+    expect((memecoinAggregator as any).solPriceUsd).toBe(290);
+    vi.spyOn(walletTrader, 'getState').mockReturnValue({ solPriceUsd: 0 } as any);
+    expect((memecoinAggregator as any).solPriceUsd).toBe(145);
   });
 });

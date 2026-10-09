@@ -3,6 +3,7 @@ import { EventEmitter } from 'events';
 import { PublicKey } from '@solana/web3.js';
 import { PumpCurveService } from './solana/pumpCurve';
 import { executionCoordinator } from './execution/coordinator';
+import { walletTrader } from './walletTrader';
 import { workstationDb } from './db/database';
 import { evaluateTokenSafety } from './risk/tokenSafety';
 import { pumpFeedListener, PumpCreateEvent } from './solana/pumpFeedListener';
@@ -105,7 +106,12 @@ const DEMO_POOL_IDS: ReadonlySet<string> = new Set(INITIAL_POOLS.map((p) => p.id
 
 export class MemecoinAggregatorService extends EventEmitter {
   private pools: MemecoinPool[] = [];
-  private solPriceUsd = 145.0;
+  // S2: this used to be a constant 145.0 that nothing ever updated, so USD->SOL sizing ignored the real price.
+  // The wallet trader fetches the live SOL/USD rate (and starts from the same 145 fallback), so read it from there.
+  private get solPriceUsd(): number {
+    const px = walletTrader.getState().solPriceUsd;
+    return px > 0 ? px : 145.0;
+  }
   private simulationTimer: NodeJS.Timeout | null = null;
   private config: SniperBotConfig = {
     isAutoSnipeEnabled: false,

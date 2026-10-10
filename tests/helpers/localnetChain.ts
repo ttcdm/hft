@@ -230,7 +230,21 @@ export async function waitCanArm(app: LocalnetApp, timeoutMs = 90_000): Promise<
   throw new Error(`can-arm still refused after ${timeoutMs} ms: ${JSON.stringify(last?.reasons)}`);
 }
 
+/**
+ * The operator's "sync wallet" action: balance from the chain plus a SOL/USD reading. With external feeds disabled the server
+ * reads no price at boot, and a LIVE buy fails closed (SOL_PRICE_UNAVAILABLE) until one exists; on localnet the reading is the
+ * fixed LOCALNET_SOL_PRICE_USD. Calling it here (as scripts/localnet/e2e.ts does) makes the price deterministic instead of
+ * depending on the wallet trader's background timer having fired before the first buy.
+ */
+export async function syncWallet(app: LocalnetApp): Promise<void> {
+  const r = await app.call('POST', '/api/wallet/sync-rpc', {});
+  if (r.status !== 200) throw new Error(`wallet sync failed: ${r.status} ${JSON.stringify(r.json)}`);
+  const px = r.json?.state?.solPriceUsd;
+  if (!(typeof px === 'number' && px > 0)) throw new Error(`no SOL price after wallet sync (LOCALNET_SOL_PRICE_USD not applied?): ${JSON.stringify(r.json?.state).slice(0, 300)}`);
+}
+
 export async function armLive(app: LocalnetApp): Promise<void> {
+  await syncWallet(app);
   await waitCanArm(app);
   const arm = await app.call('POST', '/api/execution/arm', { arm: true, confirmationCode: 'CONFIRM_LIVE_TRADING_RISK' });
   if (arm.status !== 200 || !arm.json?.success) throw new Error(`arm failed: ${arm.status} ${JSON.stringify(arm.json)}`);

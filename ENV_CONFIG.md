@@ -24,7 +24,7 @@ SOLANA_RPC_URL=<your devnet RPC URL, including its API key>
 SOLANA_WS_URL=<your devnet WebSocket URL, including its API key>
 
 # 5. Jito MEV Bundle Transport
-# Devnet has no Jito block engine: leave JITO_BLOCK_ENGINE_URL unset until you deliberately move to mainnet.
+# Devnet has no Jito block engine: leave JITO_BLOCK_ENGINE_URL unset. Jito bundles are only used on mainnet-beta, which this build does not use.
 # JITO_BLOCK_ENGINE_URL=
 MIN_JITO_TIP_SOL=0.002
 MAX_JITO_TIP_SOL=0.050

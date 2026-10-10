@@ -18,6 +18,8 @@ describe('L5: CreateEvent decoding follows the pump IDL', () => {
     expect(ev).not.toBeNull();
     expect(ev.mint).toBe(fx.mint);
     expect(ev.creator).toBe(fx.creator);
+    expect(typeof ev.user).toBe('string'); // R14: the create signer is decoded too
+    expect(ev.user!.length).toBeGreaterThan(30);
     expect(ev.name).toBe('Localnet');
     expect(ev.symbol).toBe('LCL');
     expect(ev.virtualTokenReserves).toBe(BigInt(fx.chain.virtualTokenReserves));
@@ -35,7 +37,7 @@ describe('L5: CreateEvent decoding follows the pump IDL', () => {
       virtualTokenReserves: 1_111_111_111_111_111n, virtualSolReserves: 22_222_222_222n, realTokenReserves: 333_333_333_333_333n, tokenTotalSupply: 999_999_999_999_999n,
     });
     const l = new PumpFeedListener();
-    const ev = l.parseLogs({ err: null, signature: 's', logs: [log] } as any, { slot: 1 })!;
+    const ev = l.parseLogs({ err: null, signature: 's', logs: PumpFeedListener.asPumpInvocation(log) } as any, { slot: 1 })!;
     l.destroy();
     expect([ev.virtualTokenReserves, ev.virtualSolReserves, ev.realTokenReserves, ev.tokenTotalSupply]).toEqual([1_111_111_111_111_111n, 22_222_222_222n, 333_333_333_333_333n, 999_999_999_999_999n]);
   });
@@ -43,7 +45,7 @@ describe('L5: CreateEvent decoding follows the pump IDL', () => {
   it('an event too short to carry its reserves is skipped, not filled with canonical numbers', () => {
     const buf = Buffer.concat([Buffer.from('1b72a94ddeeb6376', 'hex'), Buffer.alloc(4 + 4 + 4 + 32 * 3)]);
     const l = new PumpFeedListener();
-    expect(l.parseLogs({ err: null, signature: 's', logs: [`Program data: ${buf.toString('base64')}`] } as any, { slot: 1 })).toBeNull();
+    expect(l.parseLogs({ err: null, signature: 's', logs: PumpFeedListener.asPumpInvocation(`Program data: ${buf.toString('base64')}`) } as any, { slot: 1 })).toBeNull();
     l.destroy();
   });
 });

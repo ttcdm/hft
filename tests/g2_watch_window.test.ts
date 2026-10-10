@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { describe, it, expect, afterEach } from 'vitest';
 import { Keypair } from '@solana/web3.js';
 import { WatchWindow, WATCH_MAX_CANDIDATES, WATCH_MIN_MS, WATCH_MAX_MS } from '../server/signals/watchWindow';
@@ -99,6 +100,26 @@ describe('G2: release rules', () => {
     expect(r.state).toBe('DEAD');
     expect(r.reason).toMatch(/CREATOR_SOLD/);
     expect(r.metrics.creatorSold).toBe(true);
+  });
+
+  it('R14: a sell by the create signer (the dev buyer in create_v2), who differs from the creator field, is also an instant DEAD', () => {
+    const w = new WatchWindow();
+    const mint = mintOf();
+    const creator = wallet(), signer = wallet();
+    w.watch(mint, creator, Date.now(), [signer]);
+    const released: string[] = [];
+    w.on('release', (r) => released.push(r.state));
+    run(w, mint, [[0, wallet(), 'buy', 2], [3, signer, 'sell', 0.01]]);
+    expect(released).toEqual(['DEAD']);
+    expect(w.evaluate(mint, T0 + 3_000)!.reason).toMatch(/CREATOR_SOLD/);
+    // and the attach() path carries the signer from a decoded create event
+    const w2 = new WatchWindow();
+    const emitter = new EventEmitter();
+    w2.attach(emitter);
+    const m2 = mintOf();
+    emitter.emit('create_event', { mint: m2, creator, user: signer });
+    run(w2, m2, [[0, wallet(), 'buy', 2], [2, signer, 'sell', 0.01]]);
+    expect(w2.evaluate(m2, T0 + 3_000)!.state).toBe('DEAD');
   });
 
   it('nothing but a creator sell releases before the 20s minimum, however strong the signals', () => {
@@ -210,7 +231,7 @@ describe('G2: wired to the real PumpFeedListener', () => {
     w.attach(l);
     const mint = mintOf();
     const creator = wallet();
-    const ev = l.parseLogs({ err: null, signature: 'g2', logs: [PumpFeedListener.encodeCreateEventLog({ name: 'W', symbol: 'W', uri: '', mint, creator })] } as any, { slot: 5 })!;
+    const ev = l.parseLogs({ err: null, signature: 'g2', logs: PumpFeedListener.asPumpInvocation(PumpFeedListener.encodeCreateEventLog({ name: 'W', symbol: 'W', uri: '', mint, creator })) } as any, { slot: 5 })!;
     l.emit('create_event', ev);
     expect(w.isWatching(mint)).toBe(true);
     const [{ trade }] = replay(mint, Date.now(), [[0, wallet(), 'buy', 0.3]]);

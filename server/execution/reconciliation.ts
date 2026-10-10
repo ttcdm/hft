@@ -642,7 +642,8 @@ export class RealMarkPriceService {
             result[mintStr] = {
               priceSol: poolState.spotPriceSol,
               source: 'ON_CHAIN_PUMPSWAP_POOL',
-              timestamp: now,
+              // N16: the pool state is cached for up to 15 s; stamping it "now" would hide a stale price from the staleness check.
+              timestamp: poolState.marketDataTimestamp || now,
               poolAddress: poolState.poolAddress.toBase58(),
             };
           }

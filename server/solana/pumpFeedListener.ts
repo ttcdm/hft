@@ -41,6 +41,8 @@ export interface PumpCreateEvent {
   slot: number;
   mint: string;
   creator: string;
+  /** The signer of the create transaction (R14). Usually also makes the dev buy and can differ from `creator` in create_v2. */
+  user?: string;
   bondingCurve: string;
   name: string;
   symbol: string;
@@ -213,11 +215,42 @@ export class PumpFeedListener extends EventEmitter {
     return `Program data: ${buf.toString('base64')}`;
   }
 
+
+  /**
+   * R13: keep a `Program data:` line only when the innermost program running at that point is the pump program. Any program can
+   * emit `sol_log_data` with pump's event discriminator in a transaction that merely mentions pump, and logsSubscribe(pump) delivers
+   * that transaction; without this check a forged CreateEvent/TradeEvent would set attacker-chosen reserves (price, paper fill, board).
+   * Other log lines pass through unchanged.
+   */
+  public static pumpOwnedLogs(lines: string[]): string[] {
+    const pump = PUMP_FUN_PROGRAM_ID.toBase58();
+    const stack: string[] = [];
+    const out: string[] = [];
+    for (const line of lines) {
+      const invoke = /^Program (\S+) invoke \[\d+\]/.exec(line);
+      if (invoke) { stack.push(invoke[1]); out.push(line); continue; }
+      const done = /^Program (\S+) (success|failed)/.exec(line);
+      if (done) { if (stack.length && stack[stack.length - 1] === done[1]) stack.pop(); out.push(line); continue; }
+      if (line.startsWith('Program data: ')) {
+        if (stack.length && stack[stack.length - 1] === pump) out.push(line);
+        continue;
+      }
+      out.push(line);
+    }
+    return out;
+  }
+
+  /** Test helper: the log lines a real pump instruction would produce around one event line. */
+  public static asPumpInvocation(eventLine: string): string[] {
+    const pump = PUMP_FUN_PROGRAM_ID.toBase58();
+    return [`Program ${pump} invoke [1]`, eventLine, `Program ${pump} success`];
+  }
+
   /** Decode every TradeEvent in a transaction's logs (a tx can contain several). Never throws. */
   public parseTradeLogs(logs: Logs, ctx?: { slot: number }): PumpTradeEvent[] {
     if (logs.err) return [];
     const out: PumpTradeEvent[] = [];
-    for (const log of logs.logs) {
+    for (const log of PumpFeedListener.pumpOwnedLogs(logs.logs)) {
       if (!log.startsWith('Program data: ')) continue;
       try {
         const buf = Buffer.from(log.slice('Program data: '.length).trim(), 'base64');
@@ -290,7 +323,7 @@ export class PumpFeedListener extends EventEmitter {
     const slot = ctx?.slot ?? 0;
     const signature = logs.signature;
 
-    for (const log of logs.logs) {
+    for (const log of PumpFeedListener.pumpOwnedLogs(logs.logs)) {
       // 1. Binary Anchor Event: Program data: <base64>
       if (log.startsWith('Program data: ')) {
         const b64Data = log.slice('Program data: '.length).trim();
@@ -340,6 +373,7 @@ export class PumpFeedListener extends EventEmitter {
               // virtual_token_reserves, virtual_sol_reserves, real_token_reserves, token_total_supply (u64 each).
               // The reserves are read, never assumed: an event too short to carry them is skipped, not filled with canonical numbers.
               if (offset + 32 + 32 + 8 + 4 * 8 > buf.length) continue;
+              const userPubkey = new PublicKey(buf.subarray(offset, offset + 32));
               offset += 32; // user (the signer of the create; the token creator is the next field)
               const creatorPubkey = new PublicKey(buf.subarray(offset, offset + 32));
               offset += 32;
@@ -364,6 +398,7 @@ export class PumpFeedListener extends EventEmitter {
                 slot,
                 mint: mintPubkey.toBase58(),
                 creator: creatorPubkey.toBase58(),
+                user: userPubkey.toBase58(),
                 bondingCurve: bondingCurvePubkey.toBase58(),
                 name,
                 symbol,

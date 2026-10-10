@@ -75,6 +75,8 @@ export interface WatchResult {
 interface Candidate {
   mint: string;
   creator: string | null;
+  /** Wallets whose sells mean the dev is out: the creator and, when different, the signer of the create (R14). */
+  insiders: Set<string>;
   registeredAt: number;
   firstTradeAt: number | null;
   /** Net SOL by 10s bucket index. */
@@ -132,11 +134,11 @@ export class WatchWindow extends EventEmitter {
   }
 
   /** Start watching a mint. False when the window is full or the mint is already watched/released. */
-  public watch(mint: string, creator: string | null, now = Date.now()): boolean {
+  public watch(mint: string, creator: string | null, now = Date.now(), alsoInsiders: Array<string | undefined> = []): boolean {
     if (this.active.has(mint) || this.released.has(mint)) return false;
     if (this.active.size >= this.opts.maxCandidates) return false;
     this.active.set(mint, {
-      mint, creator, registeredAt: now, firstTradeAt: null, buckets: [], buyVolumeByWallet: new Map(),
+      mint, creator, insiders: new Set([creator, ...alsoInsiders].filter((w): w is string => !!w)), registeredAt: now, firstTradeAt: null, buckets: [], buyVolumeByWallet: new Map(),
       buyCount: 0, sellCount: 0, sellVolumeSol: 0, tradeCount: 0, creatorSold: false, flow: [], seen: new Set(),
     });
     return true;
@@ -168,7 +170,7 @@ export class WatchWindow extends EventEmitter {
     } else {
       c.sellCount++;
       c.sellVolumeSol += sol;
-      if (c.creator && trade.user === c.creator && !c.creatorSold) {
+      if (c.insiders.has(trade.user) && !c.creatorSold) {
         c.creatorSold = true;
         this.release(c, 'DEAD', 'CREATOR_SOLD: the creator sold, instant reject', at);
       }
@@ -176,10 +178,10 @@ export class WatchWindow extends EventEmitter {
   }
 
   private clusterOf(c: Candidate, wallet: string): string {
-    if (c.creator && wallet === c.creator) return CREATOR_CLUSTER;
+    if (c.insiders.has(wallet)) return CREATOR_CLUSTER;
     const f = this.funderFor(wallet);
     if (!f) return `wallet:${wallet}`;
-    if (c.creator && f === c.creator) return CREATOR_CLUSTER;
+    if (f && c.insiders.has(f)) return CREATOR_CLUSTER;
     return `funder:${f}`;
   }
 
@@ -195,7 +197,7 @@ export class WatchWindow extends EventEmitter {
     for (const [wallet, vol] of c.buyVolumeByWallet) {
       const k = this.clusterOf(c, wallet);
       clusters.set(k, (clusters.get(k) ?? 0) + vol);
-      if (this.funderFor(wallet) || (c.creator && wallet === c.creator)) known++;
+      if (this.funderFor(wallet) || c.insiders.has(wallet)) known++;
     }
     // Merge a buyer's own cluster into the cluster of wallets it funded
     for (const wallet of c.buyVolumeByWallet.keys()) {
@@ -303,8 +305,8 @@ export class WatchWindow extends EventEmitter {
 
   /** Subscribe to a PumpFeedListener: create events start a watch, trade events feed it. */
   public attach(listener: EventEmitter): void {
-    listener.on('create_event', (e: { mint: string; creator: string }) => {
-      this.watch(e.mint, e.creator);
+    listener.on('create_event', (e: { mint: string; creator: string; user?: string }) => {
+      this.watch(e.mint, e.creator, Date.now(), [e.user]);
     });
     listener.on('trade_event', (t: PumpTradeEvent) => this.onTrade(t));
   }

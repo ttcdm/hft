@@ -2161,7 +2161,10 @@ export class ExecutionCoordinator {
       };
     }
 
-    const requiredSol = req.amountSol + (quote.expectedJitoTipLamports + quote.expectedPriorityFeeLamports + 5000) / 1e9;
+    // N13: reserve the worst case the transaction can spend, not the nominal order: the buy instruction may pull up to maxInputLamports
+    // (the slippage headroom, about 8% over the order) and the first buy of a mint also pays rent for the new token account.
+    const worstCaseOrderSol = Math.max(req.amountSol, Number(quote.maxInputLamports) / 1e9);
+    const requiredSol = worstCaseOrderSol + CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS / 1e9 + (quote.expectedJitoTipLamports + quote.expectedPriorityFeeLamports + 5000) / 1e9;
 
     // Check balance concurrency reservation
     if (rawWalletBalance - this.inFlightReservedSol - requiredSol < 0.015) {

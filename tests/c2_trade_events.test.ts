@@ -42,7 +42,7 @@ describe('C2: TradeEvent decoding and real signals', () => {
 
   it('decodes a TradeEvent log (fields round-trip)', () => {
     const l = new PumpFeedListener(fakeConn().conn);
-    const [t] = l.parseTradeLogs({ err: null, signature: 's', logs: ['Program log: x', tradeLog(1.5, true, 12)] } as any, { slot: 55 });
+    const [t] = l.parseTradeLogs({ err: null, signature: 's', logs: ['Program log: x', ...PumpFeedListener.asPumpInvocation(tradeLog(1.5, true, 12))] } as any, { slot: 55 });
     expect(t.mint).toBe(mint.toBase58());
     expect(t.user).toBe(trader.toBase58());
     expect(t.isBuy).toBe(true);
@@ -55,9 +55,9 @@ describe('C2: TradeEvent decoding and real signals', () => {
   it('ignores failed transactions, create events and truncated data', () => {
     const l = new PumpFeedListener(fakeConn().conn);
     const good = tradeLog(1, true, 5);
-    expect(l.parseTradeLogs({ err: { InstructionError: 1 }, signature: 's', logs: [good] } as any)).toEqual([]);
-    expect(l.parseTradeLogs({ err: null, signature: 's', logs: [PumpFeedListener.encodeCreateEventLog({ name: 'a', symbol: 'b', uri: 'c', mint, creator })] } as any)).toEqual([]);
-    expect(l.parseTradeLogs({ err: null, signature: 's', logs: ['Program data: AAAA'] } as any)).toEqual([]);
+    expect(l.parseTradeLogs({ err: { InstructionError: 1 }, signature: 's', logs: PumpFeedListener.asPumpInvocation(good) } as any)).toEqual([]);
+    expect(l.parseTradeLogs({ err: null, signature: 's', logs: PumpFeedListener.asPumpInvocation(PumpFeedListener.encodeCreateEventLog({ name: 'a', symbol: 'b', uri: 'c', mint, creator })) } as any)).toEqual([]);
+    expect(l.parseTradeLogs({ err: null, signature: 's', logs: PumpFeedListener.asPumpInvocation('Program data: AAAA') } as any)).toEqual([]);
     l.destroy();
   });
 
@@ -68,7 +68,7 @@ describe('C2: TradeEvent decoding and real signals', () => {
     expect(curveVelocityEvaluator.hasData(mint.toBase58())).toBe(false);
     const seen: string[] = [];
     l.on('trade_event', (t) => seen.push(t.mint));
-    for (let i = 0; i < 6; i++) replay([tradeLog(2, true, 10 + i * 2)], 100 + i);
+    for (let i = 0; i < 6; i++) replay(PumpFeedListener.asPumpInvocation(tradeLog(2, true, 10 + i * 2)), 100 + i);
     const m = curveVelocityEvaluator.getMetrics(mint.toBase58());
     expect(seen).toHaveLength(6);
     expect(m.volume10sSol).toBeGreaterThan(0);
@@ -90,7 +90,7 @@ describe('C2: TradeEvent decoding and real signals', () => {
     const { conn, replay } = fakeConn();
     const l = new PumpFeedListener(conn);
     await l.start();
-    for (let i = 0; i < 6; i++) replay([tradeLog(2, true, 10 + i * 2)], 100 + i);
+    for (let i = 0; i < 6; i++) replay(PumpFeedListener.asPumpInvocation(tradeLog(2, true, 10 + i * 2)), 100 + i);
     const withFlow = ConfluenceEngine.calculate(base);
     expect(withFlow.bondingCurveVelocityScore).toBeGreaterThan(0);
     expect(withFlow.compositeScore).toBeGreaterThan(without.compositeScore);
@@ -103,7 +103,7 @@ describe('C2: TradeEvent decoding and real signals', () => {
     let release: (v: any[]) => void = () => undefined;
     conn.getSignaturesForAddress = () => new Promise((res) => { release = res; });
     const l = new PumpFeedListener(conn);
-    const event = l.parseLogs({ err: null, signature: 'c1', logs: [PumpFeedListener.encodeCreateEventLog({ name: 'n', symbol: 's', uri: 'u', mint, creator })] } as any, { slot: 1 })!;
+    const event = l.parseLogs({ err: null, signature: 'c1', logs: PumpFeedListener.asPumpInvocation(PumpFeedListener.encodeCreateEventLog({ name: 'n', symbol: 's', uri: 'u', mint, creator })) } as any, { slot: 1 })!;
     const pending = l.scoreCreator(event);
     await vi.advanceTimersByTimeAsync(CREATOR_RISK_TIMEOUT_MS);
     expect(await pending).toBe(false); // gave up waiting
@@ -146,5 +146,20 @@ describe('C2: TradeEvent decoding and real signals', () => {
     vi.resetModules();
     const fresh = await import('../server/memecoinAggregator');
     expect(fresh.memecoinAggregator.getConfluenceGating()).toBe(true);
+  });
+
+  it('R13: an event line emitted by a program other than pump is ignored, even in a transaction that also invokes pump', () => {
+    const l = new PumpFeedListener(fakeConn().conn);
+    const forged = tradeLog(1, true, 5);
+    const other = 'Program ForgedForgedForgedForgedForgedForgedForged11 invoke [2]';
+    const pump = PumpFeedListener.asPumpInvocation('Program log: Instruction: Buy');
+    const logs = [pump[0], 'Program log: Instruction: Buy', other, forged, 'Program ForgedForgedForgedForgedForgedForgedForged11 success', pump[2]];
+    expect(l.parseTradeLogs({ err: null, signature: 's', logs } as any)).toEqual([]);
+    // the same line emitted by pump itself is accepted, and a bare line with no invoke frame at all is not
+    expect(l.parseTradeLogs({ err: null, signature: 's', logs: PumpFeedListener.asPumpInvocation(forged) } as any)).toHaveLength(1);
+    expect(l.parseTradeLogs({ err: null, signature: 's', logs: [forged] } as any)).toEqual([]);
+    const create = PumpFeedListener.encodeCreateEventLog({ name: 'a', symbol: 'b', uri: 'c', mint, creator });
+    expect(l.parseLogs({ err: null, signature: 's', logs: [other, create, 'Program ForgedForgedForgedForgedForgedForgedForged11 success'] } as any, { slot: 1 })).toBeNull();
+    l.destroy();
   });
 });

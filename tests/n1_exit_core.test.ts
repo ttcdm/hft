@@ -293,4 +293,29 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
     expect(recovery).toHaveBeenCalled();
     expect(workstationDb.loadTransactions().find((t) => t.signature === sig)?.reconciliationState).toBe('RECONCILIATION_REQUIRED');
   });
+
+  it('N13: while a buy is in flight the reservation covers the slippage headroom and the new token account, not just the nominal order', async () => {
+    for (const p of workstationDb.loadPositions(undefined, 'ACTIVE')) {
+      workstationDb.savePosition({ ...p, status: 'CLOSED', tokenQuantityRaw: '0', costBasisLamports: 0, currentValueSol: 0, currentPriceSol: p.entryPriceSol, realizedPnLSol: 0 } as any);
+    }
+    vi.spyOn(workstationDb, 'getDailyTotalPnLSol').mockReturnValue(0);
+    vi.spyOn(workstationDb, 'hasUnresolvedLiveBuy').mockReturnValue(false);
+    (riskEngine as any).lastTradeFailureTimestamp = 0;
+    (riskEngine as any).mintLastTradedMap.clear(); // the N11 case above bought this mint
+    (coordinator as any).realWalletBalanceSol = 1;
+    (coordinator as any).executionMode = 'LIVE';
+    (coordinator as any).isLiveTradingArmed = true;
+    let reservedDuringSend = 0;
+    submit.mockImplementation(async () => {
+      reservedDuringSend = (coordinator as any).inFlightReservedSol;
+      return { success: false, signature: '', transport: 'SOLANA_RPC', error: 'stop here', lifecycleState: 'SUBMIT_FAILED' };
+    });
+    const r13 = await coordinator.executeTrade({
+      signalTimestamp: Date.now(), mint: VALID_PUMP_MINT_1.toBase58(), symbol: 'N13', name: 'N13', amountSol: 0.005,
+      source: 'AUTO_SNIPER', provenance: 'REAL_ONCHAIN', eligibilityReport: createPassingEligibilityReport(VALID_PUMP_MINT_1.toBase58()),
+    } as any);
+    expect(submit, r13.error).toHaveBeenCalled();
+    expect(reservedDuringSend).toBeGreaterThan(0.005 + 0.002); // order + at least the token-account rent
+    expect((coordinator as any).inFlightReservedSol).toBe(0); // released afterwards
+  });
 });

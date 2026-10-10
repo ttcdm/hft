@@ -85,7 +85,7 @@ describe('K4 #7: the auto controller passes the watch-window release time', () =
     memecoinAggregator.setConfluenceGating(false);
     const mint = Keypair.generate().publicKey.toBase58();
     const l = new PumpFeedListener();
-    const ev = l.parseLogs({ err: null, signature: 'k4', logs: [PumpFeedListener.encodeCreateEventLog({ name: 'K4', symbol: 'K4', uri: '', mint, creator: Keypair.generate().publicKey.toBase58() })] } as any, { slot: 9 })!;
+    const ev = l.parseLogs({ err: null, signature: 'k4', logs: PumpFeedListener.asPumpInvocation(PumpFeedListener.encodeCreateEventLog({ name: 'K4', symbol: 'K4', uri: '', mint, creator: Keypair.generate().publicKey.toBase58() })) } as any, { slot: 9 })!;
     memecoinAggregator.ingestOnChainCreateEvent(ev).liquidityUsd = 15_000;
     l.destroy();
     releaseAs(mint, 'HOT');

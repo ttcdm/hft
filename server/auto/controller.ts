@@ -110,6 +110,8 @@ export class AutoSnipeController extends EventEmitter {
   private decisions: AutoDecision[] = [];
   private attempted = new Set<string>();
   private busy = false;
+  /** Q29: the buy now in progress, so kill() and setMode() can wait for it instead of racing it. */
+  private inflight: Promise<void> | null = null;
   private triggers: KillTrigger[] = [];
   private slippageBreaches = 0;
   private redSince = new Map<string, number>();
@@ -213,6 +215,8 @@ export class AutoSnipeController extends EventEmitter {
     if (!['OFF', 'SHADOW', 'PAPER', 'DEVNET_LIVE'].includes(next)) return { ok: false, mode: this.mode, error: `unknown mode ${next}` };
     if (next === 'OFF') {
       this.mode = 'OFF';
+      // Q29: OFF stops new candidates at once; the session is dropped only after a buy in flight has booked itself in it
+      if (this.inflight) await this.inflight;
       this.session = null;
       this.downgradeReason = null;
       this.emit('mode', { mode: this.mode });
@@ -221,6 +225,8 @@ export class AutoSnipeController extends EventEmitter {
     if (process.env.AUTO_SNIPE_ENABLED !== 'true') {
       return { ok: false, mode: this.mode, error: 'AUTO_SNIPE_ENABLED is not true: auto trading stays OFF' };
     }
+    // Q29: never swap the session under a buy in flight; its spend and position belong to the session it started in
+    if (this.inflight) await this.inflight;
     const coordMode = executionCoordinator.getExecutionMode();
     if (next === 'PAPER' && coordMode !== 'PAPER') {
       return { ok: false, mode: this.mode, error: 'PAPER auto mode needs the execution coordinator in PAPER' };
@@ -259,6 +265,9 @@ export class AutoSnipeController extends EventEmitter {
     this.mode = 'OFF';
     this.killed = true;
     this.killReason = opts.reason || 'operator kill';
+    // Q29: a buy already past the gates finishes (its position exists once it does); wait for it so its position is in the owned set below
+    // and is sold by exitAll. Mode OFF already stops any new candidate.
+    if (this.inflight) await this.inflight;
     // R23: "sell what it bought" means the positions the auto controller opened: this session's, plus any the journal records as
     // BOUGHT by auto (a restart empties the in-memory session). A position the operator opened by hand is never in either set.
     const owned = new Set<string>(this.session?.positionIds ?? []);
@@ -465,9 +474,15 @@ export class AutoSnipeController extends EventEmitter {
     }
 
     this.busy = true;
+    let settle!: () => void;
+    this.inflight = new Promise<void>((r) => { settle = r; });
     this.attempted.add(key);
+    // Q29: kill() and setMode() change this.mode and this.session while the buy below awaits. Its journal rows and its accounting
+    // belong to the mode and the session it started in.
+    const startMode = this.mode;
+    const startSession = this.session;
     try {
-      const shadow = this.mode === 'SHADOW';
+      const shadow = startMode === 'SHADOW';
       const solUsd = solPriceService.lastKnownPrice();
       const params: Parameters<typeof memecoinAggregator.executeSnipe>[0] = {
         contractAddress: c.mint,
@@ -485,24 +500,24 @@ export class AutoSnipeController extends EventEmitter {
         expectedMode: coordMode,
       };
       if (shadow) params.dryRun = true;
-      if (this.mode === 'DEVNET_LIVE') {
-        if (solUsd === null) return this.record(c, 'REJECTED', 'size', 'SOL_PRICE_UNAVAILABLE');
+      if (startMode === 'DEVNET_LIVE') {
+        if (solUsd === null) return this.record(c, 'REJECTED', 'size', 'SOL_PRICE_UNAVAILABLE', { mode: startMode });
         params.amountSolOverride = AUTO_DEVNET_ORDER_SOL;
       }
       const res = await memecoinAggregator.executeSnipe(params);
       if (!res.success) {
         // R6: a buy that was sent and may have landed (unconfirmed, or landed with an unreadable fill) spent real SOL the cap must count.
-        if (this.session && !shadow && /^(UNCONFIRMED|RECONCILIATION FAILED)/.test(res.message)) {
-          this.session.spentSol += AUTO_DEVNET_ORDER_SOL;
-          workstationDb.logDecision({ autoMode: this.mode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'budget', outcome: 'INFO', reason: `counted ${AUTO_DEVNET_ORDER_SOL} SOL against the session cap: the buy was sent and may have landed` });
+        if (startSession && !shadow && /^(UNCONFIRMED|RECONCILIATION FAILED)/.test(res.message)) {
+          startSession.spentSol += AUTO_DEVNET_ORDER_SOL;
+          workstationDb.logDecision({ autoMode: startMode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'budget', outcome: 'INFO', reason: `counted ${AUTO_DEVNET_ORDER_SOL} SOL against the session cap: the buy was sent and may have landed` });
         }
-        return this.record(c, 'REJECTED', classifyRejection(res.message), res.message, { inputs: { confluenceScore: res.confluenceScore, dryRun: shadow } });
+        return this.record(c, 'REJECTED', classifyRejection(res.message), res.message, { mode: startMode, inputs: { confluenceScore: res.confluenceScore, dryRun: shadow } });
       }
-      if (shadow) return this.record(c, 'WOULD_BUY', 'fill', res.message, { amountSol: res.amountSol, inputs: { dryRun: true, confluenceScore: res.confluenceScore, gates: res.gates } });
-      if (this.session) {
-        this.session.buys += 1;
-        this.session.spentSol += (res.amountSol ?? 0) + (res.feesPaidLamports ?? 0) / 1e9;
-        if (res.positionId) this.session.positionIds.push(res.positionId);
+      if (shadow) return this.record(c, 'WOULD_BUY', 'fill', res.message, { mode: startMode, amountSol: res.amountSol, inputs: { dryRun: true, confluenceScore: res.confluenceScore, gates: res.gates } });
+      if (startSession) {
+        startSession.buys += 1;
+        startSession.spentSol += (res.amountSol ?? 0) + (res.feesPaidLamports ?? 0) / 1e9;
+        if (res.positionId) startSession.positionIds.push(res.positionId);
       }
       const feesSol = (res.feesPaidLamports ?? 0) / 1e9;
       const unverified = ((res.gates as any)?.eligibility?.unverified?.length ?? 0) > 0;
@@ -511,15 +526,17 @@ export class AutoSnipeController extends EventEmitter {
         if (slipBps > res.slippageBps + 1) this.slippageBreaches += 1;
       }
       const d = this.record(c, 'BOUGHT', 'fill', res.message, {
-        amountSol: res.amountSol, positionId: res.positionId, feesSol, unverified,
+        mode: startMode, amountSol: res.amountSol, positionId: res.positionId, feesSol, unverified,
         inputs: { confluenceScore: res.confluenceScore, quotePriceSol: res.quotePriceSol, fillPriceSol: res.fillPriceSol, feesSol, gates: res.gates },
       });
       this.enforceBudgets();
       return d;
     } catch (e: any) {
-      return this.record(c, 'REJECTED', 'execute', `ERROR: ${e?.message || e}`);
+      return this.record(c, 'REJECTED', 'execute', `ERROR: ${e?.message || e}`, { mode: startMode });
     } finally {
       this.busy = false;
+      this.inflight = null;
+      settle();
     }
   }
 }

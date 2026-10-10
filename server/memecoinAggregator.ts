@@ -247,7 +247,9 @@ export class MemecoinAggregatorService extends EventEmitter {
 
     this.pools.unshift(pool);
     if (this.pools.length > 200) {
-      this.pools = this.pools.slice(0, 200);
+      // S4: newest 200, plus any pool the watch window is still scoring. Dropping that one made scoreOf return null (no HOT, a READY
+      // without a score) and stopped applyTradeToPool for it, at any feed rate that creates 200 mints inside the 120 s window.
+      this.pools = this.pools.filter((p, i) => i < 200 || this.isPoolPinned(p.contractAddress));
     }
 
     onChainPoolStats.track(cleanCa, {
@@ -258,6 +260,11 @@ export class MemecoinAggregatorService extends EventEmitter {
     });
     this.emit('pool_added', pool);
     return pool;
+  }
+
+  private isPoolPinned: (mint: string) => boolean = () => false;
+  public setPoolPinned(fn: (mint: string) => boolean): void {
+    this.isPoolPinned = fn;
   }
 
   private lastPoolPush = new Map<string, number>();

@@ -13,6 +13,8 @@ import { GoogleGenAI } from '@google/genai';
 import { hftEngine } from './server/engine/engine';
 import { socialScanner, isTelegramTradeCommand } from './server/socialScanner';
 import { memecoinAggregator } from './server/memecoinAggregator';
+import { onChainPoolStats } from './server/market/poolStats';
+import { wireWatchPins } from './server/signals/watchPins';
 import { realismEngine } from './server/realismEngine';
 import { pumpFunService, pumpBootMode } from './server/pumpfunService';
 import { pumpFeedListener } from './server/solana/pumpFeedListener';
@@ -325,6 +327,7 @@ watchWindow.setScoreFn((mint) => {
   return pool ? memecoinAggregator.evaluateTokenConfluence(pool).score : null;
 });
 watchWindow.attach(pumpFeedListener);
+wireWatchPins(watchWindow, memecoinAggregator, onChainPoolStats); // S4: a watched mint keeps its pool and its trade stats until the verdict
 wireFunderLookup(watchWindow, new FunderLookup(() => executionCoordinator.getConnection())); // Q6b
 watchWindow.on('release', (r) => broadcastWs({ type: 'WATCH_RELEASE', data: r }));
 watchWindow.start();

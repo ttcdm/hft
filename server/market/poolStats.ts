@@ -50,10 +50,21 @@ const priceOf = (t: PumpTradeEvent): number | null =>
  */
 export class OnChainPoolStats {
   private mints = new Map<string, PoolState>();
+  private isPinned: (mint: string) => boolean = () => false;
+
+  /** S4: a mint the watch window is still scoring is never evicted to make room (at feed rate 300 newer mints arrive well inside its 120 s). */
+  public setPinned(fn: (mint: string) => boolean): void {
+    this.isPinned = fn;
+  }
 
   public track(mint: string, opts: { insiders: Array<string | undefined>; supplyRaw?: bigint; createPriceSol?: number; realTokenReserves?: bigint }): void {
     if (this.mints.has(mint)) return;
-    if (this.mints.size >= MAX_MINTS_KEPT) this.mints.delete(this.mints.keys().next().value as string);
+    if (this.mints.size >= MAX_MINTS_KEPT) {
+      // Oldest first, skipping pinned mints. The window holds at most 60, so an unpinned victim always exists below 300.
+      for (const k of this.mints.keys()) {
+        if (!this.isPinned(k)) { this.mints.delete(k); break; }
+      }
+    }
     this.mints.set(mint, {
       insiders: new Set(opts.insiders.filter((w): w is string => !!w)),
       supplyRaw: opts.supplyRaw ?? 1_000_000_000_000_000n,

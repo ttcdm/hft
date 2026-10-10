@@ -112,6 +112,9 @@ export interface AutoStatus {
 const MAX_DECISIONS = 500;
 /** Q27: the same unwatched / pending / dead mint from the same source is not journaled again for this long. */
 export const DROP_REPEAT_MS = 10 * 60_000;
+/** S4b: how many releases may wait behind a buy in flight, and how long a signal stays good (the watch window decides in 120 s; a release older than this is not acted on late). */
+export const PENDING_RELEASE_MAX = 10;
+export const PENDING_RELEASE_MAX_AGE_MS = 20_000;
 const MONITOR_INTERVAL_MS = 5_000;
 
 /** Map a rejection message to the pipeline stage that produced it. */
@@ -275,6 +278,7 @@ export class AutoSnipeController extends EventEmitter {
     this.redSince.clear();
     this.walletMark = null;
     this.attempted.clear();
+    this.pendingReleases.clear();
     this.mode = next;
     if (next === 'PAPER' || next === 'DEVNET_LIVE') {
       // S12: only DEVNET_LIVE sizes from the real wallet; PAPER trades a simulated bankroll, so its budgets must not depend on what the wallet holds.
@@ -401,6 +405,12 @@ export class AutoSnipeController extends EventEmitter {
   }
 
   private watchListener: ((r: WatchResult) => void) | null = null;
+  /**
+   * S4b: a watch release is announced once. One that arrives while another buy is in flight used to be dropped for good. It waits here
+   * instead (one per mint, newest 10) and is retried when the buy in flight settles, provided its verdict is still HOT/READY and it is
+   * fresh enough to still be a signal.
+   */
+  private pendingReleases = new Map<string, { candidate: AutoCandidate; queuedAt: number }>();
 
   /**
    * Q6f: the watch window is the candidate source. A HOT or READY release becomes a candidate here. Nothing did this before: the window
@@ -472,7 +482,10 @@ export class AutoSnipeController extends EventEmitter {
     const downgraded = this.enforceBudgets();
     if (process.env.AUTO_SNIPE_ENABLED !== 'true') return this.record(c, 'DROPPED', 'auto', 'AUTO_SNIPE_ENABLED is not true');
     if (this.attempted.has(key)) return this.record(c, 'DROPPED', 'auto', 'ALREADY_ATTEMPTED_THIS_SESSION');
-    if (this.busy) return this.record(c, 'DROPPED', 'auto', 'ANOTHER_CANDIDATE_IN_FLIGHT');
+    if (this.busy) {
+      const queued = c.source === 'WATCH_WINDOW' && this.queueRelease(c);
+      return this.record(c, 'DROPPED', 'auto', queued ? 'ANOTHER_CANDIDATE_IN_FLIGHT: queued, retried when the buy in flight settles' : 'ANOTHER_CANDIDATE_IN_FLIGHT');
+    }
     const open = workstationDb.loadPositions(undefined, 'ACTIVE');
     if (open.some((p) => p.mint.toLowerCase() === key)) return this.record(c, 'DROPPED', 'auto', 'POSITION_ALREADY_OPEN');
 
@@ -580,7 +593,31 @@ export class AutoSnipeController extends EventEmitter {
       this.busy = false;
       this.inflight = null;
       settle();
+      this.scheduleReleaseDrain();
     }
+  }
+
+  private queueRelease(c: AutoCandidate): boolean {
+    const key = c.mint.toLowerCase();
+    if (!this.pendingReleases.has(key)) {
+      if (this.pendingReleases.size >= PENDING_RELEASE_MAX) this.pendingReleases.delete(this.pendingReleases.keys().next().value as string);
+      this.pendingReleases.set(key, { candidate: c, queuedAt: Date.now() });
+    }
+    return true;
+  }
+
+  private scheduleReleaseDrain(): void {
+    if (this.pendingReleases.size === 0) return;
+    setImmediate(() => {
+      if (this.busy || this.mode === 'OFF') return;
+      for (const [key, p] of this.pendingReleases) {
+        this.pendingReleases.delete(key);
+        const v = watchWindow.getVerdict(p.candidate.mint);
+        if (Date.now() - p.queuedAt > PENDING_RELEASE_MAX_AGE_MS || !v || (v.state !== 'HOT' && v.state !== 'READY')) continue;
+        void this.submitCandidate(p.candidate).catch(() => undefined);
+        return; // one at a time: the next waits for this buy to settle (its own finally drains again)
+      }
+    });
   }
 }
 

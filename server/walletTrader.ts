@@ -229,6 +229,13 @@ class PlugAndPlayWalletTrader extends EventEmitter {
 
   /** Throws (before changing anything) when the new RPC endpoint is refused by the cluster guard or unreachable. */
   public async updateConfig(newConfig: Partial<WalletTraderConfig>): Promise<WalletTraderConfig> {
+    // R8s: the HTTP API may lower the per-trade size but not raise it past what the environment and capital tier allow
+    // (MAX_POSITION_SIZE_SOL). Checked first, so a refused request changes nothing.
+    const ceiling = executionConfig.getConfig().maxPositionSizeSol;
+    const requested = newConfig.riskLimits?.maxPositionSizeSol;
+    if (requested !== undefined && requested > ceiling) {
+      throw new Error(`maxPositionSizeSol ${requested} exceeds the configured ceiling ${ceiling} SOL; raise MAX_POSITION_SIZE_SOL in the environment and restart to allow more`);
+    }
     if (newConfig.rpcEndpoint && newConfig.rpcEndpoint !== this.config.rpcEndpoint) {
       const switched = await executionCoordinator.setRpcEndpoint(newConfig.rpcEndpoint);
       if (!switched.success) throw new Error(`RPC endpoint rejected: ${switched.error ?? 'unknown error'}`);

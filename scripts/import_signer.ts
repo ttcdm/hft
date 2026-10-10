@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 import fs from 'fs';
 import path from 'path';
-import bs58 from 'bs58';
+import { parseSecretKey } from '../server/solana/parseSecretKey';
 import { Keypair } from '@solana/web3.js';
 
 function printUsage() {
@@ -36,17 +36,7 @@ async function main() {
 
   try {
     const raw = fs.readFileSync(resolvedInput, 'utf8').trim();
-    let secretKeyBytes: Uint8Array;
-
-    if (raw.startsWith('[') && raw.endsWith(']')) {
-      const parsed = JSON.parse(raw);
-      if (!Array.isArray(parsed)) {
-        throw new Error('JSON is not an array of numbers');
-      }
-      secretKeyBytes = Uint8Array.from(parsed);
-    } else {
-      secretKeyBytes = bs58.decode(raw);
-    }
+    const secretKeyBytes = parseSecretKey(raw);
 
     if (secretKeyBytes.length !== 64) {
       throw new Error(`Invalid secret key length: expected 64 bytes, got ${secretKeyBytes.length}`);

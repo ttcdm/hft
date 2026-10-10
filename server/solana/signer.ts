@@ -2,6 +2,7 @@ import { Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
 import fs from 'fs';
 import path from 'path';
 import bs58 from 'bs58';
+import { parseSecretKey } from './parseSecretKey';
 import crypto from 'crypto';
 import { SignerStatus } from '../core/types';
 import { Logger } from '../middleware/enterprise';
@@ -32,12 +33,7 @@ export class LocalKeypairSigner implements TransactionSigner {
     if (envPrivateKey) {
       try {
         const raw = envPrivateKey.trim();
-        let secretKeyBytes: Uint8Array;
-        if (raw.startsWith('[') && raw.endsWith(']')) {
-          secretKeyBytes = Uint8Array.from(JSON.parse(raw));
-        } else {
-          secretKeyBytes = bs58.decode(raw);
-        }
+        const secretKeyBytes = parseSecretKey(raw);
         if (secretKeyBytes.length === 64) {
           this.setKeypair(Keypair.fromSecretKey(secretKeyBytes));
           Logger.info(`Local hot signer loaded securely from environment: ${this.keypair!.publicKey.toBase58().slice(0, 4)}...${this.keypair!.publicKey.toBase58().slice(-4)}`);
@@ -58,13 +54,7 @@ export class LocalKeypairSigner implements TransactionSigner {
     try {
       if (fs.existsSync(targetPath)) {
         const raw = fs.readFileSync(targetPath, 'utf8').trim();
-        let secretKeyBytes: Uint8Array;
-
-        if (raw.startsWith('[') && raw.endsWith(']')) {
-          secretKeyBytes = Uint8Array.from(JSON.parse(raw));
-        } else {
-          secretKeyBytes = bs58.decode(raw);
-        }
+        const secretKeyBytes = parseSecretKey(raw);
 
         if (secretKeyBytes.length === 64) {
           this.setKeypair(Keypair.fromSecretKey(secretKeyBytes));
@@ -135,13 +125,7 @@ export class LocalKeypairSigner implements TransactionSigner {
       );
     }
 
-    const raw = secretKeyInput.trim();
-    let secretKeyBytes: Uint8Array;
-    if (raw.startsWith('[') && raw.endsWith(']')) {
-      secretKeyBytes = Uint8Array.from(JSON.parse(raw));
-    } else {
-      secretKeyBytes = bs58.decode(raw);
-    }
+    const secretKeyBytes = parseSecretKey(secretKeyInput);
 
     if (secretKeyBytes.length !== 64) {
       throw new Error(`Invalid secret key length. Expected 64 bytes, got ${secretKeyBytes.length}.`);

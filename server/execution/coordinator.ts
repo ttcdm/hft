@@ -172,8 +172,16 @@ export class ExecutionCoordinator {
           const hadProblem = this.clusterProblem !== null;
           if (await this.verifyCluster()) {
             this.recordRpcHeartbeat(slot, latency);
-            // the boot pass skipped reconciliation because the genesis was unreadable or wrong; run it now that it is verified
-            if (hadProblem && this.lastStartupReconciliation === null) void this.startupReconciliation().catch(() => undefined);
+            // The boot pass skipped reconciliation (genesis unreadable or wrong, or the first connect failed outright - F3):
+            // run it once now that the RPC is up and verified. startupReconciliation is single-flight, so this cannot overlap
+            // a pass that is already running.
+            if (this.lastStartupReconciliation === null && (hadProblem || this.bootConnectFailed)) {
+              this.bootConnectFailed = false;
+              void this.syncRealWalletBalance()
+                .catch(() => undefined)
+                .then(() => this.startupReconciliation())
+                .catch(() => undefined);
+            }
           }
         }
       } catch {
@@ -243,6 +251,7 @@ export class ExecutionCoordinator {
       await this.startupReconciliation();
     } catch (err: any) {
       this.rpcHealth = 'DISCONNECTED';
+      this.bootConnectFailed = true; // F3: the heartbeat runs startup reconciliation once the RPC comes back
       Logger.warn(`Solana RPC connection failed: ${err.message}. Operating in safe paper/offline mode.`);
     }
   }
@@ -557,6 +566,8 @@ export class ExecutionCoordinator {
     this.recordSyntheticMarketEvent('LEGACY_DISPATCH');
   }
 
+  /** F3: the first RPC connect at boot failed, so startup reconciliation has not run yet. */
+  private bootConnectFailed = false;
   private reconcileInFlight: Promise<{ status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE'; mismatchesCount: number; details: string }> | null = null;
 
   // Startup Reconciliation checking database, on-chain balances, and transport health.

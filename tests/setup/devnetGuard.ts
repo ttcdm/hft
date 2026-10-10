@@ -1,5 +1,5 @@
 import net from 'node:net';
-import { beforeEach, afterEach, vi } from 'vitest';
+import { beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { executionCoordinator } from '../../server/execution/coordinator';
 import { PumpCurveService } from '../../server/solana/pumpCurve';
 import { pumpfunService } from '../../server/pumpfunService';
@@ -11,7 +11,8 @@ import { solPriceService } from '../../server/market/solPriceService';
 // net.Socket.connect, so refusing there makes a leak to a real RPC fail loudly instead of passing on a
 // machine that happens to be offline. This file runs before any test module is imported.
 (globalThis as any).__networkGuardHits = [] as string[];
-const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '0.0.0.0', '']);
+// T15: all of 127.0.0.0/8, ::1, IPv4-mapped loopback and localhost are local. Anything else is refused.
+const isLoopback = (h: string): boolean => h === '' || h === 'localhost' || h === '::1' || h === '0.0.0.0' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h) || /^::ffff:127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/i.test(h);
 const realConnect = net.Socket.prototype.connect;
 (net.Socket.prototype as any).connect = function (this: net.Socket, ...args: any[]) {
   // net.connect() hands Socket.connect an already-normalized [options, cb] array; unwrap it, otherwise
@@ -26,7 +27,7 @@ const realConnect = net.Socket.prototype.connect;
   } else {
     host = typeof args[1] === 'string' ? args[1] : undefined;
   }
-  if (!LOOPBACK.has(host ?? '')) {
+  if (!isLoopback(host ?? '')) {
     (globalThis as any).__networkGuardHits.push(String(host) + ' @ ' + (new Error().stack || '').split('\n').filter((l) => l.includes('/server') && !l.includes('node_modules')).slice(0, 2).map((l) => l.trim().replace(/.*macgit\//, '')).join(' <- '));
     throw new Error(`TEST_NETWORK_GUARD: a test tried to connect to non-loopback host "${host}"`);
   }
@@ -59,6 +60,16 @@ beforeEach(() => {
     fee: PumpCurveService.cachedFeeConfig,
     callouts: (pumpfunService as any).hotCallouts,
   };
+});
+
+// T4: hits recorded after the file's last test (a background interval firing during teardown) are not attributed to a later,
+// innocent test; they fail the file instead of vanishing.
+afterAll(() => {
+  const hits = (globalThis as any).__networkGuardHits as string[];
+  const leaked = hits.splice(0, hits.length);
+  if (leaked.length && !(globalThis as any).__expectNetworkGuardHits) {
+    throw new Error(`TEST_NETWORK_GUARD: non-loopback connections after the last test of this file: ${[...new Set(leaked)].join(', ')}`);
+  }
 });
 
 afterEach(() => {

@@ -36,6 +36,7 @@ process.env.SIGNER_KEYPAIR_PATH = keyPath;
 process.env.ALLOW_LIVE_REAL_MONEY_TRADING = 'false';
 delete process.env.ALLOWED_CLUSTER;
 delete process.env.OPERATOR_PRIVATE_KEY;
+delete process.env.SOLANA_PRIVATE_KEY;
 
 if (/mainnet|jito\.wtf/i.test(process.env.SOLANA_RPC_URL)) {
   console.error('refusing: RPC URL looks like mainnet');

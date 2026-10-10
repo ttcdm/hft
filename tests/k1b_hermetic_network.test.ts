@@ -17,9 +17,4 @@ describe('K1b: tests never reach a real cluster', () => {
     expect(hits.length).toBe(2);
     hits.length = 0; // consumed: the setup file's afterEach fails any test that leaves hits behind
   });
-
-  it('a swallowed leak still fails the test that caused it (checked by the afterEach in the setup file)', () => {
-    // Behaviour is exercised by the setup file's afterEach; here we only assert the hook state is clean.
-    expect((globalThis as any).__networkGuardHits.length).toBe(0);
-  });
 });

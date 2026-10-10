@@ -113,6 +113,7 @@ async function main() {
   process.env.APEX_ENV_FILE = '';
   process.env.SOLANA_RPC_URL = info.url;
   process.env.APEX_DB_PATH = path.join(scratch, 'driver.db');
+  process.env.APEX_WAL_PATH = path.join(scratch, 'engine.wal');
   const { PUMP_SDK } = await import('@pump-fun/pump-sdk');
   const { PumpCurveService } = await import('../../server/solana/pumpCurve');
   const { txBuilder } = await import('../../server/solana/transactionBuilder');

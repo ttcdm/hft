@@ -40,3 +40,14 @@ describe('K1b: test network guard', () => {
     expect(body).toBe('ok');
   });
 });
+
+describe('T15: loopback in any spelling is allowed, everything else is refused', () => {
+  const connectTo = (host: string) => { const s = new net.Socket(); try { s.connect({ port: 9, host }); } catch (e: any) { return String(e.message); } finally { s.on('error', () => undefined); s.destroy(); } return 'no-throw'; };
+  it('127.0.0.0/8 and the IPv4-mapped form pass the guard; a public address and a lookalike do not', () => {
+    (globalThis as any).__expectNetworkGuardHits = true;
+    try {
+      for (const ok of ['127.0.0.2', '127.255.255.254', '::ffff:127.0.0.1']) expect(connectTo(ok), ok).not.toMatch(/TEST_NETWORK_GUARD/);
+      for (const bad of ['128.0.0.1', '1.1.1.1', '127.0.0.1.evil.example', 'localhost.evil.example']) expect(connectTo(bad), bad).toMatch(/TEST_NETWORK_GUARD/);
+    } finally { (globalThis as any).__expectNetworkGuardHits = false; (globalThis as any).__networkGuardHits.length = 0; }
+  });
+});

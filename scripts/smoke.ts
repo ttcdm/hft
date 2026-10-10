@@ -8,7 +8,7 @@
 import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { createServer } from 'node:net';
-import { existsSync, mkdtempSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import WebSocket from 'ws';
@@ -103,6 +103,8 @@ async function main(): Promise<void> {
     APEX_ENV_FILE: '',
     APEX_DB_PATH: path.join(scratchDir, 'smoke.db'),
     SIGNER_KEYPAIR_PATH: path.join(scratchDir, 'no-keypair.json'),
+    APEX_WAL_PATH: path.join(scratchDir, 'engine.wal'), // never the checkout's apex_engine.wal
+    APEX_DISABLE_EXTERNAL_FEEDS: 'true', // no price or pump feeds: the smoke run must not depend on, or talk to, the internet
   };
 
   const out: string[] = [];
@@ -153,6 +155,7 @@ async function main(): Promise<void> {
     child.kill('SIGTERM');
     await Promise.race([new Promise((r) => child.once('exit', r)), sleep(5000)]);
     if (exited === null) child.kill('SIGKILL');
+    rmSync(scratchDir, { recursive: true, force: true });
   }
 
   const log = out.join('');

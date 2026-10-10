@@ -22,7 +22,7 @@ export class EngineWAL {
   private lastChecksum: string = '0000000000000000000000000000000000000000000000000000000000000000';
 
   constructor(filePath?: string) {
-    this.logFilePath = filePath || path.join(process.cwd(), 'apex_engine.wal');
+    this.logFilePath = filePath || process.env.APEX_WAL_PATH || path.join(process.cwd(), 'apex_engine.wal');
     this.initFileStream();
   }
 

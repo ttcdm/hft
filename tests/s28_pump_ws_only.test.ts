@@ -27,12 +27,17 @@ describe('S28: pump websocket listener without the HTTP pollers', () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it('the default still starts the pollers', async () => {
+  it('the default still starts the pollers', () => {
     vi.spyOn(pumpFeedListener, 'start').mockResolvedValue(undefined as any);
-    const svc = new PumpFunService();
-    const sync = vi.spyOn(svc, 'syncRealWorldData').mockResolvedValue(undefined);
-    svc.startBackground();
-    expect(sync).toHaveBeenCalled();
+    // Fake timers: initPolling also arms a 5 s interval, which must never fire for real in this process (it would call the
+    // un-mocked syncRealWorldData and reach pump.fun / DexScreener, which the network guard rightly refuses).
+    vi.useFakeTimers();
+    try {
+      const svc = new PumpFunService();
+      const sync = vi.spyOn(svc, 'syncRealWorldData').mockResolvedValue(undefined);
+      svc.startBackground();
+      expect(sync).toHaveBeenCalledTimes(1);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
   });
 });
 

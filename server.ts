@@ -39,6 +39,7 @@ import {
   OperatorExecuteTradeSchema,
   OperatorSnipeSchema,
   SignalSnipeSchema,
+  KillSwitchSchema,
   SniperConfigPatchSchema,
   ToggleCallerSchema,
   validateTradeBody,
@@ -381,7 +382,7 @@ app.use(cors(corsPolicy));
 
 app.use(express.json());
 app.get('/favicon.ico', (req, res) => res.status(204).end());
-app.use('/api', rateLimiter({ maxTokens: 120, refillRatePerSec: 30 }));
+app.use('/api', rateLimiter({ maxTokens: Number(process.env.APEX_RATE_LIMIT_BURST) || 120, refillRatePerSec: 30 }));
 // A1: deny-by-default. Only GET /api/health and POST /api/auth/login are reachable without an operator token.
 app.use(apiAuthGate);
 
@@ -1460,8 +1461,11 @@ app.post('/api/execution/arm', requireOperatorAuth, validateTradeBody(ArmSchema)
 });
 
 app.post('/api/execution/kill-switch', requireOperatorAuth, (req, res) => {
-  const { activate } = req.body;
-  riskEngine.setKillSwitch(Boolean(activate));
+  // Explicit boolean only: an empty POST or {"activate":"false"} must not trip it, and must never silently reset it.
+  const parsed = KillSwitchSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ success: false, error: 'activate must be true or false' });
+  const { activate } = parsed.data;
+  riskEngine.setKillSwitch(activate);
   if (activate) {
     executionCoordinator.armLiveTrading(false);
   }
@@ -1609,8 +1613,12 @@ async function startServer() {
     });
   }
 
-  solPriceService.startAutoRefresh();
-  pumpFunService.startBackground();
+  // Test/offline switch: the behaviour tests spawn this server and must not reach Coinbase, CoinGecko, Binance, pump.fun or
+  // DexScreener (the vitest network guard cannot see child processes). Production leaves it unset.
+  if (process.env.APEX_DISABLE_EXTERNAL_FEEDS !== 'true') {
+    solPriceService.startAutoRefresh();
+    pumpFunService.startBackground();
+  }
   autoSnipeController.startMonitor(); // G3: kill-switch triggers and wallet audit (inert while the mode is OFF)
   server.listen(PORT, BIND_HOST, () => {
     console.log(`[APEX QUANT HFT] Autonomous Execution Engine running on ${BIND_HOST}:${PORT}`);

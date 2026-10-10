@@ -156,6 +156,8 @@ export const ArmSchema = z.object({
 });
 
 /** POST /api/auto/mode (G1). */
+export const KillSwitchSchema = z.object({ activate: strictBool });
+
 export const AutoModeSchema = z.object({
   mode: z.enum(['OFF', 'SHADOW', 'PAPER', 'DEVNET_LIVE']),
   confirmationCode: z.string().max(64).optional(),

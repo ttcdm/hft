@@ -102,6 +102,7 @@ const baseEnv = (dir: string, extra: Record<string, string>): Record<string, str
   OPERATOR_PASSWORD: 'behaviour-test-password',
   SOLANA_WS_URL: 'ws://127.0.0.1:9',
   JITO_BLOCK_ENGINE_URL: 'http://127.0.0.1:9',
+  APEX_DISABLE_EXTERNAL_FEEDS: 'true', // no price/pump feeds from a child process: it is outside the vitest network guard
   ...extra,
 });
 
@@ -135,5 +136,5 @@ export async function startApp(dir: string, env: Record<string, string>): Promis
 export function haltInSeparateProcess(dbPath: string, reason: string): void {
   const code = `process.env.APEX_ENV_FILE='';process.env.APEX_DB_PATH=${JSON.stringify(dbPath)};process.env.NODE_ENV='production';` +
     `import('./server/execution/coordinator').then(({ executionCoordinator }) => { executionCoordinator.haltAll(${JSON.stringify(reason)}); setTimeout(() => process.exit(0), 200); });`;
-  execFileSync(path.resolve('node_modules/.bin/tsx'), ['-e', code], { cwd: process.cwd(), env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '', SIGNER_KEYPAIR_PATH: throwawayKeyFile(path.dirname(dbPath)) }, timeout: 60_000 });
+  execFileSync(path.resolve('node_modules/.bin/tsx'), ['-e', code], { cwd: process.cwd(), env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '', SOLANA_RPC_URL: 'http://127.0.0.1:9', SOLANA_WS_URL: 'ws://127.0.0.1:9', JITO_BLOCK_ENGINE_URL: 'http://127.0.0.1:9', SIGNER_KEYPAIR_PATH: throwawayKeyFile(path.dirname(dbPath)) }, timeout: 60_000 });
 }

@@ -160,7 +160,12 @@ export class ExecutionCoordinator {
         const slot = await this.connection.getSlot('processed');
         const latency = Math.round(performance.now() - t0);
         if (slot > 0) {
-          this.recordRpcHeartbeat(slot, latency);
+          const hadProblem = this.clusterProblem !== null;
+          if (await this.verifyCluster()) {
+            this.recordRpcHeartbeat(slot, latency);
+            // the boot pass skipped reconciliation because the genesis was unreadable or wrong; run it now that it is verified
+            if (hadProblem && this.lastStartupReconciliation === null) void this.startupReconciliation().catch(() => undefined);
+          }
         }
       } catch {
         this.rpcHealth = 'DISCONNECTED';
@@ -216,11 +221,13 @@ export class ExecutionCoordinator {
       this.rpcLatencyMs = Math.round(performance.now() - t0);
       // An RPC that answers for a cluster other than the allowed one is not "healthy": readiness must refuse to arm on it,
       // not wait for the first send to find out (the send path still re-checks). Started now, awaited after the Jito probe.
-      const clusterCheck = assertClusterAllowed(this.connection);
-      clusterCheck.catch(() => undefined); // the await below reports it; this stops an early rejection being unhandled
+      const clusterCheck = this.verifyCluster();
       await this.jitoTransport.probe();
       this.startJitoProbeLoop();
-      await clusterCheck;
+      if (!(await clusterCheck)) {
+        Logger.warn(`Solana RPC is not on the allowed cluster: ${this.clusterProblem}. Staying DISCONNECTED; the heartbeat re-checks.`);
+        return;
+      }
       this.rpcHealth = this.rpcLatencyMs > 800 ? 'DEGRADED' : 'HEALTHY';
       Logger.info(`Solana RPC connected: Slot ${slot}, Latency ${this.rpcLatencyMs}ms`);
       await this.syncRealWalletBalance();
@@ -228,6 +235,25 @@ export class ExecutionCoordinator {
     } catch (err: any) {
       this.rpcHealth = 'DISCONNECTED';
       Logger.warn(`Solana RPC connection failed: ${err.message}. Operating in safe paper/offline mode.`);
+    }
+  }
+
+  /** Why the RPC is not trusted (wrong genesis, or genesis unreadable); null once a check passes. Sticky across heartbeats. */
+  private clusterProblem: string | null = null;
+
+  /**
+   * Genesis check for readiness (not only for sends). Never throws: returns true when the RPC is on the allowed cluster.
+   * A failure pins rpcHealth to DISCONNECTED until a later check passes, so a healthy getSlot cannot hide a wrong cluster.
+   */
+  private async verifyCluster(): Promise<boolean> {
+    try {
+      await assertClusterAllowed(this.connection);
+      this.clusterProblem = null;
+      return true;
+    } catch (err: any) {
+      this.clusterProblem = err?.message ?? 'cluster check failed';
+      this.rpcHealth = 'DISCONNECTED';
+      return false;
     }
   }
 
@@ -491,6 +517,7 @@ export class ExecutionCoordinator {
 
   public recordRpcHeartbeat(slot: number, latencyMs: number) {
     this.rpcLatencyMs = latencyMs;
+    if (this.clusterProblem) return; // a wrong-cluster RPC does not become healthy because getSlot answers
     this.rpcHealth = latencyMs > 800 ? 'DEGRADED' : 'HEALTHY';
   }
 
@@ -547,6 +574,9 @@ export class ExecutionCoordinator {
     const now = Date.now();
     let mismatchesCount = 0;
     const issues: string[] = [];
+
+    // 0. A reconcile never vouches for an RPC on the wrong cluster (it would otherwise make a mainnet-answering RPC armable).
+    if (!(await this.verifyCluster())) issues.push(`RPC is not on the allowed cluster: ${this.clusterProblem}`);
 
     // 1. Check signer status
     const signerStatus = localSigner.getStatus();

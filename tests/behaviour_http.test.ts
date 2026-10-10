@@ -38,8 +38,45 @@ describe('mainnet guard over HTTP: a server pointed at a mainnet RPC can never a
     expect((await app.call('GET', '/api/execution/mode')).json.isLiveArmed).toBe(false);
   });
 
+  it('stays unarmable after a heartbeat and a Reconcile click (the check is sticky, not a boot-time snapshot)', async () => {
+    const before = rpc.count('getGenesisHash');
+    await new Promise((r) => setTimeout(r, 11_000)); // one 10 s feed heartbeat must pass; it used to flip the RPC back to HEALTHY
+    expect(rpc.count('getGenesisHash')).toBeGreaterThan(before); // the heartbeat re-checked the genesis itself
+    const rec = await app.call('POST', '/api/execution/reconcile');
+    expect(rec.json.result.status).toBe('OFFLINE');
+    const can = (await app.call('GET', '/api/execution/can-arm')).json;
+    expect(can.allowed).toBe(false);
+    expect(can.reasons.join(' ')).toMatch(/RPC health is DISCONNECTED/);
+    const arm = await app.call('POST', '/api/execution/arm', { arm: true, confirmationCode: 'CONFIRM_LIVE_TRADING_RISK' });
+    expect(arm.status).toBe(403);
+  }, 60_000);
+
   it('nothing was sent to the mainnet-answering RPC', () => {
     expect(sends(rpc)).toBe(0);
+  });
+});
+
+describe('kill switch input is strict (R6s)', () => {
+  let rpc: RpcStub; let app: AppHandle;
+  beforeAll(async () => {
+    rpc = await startRpcStub(LOCALNET_STUB_GENESIS);
+    app = await startApp(dir(), { SOLANA_RPC_URL: rpc.url, ALLOWED_CLUSTER: 'localnet', LOCALNET_GENESIS_HASH: LOCALNET_STUB_GENESIS });
+    handles.push(app);
+  }, 90_000);
+  afterAll(() => rpc.close());
+
+  it('an empty POST or a junk value is 400 and changes nothing; the string "false" means false', async () => {
+    const state = async () => (await app.call('POST', '/api/execution/kill-switch', { activate: 'false' })).json;
+    expect((await state()).killSwitchActive).toBe(false);
+    for (const body of [{}, { activate: 'maybe' }, { activate: 1 }, { activate: null }]) {
+      const r = await app.call('POST', '/api/execution/kill-switch', body);
+      expect(r.status).toBe(400);
+    }
+    expect((await state()).killSwitchActive).toBe(false);
+    expect((await app.call('POST', '/api/execution/kill-switch', { activate: 'true' })).json.killSwitchActive).toBe(true);
+    // a body-less or junk request must not reset a tripped switch either
+    expect((await app.call('POST', '/api/execution/kill-switch', {})).status).toBe(400);
+    expect((await app.call('POST', '/api/execution/kill-switch', { activate: false })).json.killSwitchActive).toBe(false);
   });
 });
 
@@ -58,10 +95,14 @@ describe('PAPER never sends, and the kill switch refuses new trades', () => {
     expect(m.isLiveArmed).toBe(false);
   });
 
-  it('a PAPER trade request, whatever its outcome, causes no send or simulation on the RPC', async () => {
+  it('a PAPER trade with no market data is refused with a stated reason, in PAPER, and nothing reaches the RPC', async () => {
     const r = await app.call('POST', '/api/execution/trade', trade());
-    expect(r.status).toBeLessThan(500);
-    expect(r.json.executionMode ?? 'PAPER').toBe('PAPER');
+    // The stub RPC has no bonding curve for a random mint, so the paper gate fails closed (price impact unknown). That is the
+    // outcome asserted: a stated refusal, not a 5xx, in PAPER, with nothing sent. A filled paper trade needs curve data (localnet:e2e).
+    expect(r.status).toBe(400);
+    expect(r.json.success).toBe(false);
+    expect(r.json.executionMode).toBe('PAPER');
+    expect(String(r.json.error)).toMatch(/PRICE_IMPACT_TOO_HIGH/);
     expect(sends(rpc)).toBe(0);
   });
 
@@ -229,23 +270,25 @@ describe('deny-by-default on the real server: no route is reachable without a to
   it('every non-public /api route answers 401 unauthenticated (case, slash and trailing-slash variants), and signer overwrite is refused', async () => {
     const rpc = await startRpcStub(LOCALNET_STUB_GENESIS);
     try {
-      const app = await startApp(dir(), { SOLANA_RPC_URL: rpc.url, ALLOWED_CLUSTER: 'localnet', LOCALNET_GENESIS_HASH: LOCALNET_STUB_GENESIS }); handles.push(app);
-      const src = fs.readFileSync('server.ts', 'utf8');
+      // a huge burst so the limiter never answers: a 429 would say nothing about the auth gate
+      const app = await startApp(dir(), { SOLANA_RPC_URL: rpc.url, ALLOWED_CLUSTER: 'localnet', LOCALNET_GENESIS_HASH: LOCALNET_STUB_GENESIS, APEX_RATE_LIMIT_BURST: '100000' }); handles.push(app);
+      const src = fs.readFileSync('server.ts', 'utf8') + fs.readFileSync('server/market/marketRoutes.ts', 'utf8');
       const routes = [...src.matchAll(/app\.(get|post|put|patch|delete)\(\s*'(\/api\/[^']*)'/g)].map((m) => ({ method: m[1].toUpperCase(), path: m[2].replace(/:[A-Za-z]+/g, 'x') }));
       expect(routes.length).toBeGreaterThan(50);
-      // before the walk: the rate limiter answers 429 once enough unauthenticated requests have been made
       expect((await app.call('POST', '/api/signer/generate', { forceOverwrite: true })).status).toBe(403);
       expect((await fetch(`${app.base}/api/auth/session`)).status).toBe(401);
       const PUBLIC = new Set(['GET /api/health', 'POST /api/auth/login']);
+      // the route list must include the market routes registered outside server.ts, or the walk would not cover them
+      expect(routes.some((r) => r.path === '/api/market/orderbook')).toBe(true);
       const leaks: string[] = [];
       for (const r of routes) {
         if (PUBLIC.has(`${r.method} ${r.path}`)) continue;
         for (const v of [r.path, '/API' + r.path.slice(4), r.path.toUpperCase(), '//' + r.path.slice(1), r.path + '/']) {
           const res = await fetch(app.base + v, { method: r.method, headers: { 'content-type': 'application/json' }, body: r.method === 'GET' ? undefined : '{}' });
-          if (res.status !== 401 && res.status !== 429) leaks.push(`${r.method} ${v} -> ${res.status}`);
+          if (res.status !== 401) leaks.push(`${r.method} ${v} -> ${res.status}`);
         }
       }
-      expect(leaks).toEqual([]); // 401, or 429 from the rate limiter: denied either way, never served
+      expect(leaks).toEqual([]); // exactly 401 for every spelling; the limiter is out of the way
     } finally { await rpc.close(); }
   }, 180_000);
 });

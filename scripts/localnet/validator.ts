@@ -510,6 +510,12 @@ export class LocalnetValidator {
       case 'localnet_expireBlockhash': this.expireBlockhash(); return true;
       case 'localnet_failNextSends': this.failNextSends(Number(params[0] ?? 1), params[1]); return true;
       case 'localnet_frontrunNext': this.frontrun.push(Buffer.from(params[0], 'base64')); return true;
+      case 'localnet_setAccount': { // params: [pubkey, { lamports, dataBase64, owner }] writes an account straight into the bank (test setup only)
+        const a = params[1];
+        this.svm.setAccount(new PublicKey(params[0]), { lamports: Number(a.lamports), data: Buffer.from(a.dataBase64, 'base64'), owner: new PublicKey(a.owner), executable: false });
+        this.known.add(String(params[0]));
+        return true;
+      }
       case 'localnet_holdNextResponse': this.holdNextResponse = true; return true;
       case 'localnet_stats': return { held: this.heldSignatures, methods: Object.fromEntries(this.methodCounts), unsupported: [...this.unsupported], txs: this.txs.size, slot: Number(this.slot) };
       default:

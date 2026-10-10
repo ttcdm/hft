@@ -16,6 +16,8 @@ import crypto from 'crypto';
 import net from 'net';
 import { spawn, ChildProcess } from 'child_process';
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
+import { AccountLayout, NATIVE_MINT, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from '@solana/spl-token';
+import { PUMP_AMM_SDK, PUMP_AMM_PROGRAM_ID, canonicalPumpPoolPda, GLOBAL_CONFIG_PDA, pumpPoolAuthorityPda, coinCreatorVaultAuthorityPda } from '@pump-fun/pump-swap-sdk';
 
 const ROOT = process.cwd();
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'apex-localnet-'));
@@ -195,6 +197,7 @@ async function main() {
   let mintE: PublicKey;
   let mintF: PublicKey;
   let mintG: PublicKey;
+  let mintH: PublicKey;
   try {
     mint = await createCoin();
     rec('seed: create_v2', true, `mint ${mint.toBase58()} created by the real pump program`);
@@ -226,7 +229,8 @@ async function main() {
     mintE = await seedCoin();
     mintF = await seedCoin();
     mintG = await seedCoin();
-    rec('seed: 4 more coins (revert, failed-send, restart, sell-in-flight scenarios)', true, [mintD, mintE, mintF, mintG].map((m) => m.toBase58()).join(' '));
+    mintH = await seedCoin();
+    rec('seed: 5 more coins (revert, failed-send, restart, sell-in-flight, PumpSwap scenarios)', true, [mintD, mintE, mintF, mintG, mintH].map((m) => m.toBase58()).join(' '));
   } catch (e: any) {
     rec('seed market', false, String(e?.stack || e).slice(0, 600));
     return finish();
@@ -426,6 +430,70 @@ async function main() {
     const closedRow = closedArr.find((x: any) => x.id === buyG.body.positionId) ?? after;
     rec('(g) Q18: restart records the sell that already happened, with its realized PnL', !!closedRow && closedRow.status === 'CLOSED' && closedRow.realizedPnLSol !== 0 && (ataAfterSellKill === null || ataAfterSellKill === 0n),
       `chain ATA ${ataAfterSellKill}; position ${JSON.stringify(closedRow ? { status: closedRow.status, realizedPnLSol: closedRow.realizedPnLSol } : null)}`);
+  }
+
+  // ---- (h) Q4: sell a MIGRATED coin through the real PumpSwap program; where do the proceeds end up? ----
+  // A migration is simulated by marking the bonding curve complete and writing the canonical pool and its vaults into the bank; the
+  // PumpSwap program itself (the real binary) executes the app's sell.
+  const armH = await call('POST', '/api/execution/arm', { arm: true, confirmationCode: 'CONFIRM_LIVE_TRADING_RISK' }); // a restart leaves the app in PAPER
+  rec('(h) re-armed after the restart', armH.status === 200 && armH.body?.success, JSON.stringify(armH.body).slice(0, 120));
+  const buyH = await call('POST', '/api/execution/trade', { mint: mintH.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02 });
+  rec('(h) buy before migration', buyH.status === 200 && buyH.body?.success, JSON.stringify(buyH.body).slice(0, 160));
+  if (buyH.body?.positionId) {
+    const setAccount = (pk: PublicKey, lamports: number, data: Buffer, owner: PublicKey) =>
+      rpcCall(info.url, 'localnet_setAccount', [pk.toBase58(), { lamports, dataBase64: data.toString('base64'), owner: owner.toBase58() }]);
+    const [curvePk] = PublicKey.findProgramAddressSync([Buffer.from('bonding-curve'), mintH.toBuffer()], new PublicKey('6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P'));
+    const curveAcct = await conn.getAccountInfo(curvePk);
+    const curveData = Buffer.from(curveAcct!.data);
+    curveData[48] = 1; // complete
+    await setAccount(curvePk, curveAcct!.lamports, curveData, curveAcct!.owner);
+
+    const poolPk = canonicalPumpPoolPda(mintH);
+    const baseVault = Keypair.generate().publicKey;
+    const quoteVault = Keypair.generate().publicKey;
+    const lpMint = Keypair.generate().publicKey;
+    const tokenAcct = (mintK: PublicKey, owner: PublicKey, amount: bigint, native: boolean) => {
+      const b = Buffer.alloc(165);
+      AccountLayout.encode({ mint: mintK, owner, amount, delegateOption: 0, delegate: PublicKey.default, state: 1, isNativeOption: native ? 1 : 0, isNative: native ? 2_039_280n : 0n, delegatedAmount: 0n, closeAuthorityOption: 0, closeAuthority: PublicKey.default } as any, b);
+      return b;
+    };
+    const poolBase = 200_000_000_000_000n; // 2e8 tokens
+    const poolQuote = 40n * 1_000_000_000n; // 40 SOL, so the position sells far above its entry
+    await setAccount(baseVault, 2_039_280, tokenAcct(mintH, poolPk, poolBase, false), TOKEN_2022_PROGRAM_ID); // pump v2 coins are Token-2022
+    await setAccount(quoteVault, 2_039_280 + Number(poolQuote), tokenAcct(NATIVE_MINT, poolPk, poolQuote, true), TOKEN_PROGRAM_ID);
+    const lpData = Buffer.alloc(82); lpData[45] = 1;
+    await setAccount(lpMint, 1_461_600, lpData, TOKEN_PROGRAM_ID);
+    const prog: any = (PUMP_AMM_SDK as any).offlineProgram;
+    const poolData: Buffer = await prog.coder.accounts.encode('pool', {
+      poolBump: 255, index: 0, creator: pumpPoolAuthorityPda(mintH), baseMint: mintH, quoteMint: NATIVE_MINT, lpMint,
+      poolBaseTokenAccount: baseVault, poolQuoteTokenAccount: quoteVault, lpSupply: new (await import('bn.js')).default(1_000_000),
+      coinCreator: creator.publicKey, isMayhemMode: false, isCashbackCoin: false, virtualQuoteReserves: new (await import('bn.js')).default(0),
+      creatorFeeBps: new (await import('bn.js')).default(0), canEditCreatorFee: false,
+    });
+    await setAccount(poolPk, 5_000_000, poolData, PUMP_AMM_PROGRAM_ID);
+    // the accounts a PumpSwap sell touches besides the pool: protocol-fee recipient WSOL account, creator-vault WSOL account
+    const globalInfo = await conn.getAccountInfo(GLOBAL_CONFIG_PDA);
+    const global = globalInfo ? prog.coder.accounts.decode('globalConfig', globalInfo.data) : null;
+    const recip: PublicKey = global?.protocolFeeRecipients?.[0];
+    const vaultAuth = coinCreatorVaultAuthorityPda(creator.publicKey);
+    const ensureWsolAta = async (owner: PublicKey) => {
+      const ataPk = getAssociatedTokenAddressSync(NATIVE_MINT, owner, true);
+      if (!(await conn.getAccountInfo(ataPk))) await setAccount(ataPk, 2_039_280, tokenAcct(NATIVE_MINT, owner, 0n, true), TOKEN_PROGRAM_ID);
+    };
+    if (recip) await ensureWsolAta(recip);
+    await ensureWsolAta(vaultAuth);
+    rec('(h) migrated pool written into the bank', !!recip, `pool ${poolPk.toBase58()}, protocol recipient ${recip?.toBase58()}`);
+
+    const solBefore = await conn.getBalance(trader.publicKey);
+    const sellH = await call('POST', '/api/execution/close', { positionId: buyH.body.positionId, sellPct: 100, reason: 'localnet Q4 PumpSwap' });
+    await sleep(1_500);
+    const solAfter = await conn.getBalance(trader.publicKey);
+    const wsolAta = getAssociatedTokenAddressSync(NATIVE_MINT, trader.publicKey, false);
+    const wsolInfo = await conn.getAccountInfo(wsolAta);
+    const wsolLeft = wsolInfo ? AccountLayout.decode(wsolInfo.data).amount : 0n;
+    const closedH = (((await positions()) as any)?.positions ?? []).find((x: any) => x.id === buyH.body.positionId);
+    rec('(h) Q4: PumpSwap sell succeeds and the proceeds arrive as native SOL', sellH.body?.success === true && solAfter > solBefore && wsolLeft === 0n,
+      `close ${sellH.status} ${JSON.stringify(sellH.body).slice(0, 300)}; wallet SOL ${solBefore} -> ${solAfter}; WSOL left in the wallet ATA: ${wsolLeft}; position ${closedH ? closedH.status + ' realized ' + closedH.realizedPnLSol : 'n/a'}`);
   }
 
   // ---- kill switch over HTTP ----

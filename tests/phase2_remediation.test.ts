@@ -340,6 +340,9 @@ describe('Phase 2 Remediation Suite (B02, B08, B09, B17, B21, B23)', () => {
   });
 
   describe('B23: Fallback Pricing Resilience (SolPriceService, C3)', () => {
+    // S26: unit tests run with the external feeds off; this block exercises the production price path.
+    beforeEach(() => { vi.stubEnv('APEX_DISABLE_EXTERNAL_FEEDS', ''); });
+    afterEach(() => { vi.unstubAllEnvs(); });
     // C3: Jupiter price API v6 is deprecated and was replaced by Coinbase spot; the cascade is Binance -> Coinbase -> CoinGecko.
     it('walletTrader falls back to Coinbase or CoinGecko if Binance fails or is geo-blocked', async () => {
       const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url: any) => {

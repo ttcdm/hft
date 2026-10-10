@@ -28,6 +28,8 @@ export default defineConfig({
       AUTO_SNIPE_ENABLED: '',
       AUTO_MANAGE_RECOVERED: '',
       DEMO_MODE: '',
+      // S26: the wallet-sync loop must not fetch the SOL price from a public host during a unit test.
+      APEX_DISABLE_EXTERNAL_FEEDS: 'true',
       TELEGRAM_BOT_TOKEN: '',
       TELEGRAM_CHAT_ID: '',
     },

@@ -125,7 +125,8 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     const bal = await executionCoordinator.syncRealWalletBalance();
 
     // C3: the single SolPriceService owns fetching, caching and staleness.
-    await solPriceService.refresh();
+    // S26: with APEX_DISABLE_EXTERNAL_FEEDS=true (unit tests, loopback-only child servers) no price host is contacted from this loop.
+    if (process.env.APEX_DISABLE_EXTERNAL_FEEDS !== 'true') await solPriceService.refresh();
 
     this.emit('wallet_state_updated', this.getState());
     return bal;

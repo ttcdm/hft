@@ -8,7 +8,7 @@ export interface BoardData {
   wallet: { balanceSol: number | null; reserveSol: number; rentLockedSol: number | null; spendableSol: number | null; solUsd: number | null };
   launches: Array<{
     mint: string; symbol: string; name: string; priceSol: number | null; priceUsd: number | null; curveProgressPct: number | null;
-    top10HoldersPct: number | null; creatorHoldingPct: number | null; mintRevoked: boolean; freezeRevoked: boolean; createdAgo: string | null;
+    top10HoldersPct: number | null; creatorHoldingPct: number | null; mintRevoked: boolean | null; freezeRevoked: boolean | null; createdAgo: string | null;
   }>;
   watching: Array<{
     mint: string; state: 'WATCHING' | 'HOT' | 'READY' | 'DEAD'; reason: string | null;

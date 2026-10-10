@@ -29,6 +29,7 @@ import { runComprehensiveTestSuite } from './server/unitTestCases';
 import { registerMarketRoutes } from './server/market/marketRoutes';
 import { walletTrader } from './server/walletTrader';
 import { resolveRpcUrl, allowedCluster } from './server/solana/clusterGuard';
+import { liveConfirmationRefusal } from './server/execution/liveConfirmation';
 import {
   ArmSchema,
   AutoModeSchema,
@@ -788,6 +789,8 @@ app.get('/api/social/signals', requireOperatorAuth, (req, res) => {
 
 app.post('/api/social/signals/snipe', requireOperatorAuth, validateTradeBody(SignalSnipeSchema), async (req, res) => {
   const { signalId } = req.body;
+  const unconfirmed = liveConfirmationRefusal(executionCoordinator.isLiveArmed(), allowedCluster(), req.body); // Q10b
+  if (unconfirmed) return res.status(409).json({ success: false, status: 'REJECTED', error: unconfirmed });
   const existing = socialScanner.getSignals().find((s) => s.id === signalId);
   if (!existing) {
     return res.status(404).json({ error: 'Signal not found' });
@@ -1166,6 +1169,8 @@ app.get('/api/pumpfun/leaderboard', requireOperatorAuth, (req, res) => {
 
 app.post('/api/pumpfun/callouts/snipe', requireOperatorAuth, validateTradeBody(CalloutSnipeSchema), async (req, res) => {
   const { calloutId, amountUsd, jitoTipSol, slippagePct } = req.body;
+  const unconfirmed = liveConfirmationRefusal(executionCoordinator.isLiveArmed(), allowedCluster(), req.body); // Q10b
+  if (unconfirmed) return res.status(409).json({ success: false, status: 'REJECTED', error: unconfirmed, result: { success: false, message: unconfirmed } });
 
   const result = await pumpFunService.snipeCallout(calloutId, amountUsd, jitoTipSol, slippagePct);
 

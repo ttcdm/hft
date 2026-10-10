@@ -54,8 +54,9 @@ export function buildBoard(now = Date.now()) {
       curveProgressPct: Number.isFinite(p.bondingCurveProgress) ? (p.bondingCurveProgress as number) : null,
       top10HoldersPct: p.top10HoldersPct >= 0 ? p.top10HoldersPct : null,
       creatorHoldingPct: p.devHoldingPct >= 0 ? p.devHoldingPct : null,
-      mintRevoked: p.isMintRevoked,
-      freezeRevoked: p.isFreezeRevoked,
+      // Q10d: a placeholder is not a fact; unknown goes out as null
+      mintRevoked: p.authoritiesVerified === false ? null : p.isMintRevoked,
+      freezeRevoked: p.authoritiesVerified === false ? null : p.isFreezeRevoked,
       createdAgo: p.createdAgo || null,
     }));
 

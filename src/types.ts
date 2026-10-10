@@ -314,6 +314,11 @@ export interface MemecoinPool {
   devHoldingPct: number;
   isMintRevoked: boolean;
   isFreezeRevoked: boolean;
+  /**
+   * Q10d: false when isMintRevoked / isFreezeRevoked are placeholders (a pool made from a create event, a demo pool) and have not been read
+   * from the chain. The execution path reads the chain itself; this flag only stops a screen from showing a placeholder as a fact.
+   */
+  authoritiesVerified?: boolean;
   isLpBurned: boolean;
   rugcheckScore: 'SAFE' | 'CAUTION' | 'DANGEROUS';
   createdAgo: string;

@@ -1,4 +1,6 @@
 import { probeBadge, probeLatency, hostOfService } from '../utils/probeBadge';
+import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
+import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
 import React, { useState, useEffect } from 'react';
 import {
   Send,
@@ -109,6 +111,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const [telegramTestResult, setTelegramTestResult] = useState<any | null>(null);
   const [sendPingMsg, setSendPingMsg] = useState(false);
   const [isTestingDiagnostics, setIsTestingDiagnostics] = useState(false);
+  const tradingMode = useTradingMode();
   const [diagnosticsResult, setDiagnosticsResult] = useState<any | null>(null);
   const [showDiagnosticsModal, setShowDiagnosticsModal] = useState(false);
 
@@ -236,9 +239,12 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
   // Snipe a specific signal
   const handleSnipeSignal = async (sig: SocialSignal) => {
-    hftAudio.playOrderFill();
     const amount = capitalTier === 'MICRO_10' ? 5.0 : 25.0;
-    const res = await engineClient.snipeSocialSignal(sig.id, amount, sniperConfig.jitoTipSol, sniperConfig.maxSlippagePct);
+    // Q10b: while LIVE is armed this click sends a real transaction; say so and ask first
+    const warning = liveClickWarning(tradingMode, `Sniping ${sig.tokenTicker} for $${amount.toFixed(2)}`);
+    if (warning && !window.confirm(warning)) return;
+    hftAudio.playOrderFill();
+    const res = await engineClient.snipeSocialSignal(sig.id, amount, sniperConfig.jitoTipSol, sniperConfig.maxSlippagePct, tradingMode.live);
     
     if (res?.tradeResult?.success) {
       onAlertTrigger?.(
@@ -750,7 +756,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                               className="px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs shadow-md shadow-emerald-950/40 flex items-center space-x-1.5 transition active:scale-95"
                             >
                               <Zap className="w-3.5 h-3.5" />
-                              <span>Snipe with {capitalTier === 'MICRO_10' ? '$5 Micro' : '$25'}</span>
+                              <span>Snipe with {capitalTier === 'MICRO_10' ? '$5 Micro' : '$25'} ({tradingMode.label})</span>
                             </button>
                           )}
                         </div>
@@ -818,7 +824,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                   <tbody className="divide-y divide-[#172033]">
                     {filteredPools.map((pool, pIdx) => {
                       const isPositive = pool.priceChange5mPct >= 0;
-                      const hasBonding = pool.bondingCurveProgress !== undefined && pool.bondingCurveProgress < 100;
+                      const hasBonding = !pool.isMigrated && pool.bondingCurveProgress !== undefined && pool.bondingCurveProgress < 100;
 
                       return (
                         <tr key={`pool-${pool.id}-${pool.contractAddress || ''}-${pIdx}`} className="hover:bg-[#12192C] transition">
@@ -898,9 +904,13 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                 </div>
                               </div>
                             ) : (
-                              <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                                🎓 Raydium Migrated
-                              </span>
+                              pool.isMigrated || (pool.bondingCurveProgress ?? 0) >= 100 ? (
+                                <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                                  🎓 Raydium Migrated
+                                </span>
+                              ) : (
+                                <span className="text-slate-500 text-[10px]">curve progress unknown</span>
+                              )
                             )}
                           </td>
 
@@ -921,16 +931,17 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                           {/* RugCheck Security */}
                           <td className="p-3">
                             <div className="space-y-0.5 text-[10px]">
-                              <div className="flex items-center space-x-1 text-emerald-400">
-                                <CheckCircle2 className="w-3 h-3" />
-                                <span>Mint Revoked</span>
-                              </div>
-                              <div className="flex items-center space-x-1 text-emerald-400">
-                                <CheckCircle2 className="w-3 h-3" />
-                                <span>Freeze Revoked</span>
-                              </div>
+                              {([['Mint', pool.authoritiesVerified === false ? null : pool.isMintRevoked], ['Freeze', pool.authoritiesVerified === false ? null : pool.isFreezeRevoked]] as const).map(([kind, v]) => {
+                                const b = authorityBadge(kind, v);
+                                return (
+                                  <div key={kind} className={`flex items-center space-x-1 ${authorityTone[b.tone]}`}>
+                                    <CheckCircle2 className="w-3 h-3" />
+                                    <span>{b.text}</span>
+                                  </div>
+                                );
+                              })}
                               <div className="text-slate-400">
-                                Top 10: <strong className="text-slate-200">{pool.top10HoldersPct}%</strong>
+                                Top 10: <strong className="text-slate-200">{holderPct(pool.top10HoldersPct)}</strong>
                               </div>
                             </div>
                           </td>

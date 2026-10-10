@@ -294,12 +294,14 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                 <h2 className="text-base sm:text-lg font-bold text-white tracking-wide">SOLANA TRADING WORKSTATION</h2>
                 <span
                   className={`px-2 py-0.5 text-xs font-bold rounded ${
-                    systemAudit?.isLiveArmed
-                      ? 'bg-rose-500/20 text-rose-400 border border-rose-500/40 animate-pulse'
-                      : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                    !systemAudit
+                      ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                      : systemAudit.isLiveArmed
+                        ? 'bg-rose-500/20 text-rose-400 border border-rose-500/40 animate-pulse'
+                        : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
                   }`}
                 >
-                  {systemAudit?.isLiveArmed ? 'LIVE BROADCAST ACTIVE' : 'PAPER TRADING (SAFE)'}
+                  {!systemAudit ? 'MODE UNKNOWN' : systemAudit.isLiveArmed ? 'LIVE BROADCAST ACTIVE' : 'PAPER TRADING'}
                 </span>
                 <span className="px-1.5 py-0.5 text-[10px] font-mono rounded bg-slate-800 text-slate-300 border border-slate-700">
                   MICRO $10 TIER
@@ -339,7 +341,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                 }`}
               />
               <span className={`font-bold ${systemAudit?.isLiveArmed ? 'text-rose-400' : 'text-emerald-400'}`}>
-                {systemAudit?.mode || 'PAPER'}
+                {systemAudit?.mode || 'UNKNOWN'}
               </span>
             </div>
           </div>

@@ -84,15 +84,17 @@ export const SignalSnipeSchema = z
     platform: z.string().trim().max(32).optional(),
     jitoTipSol,
     slippagePct,
+    confirmLive: z.boolean().optional(),
   })
   .loose()
   .superRefine(rejectForbiddenKeys)
-  .transform(({ signalId, amountUsd, platform, jitoTipSol, slippagePct }) => ({
+  .transform(({ signalId, amountUsd, platform, jitoTipSol, slippagePct, confirmLive }) => ({
     signalId,
     amountUsd,
     platform,
     jitoTipSol,
     slippagePct,
+    confirmLive,
   }));
 
 /** POST /api/pumpfun/callouts/snipe, WS SNIPE_PUMP_CALLOUT. */
@@ -102,10 +104,11 @@ export const CalloutSnipeSchema = z
     amountUsd,
     jitoTipSol,
     slippagePct: z.coerce.number().min(0.5).max(50).default(6.0),
+    confirmLive: z.boolean().optional(),
   })
   .loose()
   .superRefine(rejectForbiddenKeys)
-  .transform(({ calloutId, amountUsd, jitoTipSol, slippagePct }) => ({ calloutId, amountUsd, jitoTipSol, slippagePct }));
+  .transform(({ calloutId, amountUsd, jitoTipSol, slippagePct, confirmLive }) => ({ calloutId, amountUsd, jitoTipSol, slippagePct, confirmLive }));
 
 /** POST /api/memecoins/close, POST /api/execution/close, WS CLOSE_POSITION. */
 export const OperatorCloseSchema = z

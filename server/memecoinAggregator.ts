@@ -236,6 +236,7 @@ export class MemecoinAggregatorService extends EventEmitter {
       sells5m: 0,
       top10HoldersPct: -1, // -1 denotes UNKNOWN until on-chain holder query
       devHoldingPct: -1,   // -1 denotes UNKNOWN until on-chain holder query
+      authoritiesVerified: false, // placeholders until the curve is read at execution
       isMintRevoked: true,
       isFreezeRevoked: true,
       isLpBurned: false,
@@ -563,6 +564,7 @@ export class MemecoinAggregatorService extends EventEmitter {
             devHoldingPct: -1,   // -1 denotes UNKNOWN / unindexed
             isMintRevoked: state.isMintAuthorityRevoked,
             isFreezeRevoked: state.isFreezeAuthorityRevoked,
+            authoritiesVerified: true,
             isLpBurned: false,
             rugcheckScore: evaluateTokenSafety(
               {
@@ -621,6 +623,7 @@ export class MemecoinAggregatorService extends EventEmitter {
             devHoldingPct: t.devHoldingPct ?? 0.8,
             isMintRevoked: t.isMintRevoked ?? true,
             isFreezeRevoked: t.isFreezeRevoked ?? true,
+            authoritiesVerified: t.isMintRevoked != null && t.isFreezeRevoked != null,
             isLpBurned: false,
             rugcheckScore: (t.rugcheckScore as any) || 'SAFE',
             createdAgo: t.timeAgoStr || 'Just now',

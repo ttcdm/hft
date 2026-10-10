@@ -1,3 +1,5 @@
+import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
+import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
 import React, { useState, useEffect } from 'react';
 import {
   Flame,
@@ -48,6 +50,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   onAlertTrigger,
   onRefreshParent,
 }) => {
+  const tradingMode = useTradingMode();
   const [subTab, setSubTab] = useState<'CALLOUTS' | 'LEADERBOARD' | 'RULES'>('CALLOUTS');
   const [callouts, setCallouts] = useState<PumpFunHotCallout[]>([]);
   const [leaderboard, setLeaderboard] = useState<PumpFunCaller[]>([]);
@@ -165,15 +168,19 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   };
 
   const handleSnipeCallout = async (callout: PumpFunHotCallout) => {
+    const defaultAmount = capitalTier === 'MICRO_10' ? 5.0 : 25.0;
+    // Q10b: while LIVE is armed this click sends a real transaction; say so and ask first
+    const warning = liveClickWarning(tradingMode, `Sniping $${callout.token.symbol} for $${defaultAmount.toFixed(2)}`);
+    if (warning && !window.confirm(warning)) return;
     setSnipingCalloutId(callout.id);
     hftAudio.playOrderFill();
 
-    const defaultAmount = capitalTier === 'MICRO_10' ? 5.0 : 25.0;
     const res = await engineClient.snipePumpFunCallout(
       callout.id,
       defaultAmount,
       rules.jitoPriorityTipSol,
-      6.0
+      6.0,
+      tradingMode.live
     );
 
     if (res?.status === 'OK' && res?.result?.success) {
@@ -731,12 +738,17 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
 
                         {/* Security check badges */}
                         <div className="flex items-center space-x-2 text-[10px] font-mono text-slate-400">
-                          <span className="text-emerald-400 flex items-center">
-                            <ShieldCheck className="w-3 h-3 mr-0.5" /> Mint Revoked
-                          </span>
+                          {(() => {
+                            const b = authorityBadge('Mint', c.token.isMintRevoked as boolean | null);
+                            return (
+                              <span className={`${authorityTone[b.tone]} flex items-center`}>
+                                <ShieldCheck className="w-3 h-3 mr-0.5" /> {b.text}
+                              </span>
+                            );
+                          })()}
                           <span>•</span>
                           <span className="text-slate-400">
-                            Dev: <span className="text-white font-semibold">{c.token.devHoldingPct}%</span>
+                            Dev: <span className="text-white font-semibold">{holderPct(c.token.devHoldingPct)}</span>
                           </span>
                         </div>
                       </div>
@@ -1220,7 +1232,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 <span className="text-slate-300">Pump.fun + DexScreener</span>
               </div>
               <p className="text-slate-400 text-[10px] leading-relaxed">
-                Tokens called by this profile are monitored on live DexScreener boosted queues. Snipes executed through this profile use paper trading simulation with realistic Jito MEV priority tips.
+                Tokens called by this profile are monitored on live DexScreener boosted queues. {tradingMode.live ? `LIVE is armed${tradingMode.cluster ? ` on ${tradingMode.cluster}` : ''}: a snipe from this profile sends a real transaction after you confirm it.` : tradingMode.known ? 'Mode is PAPER: a snipe from this profile is a simulated fill priced from the bonding curve.' : 'The server has not reported its mode, so this screen does not say whether a snipe is paper or live.'}
               </p>
             </div>
 

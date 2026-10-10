@@ -375,12 +375,12 @@ class EngineClient {
     return { status: 'ERROR', signals: [] };
   }
 
-  public async snipeSocialSignal(signalId: string, amountUsd: number = 5.0, jitoTipSol: number = 0.005, slippagePct: number = 8.0) {
+  public async snipeSocialSignal(signalId: string, amountUsd: number = 5.0, jitoTipSol: number = 0.005, slippagePct: number = 8.0, confirmLive = false) {
     try {
       const res = await authFetch('/api/social/signals/snipe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ signalId, amountUsd, jitoTipSol, slippagePct }),
+        body: JSON.stringify({ signalId, amountUsd, jitoTipSol, slippagePct, ...(confirmLive ? { confirmLive: true } : {}) }),
       });
       return await res.json();
     } catch (e) {
@@ -553,12 +553,12 @@ class EngineClient {
     return null;
   }
 
-  public async snipePumpFunCallout(calloutId: string, amountUsd?: number, jitoTipSol?: number, slippagePct?: number) {
+  public async snipePumpFunCallout(calloutId: string, amountUsd?: number, jitoTipSol?: number, slippagePct?: number, confirmLive = false) {
     try {
       const res = await authFetch('/api/pumpfun/callouts/snipe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ calloutId, amountUsd, jitoTipSol, slippagePct }),
+        body: JSON.stringify({ calloutId, amountUsd, jitoTipSol, slippagePct, ...(confirmLive ? { confirmLive: true } : {}) }),
       });
       return await res.json();
     } catch (e) {

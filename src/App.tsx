@@ -1,3 +1,4 @@
+import { TradingModeBanner } from './components/TradingModeBanner';
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { TradingBot, NetworkStressConfig, PerformanceKPIs, AlertEvent } from './types';
 import { hftAudio } from './utils/audio';
@@ -363,6 +364,8 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#06080D] text-slate-200 flex flex-col selection:bg-cyan-500 selection:text-white">
+      {/* Q10b / Q41: mode, cluster, rpc and the age of the server's answer, always visible */}
+      <TradingModeBanner />
       {/* 1. INSTITUTIONAL HEADER BAR - PERMANENTLY DOCKED & ALWAYS ACCESSIBLE */}
       <Header
         kpis={kpis}

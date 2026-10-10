@@ -4,6 +4,7 @@ import { authFetch } from '../services/engineClient';
 /** H1: the home page. Launches / Watching / Holding, all from GET /api/board. Unknown values render "—", never a number. */
 export interface BoardData {
   generatedAt: number;
+  watchCapacity?: { active: number; max: number; refusedFull: number; lastRefusedMint: string | null };
   executionMode: string;
   wallet: { balanceSol: number | null; reserveSol: number; rentLockedSol: number | null; spendableSol: number | null; solUsd: number | null };
   launches: Array<{
@@ -57,7 +58,10 @@ const STATE_STYLE: Record<string, string> = {
   HOT: 'bg-orange-900/50 text-orange-300', READY: 'bg-emerald-900/50 text-emerald-300', DEAD: 'bg-slate-800 text-slate-500', WATCHING: 'bg-cyan-900/40 text-cyan-300',
 };
 
-export function TokenBoardView({ board, tab, onTab, onSelect, selected }: {
+export const BOARD_STALE_MS = 10_000;
+
+export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }: {
+  ageMs?: number | null;
   board: BoardData | null; tab: 'launches' | 'watching' | 'holding'; onTab: (t: 'launches' | 'watching' | 'holding') => void;
   onSelect?: (mint: string) => void; selected?: string | null;
 }) {
@@ -68,13 +72,19 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected }: {
   ];
   return (
     <section className="col-span-12 lg:col-span-8 rounded-lg border border-slate-800 bg-[#0B0F17] overflow-hidden" data-testid="token-board">
-      <div className="flex border-b border-slate-800">
+      <div className="flex border-b border-slate-800 items-center">
         {tabs.map(([key, label, n]) => (
           <button key={key} onClick={() => onTab(key)} data-testid={`tab-${key}`}
             className={`px-4 py-2.5 text-sm font-semibold ${tab === key ? 'text-cyan-300 border-b-2 border-cyan-400' : 'text-slate-400 hover:text-slate-200'}`}>
             {label} <span className="text-xs text-slate-500">({n})</span>
           </button>
         ))}
+        {ageMs !== undefined && (
+          <span data-testid="board-age" className={`ml-auto px-3 text-[11px] font-mono ${ageMs === null || ageMs > BOARD_STALE_MS ? 'text-amber-300' : 'text-slate-500'}`}>
+            {ageMs === null ? 'no board received yet' : `updated ${Math.round(ageMs / 1000)}s ago${ageMs > BOARD_STALE_MS ? ' (STALE)' : ''}`}
+            {board?.watchCapacity && board.watchCapacity.refusedFull > 0 ? ` • watch full: ${board.watchCapacity.refusedFull} launches skipped` : ''}
+          </span>
+        )}
       </div>
       {!board && <div className="p-6 text-sm text-slate-500">Loading… (sign in as operator to read the board)</div>}
       {board && tab === 'launches' && (
@@ -138,22 +148,25 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected }: {
 export function TokenBoard({ onSelect, selected }: { onSelect?: (mint: string) => void; selected?: string | null }) {
   const [board, setBoard] = useState<BoardData | null>(null);
   const [tab, setTab] = useState<'launches' | 'watching' | 'holding'>('launches');
+  const [lastOkAt, setLastOkAt] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     let alive = true;
     const load = async () => {
       try {
         const r = await authFetch('/api/board');
-        if (r.ok && alive) setBoard(await r.json());
-      } catch { /* offline: keep the last board */ }
+        if (r.ok && alive) { setBoard(await r.json()); setLastOkAt(Date.now()); }
+      } catch { /* offline: keep the last board; its age keeps growing and shows */ }
     };
     load();
     const t = setInterval(load, 3000);
-    return () => { alive = false; clearInterval(t); };
+    const tick = setInterval(() => setNow(Date.now()), 1000);
+    return () => { alive = false; clearInterval(t); clearInterval(tick); };
   }, []);
   return (
     <>
       {board && <WalletStrip wallet={board.wallet} mode={board.executionMode} />}
-      <TokenBoardView board={board} tab={tab} onTab={setTab} onSelect={onSelect} selected={selected} />
+      <TokenBoardView board={board} tab={tab} onTab={setTab} onSelect={onSelect} selected={selected} ageMs={lastOkAt === null ? null : Math.max(0, now - lastOkAt)} />
     </>
   );
 }

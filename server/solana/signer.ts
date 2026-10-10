@@ -29,6 +29,8 @@ export class LocalKeypairSigner implements TransactionSigner {
   }
 
   private initializeSigner() {
+    // Q5: the file this signer would write to is known up front, also when the key itself came from the environment.
+    this.keypairPath = process.env.SIGNER_KEYPAIR_PATH || path.join(process.cwd(), '.apex_trading_keypair.json');
     const envPrivateKey = process.env.OPERATOR_PRIVATE_KEY || process.env.SOLANA_PRIVATE_KEY;
     if (envPrivateKey) {
       try {
@@ -96,6 +98,14 @@ export class LocalKeypairSigner implements TransactionSigner {
   // Protected against accidental overwriting of existing keypairs with funds
   public generateDedicatedTradingKeypair(forceOverwrite = false): { publicKey: string; path: string } {
     const targetPath = this.keypairPath || path.join(process.cwd(), '.apex_trading_keypair.json');
+
+    // Q5: a key that is already loaded (from OPERATOR_PRIVATE_KEY, SIGNER_KEYPAIR_PATH or the default file) is never swapped at runtime:
+    // open positions are sold with the key that bought them, and after a restart the environment key would win over a new file anyway.
+    if (this.keypair && !forceOverwrite) {
+      throw new Error(
+        `A signing key already exists in this process (${this.keypair.publicKey.toBase58().slice(0, 4)}...). It is not replaced at runtime; set up a new key with: npm run signer:import, then restart.`
+      );
+    }
 
     if (fs.existsSync(targetPath) && !forceOverwrite) {
       throw new Error(

@@ -1542,6 +1542,10 @@ app.post('/api/signer/generate', requireOperatorAuth, (req, res) => {
         error: 'Overwriting an existing keypair over HTTP is disabled. Back it up and replace it with: npm run signer:import',
       });
     }
+    // Q5: positions bought with the current key can only be sold with it
+    if (workstationDb.loadPositions('LIVE', 'ACTIVE').length > 0) {
+      return res.status(409).json({ success: false, error: 'A signing key already exists for the open LIVE positions; it is not replaced while they are open.' });
+    }
     const pubkey = localSigner.generateNewKeypair(false);
     res.json({
       success: true,

@@ -20,8 +20,8 @@ function setup(opts: { curveLamports: number; fee: number; tip: number; rent: nu
   const tipAcct = Keypair.generate().publicKey;
   const keys = [wallet, ata, curve, tipAcct];
   const delta = opts.curveLamports + opts.fee + opts.tip + opts.rent;
-  const pre = [5 * SOL, 0, 10 * SOL, 0];
-  const post = [5 * SOL - delta, opts.rent, 10 * SOL + opts.curveLamports, opts.tip];
+  const pre = [5 * SOL, 0, 10 * SOL, 1 * SOL]; // a tip account already exists on chain
+  const post = [5 * SOL - delta, opts.rent, 10 * SOL + opts.curveLamports, 1 * SOL + opts.tip];
   const connection = {
     getTransaction: async () => ({
       slot: 123,

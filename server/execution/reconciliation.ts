@@ -27,6 +27,8 @@ export interface BuyReconciliationResult {
   curveSpendLamports?: number;
   /** Lamports locked in token accounts this tx created (the buyer's ATA). */
   tokenAccountRentLamports?: number;
+  /** Rent for other accounts the buyer funded in the same tx (e.g. a pump per-user account on a first buy). */
+  otherNewAccountRentLamports?: number;
   slot: number;
   error?: string;
 }
@@ -253,7 +255,19 @@ export class TradeReconciler {
           break;
         }
       }
-      const nonCurveLamports = actualNetworkFeeLamports + expectedJitoTipLamports + tokenAccountRentLamports;
+      // F1: the pump program can also make the buyer fund other new accounts in the same tx (on devnet, a pump-owned per-user
+      // account of 1,346,200 lamports on the first buy). That rent is not curve spend either. Any account other than the
+      // wallet and its token account that had no lamports before and has some after was created (and funded) by this tx.
+      let otherNewAccountRentLamports = 0;
+      for (let i = 0; i < accountKeys.length; i++) {
+        const key = accountKeys.get(i)?.toBase58();
+        if (!key || key === walletStr || key === ataKey) continue;
+        const pre = tx.meta.preBalances[i] ?? 0;
+        const post = tx.meta.postBalances[i] ?? 0;
+        if (pre === 0 && post > 0) otherNewAccountRentLamports += post;
+      }
+      const nonCurveLamports =
+        actualNetworkFeeLamports + expectedJitoTipLamports + tokenAccountRentLamports + otherNewAccountRentLamports;
       let curveSpendLamports = actualSolSpentLamports - nonCurveLamports;
       if (!(curveSpendLamports > 0)) curveSpendLamports = actualSolSpentLamports; // cannot split: fall back to the whole delta
       const effectiveFillPriceSol = (curveSpendLamports / 1e9) / tokensReceivedHuman;
@@ -274,6 +288,7 @@ export class TradeReconciler {
         allInFillPriceSol,
         curveSpendLamports,
         tokenAccountRentLamports,
+        otherNewAccountRentLamports,
         slot,
       };
     } catch (err: any) {

@@ -158,15 +158,14 @@ describe('G3: decision journal and kill switch on the real controller', () => {
     }
   });
 
-  it('a bought candidate is journaled with the SOL it moved, and a close journals the exit', async () => {
+  it('a bought candidate is journaled, and a close journals the exit; a PAPER trade moves no wallet SOL so it journals no delta (Q8)', async () => {
     await setAutoMode('PAPER');
     const { mint } = newPumpPool();
     const d = await autoSnipeController.submitCandidate({ mint, symbol: 'G3', source: 'TEST', amountUsd: 0.7, provenance: 'REAL_ONCHAIN' });
     expect(d.outcome, d.reason).toBe('BOUGHT');
     const buy = workstationDb.loadDecisions({ mint }).find((r) => r.outcome === 'BOUGHT')!;
     expect(buy.stage).toBe('fill');
-    expect(buy.solDelta).toBeLessThan(0);
-    expect(buy.solDelta).toBeCloseTo(-(d.amountSol! + 0), 3); // amount plus a fee of at most a few thousand lamports
+    expect(buy.solDelta ?? null).toBeNull(); // Q8: the wallet audit sums solDelta against the real balance; a PAPER fill never touched it
     expect(buy.positionId).toBe(d.positionId);
 
     const r = await executionCoordinator.closePosition(d.positionId!, 100, 'MANUAL');
@@ -174,7 +173,7 @@ describe('G3: decision journal and kill switch on the real controller', () => {
     const exit = workstationDb.loadDecisions({ mint, stage: 'exit' });
     expect(exit).toHaveLength(1);
     expect(exit[0].positionId).toBe(d.positionId);
-    expect(exit[0].solDelta).toBeGreaterThan(0);
+    expect(exit[0].solDelta ?? null).toBeNull();
   });
 
   it('readiness red for over 10s drops to SHADOW; a brief blip does not', async () => {

@@ -98,6 +98,8 @@ export class ExecutionCoordinator {
   private executionMode: ExecutionMode = 'PAPER';
   private isLiveTradingArmed: boolean = false;
   private inFlightReservedSol: number = 0;
+  /** Q8: exits between the first line of closePosition and the journal row that records their fill. */
+  private exitsInFlight = 0;
   private inFlightPositionExits: Set<string> = new Set<string>();
   private inFlightBuyMints: Set<string> = new Set<string>();
   private connection: Connection;
@@ -2624,6 +2626,11 @@ export class ExecutionCoordinator {
     this.clearOperatorAlert('TRADING_HALTED');
   }
 
+  /** Q8: true while a LIVE buy is being sent/reconciled or an exit is between its send and its journal row. */
+  public hasTradeInFlight(): boolean {
+    return this.inFlightReservedSol > 0 || this.exitsInFlight > 0;
+  }
+
   public getHaltReason(): string | null {
     return this.haltReason;
   }
@@ -2692,24 +2699,31 @@ export class ExecutionCoordinator {
       return { success: false, pnlSol: 0, error: `TRADING_HALTED: ${this.haltReason}` };
     }
     const before = workstationDb.loadPositions().find((p) => p.id === positionId);
-    const res = await this.closePositionImpl(positionId, sellPct, reason);
-    this.recordExitOutcome(positionId, res, before?.executionMode);
-    if (res.success && before) {
-      const fraction = Math.min(100, Math.max(1, sellPct)) / 100;
-      workstationDb.logDecision({
-        autoMode: 'n/a',
-        mint: before.mint,
-        symbol: before.symbol,
-        source: 'EXIT_ENGINE',
-        stage: 'exit',
-        outcome: 'EXITED',
-        reason,
-        inputs: { sellPct, mode: before.executionMode, pnlSol: res.pnlSol },
-        positionId,
-        solDelta: (before.costBasisLamports / 1e9) * fraction + res.pnlSol,
-      });
+    // Q8: an exit is "in flight" until its fill is journaled, so the wallet audit does not look at the balance in between.
+    this.exitsInFlight++;
+    try {
+      const res = await this.closePositionImpl(positionId, sellPct, reason);
+      this.recordExitOutcome(positionId, res, before?.executionMode);
+      if (res.success && before) {
+        const fraction = Math.min(100, Math.max(1, sellPct)) / 100;
+        workstationDb.logDecision({
+          autoMode: 'n/a',
+          mint: before.mint,
+          symbol: before.symbol,
+          source: 'EXIT_ENGINE',
+          stage: 'exit',
+          outcome: 'EXITED',
+          reason,
+          inputs: { sellPct, mode: before.executionMode, pnlSol: res.pnlSol },
+          positionId,
+          // Q8: only a LIVE exit moves the wallet; a PAPER exit journaled a delta the balance never showed, which the wallet audit read as a drain
+          solDelta: before.executionMode === 'LIVE' ? (before.costBasisLamports / 1e9) * fraction + res.pnlSol : undefined,
+        });
+      }
+      return res;
+    } finally {
+      this.exitsInFlight--;
     }
-    return res;
   }
 
   private async closePositionImpl(

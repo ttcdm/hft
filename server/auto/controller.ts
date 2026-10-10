@@ -136,7 +136,8 @@ export class AutoSnipeController extends EventEmitter {
     const d: AutoDecision = { ts: Date.now(), mode: this.mode, mint: c.mint, symbol: c.symbol, source: c.source, outcome, stage, reason, ...pub };
     this.decisions.push(d);
     if (this.decisions.length > MAX_DECISIONS) this.decisions.shift();
-    const solDelta = outcome === 'BOUGHT' && extra.amountSol !== undefined ? -(extra.amountSol + (extra.feesSol ?? 0)) : undefined;
+    // Q8: only DEVNET_LIVE fills move the wallet; a PAPER fill's delta must not enter the wallet audit
+    const solDelta = outcome === 'BOUGHT' && d.mode === 'DEVNET_LIVE' && extra.amountSol !== undefined ? -(extra.amountSol + (extra.feesSol ?? 0)) : undefined;
     workstationDb.logDecision({
       ts: d.ts,
       autoMode: d.mode,
@@ -328,7 +329,11 @@ export class AutoSnipeController extends EventEmitter {
       this.walletMark = null;
       return null;
     }
+    // Q8: while a buy or an exit is between its send and its journal row, the balance has moved and the journal has not. Looking now
+    // would read the fill as a drain. Skip, and keep the old mark so the next look spans the whole trade and its row.
+    if (this.busy || executionCoordinator.hasTradeInFlight()) return null;
     await executionCoordinator.syncRealWalletBalance();
+    if (this.busy || executionCoordinator.hasTradeInFlight()) return null; // a trade started during the balance read
     const bal = executionCoordinator.getRealWalletBalanceSol();
     if (bal === null || bal === undefined) return null;
     const prev = this.walletMark;

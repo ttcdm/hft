@@ -39,6 +39,25 @@ export const SESSION_BUDGETS = {
   maxDurationMs: 4 * 60 * 60 * 1000,
 } as const;
 
+/**
+ * Q28: the 0.02 SOL / 5 buy limits above are a REAL-SOL cap for DEVNET_LIVE. Applied to PAPER (orders of ~0.007 SOL on the 0.07 SOL
+ * paper bankroll) they ended every PAPER session after 2 or 3 buys, far too few to say anything about expectancy. A paper session
+ * may turn its bankroll over: spend up to 10x the starting bankroll and 50 buys. Loss and time limits are the same.
+ */
+export const PAPER_SESSION_BUDGETS = {
+  maxBuys: 50,
+  maxSpendBankrollMultiple: 10,
+  maxLossFraction: 0.15,
+  maxDurationMs: 4 * 60 * 60 * 1000,
+} as const;
+
+export interface SessionBudgets {
+  maxBuys: number;
+  maxSpendSol: number;
+  maxLossFraction: number;
+  maxDurationMs: number;
+}
+
 export interface AutoCandidate {
   mint: string;
   symbol?: string;
@@ -73,6 +92,8 @@ export interface AutoSession {
   buys: number;
   spentSol: number;
   positionIds: string[];
+  /** The limits this session runs under, fixed when it starts (PAPER and DEVNET_LIVE differ). */
+  budgets: SessionBudgets;
 }
 
 export interface AutoStatus {
@@ -85,7 +106,7 @@ export interface AutoStatus {
   haltReason: string | null;
   slippageBreaches: number;
   session: (AutoSession & { sessionPnlSol: number; budgetsLeft: { buys: number; spendSol: number; lossSol: number; msLeft: number } }) | null;
-  budgets: typeof SESSION_BUDGETS;
+  budgets: SessionBudgets;
 }
 
 const MAX_DECISIONS = 500;
@@ -177,17 +198,17 @@ export class AutoSnipeController extends EventEmitter {
         ...this.session,
         sessionPnlSol: pnl,
         budgetsLeft: {
-          buys: Math.max(0, SESSION_BUDGETS.maxBuys - this.session.buys),
-          spendSol: Math.max(0, SESSION_BUDGETS.maxSpendSol - this.session.spentSol),
-          lossSol: Math.max(0, SESSION_BUDGETS.maxLossFraction * this.session.startingBankrollSol + pnl),
-          msLeft: Math.max(0, SESSION_BUDGETS.maxDurationMs - (Date.now() - this.session.startedAt)),
+          buys: Math.max(0, this.session.budgets.maxBuys - this.session.buys),
+          spendSol: Math.max(0, this.session.budgets.maxSpendSol - this.session.spentSol),
+          lossSol: Math.max(0, this.session.budgets.maxLossFraction * this.session.startingBankrollSol + pnl),
+          msLeft: Math.max(0, this.session.budgets.maxDurationMs - (Date.now() - this.session.startedAt)),
         },
       };
     }
     return {
       mode: this.mode, killed: this.killed, killReason: this.killReason, downgradeReason: this.downgradeReason,
       triggers: [...this.triggers], haltReason: executionCoordinator.getHaltReason(), slippageBreaches: this.slippageBreaches,
-      session, budgets: SESSION_BUDGETS,
+      session, budgets: session?.budgets ?? SESSION_BUDGETS,
     };
   }
 
@@ -195,12 +216,13 @@ export class AutoSnipeController extends EventEmitter {
   private enforceBudgets(): string | null {
     if (!this.session || (this.mode !== 'PAPER' && this.mode !== 'DEVNET_LIVE')) return null;
     const s = this.session;
+    const b = s.budgets;
     let reason: string | null = null;
-    if (s.buys >= SESSION_BUDGETS.maxBuys) reason = `max buys per session (${SESSION_BUDGETS.maxBuys}) used`;
-    else if (s.spentSol >= SESSION_BUDGETS.maxSpendSol) reason = `max spend per session (${SESSION_BUDGETS.maxSpendSol} SOL incl. fees) used`;
-    else if (Date.now() - s.startedAt >= SESSION_BUDGETS.maxDurationMs) reason = 'session time limit (4h) reached';
-    else if (this.sessionPnlSol() <= -SESSION_BUDGETS.maxLossFraction * s.startingBankrollSol) {
-      reason = `session loss reached ${SESSION_BUDGETS.maxLossFraction * 100}% of the starting bankroll`;
+    if (s.buys >= b.maxBuys) reason = `max buys per session (${b.maxBuys}) used`;
+    else if (s.spentSol >= b.maxSpendSol) reason = `max spend per session (${Number(b.maxSpendSol.toFixed(4))} SOL incl. fees) used`;
+    else if (Date.now() - s.startedAt >= b.maxDurationMs) reason = 'session time limit (4h) reached';
+    else if (this.sessionPnlSol() <= -b.maxLossFraction * s.startingBankrollSol) {
+      reason = `session loss reached ${b.maxLossFraction * 100}% of the starting bankroll`;
     }
     if (reason) {
       this.mode = 'SHADOW';
@@ -252,7 +274,10 @@ export class AutoSnipeController extends EventEmitter {
     this.mode = next;
     if (next === 'PAPER' || next === 'DEVNET_LIVE') {
       const bankroll = executionCoordinator.getRealWalletBalanceSol() ?? executionConfig.getConfig().paperBankrollSol;
-      this.session = { startedAt: Date.now(), startingBankrollSol: bankroll, buys: 0, spentSol: 0, positionIds: [] };
+      const budgets: SessionBudgets = next === 'PAPER'
+        ? { maxBuys: PAPER_SESSION_BUDGETS.maxBuys, maxSpendSol: PAPER_SESSION_BUDGETS.maxSpendBankrollMultiple * bankroll, maxLossFraction: PAPER_SESSION_BUDGETS.maxLossFraction, maxDurationMs: PAPER_SESSION_BUDGETS.maxDurationMs }
+        : { ...SESSION_BUDGETS };
+      this.session = { startedAt: Date.now(), startingBankrollSol: bankroll, buys: 0, spentSol: 0, positionIds: [], budgets };
     } else {
       this.session = null;
     }
@@ -468,8 +493,8 @@ export class AutoSnipeController extends EventEmitter {
     // DEVNET_LIVE only: the cap is a real-SOL cap (0.02), a paper $5 order (~0.033 SOL) would never fit it.
     if (this.session && mode === 'DEVNET_LIVE') {
       const plannedSol = AUTO_DEVNET_ORDER_SOL;
-      if (this.session.spentSol + plannedSol > SESSION_BUDGETS.maxSpendSol) {
-        return this.record(c, 'REJECTED', 'budget', `would exceed the session spend limit (${this.session.spentSol.toFixed(4)} + ${plannedSol.toFixed(4)} > ${SESSION_BUDGETS.maxSpendSol} SOL)`);
+      if (this.session.spentSol + plannedSol > this.session.budgets.maxSpendSol) {
+        return this.record(c, 'REJECTED', 'budget', `would exceed the session spend limit (${this.session.spentSol.toFixed(4)} + ${plannedSol.toFixed(4)} > ${this.session.budgets.maxSpendSol} SOL)`);
       }
     }
 

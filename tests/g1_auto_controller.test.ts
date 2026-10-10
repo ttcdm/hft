@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import fs from 'fs';
 import { Keypair } from '@solana/web3.js';
-import { AutoSnipeController, autoSnipeController, SESSION_BUDGETS, DEVNET_CONFIRMATION_CODE, AUTO_DEVNET_ORDER_SOL } from '../server/auto/controller';
+import { AutoSnipeController, autoSnipeController, SESSION_BUDGETS, PAPER_SESSION_BUDGETS, DEVNET_CONFIRMATION_CODE, AUTO_DEVNET_ORDER_SOL } from '../server/auto/controller';
 import { memecoinAggregator } from '../server/memecoinAggregator';
 import { executionCoordinator } from '../server/execution/coordinator';
 import { paperEngine } from '../server/execution/paperEngine';
@@ -103,7 +103,7 @@ describe('G1: auto-snipe controller', () => {
     expect(s.session!.buys).toBe(1);
     expect(s.session!.spentSol).toBeGreaterThan(0);
     expect(s.session!.positionIds).toContain(d.positionId);
-    expect(s.session!.budgetsLeft.buys).toBe(SESSION_BUDGETS.maxBuys - 1);
+    expect(s.session!.budgetsLeft.buys).toBe(PAPER_SESSION_BUDGETS.maxBuys - 1);
   });
 
   it('PAPER mode refuses to start unless the coordinator is PAPER; any mode refuses without AUTO_SNIPE_ENABLED', async () => {
@@ -119,17 +119,17 @@ describe('G1: auto-snipe controller', () => {
     const stub = (id: string, amountSol: number) =>
       vi.spyOn(memecoinAggregator, 'executeSnipe').mockResolvedValue({ success: true, message: 'ok', txHash: 't', amountSol, positionId: id, feesPaidLamports: 0 });
 
-    // spend
+    // spend (Q28: PAPER may spend 10x its starting bankroll; DEVNET_LIVE keeps the real-SOL 0.02 cap, covered by the R6 test)
     await setAutoMode('PAPER');
-    stub('p1', 0.02);
+    stub('p1', PAPER_SESSION_BUDGETS.maxSpendBankrollMultiple * autoSnipeController.getStatus().session!.startingBankrollSol + 0.001);
     await autoSnipeController.submitCandidate(cand(newPool()));
     expect(autoSnipeController.getMode()).toBe('SHADOW');
     expect(autoSnipeController.getStatus().downgradeReason).toMatch(/max spend/);
 
-    // buys: five small ones
+    // buys: the PAPER limit of small ones
     await setAutoMode('PAPER');
     stub('p2', 0.001);
-    for (let i = 0; i < SESSION_BUDGETS.maxBuys; i++) await autoSnipeController.submitCandidate(cand(newPool()));
+    for (let i = 0; i < PAPER_SESSION_BUDGETS.maxBuys; i++) await autoSnipeController.submitCandidate(cand(newPool()));
     expect(autoSnipeController.getMode()).toBe('SHADOW');
     expect(autoSnipeController.getStatus().downgradeReason).toMatch(/max buys/);
 
@@ -150,7 +150,7 @@ describe('G1: auto-snipe controller', () => {
 
   it('after a downgrade the next candidate is a shadow run, never a buy', async () => {
     await setAutoMode('PAPER');
-    vi.spyOn(memecoinAggregator, 'executeSnipe').mockResolvedValueOnce({ success: true, message: 'ok', txHash: 't', amountSol: 0.02, positionId: 'x', feesPaidLamports: 0 });
+    vi.spyOn(memecoinAggregator, 'executeSnipe').mockResolvedValueOnce({ success: true, message: 'ok', txHash: 't', amountSol: 10 * autoSnipeController.getStatus().session!.startingBankrollSol + 0.001, positionId: 'x', feesPaidLamports: 0 });
     await autoSnipeController.submitCandidate(cand(newPool()));
     expect(autoSnipeController.getMode()).toBe('SHADOW');
     const exec = vi.spyOn(executionCoordinator, 'executeTrade');

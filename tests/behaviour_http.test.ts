@@ -208,6 +208,12 @@ describe('arming policy and readiness, through the real API', () => {
         await app.call('POST', '/api/social/signals/snipe', { signalId: 'x' }),
       ];
       for (const r of unconfirmed) { expect(r.status).toBe(409); expect(JSON.stringify(r.json)).toMatch(/LIVE_CONFIRMATION_REQUIRED/); }
+      // S21: the guard is the only thing that differs: with confirmLive: true the same two routes get past it (they then fail on the unknown id, not with 409)
+      for (const [route, body] of [['/api/social/signals/snipe', { signalId: 'x' }], ['/api/pumpfun/callouts/snipe', { calloutId: 'x' }]] as const) {
+        const r = await app.call('POST', route, { ...body, confirmLive: true });
+        expect(r.status, route).not.toBe(409);
+        expect(JSON.stringify(r.json), route).not.toMatch(/LIVE_CONFIRMATION_REQUIRED/);
+      }
       // the telegram guard covers the prefix the parser accepts, not just "/snipe " and "/buy "
       for (const text of ['/snipe ' + mintB, '/buy ' + mintB, '/snipe_x ' + mintB, '/buyer ' + mintB, '  /snipe ' + mintB]) {
         const t = await app.call('POST', '/api/telegram/webhook', { text });

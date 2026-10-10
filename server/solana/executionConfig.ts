@@ -1,6 +1,6 @@
 import { PublicKey } from '@solana/web3.js';
 import { getRandomJitoTipAccount } from './programs';
-import { resolveJitoUrl } from './clusterGuard';
+import { allowedCluster, resolveJitoUrl } from './clusterGuard';
 
 export interface AuthoritativeExecutionConfig {
   jitoBlockEngineUrl: string;
@@ -45,6 +45,28 @@ export const ECONOMIC_TIP_CAP_FRACTION = 0.15;
 export const MAX_TOP10_HOLDERS_PCT = 20;
 /** Max share of TOTAL supply the creator may hold (C1b). Same caveat as MAX_TOP10_HOLDERS_PCT. */
 export const MAX_CREATOR_HOLDING_PCT = 5;
+
+/** Minimum pool liquidity (USD) for the eligibility gate on mainnet and by default. */
+export const DEFAULT_MIN_LIQUIDITY_USD = 2000;
+
+/**
+ * D1: devnet and localnet pump curves hold a few cents to a few dollars of real SOL, so the mainnet minimum makes every
+ * test token ineligible. `MIN_LIQUIDITY_USD` may lower (or raise) it only off mainnet; on mainnet-beta it is ignored.
+ */
+export function minLiquidityUsd(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.MIN_LIQUIDITY_USD;
+  if (raw === undefined || raw === '') return DEFAULT_MIN_LIQUIDITY_USD;
+  const value = Number(raw);
+  if (allowedCluster(env) === 'mainnet-beta') {
+    console.warn(`MIN_LIQUIDITY_USD=${raw} ignored on mainnet-beta; using ${DEFAULT_MIN_LIQUIDITY_USD}`);
+    return DEFAULT_MIN_LIQUIDITY_USD;
+  }
+  if (!Number.isFinite(value) || value < 0) {
+    console.warn(`MIN_LIQUIDITY_USD=${raw} is not a non-negative number; using ${DEFAULT_MIN_LIQUIDITY_USD}`);
+    return DEFAULT_MIN_LIQUIDITY_USD;
+  }
+  return value;
+}
 
 export function calculateDynamicJitoTip(tradeNotionalSol: number): number {
   if (!Number.isFinite(tradeNotionalSol) || tradeNotionalSol <= 0) {

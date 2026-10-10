@@ -1,4 +1,4 @@
-import { MAX_TOP10_HOLDERS_PCT, MAX_CREATOR_HOLDING_PCT } from '../solana/executionConfig';
+import { MAX_TOP10_HOLDERS_PCT, MAX_CREATOR_HOLDING_PCT, minLiquidityUsd } from '../solana/executionConfig';
 import { TokenEligibilityReport, EligibilityCheckResult, TriState, ExecutionMode } from '../core/types';
 
 export type AuthorityStatus = 'ACTIVE' | 'REVOKED' | 'UNKNOWN';
@@ -192,7 +192,7 @@ export class EligibilityFilter {
     }
 
     // 6. Minimum Liquidity Depth
-    const MIN_LIQUIDITY_USD = 2000;
+    const MIN_LIQUIDITY_USD = minLiquidityUsd();
     // C5: a missing liquidity figure is UNKNOWN (LIVE rejects it, PAPER lets it through and records it), not "$NaN < min".
     const hasLiq = typeof token.liquidityUsd === 'number' && Number.isFinite(token.liquidityUsd);
     const liqStatus: TriState = !hasLiq ? 'UNKNOWN' : token.liquidityUsd >= MIN_LIQUIDITY_USD ? 'PASS' : 'FAIL';

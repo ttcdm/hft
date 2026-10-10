@@ -785,7 +785,7 @@ export class MemecoinAggregatorService extends EventEmitter {
       amountSol,
       positionId: execRes.positionId,
       feesPaidLamports: execRes.feesPaidLamports,
-      quotePriceSol: pool.priceNative,
+      quotePriceSol: execRes.quotePriceSol ?? pool.priceNative,
       fillPriceSol: execRes.fillPriceSol,
       slippageBps,
       gates: execRes.gates,

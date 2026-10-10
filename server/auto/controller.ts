@@ -560,7 +560,8 @@ export class AutoSnipeController extends EventEmitter {
         if (res.positionId) startSession.positionIds.push(res.positionId);
       }
       const feesSol = (res.feesPaidLamports ?? 0) / 1e9;
-      const unverified = ((res.gates as any)?.eligibility?.unverified?.length ?? 0) > 0;
+      // Q7: a PAPER fill priced by the flat model (the curve could not be read) is not evidence of what a real fill would cost
+      const unverified = ((res.gates as any)?.eligibility?.unverified?.length ?? 0) > 0 || (res.gates as any)?.pricing === 'MODEL';
       if (res.quotePriceSol && res.fillPriceSol && res.slippageBps !== undefined) {
         const slipBps = (res.fillPriceSol / res.quotePriceSol - 1) * 10_000;
         if (slipBps > res.slippageBps + 1) this.slippageBreaches += 1;

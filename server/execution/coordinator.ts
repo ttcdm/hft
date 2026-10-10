@@ -38,7 +38,7 @@ import { getRandomJitoTipAccount, TOKEN_2022_PROGRAM_ID } from '../solana/progra
 import { executionConfig } from '../solana/executionConfig';
 import { Logger } from '../middleware/enterprise';
 import { allowedCluster, assertClusterAllowed, resolveRpcUrl } from '../solana/clusterGuard';
-import { PumpCurveService, TradeQuote, fetchTokenHolderDistribution } from '../solana/pumpCurve';
+import { PumpCurveService, TradeQuote, PumpMarketState, fetchTokenHolderDistribution } from '../solana/pumpCurve';
 import { TradeReconciler, RealMarkPriceService, PreTradeSnapshot } from './reconciliation';
 export type { PreTradeSnapshot };
 import { CapitalSizer } from '../capital/capitalSizer';
@@ -73,6 +73,8 @@ export interface ExecutionResponse {
   txSignature?: string;
   bundleId?: string;
   fillPriceSol?: number;
+  /** Q7: the price the order was quoted at (curve execution price, fees included), so a caller measures slippage against the quote and not a stale pool price. */
+  quotePriceSol?: number;
   tokensReceived?: number;
   executionMode: ExecutionMode;
   feesPaidLamports?: number;
@@ -1737,27 +1739,19 @@ export class ExecutionCoordinator {
     totalExposureSol: number
   ): Promise<
     | { rejection: ExecutionResponse }
-    | { quotePriceSol: number; paperEligibility: { gates: Record<string, unknown> }; paperTip: ReturnType<typeof executionConfig.resolveDynamicJitoTip>; maxPaperOrderSol: number }
+    | { quotePriceSol: number; paperEligibility: { gates: Record<string, unknown> }; paperTip: ReturnType<typeof executionConfig.resolveDynamicJitoTip>; maxPaperOrderSol: number; curveState: PumpMarketState | null }
   > {
     let quotePriceSol = req.currentPriceSol;
-
-    // If price not provided, attempt querying real on-chain bonding curve
-    if (!quotePriceSol || quotePriceSol <= 0) {
-      try {
-        const mintPubkey = new PublicKey(req.mint);
-        const state = await PumpCurveService.fetchPumpMarketState({
-          connection: this.connection,
-          mint: mintPubkey,
-          executionMode: 'PAPER',
-        });
-        if (state && !state.complete) {
-          quotePriceSol =
-            Number(state.virtualSolReserves) /
-            Number(state.virtualTokenReserves) /
-            (1e9 / Math.pow(10, state.tokenDecimals));
-        }
-      } catch {}
-    }
+    // Q7: read the real curve for every paper order. Its price replaces the caller's (a WS pool's came from the create event), and the
+    // fill is quoted from its reserves and fee settings. null when the curve cannot be read (offline, migrated): the fill is then the MODEL.
+    let curveState: PumpMarketState | null = null;
+    try {
+      const state = await PumpCurveService.fetchPumpMarketState({ connection: this.connection, mint: new PublicKey(req.mint), executionMode: 'PAPER' });
+      if (state && !state.complete) {
+        curveState = state;
+        quotePriceSol = Number(state.virtualSolReserves) / Number(state.virtualTokenReserves) / (1e9 / Math.pow(10, state.tokenDecimals));
+      }
+    } catch {}
 
     if (!quotePriceSol || quotePriceSol <= 0) {
       return { rejection: {
@@ -1832,7 +1826,7 @@ export class ExecutionCoordinator {
         correlationId,
       } };
     }
-    return { quotePriceSol, paperEligibility, paperTip, maxPaperOrderSol };
+    return { quotePriceSol, paperEligibility, paperTip, maxPaperOrderSol, curveState };
   }
 
 
@@ -1988,7 +1982,18 @@ export class ExecutionCoordinator {
     if (this.executionMode === 'PAPER') {
       const evaluated = await this.evaluatePaperBuy(req, correlationId, now, openPositions, totalExposureSol);
       if ('rejection' in evaluated) return evaluated.rejection;
-      const { quotePriceSol, paperEligibility, paperTip, maxPaperOrderSol } = evaluated;
+      const { quotePriceSol, paperEligibility, paperTip, maxPaperOrderSol, curveState } = evaluated;
+
+      // Q7: quote the fill from the curve that was just read. A quote that cannot be made (curve nearly complete, order larger than the
+      // curve holds) is a refusal, not a reason to fall back to the flat model.
+      let curveQuote: ReturnType<typeof PumpCurveService.calculateBuyQuote> | undefined;
+      if (curveState) {
+        try {
+          curveQuote = PumpCurveService.calculateBuyQuote({ state: curveState, amountSol: req.amountSol, slippageBps: req.slippageBps || 800, jitoTipSol: paperTip.tipSol, executionMode: 'PAPER' });
+        } catch (e: any) {
+          return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'PAPER', error: `PAPER_QUOTE_FAILED: ${e.message}`, correlationId };
+        }
+      }
 
       const paperRes = paperEngine.executePaperBuy({
         mint: req.mint,
@@ -1999,6 +2004,8 @@ export class ExecutionCoordinator {
         slippageBps: req.slippageBps || 800,
         jitoTipSol: paperTip.tipSol,
         liquidityUsd: req.liquidityUsd,
+        curveQuote,
+        tokenDecimals: curveState?.tokenDecimals,
       });
 
       if (!paperRes.success) {
@@ -2017,6 +2024,7 @@ export class ExecutionCoordinator {
         ...paperEligibility.gates,
         capitalCeiling: { maxOrderSol: maxPaperOrderSol, orderSol: req.amountSol, passed: true },
         risk: { approved: true, tipLamports: paperTip.tipLamports, tipPolicy: paperTip.policyReason },
+        pricing: paperRes.pricing,
       };
       workstationDb.logJournal('PAPER_FILL_GATES', correlationId, 'PAPER', { mint: req.mint, orderId: paperRes.paperOrderId, gates });
 
@@ -2027,6 +2035,7 @@ export class ExecutionCoordinator {
         positionId: paperRes.paperOrderId,
         txSignature: paperRes.paperOrderId,
         fillPriceSol: paperRes.fillPriceSol,
+        quotePriceSol: curveQuote?.executionPriceSol,
         tokensReceived: paperRes.tokensReceived,
         executionMode: 'PAPER',
         feesPaidLamports: paperRes.networkFeeLamports + paperRes.jitoTipLamports,
@@ -2583,6 +2592,7 @@ export class ExecutionCoordinator {
         txSignature: subRes.signature,
         bundleId: subRes.bundleId,
         fillPriceSol: reconciliation.effectiveFillPriceSol,
+        quotePriceSol: quote.executionPriceSol,
         tokensReceived: reconciliation.tokensReceivedHuman,
         executionMode: 'LIVE',
         feesPaidLamports: reconciliation.actualNetworkFeeLamports + quote.expectedJitoTipLamports,
@@ -2784,7 +2794,18 @@ export class ExecutionCoordinator {
       // PAPER Sell Branch
       if (target.executionMode === 'PAPER') {
         await new Promise((r) => setTimeout(r, 10));
-        const res = paperEngine.executePaperSell(target.id, target.currentPriceSol, safeSellPct, reason);
+        // Q7: sell against the curve as it is now. Unreadable or migrated curve: the flat model, which the journal row says.
+        let sellQuote: ReturnType<typeof PumpCurveService.calculateSellQuote> | undefined;
+        try {
+          const state = await PumpCurveService.fetchPumpMarketState({ connection: this.connection, mint: new PublicKey(target.mint), executionMode: 'PAPER' });
+          if (state && !state.complete) {
+            const sold = (BigInt(target.tokenQuantityRaw) * BigInt(safeSellPct)) / 100n;
+            if (sold > 0n) sellQuote = PumpCurveService.calculateSellQuote({ state, tokenAmountRaw: sold, executionMode: 'PAPER' });
+          }
+        } catch {}
+        const res = paperEngine.executePaperSell(target.id, target.currentPriceSol, safeSellPct, reason, sellQuote && {
+          netSolOutLamports: sellQuote.expectedSolAmountLamports, executionPriceSol: sellQuote.executionPriceSol, spotPriceSol: sellQuote.spotPriceSol,
+        });
         return {
           success: res.success,
           pnlSol: res.realizedPnLSol,

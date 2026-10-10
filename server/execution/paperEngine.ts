@@ -15,7 +15,33 @@ export interface PaperOrderRequest {
   jitoTipSol: number;
   liquidityUsd?: number;
   solPriceUsd?: number;
+  /**
+   * Q7: a buy quote from the real bonding-curve state (PumpCurveService.calculateBuyQuote, mode PAPER). With it the fill is the curve's
+   * own: tokens out and fees from the curve maths, price impact from the reserves. Without it the fill is a MODEL (caller's price, a flat
+   * impact and a flat 1% fee) and says so.
+   */
+  curveQuote?: CurveBuyQuote;
 }
+
+export interface CurveBuyQuote {
+  tokenAmountRaw: string;
+  /** SOL per token actually paid, fees included. */
+  executionPriceSol: number;
+  /** Curve spot price before the order. */
+  spotPriceSol: number;
+  protocolFeeLamports: number;
+  creatorFeeLamports: number;
+  estimatedPriceImpactBps: number;
+}
+
+export interface CurveSellQuote {
+  /** SOL received after the protocol and creator fees. */
+  netSolOutLamports: number;
+  executionPriceSol: number;
+  spotPriceSol: number;
+}
+
+export type PaperPricing = 'CURVE_QUOTE' | 'MODEL';
 
 export interface PaperExecutionResult {
   success: boolean;
@@ -28,6 +54,8 @@ export interface PaperExecutionResult {
   simulatedLatencyMs: number;
   effectiveSlippageBps: number;
   error?: string;
+  /** Q7: whether the fill came from the real curve or from the flat model. */
+  pricing?: PaperPricing;
 }
 
 export class PaperExecutionEngine {
@@ -60,19 +88,26 @@ export class PaperExecutionEngine {
       };
     }
 
-    // Realistic slippage model based on order size vs pool liquidity
-    const impactBps = Math.min(
-      req.slippageBps,
-      PaperExecutionEngine.estimateImpactBps(req.amountSol, req.liquidityUsd, req.solPriceUsd)
-    );
-
-    // Fill price derived honestly from market price + calculated impact
-    const fillPriceSol = req.currentPriceSol * (1 + impactBps / 10000);
-    // Pump.fun charges the 1% protocol fee on the SOL spent; only the remainder buys tokens.
-    const protocolFeeSol = req.amountSol * 0.01;
-    const tokensReceived = (req.amountSol - protocolFeeSol) / fillPriceSol;
+    const q = req.curveQuote;
+    let impactBps: number;
+    let fillPriceSol: number;
+    let tokensReceived: number;
     const tokenDecimals = req.tokenDecimals || 6;
-    const tokenQtyRaw = BigInt(Math.floor(tokensReceived * Math.pow(10, tokenDecimals))).toString();
+    let tokenQtyRaw: string;
+    if (q) {
+      // Q7: the curve's own numbers. The fee is inside the SOL spent (the curve is entered with amount / (1 + fee)).
+      impactBps = q.estimatedPriceImpactBps;
+      fillPriceSol = q.executionPriceSol;
+      tokenQtyRaw = q.tokenAmountRaw;
+      tokensReceived = Number(BigInt(q.tokenAmountRaw)) / Math.pow(10, tokenDecimals);
+    } else {
+      // MODEL: size against pool liquidity, and the flat 1% protocol fee on the SOL spent
+      impactBps = Math.min(req.slippageBps, PaperExecutionEngine.estimateImpactBps(req.amountSol, req.liquidityUsd, req.solPriceUsd));
+      fillPriceSol = req.currentPriceSol * (1 + impactBps / 10000);
+      tokensReceived = (req.amountSol - req.amountSol * 0.01) / fillPriceSol;
+      tokenQtyRaw = BigInt(Math.floor(tokensReceived * Math.pow(10, tokenDecimals))).toString();
+    }
+    const pricing: PaperPricing = q ? 'CURVE_QUOTE' : 'MODEL';
 
     // Fees: base network fee ~5000 lamports + Jito tip
     const networkFeeLamports = 5000;
@@ -90,9 +125,10 @@ export class PaperExecutionEngine {
       // Cost basis is everything paid to enter: the SOL spent (fee included) plus network fee and tip.
       costBasisLamports: Math.round(req.amountSol * 1e9) + networkFeeLamports + jitoTipLamports,
       entryPriceSol: fillPriceSol,
-      currentPriceSol: fillPriceSol,
-      currentValueSol: tokensReceived * fillPriceSol,
-      unrealizedPnLSol: tokensReceived * fillPriceSol - (req.amountSol * 1e9 + networkFeeLamports + jitoTipLamports) / 1e9,
+      // Marked at the curve's spot price when quoted (the order's own fees and impact show as the immediate loss they are)
+      currentPriceSol: q ? q.spotPriceSol : fillPriceSol,
+      currentValueSol: tokensReceived * (q ? q.spotPriceSol : fillPriceSol),
+      unrealizedPnLSol: tokensReceived * (q ? q.spotPriceSol : fillPriceSol) - (req.amountSol * 1e9 + networkFeeLamports + jitoTipLamports) / 1e9,
       unrealizedPnLPct: 0,
       realizedPnLSol: 0,
       entryTxSignature: paperOrderId,
@@ -149,6 +185,8 @@ export class PaperExecutionEngine {
       tokensReceived,
       impactBps,
       simulatedLatencyMs,
+      pricing,
+      ...(q ? { protocolFeeLamports: q.protocolFeeLamports, creatorFeeLamports: q.creatorFeeLamports } : {}),
     });
 
     Logger.info(`Paper Buy Executed [${paperOrderId}] for ${req.symbol}: ${req.amountSol} SOL @ ${fillPriceSol.toFixed(8)} SOL`);
@@ -163,6 +201,7 @@ export class PaperExecutionEngine {
       jitoTipLamports,
       simulatedLatencyMs,
       effectiveSlippageBps: impactBps,
+      pricing,
     };
   }
 
@@ -171,8 +210,10 @@ export class PaperExecutionEngine {
     positionId: string,
     currentMarketPriceSol: number,
     sellPct = 100,
-    reason = 'Manual Paper Sell'
-  ): { success: boolean; realizedPnLSol: number; position?: NormalizedPosition; error?: string } {
+    reason = 'Manual Paper Sell',
+    /** Q7: the curve's sell quote for the tokens being sold (net of its fees); without it the sell is the flat model below. */
+    curveQuote?: CurveSellQuote
+  ): { success: boolean; realizedPnLSol: number; position?: NormalizedPosition; error?: string; pricing?: PaperPricing } {
     const positions = workstationDb.loadPositions('PAPER');
     const pos = positions.find((p) => p.id === positionId && (p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED'));
 
@@ -193,19 +234,23 @@ export class PaperExecutionEngine {
 
     const tokensSoldHuman = Number(tokensSoldRaw) / Math.pow(10, pos.tokenDecimals);
 
-    // Modeled flat 0.5% sell-side price concession (not derived from pool depth)
-    const exitPriceSol = currentMarketPriceSol * 0.995;
-    const grossProceedsSol = tokensSoldHuman * exitPriceSol;
-
     const costPortionLamports = Math.round(pos.costBasisLamports * fraction);
     const costPortionSol = costPortionLamports / 1e9;
-
-    // All-in fees on exit: 1% Pump.fun protocol fee + network base/priority fee + Jito bundle tip
-    const protocolFeeSol = grossProceedsSol * 0.01;
     const exitNetworkFeeSol = 0.000015; // 5000 base + 10000 priority
     const exitJitoTipSol = (pos.jitoTipLamports || 2000000) / 1e9;
-    const totalExitFrictionSol = protocolFeeSol + exitNetworkFeeSol + exitJitoTipSol;
-    const netProceedsSol = Math.max(0, grossProceedsSol - totalExitFrictionSol);
+    let grossProceedsSol: number;
+    let netProceedsSol: number;
+    if (curveQuote) {
+      // Q7: the curve's net SOL out already has the protocol and creator fees taken; what is left to charge is the network fee and tip
+      grossProceedsSol = curveQuote.netSolOutLamports / 1e9;
+      netProceedsSol = Math.max(0, grossProceedsSol - exitNetworkFeeSol - exitJitoTipSol);
+    } else {
+      // MODEL: a flat 0.5% price concession (not derived from pool depth) and the 1% protocol fee
+      const exitPriceSol = currentMarketPriceSol * 0.995;
+      grossProceedsSol = tokensSoldHuman * exitPriceSol;
+      const protocolFeeSol = grossProceedsSol * 0.01;
+      netProceedsSol = Math.max(0, grossProceedsSol - (protocolFeeSol + exitNetworkFeeSol + exitJitoTipSol));
+    }
     const netRealizedPnLSol = netProceedsSol - costPortionSol;
 
     pos.realizedPnLSol += Number(netRealizedPnLSol.toFixed(6));
@@ -267,7 +312,8 @@ export class PaperExecutionEngine {
       netRealizedPnLSol,
       status: pos.status,
       reason,
-      exitPriceSol,
+      exitPriceSol: tokensSoldHuman > 0 ? grossProceedsSol / tokensSoldHuman : currentMarketPriceSol,
+      pricing: curveQuote ? 'CURVE_QUOTE' : 'MODEL',
     });
 
     Logger.info(`Paper Sell Executed [${pos.id}]: Sold ${safeSellPct}% (${tokensSoldHuman.toFixed(2)} tokens), Net PnL = ${netRealizedPnLSol >= 0 ? '+' : ''}${netRealizedPnLSol.toFixed(5)} SOL, Status: ${pos.status}`);
@@ -276,6 +322,7 @@ export class PaperExecutionEngine {
       success: true,
       realizedPnLSol: netRealizedPnLSol,
       position: pos,
+      pricing: curveQuote ? 'CURVE_QUOTE' : 'MODEL',
     };
   }
 }

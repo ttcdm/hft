@@ -10,7 +10,7 @@ import type { SignalProvenance } from '../core/types';
 import { computeJournalStats, type JournalStats } from './journalStats';
 import { evaluateKillTriggers, auditWalletChange, type KillTrigger } from './killSwitch';
 import { riskEngine } from '../risk/riskEngine';
-import { watchWindow, HOT_MIN_SCORE } from '../signals/watchWindow';
+import { watchWindow, HOT_MIN_SCORE, type WatchResult } from '../signals/watchWindow';
 
 /**
  * G1: the only owner of auto trading.
@@ -42,7 +42,7 @@ export const SESSION_BUDGETS = {
 export interface AutoCandidate {
   mint: string;
   symbol?: string;
-  source: 'PUMPFUN_CALLOUT' | 'AGGREGATOR_LOOP' | 'TEST';
+  source: 'PUMPFUN_CALLOUT' | 'AGGREGATOR_LOOP' | 'WATCH_WINDOW' | 'TEST';
   signalId?: string;
   provenance?: SignalProvenance;
   amountUsd?: number;
@@ -358,6 +358,38 @@ export class AutoSnipeController extends EventEmitter {
   public resume(opts: { clearHalt?: boolean } = {}): { halted: boolean; mode: AutoMode } {
     if (opts.clearHalt) executionCoordinator.clearHalt();
     return { halted: executionCoordinator.getHaltReason() !== null, mode: this.mode };
+  }
+
+  private watchListener: ((r: WatchResult) => void) | null = null;
+
+  /**
+   * Q6f: the watch window is the candidate source. A HOT or READY release becomes a candidate here. Nothing did this before: the window
+   * only broadcast its verdicts, and the other two sources submit mints it never watched, so every one of those was dropped as
+   * NOT_IN_WATCH_WINDOW and auto could not buy anything. DEAD releases are not candidates. Idempotent.
+   */
+  public attachWatchWindow(ww: Pick<EventEmitter, 'on' | 'off'> = watchWindow): void {
+    if (this.watchListener) return;
+    this.watchListener = (r) => {
+      if (r.state !== 'HOT' && r.state !== 'READY') return;
+      if (this.mode === 'OFF') return; // OFF drops silently here; no journal row per release
+      const cfg = memecoinAggregator.getConfig();
+      const pool = memecoinAggregator.getPools().find((p) => p.contractAddress === r.metrics.mint);
+      void this.submitCandidate({
+        mint: r.metrics.mint,
+        symbol: pool?.symbol,
+        source: 'WATCH_WINDOW',
+        provenance: 'REAL_ONCHAIN',
+        amountUsd: cfg.defaultSnipeAmountUsd || 5.0,
+        slippagePct: cfg.maxSlippagePct || 6.0,
+        jitoTipSol: cfg.jitoTipSol,
+      }).catch(() => undefined);
+    };
+    ww.on('release', this.watchListener);
+  }
+
+  public detachWatchWindow(ww: Pick<EventEmitter, 'on' | 'off'> = watchWindow): void {
+    if (this.watchListener) ww.off('release', this.watchListener);
+    this.watchListener = null;
   }
 
   public startMonitor(intervalMs = MONITOR_INTERVAL_MS): void {

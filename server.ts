@@ -320,6 +320,7 @@ watchWindow.setScoreFn((mint) => {
 watchWindow.attach(pumpFeedListener);
 watchWindow.on('release', (r) => broadcastWs({ type: 'WATCH_RELEASE', data: r }));
 watchWindow.start();
+autoSnipeController.attachWatchWindow(); // Q6f: HOT and READY releases are the auto candidates
 
 // Broadcast real-time Pump.fun V2 WebSocket CreateEvents (B08)
 pumpFeedListener.on('create_event', (data) => {

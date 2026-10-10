@@ -356,7 +356,8 @@ describe('Tier 5 [mock-level]: Jito MEV Bundles, Tip Policies & Zero-Double-Fill
       expect(res.slot).toBe(280000200);
 
       // Verify SQLite records both transactions under the SAME logical orderId
-      const txs = workstationDb.loadTransactions('ord-test-rpc-fallback');
+      // (the write-ahead PENDING row for the tx's own signature is a third row here only because the mocked transports invent signatures)
+      const txs = workstationDb.loadTransactions('ord-test-rpc-fallback').filter((t) => t.signature.startsWith('sig_'));
       expect(txs.length).toBe(2);
       expect(txs[0].submissionTransport).toBe('JITO');
       expect(txs[1].submissionTransport).toBe('SOLANA_RPC');

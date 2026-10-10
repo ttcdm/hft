@@ -462,6 +462,18 @@ export class WorkstationDatabase {
     }
   }
 
+  /** A LIVE buy of this mint was sent and not yet resolved (PENDING or RECONCILIATION_REQUIRED): it may still become a position. */
+  public hasUnresolvedLiveBuy(mint: string): boolean {
+    try {
+      const row = this.db
+        .prepare(`SELECT 1 FROM transactions WHERE mint = ? AND direction = 'BUY' AND execution_mode = 'LIVE' AND reconciliation_state IN ('PENDING', 'RECONCILIATION_REQUIRED') LIMIT 1`)
+        .get(mint);
+      return !!row;
+    } catch {
+      return false;
+    }
+  }
+
   public loadTransactions(orderId?: string): PersistedTransaction[] {
     try {
       const stmt = orderId

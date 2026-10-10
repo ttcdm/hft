@@ -1,4 +1,5 @@
 import '../loadEnv'; // must stay the first import
+import bs58 from 'bs58';
 import { solPriceService } from '../market/solPriceService';
 import { Connection, PublicKey, SystemProgram, VersionedTransaction } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID, createCloseAccountInstruction } from '@solana/spl-token';
@@ -1211,7 +1212,51 @@ export class ExecutionCoordinator {
   }
 
   // Idempotent, bounded Jito retry loop with pre-checks and zero-double-fill RPC fallback (R0.6)
-  public async submitAndConfirmWithRetry(params: {
+  /**
+   * N20: the signature is known before anything is sent, so the PENDING row is written first. A crash between broadcast and
+   * response then leaves a row that startup recovery can resolve, instead of only a wallet scan with no cost basis.
+   */
+  public async submitAndConfirmWithRetry(
+    params: Parameters<ExecutionCoordinator['submitAndConfirmInner']>[0]
+  ): ReturnType<ExecutionCoordinator['submitAndConfirmInner']> {
+    const preSignature = this.signatureOf(params.tx);
+    if (preSignature) {
+      workstationDb.saveTransaction({
+        signature: preSignature,
+        orderId: params.orderId,
+        correlationId: params.correlationId,
+        mint: params.mint,
+        direction: params.side,
+        submissionTransport: 'JITO',
+        submissionTime: Date.now(),
+        reconciliationState: 'PENDING',
+        networkFeeLamports: 5000,
+        jitoTipLamports: params.jitoTipLamports,
+        executionMode: 'LIVE',
+      });
+    }
+    const res = await this.submitAndConfirmInner(params);
+    if (preSignature && !res.success && !res.unconfirmed) {
+      // Definitely not landing (never sent, rejected, or seen failing): do not leave a PENDING row to block readiness.
+      const rows = workstationDb.loadTransactions(params.orderId).filter((t) => t.signature === preSignature);
+      if (rows.some((t) => t.reconciliationState === 'PENDING')) {
+        workstationDb.saveTransaction({ ...rows[0], reconciliationState: 'REVERTED', error: res.error ?? 'not sent or rejected' });
+      }
+    }
+    return res;
+  }
+
+  private signatureOf(tx: any): string | null {
+    try {
+      const sig = tx?.signatures?.[0];
+      if (!sig || sig.every((b: number) => b === 0)) return null;
+      return bs58.encode(sig);
+    } catch {
+      return null;
+    }
+  }
+
+  private async submitAndConfirmInner(params: {
     tx: VersionedTransaction;
     orderId: string;
     correlationId: string;
@@ -2121,6 +2166,17 @@ export class ExecutionCoordinator {
         correlationId,
       };
     }
+    // N4: a buy of this mint that was sent and is still unresolved may become a position any moment; a second buy now would double the exposure.
+    if (workstationDb.hasUnresolvedLiveBuy(req.mint)) {
+      workstationDb.logJournal('TRADE_REJECTED_UNRESOLVED_BUY', correlationId, 'LIVE', { mint: req.mint });
+      return {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'LIVE',
+        error: `UNRESOLVED_BUY: an earlier buy of ${req.mint} was sent and is not reconciled yet; waiting for it before buying again.`,
+        correlationId,
+      };
+    }
     this.inFlightBuyMints.add(req.mint);
 
     // Acquire in-flight balance reservation
@@ -2295,7 +2351,8 @@ export class ExecutionCoordinator {
           error: reconciliation.error || 'Token balance increase not verified',
         });
         // The buy landed but its fill is unread: keep retrying so the tokens get a position (and a stop-loss).
-        if (reconciliation.reconciliationState === 'RECONCILIATION_REQUIRED') this.scheduleOrphanRecovery();
+        // Any non-RECONCILED outcome (including ERROR): the buy landed, so keep trying to give the tokens a position and a stop-loss.
+        this.scheduleOrphanRecovery();
 
         return {
           success: false,
@@ -2527,7 +2584,7 @@ export class ExecutionCoordinator {
         // Hard-stop and trailing-stop exits are never blocked by the dust check: a full exit closes the ATA and returns
         // about 0.002 SOL of rent, and holding a falling position to avoid a tip is worse. The check only gates
         // take-profit partials, the stale-position exit and manual closes.
-        const isProtectiveExit = reason === 'STOP_LOSS' || reason === 'TRAILING_STOP';
+        const isProtectiveExit = reason === 'STOP_LOSS' || reason === 'TRAILING_STOP' || reason === 'EMERGENCY_PANIC_LIQUIDATION';
         if (netProceeds <= 0 && !isProtectiveExit) {
           return {
             success: false,
@@ -2849,7 +2906,11 @@ export class ExecutionCoordinator {
       return;
     }
     this.operatorAlerts.push({ code, message, positionId, raisedAt: now, lastSeenAt: now, cleared: false });
-    if (this.operatorAlerts.length > 50) this.operatorAlerts.shift();
+    // N17: at the cap drop a cleared alert first; an uncleared one is only dropped when everything is uncleared.
+    if (this.operatorAlerts.length > 50) {
+      const cleared = this.operatorAlerts.findIndex((a) => a.cleared);
+      this.operatorAlerts.splice(cleared >= 0 ? cleared : 0, 1);
+    }
     Logger.error(`[OPERATOR ALERT] ${code}: ${message}`);
   }
 
@@ -2881,6 +2942,8 @@ export class ExecutionCoordinator {
 
     const positions = workstationDb.loadPositions(undefined, 'ACTIVE');
     const loadedQty = new Map(positions.map((p) => [p.id, p.tokenQuantityRaw]));
+    // N17: failure counters only matter for positions still open; drop the rest so the map cannot grow forever.
+    for (const id of this.exitFailures.keys()) if (!loadedQty.has(id)) this.exitFailures.delete(id);
     const now = Date.now();
     // Nothing LIVE is open, so there is no mark to be stale (see the feed heartbeat): reset the clock here too.
     if (!positions.some((p) => p.executionMode === 'LIVE')) {

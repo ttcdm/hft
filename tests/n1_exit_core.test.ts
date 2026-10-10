@@ -8,6 +8,7 @@ import {
   EXIT_FAILURE_ALERT_AFTER,
 } from '../server/execution/coordinator';
 import { localSigner } from '../server/solana/signer';
+import { riskEngine } from '../server/risk/riskEngine';
 import { workstationDb } from '../server/db/database';
 import { PumpCurveService } from '../server/solana/pumpCurve';
 import { PumpSwapVenueService } from '../server/solana/pumpSwapService';
@@ -126,6 +127,17 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
     expect(recovery).toHaveBeenCalled();
     const tx = workstationDb.loadTransactions().find((t) => t.signature === 'unconf_sig');
     expect(tx?.reconciliationState).toBe('RECONCILIATION_REQUIRED');
+
+    // N4: while that buy is unresolved, buying the same mint again is refused and nothing more is sent
+    (riskEngine as any).lastTradeFailureTimestamp = 0; // the failure cooldown would otherwise answer first
+    const calls = submit.mock.calls.length;
+    const again = await coordinator.executeTrade({
+      signalTimestamp: Date.now(), mint: VALID_PUMP_MINT_1.toBase58(), symbol: 'N2', name: 'N2', amountSol: 0.005,
+      source: 'AUTO_SNIPER', provenance: 'REAL_ONCHAIN', eligibilityReport: createPassingEligibilityReport(VALID_PUMP_MINT_1.toBase58()),
+    } as any);
+    expect(again.success).toBe(false);
+    expect(again.error).toMatch(/UNRESOLVED_BUY/);
+    expect(submit.mock.calls.length).toBe(calls);
   });
 
   it('N3: a sell that landed but whose fill is unreadable is not sold again; the wallet decides', async () => {
@@ -158,5 +170,67 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
     const row = workstationDb.loadPositions().find((p) => p.id === posId)!;
     expect(row.status).toBe('PARTIALLY_CLOSED');
     expect(row.tokenQuantityRaw).toBe('500000000');
+  });
+
+  describe('N20: the PENDING row is written before anything is sent', () => {
+    const params = (sigByte: number, orderId: string) => ({
+      tx: { signatures: [new Uint8Array(64).fill(sigByte)] } as any, orderId, correlationId: 'c-' + orderId, side: 'BUY' as const,
+      mint: VALID_PUMP_MINT_1.toBase58(), mintPubkey: VALID_PUMP_MINT_1, owner: Keypair.generate().publicKey,
+      tokenProgram: Keypair.generate().publicKey, preSnapshot: { walletSolLamports: 1, tokenBalanceRaw: '0', tokenDecimals: 6, timestamp: 1 }, jitoTipLamports: 0,
+    });
+    const rowFor = (orderId: string) => workstationDb.loadTransactions(orderId);
+
+    it('a row exists while the send is still in flight (a crash here leaves something for recovery to find)', async () => {
+      submit.mockRestore();
+      let release!: (v: any) => void;
+      const inner = vi.spyOn(coordinator as any, 'submitAndConfirmInner').mockImplementation(() => new Promise((r) => { release = r; }));
+      const p = coordinator.submitAndConfirmWithRetry(params(7, 'ord-n20-a'));
+      const rows = rowFor('ord-n20-a');
+      expect(rows).toHaveLength(1);
+      expect(rows[0].reconciliationState).toBe('PENDING');
+      release({ success: true, signature: rows[0].signature, transport: 'SOLANA_RPC', lifecycleState: 'CONFIRMED' });
+      await p;
+      expect(inner).toHaveBeenCalledTimes(1);
+    });
+
+    it('a send that definitely did not go out is marked REVERTED, not left PENDING to block readiness', async () => {
+      submit.mockRestore();
+      vi.spyOn(coordinator as any, 'submitAndConfirmInner').mockResolvedValue({ success: false, signature: '', transport: 'SOLANA_RPC', error: 'rejected', lifecycleState: 'SUBMIT_FAILED' });
+      await coordinator.submitAndConfirmWithRetry(params(8, 'ord-n20-b'));
+      expect(rowFor('ord-n20-b').map((t) => t.reconciliationState)).toEqual(['REVERTED']);
+    });
+
+    it('an unconfirmed send stays PENDING so recovery keeps watching it', async () => {
+      submit.mockRestore();
+      vi.spyOn(coordinator as any, 'submitAndConfirmInner').mockResolvedValue({ success: false, signature: 'x', transport: 'SOLANA_RPC', error: 'timeout', lifecycleState: 'REVERTED', unconfirmed: true });
+      await coordinator.submitAndConfirmWithRetry(params(9, 'ord-n20-c'));
+      expect(rowFor('ord-n20-c').map((t) => t.reconciliationState)).toEqual(['PENDING']);
+    });
+  });
+
+  it('N14: panic liquidation is never blocked by the dust-economics check, a take-profit partial still is', async () => {
+    const id = mkPosition();
+    const row = workstationDb.loadPositions().find((p) => p.id === id)!;
+    workstationDb.savePosition({ ...row, currentValueSol: 0.0000001, currentPriceSol: 1e-13 } as any);
+    const tp = await coordinator.closePosition(id, 50, 'TAKE_PROFIT_1');
+    expect(tp.error).toBe('DUST_POSITION_EXIT_UNECONOMICAL');
+    const panic = await coordinator.closePosition(id, 100, 'EMERGENCY_PANIC_LIQUIDATION');
+    expect(panic.error).not.toBe('DUST_POSITION_EXIT_UNECONOMICAL');
+  });
+
+  it('N17: at the alert cap a cleared alert is dropped before an uncleared one; failure counters of closed positions are pruned', async () => {
+    const raise = (coordinator as any).raiseOperatorAlert.bind(coordinator);
+    raise('KEEP_ME', 'first, uncleared');
+    for (let i = 0; i < 49; i++) raise('FILL', `n${i}`, `pos-${i}`);
+    (coordinator as any).clearOperatorAlert('FILL', 'pos-3');
+    raise('NEW', 'one past the cap');
+    const codes = coordinator.getOperatorAlerts().map((a) => a.code);
+    expect(codes).toContain('KEEP_ME');
+    expect(codes).toContain('NEW');
+    expect(coordinator.getOperatorAlerts().some((a) => a.positionId === 'pos-3')).toBe(false);
+
+    (coordinator as any).exitFailures.set('gone-position', { count: 3, nextAttemptAt: 0, lastError: 'x' });
+    await coordinator.evaluateAndProcessExits();
+    expect((coordinator as any).exitFailures.has('gone-position')).toBe(false);
   });
 });

@@ -314,6 +314,8 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
         throw new Error('Concurrent injected error');
       });
 
+      // earlier cases in this file leave unresolved buy rows for this mint in the shared DB; this case is about the in-flight guard
+      vi.spyOn(workstationDb, 'hasUnresolvedLiveBuy').mockReturnValue(false);
       const burstCount = 20;
       const promises: Promise<any>[] = [];
 
@@ -338,7 +340,7 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
       for (const res of results) {
         expect(res.success).toBe(false);
         if (res.lifecycleState === 'RISK_REJECTED') {
-          expect(res.error).toMatch(/DUPLICATE_MINT/);
+          expect(res.error).toMatch(/DUPLICATE_MINT|UNRESOLVED_BUY/);
         } else {
           expect(res.lifecycleState).toBe('CHAIN_ERROR');
         }

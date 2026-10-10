@@ -171,7 +171,11 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ arm: false }),
       });
-      await res.json();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) {
+        setStatusMessage({ text: data.message || data.error || `Disarm failed (HTTP ${res.status}). Live trading may still be armed.`, type: 'error' });
+        return;
+      }
       setStatusMessage({ text: 'Trading disarmed. Defaulting safely to paper simulation mode.', type: 'info' });
       await fetchSystemData();
     } catch (err: any) {
@@ -257,8 +261,12 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
     try {
       setIsLoading(true);
       const res = await authFetch('/api/wallet/panic-liquidate', { method: 'POST' });
-      const data = await res.json();
-      setStatusMessage({ text: data.message, type: 'error' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setStatusMessage({ text: data.message || data.error || `Panic liquidate failed (HTTP ${res.status}). Positions may still be open.`, type: 'error' });
+        return;
+      }
+      setStatusMessage({ text: data.message || 'Panic liquidate sent.', type: 'error' });
       await fetchSystemData();
     } catch (err: any) {
       setStatusMessage({ text: err.message || 'Panic liquidate failed', type: 'error' });
@@ -401,7 +409,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                 : 'border-transparent text-slate-400 hover:text-slate-200'
             }`}
           >
-            Open Positions ({positions.filter((p) => p.status === 'OPEN').length})
+            Open Positions ({positions.filter((p) => p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED').length})
           </button>
           <button
             onClick={() => setActiveTab('RISK_LOGS')}
@@ -553,28 +561,28 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                     </thead>
                     <tbody className="divide-y divide-slate-800 bg-slate-900/40">
                       {positions
-                        .filter((p) => !positionSearchQuery || p.symbol.toLowerCase().includes(positionSearchQuery.toLowerCase()))
+                        .filter((p) => !positionSearchQuery || (p.symbol ?? '').toLowerCase().includes(positionSearchQuery.toLowerCase()))
                         .map((pos) => (
                           <tr key={pos.id}>
                             <td className="p-2.5 font-mono">
-                              <div className="font-bold text-white">${pos.symbol}</div>
+                              <div className="font-bold text-white">${pos.symbol || pos.mint.slice(0, 6)}</div>
                               <span className="text-[10px] text-slate-400 truncate block max-w-[140px]">{pos.mint}</span>
                             </td>
                             <td className="p-2.5">
                               <span
                                 className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                                  pos.mode === 'LIVE' ? 'bg-rose-500/20 text-rose-300' : 'bg-emerald-500/20 text-emerald-300'
+                                  pos.executionMode === 'LIVE' ? 'bg-rose-500/20 text-rose-300' : 'bg-emerald-500/20 text-emerald-300'
                                 }`}
                               >
-                                {pos.mode}
+                                {pos.executionMode}
                               </span>
                             </td>
                             <td className="p-2.5 font-mono">{((pos.costBasisLamports ?? 0) / 1e9).toFixed(4)} SOL</td>
                             <td className="p-2.5 font-mono">{(pos.currentValueSol ?? 0).toFixed(4)} SOL</td>
                             <td className="p-2.5 font-mono font-bold">
-                              <span className={(pos.unrealizedPnlPct ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                                {(pos.unrealizedPnlPct ?? 0) >= 0 ? '+' : ''}
-                                {(pos.unrealizedPnlPct ?? 0).toFixed(1)}%
+                              <span className={(pos.unrealizedPnLPct ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
+                                {(pos.unrealizedPnLPct ?? 0) >= 0 ? '+' : ''}
+                                {(pos.unrealizedPnLPct ?? 0).toFixed(1)}%
                               </span>
                             </td>
                             <td className="p-2.5">
@@ -587,7 +595,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                               </span>
                             </td>
                             <td className="p-2.5 text-right">
-                              {pos.status === 'OPEN' && (
+                              {(pos.status === 'OPEN' || pos.status === 'PARTIALLY_CLOSED') && (
                                 <button
                                   onClick={() => handleClosePosition(pos.id)}
                                   className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-rose-300 text-[11px] font-bold"

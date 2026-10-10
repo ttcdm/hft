@@ -1341,6 +1341,13 @@ app.post('/api/wallet/close-position', requireOperatorAuth, validateBody(ClosePo
   });
 });
 
+// S13: the Telegram /panic_sell stops new entries the same way the HTTP panic does.
+socialScanner.setPanicHook(async () => {
+  riskEngine.setKillSwitch(true);
+  executionCoordinator.armLiveTrading(false);
+  await autoSnipeController.kill({ exitAll: false, reason: 'telegram panic' });
+});
+
 app.post('/api/wallet/panic-liquidate', requireOperatorAuth, async (req, res) => {
   const result = await walletTrader.panicLiquidateAll();
   await autoSnipeController.kill({ exitAll: false, reason: 'panic liquidate' }); // Q37: a panic also stops auto; it must not re-buy after the exits

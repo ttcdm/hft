@@ -59,9 +59,11 @@ describe('G1: auto-snipe controller', () => {
     await setAutoMode('SHADOW');
     const exec = vi.spyOn(executionCoordinator, 'executeTrade');
     const fill = vi.spyOn(paperEngine, 'executePaperBuy');
+    const snipeSpy = vi.spyOn(memecoinAggregator, 'executeSnipe');
     const before = workstationDb.loadPositions().length;
     const d = await autoSnipeController.submitCandidate(cand(newPool()));
     expect(d.outcome, d.reason).toBe('WOULD_BUY');
+    expect(snipeSpy.mock.calls[0][0].noSyntheticPool).toBe(true); // S16: auto never trades against an invented pool
     expect(d.stage).toBe('fill');
     expect(d.amountSol).toBeGreaterThan(0);
     expect(exec).not.toHaveBeenCalled();

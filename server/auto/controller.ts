@@ -240,12 +240,27 @@ export class AutoSnipeController extends EventEmitter {
     return reason;
   }
 
+  /** S17: how long kill()/setMode() wait for a buy in flight. It settles in a `finally`, so this is a backstop, not an expected path. */
+  private inflightWaitMs = 90_000;
+
+  private async waitInflight(who: string): Promise<void> {
+    const p = this.inflight;
+    if (!p) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = await Promise.race([
+      p.then(() => false),
+      new Promise<boolean>((r) => { timer = setTimeout(() => r(true), this.inflightWaitMs); timer.unref?.(); }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (timedOut) Logger.warn(`[AUTO] ${who}: a buy in flight did not settle within ${this.inflightWaitMs} ms; continuing without it. A position it opens later is still found through the decision journal.`);
+  }
+
   public async setMode(next: AutoMode, opts: { confirmationCode?: string } = {}): Promise<{ ok: boolean; mode: AutoMode; error?: string }> {
     if (!['OFF', 'SHADOW', 'PAPER', 'DEVNET_LIVE'].includes(next)) return { ok: false, mode: this.mode, error: `unknown mode ${next}` };
     if (next === 'OFF') {
       this.mode = 'OFF';
       // Q29: OFF stops new candidates at once; the session is dropped only after a buy in flight has booked itself in it
-      if (this.inflight) await this.inflight;
+      await this.waitInflight('setMode(OFF)');
       this.session = null;
       this.downgradeReason = null;
       this.emit('mode', { mode: this.mode });
@@ -255,7 +270,7 @@ export class AutoSnipeController extends EventEmitter {
       return { ok: false, mode: this.mode, error: 'AUTO_SNIPE_ENABLED is not true: auto trading stays OFF' };
     }
     // Q29: never swap the session under a buy in flight; its spend and position belong to the session it started in
-    if (this.inflight) await this.inflight;
+    await this.waitInflight('setMode');
     const coordMode = executionCoordinator.getExecutionMode();
     if (next === 'PAPER' && coordMode !== 'PAPER') {
       return { ok: false, mode: this.mode, error: 'PAPER auto mode needs the execution coordinator in PAPER' };
@@ -302,7 +317,7 @@ export class AutoSnipeController extends EventEmitter {
     this.killReason = opts.reason || 'operator kill';
     // Q29: a buy already past the gates finishes (its position exists once it does); wait for it so its position is in the owned set below
     // and is sold by exitAll. Mode OFF already stops any new candidate.
-    if (this.inflight) await this.inflight;
+    await this.waitInflight('kill');
     // R23: "sell what it bought" means the positions the auto controller opened: this session's, plus any the journal records as
     // BOUGHT by auto (a restart empties the in-memory session). A position the operator opened by hand is never in either set.
     const owned = new Set<string>(this.session?.positionIds ?? []);
@@ -553,6 +568,7 @@ export class AutoSnipeController extends EventEmitter {
         signalTimestamp: verdict.releasedAt,
         // R5: the mode checked above; the coordinator refuses the trade if LIVE was armed or disarmed during the awaits in executeSnipe.
         expectedMode: coordMode,
+        noSyntheticPool: true, // S16
       };
       if (shadow) params.dryRun = true;
       if (startMode === 'DEVNET_LIVE') {

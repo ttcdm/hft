@@ -200,7 +200,7 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
 
   describe('Q13: a 100% sell sells what the wallet holds', () => {
     const rowOf = () => workstationDb.loadPositions().find((p) => p.id === posId)!;
-    const balance = (amount: string) => { (coordinator as any).connection.getTokenAccountBalance = vi.fn(async () => ({ value: { amount } })); };
+    const balance = (amount: string) => { vi.spyOn((coordinator as any).connection, 'getTokenAccountBalance').mockImplementation((async () => ({ value: { amount } })) as any); };
 
     it('the row says 1,000,000,000 but the wallet holds 600,000,000: the sell is for 600,000,000, the basis is scaled and the position closes', async () => {
       balance('600000000');

@@ -130,3 +130,9 @@ What to expect: **72-76 at best with an ideal crowd, 62-68 for a typical launch,
 
 The seeded devnet token (`scripts/devnet_seed.ts`) is **not expected to be bought by auto**: the seed funds all 30 buyers from one wallet, the watch window clusters buyers by who first funded them, so it sees one buyer (HOT needs 25 unique buyers), and the measured score is 35. That is by design here; funding the buyers through disguised intermediaries to get around the check was considered and rejected. The seed is useful for watching the board and the watch window, and for manual buys, not as proof that auto can trade.
 
+
+## 9. What the localnet proof does not cover (S23)
+
+- **Finality is instant.** The in-process validator reports `finalized` for every landed signature at once. The "sent and unknown" class (SELL_PENDING_VERIFICATION, blockhash expiry, processed to confirmed) therefore runs only through explicit fault injection. Step (g) of `npm run localnet:e2e` covers "landed but the response was withheld", not "sent and the outcome is unknown". Devnet is the first place those paths meet real latency.
+- **The `localnet_*` methods are harness-only.** No production code calls them (`grep` finds none), so `localnet_setAccount` cannot be reached from the app.
+- **A buyer funded through a program call is untested.** The validator's `getTransaction` (`jsonParsed`) understands only direct system transfers. A buyer funded by a CPI (the case S4d's public-funder list handles) has no localnet test.

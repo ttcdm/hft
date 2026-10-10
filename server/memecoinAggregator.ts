@@ -426,6 +426,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     minConfluenceScore?: number;
     /** G1: run every gate and report what would be bought, without sending or filling anything. */
     dryRun?: boolean;
+    /** S16: the auto trader never trades against an invented pool (a PAPER fill on made-up price and liquidity is not evidence). */
+    noSyntheticPool?: boolean;
     /** G1: fixed order size in SOL (auto-snipe Devnet mode). Overrides sizing; the 10% ceiling still applies downstream. */
     amountSolOverride?: number;
     /** When the signal behind this trade happened (ms). Required for LIVE: the coordinator never defaults it to now. */
@@ -643,7 +645,7 @@ export class MemecoinAggregatorService extends EventEmitter {
       } catch {}
     }
 
-    if (!pool && executionCoordinator.getExecutionMode() === 'PAPER') {
+    if (!pool && !params.noSyntheticPool && executionCoordinator.getExecutionMode() === 'PAPER') {
       const priceUsd = 0.000045;
       const priceNative = priceUsd / this.solPriceUsd;
       pool = {
@@ -676,6 +678,10 @@ export class MemecoinAggregatorService extends EventEmitter {
         trendingRank: 1,
       };
       this.pools.unshift(pool);
+    }
+
+    if (pool && params.noSyntheticPool && (DEMO_POOL_IDS.has(pool.id) || pool.id.startsWith('pool-simulated-'))) {
+      return { success: false, message: `MARKET_DATA_UNAVAILABLE: ${cleanCa} has only a simulated pool; the auto trader does not trade against one.`, txHash: '' };
     }
 
     if (!pool) {

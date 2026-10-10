@@ -130,7 +130,10 @@ export class OnChainPoolStats {
     const s = this.mints.get(mint);
     if (!s || s.tradeCount === 0 || s.priceSol === null) return null;
     const recent = s.trades.filter((t) => t.at > now - POOL_STATS_WINDOW_MS);
-    const base = recent.length > 0 && s.trades.length === recent.length ? (s.anchorPriceSol ?? recent[0].priceSol) : (recent[0]?.priceSol ?? s.anchorPriceSol);
+    // S15: the create price is the 5-minute base only while every trade since launch is still held; once the oldest were shifted out, the
+    // first held trade is the base (a shorter window, never change-since-launch).
+    const nothingDropped = s.tradeCount === s.trades.length;
+    const base = recent.length > 0 && s.trades.length === recent.length && nothingDropped ? (s.anchorPriceSol ?? recent[0].priceSol) : (recent[0]?.priceSol ?? s.anchorPriceSol);
     const priceChange5mPct = base && base > 0 ? (s.priceSol / base - 1) * 100 : 0;
 
     const supply = Number(s.supplyRaw);

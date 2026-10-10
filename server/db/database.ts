@@ -208,7 +208,7 @@ export class WorkstationDatabase {
       const n = (this.db.prepare('SELECT COUNT(*) AS n FROM realized_events').get() as any).n;
       if (n === 0) {
         this.db.exec(`INSERT INTO realized_events (position_id, execution_mode, delta_lamports, ts)
-          SELECT id, execution_mode, realized_pnl_lamports, updated_at FROM positions WHERE realized_pnl_lamports != 0`);
+          SELECT id, execution_mode, realized_pnl_lamports, updated_at FROM positions WHERE realized_pnl_lamports != 0 AND entry_tx_signature NOT LIKE 'RECOVERED:%'`);
       }
     } catch (err: any) {
       Logger.warn(`realized_events backfill failed: ${err.message}`);
@@ -662,6 +662,40 @@ export class WorkstationDatabase {
     if (realizedDelta !== 0 && !pos.entryTxSignature?.startsWith('RECOVERED:')) {
       this.db.prepare('INSERT INTO realized_events (position_id, execution_mode, delta_lamports, ts) VALUES (?, ?, ?, ?)').run(pos.id, pos.executionMode, realizedDelta, now);
     }
+  }
+
+  /**
+   * S11 / Q14: persist ONLY the mark fields. A mark refresh works from a copy loaded before several awaits; saving the whole row from
+   * that copy can undo a close or a sell that committed meanwhile (status, quantity, realized). This touches no other column and never
+   * a CLOSED row, so a stale refresh cannot resurrect a position or write a bogus realized event.
+   */
+  public saveMark(pos: NormalizedPosition): boolean {
+    const now = Date.now();
+    const markTimestamp = pos.lastMarkTimestamp && pos.lastMarkTimestamp > 0 ? pos.lastMarkTimestamp : 0;
+    const r = this.db.prepare(`
+      UPDATE positions SET
+        current_price_sol = ?,
+        last_mark_timestamp = CASE WHEN ? > 0 THEN ? ELSE last_mark_timestamp END,
+        last_mark_source = CASE WHEN ? != 'UNKNOWN' THEN ? ELSE last_mark_source END,
+        venue = COALESCE(?, venue),
+        pool_address = COALESCE(?, pool_address),
+        migration_timestamp = COALESCE(?, migration_timestamp),
+        high_water_mark_sol = MAX(COALESCE(high_water_mark_sol, 0), ?),
+        record_updated_at = ?,
+        updated_at = ?
+      WHERE id = ? AND status != 'CLOSED'
+    `).run(
+      pos.currentPriceSol ?? 0,
+      markTimestamp, markTimestamp,
+      pos.markSource || 'UNKNOWN', pos.markSource || 'UNKNOWN',
+      pos.venue ?? null,
+      pos.poolAddress ?? null,
+      pos.migrationTimestamp ?? null,
+      pos.highWaterMarkSol ?? 0,
+      now, now,
+      pos.id
+    );
+    return Number((r as any).changes) > 0;
   }
 
   public loadPositions(mode?: ExecutionMode, status?: 'OPEN' | 'PARTIALLY_CLOSED' | 'CLOSED' | 'ACTIVE'): NormalizedPosition[] {

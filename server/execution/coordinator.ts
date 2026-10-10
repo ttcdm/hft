@@ -1194,7 +1194,7 @@ export class ExecutionCoordinator {
           // Mark age increases honestly
           const baseTimestamp = pos.lastMarkTimestamp || pos.lastUpdatedTimestamp;
           if (baseTimestamp) pos.markAgeMs = now - baseTimestamp;
-          workstationDb.savePosition(pos);
+          // nothing new to store: the mark age is derived from the stored timestamps on load (S11: no whole-row save here)
         }
       }
     } catch (err: any) {
@@ -1229,7 +1229,7 @@ export class ExecutionCoordinator {
     }
 
     pos.lastUpdatedTimestamp = Date.now();
-    workstationDb.savePosition(pos);
+    workstationDb.saveMark(pos); // S11: marks never rewrite status, quantity or realized
   }
 
   // Pre-retry and pre-fallback on-chain and database verification (R0.6)
@@ -2683,7 +2683,7 @@ export class ExecutionCoordinator {
    * quantity are not rejected sends; counting them walked the ladder to 4000 bps before the real resend.
    */
   private static isNonAttemptExitError(error?: string): boolean {
-    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found|SELL_PENDING_VERIFICATION|UNKNOWN_TRADING_VENUE|Signer is not configured|Calculated sell quantity is zero)/.test(error) || ExecutionCoordinator.isQuoteFailure(error);
+    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found|SELL_PENDING_VERIFICATION|UNKNOWN_TRADING_VENUE|Trading venue for mint|Signer is not configured|Calculated sell quantity is zero)/.test(error) || ExecutionCoordinator.isQuoteFailure(error);
   }
 
   /** R10: the sell could not even be quoted (fail-closed quote, fee config, market state). Nothing was sent, and widening slippage cannot help. */

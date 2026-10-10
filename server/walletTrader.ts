@@ -47,7 +47,7 @@ export interface LiveWalletState {
   /** Q35: the header pill reads these; it used to read two fields that were never sent. */
   activePositionsCount: number;
   closedPositionsCount: number;
-  /** Realized today (EST/NY), net of fees, from the realized-events ledger. */
+  /** Realized today (UTC day, as the database keys it), net of fees, from the realized-events ledger. */
   totalRealizedPnLSol: number;
   totalRealizedPnLUsd: number | null;
   /** Marked profit or loss of the open positions (recovered dust is 0 by Q2). */

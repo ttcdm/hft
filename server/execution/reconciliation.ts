@@ -50,6 +50,30 @@ export interface SellReconciliationResult {
   error?: string;
 }
 
+/**
+ * F1/Q1: lamports the buyer funded into accounts this transaction created, other than the wallet and the excluded keys (its token
+ * account, counted separately). An account with no lamports before and some after was created and funded by the tx (on devnet, the
+ * pump per-user volume account, 1,346,200 lamports on a first buy). It is rent, not curve spend. Shared by the live reconcile and
+ * the interrupted-transaction recovery so both price an entry the same way.
+ */
+export function otherNewAccountRent(
+  keyAt: (i: number) => string | undefined,
+  count: number,
+  preBalances: number[] | undefined,
+  postBalances: number[] | undefined,
+  exclude: Set<string>,
+): number {
+  let total = 0;
+  for (let i = 0; i < count; i++) {
+    const key = keyAt(i);
+    if (!key || exclude.has(key)) continue;
+    const pre = preBalances?.[i] ?? 0;
+    const post = postBalances?.[i] ?? 0;
+    if (pre === 0 && post > 0) total += post;
+  }
+  return total;
+}
+
 export class TradeReconciler {
   /**
    * Delays between getTransaction retries when the RPC has not indexed a just-confirmed signature yet (returns null) or errors.
@@ -258,14 +282,13 @@ export class TradeReconciler {
       // F1: the pump program can also make the buyer fund other new accounts in the same tx (on devnet, a pump-owned per-user
       // account of 1,346,200 lamports on the first buy). That rent is not curve spend either. Any account other than the
       // wallet and its token account that had no lamports before and has some after was created (and funded) by this tx.
-      let otherNewAccountRentLamports = 0;
-      for (let i = 0; i < accountKeys.length; i++) {
-        const key = accountKeys.get(i)?.toBase58();
-        if (!key || key === walletStr || key === ataKey) continue;
-        const pre = tx.meta.preBalances[i] ?? 0;
-        const post = tx.meta.postBalances[i] ?? 0;
-        if (pre === 0 && post > 0) otherNewAccountRentLamports += post;
-      }
+      const otherNewAccountRentLamports = otherNewAccountRent(
+        (i) => accountKeys.get(i)?.toBase58(),
+        accountKeys.length,
+        tx.meta.preBalances,
+        tx.meta.postBalances,
+        new Set([walletStr, ataKey]),
+      );
       const nonCurveLamports =
         actualNetworkFeeLamports + expectedJitoTipLamports + tokenAccountRentLamports + otherNewAccountRentLamports;
       let curveSpendLamports = actualSolSpentLamports - nonCurveLamports;
@@ -479,6 +502,7 @@ export class TradeReconciler {
     /** BUY only: SOL that went to the curve (wallet delta minus fee, tip and rent of the token account this tx opened). */
     curveSpendLamports?: number;
     tokenAccountRentLamports?: number;
+    otherNewAccountRentLamports?: number;
     slot?: number;
     blockTime?: number;
     error?: string;
@@ -574,7 +598,18 @@ export class TradeReconciler {
           tokenAccountRentLamports = Math.max(0, (txDetails.meta.postBalances[tb.accountIndex] ?? 0) - (txDetails.meta.preBalances[tb.accountIndex] ?? 0));
         }
       }
-      let curveSpendLamports = solSpentLamports - networkFeeLamports - expectedJitoTipLamports - tokenAccountRentLamports;
+      let otherNewAccountRentLamports = 0;
+      if (type === 'BUY' && matchedMint) {
+        try {
+          const keys = txDetails.transaction.message.getAccountKeys();
+          const tb = postTokens.find((p) => p.mint === matchedMint);
+          const exclude = new Set<string>([walletStr]);
+          const tokenAcct = tb ? keys.get(tb.accountIndex)?.toBase58() : undefined;
+          if (tokenAcct) exclude.add(tokenAcct);
+          otherNewAccountRentLamports = otherNewAccountRent((i) => keys.get(i)?.toBase58(), keys.length, txDetails.meta?.preBalances, txDetails.meta?.postBalances, exclude);
+        } catch { /* address-table keys not resolvable: fall back to the old split */ }
+      }
+      let curveSpendLamports = solSpentLamports - networkFeeLamports - expectedJitoTipLamports - tokenAccountRentLamports - otherNewAccountRentLamports;
       if (!(curveSpendLamports > 0)) curveSpendLamports = solSpentLamports;
 
       if (matchedMint && tokenDelta > 0n) {
@@ -596,6 +631,7 @@ export class TradeReconciler {
           networkFeeLamports,
           curveSpendLamports,
           tokenAccountRentLamports,
+          otherNewAccountRentLamports,
           slot: txDetails.slot,
           blockTime: txDetails.blockTime ? txDetails.blockTime * 1000 : Date.now(),
         };

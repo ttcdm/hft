@@ -6,7 +6,8 @@ import { executionCoordinator } from './execution/coordinator';
 import { solPriceService } from './market/solPriceService';
 import { workstationDb } from './db/database';
 import { evaluateTokenSafety } from './risk/tokenSafety';
-import { pumpFeedListener, PumpCreateEvent } from './solana/pumpFeedListener';
+import { pumpFeedListener, PumpCreateEvent, PumpTradeEvent } from './solana/pumpFeedListener';
+import { onChainPoolStats } from './market/poolStats';
 import { SignalProvenance, ConfluenceBreakdown, ExecutionMode } from './core/types';
 import { CapitalSizer } from './capital/capitalSizer';
 import { ConfluenceEngine, isConfluencePassed, MIN_CONFLUENCE_SCORE } from './signals/confluenceEngine';
@@ -143,6 +144,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     pumpFeedListener.on('create_event', (event: PumpCreateEvent) => {
       this.ingestOnChainCreateEvent(event);
     });
+    // Q6: a pool made from a create event holds zeros for everything a trade reveals. Trades fill them in.
+    pumpFeedListener.on('trade_event', (t: PumpTradeEvent) => this.applyTradeToPool(t));
 
     this.startAutonomousSniperLoop();
   }
@@ -246,8 +249,40 @@ export class MemecoinAggregatorService extends EventEmitter {
       this.pools = this.pools.slice(0, 200);
     }
 
+    onChainPoolStats.track(cleanCa, {
+      insiders: [event.creator, event.user],
+      supplyRaw: event.tokenTotalSupply,
+      createPriceSol: event.initialPriceSol,
+      realTokenReserves: event.realTokenReserves,
+    });
     this.emit('pool_added', pool);
     return pool;
+  }
+
+  private lastPoolPush = new Map<string, number>();
+
+  /** Q6: fold one decoded trade into its pool (price, liquidity, curve progress, order flow, holder shares). */
+  public applyTradeToPool(t: PumpTradeEvent, now = Date.now()): void {
+    if (!onChainPoolStats.record(t, now)) return;
+    const pool = this.pools.find((p) => p.contractAddress === t.mint);
+    const m = onChainPoolStats.get(t.mint, now);
+    if (!pool || !m) return;
+    const solUsd = this.solPriceUsd;
+    pool.priceNative = m.priceSol;
+    pool.priceUsd = m.priceSol * solUsd;
+    pool.marketCapUsd = m.priceSol * 1_000_000_000 * solUsd;
+    pool.liquidityUsd = m.realSolReserves * solUsd * 2;
+    pool.bondingCurveProgress = Number(m.curveProgressPct.toFixed(1));
+    pool.priceChange5mPct = m.priceChange5mPct;
+    pool.buys5m = m.buys5m;
+    pool.sells5m = m.sells5m;
+    pool.volume5mUsd = m.volume5mSol * solUsd;
+    pool.top10HoldersPct = m.top10HoldersPct ?? -1;
+    pool.devHoldingPct = m.devHoldingPct ?? -1;
+    if (now - (this.lastPoolPush.get(t.mint) ?? 0) >= 1_000) {
+      this.lastPoolPush.set(t.mint, now);
+      this.emit('price_update', { pool });
+    }
   }
 
   public getPools(platform?: string, chain?: string): MemecoinPool[] {

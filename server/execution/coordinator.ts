@@ -2136,6 +2136,18 @@ export class ExecutionCoordinator {
     const verdict = this.eligibilityVerdict(eligibility, now, 'LIVE', correlationId);
     if (verdict) return verdict;
 
+    // Q16: one open LIVE row per mint. A second buy over the same token account leaves two rows against one balance (the N3 adoption and the
+    // N5 zero-balance check each compare one row with the whole account), and the risk engine's DUPLICATE_MINT is only a 30 s cooldown.
+    if (openPositions.some((p) => p.mint === req.mint)) {
+      return {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'LIVE',
+        error: `POSITION_ALREADY_OPEN: an open LIVE position in ${req.mint} exists; close it before buying the same mint again.`,
+        correlationId,
+      };
+    }
+
     // 3. Pre-Trade Capital Sizing (B12): spendable bankroll and 10% ceiling check
     const rawWalletBalance = this.realWalletBalanceSol ?? 0;
     const spendable = CapitalSizer.calculateSpendableBankroll(rawWalletBalance, 0.015, this.inFlightReservedSol);
@@ -2334,6 +2346,20 @@ export class ExecutionCoordinator {
       // 5. Build, sign, and submit real Solana transaction
       const v0Tx = await txBuilder.buildBuyTransaction(this.connection, buyParams);
       await localSigner.signTransaction(v0Tx);
+
+      // Q17: risk approval was several awaits ago (curve read, holder lookup, tip floor, blockhash, snapshot, sign). Disarm, a halt or the
+      // kill switch may have happened in between; nothing is sent after any of them.
+      if (!this.isLiveTradingArmed || this.executionMode !== 'LIVE' || this.haltReason || riskEngine.isKillSwitchActive()) {
+        const why = !this.isLiveTradingArmed || this.executionMode !== 'LIVE' ? 'live trading was disarmed' : this.haltReason ? `trading was halted (${this.haltReason})` : 'the kill switch was activated';
+        workstationDb.logJournal('TRADE_REVOKED_BEFORE_SEND', correlationId, 'LIVE', { mint: req.mint, reason: why });
+        return {
+          success: false,
+          lifecycleState: 'RISK_REJECTED',
+          executionMode: 'LIVE',
+          error: `ENTRY_REVOKED: ${why} after the order was approved; nothing was sent.`,
+          correlationId,
+        };
+      }
 
       // The tip transfer is an instruction inside the signed transaction, so it is paid on-chain whichever
       // transport lands it (Jito bundle or the RPC fallback). Accounting uses resolvedTip.tipLamports for both.

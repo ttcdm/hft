@@ -237,6 +237,71 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
     });
   });
 
+  describe('Q16/Q17: LIVE entry guards', () => {
+    const buy = () => coordinator.executeTrade({
+      signalTimestamp: Date.now(), mint: VALID_PUMP_MINT_1.toBase58(), symbol: 'Q16', name: 'Q16', amountSol: 0.005,
+      source: 'AUTO_SNIPER', provenance: 'REAL_ONCHAIN', eligibilityReport: createPassingEligibilityReport(VALID_PUMP_MINT_1.toBase58()),
+    } as any);
+    const armLive = () => {
+      (coordinator as any).realWalletBalanceSol = 1;
+      (coordinator as any).executionMode = 'LIVE';
+      (coordinator as any).isLiveTradingArmed = true;
+      vi.spyOn(workstationDb, 'getDailyTotalPnLSol').mockReturnValue(0);
+      vi.spyOn(workstationDb, 'hasUnresolvedLiveBuy').mockReturnValue(false); // the N2 case above leaves an unresolved buy of this mint
+      (riskEngine as any).lastTradeFailureTimestamp = 0;
+      (riskEngine as any).mintLastTradedMap?.clear?.();
+    };
+    const closeAllActive = () => {
+      for (const p of workstationDb.loadPositions(undefined, 'ACTIVE')) {
+        workstationDb.savePosition({ ...p, status: 'CLOSED', tokenQuantityRaw: '0', costBasisLamports: 0, currentValueSol: 0, currentPriceSol: p.entryPriceSol, realizedPnLSol: 0 } as any);
+      }
+    };
+
+    it('Q16: a second LIVE buy of a mint that already has an open LIVE row is refused and nothing is sent', async () => {
+      armLive(); // beforeEach left one ACTIVE LIVE row for VALID_PUMP_MINT_1
+      expect(workstationDb.loadPositions('LIVE', 'ACTIVE').some((p) => p.mint === VALID_PUMP_MINT_1.toBase58())).toBe(true);
+      const res = await buy();
+      expect(res.success).toBe(false);
+      expect(res.error).toMatch(/POSITION_ALREADY_OPEN/);
+      expect(submit).not.toHaveBeenCalled();
+    });
+
+    it('Q17: a disarm between risk approval and the send stops the buy', async () => {
+      closeAllActive();
+      armLive();
+      const realEvaluate = riskEngine.evaluateOrder.bind(riskEngine);
+      vi.spyOn(riskEngine, 'evaluateOrder').mockImplementation((r: any) => { const d = realEvaluate(r); (coordinator as any).isLiveTradingArmed = false; return d; });
+      const res = await buy();
+      expect(res.error).toMatch(/ENTRY_REVOKED.*disarmed/);
+      expect(submit).not.toHaveBeenCalled();
+    });
+
+    it('Q17: a halt or the kill switch between approval and the send stops the buy', async () => {
+      closeAllActive();
+      armLive();
+      const realEvaluate = riskEngine.evaluateOrder.bind(riskEngine);
+      const spy = vi.spyOn(riskEngine, 'evaluateOrder').mockImplementation((r: any) => { const d = realEvaluate(r); coordinator.haltAll('halted mid-order'); return d; });
+      const halted = await buy();
+      expect(halted.error).toMatch(/ENTRY_REVOKED.*halted/);
+      coordinator.clearHalt();
+      spy.mockImplementation((r: any) => { const d = realEvaluate(r); riskEngine.setKillSwitch(true); return d; });
+      (riskEngine as any).lastTradeFailureTimestamp = 0;
+      try {
+        const killed = await buy();
+        expect(killed.error).toMatch(/ENTRY_REVOKED.*kill switch/);
+      } finally { riskEngine.setKillSwitch(false); }
+      expect(submit).not.toHaveBeenCalled();
+    });
+
+    it('control: with nothing revoked the same buy is sent', async () => {
+      closeAllActive();
+      armLive();
+      submit.mockResolvedValue({ success: false, signature: '', transport: 'SOLANA_RPC', error: 'x', lifecycleState: 'SUBMIT_FAILED' });
+      await buy();
+      expect(submit).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('N20: the PENDING row is written before anything is sent', () => {
     const params = (sigByte: number, orderId: string) => ({
       tx: { signatures: [new Uint8Array(64).fill(sigByte)] } as any, orderId, correlationId: 'c-' + orderId, side: 'BUY' as const,

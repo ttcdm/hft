@@ -1314,9 +1314,11 @@ app.post('/api/wallet/close-position', requireOperatorAuth, validateBody(ClosePo
 
 app.post('/api/wallet/panic-liquidate', requireOperatorAuth, async (req, res) => {
   const result = await walletTrader.panicLiquidateAll();
+  await autoSnipeController.kill({ exitAll: false, reason: 'panic liquidate' }); // Q37: a panic also stops auto; it must not re-buy after the exits
+  const failedList = result.failed.map((f) => `${f.symbol}: ${f.error}`).join('; ');
   res.json({
-    success: true,
-    message: `Emergency liquidation complete. Attempted: ${result.attemptedCount}, Succeeded: ${result.succeeded.length}, Failed: ${result.failed.length}`,
+    success: result.failed.length === 0,
+    message: `Emergency liquidation ${result.failed.length === 0 ? 'complete' : 'INCOMPLETE, positions still open'}. Attempted: ${result.attemptedCount}, Succeeded: ${result.succeeded.length}, Failed: ${result.failed.length}${failedList ? ` (${failedList})` : ''}. Kill switch on, live trading disarmed, auto stopped.`,
     data: result,
     state: walletTrader.getState(),
   });

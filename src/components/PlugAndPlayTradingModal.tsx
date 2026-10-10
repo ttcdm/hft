@@ -1,3 +1,4 @@
+import { ARMED_MESSAGE, PANIC_CONFIRM_TEXT, panicOutcome } from '../utils/tradingCopy';
 import React, { useState, useEffect } from 'react';
 import {
   Wallet,
@@ -153,7 +154,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
       if (!res.ok) throw new Error(data.error || 'Failed to arm live trading');
 
       setStatusMessage({
-        text: 'LIVE TRADING ARMED: On-chain transactions will now execute via Jito MEV bundles with real SOL.',
+        text: ARMED_MESSAGE(systemAudit?.allowedCluster),
         type: 'success',
       });
       setShowArmConfirmModal(false);
@@ -260,16 +261,13 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   };
 
   const handlePanicLiquidate = async () => {
-    if (!confirm('EMERGENCY: Are you sure you want to close ALL open positions immediately and trip the circuit breaker?')) return;
+    if (!confirm(PANIC_CONFIRM_TEXT)) return;
     try {
       setIsLoading(true);
       const res = await authFetch('/api/wallet/panic-liquidate', { method: 'POST' });
       const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setStatusMessage({ text: data.message || data.error || `Panic liquidate failed (HTTP ${res.status}). Positions may still be open.`, type: 'error' });
-        return;
-      }
-      setStatusMessage({ text: data.message || 'Panic liquidate sent.', type: 'error' });
+      setStatusMessage(panicOutcome(res.ok, res.status, data));
+      if (!res.ok) return;
       await fetchSystemData();
     } catch (err: any) {
       setStatusMessage({ text: err.message || 'Panic liquidate failed', type: 'error' });

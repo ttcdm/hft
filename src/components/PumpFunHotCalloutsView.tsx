@@ -686,7 +686,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                                   target="_blank"
                                   rel="noreferrer"
                                   className="text-blue-300 bg-blue-500/20 border border-blue-500/40 hover:bg-blue-500/30 p-0.5 text-[9px] font-mono flex items-center gap-0.5 px-1 rounded transition"
-                                  title={`Verified Telegram: ${tgUrl}`}
+                                  title={`Telegram (creator-supplied, unverified): ${tgUrl}`}
                                 >
                                   <span className="font-bold">TG</span>
                                 </a>
@@ -703,7 +703,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                                   target="_blank"
                                   rel="noreferrer"
                                   className="text-emerald-300 bg-emerald-500/20 border border-emerald-500/40 hover:bg-emerald-500/30 p-0.5 text-[9px] font-mono flex items-center gap-0.5 px-1 rounded transition"
-                                  title={`Verified Website: ${webUrl}`}
+                                  title={`Website (creator-supplied, unverified): ${webUrl}`}
                                 >
                                   <Globe className="w-2.5 h-2.5" />
                                 </a>

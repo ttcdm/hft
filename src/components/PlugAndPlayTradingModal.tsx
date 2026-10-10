@@ -191,24 +191,6 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
     }
   };
 
-  const handleEmergencyKillSwitch = async (activate: boolean) => {
-    try {
-      setIsLoading(true);
-      const res = await authFetch('/api/execution/kill-switch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ activate }),
-      });
-      const data = await res.json();
-      setStatusMessage({ text: data.message, type: activate ? 'error' : 'info' });
-      await fetchSystemData();
-    } catch (err: any) {
-      setStatusMessage({ text: err.message, type: 'error' });
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
   const handleManualSnipe = async () => {
     if (!manualMint || manualMint.length < 32) {
       setStatusMessage({ text: 'Please enter a valid Solana token mint address', type: 'error' });

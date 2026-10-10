@@ -54,7 +54,7 @@ describe('142: devnet seeding guards', () => {
   });
 
   it('the CLI exits 2 before connecting for a mainnet, loopback or missing RPC URL, or a non-devnet cluster', () => {
-    const run = (env: Record<string, string>) => spawnSync(process.execPath, ['--import', 'tsx', 'scripts/devnet_seed.ts'], { // S8: no --execute; every case below must stop at a guard, and the test must not depend on that being the only thing standing between it and a send
+    const run = (env: Record<string, string | undefined>) => spawnSync(process.execPath, ['--import', 'tsx', 'scripts/devnet_seed.ts'], { // S8: no --execute; every case below must stop at a guard, and the test must not depend on that being the only thing standing between it and a send
       env: { PATH: process.env.PATH, HOME: process.env.HOME, APEX_ENV_FILE: '', ...env }, encoding: 'utf8', timeout: 60_000,
     });
     for (const env of [{ SOLANA_RPC_URL: 'https://api.mainnet-beta.solana.com' }, { SOLANA_RPC_URL: 'https://127.0.0.1:8899' }, {}, { SOLANA_RPC_URL: 'https://api.devnet.solana.com', ALLOWED_CLUSTER: 'mainnet' }]) {

@@ -33,7 +33,7 @@ const walSize = (): number | null => (fs.existsSync(checkoutWal) ? fs.statSync(c
 const walBefore = walSize();
 
 /** Startup reconciliation (including the wallet token scan) finishes in the background; arming before it is refused by design. */
-async function waitCanArm(call: (m: string, p: string, b?: unknown) => Promise<any>, timeoutMs = 60_000) {
+async function waitCanArm(call: (m: 'GET' | 'POST', p: string, b?: unknown) => Promise<any>, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs;
   let last: any;
   while (Date.now() < deadline) {

@@ -285,16 +285,16 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     const activePositions = executionCoordinator.getPositions(mode, 'ACTIVE');
     const closedPositions = executionCoordinator.getPositions(mode, 'CLOSED');
     const totalOpenCost = activePositions.reduce((s, p) => s + p.costBasisLamports / 1e9, 0);
-    const totalOpenValue = activePositions.reduce((s, p) => s + p.currentValueSol, 0);
+    const totalOpenValue = activePositions.reduce((s, p) => s + (p.currentValueSol ?? 0), 0);
     const availableSol = Math.max(0, this.config.allocatedSol - totalOpenCost);
 
     const solPriceUsd = solPriceService.lastKnownPrice(); // null when no price has ever been read
     const totalPortfolioValueUsd = solPriceUsd === null ? null : (availableSol + totalOpenValue) * solPriceUsd;
-    const totalUnrealizedPnLSol = activePositions.reduce((s, p) => s + (Number.isFinite(p.unrealizedPnLSol) ? p.unrealizedPnLSol : 0), 0);
+    const totalUnrealizedPnLSol = activePositions.reduce((s, p) => s + (Number.isFinite(p.unrealizedPnLSol) ? (p.unrealizedPnLSol as number) : 0), 0);
     const totalRealizedPnLSol = workstationDb.getDailyRealizedPnLSol(mode);
     const totalRealizedPnLUsd = solPriceUsd === null ? null : totalRealizedPnLSol * solPriceUsd;
 
-    const totalJitoTipsPaidSol = activePositions.reduce((s, p) => s + p.jitoTipLamports / 1e9, 0);
+    const totalJitoTipsPaidSol = activePositions.reduce((s, p) => s + (p.jitoTipLamports ?? 0) / 1e9, 0);
 
     const signerStatus = localSigner.getStatus();
     const walletAddress =

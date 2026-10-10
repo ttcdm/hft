@@ -118,7 +118,11 @@ export function AutoPanel() {
   return (
     <AutoPanelView status={shown} busy={busy} error={error} code={code} onCode={setCode}
       onMode={(m) => post('/api/auto/mode', { mode: m, confirmationCode: m === 'DEVNET_LIVE' ? code : undefined })}
-      onKill={() => post('/api/auto/kill', { exitAll: true, reason: 'operator kill from panel' })}
+      onKill={() => {
+        // Q45: KILL sells every position the auto trader opened, so it asks first
+        if (typeof window !== 'undefined' && !window.confirm('KILL AUTO: switch auto to OFF and sell every position it bought. Continue?')) return;
+        void post('/api/auto/kill', { exitAll: true, reason: 'operator kill from panel' });
+      }}
       onResume={() => post('/api/auto/resume', { clearHalt: true })} />
   );
 }

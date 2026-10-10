@@ -105,7 +105,7 @@ export const DeployBotModal: React.FC<DeployBotModalProps> = ({
       archetype: formData.archetype,
       assetClass: formData.assetClass,
       symbol: formData.symbol,
-      isRunning: true,
+      isRunning: false, // Q43: nothing is deployed to a server; the entry is a local record
       winRate: 0, // no trades yet; nothing to measure
       pnl: 0,
       tradesCount: 0,
@@ -127,7 +127,7 @@ export const DeployBotModal: React.FC<DeployBotModalProps> = ({
           <div className="flex items-center space-x-2">
             <Bot className="w-5 h-5 text-cyan-400" />
             <h3 className="text-sm font-bold text-white font-mono uppercase tracking-wider">
-              Deploy High-Frequency Trading Bot
+              Add a Strategy Record
             </h3>
           </div>
           <button onClick={onClose} className="text-slate-400 hover:text-white font-mono">
@@ -286,7 +286,7 @@ export const DeployBotModal: React.FC<DeployBotModalProps> = ({
               className="px-5 py-2 rounded bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-500 hover:to-cyan-500 text-white font-bold flex items-center space-x-1.5 shadow-lg shadow-cyan-500/20"
             >
               <Plus className="w-3.5 h-3.5" />
-              <span>Deploy Strategy</span>
+              <span>Add Strategy to List</span>
             </button>
           </div>
         </form>

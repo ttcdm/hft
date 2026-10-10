@@ -1035,7 +1035,7 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, async (req, res) =
         mint: c.token.mint,
         action: c.hftAction,
         confluenceCount: c.confluenceCount,
-        callers: [`@${c.caller.userId}`, ...c.otherCallers],
+        callers: [`@${c.caller.userId}`, ...(c.otherCallers ?? [])],
       })),
     },
     simulationScopeMatrix: [

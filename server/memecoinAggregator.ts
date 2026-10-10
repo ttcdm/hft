@@ -316,8 +316,8 @@ export class MemecoinAggregatorService extends EventEmitter {
       const entryPriceUsd = p.entryPriceSol * this.solPriceUsd;
       const currentPriceUsd = p.currentPriceSol * this.solPriceUsd;
       const costBasisUsd = (p.costBasisLamports / 1e9) * this.solPriceUsd;
-      const currentValueUsd = p.currentValueSol * this.solPriceUsd;
-      const unrealizedPnlUsd = p.unrealizedPnLSol * this.solPriceUsd;
+      const currentValueUsd = (p.currentValueSol ?? 0) * this.solPriceUsd;
+      const unrealizedPnlUsd = (p.unrealizedPnLSol ?? 0) * this.solPriceUsd;
 
       return {
         id: p.id,
@@ -332,10 +332,10 @@ export class MemecoinAggregatorService extends EventEmitter {
         costBasisUsd,
         currentValueUsd,
         unrealizedPnlUsd,
-        unrealizedPnlPct: p.unrealizedPnLPct,
+        unrealizedPnlPct: p.unrealizedPnLPct ?? 0,
         targetTpPct: this.config.takeProfitPct,
         targetSlPct: -this.config.stopLossPct,
-        priorityFeeSol: p.jitoTipLamports / 1e9,
+        priorityFeeSol: (p.jitoTipLamports ?? 0) / 1e9,
         openedAt: p.entryTimestamp,
         status: p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED' ? 'OPEN' : 'CLOSED',
         txHash: p.entryTxSignature,

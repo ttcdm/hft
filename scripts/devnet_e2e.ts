@@ -146,7 +146,7 @@ async function main() {
   if (phase === 'crash') {
     // Kill the process the instant the RPC returns a signature, before confirmation is recorded.
     const orig = Connection.prototype.sendRawTransaction;
-    Connection.prototype.sendRawTransaction = async function (...a: any[]) {
+    Connection.prototype.sendRawTransaction = async function (this: InstanceType<typeof Connection>, ...a: any[]) {
       const sig = await (orig as any).apply(this, a);
       console.log(`CRASH_AFTER_SUBMIT ${sig}`);
       process.exit(137);

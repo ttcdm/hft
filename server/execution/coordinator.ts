@@ -590,7 +590,7 @@ export class ExecutionCoordinator {
   }> {
     if (opts.fresh && this.reconcileInFlight) {
       if (!this.reconcileFollowUp) {
-        const follow: NonNullable<typeof this.reconcileFollowUp> = this.reconcileInFlight
+        const follow: Promise<{ status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE'; mismatchesCount: number; details: string }> = this.reconcileInFlight
           .catch(() => undefined)
           .then(() => {
             if (this.reconcileFollowUp === follow) this.reconcileFollowUp = null; // later fresh callers start their own
@@ -1193,7 +1193,7 @@ export class ExecutionCoordinator {
           if (rejected) this.raiseOperatorAlert('MARK_MINT_REJECTED', `${pos.symbol || pos.mint.slice(0, 6)} cannot be marked: ${rejected}. The position keeps its last mark and goes stale.`, pos.id); // R19
           // Mark age increases honestly
           const baseTimestamp = pos.lastMarkTimestamp || pos.lastUpdatedTimestamp;
-          pos.markAgeMs = now - baseTimestamp;
+          if (baseTimestamp) pos.markAgeMs = now - baseTimestamp;
           workstationDb.savePosition(pos);
         }
       }
@@ -2123,7 +2123,7 @@ export class ExecutionCoordinator {
     );
 
     if (needsHolderVerification) {
-      let holderDist = null;
+      let holderDist: Awaited<ReturnType<typeof fetchTokenHolderDistribution>> | null = null;
       try {
         holderDist = await fetchTokenHolderDistribution(
           this.connection,
@@ -2155,7 +2155,7 @@ export class ExecutionCoordinator {
       );
     }
 
-    const verdict = this.eligibilityVerdict(eligibility, now, 'LIVE', correlationId);
+    const verdict = this.eligibilityVerdict(eligibility!, now, 'LIVE', correlationId); // set above whenever it was missing
     if (verdict) return verdict;
 
     // Q16: one open LIVE row per mint. A second buy over the same token account leaves two rows against one balance (the N3 adoption and the

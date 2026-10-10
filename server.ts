@@ -555,11 +555,6 @@ app.post('/api/ai/diagnostics', requireOperatorAuth, async (req, res) => {
   if (!ai) {
     return res.status(503).json({
       error: 'GEMINI_API_KEY is not configured. Add it in AI Studio Settings to activate AI Quant Diagnostics.',
-      offlineAnalysis: {
-        recommendation: 'Risk profile looks balanced for high-watermark scaling. Recommended inventory gamma adjustment: 0.12.',
-        estimatedSharpe: 2.85,
-        riskScore: 'LOW_RISK',
-      },
     });
   }
 

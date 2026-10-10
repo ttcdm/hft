@@ -63,13 +63,7 @@ export const AiDiagnosticsModal: React.FC<AiDiagnosticsModalProps> = ({
 
       const data = await res.json();
       if (!res.ok) {
-        if (data.offlineAnalysis) {
-          setResult({
-            analysis: `[Offline Diagnostic Engine]: ${data.offlineAnalysis.recommendation}\n\nEstimated Sharpe: ${data.offlineAnalysis.estimatedSharpe}\nRisk Assessment: ${data.offlineAnalysis.riskScore}\n\n(Note: Configure GEMINI_API_KEY in AI Studio Settings to activate full Deep Thinking Mode with gemini-3.1-pro-preview)`,
-          });
-        } else {
-          setError(data.error || 'Diagnostic request failed.');
-        }
+        setError(data.error || 'Diagnostic request failed.'); // Q38: no canned analysis when the model is unavailable
       } else {
         setResult(data);
       }

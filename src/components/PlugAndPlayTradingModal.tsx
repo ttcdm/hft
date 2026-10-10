@@ -469,8 +469,8 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                 </h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-slate-300 text-[11px] leading-relaxed">
                   <div className="p-2.5 rounded-lg bg-slate-900/60 border border-slate-800 space-y-1">
-                    <strong className="text-white block">1. Micro-Capital $10 Envelope:</strong>
-                    Max trade size is capped strictly at 0.02 SOL (~$2.90 USD). Max aggregate exposure is capped at 0.06 SOL (~$8.70 USD) to ensure rent exemption and transaction fees are preserved.
+                    <strong className="text-white block">1. Server-enforced size caps:</strong>
+                    Max trade size and aggregate exposure are capped by the server's risk limits (MAX_POSITION_SIZE_SOL and the capital tier), and a SOL reserve for rent and fees is kept back. The live numbers are on the wallet strip, not here.
                   </div>
                   <div className="p-2.5 rounded-lg bg-slate-900/60 border border-slate-800 space-y-1">
                     <strong className="text-white block">2. Signer Isolation & Security:</strong>

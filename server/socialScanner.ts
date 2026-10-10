@@ -67,7 +67,7 @@ const INITIAL_SIGNALS: SocialSignal[] = [
       twitter: 'https://x.com/search?q=%24GOAT+solana',
       telegram: 'https://t.me/sol_cabal_insider_bot',
     },
-    isLiveFeed: true,
+    isLiveFeed: false,
   },
   {
     id: 'sig-002',
@@ -99,7 +99,7 @@ const INITIAL_SIGNALS: SocialSignal[] = [
       website: 'https://www.moodengsol.com/',
       dexScreener: 'https://dexscreener.com/solana/ED5nyyWEzpPPiWimP8vYm7sD7TD3LAt3Q3gRTWHzPJBY',
     },
-    isLiveFeed: true,
+    isLiveFeed: false,
   },
   {
     id: 'sig-003',
@@ -131,7 +131,7 @@ const INITIAL_SIGNALS: SocialSignal[] = [
       twitter: 'https://x.com/search?q=%24PNUT+solana',
       telegram: 'https://t.me/raydium_clmm_scanner',
     },
-    isLiveFeed: true,
+    isLiveFeed: false,
   },
   {
     id: 'sig-004',
@@ -162,7 +162,7 @@ const INITIAL_SIGNALS: SocialSignal[] = [
       dexScreener: 'https://dexscreener.com/solana/HeLp6NuQkmYB4pYWo2zYs22mESHXPQYzXbB8n4V98jwC',
       website: 'https://ai16z.ai',
     },
-    isLiveFeed: true,
+    isLiveFeed: false,
   },
   {
     id: 'sig-005',
@@ -193,7 +193,7 @@ const INITIAL_SIGNALS: SocialSignal[] = [
       dexScreener: 'https://dexscreener.com/solana/Df6yfrKC8kZE3KNkrHERKzAChSxGQW5v68tK4yWBpump',
       twitter: 'https://x.com/search?q=%24CHILLGUY+solana',
     },
-    isLiveFeed: true,
+    isLiveFeed: false,
   },
 ];
 

@@ -601,9 +601,9 @@ export function run60DayBacktest(customConfig?: Partial<BacktestConfig>): Backte
       : 0.0001;
   const downsideStdDev = Math.sqrt(downsideVariance);
 
-  const annualizedSharpe = dailyStdDev > 0 ? (avgDailyReturn / dailyStdDev) * Math.sqrt(365) : 3.2;
-  const annualizedSortino = downsideStdDev > 0 ? (avgDailyReturn / downsideStdDev) * Math.sqrt(365) : 4.5;
-  const calmarRatio = maxDrawdownPct > 0 ? (roiPct / maxDrawdownPct) : 10.0;
+  const annualizedSharpe = dailyStdDev > 0 ? (avgDailyReturn / dailyStdDev) * Math.sqrt(365) : 0;
+  const annualizedSortino = downsideStdDev > 0 ? (avgDailyReturn / downsideStdDev) * Math.sqrt(365) : 0;
+  const calmarRatio = maxDrawdownPct > 0 ? (roiPct / maxDrawdownPct) : 0;
 
   const totalTrades = dailyRecords.reduce((acc, r) => acc + r.tradesCount, 0);
   const totalWins = dailyRecords.reduce((acc, r) => acc + r.winCount, 0);

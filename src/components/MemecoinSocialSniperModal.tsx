@@ -1,3 +1,4 @@
+import { signalFeedBadge } from '../utils/signalBadge';
 import { probeBadge, probeLatency, hostOfService } from '../utils/probeBadge';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
 import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
@@ -734,11 +735,14 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                             )}
 
                             {/* Live Ingestion Indicator */}
-                            {sig.isLiveFeed && (
+                            {signalFeedBadge(sig) === 'LIVE' && (
                               <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 flex items-center space-x-1">
                                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
                                 <span>LIVE</span>
                               </span>
+                            )}
+                            {signalFeedBadge(sig) === 'SYNTHETIC' && (
+                              <span data-testid="synthetic-badge" className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-amber-500/15 text-amber-300 border border-amber-500/30">SYNTHETIC</span>
                             )}
                           </div>
                         </div>

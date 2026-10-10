@@ -53,17 +53,18 @@ describe('L8: an all-trading halt survives a restart', () => {
     const c = make(false);
     c.haltAll('test halt');
     const impl = vi.spyOn(c as any, 'closePositionImpl').mockResolvedValue({ success: true, pnlSol: 0, status: 'CLOSED' });
-    for (const reason of ['STOP_LOSS', 'TRAILING_STOP', 'MANUAL', 'Manual Close', 'EMERGENCY_PANIC_LIQUIDATION']) {
+    // Q11: 'Manual user order', 'Aggregator Close' and 'Operator close' are what the operator's HTTP/WS close routes pass (every caller of the aggregator close is operator-initiated)
+    for (const reason of ['STOP_LOSS', 'TRAILING_STOP', 'MANUAL', 'Manual Close', 'EMERGENCY_PANIC_LIQUIDATION', 'Manual user order', 'Aggregator Close', 'Operator close']) {
       const r = await c.closePosition('p1', 100, reason);
       expect(r.success, reason).toBe(true);
     }
-    expect(impl).toHaveBeenCalledTimes(5);
-    for (const reason of ['TAKE_PROFIT_1', 'TAKE_PROFIT_2', 'STALE_POSITION', 'Aggregator Close']) {
+    expect(impl).toHaveBeenCalledTimes(8);
+    for (const reason of ['TAKE_PROFIT_1', 'TAKE_PROFIT_2', 'STALE_POSITION']) {
       const r = await c.closePosition('p1', 100, reason);
       expect(r.success, reason).toBe(false);
       expect(r.error, reason).toMatch(/TRADING_HALTED/);
     }
-    expect(impl).toHaveBeenCalledTimes(5);
+    expect(impl).toHaveBeenCalledTimes(8);
   });
 
   it('S2: the rent of the token account a buy opens does not read as an unexplained loss, but a real drain still does', () => {

@@ -62,3 +62,4 @@ env.txt
 
 # ─── Seed-run buyer wallets (secret keys) ────────────────────────────────────
 .overnight/seed-wallets/
+.overnight/seed-funder*.json

@@ -7,6 +7,8 @@
  *   npx tsx scripts/devnet_seed.ts --execute       spends devnet SOL (needs the operator's go-ahead)
  *   npx tsx scripts/devnet_seed.ts --sweep .overnight/seed-wallets/<mint>.json     bring the SOL in a saved run's buyer wallets back to its funder
  *   --funder-keyfile <file> (or SEED_FUNDER_KEYPAIR_PATH): pay from a separate devnet wallet, not the app wallet
+ *   npx tsx scripts/devnet_seed.ts --make-funder <file> --fund-sol <x> --confirm-auto-off
+ *       create that separate wallet: a fresh keypair file (0600) funded with x SOL (max 0.5) from the app wallet. Auto mode must be OFF. Prints only the public key.
  *   options: --buyers 30  --buy-sol 0.01  --window-s 30  --cap-sol 0.45  --no-sweep
  *
  * The funder is the wallet the app uses (OPERATOR_PRIVATE_KEY / SOLANA_PRIVATE_KEY / SIGNER_KEYPAIR_PATH, read from `.env`).
@@ -28,6 +30,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, ComputeBudgetProgram } from '@solana/web3.js';
 
 export const HARD_CAP_SOL = 0.45;
@@ -390,6 +393,76 @@ export async function sweepFromFile(o: { connection: Connection; allowedGenesis:
   return { wallets: wallets.length, sweptSol: swept / LAMPORTS_PER_SOL, funder: funder.toBase58(), mint };
 }
 
+// ---- make-funder -------------------------------------------------------------------------------------------------------
+/** The most one `--make-funder` run may move out of the app wallet. */
+export const MAX_MAKE_FUNDER_SOL = 0.5;
+/** Left in the app wallet after a make-funder transfer (its own fee plus a margin). */
+const MAKE_FUNDER_APP_RESERVE_SOL = 0.01;
+
+/** True when git says `file` is inside a repository and not ignored; false when ignored or outside any repository. */
+function trackedByGitAndNotIgnored(file: string): boolean {
+  const abs = path.resolve(file);
+  try { execFileSync('git', ['check-ignore', '-q', '--', abs], { cwd: path.dirname(abs), stdio: 'ignore' }); return false; }
+  catch (e: any) { return e?.status === 1; } // 1: inside a repo, not ignored. 128: not a repo (or git missing): nothing to leak into.
+}
+
+export interface MakeFunderOptions {
+  connection: Connection;
+  /** The wallet that pays (the app wallet). */
+  signer: SeedSigner;
+  allowedGenesis: string;
+  /** Where the new funder's keypair goes (a Solana keypair JSON, mode 0600, created with its directory at 0700). Must not exist. */
+  file: string;
+  fundSol: number;
+  /** The caller states that the app's auto mode is OFF; otherwise its wallet audit reads this transfer as an unexplained drain and halts trading. */
+  autoOffConfirmed: boolean;
+  log?: (m: string) => void;
+  sleep?: (ms: number) => Promise<void>;
+  retry?: RetryOptions;
+}
+
+export interface MakeFunderResult { pubkey: string; file: string; fundedSol: number; signature: string }
+
+/**
+ * Generates a fresh keypair file for the seed funder and moves `fundSol` (at most 0.5) into it from the app wallet, under the same
+ * guards as the seed (devnet genesis checked before anything is written or sent). The key file is written first, so a failure after
+ * the transfer cannot strand the money; it is never overwritten, and never printed.
+ */
+export async function makeFunder(o: MakeFunderOptions): Promise<MakeFunderResult> {
+  const log = o.log ?? (() => undefined);
+  const sleep = o.sleep ?? sleepReal;
+  if (!Number.isFinite(o.fundSol) || o.fundSol <= 0) throw new SeedGuardError('--fund-sol must be a positive number');
+  if (o.fundSol > MAX_MAKE_FUNDER_SOL) throw new SeedGuardError(`--fund-sol ${o.fundSol} is over the ${MAX_MAKE_FUNDER_SOL} SOL limit`);
+  if (!o.autoOffConfirmed) throw new SeedGuardError('auto mode must be OFF while the app wallet funds a seed funder (its wallet audit would halt trading on the transfer); confirm with --confirm-auto-off once it is');
+  if (!o.file || o.file.startsWith('--')) throw new SeedGuardError('--make-funder needs a file path');
+  if (fs.existsSync(o.file)) throw new SeedGuardError(`${o.file} already exists; refusing to overwrite a key file`);
+  if (trackedByGitAndNotIgnored(o.file)) throw new SeedGuardError(`${o.file} is inside a git repository and not ignored; use a path under .overnight/ (ignored) or outside the repository`);
+  const conn = retryingConnection(o.connection, sleep, o.retry, (m) => log(`retry ${m}`));
+  const genesisHash = await conn.getGenesisHash();
+  if (genesisHash !== o.allowedGenesis) throw new SeedGuardError(`genesis hash ${genesisHash} is not the allowed cluster's (${o.allowedGenesis}); nothing was written or sent`);
+  const balance = (await conn.getBalance(o.signer.publicKey, 'confirmed')) / LAMPORTS_PER_SOL;
+  if (balance < o.fundSol + MAKE_FUNDER_APP_RESERVE_SOL) throw new SeedGuardError(`the app wallet holds ${balance.toFixed(4)} SOL; funding ${o.fundSol} needs a ${MAKE_FUNDER_APP_RESERVE_SOL} reserve on top`);
+
+  const kp = Keypair.generate();
+  fs.mkdirSync(path.dirname(path.resolve(o.file)), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(o.file, JSON.stringify(Array.from(kp.secretKey)), { flag: 'wx', mode: 0o600 });
+  fs.chmodSync(o.file, 0o600);
+  const tx = new Transaction().add(SystemProgram.transfer({ fromPubkey: o.signer.publicKey, toPubkey: kp.publicKey, lamports: Math.round(o.fundSol * LAMPORTS_PER_SOL) }));
+  tx.recentBlockhash = (await conn.getLatestBlockhash('confirmed')).blockhash;
+  tx.feePayer = o.signer.publicKey;
+  await o.signer.sign(tx);
+  const signature = await conn.sendRawTransaction(tx.serialize());
+  for (let i = 0; ; i++) {
+    const st = (await conn.getSignatureStatuses([signature])).value[0];
+    if (st?.err) throw new Error(`funding transfer ${signature.slice(0, 8)} failed: ${JSON.stringify(st.err)} (the new key file ${o.file} holds no funds)`);
+    if (st?.confirmationStatus === 'confirmed' || st?.confirmationStatus === 'finalized') break;
+    if (i >= 60) throw new Error(`funding transfer ${signature.slice(0, 8)} not confirmed in 40 s; check the balance of ${kp.publicKey.toBase58()} (key file ${o.file})`);
+    await sleep(700);
+  }
+  log(`seed funder ${kp.publicKey.toBase58()} funded with ${o.fundSol} SOL`);
+  return { pubkey: kp.publicKey.toBase58(), file: o.file, fundedSol: o.fundSol, signature };
+}
+
 // ---- CLI -------------------------------------------------------------------------------------------------------------
 async function main() {
   await import('../server/loadEnv');
@@ -405,6 +478,21 @@ async function main() {
     if (flag('funder-keyfile') && (!keyfile || keyfile.startsWith('--'))) throw new SeedGuardError('--funder-keyfile needs a file path');
     if (keyfile && !flag('sweep')) loadFunderKeypair(keyfile); // a bad keyfile fails here, before any connection
     const conn = new Connection(rpcUrl, { commitment: 'confirmed', disableRetryOnRateLimit: false });
+    if (flag('make-funder')) {
+      const file = val('make-funder');
+      if (!file || file.startsWith('--')) throw new SeedGuardError('--make-funder needs a file path');
+      if (flag('funder-keyfile')) throw new SeedGuardError('--make-funder pays from the app wallet; do not combine it with --funder-keyfile');
+      const { localSigner } = await import('../server/solana/signer');
+      const pub = localSigner.getPublicKey?.();
+      const appKp = localSigner.exportKeypair();
+      if (!pub || !appKp) throw new SeedGuardError('no app wallet: set OPERATOR_PRIVATE_KEY or SIGNER_KEYPAIR_PATH in .env');
+      const r = await makeFunder({
+        connection: conn, allowedGenesis: DEVNET_GENESIS_HASH, file, fundSol: Number(val('fund-sol')), autoOffConfirmed: flag('confirm-auto-off'),
+        signer: { publicKey: pub, sign: async (tx) => { tx.partialSign(appKp); } },
+      });
+      console.log(r.pubkey); // only the public key; the secret stays in the file
+      return;
+    }
     if (flag('sweep')) {
       const file = val('sweep');
       if (!file || file.startsWith('--')) throw new SeedGuardError('--sweep needs the wallet file path');

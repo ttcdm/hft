@@ -160,6 +160,31 @@ async function main() {
     }
   }
 
+  // 8. S29: --make-funder creates and funds the separate seed funder from the "app" wallet; the seed then runs from it and never touches the app wallet.
+  {
+    const { makeFunder, loadFunderKeypair, MAX_MAKE_FUNDER_SOL } = await import('../devnet_seed');
+    const appKp = Keypair.generate();
+    await conn.requestAirdrop(appKp.publicKey, 1 * LAMPORTS_PER_SOL);
+    const appSigner = { publicKey: appKp.publicKey, sign: async (tx: any) => { tx.partialSign(appKp); } };
+    const keyFile = path.join(scratch, 'funder-dir', 'seed-funder.json');
+    const appBefore = await conn.getBalance(appKp.publicKey);
+    let refusedWrong = false;
+    try { await makeFunder({ connection: conn, signer: appSigner, allowedGenesis: 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG', file: keyFile, fundSol: 0.2, autoOffConfirmed: true }); } catch { refusedWrong = true; }
+    rec('make-funder refuses a different genesis: no key written, nothing sent', refusedWrong && !fs.existsSync(keyFile) && (await conn.getBalance(appKp.publicKey)) === appBefore, 'refused');
+    const made = await makeFunder({ connection: conn, signer: appSigner, allowedGenesis: info.genesisHash, file: keyFile, fundSol: 0.2, autoOffConfirmed: true, sleep: async () => undefined });
+    const fundedLamports = await conn.getBalance(new PublicKey(made.pubkey));
+    const appAfter = await conn.getBalance(appKp.publicKey);
+    rec('make-funder: the new wallet holds exactly the amount; the app wallet paid it plus one fee', fundedLamports === 200_000_000 && appBefore - appAfter === 200_000_000 + 5000, `funder ${fundedLamports} lamports, app paid ${appBefore - appAfter}`);
+    rec('make-funder: key file 0600 in a 0700 directory, matches the printed public key', (fs.statSync(keyFile).mode & 0o777) === 0o600 && (fs.statSync(path.dirname(keyFile)).mode & 0o777) === 0o700 && loadFunderKeypair(keyFile).publicKey.toBase58() === made.pubkey, made.pubkey.slice(0, 6) + '...');
+    let overCap = false;
+    try { await makeFunder({ connection: conn, signer: appSigner, allowedGenesis: info.genesisHash, file: path.join(scratch, 'funder-dir', 'over.json'), fundSol: MAX_MAKE_FUNDER_SOL + 0.01, autoOffConfirmed: true }); } catch { overCap = true; }
+    rec('make-funder refuses more than the cap', overCap && !fs.existsSync(path.join(scratch, 'funder-dir', 'over.json')), `cap ${MAX_MAKE_FUNDER_SOL} SOL`);
+    const fk = loadFunderKeypair(keyFile);
+    const appMid = await conn.getBalance(appKp.publicKey);
+    const seeded = await runSeed({ connection: conn, signer: { publicKey: fk.publicKey, sign: async (tx: any) => { tx.partialSign(fk); } }, allowedGenesis: info.genesisHash, dryRun: false, walletDir: path.join(scratch, 'mf-wallets'), buyers: 3, minSendGapMs: 20, sleep: async () => undefined });
+    rec('a seed run paid from the made funder lands its buys and leaves the app wallet untouched', seeded.buysLanded === 3 && (await conn.getBalance(appKp.publicKey)) === appMid, `${seeded.buysLanded}/3 landed, app wallet change ${(await conn.getBalance(appKp.publicKey)) - appMid} lamports`);
+  }
+
   const failed = checks.filter((c) => !c.ok);
   console.log(`\nSEED_PROOF ${failed.length ? 'FAILED: ' + failed.map((f) => f.name).join(', ') : 'OK'} (${checks.length} checks)`);
   return failed.length ? 1 : 0;

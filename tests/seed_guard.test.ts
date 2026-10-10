@@ -54,7 +54,7 @@ describe('142: devnet seeding guards', () => {
   });
 
   it('the CLI exits 2 before connecting for a mainnet, loopback or missing RPC URL, or a non-devnet cluster', () => {
-    const run = (env: Record<string, string>) => spawnSync(process.execPath, ['--import', 'tsx', 'scripts/devnet_seed.ts', '--execute'], {
+    const run = (env: Record<string, string>) => spawnSync(process.execPath, ['--import', 'tsx', 'scripts/devnet_seed.ts'], { // S8: no --execute; every case below must stop at a guard, and the test must not depend on that being the only thing standing between it and a send
       env: { PATH: process.env.PATH, HOME: process.env.HOME, APEX_ENV_FILE: '', ...env }, encoding: 'utf8', timeout: 60_000,
     });
     for (const env of [{ SOLANA_RPC_URL: 'https://api.mainnet-beta.solana.com' }, { SOLANA_RPC_URL: 'https://127.0.0.1:8899' }, {}, { SOLANA_RPC_URL: 'https://api.devnet.solana.com', ALLOWED_CLUSTER: 'mainnet' }]) {
@@ -62,6 +62,21 @@ describe('142: devnet seeding guards', () => {
       expect(r.status, JSON.stringify(env) + r.stderr).toBe(2);
       expect(r.stderr).toMatch(/SEED_GUARD/);
     }
+  });
+
+  it('S8: a devnet URL with no funder wallet exits 2 with the "no funder wallet" message, before any connection', () => {
+    const r = spawnSync(process.execPath, ['--import', 'tsx', 'scripts/devnet_seed.ts'], {
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, APEX_ENV_FILE: '', SOLANA_RPC_URL: 'https://api.devnet.solana.com', SIGNER_KEYPAIR_PATH: '/nonexistent/none.json' }, encoding: 'utf8', timeout: 60_000,
+    });
+    expect(r.status, r.stderr).toBe(2);
+    expect(r.stderr).toMatch(/no funder wallet/);
+  });
+
+  it('S8: the library refuses the mainnet genesis hash even when the caller passes it as the allowed one', async () => {
+    const MAINNET = '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';
+    const { c, calls } = fakeConn(MAINNET, 2_000_000_000);
+    await expect(runSeed({ connection: c, signer: signer(), allowedGenesis: MAINNET, dryRun: false })).rejects.toThrow(/mainnet-beta genesis hash is never allowed/);
+    expect(calls).toEqual([]);
   });
 
   it('the CLI cannot be told a different genesis or cluster, and spends only with --execute', () => {

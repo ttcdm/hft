@@ -39,6 +39,14 @@ import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transa
 
 export const HARD_CAP_SOL = 0.45;
 export const DEVNET_GENESIS_HASH = 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG';
+/** S8: mainnet-beta's genesis hash. The library refuses it whatever `allowedGenesis` says, so no caller can point a run at mainnet by passing it in. */
+export const MAINNET_GENESIS_HASH = '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';
+
+/** Throws unless `got` is the allowed cluster's genesis hash and not mainnet's. Every function that can send goes through this. */
+export function assertGenesisAllowed(got: string, allowed: string, what = 'nothing was sent'): void {
+  if (got === MAINNET_GENESIS_HASH || allowed === MAINNET_GENESIS_HASH) throw new SeedGuardError(`the mainnet-beta genesis hash is never allowed here; ${what}`);
+  if (got !== allowed) throw new SeedGuardError(`genesis hash ${got} is not the allowed cluster's (${allowed}); ${what}`);
+}
 /** Token-2022 token account rent plus the one-time pump account the first buy of a wallet creates, measured on the local chain: a fresh wallet's first 0.01 SOL buy cost it at most 0.01352 SOL (buy, curve fee, tx fee, Token-2022 account rent, the one-time pump account), plus the 0.00089 SOL a wallet must keep to stay rent-exempt, which is why a buyer that ends with less fails InsufficientFundsForRent. */
 export const BUYER_ACCOUNT_OVERHEAD_SOL = 0.0044;
 /** What the create transaction costs the creator (mint, curve and token accounts), measured on the local chain. */
@@ -254,7 +262,7 @@ export async function runSeed(o: SeedOptions): Promise<SeedReport> {
   const conn = retryingConnection(o.connection, sleep, o.retry, (m) => log(`retry ${m}`));
 
   const genesisHash = await conn.getGenesisHash();
-  if (genesisHash !== o.allowedGenesis) throw new SeedGuardError(`genesis hash ${genesisHash} is not the allowed cluster's (${o.allowedGenesis}); nothing was sent`);
+  assertGenesisAllowed(genesisHash, o.allowedGenesis);
   const balance = (await conn.getBalance(signer.publicKey, 'confirmed')) / LAMPORTS_PER_SOL;
   const report: SeedReport = { dryRun: !!o.dryRun, plan, genesisHash, funder: signer.publicKey.toBase58(), funderBalanceSol: balance, buyers: [], buysLanded: 0, signatures: [] };
   if (balance < plan.grossSol + FUNDER_RESERVE_SOL) throw new SeedGuardError(`funder holds ${balance.toFixed(4)} SOL; the plan needs ${plan.grossSol.toFixed(4)} plus a ${FUNDER_RESERVE_SOL} reserve`);
@@ -387,7 +395,7 @@ export async function sweepFromFile(o: { connection: Connection; allowedGenesis:
   const sleep = o.sleep ?? sleepReal;
   const conn = retryingConnection(o.connection, sleep, o.retry, (m) => log(`retry ${m}`));
   const genesis = await conn.getGenesisHash();
-  if (genesis !== o.allowedGenesis) throw new SeedGuardError(`genesis hash ${genesis} is not the allowed cluster's (${o.allowedGenesis}); nothing was sent`);
+  assertGenesisAllowed(genesis, o.allowedGenesis);
   const { funder, mint, wallets } = loadWalletFile(o.file);
   const minGap = o.minSendGapMs ?? 400;
   let lastSendAt = 0;
@@ -443,7 +451,7 @@ export async function makeFunder(o: MakeFunderOptions): Promise<MakeFunderResult
   if (trackedByGitAndNotIgnored(o.file)) throw new SeedGuardError(`${o.file} is inside a git repository and not ignored; use a path under .overnight/ (ignored) or outside the repository`);
   const conn = retryingConnection(o.connection, sleep, o.retry, (m) => log(`retry ${m}`));
   const genesisHash = await conn.getGenesisHash();
-  if (genesisHash !== o.allowedGenesis) throw new SeedGuardError(`genesis hash ${genesisHash} is not the allowed cluster's (${o.allowedGenesis}); nothing was written or sent`);
+  assertGenesisAllowed(genesisHash, o.allowedGenesis, 'nothing was written or sent');
   const balance = (await conn.getBalance(o.signer.publicKey, 'confirmed')) / LAMPORTS_PER_SOL;
   if (balance < o.fundSol + MAKE_FUNDER_APP_RESERVE_SOL) throw new SeedGuardError(`the app wallet holds ${balance.toFixed(4)} SOL; funding ${o.fundSol} needs a ${MAKE_FUNDER_APP_RESERVE_SOL} reserve on top`);
 
@@ -516,7 +524,8 @@ async function main() {
       } catch { /* no app wallet configured: nothing to compare */ }
     } else {
       const { localSigner } = await import('../server/solana/signer');
-      const pub = localSigner.getPublicKey?.();
+      let pub: PublicKey | undefined;
+      try { pub = localSigner.getPublicKey(); } catch { /* getPublicKey throws when no signer is configured */ }
       if (!pub) throw new SeedGuardError('no funder wallet: set OPERATOR_PRIVATE_KEY or SIGNER_KEYPAIR_PATH in .env, or give --funder-keyfile / SEED_FUNDER_KEYPAIR_PATH');
       const kp = localSigner.exportKeypair();
       if (!kp) throw new Error('funder keypair is not readable');

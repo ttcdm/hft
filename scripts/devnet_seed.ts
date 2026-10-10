@@ -16,6 +16,10 @@
  * loopback / private / mainnet-looking RPC URL is refused); at most 0.45 SOL leaves the funder in total.
  * Nothing runs unless every check passes; a failed check exits 2 before the first transaction.
  *
+ * Expectation: auto is NOT expected to buy the seeded token. Every buyer here is funded by the same wallet, the watch window counts
+ * wallets that share a funder as one buyer (HOT needs 25), and the measured score is 35 against the 70 the gate asks for. Do not read a
+ * quiet auto run on this token as a fault (KNOWN_RISKS.md section 8).
+ *
  * Safety nets added after the first devnet run died on a 429 with 20 funded buyers whose keys lived only in memory:
  *   - every buyer secret key is written (0600) to .overnight/seed-wallets/<mint>.json BEFORE any wallet is funded;
  *   - every RPC call retries 429 / transient errors with backoff, and sends are spaced (default 400 ms apart);

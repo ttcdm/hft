@@ -110,3 +110,23 @@ Also: Jito bundles are used only on mainnet-beta, which this build does not use.
 While LIVE is armed, every route and socket action that can open a position (`/api/execution/trade`, `/api/memecoins/trade`, `/api/wallet/snipe`, `/api/pumpfun/callouts/snipe`, `/api/social/signals/snipe`, the WebSocket `SNIPE_PUMP_CALLOUT` and `SNIPE_MEMECOIN` actions, and the Telegram `/snipe` and `/buy` commands) refuses a request that does not carry `confirmLive: true`. The UI sends it only after the operator accepts a dialog that names the cluster.
 
 It is a guard against an accidental or scripted one-click trade. It is **not** a security boundary: the flag is a value the client asserts, and anyone holding the operator token can send it. The operator token is the real authorisation. Closing a position and the kill switch are not behind it.
+
+## 8. What score auto can reach, and what the seeded devnet token will and will not do (S5, S4)
+
+The auto gate asks for a confluence score of 70 (HOT also needs 3 of the watch window's 4 signals). The second review measured the score on the production modules at SOL $150; the earlier notes that put the ceiling at 90, or at 81, were wrong, because Liquidity cannot reach its maximum (it is real SOL x price x 2, so it is 0 to 3 below about 30 SOL real and 6 only at graduation, when the curve is complete and untradable), and Social is always 0.
+
+| Scenario (hand-built replays, not recorded feeds) | Score |
+|---|---|
+| 70 buyers in 36 s, 0.2-0.9 SOL each | 72-73 |
+| same, 0.1 SOL flat | 68 |
+| 10 buyers in 36 s | 26-38 |
+| 130-buyer crowd, 0.13 SOL | 74 (READY, not HOT: velocity not rising at the tick) |
+| 260-buyer crowd | 76 |
+| 40 buyers in 60 s plus 8 sells (mainnet-like) | 55 |
+| one whale plus 30 small buyers | 56 |
+| the devnet seed, 30 x 0.01 SOL, all funded by one wallet | 35 |
+
+What to expect: **72-76 at best with an ideal crowd, 62-68 for a typical launch, and 81 only at graduation.** Reaching 70 needs Momentum 20, OrderFlow 20 (no sells), Distribution at least 10 (about 35 near-equal buyers), Curve at least 13 and DevRisk 5 at the same tick. DevRisk is 5 only when no creator report arrived; a mainnet creator who dev-buys gets 0-1. So a quiet auto run is normal, not a fault.
+
+The seeded devnet token (`scripts/devnet_seed.ts`) is **not expected to be bought by auto**: the seed funds all 30 buyers from one wallet, the watch window clusters buyers by who first funded them, so it sees one buyer (HOT needs 25 unique buyers), and the measured score is 35. That is by design here; funding the buyers through disguised intermediaries to get around the check was considered and rejected. The seed is useful for watching the board and the watch window, and for manual buys, not as proof that auto can trade.
+

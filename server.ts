@@ -18,6 +18,7 @@ import { pumpFunService } from './server/pumpfunService';
 import { pumpFeedListener } from './server/solana/pumpFeedListener';
 import { autoSnipeController } from './server/auto/controller';
 import { watchWindow } from './server/signals/watchWindow';
+import { FunderLookup, wireFunderLookup } from './server/signals/funderLookup';
 import { buildBoard } from './server/board';
 import { PublicKey } from '@solana/web3.js';
 import { solPriceService } from './server/market/solPriceService';
@@ -318,6 +319,7 @@ watchWindow.setScoreFn((mint) => {
   return pool ? memecoinAggregator.evaluateTokenConfluence(pool).score : null;
 });
 watchWindow.attach(pumpFeedListener);
+wireFunderLookup(watchWindow, new FunderLookup(() => executionCoordinator.getConnection())); // Q6b
 watchWindow.on('release', (r) => broadcastWs({ type: 'WATCH_RELEASE', data: r }));
 watchWindow.start();
 autoSnipeController.attachWatchWindow(); // Q6f: HOT and READY releases are the auto candidates

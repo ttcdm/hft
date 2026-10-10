@@ -24,6 +24,7 @@ export const HOT_MAX_LARGEST_BUYER_SHARE = 0.15;
 export const HOT_MIN_SIGNALS = 3;
 export const HOT_MIN_SCORE = 70;
 const CREATOR_CLUSTER = 'cluster:creator';
+const MAX_FUNDERS_KEPT = 20_000;
 
 export type WatchState = 'WATCHING' | 'HOT' | 'READY' | 'DEAD';
 
@@ -108,6 +109,9 @@ export class WatchWindow extends EventEmitter {
   private released = new Map<string, WatchResult>();
   private opts: Required<Pick<WatchWindowOptions, 'maxCandidates' | 'minMs' | 'maxMs'>> & Pick<WatchWindowOptions, 'funderOf' | 'scoreOf'>;
   private funders = new Map<string, string>();
+  /** Wallets whose funder was looked up and does not exist / is out of reach: they count as known, in a cluster of their own. */
+  private noFunder = new Set<string>();
+  private requestFunder: ((wallet: string, mint: string) => void) | null = null;
   /** Q6c: launches that were not watched because the window was full. */
   private refusedFull = 0;
   private lastRefusedMint: string | null = null;
@@ -127,6 +131,18 @@ export class WatchWindow extends EventEmitter {
   /** Record a wallet's funder (the sender of its earliest incoming transfer). */
   public setFunder(wallet: string, funder: string): void {
     this.funders.set(wallet, funder);
+    if (this.funders.size > MAX_FUNDERS_KEPT) this.funders.delete(this.funders.keys().next().value as string);
+  }
+
+  /** Q6b: record that a wallet's funder was looked up and there is none to cluster it with. */
+  public setNoFunder(wallet: string): void {
+    this.noFunder.add(wallet);
+    if (this.noFunder.size > MAX_FUNDERS_KEPT) this.noFunder.delete(this.noFunder.values().next().value as string);
+  }
+
+  /** Q6b: ask this function for the funder of every new buyer. The answer comes back through setFunder / setNoFunder. */
+  public setFunderRequester(fn: ((wallet: string, mint: string) => void) | null): void {
+    this.requestFunder = fn;
   }
 
   public setScoreFn(fn: WatchWindowOptions['scoreOf']): void {
@@ -175,6 +191,7 @@ export class WatchWindow extends EventEmitter {
 
     if (trade.isBuy) {
       c.buyCount++;
+      if (!c.buyVolumeByWallet.has(trade.user) && !c.insiders.has(trade.user) && !this.funders.has(trade.user) && !this.noFunder.has(trade.user)) this.requestFunder?.(trade.user, trade.mint);
       c.buyVolumeByWallet.set(trade.user, (c.buyVolumeByWallet.get(trade.user) ?? 0) + sol);
     } else {
       c.sellCount++;
@@ -206,7 +223,7 @@ export class WatchWindow extends EventEmitter {
     for (const [wallet, vol] of c.buyVolumeByWallet) {
       const k = this.clusterOf(c, wallet);
       clusters.set(k, (clusters.get(k) ?? 0) + vol);
-      if (this.funderFor(wallet) || c.insiders.has(wallet)) known++;
+      if (this.funderFor(wallet) || this.noFunder.has(wallet) || c.insiders.has(wallet)) known++;
     }
     // Merge a buyer's own cluster into the cluster of wallets it funded
     for (const wallet of c.buyVolumeByWallet.keys()) {

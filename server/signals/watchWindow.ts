@@ -13,7 +13,8 @@ import type { PumpTradeEvent } from '../solana/pumpFeedListener';
  *   HOT    minimum hold passed, >= 3 measured signals strong, and the confluence score is >= 70
  *   READY  the full window elapsed without a dead or hot verdict
  */
-export const WATCH_MAX_CANDIDATES = 10;
+/** Q6c: was 10, which a busy feed fills with the first ten launches while the rest are refused without a trace. */
+export const WATCH_MAX_CANDIDATES = 60;
 export const WATCH_MIN_MS = 20_000;
 export const WATCH_MAX_MS = 120_000;
 export const WATCH_BUCKET_MS = 10_000;
@@ -107,6 +108,9 @@ export class WatchWindow extends EventEmitter {
   private released = new Map<string, WatchResult>();
   private opts: Required<Pick<WatchWindowOptions, 'maxCandidates' | 'minMs' | 'maxMs'>> & Pick<WatchWindowOptions, 'funderOf' | 'scoreOf'>;
   private funders = new Map<string, string>();
+  /** Q6c: launches that were not watched because the window was full. */
+  private refusedFull = 0;
+  private lastRefusedMint: string | null = null;
   private timer: NodeJS.Timeout | null = null;
 
   constructor(opts: WatchWindowOptions = {}) {
@@ -136,7 +140,12 @@ export class WatchWindow extends EventEmitter {
   /** Start watching a mint. False when the window is full or the mint is already watched/released. */
   public watch(mint: string, creator: string | null, now = Date.now(), alsoInsiders: Array<string | undefined> = []): boolean {
     if (this.active.has(mint) || this.released.has(mint)) return false;
-    if (this.active.size >= this.opts.maxCandidates) return false;
+    if (this.active.size >= this.opts.maxCandidates) {
+      this.refusedFull++;
+      this.lastRefusedMint = mint;
+      this.emit('refused', { mint, active: this.active.size, max: this.opts.maxCandidates, refusedFull: this.refusedFull });
+      return false;
+    }
     this.active.set(mint, {
       mint, creator, insiders: new Set([creator, ...alsoInsiders].filter((w): w is string => !!w)), registeredAt: now, firstTradeAt: null, buckets: [], buyVolumeByWallet: new Map(),
       buyCount: 0, sellCount: 0, sellVolumeSol: 0, tradeCount: 0, creatorSold: false, flow: [], seen: new Set(),
@@ -296,8 +305,9 @@ export class WatchWindow extends EventEmitter {
   }
 
   /** Everything the board needs: live metrics for watched mints and the verdicts already given. */
-  public getSnapshot(now = Date.now()): { watching: Array<{ metrics: WatchMetrics; state: 'WATCHING' }>; released: WatchResult[] } {
+  public getSnapshot(now = Date.now()): { watching: Array<{ metrics: WatchMetrics; state: 'WATCHING' }>; released: WatchResult[]; capacity: { active: number; max: number; refusedFull: number; lastRefusedMint: string | null } } {
     return {
+      capacity: { active: this.active.size, max: this.opts.maxCandidates, refusedFull: this.refusedFull, lastRefusedMint: this.lastRefusedMint },
       watching: [...this.active.values()].map((c) => ({ metrics: this.computeMetrics(c, now), state: 'WATCHING' as const })),
       released: [...this.released.values()].slice(-50),
     };

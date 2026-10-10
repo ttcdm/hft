@@ -93,6 +93,8 @@ export function buildBoard(now = Date.now()) {
     },
     launches,
     watching,
+    /** Q6c: how full the watch window is and how many launches it turned away because it was full. */
+    watchCapacity: snap.capacity,
     holding,
   };
 }

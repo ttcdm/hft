@@ -132,6 +132,11 @@ describe('144: separate seed funder keyfile', () => {
     const ok = mk(0o600);
     expect(run(['--funder-keyfile', ok.f, '--execute'], { SEED_RPC_URL: 'https://api.mainnet-beta.solana.com' }).status).toBe(2);
   });
+  it('CI runs the separate-funder audit proof (with its app-wallet control) after the seed proof', () => {
+    const ci = fs.readFileSync('.github/workflows/ci.yml', 'utf8');
+    expect(ci.indexOf('npm run localnet:seed-audit')).toBeGreaterThan(ci.indexOf('npm run localnet:seed\n'));
+    expect(fs.readFileSync('scripts/localnet/seed_audit_proof.ts', 'utf8')).toContain('control: seeding from the APP wallet');
+  });
   it('the saved wallet file records the funder, so sweeps return SOL to the separate wallet', () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'seedw-'));
     const separate = Keypair.generate().publicKey;

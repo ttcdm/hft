@@ -1,7 +1,7 @@
 import net from 'node:net';
 import fs from 'node:fs';
 import { beforeEach, afterEach, afterAll, vi } from 'vitest';
-import { executionCoordinator } from '../../server/execution/coordinator';
+import { executionCoordinator, ExecutionCoordinator } from '../../server/execution/coordinator';
 import { PumpCurveService } from '../../server/solana/pumpCurve';
 import { pumpfunService } from '../../server/pumpfunService';
 import { Connection } from '@solana/web3.js';
@@ -43,8 +43,11 @@ const realConnect = net.Socket.prototype.connect;
 // - the SOL/USD price (C3) is seeded with a labelled fixture; there is no built-in numeric fallback in server/.
 //   Tests of the missing/stale behavior call solPriceService.reset() or setPrice with an old timestamp.
 // - Jito points at the in-process mock block engine (tests/e2e/helpers/mockJito.ts), never a real host.
+// - S6: the test wallet already owns its pump volume accumulator, so the first-buy rent (1.84M lamports, 37% of a 0.005 SOL order) is not in
+//   the round-trip cost gate of every unrelated buy test. The S6 tests restore the real method.
 beforeEach(() => {
   vi.spyOn(Connection.prototype, 'getGenesisHash').mockResolvedValue(CLUSTER_GENESIS_HASH.devnet);
+  vi.spyOn(ExecutionCoordinator.prototype as any, 'unrefundedFirstBuyRentLamports').mockResolvedValue(0);
   solPriceService.setPrice(150, 'TEST_FIXTURE');
 });
 

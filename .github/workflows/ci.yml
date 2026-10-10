@@ -52,6 +52,9 @@ jobs:
       - name: Devnet seeding script proof (local chain, incl. forced 429 and sweep)
         run: npm run localnet:seed
 
+      - name: Seeding from a separate funder keeps the wallet audit quiet (local chain, app in DEVNET_LIVE)
+        run: npm run localnet:seed-audit
+
   validate-rust:
     name: Validate Rust HFT Engine
     runs-on: ubuntu-latest

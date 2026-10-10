@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import { HardenedRiskEngine, RiskEvaluationRequest, estimateRoundTripCostLamports, MAX_ROUND_TRIP_COST_FRACTION } from '../server/risk/riskEngine';
+import { HardenedRiskEngine, RiskEvaluationRequest, estimateRoundTripCostLamports, MAX_ROUND_TRIP_COST_FRACTION, PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS } from '../server/risk/riskEngine';
 import { PaperExecutionEngine } from '../server/execution/paperEngine';
 import { EligibilityFilter } from '../server/signals/eligibilityFilter';
 import { CapitalSizer } from '../server/capital/capitalSizer';
@@ -100,6 +100,13 @@ describe('C7: live-path correctness', () => {
 
     it('sums buy tip + sell tip + 2 x (5,000 + priority) + pump fees on both sides', () => {
       expect(estimateRoundTripCostLamports(base)).toBe(150_000 + 150_000 + 2 * (5_000 + 25_000) + 2 * 95_000);
+    });
+
+    it('S6: unrefunded rent is part of the round-trip cost; the accumulator rent is (137 + 128) x 6,960 and a 0.005 SOL first order fails the 20% gate', () => {
+      expect(PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS).toBe(1_844_400);
+      expect(estimateRoundTripCostLamports({ ...base, nonRefundableRentLamports: PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS })).toBe(estimateRoundTripCostLamports(base) + 1_844_400);
+      expect(estimateRoundTripCostLamports(base) > MAX_ROUND_TRIP_COST_FRACTION * 0.005 * 1e9).toBe(false); // without the rent it passed
+      expect(estimateRoundTripCostLamports({ ...base, nonRefundableRentLamports: 1_844_400 }) > MAX_ROUND_TRIP_COST_FRACTION * 0.005 * 1e9).toBe(true);
     });
 
     it('a 0.01 SOL order is above the 20% floor at these costs and a 0.1 SOL order is below it', () => {

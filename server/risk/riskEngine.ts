@@ -320,9 +320,20 @@ export const riskEngine = new HardenedRiskEngine();
 /** Max share of an order that may go to round-trip execution cost before the entry is refused. */
 export const MAX_ROUND_TRIP_COST_FRACTION = 0.2;
 
+/** Solana rent: lamports per byte of account data (the 2-year exemption rate, 3,480 x 2), the same on mainnet, devnet and testnet. */
+export const RENT_LAMPORTS_PER_BYTE = 6_960;
+/**
+ * S6: the pump program creates a UserVolumeAccumulator (137 bytes, measured on the local chain with the real program binary) the first time
+ * a wallet buys anything on pump.fun, and charges the buyer its rent: (137 + 128) x 6,960 = 1,844,400 lamports (0.00184 SOL). Nothing
+ * refunds it. A 0.005 SOL first order therefore starts 37% down before any fee; every later buy by the wallet does not pay it.
+ * The token account's rent (Token-2022, 170 bytes: 2,074,080 lamports) is NOT counted: the exit closes the account and refunds it.
+ */
+export const PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS = (137 + 128) * RENT_LAMPORTS_PER_BYTE;
+
 /**
  * Round-trip cost in lamports: buy tip + one expected sell tip + 2 x (base 5,000 + priority fee) + pump fees on both sides.
  * The sell-side pump fee is taken equal to the buy-side fee (same bps on a notional of about the order size).
+ * S6: plus any rent that is paid and never refunded (see PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS).
  */
 export function estimateRoundTripCostLamports(p: {
   buyTipLamports: number;
@@ -330,8 +341,10 @@ export function estimateRoundTripCostLamports(p: {
   priorityFeeLamports: number;
   buyProtocolFeeLamports: number;
   buyCreatorFeeLamports: number;
+  /** S6: rent this round trip pays and never gets back (the one-time pump volume accumulator on a wallet's first pump buy). Default 0. */
+  nonRefundableRentLamports?: number;
 }): number {
   const baseFees = 2 * (5_000 + p.priorityFeeLamports);
   const pumpFees = 2 * (p.buyProtocolFeeLamports + p.buyCreatorFeeLamports);
-  return p.buyTipLamports + p.sellTipLamports + baseFees + pumpFees;
+  return p.buyTipLamports + p.sellTipLamports + baseFees + pumpFees + (p.nonRefundableRentLamports ?? 0);
 }

@@ -31,7 +31,8 @@ import { EligibilityFilter } from '../signals/eligibilityFilter';
 import { localSigner } from '../solana/signer';
 import { txBuilder, SolanaTransactionBuilder, PumpBuyParams, PumpSellParams } from '../solana/transactionBuilder';
 import { SolanaRpcTransport, JitoTransport } from '../solana/transports';
-import { riskEngine, estimateRoundTripCostLamports, MAX_ROUND_TRIP_COST_FRACTION } from '../risk/riskEngine';
+import { riskEngine, estimateRoundTripCostLamports, MAX_ROUND_TRIP_COST_FRACTION, PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS } from '../risk/riskEngine';
+import { userVolumeAccumulatorPda } from '@pump-fun/pump-sdk';
 import { paperEngine, PaperExecutionEngine } from './paperEngine';
 import { workstationDb } from '../db/database';
 import { getRandomJitoTipAccount, TOKEN_2022_PROGRAM_ID } from '../solana/programs';
@@ -2234,12 +2235,15 @@ export class ExecutionCoordinator {
 
     // C7b: an entry whose round-trip execution cost (both tips, both base+priority fees, pump fees both sides)
     // exceeds 20% of the order cannot realistically be profitable. The size is never rounded up to make it pass.
+    // S6: the wallet's first pump buy also pays the (never refunded) rent of its volume accumulator account; later buys do not.
+    const accumulatorRentLamports = await this.unrefundedFirstBuyRentLamports();
     const roundTripCostLamports = estimateRoundTripCostLamports({
       buyTipLamports: quote.expectedJitoTipLamports,
       sellTipLamports: resolvedTip.tipLamports,
       priorityFeeLamports: quote.expectedPriorityFeeLamports,
       buyProtocolFeeLamports: quote.protocolFeeLamports,
       buyCreatorFeeLamports: quote.creatorFeeLamports,
+      nonRefundableRentLamports: accumulatorRentLamports,
     });
     if (roundTripCostLamports > MAX_ROUND_TRIP_COST_FRACTION * req.amountSol * 1e9) {
       workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'LIVE', {
@@ -2251,7 +2255,7 @@ export class ExecutionCoordinator {
         success: false,
         lifecycleState: 'RISK_REJECTED',
         executionMode: 'LIVE',
-        error: `EXPECTED_EDGE_BELOW_EXECUTION_COST: Round-trip cost ${roundTripCostLamports} lamports exceeds ${MAX_ROUND_TRIP_COST_FRACTION * 100}% of the ${req.amountSol} SOL order.`,
+        error: `EXPECTED_EDGE_BELOW_EXECUTION_COST: Round-trip cost ${roundTripCostLamports} lamports exceeds ${MAX_ROUND_TRIP_COST_FRACTION * 100}% of the ${req.amountSol} SOL order.${accumulatorRentLamports > 0 ? ` It includes ${accumulatorRentLamports} lamports of one-time pump account rent this wallet has not paid yet; a larger first buy (about ${(Math.ceil(roundTripCostLamports / MAX_ROUND_TRIP_COST_FRACTION / 1e6) / 1e3).toFixed(3)} SOL) pays it once, after which smaller buys pass.` : ''}`,
         correlationId,
       };
     }
@@ -3107,6 +3111,22 @@ export class ExecutionCoordinator {
     } finally {
       this.inFlightPositionExits.delete(positionId);
     }
+  }
+
+  /** Wallets whose pump volume accumulator is known to exist (it is never closed by this app), so the account is read once. */
+  private volumeAccumulatorKnown = new Set<string>();
+
+  /** S6: 0 when the signer wallet already has its pump volume accumulator; the rent of creating it otherwise (also when it cannot be read). */
+  private async unrefundedFirstBuyRentLamports(): Promise<number> {
+    let owner: PublicKey;
+    try { owner = localSigner.getPublicKey(); } catch { return PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS; }
+    const key = owner.toBase58();
+    if (this.volumeAccumulatorKnown.has(key)) return 0;
+    try {
+      const info = await this.connection.getAccountInfo(userVolumeAccumulatorPda(owner), 'confirmed');
+      if (info) { this.volumeAccumulatorKnown.add(key); return 0; }
+    } catch { /* unreadable: assume the rent is still to be paid */ }
+    return PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS;
   }
 
   private async simulateSell(tx: any): Promise<{ ok: boolean; error?: string }> {

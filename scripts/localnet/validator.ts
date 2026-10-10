@@ -395,6 +395,26 @@ export class LocalnetValidator {
     };
   }
 
+  /** jsonParsed: account keys as objects, system transfers parsed (what a funder lookup reads); everything else partially decoded. */
+  private txJsonParsed(rec: TxRecord) {
+    const base: any = this.txJson(rec);
+    const tx = VersionedTransaction.deserialize(rec.raw);
+    const m = tx.message;
+    const SYSTEM = '11111111111111111111111111111111';
+    const keys = rec.keys;
+    const nSig = m.header.numRequiredSignatures;
+    base.transaction.message.accountKeys = keys.map((k, i) => ({ pubkey: k, signer: i < nSig, writable: i < nSig - m.header.numReadonlySignedAccounts || (i >= nSig && i < keys.length - m.header.numReadonlyUnsignedAccounts), source: 'transaction' }));
+    base.transaction.message.instructions = m.compiledInstructions.map((ix) => {
+      const programId = keys[ix.programIdIndex];
+      const accts = Array.from(ix.accountKeyIndexes).map((i) => keys[i]);
+      if (programId === SYSTEM && ix.data.length === 12 && Buffer.from(ix.data).readUInt32LE(0) === 2) {
+        return { program: 'system', programId, parsed: { type: 'transfer', info: { source: accts[0], destination: accts[1], lamports: Number(Buffer.from(ix.data).readBigUInt64LE(4)) } }, stackHeight: null };
+      }
+      return { programId, accounts: accts, data: bs58.encode(ix.data), stackHeight: null };
+    });
+    return base;
+  }
+
   // ---- log subscriptions ---------------------------------------------------------------------------------------
   private notifyLogs(rec: TxRecord) {
     for (const [id, sub] of this.logSubs) {
@@ -496,7 +516,8 @@ export class LocalnetValidator {
       }
       case 'getTransaction': {
         const r = this.txs.get(params[0]);
-        return r ? this.txJson(r) : null;
+        if (!r) return null;
+        return params[1]?.encoding === 'jsonParsed' ? this.txJsonParsed(r) : this.txJson(r);
       }
       case 'sendTransaction': return this.sendRaw(Buffer.from(params[0], params[1]?.encoding === 'base58' ? 'binary' : 'base64'));
       case 'simulateTransaction': return this.simulate(params);

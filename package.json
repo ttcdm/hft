@@ -23,7 +23,8 @@
     "localnet:e2e": "tsx scripts/localnet/e2e.ts",
     "test:devnet": "tsx scripts/test_devnet_execution.ts",
     "devnet:e2e": "node --require ./scripts/devnet_guard.cjs --import tsx scripts/devnet_e2e.ts",
-    "postinstall": "node scripts/patch-anchor.cjs"
+    "postinstall": "node scripts/patch-anchor.cjs",
+    "localnet:auto": "tsx scripts/localnet/auto_run.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

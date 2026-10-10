@@ -208,7 +208,7 @@ export class WorkstationDatabase {
       const n = (this.db.prepare('SELECT COUNT(*) AS n FROM realized_events').get() as any).n;
       if (n === 0) {
         this.db.exec(`INSERT INTO realized_events (position_id, execution_mode, delta_lamports, ts)
-          SELECT id, execution_mode, realized_pnl_lamports, updated_at FROM positions WHERE realized_pnl_lamports != 0`);
+          SELECT id, execution_mode, realized_pnl_lamports, updated_at FROM positions WHERE realized_pnl_lamports != 0 AND entry_tx_signature NOT LIKE 'RECOVERED:%'`);
       }
     } catch (err: any) {
       Logger.warn(`realized_events backfill failed: ${err.message}`);
@@ -353,12 +353,14 @@ export class WorkstationDatabase {
     // Q2: adopted balances (no known cost) and rows closed because the wallet held nothing (cost 0, realized 0) say nothing about an edge.
     return closed
       .filter((p) => !unverified.has(p.id) && !p.entryTxSignature?.startsWith('RECOVERED:') && !p.exitReason?.startsWith('RECONCILED_ZERO_BALANCE'))
-      .sort((a, b) => (a.updatedAt ?? 0) - (b.updatedAt ?? 0));
+      .sort((a, b) => (a.lastUpdatedTimestamp ?? 0) - (b.lastUpdatedTimestamp ?? 0)); // Q30: this sorted on a field that does not exist, so "the last 20" were the oldest 20
   }
 
   /**
-   * Order ids of paper fills where at least one safety gate stayed UNKNOWN (C5). Those fills are not evidence
-   * of an edge, so closed-trade statistics (CapitalSizer, kill-switch expectancy) leave them out.
+   * Ids of paper positions whose result is not evidence of an edge, so closed-trade statistics (CapitalSizer, kill-switch expectancy) leave
+   * them out: (C5) a fill where at least one safety gate stayed UNKNOWN; (S9) a fill priced by the flat MODEL because the curve could not be
+   * read (the controller already flagged these as unverified on the decision row, but the evidence query did not); and a position whose
+   * EXIT was model-priced (PAPER_SELL_FILLED, keyed by the position id).
    */
   public getUnverifiedFillIds(): Set<string> {
     const ids = new Set<string>();
@@ -367,7 +369,14 @@ export class WorkstationDatabase {
       for (const r of rows) {
         try {
           const p = JSON.parse(r.payload_json);
-          if (p?.gates?.eligibility?.unverified?.length > 0 && p.orderId) ids.add(p.orderId);
+          if ((p?.gates?.eligibility?.unverified?.length > 0 || p?.gates?.pricing === 'MODEL') && p.orderId) ids.add(p.orderId);
+        } catch { /* skip */ }
+      }
+      const sells = this.db.prepare("SELECT payload_json FROM system_journal WHERE event_type = 'PAPER_SELL_FILLED'").all() as Array<{ payload_json: string }>;
+      for (const r of sells) {
+        try {
+          const p = JSON.parse(r.payload_json);
+          if (p?.pricing === 'MODEL' && p.positionId) ids.add(p.positionId);
         } catch { /* skip */ }
       }
     } catch { /* no journal yet */ }
@@ -513,7 +522,7 @@ export class WorkstationDatabase {
   /**
    * N18: the append-only audit tables (risk_decisions, decisions, system_journal) grew without bound. Rows older than the retention
    * window are deleted. Kept regardless of age because something still reads them: the halt journal (the latest row decides whether
-   * trading is halted after a restart) and PAPER_FILL_GATES (marks which old paper fills are unverified, for the closed-trade statistics).
+   * trading is halted after a restart) and PAPER_FILL_GATES / PAPER_SELL_FILLED (mark which old paper fills and exits are unverified or model-priced, for the closed-trade statistics).
    * Positions, orders and transactions are never pruned. Returns the number of rows deleted per table.
    */
   public pruneOldRows(retentionDays: number, now: number = Date.now()): { riskDecisions: number; decisions: number; journal: number } {
@@ -524,7 +533,7 @@ export class WorkstationDatabase {
       return {
         riskDecisions: run('DELETE FROM risk_decisions WHERE created_at < ?', cutoff),
         decisions: run('DELETE FROM decisions WHERE ts < ?', cutoff),
-        journal: run(`DELETE FROM system_journal WHERE created_at < ? AND event_type NOT IN ('TRADING_HALTED','TRADING_HALT_CLEARED','PAPER_FILL_GATES')`, cutoff),
+        journal: run(`DELETE FROM system_journal WHERE created_at < ? AND event_type NOT IN ('TRADING_HALTED','TRADING_HALT_CLEARED','PAPER_FILL_GATES','PAPER_SELL_FILLED')`, cutoff),
       };
     } catch (e: any) {
       Logger.error(`Retention prune failed: ${e?.message ?? e}`);
@@ -653,6 +662,54 @@ export class WorkstationDatabase {
     if (realizedDelta !== 0 && !pos.entryTxSignature?.startsWith('RECOVERED:')) {
       this.db.prepare('INSERT INTO realized_events (position_id, execution_mode, delta_lamports, ts) VALUES (?, ?, ?, ?)').run(pos.id, pos.executionMode, realizedDelta, now);
     }
+  }
+
+  /**
+   * S11 / Q14: persist ONLY the mark fields. A mark refresh works from a copy loaded before several awaits; saving the whole row from
+   * that copy can undo a close or a sell that committed meanwhile (status, quantity, realized). This touches no other column and never
+   * a CLOSED row, so a stale refresh cannot resurrect a position or write a bogus realized event.
+   */
+  public saveMark(pos: NormalizedPosition): boolean {
+    const now = Date.now();
+    const markTimestamp = pos.lastMarkTimestamp && pos.lastMarkTimestamp > 0 ? pos.lastMarkTimestamp : 0;
+    const r = this.db.prepare(`
+      UPDATE positions SET
+        current_price_sol = ?,
+        last_mark_timestamp = CASE WHEN ? > 0 THEN ? ELSE last_mark_timestamp END,
+        last_mark_source = CASE WHEN ? != 'UNKNOWN' THEN ? ELSE last_mark_source END,
+        venue = COALESCE(?, venue),
+        pool_address = COALESCE(?, pool_address),
+        migration_timestamp = COALESCE(?, migration_timestamp),
+        high_water_mark_sol = MAX(COALESCE(high_water_mark_sol, 0), ?),
+        record_updated_at = ?,
+        updated_at = ?
+      WHERE id = ? AND status != 'CLOSED'
+    `).run(
+      pos.currentPriceSol ?? 0,
+      markTimestamp, markTimestamp,
+      pos.markSource || 'UNKNOWN', pos.markSource || 'UNKNOWN',
+      pos.venue ?? null,
+      pos.poolAddress ?? null,
+      pos.migrationTimestamp ?? null,
+      pos.highWaterMarkSol ?? 0,
+      now, now,
+      pos.id
+    );
+    return Number((r as any).changes) > 0;
+  }
+
+  /** Q56 / S11: the exit engine's own fields (high-water mark, trailing stop, stage) for an open row, nothing else. */
+  public saveExitState(pos: NormalizedPosition): boolean {
+    const now = Date.now();
+    const r = this.db.prepare(`
+      UPDATE positions SET
+        high_water_mark_sol = CASE WHEN ? > 0 THEN ? ELSE high_water_mark_sol END,
+        trailing_stop_sol = CASE WHEN ? > 0 THEN ? ELSE trailing_stop_sol END,
+        exit_stage = ?,
+        record_updated_at = ?, updated_at = ?
+      WHERE id = ? AND status != 'CLOSED'
+    `).run(pos.highWaterMarkSol ?? 0, pos.highWaterMarkSol ?? 0, pos.trailingStopSol ?? 0, pos.trailingStopSol ?? 0, pos.exitStage ?? 0, now, now, pos.id);
+    return Number((r as any).changes) > 0;
   }
 
   public loadPositions(mode?: ExecutionMode, status?: 'OPEN' | 'PARTIALLY_CLOSED' | 'CLOSED' | 'ACTIVE'): NormalizedPosition[] {

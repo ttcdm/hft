@@ -458,7 +458,7 @@ describe('Phase 4 Master Remediation Suite (B12 & B13)', () => {
       expect(eval1.newHighWaterMarkSol).toBe(0.000110);
       expect(eval1.newTrailingStopSol).toBe(0); // Not activated yet
 
-      // 2. Price rises to +20% (0.000120): ratchets to HWM * 0.85 = 0.000102
+      // 2. Price rises to +20% (0.000120): HWM * 0.85 = 0.000102, but S3 floors the first stop at entry * 1.03 = 0.000103
       const eval2 = ExitEngine.evaluate({
         entryPriceSol: entryPrice,
         currentPriceSol: 0.000120, // +20%
@@ -471,7 +471,7 @@ describe('Phase 4 Master Remediation Suite (B12 & B13)', () => {
 
       expect(eval2.shouldExit).toBe(false);
       expect(eval2.newHighWaterMarkSol).toBe(0.000120);
-      expect(eval2.newTrailingStopSol).toBeCloseTo(0.000120 * 0.85, 8); // 0.000102
+      expect(eval2.newTrailingStopSol).toBeCloseTo(0.000103, 8); // the floor, not 0.000102
 
       // 3. Price peaks at +25% (0.000125): stop ratchets up to 0.000125 * 0.85 = 0.00010625
       const eval3 = ExitEngine.evaluate({

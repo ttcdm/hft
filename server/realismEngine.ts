@@ -18,7 +18,7 @@ export class MicrostructureRealismEngine {
       rtt: 1.15,
       jitter: 0.04,
       packetLoss: 0.0,
-      description: 'Equinix TY2 / AWS Tokyo ap-northeast-1 Direct Cross-Connect (Sub-millisecond direct dark fiber to Binance & Bybit matching engines)',
+      description: 'Equinix TY2 / AWS Tokyo ap-northeast-1 Direct Cross-Connect (simulated co-location profile: this app trades Solana, and no Binance or Bybit connection exists)',
     },
     TOKYO_RETAIL_FIBER: {
       rtt: 18.5,

@@ -257,6 +257,12 @@ export default function App() {
     []
   );
 
+  // Q36: a refused WebSocket command is shown, not dropped.
+  useEffect(() => {
+    const unsub = engineClient.onActionError((m) => triggerAlert('CRITICAL', `COMMAND REFUSED${m.action ? `: ${m.action}` : ''}`, m.error));
+    return () => unsub();
+  }, [triggerAlert]);
+
   // R25: the header must show the server's kill-switch state, not a local guess: a panic liquidation, the RPC auto-trip, another
   // tab or a reload all change it without this component knowing.
   useEffect(() => {
@@ -323,11 +329,16 @@ export default function App() {
   };
 
   // Toggle Capital Allocation Tier ($10 Micro Account vs $500,000 Institutional)
-  const toggleCapitalTier = () => {
+  const toggleCapitalTier = async () => {
     const nextTier = capitalTier === 'MICRO_10' ? 'INSTITUTIONAL' : 'MICRO_10';
-    setCapitalTier(nextTier);
     const isMicro = nextTier === 'MICRO_10';
-    engineClient.setMicro10Mode(isMicro);
+    // Q43: the tier changes only after the server accepted it; a refusal is shown and the old tier stays.
+    const result = await engineClient.setMicro10Mode(isMicro);
+    if (!result.ok) {
+      triggerAlert('WARNING', 'CAPITAL TIER NOT CHANGED', result.error || 'The server did not accept the change.');
+      return;
+    }
+    setCapitalTier(nextTier);
 
     if (isMicro) {
       setKpis(makeEmptyKpis(10));
@@ -349,7 +360,7 @@ export default function App() {
   // Switch Symbol
   const handleSelectSymbol = (sym: string) => {
     setSelectedSymbol(sym);
-    triggerAlert('INFO', 'DMA FEED SWITCHED', `Subscribed to live ${sym} order depth and trades.`);
+    triggerAlert('INFO', 'SYMBOL SELECTED', `Showing ${sym}. This changes the view only; no market-data subscription was made.`);
   };
 
   // Deploy New Bot
@@ -357,8 +368,8 @@ export default function App() {
     setBots((prev) => [bot, ...prev]);
     triggerAlert(
       'INFO',
-      'NEW STRATEGY DEPLOYED',
-      `${bot.name} (${bot.archetype}) deployed to ${bot.symbol}.`
+      'STRATEGY ADDED TO LIST',
+      `${bot.name} (${bot.archetype}) for ${bot.symbol} was added to this screen's list. Nothing was deployed to the server.`
     );
   };
 

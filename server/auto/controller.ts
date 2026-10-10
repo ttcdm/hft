@@ -112,6 +112,9 @@ export interface AutoStatus {
 const MAX_DECISIONS = 500;
 /** Q27: the same unwatched / pending / dead mint from the same source is not journaled again for this long. */
 export const DROP_REPEAT_MS = 10 * 60_000;
+/** S4b: how many releases may wait behind a buy in flight, and how long a signal stays good (the watch window decides in 120 s; a release older than this is not acted on late). */
+export const PENDING_RELEASE_MAX = 10;
+export const PENDING_RELEASE_MAX_AGE_MS = 20_000;
 const MONITOR_INTERVAL_MS = 5_000;
 
 /** Map a rejection message to the pipeline stage that produced it. */
@@ -237,12 +240,27 @@ export class AutoSnipeController extends EventEmitter {
     return reason;
   }
 
+  /** S17: how long kill()/setMode() wait for a buy in flight. It settles in a `finally`, so this is a backstop, not an expected path. */
+  private inflightWaitMs = 90_000;
+
+  private async waitInflight(who: string): Promise<void> {
+    const p = this.inflight;
+    if (!p) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = await Promise.race([
+      p.then(() => false),
+      new Promise<boolean>((r) => { timer = setTimeout(() => r(true), this.inflightWaitMs); timer.unref?.(); }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (timedOut) Logger.warn(`[AUTO] ${who}: a buy in flight did not settle within ${this.inflightWaitMs} ms; continuing without it. A position it opens later is still found through the decision journal.`);
+  }
+
   public async setMode(next: AutoMode, opts: { confirmationCode?: string } = {}): Promise<{ ok: boolean; mode: AutoMode; error?: string }> {
     if (!['OFF', 'SHADOW', 'PAPER', 'DEVNET_LIVE'].includes(next)) return { ok: false, mode: this.mode, error: `unknown mode ${next}` };
     if (next === 'OFF') {
       this.mode = 'OFF';
       // Q29: OFF stops new candidates at once; the session is dropped only after a buy in flight has booked itself in it
-      if (this.inflight) await this.inflight;
+      await this.waitInflight('setMode(OFF)');
       this.session = null;
       this.downgradeReason = null;
       this.emit('mode', { mode: this.mode });
@@ -252,7 +270,7 @@ export class AutoSnipeController extends EventEmitter {
       return { ok: false, mode: this.mode, error: 'AUTO_SNIPE_ENABLED is not true: auto trading stays OFF' };
     }
     // Q29: never swap the session under a buy in flight; its spend and position belong to the session it started in
-    if (this.inflight) await this.inflight;
+    await this.waitInflight('setMode');
     const coordMode = executionCoordinator.getExecutionMode();
     if (next === 'PAPER' && coordMode !== 'PAPER') {
       return { ok: false, mode: this.mode, error: 'PAPER auto mode needs the execution coordinator in PAPER' };
@@ -275,9 +293,12 @@ export class AutoSnipeController extends EventEmitter {
     this.redSince.clear();
     this.walletMark = null;
     this.attempted.clear();
+    this.pendingReleases.clear();
     this.mode = next;
     if (next === 'PAPER' || next === 'DEVNET_LIVE') {
-      const bankroll = executionCoordinator.getRealWalletBalanceSol() ?? executionConfig.getConfig().paperBankrollSol;
+      // S12: only DEVNET_LIVE sizes from the real wallet; PAPER trades a simulated bankroll, so its budgets must not depend on what the wallet holds.
+      const paperBankroll = executionConfig.getConfig().paperBankrollSol;
+      const bankroll = next === 'DEVNET_LIVE' ? (executionCoordinator.getRealWalletBalanceSol() ?? paperBankroll) : paperBankroll;
       const budgets: SessionBudgets = next === 'PAPER'
         ? { maxBuys: PAPER_SESSION_BUDGETS.maxBuys, maxSpendSol: PAPER_SESSION_BUDGETS.maxSpendBankrollMultiple * bankroll, maxLossFraction: PAPER_SESSION_BUDGETS.maxLossFraction, maxDurationMs: PAPER_SESSION_BUDGETS.maxDurationMs }
         : { ...SESSION_BUDGETS };
@@ -296,7 +317,7 @@ export class AutoSnipeController extends EventEmitter {
     this.killReason = opts.reason || 'operator kill';
     // Q29: a buy already past the gates finishes (its position exists once it does); wait for it so its position is in the owned set below
     // and is sold by exitAll. Mode OFF already stops any new candidate.
-    if (this.inflight) await this.inflight;
+    await this.waitInflight('kill');
     // R23: "sell what it bought" means the positions the auto controller opened: this session's, plus any the journal records as
     // BOUGHT by auto (a restart empties the in-memory session). A position the operator opened by hand is never in either set.
     const owned = new Set<string>(this.session?.positionIds ?? []);
@@ -335,7 +356,7 @@ export class AutoSnipeController extends EventEmitter {
 
     const ctx = {
       mode: this.mode,
-      closedNetPnlSol: workstationDb.loadEvidenceClosedTrades(execMode).map((p) => p.realizedPnLSol ?? 0),
+      closedNetPnlSol: this.sessionEvidencePnl(execMode),
       dailyTotalPnlSol: riskEngine.getDailyTotalPnLSol(execMode),
       maxDailyLossSol: riskEngine.effectiveMaxDailyLossSol(),
       slippageBreaches: this.slippageBreaches,
@@ -392,6 +413,20 @@ export class AutoSnipeController extends EventEmitter {
     return { explained: audit.explained, unexplainedSol: audit.unexplainedSol };
   }
 
+  /**
+   * Q30: the trades the expectancy and loss-streak triggers judge. Only positions the auto trader opened (this session's, or recorded as
+   * BOUGHT in the journal) that closed since this session started, in this execution mode. Before, every closed trade of every mode and
+   * every origin counted, so the old losses that tripped a trigger re-tripped it within seconds of the operator turning auto back on.
+   */
+  private sessionEvidencePnl(execMode: 'PAPER' | 'LIVE'): number[] {
+    const since = this.session?.startedAt ?? 0;
+    const owned = new Set<string>(this.session?.positionIds ?? []);
+    for (const d of workstationDb.loadDecisions({ outcome: 'BOUGHT', limit: 5000 })) if (d.positionId) owned.add(d.positionId);
+    return workstationDb.loadEvidenceClosedTrades(execMode)
+      .filter((p) => owned.has(p.id) && (p.lastUpdatedTimestamp ?? 0) >= since)
+      .map((p) => p.realizedPnLSol ?? 0);
+  }
+
   /** Clear an all-trading halt. Does not turn auto trading back on: the operator still sets a mode. */
   public resume(opts: { clearHalt?: boolean } = {}): { halted: boolean; mode: AutoMode } {
     if (opts.clearHalt) executionCoordinator.clearHalt();
@@ -399,6 +434,12 @@ export class AutoSnipeController extends EventEmitter {
   }
 
   private watchListener: ((r: WatchResult) => void) | null = null;
+  /**
+   * S4b: a watch release is announced once. One that arrives while another buy is in flight used to be dropped for good. It waits here
+   * instead (one per mint, newest 10) and is retried when the buy in flight settles, provided its verdict is still HOT/READY and it is
+   * fresh enough to still be a signal.
+   */
+  private pendingReleases = new Map<string, { candidate: AutoCandidate; queuedAt: number }>();
 
   /**
    * Q6f: the watch window is the candidate source. A HOT or READY release becomes a candidate here. Nothing did this before: the window
@@ -470,7 +511,10 @@ export class AutoSnipeController extends EventEmitter {
     const downgraded = this.enforceBudgets();
     if (process.env.AUTO_SNIPE_ENABLED !== 'true') return this.record(c, 'DROPPED', 'auto', 'AUTO_SNIPE_ENABLED is not true');
     if (this.attempted.has(key)) return this.record(c, 'DROPPED', 'auto', 'ALREADY_ATTEMPTED_THIS_SESSION');
-    if (this.busy) return this.record(c, 'DROPPED', 'auto', 'ANOTHER_CANDIDATE_IN_FLIGHT');
+    if (this.busy) {
+      const queued = c.source === 'WATCH_WINDOW' && this.queueRelease(c);
+      return this.record(c, 'DROPPED', 'auto', queued ? 'ANOTHER_CANDIDATE_IN_FLIGHT: queued, retried when the buy in flight settles' : 'ANOTHER_CANDIDATE_IN_FLIGHT');
+    }
     const open = workstationDb.loadPositions(undefined, 'ACTIVE');
     if (open.some((p) => p.mint.toLowerCase() === key)) return this.record(c, 'DROPPED', 'auto', 'POSITION_ALREADY_OPEN');
 
@@ -538,6 +582,7 @@ export class AutoSnipeController extends EventEmitter {
         signalTimestamp: verdict.releasedAt,
         // R5: the mode checked above; the coordinator refuses the trade if LIVE was armed or disarmed during the awaits in executeSnipe.
         expectedMode: coordMode,
+        noSyntheticPool: true, // S16
       };
       if (shadow) params.dryRun = true;
       if (startMode === 'DEVNET_LIVE') {
@@ -578,7 +623,31 @@ export class AutoSnipeController extends EventEmitter {
       this.busy = false;
       this.inflight = null;
       settle();
+      this.scheduleReleaseDrain();
     }
+  }
+
+  private queueRelease(c: AutoCandidate): boolean {
+    const key = c.mint.toLowerCase();
+    if (!this.pendingReleases.has(key)) {
+      if (this.pendingReleases.size >= PENDING_RELEASE_MAX) this.pendingReleases.delete(this.pendingReleases.keys().next().value as string);
+      this.pendingReleases.set(key, { candidate: c, queuedAt: Date.now() });
+    }
+    return true;
+  }
+
+  private scheduleReleaseDrain(): void {
+    if (this.pendingReleases.size === 0) return;
+    setImmediate(() => {
+      if (this.busy || this.mode === 'OFF') return;
+      for (const [key, p] of this.pendingReleases) {
+        this.pendingReleases.delete(key);
+        const v = watchWindow.getVerdict(p.candidate.mint);
+        if (Date.now() - p.queuedAt > PENDING_RELEASE_MAX_AGE_MS || !v || (v.state !== 'HOT' && v.state !== 'READY')) continue;
+        void this.submitCandidate(p.candidate).catch(() => undefined);
+        return; // one at a time: the next waits for this buy to settle (its own finally drains again)
+      }
+    });
   }
 }
 

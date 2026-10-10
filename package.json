@@ -18,6 +18,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint . && tsc --noEmit",
     "test": "vitest run",
+    "test:facades": "tsx scripts/find_facade_tests.ts --baseline tests/facade-baseline.json",
+    "test:long": "vitest run -c vitest.long.config.ts",
     "signer:import": "tsx scripts/import_signer.ts",
     "smoke": "tsx scripts/smoke.ts",
     "localnet:e2e": "tsx scripts/localnet/e2e.ts",
@@ -25,7 +27,8 @@
     "devnet:e2e": "node --require ./scripts/devnet_guard.cjs --import tsx scripts/devnet_e2e.ts",
     "postinstall": "node scripts/patch-anchor.cjs",
     "localnet:auto": "tsx scripts/localnet/auto_run.ts",
-    "localnet:seed": "tsx scripts/localnet/seed_proof.ts"
+    "localnet:seed": "tsx scripts/localnet/seed_proof.ts",
+    "localnet:seed-audit": "tsx scripts/localnet/seed_audit_proof.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

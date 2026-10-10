@@ -31,12 +31,13 @@ import { EligibilityFilter } from '../signals/eligibilityFilter';
 import { localSigner } from '../solana/signer';
 import { txBuilder, SolanaTransactionBuilder, PumpBuyParams, PumpSellParams } from '../solana/transactionBuilder';
 import { SolanaRpcTransport, JitoTransport } from '../solana/transports';
-import { riskEngine, estimateRoundTripCostLamports, MAX_ROUND_TRIP_COST_FRACTION } from '../risk/riskEngine';
+import { riskEngine, estimateRoundTripCostLamports, MAX_ROUND_TRIP_COST_FRACTION, PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS } from '../risk/riskEngine';
+import { userVolumeAccumulatorPda } from '@pump-fun/pump-sdk';
 import { paperEngine, PaperExecutionEngine } from './paperEngine';
 import { workstationDb } from '../db/database';
 import { getRandomJitoTipAccount, TOKEN_2022_PROGRAM_ID } from '../solana/programs';
 import { executionConfig } from '../solana/executionConfig';
-import { Logger } from '../middleware/enterprise';
+import { Logger, endpointOrigin } from '../middleware/enterprise';
 import { allowedCluster, assertClusterAllowed, resolveRpcUrl } from '../solana/clusterGuard';
 import { PumpCurveService, TradeQuote, PumpMarketState, fetchTokenHolderDistribution } from '../solana/pumpCurve';
 import { TradeReconciler, RealMarkPriceService, PreTradeSnapshot } from './reconciliation';
@@ -451,7 +452,7 @@ export class ExecutionCoordinator {
       this.jitoTransport = new JitoTransport(this.connection);
       this.rpcTransport = new SolanaRpcTransport(this.connection);
 
-      Logger.info(`Switched Solana RPC endpoint to ${newEndpoint} (${latency}ms)`);
+      Logger.info(`Switched Solana RPC endpoint to ${endpointOrigin(newEndpoint)} (${latency}ms)`);
       await this.syncRealWalletBalance();
       return { success: true, latencyMs: latency };
     } catch (err: any) {
@@ -463,7 +464,7 @@ export class ExecutionCoordinator {
   // Update Jito Block Engine URL
   public setJitoBlockEngineUrl(url: string) {
     this.jitoTransport.setBlockEngineUrl(url);
-    Logger.info(`Updated Jito Block Engine URL to ${url}`);
+    Logger.info(`Updated Jito Block Engine URL to ${endpointOrigin(url)}`);
   }
 
   /**
@@ -589,7 +590,7 @@ export class ExecutionCoordinator {
   }> {
     if (opts.fresh && this.reconcileInFlight) {
       if (!this.reconcileFollowUp) {
-        const follow: NonNullable<typeof this.reconcileFollowUp> = this.reconcileInFlight
+        const follow: Promise<{ status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE'; mismatchesCount: number; details: string }> = this.reconcileInFlight
           .catch(() => undefined)
           .then(() => {
             if (this.reconcileFollowUp === follow) this.reconcileFollowUp = null; // later fresh callers start their own
@@ -774,6 +775,10 @@ export class ExecutionCoordinator {
     if (signerStatus === 'READY') {
       const walletPubkey = localSigner.getPublicKey();
       const activeLivePositions = workstationDb.loadPositions('LIVE', 'ACTIVE');
+      // S10: a SELL that step 4 could not settle (the RPC failed, or the signature is confirmed but its details are not readable yet) is
+      // still PENDING here. Its position shows an empty wallet precisely BECAUSE the sell landed, and closing it now would zero the cost
+      // basis; the retry would then find the position closed and drop the sell as "already applied", so its realized PnL is lost for good.
+      const unsettledSellMints = new Map(workstationDb.getPendingTransactions().filter((t) => t.direction === 'SELL').map((t) => [t.mint, t.signature]));
 
       for (const pos of activeLivePositions) {
         try {
@@ -791,7 +796,11 @@ export class ExecutionCoordinator {
             else throw e;
           }
 
-          if (onChainAmount <= 0n) {
+          if (onChainAmount <= 0n && unsettledSellMints.has(pos.mint)) {
+            mismatchesCount++;
+            issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) shows no tokens but its sell ${String(unsettledSellMints.get(pos.mint)).slice(0, 8)}... is not settled yet; left open so the fill and its PnL can be applied`);
+            this.scheduleReconcileRetry();
+          } else if (onChainAmount <= 0n) {
             // The tokens are gone (sold or moved outside this app). Left OPEN this position blocks arming until someone edits the DB,
             // while the exit loop keeps trying to sell an empty account. Close it with the reason on the record, and say so.
             pos.status = 'CLOSED';
@@ -1184,8 +1193,8 @@ export class ExecutionCoordinator {
           if (rejected) this.raiseOperatorAlert('MARK_MINT_REJECTED', `${pos.symbol || pos.mint.slice(0, 6)} cannot be marked: ${rejected}. The position keeps its last mark and goes stale.`, pos.id); // R19
           // Mark age increases honestly
           const baseTimestamp = pos.lastMarkTimestamp || pos.lastUpdatedTimestamp;
-          pos.markAgeMs = now - baseTimestamp;
-          workstationDb.savePosition(pos);
+          if (baseTimestamp) pos.markAgeMs = now - baseTimestamp;
+          // nothing new to store: the mark age is derived from the stored timestamps on load (S11: no whole-row save here)
         }
       }
     } catch (err: any) {
@@ -1220,7 +1229,7 @@ export class ExecutionCoordinator {
     }
 
     pos.lastUpdatedTimestamp = Date.now();
-    workstationDb.savePosition(pos);
+    workstationDb.saveMark(pos); // S11: marks never rewrite status, quantity or realized
   }
 
   // Pre-retry and pre-fallback on-chain and database verification (R0.6)
@@ -1514,6 +1523,8 @@ export class ExecutionCoordinator {
           landedSlot = postConfirmCheck.slot;
           break;
         }
+        // Q52: a transaction seen REVERTED on chain stays reverted; sending the same transaction again cannot change that.
+        if (lastConfirmDefinite) break;
       }
     }
 
@@ -1782,11 +1793,8 @@ export class ExecutionCoordinator {
 
     // Pre-trade capital sizing check: ensure order does not exceed 10% of spendable bankroll (B12)
     // C5: the configured paper bankroll (default 0.07 SOL), never an invented 1.0
-    const paperSpendable = CapitalSizer.calculateSpendableBankroll(
-      this.realWalletBalanceSol !== null ? this.realWalletBalanceSol : executionConfig.getConfig().paperBankrollSol,
-      0.015,
-      this.inFlightReservedSol
-    );
+    const paperBalanceSol = this.realWalletBalanceSol !== null ? this.realWalletBalanceSol : executionConfig.getConfig().paperBankrollSol;
+    const paperSpendable = CapitalSizer.calculateSpendableBankroll(paperBalanceSol, 0.015, this.inFlightReservedSol);
     const maxPaperOrderSol = Number((paperSpendable * 0.10).toFixed(6));
     if (paperSpendable > 0 && req.amountSol > maxPaperOrderSol + 0.000001) {
       return { rejection: {
@@ -1799,6 +1807,8 @@ export class ExecutionCoordinator {
     }
 
     // Evaluate Risk in Paper Mode
+    // Q51: read the open positions now (the caller's list is from before the awaits above)
+    const paperOpenNow = workstationDb.loadPositions('PAPER', 'ACTIVE');
     const riskDecision = riskEngine.evaluateOrder({
       mint: req.mint,
       orderSizeSol: req.amountSol,
@@ -1809,9 +1819,11 @@ export class ExecutionCoordinator {
       jitoTipLamports: paperTip.tipLamports,
       signalTimestamp: req.signalTimestamp || now,
       marketDataTimestamp: req.marketDataTimestamp || now,
-      currentOpenPositionsCount: openPositions.length,
-      currentTotalExposureSol: totalExposureSol,
-      walletSpendableSol: paperSpendable,
+      currentOpenPositionsCount: paperOpenNow.length,
+      currentTotalExposureSol: paperOpenNow.reduce((acc, p) => acc + p.costBasisLamports / 1e9, 0),
+      // Q50: the risk engine applies the 0.015 reserve itself, so it gets the balance net of in-flight orders only (as LIVE does, N12);
+      // `paperSpendable` already had the reserve taken off, and passing it charged the reserve twice.
+      walletSpendableSol: Math.max(0, paperBalanceSol - this.inFlightReservedSol),
       executionMode: 'PAPER',
     });
 
@@ -1956,7 +1968,7 @@ export class ExecutionCoordinator {
           success: false,
           lifecycleState: 'RISK_REJECTED',
           executionMode: 'LIVE',
-          error: `PROVENANCE_VIOLATION: Live trading requires LIVE_PUMP_STREAM, REAL_ONCHAIN, REAL_SOCIAL, COPY_TRADE, or MANUAL_OPERATOR provenance. Observed: '${req.provenance}'.`,
+          error: `PROVENANCE_VIOLATION: Live trading requires LIVE_PUMP_STREAM, REAL_ONCHAIN, PUMP_HTTP_API, REAL_SOCIAL, COPY_TRADE, or MANUAL_OPERATOR provenance. Observed: '${req.provenance}'.`,
           correlationId,
         };
       }
@@ -2114,7 +2126,7 @@ export class ExecutionCoordinator {
     );
 
     if (needsHolderVerification) {
-      let holderDist = null;
+      let holderDist: Awaited<ReturnType<typeof fetchTokenHolderDistribution>> | null = null;
       try {
         holderDist = await fetchTokenHolderDistribution(
           this.connection,
@@ -2146,7 +2158,7 @@ export class ExecutionCoordinator {
       );
     }
 
-    const verdict = this.eligibilityVerdict(eligibility, now, 'LIVE', correlationId);
+    const verdict = this.eligibilityVerdict(eligibility!, now, 'LIVE', correlationId); // set above whenever it was missing
     if (verdict) return verdict;
 
     // Q16: one open LIVE row per mint. A second buy over the same token account leaves two rows against one balance (the N3 adoption and the
@@ -2234,12 +2246,15 @@ export class ExecutionCoordinator {
 
     // C7b: an entry whose round-trip execution cost (both tips, both base+priority fees, pump fees both sides)
     // exceeds 20% of the order cannot realistically be profitable. The size is never rounded up to make it pass.
+    // S6: the wallet's first pump buy also pays the (never refunded) rent of its volume accumulator account; later buys do not.
+    const accumulatorRentLamports = await this.unrefundedFirstBuyRentLamports();
     const roundTripCostLamports = estimateRoundTripCostLamports({
       buyTipLamports: quote.expectedJitoTipLamports,
       sellTipLamports: resolvedTip.tipLamports,
       priorityFeeLamports: quote.expectedPriorityFeeLamports,
       buyProtocolFeeLamports: quote.protocolFeeLamports,
       buyCreatorFeeLamports: quote.creatorFeeLamports,
+      nonRefundableRentLamports: accumulatorRentLamports,
     });
     if (roundTripCostLamports > MAX_ROUND_TRIP_COST_FRACTION * req.amountSol * 1e9) {
       workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'LIVE', {
@@ -2251,11 +2266,15 @@ export class ExecutionCoordinator {
         success: false,
         lifecycleState: 'RISK_REJECTED',
         executionMode: 'LIVE',
-        error: `EXPECTED_EDGE_BELOW_EXECUTION_COST: Round-trip cost ${roundTripCostLamports} lamports exceeds ${MAX_ROUND_TRIP_COST_FRACTION * 100}% of the ${req.amountSol} SOL order.`,
+        error: `EXPECTED_EDGE_BELOW_EXECUTION_COST: Round-trip cost ${roundTripCostLamports} lamports exceeds ${MAX_ROUND_TRIP_COST_FRACTION * 100}% of the ${req.amountSol} SOL order.${accumulatorRentLamports > 0 ? ` It includes ${accumulatorRentLamports} lamports of one-time pump account rent this wallet has not paid yet; a larger first buy (about ${(Math.ceil(roundTripCostLamports / MAX_ROUND_TRIP_COST_FRACTION / 1e6) / 1e3).toFixed(3)} SOL) pays it once, after which smaller buys pass.` : ''}`,
         correlationId,
       };
     }
 
+    // Q51: count and exposure are read now, not from the snapshot taken before the awaits above, and they include the buys of other mints
+    // that are in flight (not positions yet). There is no await between this read, the risk check and the reservation below.
+    const freshOpen = workstationDb.loadPositions(this.executionMode, 'ACTIVE');
+    const freshExposureSol = freshOpen.reduce((acc, p) => acc + p.costBasisLamports / 1e9, 0) + this.inFlightReservedSol;
     const riskDecision = riskEngine.evaluateOrder({
       mint: req.mint,
       orderSizeSol: req.amountSol,
@@ -2267,8 +2286,8 @@ export class ExecutionCoordinator {
       signalTimestamp: req.signalTimestamp as number,
       marketDataTimestamp: marketState.marketDataTimestamp,
       // R3: adopted wallet dust is not a position the app chose to open; it must not fill the position cap forever.
-      currentOpenPositionsCount: openPositions.filter((p) => !isRecoveredPosition(p)).length,
-      currentTotalExposureSol: totalExposureSol,
+      currentOpenPositionsCount: freshOpen.filter((p) => !isRecoveredPosition(p)).length + this.inFlightBuyMints.size,
+      currentTotalExposureSol: freshExposureSol,
       // N12: the risk engine applies the minimum reserve itself, so it gets the balance net of in-flight orders only. `spendable` already
       // has the reserve and the in-flight amount taken off; passing it (minus in-flight again) charged both twice. Rent held in token accounts
       // is not in getBalance, so it is not subtracted either.
@@ -2671,7 +2690,7 @@ export class ExecutionCoordinator {
    * quantity are not rejected sends; counting them walked the ladder to 4000 bps before the real resend.
    */
   private static isNonAttemptExitError(error?: string): boolean {
-    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found|SELL_PENDING_VERIFICATION|UNKNOWN_TRADING_VENUE|Signer is not configured|Calculated sell quantity is zero)/.test(error) || ExecutionCoordinator.isQuoteFailure(error);
+    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found|SELL_PENDING_VERIFICATION|UNKNOWN_TRADING_VENUE|Trading venue for mint|Signer is not configured|Calculated sell quantity is zero)/.test(error) || ExecutionCoordinator.isQuoteFailure(error);
   }
 
   /** R10: the sell could not even be quoted (fail-closed quote, fee config, market state). Nothing was sent, and widening slippage cannot help. */
@@ -2704,7 +2723,7 @@ export class ExecutionCoordinator {
     positionId: string,
     sellPct: number = 100,
     reason: string = 'Manual Close'
-  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string }> {
+  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number }> {
     // A halt stops entries and discretionary exits. It never stops the exits that protect the wallet: stop-loss, trailing stop,
     // an operator's manual close and panic liquidation (a halt that froze a losing position would be the opposite of its purpose).
     if (this.haltReason && !PROTECTIVE_EXIT_REASONS.test(reason)) {
@@ -2717,7 +2736,6 @@ export class ExecutionCoordinator {
       const res = await this.closePositionImpl(positionId, sellPct, reason);
       this.recordExitOutcome(positionId, res, before?.executionMode);
       if (res.success && before) {
-        const fraction = Math.min(100, Math.max(1, sellPct)) / 100;
         workstationDb.logDecision({
           autoMode: 'n/a',
           mint: before.mint,
@@ -2728,8 +2746,12 @@ export class ExecutionCoordinator {
           reason,
           inputs: { sellPct, mode: before.executionMode, pnlSol: res.pnlSol },
           positionId,
-          // Q8: only a LIVE exit moves the wallet; a PAPER exit journaled a delta the balance never showed, which the wallet audit read as a drain
-          solDelta: before.executionMode === 'LIVE' ? (before.costBasisLamports / 1e9) * fraction + res.pnlSol : undefined,
+          // Q8: only a LIVE exit moves the wallet; a PAPER exit journaled a delta the balance never showed, which the wallet audit read as a drain.
+          // S2: and only what THIS call actually moved. Adopting an earlier sell, closing an empty wallet without a send, and a sell clamped
+          // to a smaller wallet balance all used to journal the pre-clamp cost basis as an inflow that never arrived (a phantom credit that
+          // the DEVNET_LIVE audit then read as an unexplained change). closePositionImpl reports the SOL it moved; a LIVE success that
+          // reports none journals 0, which fails safe (any real inflow it missed shows up as unexplained and halts).
+          solDelta: before.executionMode === 'LIVE' ? (res.solMoved ?? 0) : undefined,
         });
       }
       return res;
@@ -2742,7 +2764,7 @@ export class ExecutionCoordinator {
     positionId: string,
     sellPct: number,
     reason: string
-  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string }> {
+  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number }> {
     if (this.inFlightPositionExits.has(positionId)) {
       return { success: false, pnlSol: 0, error: 'EXIT_IN_PROGRESS: An exit transaction for this position is already in progress.' };
     }
@@ -2861,7 +2883,7 @@ export class ExecutionCoordinator {
           workstationDb.savePosition(target);
           this.raiseOperatorAlert('SELL_ADOPTED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed but its fill could not be read. The position now matches the wallet; realized PnL for it was not recorded.`, positionId);
           await this.syncRealWalletBalance();
-          return { success: true, pnlSol: 0, status: target.status };
+          return { success: true, pnlSol: 0, status: target.status, solMoved: 0 }; // S2: the earlier sell moved the SOL; this call moved none
         }
         if (Date.now() - pendingSell.ts < PENDING_SELL_WINDOW_MS) {
           return { success: false, pnlSol: 0, error: `SELL_PENDING_VERIFICATION: sell ${pendingSell.signature.slice(0, 8)} was sent and is not confirmed or expired yet; not selling again` };
@@ -2890,7 +2912,7 @@ export class ExecutionCoordinator {
             target.exitReason = 'RECONCILED_ZERO_BALANCE: the wallet held no tokens when the sell was prepared';
             workstationDb.savePosition(target);
             this.raiseOperatorAlert('POSITION_BALANCE_MISSING', `${target.symbol || target.mint} was closed without a sell: the wallet held none of it. Realized PnL for it was not recorded.`, positionId);
-            return { success: true, pnlSol: 0, status: 'CLOSED' };
+            return { success: true, pnlSol: 0, status: 'CLOSED', solMoved: 0 }; // S2: nothing was sent, so nothing moved
           }
           target.costBasisLamports = Math.round(target.costBasisLamports * Number(held) / Number(totalTokensRaw));
           target.tokenQuantityRaw = held.toString();
@@ -2956,11 +2978,10 @@ export class ExecutionCoordinator {
           ...SolanaTransactionBuilder.createComputeBudgetInstructions(250000, executionConfig.getConfig().priorityFeeMicrolamports),
           ...pumpSwapSell.instructions,
           ...(closeAtaEffective ? [createCloseAccountInstruction(associatedUser, seller, seller, [], tokenProgramToUse)] : []),
-          SystemProgram.transfer({
-            fromPubkey: seller,
-            toPubkey: jitoTipAccount,
-            lamports: expectedJitoTipLamports,
-          }),
+          // Q52: no tip transfer when the tip is 0 (the builder guards the same way)
+          ...(expectedJitoTipLamports > 0
+            ? [SystemProgram.transfer({ fromPubkey: seller, toPubkey: jitoTipAccount, lamports: expectedJitoTipLamports })]
+            : []),
         ];
 
         v0Tx = await txBuilder.buildCustomVersionedTransaction(this.connection, seller, instructions);
@@ -3053,6 +3074,9 @@ export class ExecutionCoordinator {
         return { success: false, pnlSol: 0, error: subRes.error || 'Failed to submit or confirm sell bundle' };
       }
 
+      // S2: the basis being sold, AFTER any clamp to the wallet balance above (target.costBasisLamports was scaled there)
+      const costSoldSol = (target.costBasisLamports / 1e9) * fraction;
+
       // Reconcile real proceeds from confirmed transaction
       const sellRecon = await TradeReconciler.reconcileSellTransaction(
         this.connection,
@@ -3094,12 +3118,29 @@ export class ExecutionCoordinator {
         success: true,
         pnlSol: sellRecon.actualRealizedPnLSol,
         status: target.status,
+        solMoved: costSoldSol + sellRecon.actualRealizedPnLSol,
       };
     } catch (err: any) {
       return { success: false, pnlSol: 0, error: err.message };
     } finally {
       this.inFlightPositionExits.delete(positionId);
     }
+  }
+
+  /** Wallets whose pump volume accumulator is known to exist (it is never closed by this app), so the account is read once. */
+  private volumeAccumulatorKnown = new Set<string>();
+
+  /** S6: 0 when the signer wallet already has its pump volume accumulator; the rent of creating it otherwise (also when it cannot be read). */
+  private async unrefundedFirstBuyRentLamports(): Promise<number> {
+    let owner: PublicKey;
+    try { owner = localSigner.getPublicKey(); } catch { return PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS; }
+    const key = owner.toBase58();
+    if (this.volumeAccumulatorKnown.has(key)) return 0;
+    try {
+      const info = await this.connection.getAccountInfo(userVolumeAccumulatorPda(owner), 'confirmed');
+      if (info) { this.volumeAccumulatorKnown.add(key); return 0; }
+    } catch { /* unreadable: assume the rent is still to be paid */ }
+    return PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS;
   }
 
   private async simulateSell(tx: any): Promise<{ ok: boolean; error?: string }> {
@@ -3261,7 +3302,11 @@ export class ExecutionCoordinator {
       // or undo a partial; skip it and let the next pass re-evaluate from the current row.
       const current = workstationDb.loadPositions(undefined, undefined).find((p) => p.id === pos.id);
       if (!current || current.status === 'CLOSED' || current.tokenQuantityRaw !== loadedQty.get(pos.id)) continue;
-      workstationDb.savePosition(pos);
+      try {
+        workstationDb.saveExitState(pos); // S11: only the exit engine's fields, so a stale copy cannot undo a sell; Q56: a failing write must not stop the exits in this pass
+      } catch (err: any) {
+        Logger.error(`[B13 ExitEngine] could not persist the trailing state of ${pos.symbol || pos.mint}: ${err.message}. Exit evaluation continues.`);
+      }
 
       if (decision.shouldExit) {
         const waitMs = this.exitRetryWaitMs(pos.id, now);

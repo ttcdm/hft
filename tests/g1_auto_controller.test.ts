@@ -59,9 +59,11 @@ describe('G1: auto-snipe controller', () => {
     await setAutoMode('SHADOW');
     const exec = vi.spyOn(executionCoordinator, 'executeTrade');
     const fill = vi.spyOn(paperEngine, 'executePaperBuy');
+    const snipeSpy = vi.spyOn(memecoinAggregator, 'executeSnipe');
     const before = workstationDb.loadPositions().length;
     const d = await autoSnipeController.submitCandidate(cand(newPool()));
     expect(d.outcome, d.reason).toBe('WOULD_BUY');
+    expect(snipeSpy.mock.calls[0][0].noSyntheticPool).toBe(true); // S16: auto never trades against an invented pool
     expect(d.stage).toBe('fill');
     expect(d.amountSol).toBeGreaterThan(0);
     expect(exec).not.toHaveBeenCalled();
@@ -113,6 +115,16 @@ describe('G1: auto-snipe controller', () => {
     vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('LIVE');
     expect((await autoSnipeController.setMode('PAPER')).ok).toBe(false);
     expect(autoSnipeController.getMode()).toBe('OFF');
+  });
+
+  it('S12: PAPER sizes its session from the paper bankroll, not from whatever the real wallet holds', async () => {
+    const { executionConfig } = await import('../server/solana/executionConfig');
+    const paper = executionConfig.getConfig().paperBankrollSol;
+    vi.spyOn(executionCoordinator, 'getRealWalletBalanceSol').mockReturnValue(123.456);
+    await setAutoMode('PAPER');
+    const s = autoSnipeController.getStatus().session!;
+    expect(s.startingBankrollSol).toBe(paper);
+    expect(s.budgets.maxSpendSol).toBeCloseTo(PAPER_SESSION_BUDGETS.maxSpendBankrollMultiple * paper, 9);
   });
 
   it('budgets: running out of buys, spend or loss drops the controller to SHADOW', async () => {

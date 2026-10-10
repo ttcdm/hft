@@ -37,6 +37,8 @@ import {
   sanitizeExternalUrl,
   sanitizeTwitterUrl,
   sanitizeTelegramUrl,
+  isMainnetCluster,
+  solscanAccountUrl,
 } from '../utils/tokenLinks';
 
 interface PumpFunHotCalloutsViewProps {
@@ -58,7 +60,8 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
     liveSource: string;
     syncLatencyMs: number;
     tokensTrackedCount: number;
-    lastUpdated: number;
+    /** null until the server has reported a sync time; never invented from the browser clock (S19) */
+    lastUpdated: number | null;
   }>({
     liveSource: '—',
     syncLatencyMs: 0,
@@ -96,7 +99,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
           liveSource: data.liveSource || '—',
           syncLatencyMs: data.syncLatencyMs ?? 0,
           tokensTrackedCount: data.tokensTrackedCount ?? 0,
-          lastUpdated: data.lastUpdated || Date.now(),
+          lastUpdated: data.lastUpdated || null,
         });
         if (data.autoSnipeRules) {
           setRules(data.autoSnipeRules);
@@ -120,7 +123,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
           liveSource: data.status.liveSource || '—',
           syncLatencyMs: data.status.syncLatencyMs ?? 0,
           tokensTrackedCount: data.status.tokensTrackedCount ?? 0,
-          lastUpdated: data.status.lastSyncTimestamp || Date.now(),
+          lastUpdated: data.status.lastSyncTimestamp || null,
         });
       }
     });
@@ -133,7 +136,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
         onAlertTrigger?.(
           'INFO',
           `⚡ AUTONOMOUS CALLOUT SNIPED: $${data.callout.token.symbol}`,
-          data.tradeRes?.message || `Executed Jito MEV Snipe on Pump.fun for $${data.callout.token.symbol}`
+          data.tradeRes?.message || `Snipe request handled for $${data.callout.token.symbol}`
         );
         onRefreshParent?.();
       }
@@ -187,7 +190,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
       onAlertTrigger?.(
         'INFO',
         `⚡ HOT CALLOUT SNIPED: $${callout.token.symbol}`,
-        `Executed $${defaultAmount.toFixed(2)} on Pump.fun via Jito MEV Bundle. Caller: @${callout.caller.userId} (Avg: ${callout.caller.avgMultiple}x)`
+        `${tradingMode.live ? 'Sent' : 'PAPER fill of'} $${defaultAmount.toFixed(2)} on Pump.fun (${tradingMode.label}). Caller: @${callout.caller.userId} (Avg: ${callout.caller.avgMultiple}x)`
       );
       setCallouts((prev) =>
         prev.map((c) => (c.id === callout.id ? { ...c, status: 'SNIPED' } : c))
@@ -197,7 +200,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
       onAlertTrigger?.(
         'WARNING',
         'SNIPE REJECTED',
-        res?.result?.message || 'Failed pre-trade risk or curve check'
+        res?.result?.message || res?.error || 'Failed pre-trade risk or curve check'
       );
     }
     setSnipingCalloutId(null);
@@ -265,9 +268,8 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <span className="text-xs font-bold text-white uppercase tracking-wider font-mono">
                 Pump.fun Hot Callouts & Caller Reputation Engine
               </span>
-              <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex items-center space-x-1">
-                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping inline-block" />
-                <span>LIVE API v3</span>
+              <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-slate-700/40 text-slate-300 border border-slate-600/50">
+                <span>pump.fun API v3</span>
               </span>
               {isWsLive && (
                 <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 flex items-center space-x-1">
@@ -284,7 +286,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
 
         <div className="flex items-center space-x-2">
           <div className="px-2.5 py-1 rounded bg-[#0A0E1A] border border-[#1E293B] text-[11px] font-mono text-slate-300 hidden md:block">
-            Synced: <span className="text-white font-semibold">{new Date(statusInfo.lastUpdated).toLocaleTimeString()}</span>
+            Synced: <span className="text-white font-semibold">{statusInfo.lastUpdated ? new Date(statusInfo.lastUpdated).toLocaleTimeString() : '—'}</span>
           </div>
 
           <button
@@ -371,7 +373,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                   </span>
                 </div>
                 <div className="text-[11px] text-slate-400">
-                  Toggle Auto-Snipe on specific callers below or in the Leaderboard to automatically snipe their signals.
+                  The per-caller auto-snipe toggle only marks a caller on this screen; nothing buys because of it. Auto trading is controlled in the Auto panel.
                 </div>
               </div>
             </div>
@@ -617,6 +619,8 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                             </button>
 
                             {/* External Links */}
+                            {isMainnetCluster(tradingMode.cluster) ? (
+                              <>
                             <a
                               href={`https://pump.fun/coin/${c.token.mint}`}
                               target="_blank"
@@ -645,6 +649,10 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                             >
                               <span className="text-emerald-400 font-bold">GMGN</span>
                             </a>
+                              </>
+                            ) : (
+                              <span className="text-slate-600 p-0.5 text-[9px] font-mono" title={`Mainnet-only sites (pump.fun, DexScreener, GMGN) do not list this token${tradingMode.cluster ? ` on ${tradingMode.cluster}` : ' (cluster unknown)'}`}>no mainnet links</span>
+                            )}
 
                             {/* Verified X.com Link */}
                             {(() => {
@@ -678,7 +686,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                                   target="_blank"
                                   rel="noreferrer"
                                   className="text-blue-300 bg-blue-500/20 border border-blue-500/40 hover:bg-blue-500/30 p-0.5 text-[9px] font-mono flex items-center gap-0.5 px-1 rounded transition"
-                                  title={`Verified Telegram: ${tgUrl}`}
+                                  title={`Telegram (creator-supplied, unverified): ${tgUrl}`}
                                 >
                                   <span className="font-bold">TG</span>
                                 </a>
@@ -695,7 +703,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                                   target="_blank"
                                   rel="noreferrer"
                                   className="text-emerald-300 bg-emerald-500/20 border border-emerald-500/40 hover:bg-emerald-500/30 p-0.5 text-[9px] font-mono flex items-center gap-0.5 px-1 rounded transition"
-                                  title={`Verified Website: ${webUrl}`}
+                                  title={`Website (creator-supplied, unverified): ${webUrl}`}
                                 >
                                   <Globe className="w-2.5 h-2.5" />
                                 </a>
@@ -809,7 +817,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                               ? 'bg-rose-500/20 text-rose-300 border-rose-500/50 shadow-sm'
                               : 'bg-[#141B2D] text-slate-400 border-[#1E293B] hover:text-white hover:border-slate-600'
                           }`}
-                          title={c.caller.isAutoSnipeSubscribed ? 'Click to disable auto-snipe for this caller' : 'Click to automatically snipe all callouts from this caller'}
+                          title={c.caller.isAutoSnipeSubscribed ? 'Click to unmark this caller (a screen marker only; nothing buys because of it)' : 'Click to mark this caller (a screen marker only; nothing buys because of it)'}
                         >
                           <Bot className="w-3 h-3 text-cyan-400" />
                           <span>{c.caller.isAutoSnipeSubscribed ? 'AUTO-SNIPE: ON' : 'AUTO-SNIPE: OFF'}</span>
@@ -852,7 +860,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
             </div>
 
             <div className="text-[11px] text-slate-400">
-              Toggle <span className="text-rose-400 font-bold">Auto-Snipe</span> to execute instant Jito MEV trades whenever that specific caller drops a callout
+              Toggle <span className="text-rose-400 font-bold">Auto-Snipe</span> to snipe whenever that specific caller drops a callout (a real transaction only when LIVE is armed)
             </div>
           </div>
 
@@ -980,7 +988,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 Autonomous Pump.fun Callout Sniper Parameters
               </h3>
               <p className="text-xs text-slate-400 mt-0.5">
-                Automatically execute Jito MEV bundles when high-winrate callers or multi-caller confluence trigger.
+                These rules are stored and shown here; no code acts on them. Auto trading is controlled in the Auto panel (a real transaction only when LIVE is armed; PAPER sends nothing).
               </p>
             </div>
 
@@ -1115,7 +1123,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
-                Direct tip to Jito MEV validators for slot leader front-running and anti-sandwich.
+                Tip paid to Jito validators with a LIVE bundle. PAPER sends nothing and pays no tip.
               </span>
             </div>
           </div>
@@ -1151,8 +1159,9 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                   </div>
                   <div className="text-xs font-mono text-slate-400 flex items-center space-x-1.5">
                     <span>Wallet: {selectedCallerModal.primaryWallet.slice(0, 10)}...{selectedCallerModal.primaryWallet.slice(-6)}</span>
+                    {solscanAccountUrl(selectedCallerModal.primaryWallet, tradingMode.cluster) ? (
                     <a
-                      href={`https://solscan.io/account/${selectedCallerModal.primaryWallet}`}
+                      href={solscanAccountUrl(selectedCallerModal.primaryWallet, tradingMode.cluster) as string}
                       target="_blank"
                       rel="noreferrer"
                       className="text-cyan-400 hover:text-cyan-300 inline-flex items-center"
@@ -1160,6 +1169,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                     >
                       <ExternalLink className="w-3 h-3 ml-0.5" />
                     </a>
+                    ) : null}
                   </div>
                   <span className="px-2 py-0.5 rounded text-[10px] font-mono bg-amber-500/20 text-amber-300 border border-amber-500/40 mt-1 inline-block">
                     {selectedCallerModal.reputationTier}

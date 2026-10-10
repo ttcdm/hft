@@ -23,8 +23,8 @@ describe('G3: kill-switch triggers (pure rules)', () => {
     expect(upperBound80([])).toBeNull();
     expect(upperBound80([1])).toBeNull();
     expect(upperBound80([1, 1, 1, 1])).toBe(1); // zero variance: the bound is the mean
-    const ub = upperBound80([0, 2])!; // mean 1, sd sqrt(2), n 2 -> 1 + 1.2816 * sqrt(2) / sqrt(2)
-    expect(ub).toBeCloseTo(1 + 1.2816, 6);
+    const ub = upperBound80([0, 2])!; // mean 1, sd sqrt(2), n 2 -> 1 + 0.8416 * sqrt(2) / sqrt(2)
+    expect(ub).toBeCloseTo(1 + 0.8416, 6);
   });
 
   it('negative expectancy needs a full window and an upper bound below zero', () => {
@@ -208,7 +208,8 @@ describe('G3: decision journal and kill switch on the real controller', () => {
 
   it('a negative-expectancy sequence of verified trades drops PAPER to SHADOW; shadow journals "would buy" and buys nothing', async () => {
     await setAutoMode('PAPER');
-    for (let i = 0; i < EXPECTANCY_WINDOW; i++) closedPaper(100 + i, lose(i), false);
+    const own = (id: string) => (autoSnipeController as any).session.positionIds.push(id); // Q30: only trades auto opened are judged
+    for (let i = 0; i < EXPECTANCY_WINDOW; i++) own(closedPaper(100 + i, lose(i), false));
     expect(CapitalSizer.getHistoricalTradeStats('PAPER').tradeCount).toBeGreaterThanOrEqual(EXPECTANCY_WINDOW);
 
     const hits = await autoSnipeController.checkTriggers();
@@ -224,6 +225,16 @@ describe('G3: decision journal and kill switch on the real controller', () => {
     const d = await autoSnipeController.submitCandidate({ mint, symbol: 'G3', source: 'TEST', amountUsd: 0.7, provenance: 'REAL_ONCHAIN' });
     expect(d.outcome, d.reason).toBe('WOULD_BUY');
     expect(exec).not.toHaveBeenCalled();
+  });
+
+  it('Q30: losses the operator closed by hand, or that closed before this session, do not re-trip the trigger', async () => {
+    await setAutoMode('PAPER');
+    for (let i = 0; i < EXPECTANCY_WINDOW; i++) closedPaper(300 + i, lose(i), false); // not opened by auto
+    expect((await autoSnipeController.checkTriggers()).map((h) => h.code)).not.toContain('NEGATIVE_EXPECTANCY');
+    const before = Array.from({ length: EXPECTANCY_WINDOW }, (_, i) => closedPaper(400 + i, lose(i), false));
+    (autoSnipeController as any).session.positionIds.push(...before);
+    (autoSnipeController as any).session.startedAt = Date.now() + 60_000; // a session that started after those trades closed
+    expect((await autoSnipeController.checkTriggers()).map((h) => h.code)).not.toContain('NEGATIVE_EXPECTANCY');
   });
 
   it('DEVNET_LIVE wallet audit: an explained change passes, an unexplained drain halts ALL trading including exits', async () => {

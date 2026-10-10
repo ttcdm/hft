@@ -8,7 +8,8 @@ import {
   EXIT_FAILURE_ALERT_AFTER,
 } from '../server/execution/coordinator';
 import { localSigner } from '../server/solana/signer';
-import { riskEngine } from '../server/risk/riskEngine';
+import { riskEngine, PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS } from '../server/risk/riskEngine';
+import { userVolumeAccumulatorPda } from '@pump-fun/pump-sdk';
 import { workstationDb } from '../server/db/database';
 import { PumpCurveService } from '../server/solana/pumpCurve';
 import { PumpSwapVenueService } from '../server/solana/pumpSwapService';
@@ -199,7 +200,7 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
 
   describe('Q13: a 100% sell sells what the wallet holds', () => {
     const rowOf = () => workstationDb.loadPositions().find((p) => p.id === posId)!;
-    const balance = (amount: string) => { (coordinator as any).connection.getTokenAccountBalance = vi.fn(async () => ({ value: { amount } })); };
+    const balance = (amount: string) => { vi.spyOn((coordinator as any).connection, 'getTokenAccountBalance').mockImplementation((async () => ({ value: { amount } })) as any); };
 
     it('the row says 1,000,000,000 but the wallet holds 600,000,000: the sell is for 600,000,000, the basis is scaled and the position closes', async () => {
       balance('600000000');
@@ -234,6 +235,45 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
       const res = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
       expect(res.success, res.error).toBe(true);
       expect(String(quoteSpy.mock.calls[0][0].amountTokens ?? quoteSpy.mock.calls[0][0].tokenAmountRaw ?? '')).toBe('1000000000');
+    });
+  });
+
+  describe('S2: the exit journals the SOL this call actually moved', () => {
+    const exitedDelta = (spy: ReturnType<typeof vi.spyOn>) => (spy.mock.calls.map((c) => c[0] as any).find((r) => r.outcome === 'EXITED'))?.solDelta;
+    const balance = (amount: string) => { (coordinator as any).connection.getTokenAccountBalance = vi.fn(async () => ({ value: { amount } })); };
+
+    it('a normal full exit journals cost basis + realized PnL', async () => {
+      const log = vi.spyOn(workstationDb, 'logDecision');
+      balance('1000000000');
+      await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(exitedDelta(log)).toBeCloseTo(0.1 - 0.05, 9);
+    });
+
+    it('an empty wallet closes the row with nothing sent and journals 0, not the cost basis as an inflow', async () => {
+      const log = vi.spyOn(workstationDb, 'logDecision');
+      balance('0');
+      const res = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(res.success).toBe(true);
+      expect(submit).not.toHaveBeenCalled();
+      expect(exitedDelta(log)).toBe(0); // was +0.1 SOL of credit that never arrived
+    });
+
+    it('a sell clamped to a smaller wallet journals the clamped basis (0.06), not the row basis (0.1)', async () => {
+      const log = vi.spyOn(workstationDb, 'logDecision');
+      balance('600000000');
+      await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(exitedDelta(log)).toBeCloseTo(0.06 - 0.05, 9); // was 0.1 - 0.05
+    });
+
+    it('adopting an earlier sell journals 0: that sell moved the SOL, this call moved none', async () => {
+      (TradeReconciler.reconcileSellTransaction as any).mockResolvedValue({ success: false, reconciliationState: 'RECONCILIATION_REQUIRED', error: 'fill unreadable' });
+      await coordinator.closePosition(posId, 100, 'STOP_LOSS'); // sent, fill unreadable: pending
+      const log = vi.spyOn(workstationDb, 'logDecision');
+      balance('0'); // the wallet shows the sell landed
+      const again = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(again.success).toBe(true);
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(exitedDelta(log)).toBe(0);
     });
   });
 
@@ -299,6 +339,43 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
       submit.mockResolvedValue({ success: false, signature: '', transport: 'SOLANA_RPC', error: 'x', lifecycleState: 'SUBMIT_FAILED' });
       await buy();
       expect(submit).toHaveBeenCalledTimes(1);
+    });
+
+    describe('S6: the first pump buy of a wallet pays rent nothing refunds, and the cost gate counts it', () => {
+      const realRent = () => vi.spyOn(ExecutionCoordinator.prototype as any, 'unrefundedFirstBuyRentLamports').mockRestore(); // the suite default stubs it to 0
+      const pdaOf = () => userVolumeAccumulatorPda(localSigner.getPublicKey());
+
+      it('no accumulator yet: a 0.005 SOL order is refused, the error carries the rent and says what to do; nothing is sent', async () => {
+        closeAllActive(); armLive(); realRent();
+        vi.spyOn((coordinator as any).connection, 'getAccountInfo').mockResolvedValue(null);
+        const res: any = await buy();
+        expect(res.success).toBe(false);
+        expect(res.error).toMatch(/EXPECTED_EDGE_BELOW_EXECUTION_COST/);
+        expect(res.error).toContain(String(PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS));
+        expect(res.error).toMatch(/one-time pump account rent/);
+        expect(submit).not.toHaveBeenCalled();
+      });
+
+      it('the wallet already has it: the same order passes the gate and is sent', async () => {
+        closeAllActive(); armLive(); realRent();
+        vi.spyOn((coordinator as any).connection, 'getAccountInfo').mockResolvedValue({ lamports: 1_346_200, data: Buffer.alloc(137), owner: Keypair.generate().publicKey, executable: false } as any);
+        submit.mockResolvedValue({ success: false, signature: '', transport: 'SOLANA_RPC', error: 'x', lifecycleState: 'SUBMIT_FAILED' });
+        await buy();
+        expect(submit).toHaveBeenCalledTimes(1);
+      });
+
+      it('an unreadable account assumes the rent is still owed; once seen it is read only once', async () => {
+        realRent();
+        const read = vi.spyOn((coordinator as any).connection, 'getAccountInfo');
+        read.mockRejectedValueOnce(new Error('429'));
+        expect(await (coordinator as any).unrefundedFirstBuyRentLamports()).toBe(PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS);
+        read.mockResolvedValue({ lamports: 1, data: Buffer.alloc(137) } as any);
+        expect(await (coordinator as any).unrefundedFirstBuyRentLamports()).toBe(0);
+        const reads = read.mock.calls.length;
+        expect(await (coordinator as any).unrefundedFirstBuyRentLamports()).toBe(0);
+        expect(read.mock.calls.length).toBe(reads);
+        expect(read.mock.calls.some((c) => (c[0] as any).equals(pdaOf()))).toBe(true);
+      });
     });
   });
 

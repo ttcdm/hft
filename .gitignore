@@ -59,3 +59,7 @@ Thumbs.db
 # local env copies (contain secrets)
 env.txt
 .env.bak-*
+
+# ─── Seed-run buyer wallets (secret keys) ────────────────────────────────────
+.overnight/seed-wallets/
+.overnight/seed-funder*.json

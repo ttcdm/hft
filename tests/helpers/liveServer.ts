@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
 import { Keypair } from '@solana/web3.js';
 
 /**
@@ -69,6 +71,8 @@ export interface AppHandle {
   base: string;
   token: string;
   dbPath: string;
+  /** The server process itself (S27: no tsx wrapper in between, so SIGKILL on this pid really kills the server). */
+  pid: number;
   logs: () => string;
   call(method: 'GET' | 'POST', route: string, body?: unknown): Promise<{ status: number; json: any }>;
   stop(): Promise<void>;
@@ -92,7 +96,7 @@ export function throwawayKeyFile(dir: string): string {
   return f;
 }
 
-const baseEnv = (dir: string, extra: Record<string, string>): Record<string, string> => ({
+export const baseEnv = (dir: string, extra: Record<string, string>): Record<string, string> => ({
   PATH: process.env.PATH ?? '',
   HOME: process.env.HOME ?? dir,
   NODE_ENV: 'production',
@@ -100,6 +104,10 @@ const baseEnv = (dir: string, extra: Record<string, string>): Record<string, str
   APEX_DB_PATH: path.join(dir, 'app.db'),
   SIGNER_KEYPAIR_PATH: throwawayKeyFile(dir),
   OPERATOR_PASSWORD: 'behaviour-test-password',
+  // S7: no test child may default to a public RPC (it is outside the vitest network guard): a closed loopback port on the local cluster.
+  SOLANA_RPC_URL: 'http://127.0.0.1:9',
+  ALLOWED_CLUSTER: 'localnet',
+  LOCALNET_GENESIS_HASH: LOCALNET_STUB_GENESIS,
   SOLANA_WS_URL: 'ws://127.0.0.1:9',
   JITO_BLOCK_ENGINE_URL: 'http://127.0.0.1:9',
   APEX_DISABLE_EXTERNAL_FEEDS: 'true', // no price/pump feeds from a child process: it is outside the vitest network guard
@@ -109,21 +117,25 @@ const baseEnv = (dir: string, extra: Record<string, string>): Record<string, str
 export async function startApp(dir: string, env: Record<string, string>): Promise<AppHandle> {
   const port = await freePort();
   const full = { ...baseEnv(dir, env), APP_PORT: String(port) };
-  const child: ChildProcess = spawn(path.resolve('node_modules/.bin/tsx'), [path.resolve('server.ts')], { cwd: dir, env: full, stdio: ['ignore', 'pipe', 'pipe'] });
+  // S27: `node --import tsx`, not the node_modules/.bin/tsx wrapper. The wrapper does not relay SIGKILL, so a crash test that killed it left the real server running.
+  const tsxEsm = pathToFileURL(createRequire(path.resolve('package.json')).resolve('tsx/esm')).href;
+  const child: ChildProcess = spawn(process.execPath, ['--import', tsxEsm, path.resolve('server.ts')], { cwd: dir, env: full, stdio: ['ignore', 'pipe', 'pipe'] });
   let log = '';
   child.stdout?.on('data', (d) => (log += d));
   child.stderr?.on('data', (d) => (log += d));
   const base = `http://127.0.0.1:${port}`;
   let up = false;
-  for (let i = 0; i < 120 && !up; i++) {
+  // S27: 120 s by default (was 30 s: a gate run under load, with the long tests in parallel, timed out before the server was up). APEX_TEST_STARTUP_MS overrides.
+  const startupPolls = Math.ceil(Number(process.env.APEX_TEST_STARTUP_MS || 120_000) / 250);
+  for (let i = 0; i < startupPolls && !up; i++) {
     if (child.exitCode !== null) throw new Error(`server exited early (${child.exitCode}):\n${log.slice(-2000)}`);
     try { up = (await fetch(`${base}/api/health`)).ok; } catch { await new Promise((r) => setTimeout(r, 250)); }
   }
-  if (!up) { child.kill('SIGKILL'); throw new Error(`server did not come up:\n${log.slice(-2000)}`); }
+  if (!up) { child.kill('SIGKILL'); throw new Error(`server did not come up after ${Math.round(startupPolls * 0.25)} s (child exitCode ${child.exitCode}, signal ${child.signalCode}):\n${log.slice(-2000)}`); }
   const login = await (await fetch(`${base}/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ password: full['OPERATOR_PASSWORD'] }) })).json();
   const token: string = login.token;
   return {
-    base, token, dbPath: full['APEX_DB_PATH'], logs: () => log,
+    base, token, dbPath: full['APEX_DB_PATH'], pid: child.pid!, logs: () => log,
     async call(method, route, body) {
       const res = await fetch(base + route, { method, headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: body === undefined ? undefined : JSON.stringify(body) });
       return { status: res.status, json: await res.json().catch(() => null) };

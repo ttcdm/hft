@@ -76,7 +76,9 @@ export class HardenedRiskEngine {
   /** Daily loss stop in SOL: pinned value if set explicitly, else maxDailyLossUsd / live SOL price, else the safe default. */
   public effectiveMaxDailyLossSol(): number {
     if (this.dailyLossLimitPinned) return this.limits.maxDailyLossSol;
-    const px = solPriceService.lastKnownPrice();
+    // Q56: a price older than an hour no longer converts the USD limit; the fixed SOL default applies until a fresh one is read.
+    const reading = solPriceService.getPrice();
+    const px = reading.usd !== null && (reading.ageMs ?? Infinity) <= 60 * 60_000 ? reading.usd : null;
     return px ? executionConfig.getConfig().maxDailyLossUsd / px : this.limits.maxDailyLossSol;
   }
 
@@ -321,8 +323,23 @@ export const riskEngine = new HardenedRiskEngine();
 export const MAX_ROUND_TRIP_COST_FRACTION = 0.2;
 
 /**
+ * Rent-exempt lamports per byte of account data, including the 128-byte header. Measured, not assumed: the user_volume_accumulator
+ * (137 bytes) that the real pump program creates holds 1,346,200 lamports on the local chain and on devnet (S6b), which is
+ * 265 x 5,080. (An earlier 6,960 was the old 3,480 x 2 figure and over-counted by 37%.)
+ */
+export const RENT_LAMPORTS_PER_BYTE = 5_080;
+/**
+ * S6: the pump program creates a UserVolumeAccumulator (137 bytes, measured on the local chain with the real program binary) the first time
+ * a wallet buys anything on pump.fun, and charges the buyer its rent: (137 + 128) x 5,080 = 1,346,200 lamports (0.00135 SOL), the figure also read off the app wallet's account on devnet. Nothing
+ * refunds it. A 0.005 SOL first order therefore starts 27% down before any fee; every later buy by the wallet does not pay it.
+ * The token account's rent (Token-2022, 170 bytes: 1,513,840 lamports) is NOT counted: the exit closes the account and refunds it.
+ */
+export const PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS = (137 + 128) * RENT_LAMPORTS_PER_BYTE;
+
+/**
  * Round-trip cost in lamports: buy tip + one expected sell tip + 2 x (base 5,000 + priority fee) + pump fees on both sides.
  * The sell-side pump fee is taken equal to the buy-side fee (same bps on a notional of about the order size).
+ * S6: plus any rent that is paid and never refunded (see PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS).
  */
 export function estimateRoundTripCostLamports(p: {
   buyTipLamports: number;
@@ -330,8 +347,10 @@ export function estimateRoundTripCostLamports(p: {
   priorityFeeLamports: number;
   buyProtocolFeeLamports: number;
   buyCreatorFeeLamports: number;
+  /** S6: rent this round trip pays and never gets back (the one-time pump volume accumulator on a wallet's first pump buy). Default 0. */
+  nonRefundableRentLamports?: number;
 }): number {
   const baseFees = 2 * (5_000 + p.priorityFeeLamports);
   const pumpFees = 2 * (p.buyProtocolFeeLamports + p.buyCreatorFeeLamports);
-  return p.buyTipLamports + p.sellTipLamports + baseFees + pumpFees;
+  return p.buyTipLamports + p.sellTipLamports + baseFees + pumpFees + (p.nonRefundableRentLamports ?? 0);
 }

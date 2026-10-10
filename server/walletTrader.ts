@@ -47,7 +47,7 @@ export interface LiveWalletState {
   /** Q35: the header pill reads these; it used to read two fields that were never sent. */
   activePositionsCount: number;
   closedPositionsCount: number;
-  /** Realized today (EST/NY), net of fees, from the realized-events ledger. */
+  /** Realized today (UTC day, as the database keys it), net of fees, from the realized-events ledger. */
   totalRealizedPnLSol: number;
   totalRealizedPnLUsd: number | null;
   /** Marked profit or loss of the open positions (recovered dust is 0 by Q2). */
@@ -125,7 +125,8 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     const bal = await executionCoordinator.syncRealWalletBalance();
 
     // C3: the single SolPriceService owns fetching, caching and staleness.
-    await solPriceService.refresh();
+    // S26: with APEX_DISABLE_EXTERNAL_FEEDS=true (unit tests, loopback-only child servers) no price host is contacted from this loop.
+    if (process.env.APEX_DISABLE_EXTERNAL_FEEDS !== 'true') await solPriceService.refresh();
 
     this.emit('wallet_state_updated', this.getState());
     return bal;
@@ -284,16 +285,16 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     const activePositions = executionCoordinator.getPositions(mode, 'ACTIVE');
     const closedPositions = executionCoordinator.getPositions(mode, 'CLOSED');
     const totalOpenCost = activePositions.reduce((s, p) => s + p.costBasisLamports / 1e9, 0);
-    const totalOpenValue = activePositions.reduce((s, p) => s + p.currentValueSol, 0);
+    const totalOpenValue = activePositions.reduce((s, p) => s + (p.currentValueSol ?? 0), 0);
     const availableSol = Math.max(0, this.config.allocatedSol - totalOpenCost);
 
     const solPriceUsd = solPriceService.lastKnownPrice(); // null when no price has ever been read
     const totalPortfolioValueUsd = solPriceUsd === null ? null : (availableSol + totalOpenValue) * solPriceUsd;
-    const totalUnrealizedPnLSol = activePositions.reduce((s, p) => s + (Number.isFinite(p.unrealizedPnLSol) ? p.unrealizedPnLSol : 0), 0);
+    const totalUnrealizedPnLSol = activePositions.reduce((s, p) => s + (Number.isFinite(p.unrealizedPnLSol) ? (p.unrealizedPnLSol as number) : 0), 0);
     const totalRealizedPnLSol = workstationDb.getDailyRealizedPnLSol(mode);
     const totalRealizedPnLUsd = solPriceUsd === null ? null : totalRealizedPnLSol * solPriceUsd;
 
-    const totalJitoTipsPaidSol = activePositions.reduce((s, p) => s + p.jitoTipLamports / 1e9, 0);
+    const totalJitoTipsPaidSol = activePositions.reduce((s, p) => s + (p.jitoTipLamports ?? 0) / 1e9, 0);
 
     const signerStatus = localSigner.getStatus();
     const walletAddress =

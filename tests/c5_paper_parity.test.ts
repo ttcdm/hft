@@ -141,10 +141,32 @@ describe('C5: PAPER runs the same gate as LIVE', () => {
     expect(ok.success, ok.error).toBe(true);
   });
 
+  it('Q50: the risk engine gets the paper balance net of in-flight orders only; the 0.015 reserve is applied once, there', async () => {
+    const mint = Keypair.generate().publicKey.toBase58();
+    const spy = vi.spyOn(riskEngine, 'evaluateOrder');
+    const r = await executionCoordinator.executeTrade(req(mint, known(mint), 0.005));
+    expect(r.success, r.error).toBe(true);
+    const bankroll = (executionCoordinator as any).realWalletBalanceSol ?? executionConfig.getConfig().paperBankrollSol;
+    expect(spy.mock.calls[0][0].walletSpendableSol).toBeCloseTo(bankroll - (executionCoordinator as any).inFlightReservedSol, 6);
+  });
+
+  it('Q51: LIVE counts buys of other mints that are in flight, and reads the open positions at the risk check', async () => {
+    (live as any).inFlightBuyMints.add('SOME_OTHER_MINT_IN_FLIGHT');
+    (live as any).inFlightReservedSol = 0.0001;
+    const spy = vi.spyOn(riskEngine, 'evaluateOrder');
+    await live.executeTrade(req(MINT, known(MINT), 0.003));
+    expect(spy).toHaveBeenCalled();
+    const arg = spy.mock.calls[0][0];
+    expect(arg.currentOpenPositionsCount).toBeGreaterThanOrEqual(1); // the in-flight buy counts as a position
+    expect(arg.currentTotalExposureSol).toBeGreaterThanOrEqual(0.0001); // and its reserved SOL as exposure
+    (live as any).inFlightBuyMints.clear();
+    (live as any).inFlightReservedSol = 0;
+  });
+
   it('the tip the risk engine approved is the tip the paper fill is charged', async () => {
     const mint = Keypair.generate().publicKey.toBase58();
     const spy = vi.spyOn(riskEngine, 'evaluateOrder');
-    const r = await executionCoordinator.executeTrade({ signalTimestamp: Date.now(), ...req(mint, known(mint)), jitoTipSol: 0.0004 });
+    const r = await executionCoordinator.executeTrade({ ...req(mint, known(mint)), jitoTipSol: 0.0004 });
     expect(r.success, r.error).toBe(true);
     const approvedTip = spy.mock.calls[0][0].jitoTipLamports;
     expect((r.gates as any).risk.tipLamports).toBe(approvedTip);

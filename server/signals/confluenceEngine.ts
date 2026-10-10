@@ -112,9 +112,9 @@ export class ConfluenceEngine {
     // 5. Buy/Sell Imbalance Score (0 - 20)
     // Higher buy ratio (> 75% buys) gives max points
     let imbalanceScore = 0;
-    const totalTx = known(input.buys5m) && known(input.sells5m) ? input.buys5m + input.sells5m : 0;
+    const totalTx = known(input.buys5m) && known(input.sells5m) ? (input.buys5m as number) + (input.sells5m as number) : 0;
     if (totalTx > 10) {
-      const buyRatio = input.buys5m / totalTx;
+      const buyRatio = (input.buys5m as number) / totalTx;
       imbalanceScore = Math.round(buyRatio * 20);
     }
 

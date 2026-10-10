@@ -41,3 +41,28 @@ describe('Q2: adopted balances do not fabricate PnL', () => {
     expect(db.getDailyRealizedPnLSol('LIVE')).toBeCloseTo(-0.004, 9);
   });
 });
+
+/** S9: paper trades priced by the flat model (the curve could not be read) are not evidence either, on the entry or on the exit. */
+describe('S9: model-priced paper fills stay out of the evidence set', () => {
+  const closed = (id: string) => base(id, { executionMode: 'PAPER', status: 'CLOSED', tokenQuantityRaw: '0', costBasisLamports: 10_000_000, realizedPnLSol: 0.002 });
+
+  it('a MODEL-priced entry and a MODEL-priced exit are excluded; a curve-quoted round trip is kept', () => {
+    for (const id of ['entry-model', 'exit-model', 'quoted']) db.savePosition(closed(id));
+    db.logJournal('PAPER_FILL_GATES', 'c1', 'PAPER', { mint: 'm', orderId: 'entry-model', gates: { pricing: 'MODEL', eligibility: { unverified: [] } } });
+    db.logJournal('PAPER_FILL_GATES', 'c2', 'PAPER', { mint: 'm', orderId: 'exit-model', gates: { pricing: 'CURVE_QUOTE', eligibility: { unverified: [] } } });
+    db.logJournal('PAPER_FILL_GATES', 'c3', 'PAPER', { mint: 'm', orderId: 'quoted', gates: { pricing: 'CURVE_QUOTE', eligibility: { unverified: [] } } });
+    db.logJournal('PAPER_SELL_FILLED', 'exit-model', 'PAPER', { positionId: 'exit-model', pricing: 'MODEL' });
+    db.logJournal('PAPER_SELL_FILLED', 'quoted', 'PAPER', { positionId: 'quoted', pricing: 'CURVE_QUOTE' });
+    expect(db.loadEvidenceClosedTrades('PAPER').map((p) => p.id)).toEqual(['quoted']);
+  });
+
+  it('the C5 rule still applies (an UNKNOWN gate), and retention keeps both journal kinds', () => {
+    db.savePosition(closed('unknown-gate'));
+    db.logJournal('PAPER_FILL_GATES', 'c', 'PAPER', { mint: 'm', orderId: 'unknown-gate', gates: { pricing: 'CURVE_QUOTE', eligibility: { unverified: ['liquidity'] } } });
+    db.savePosition(closed('exit-only'));
+    db.logJournal('PAPER_SELL_FILLED', 'exit-only', 'PAPER', { positionId: 'exit-only', pricing: 'MODEL' });
+    expect(db.loadEvidenceClosedTrades('PAPER')).toEqual([]);
+    db.pruneOldRows(1, Date.now() + 10 * 86_400_000); // everything is "old"
+    expect([...db.getUnverifiedFillIds()].sort()).toEqual(['exit-only', 'unknown-gate']);
+  });
+});

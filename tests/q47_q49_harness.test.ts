@@ -9,7 +9,7 @@ describe('Q47-Q49: the harness is hermetic and does not pass by default', () => 
   });
   it('no e2e script records a literal pass', () => {
     for (const f of ['scripts/localnet/e2e.ts', 'scripts/devnet_e2e.ts']) {
-      expect(fs.readFileSync(f, 'utf8'), f).not.toMatch(/\brec\('[^']*', true,/);
+      expect(fs.readFileSync(f, 'utf8'), f).not.toMatch(/\brec\(['"`][^'"`]*['"`], true,/);
     }
   });
   it('CI runs the localnet end-to-end', () => {

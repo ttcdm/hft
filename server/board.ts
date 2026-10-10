@@ -77,7 +77,7 @@ export function buildBoard(now = Date.now()) {
       markPriceSol: p.currentPriceSol > 0 ? p.currentPriceSol : null,
       markAgeMs: p.lastMarkTimestamp ? now - p.lastMarkTimestamp : null,
       costSol: p.costBasisLamports ? p.costBasisLamports / 1e9 : null,
-      pnlSol: p.currentPriceSol > 0 ? (p.realizedPnLSol ?? 0) + (p.unrealizedPnLSol ?? 0) : null,
+      pnlSol: p.currentPriceSol > 0 && !String(p.entryTxSignature || '').startsWith('RECOVERED:') ? (p.realizedPnLSol ?? 0) + (p.unrealizedPnLSol ?? 0) : null,
       nextExit: nextExitFor(p),
     }));
 

@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
 import { authFetch } from '../services/engineClient';
+import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
 import { positionPnlCell } from '../utils/positionPnl';
 
 interface PlugAndPlayTradingModalProps {
@@ -80,6 +81,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   const [positionSearchQuery, setPositionSearchQuery] = useState('');
   const [selectedExternalToken, setSelectedExternalToken] = useState<any>(null);
 
+  const tradingMode = useTradingMode();
   const [isLoading, setIsLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ text: string; type: 'info' | 'success' | 'error' } | null>(null);
 
@@ -189,29 +191,15 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
     }
   };
 
-  const handleEmergencyKillSwitch = async (activate: boolean) => {
-    try {
-      setIsLoading(true);
-      const res = await authFetch('/api/execution/kill-switch', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ activate }),
-      });
-      const data = await res.json();
-      setStatusMessage({ text: data.message, type: activate ? 'error' : 'info' });
-      await fetchSystemData();
-    } catch (err: any) {
-      setStatusMessage({ text: err.message, type: 'error' });
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
   const handleManualSnipe = async () => {
     if (!manualMint || manualMint.length < 32) {
       setStatusMessage({ text: 'Please enter a valid Solana token mint address', type: 'error' });
       return;
     }
+
+    // S1: this button sends a real transaction while LIVE is armed, so it asks first and tells the server it asked
+    const warning = liveClickWarning(tradingMode, `Sniping ${manualMint.trim().slice(0, 8)}… for ${Number(manualAmountSol)} SOL`);
+    if (warning && !window.confirm(warning)) return;
 
     try {
       setIsLoading(true);
@@ -225,6 +213,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
           jitoTipSol: Number(jitoTipSol),
           callerHandle: '@manual_terminal',
           confluenceScore: 100,
+          ...(tradingMode.live ? { confirmLive: true } : {}),
         }),
       });
 
@@ -232,7 +221,8 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
       if (!res.ok) throw new Error(data.error || 'Snipe order failed');
 
       setStatusMessage({
-        text: `Snipe executed successfully! ID: ${data.data?.positionId} (TX: ${data.data?.txSignature?.slice(0, 16)}...)`,
+        // S19: a paper fill sends nothing, so it must not read as a transaction
+        text: `${tradingMode.live ? 'Snipe sent' : 'PAPER fill recorded (nothing sent)'}. ID: ${data.data?.positionId}${data.data?.txSignature ? ` (TX: ${data.data.txSignature.slice(0, 16)}...)` : ''}`,
         type: 'success',
       });
       setManualMint('');
@@ -335,10 +325,10 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
             <div className="flex items-center space-x-1.5">
               <span
                 className={`w-2 h-2 rounded-full ${
-                  systemAudit?.isLiveArmed ? 'bg-rose-400 animate-ping' : 'bg-emerald-400'
+                  !systemAudit ? 'bg-slate-500' : systemAudit.isLiveArmed ? 'bg-rose-400 animate-ping' : 'bg-emerald-400'
                 }`}
               />
-              <span className={`font-bold ${systemAudit?.isLiveArmed ? 'text-rose-400' : 'text-emerald-400'}`}>
+              <span className={`font-bold ${!systemAudit ? 'text-slate-400' : systemAudit.isLiveArmed ? 'text-rose-400' : 'text-emerald-400'}`}>
                 {systemAudit?.mode || 'UNKNOWN'}
               </span>
             </div>
@@ -673,7 +663,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                     <span>Generate Local Signer Keypair</span>
                   </button>
                   <span className="text-[11px] text-slate-400">
-                    Fund this address with 0.07 SOL to begin live trading.
+                    Fund this address with devnet SOL before arming LIVE; how much depends on the order size you set.
                   </span>
                 </div>
               </div>

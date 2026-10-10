@@ -21,6 +21,15 @@ export const WATCH_BUCKET_MS = 10_000;
 export const HOT_MIN_VELOCITY_SOL_PER_MIN = 1.5;
 export const HOT_MIN_UNIQUE_BUYERS = 25;
 export const HOT_MAX_LARGEST_BUYER_SHARE = 0.15;
+/**
+ * S4d: wallets that fund thousands of unrelated traders (exchange hot wallets, a faucet) and must not make their customers one cluster.
+ * EXPLICIT only: an operator-supplied list in APEX_PUBLIC_FUNDERS (comma-separated addresses), empty by default. It is deliberately not
+ * inferred from behaviour (for example "funds buyers of 5 mints"), because an attacker can fake any behaviour cheaply and so make their own
+ * cluster vanish. No address is built in: I could not verify any here, and a wrong entry silently blinds the buyers signal.
+ */
+export function publicFundersFromEnv(env: NodeJS.ProcessEnv = process.env): Set<string> {
+  return new Set((env.APEX_PUBLIC_FUNDERS ?? '').split(',').map((a) => a.trim()).filter(Boolean));
+}
 export const HOT_MIN_SIGNALS = 3;
 export const HOT_MIN_SCORE = 70;
 const CREATOR_CLUSTER = 'cluster:creator';
@@ -102,6 +111,8 @@ export interface WatchWindowOptions {
   funderOf?: (wallet: string) => string | null | undefined;
   /** Confluence score for a mint, or null when it cannot be scored. HOT needs a score of at least 70. */
   scoreOf?: (mint: string) => number | null | undefined;
+  /** S4d: funders whose wallets are not clustered together (see publicFundersFromEnv). Default: the environment's list. */
+  publicFunders?: Iterable<string>;
 }
 
 export class WatchWindow extends EventEmitter {
@@ -109,6 +120,7 @@ export class WatchWindow extends EventEmitter {
   private released = new Map<string, WatchResult>();
   private opts: Required<Pick<WatchWindowOptions, 'maxCandidates' | 'minMs' | 'maxMs'>> & Pick<WatchWindowOptions, 'funderOf' | 'scoreOf'>;
   private funders = new Map<string, string>();
+  private publicFunders: Set<string>;
   /** Wallets whose funder was looked up and does not exist / is out of reach: they count as known, in a cluster of their own. */
   private noFunder = new Set<string>();
   private requestFunder: ((wallet: string, mint: string) => void) | null = null;
@@ -119,6 +131,7 @@ export class WatchWindow extends EventEmitter {
 
   constructor(opts: WatchWindowOptions = {}) {
     super();
+    this.publicFunders = new Set(opts.publicFunders ?? publicFundersFromEnv());
     this.opts = {
       maxCandidates: opts.maxCandidates ?? WATCH_MAX_CANDIDATES,
       minMs: opts.minMs ?? WATCH_MIN_MS,
@@ -208,6 +221,8 @@ export class WatchWindow extends EventEmitter {
     const f = this.funderFor(wallet);
     if (!f) return `wallet:${wallet}`;
     if (f && c.insiders.has(f)) return CREATOR_CLUSTER;
+    // S4d: an allowlisted public funder does not tie its wallets together. The creator check above still wins.
+    if (this.publicFunders.has(f)) return `wallet:${wallet}`;
     return `funder:${f}`;
   }
 

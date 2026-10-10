@@ -197,12 +197,21 @@ const INITIAL_SIGNALS: SocialSignal[] = [
   },
 ];
 
+/**
+ * True for any text the Telegram parser could treat as a buy command. Deliberately a PREFIX test on the trimmed text, the same one the
+ * parser starts from, so the webhook's live-confirmation guard cannot be dodged by "/snipe_x" or "/buyer" (S1c).
+ */
+export function isTelegramTradeCommand(text: string): boolean {
+  const t = (text ?? '').trim();
+  return t.startsWith('/snipe') || t.startsWith('/buy');
+}
+
 export class SocialAlphaScanner {
   private signals: SocialSignal[] = [];
   private telegramConfig: TelegramBotConfig = {
     botToken: process.env.TELEGRAM_BOT_TOKEN || '',
     chatId: process.env.TELEGRAM_CHAT_ID || '',
-    webhookActive: true,
+    webhookActive: false, // Q34: no webhook is registered with Telegram; the /status reply must not say LIVE WEBHOOK
     autoForwardAlerts: true,
     snipeThresholdScore: 85,
   };
@@ -272,6 +281,10 @@ export class SocialAlphaScanner {
   }
 
   // Handle simulated or real incoming Telegram Bot commands
+  private panicHook: (() => Promise<void>) | null = null;
+  /** S13: what /panic_sell does besides closing positions (kill switch, disarm, stop auto). Set by server.ts, so this file imports none of it. */
+  public setPanicHook(fn: (() => Promise<void>) | null): void { this.panicHook = fn; }
+
   public async processTelegramCommand(commandText: string): Promise<{ reply: string; actionTaken?: string }> {
     const trimmed = commandText.trim();
     if (trimmed.startsWith('/start') || trimmed.startsWith('/help')) {
@@ -314,9 +327,12 @@ export class SocialAlphaScanner {
     }
 
     if (trimmed.startsWith('/panic_sell') || trimmed.startsWith('/dump_all')) {
+      // S13: like the HTTP panic, stop new entries first, so auto does not re-buy after the exits.
+      let stopNote = '';
+      try { await this.panicHook?.(); } catch (e: any) { stopNote = `\n⚠️ Could not stop new entries: ${e?.message || e}`; }
       const positions = memecoinAggregator.getPositions();
       if (positions.length === 0) {
-        return { reply: `⚠️ No active positions to liquidate.` };
+        return { reply: `⚠️ No active positions to liquidate. Kill switch on, live trading disarmed, auto stopped.${stopNote}` };
       }
       let totalRealized = 0;
       const closedNames: string[] = [];
@@ -332,7 +348,7 @@ export class SocialAlphaScanner {
       }
       const head = failedNames.length === 0 ? '🚨 EMERGENCY DUMP COMPLETE' : `⚠️ EMERGENCY DUMP INCOMPLETE: ${failedNames.length} position(s) STILL OPEN`;
       return {
-        reply: `${head}:\nClosed ${closedNames.length}: ${closedNames.join(', ') || 'none'}${failedNames.length ? `\nStill open: ${failedNames.join(', ')}` : ''}\nRealized PnL of the closed: ${totalRealized >= 0 ? '+' : ''}$${totalRealized.toFixed(2)}`,
+        reply: `${head}:\nClosed ${closedNames.length}: ${closedNames.join(', ') || 'none'}${failedNames.length ? `\nStill open: ${failedNames.join(', ')}` : ''}\nRealized PnL of the closed: ${totalRealized >= 0 ? '+' : ''}$${totalRealized.toFixed(2)}\nKill switch on, live trading disarmed, auto stopped.${stopNote}`,
         actionTaken: failedNames.length === 0 ? 'PANIC_SELL_EXECUTED' : 'PANIC_SELL_PARTIAL',
       };
     }
@@ -344,8 +360,11 @@ export class SocialAlphaScanner {
       };
     }
 
-    if (trimmed.startsWith('/snipe') || trimmed.startsWith('/buy')) {
+    if (isTelegramTradeCommand(trimmed)) {
       const parts = trimmed.split(/\s+/);
+      // S1c: only the exact commands trade. The route's live-confirmation guard uses the broader prefix test, so "/snipe_x" and "/buyer"
+      // are refused by the guard while LIVE is armed and are not trades here either.
+      if (!/^\/(snipe|buy)(@\w+)?$/.test(parts[0])) return { reply: `Unknown command ${parts[0].slice(0, 40)}. Type /help for the available operations.` };
       const ca = parts[1] || '';
       // S1: never fall back to a hardcoded token. A missing or malformed mint, or a bad amount, is rejected.
       let validMint: boolean;
@@ -619,7 +638,7 @@ export class SocialAlphaScanner {
     // K5 (#15): this is a token discovered on the pump.fun feed, not a post by a known account. Nothing is invented about
     // the author, the audience, the confidence or the intent: tier, confidence, sentiment and engagement metrics are
     // unknown, the signal is unverified, and the suggested action is to review it, never SNIPE_IMMEDIATE.
-    const source: SocialSource = hasTwitter ? 'X_TWITTER' : 'TELEGRAM';
+    const source: SocialSource = hasTwitter ? 'X_TWITTER' : hasTelegram ? 'TELEGRAM' : 'PUMP_FEED';
     const authorHandle = tokenData.callerHandle
       ? tokenData.callerHandle
       : hasTwitter
@@ -644,7 +663,7 @@ export class SocialAlphaScanner {
 
     const newSignal: SocialSignal = {
       id: `sig-live-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      provenance: 'REAL_ONCHAIN',
+      provenance: 'PUMP_HTTP_API', // Q33
       source,
       authorHandle,
       authorDisplayName,

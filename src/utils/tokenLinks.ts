@@ -71,6 +71,19 @@ export function sanitizeTelegramUrl(raw?: string | null): string | undefined {
   return `https://t.me/${handle}`;
 }
 
+/** S20: only a known mainnet cluster may link to the mainnet-only sites. Unknown (the server has not answered yet) is NOT mainnet. */
+export function isMainnetCluster(cluster?: string | null): boolean {
+  return cluster === 'mainnet-beta' || cluster === 'mainnet';
+}
+
+/** S20: a Solscan account link that names the cluster, so a devnet / localnet wallet never opens as a mainnet page. */
+export function solscanAccountUrl(address: string, cluster?: string | null): string | null {
+  if (cluster === 'devnet') return `https://solscan.io/account/${address}?cluster=devnet`;
+  if (cluster === 'localnet') return `https://solscan.io/account/${address}?cluster=custom&customUrl=http%3A%2F%2Flocalhost%3A8899`;
+  if (isMainnetCluster(cluster)) return `https://solscan.io/account/${address}`;
+  return null;
+}
+
 export function getTokenExternalLinks(params: {
   mintOrCa: string;
   symbol: string;
@@ -228,11 +241,11 @@ export function getTokenExternalLinks(params: {
     },
     {
       id: 'twitter',
-      name: twitter ? '𝕏 (Official Profile)' : '𝕏 (Twitter Search)',
-      shortName: twitter ? '𝕏 Official' : '𝕏 Search',
+      name: twitter ? '𝕏 (creator-supplied profile)' : '𝕏 (Twitter Search)',
+      shortName: twitter ? '𝕏 Profile' : '𝕏 Search',
       url: twitterClean,
       description: twitter
-        ? 'Verified project 𝕏 handle, dev updates, and community presence'
+        ? 'Project 𝕏 handle as supplied by the token creator (unverified)'
         : 'Search live influencer callouts, caller confluence, and community sentiment',
       colorClass: 'text-sky-400 hover:text-sky-300 border-sky-500/40 hover:border-sky-400',
       badgeBgClass: 'bg-sky-500/10 hover:bg-sky-500/20 text-sky-300 border-sky-500/30',
@@ -243,10 +256,10 @@ export function getTokenExternalLinks(params: {
   if (telegramClean) {
     items.push({
       id: 'telegram',
-      name: 'Official Telegram',
+      name: 'Telegram (creator-supplied)',
       shortName: 'Telegram',
       url: telegramClean,
-      description: 'Official verified Telegram community channel, dev announcements & voice rooms',
+      description: 'Telegram link supplied by the token creator (unverified)',
       colorClass: 'text-blue-400 hover:text-blue-300 border-blue-500/40 hover:border-blue-400',
       badgeBgClass: 'bg-blue-500/10 hover:bg-blue-500/20 text-blue-300 border-blue-500/30',
       isAvailable: true,
@@ -259,7 +272,7 @@ export function getTokenExternalLinks(params: {
       name: 'Project Website',
       shortName: 'Website',
       url: websiteClean,
-      description: 'Official project homepage, whitepaper documentation & dapp interface',
+      description: 'Website supplied by the token creator (unverified)',
       colorClass: 'text-emerald-400 hover:text-emerald-300 border-emerald-500/40 hover:border-emerald-400',
       badgeBgClass: 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border-emerald-500/30',
       isAvailable: true,

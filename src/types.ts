@@ -213,7 +213,7 @@ export interface EngineTelemetryData {
 }
 
 // ---------------- SOCIAL SCANNER & ALPHA INTELLIGENCE ----------------
-export type SocialSource = 'TELEGRAM' | 'X_TWITTER';
+export type SocialSource = 'TELEGRAM' | 'X_TWITTER' | 'PUMP_FEED'; // Q33: PUMP_FEED = discovered on the pump.fun / DexScreener lists, no social post behind it
 
 export type AuthorTier =
   | 'CABAL_TRACKER'
@@ -234,6 +234,7 @@ export type SignalPattern =
 export type SignalProvenance =
   | 'LIVE_PUMP_STREAM'
   | 'REAL_ONCHAIN'
+  | 'PUMP_HTTP_API' // Q33: the pump.fun / DexScreener HTTP lists; market data, not an on-chain event and not a social post
   | 'REAL_SOCIAL'
   | 'COPY_TRADE'
   | 'MANUAL_OPERATOR'
@@ -323,6 +324,8 @@ export interface MemecoinPool {
   rugcheckScore: 'SAFE' | 'CAUTION' | 'DANGEROUS';
   createdAgo: string;
   trendingRank: number;
+  /** Q32: true when some numbers above are placeholders (a pool built from a callout, not read from the chain). It is never real evidence. */
+  unverified?: boolean;
 }
 
 // ---------------- SNIPER POSITIONS & EXECUTION ----------------

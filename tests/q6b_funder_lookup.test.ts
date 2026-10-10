@@ -103,3 +103,22 @@ describe('Q6b: funder lookup', () => {
     expect(calls.sigs).toBe(5);
   });
 });
+
+describe('S4c: a funder lookup error is retried', () => {
+  it('a transient RPC error is retried and the funder is then reported; a permanent one is reported as ERROR after the retries, once', async () => {
+    const [a, b] = [wallet(), wallet()];
+    const funder = wallet();
+    let failuresLeft = 2;
+    const { conn } = fakeConn((w) => (w === a ? funder : null), { fail: new Set([b]) });
+    const base = conn.getSignaturesForAddress;
+    conn.getSignaturesForAddress = async (key: any) => { if (key.toBase58() === a && failuresLeft-- > 0) throw new Error('429'); return base(key); };
+    const l = new FunderLookup(() => conn, { retryDelaysMs: [1, 1, 1] });
+    const got: Array<[string, any]> = [];
+    l.onResult((w, r) => got.push([w, r]));
+    l.request(a, 'M'); l.request(b, 'M');
+    for (let i = 0; i < 100 && got.length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+    expect(got.find(([w]) => w === a)![1]).toEqual({ funder });
+    expect(got.filter(([w]) => w === b).length).toBe(1);
+    expect(got.find(([w]) => w === b)![1]).toMatchObject({ reason: 'ERROR' });
+  });
+});

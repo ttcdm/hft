@@ -14,26 +14,11 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
     <script>
-      // Gracefully prevent unhandled promise rejections or errors from sandbox WebSocket disconnections
+      // Q45: a failed WebSocket is expected while the server restarts, and the client reconnects by itself. Log it; do not hide
+      // other errors (the old handlers called preventDefault on anything mentioning "WebSocket" or "1006").
       window.addEventListener('unhandledrejection', function (event) {
-        var str = String(event?.reason?.message || event?.reason || '');
-        if (
-          str.includes('WebSocket') ||
-          str.includes('1006') ||
-          str.includes('ws error')
-        ) {
-          event.preventDefault();
-        }
-      });
-      window.addEventListener('error', function (event) {
-        var str = String(event?.message || event?.error?.message || '');
-        if (
-          str.includes('WebSocket') ||
-          str.includes('1006') ||
-          str.includes('ws error')
-        ) {
-          event.preventDefault();
-        }
+        var str = String((event && event.reason && event.reason.message) || (event && event.reason) || '');
+        if (str.indexOf('WebSocket') !== -1) console.warn('[ws] unhandled rejection:', str);
       });
     </script>
   </head>

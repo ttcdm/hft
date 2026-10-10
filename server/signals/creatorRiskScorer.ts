@@ -47,6 +47,17 @@ export interface CreatorRiskReport {
 export class CreatorRiskScorer {
   private cache: Map<string, { report: CreatorRiskReport; expiresAt: number }> = new Map();
   private readonly defaultCacheTtlMs = 120_000; // 2 minutes cache for HFT speed
+  /** S14: expired entries were only ignored on read, never removed, so the cache grew with every creator seen. */
+  private readonly maxCacheEntries = 2_000;
+
+  private storeInCache(creatorAddress: string, report: CreatorRiskReport): void {
+    const now = Date.now();
+    this.cache.set(creatorAddress, { report, expiresAt: now + this.defaultCacheTtlMs });
+    if (this.cache.size > this.maxCacheEntries) {
+      for (const [k, v] of this.cache) if (v.expiresAt <= now) this.cache.delete(k);
+      while (this.cache.size > this.maxCacheEntries) this.cache.delete(this.cache.keys().next().value as string);
+    }
+  }
 
   /**
    * Inspect creator transaction history via RPC connection.getSignaturesForAddress
@@ -77,10 +88,7 @@ export class CreatorRiskScorer {
       }
 
       const report = this.evaluateSignatures(creatorAddress, signatures, nowSec);
-      this.cache.set(creatorAddress, {
-        report,
-        expiresAt: Date.now() + this.defaultCacheTtlMs,
-      });
+      this.storeInCache(creatorAddress, report);
 
       return report;
     } catch (err: any) {

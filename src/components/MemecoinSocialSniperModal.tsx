@@ -1,6 +1,7 @@
 import { signalFeedBadge } from '../utils/signalBadge';
 import { probeBadge, probeLatency, hostOfService } from '../utils/probeBadge';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
+import { isMainnetCluster, sanitizeExternalUrl, sanitizeTelegramUrl } from '../utils/tokenLinks';
 import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
 import React, { useState, useEffect } from 'react';
 import {
@@ -262,7 +263,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
       onAlertTrigger?.(
         'WARNING',
         `SNIPE REJECTED`,
-        res?.tradeResult?.message || 'Failed pre-trade risk check'
+        res?.tradeResult?.message || res?.error || 'Failed pre-trade risk check'
       );
     }
   };
@@ -307,6 +308,9 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   // Manual Snipe by CA
   const handleManualSnipe = async () => {
     if (!manualSnipeCa.trim()) return;
+    // S1: a manual snipe by address is a one-click trade too
+    const warning = liveClickWarning(tradingMode, `Sniping ${manualSnipeCa.trim().slice(0, 8)}… for $${(Number(manualSnipeAmount) || 5.0).toFixed(2)}`);
+    if (warning && !window.confirm(warning)) return;
     setManualSnipeLoading(true);
     hftAudio.playOrderFill();
     try {
@@ -315,7 +319,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
         amountUsd: Number(manualSnipeAmount) || 5.0,
         jitoTipSol: sniperConfig.jitoTipSol,
         slippagePct: sniperConfig.maxSlippagePct,
-      });
+      }, tradingMode.live);
 
       if (res?.result?.success) {
         onAlertTrigger?.('INFO', 'MANUAL SNIPE SUCCESSFUL', res.result.message);
@@ -358,10 +362,6 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                 <h2 className="text-base sm:text-lg font-bold text-white tracking-wide">
                   Telegram & X Market Maker Intelligence & Memecoin Sniper Swarm
                 </h2>
-                <span className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex items-center space-x-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
-                  <span>LIVE INGESTION</span>
-                </span>
                 {isWsLive && (
                   <span className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 flex items-center space-x-1">
                     <Radio className="w-3 h-3 text-cyan-400 animate-pulse" />
@@ -370,7 +370,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                 )}
               </div>
               <p className="text-xs text-slate-400 mt-0.5">
-                Aggregating Pump.fun, Raydium, DexScreener, Uniswap/Base with automated Jito MEV bundle execution.
+                Aggregating Pump.fun, Raydium, DexScreener and Uniswap/Base signals. Orders run through the execution engine in the mode shown in the banner; PAPER sends nothing.
               </p>
             </div>
           </div>
@@ -660,6 +660,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
                           {/* Live Platform Feed Links */}
                           <div className="flex flex-wrap items-center gap-1.5">
+                            {isMainnetCluster(tradingMode.cluster) ? (
+                              <>
                             {/* Pump.fun Link */}
                             <a
                               href={`https://pump.fun/coin/${sig.contractAddress}`}
@@ -685,11 +687,15 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                               <span>DexScreener</span>
                               <ExternalLink className="w-2 h-2 text-cyan-400" />
                             </a>
+                              </>
+                            ) : (
+                              <span className="text-slate-600 text-[10px] font-mono" title="Mainnet-only sites do not list this token unless the server is on mainnet">no mainnet links</span>
+                            )}
 
                             {/* X.com Link */}
                             <a
                               href={
-                                sig.socials?.twitter ||
+                                sanitizeExternalUrl(sig.socials?.twitter) ||
                                 (sig.source === 'X_TWITTER' && sig.authorHandle.startsWith('@')
                                   ? `https://x.com/${sig.authorHandle.replace('@', '')}`
                                   : `https://x.com/search?q=%24${sig.tokenTicker.replace('$', '')}+solana`)
@@ -698,33 +704,31 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                               rel="noreferrer"
                               className="px-2 py-0.5 rounded bg-sky-500/10 hover:bg-sky-500/20 text-sky-300 border border-sky-500/30 text-[10px] font-mono flex items-center space-x-1 transition"
                               title={
-                                sig.socials?.twitter
-                                  ? `Verified Token X Feed: ${sig.socials.twitter}`
+                                sanitizeExternalUrl(sig.socials?.twitter)
+                                  ? `Token X link (creator-supplied, unverified): ${sanitizeExternalUrl(sig.socials?.twitter)}`
                                   : sig.source === 'X_TWITTER'
                                   ? `View Author @${sig.authorHandle} on X`
                                   : `Search $${sig.tokenTicker} on X.com`
                               }
                             >
                               <span className="font-bold text-[11px]">𝕏</span>
-                              <span>{sig.socials?.twitter ? 'Token 𝕏' : sig.source === 'X_TWITTER' ? 'KOL 𝕏' : 'Search 𝕏'}</span>
+                              <span>{sanitizeExternalUrl(sig.socials?.twitter) ? 'Token 𝕏' : sig.source === 'X_TWITTER' ? 'KOL 𝕏' : 'Search 𝕏'}</span>
                               <ExternalLink className="w-2 h-2 text-sky-400" />
                             </a>
 
                             {/* Telegram Link */}
-                            {(sig.socials?.telegram || sig.source === 'TELEGRAM') && (
+                            {(sanitizeTelegramUrl(sig.socials?.telegram) || (sig.source === 'TELEGRAM' && /^@?[A-Za-z0-9_]{4,32}$/.test(sig.authorHandle))) && (
                               <a
                                 href={
-                                  sig.socials?.telegram ||
-                                  (sig.authorHandle.startsWith('@') || !sig.authorHandle.includes(' ')
-                                    ? `https://t.me/${sig.authorHandle.replace('@', '')}`
-                                    : `https://t.me/pumpfun_channel`)
+                                  sanitizeTelegramUrl(sig.socials?.telegram) ||
+                                  `https://t.me/${sig.authorHandle.replace('@', '')}`
                                 }
                                 target="_blank"
                                 rel="noreferrer"
                                 className="px-2 py-0.5 rounded bg-blue-500/10 hover:bg-blue-500/20 text-blue-300 border border-blue-500/30 text-[10px] font-mono flex items-center space-x-1 transition"
                                 title={
-                                  sig.socials?.telegram
-                                    ? `Verified Telegram Channel: ${sig.socials.telegram}`
+                                  sanitizeTelegramUrl(sig.socials?.telegram)
+                                    ? `Telegram link (creator-supplied, unverified): ${sanitizeTelegramUrl(sig.socials?.telegram)}`
                                     : `Open Channel on Telegram`
                                 }
                               >
@@ -752,7 +756,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                           {sig.status === 'SNIPED' ? (
                             <span className="px-3 py-1.5 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-xs font-bold flex items-center space-x-1.5">
                               <CheckCircle2 className="w-3.5 h-3.5" />
-                              <span>SNIPED IN BLOCK SLOT</span>
+                              <span>SNIPED</span>
                             </span>
                           ) : (
                             <button
@@ -1503,7 +1507,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                   <h3 className="text-sm font-bold text-white flex items-center space-x-2">
                     <span>Live External Pipes & Simulation Scope Audit</span>
                     <span className="px-2 py-0.5 rounded-full text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                      LIVE AUDIT
+                      AUDIT
                     </span>
                   </h3>
                   <p className="text-xs text-slate-400">
@@ -1583,7 +1587,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                       Endpoint: <code className="text-slate-300">https://api.twitter.com</code>
                     </div>
                     <div className="text-[11px] text-slate-300">
-                      Latency: <strong className="text-cyan-400">{probeLatency(diagnosticsResult.connections.xTwitter?.testResult?.latencyMs)}</strong> | Mode: {diagnosticsResult.connections.xTwitter?.testResult?.bearerAuthorized ? 'AUTHENTICATED' : 'LIVE METADATA FEED'}
+                      Latency: <strong className="text-cyan-400">{probeLatency(diagnosticsResult.connections.xTwitter?.testResult?.latencyMs)}</strong> | Mode: {diagnosticsResult.connections.xTwitter?.testResult?.bearerAuthorized ? 'AUTHENTICATED' : 'NO BEARER TOKEN (public metadata only)'}
                     </div>
                     <p className="text-slate-400 text-[10px] border-t border-slate-800 pt-1">
                       {diagnosticsResult.connections.xTwitter?.testResult?.diagnosis ||

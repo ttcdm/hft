@@ -247,7 +247,9 @@ export class MemecoinAggregatorService extends EventEmitter {
 
     this.pools.unshift(pool);
     if (this.pools.length > 200) {
-      this.pools = this.pools.slice(0, 200);
+      // S4: newest 200, plus any pool the watch window is still scoring. Dropping that one made scoreOf return null (no HOT, a READY
+      // without a score) and stopped applyTradeToPool for it, at any feed rate that creates 200 mints inside the 120 s window.
+      this.pools = this.pools.filter((p, i) => i < 200 || this.isPoolPinned(p.contractAddress));
     }
 
     onChainPoolStats.track(cleanCa, {
@@ -258,6 +260,11 @@ export class MemecoinAggregatorService extends EventEmitter {
     });
     this.emit('pool_added', pool);
     return pool;
+  }
+
+  private isPoolPinned: (mint: string) => boolean = () => false;
+  public setPoolPinned(fn: (mint: string) => boolean): void {
+    this.isPoolPinned = fn;
   }
 
   private lastPoolPush = new Map<string, number>();
@@ -282,6 +289,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     pool.devHoldingPct = m.devHoldingPct ?? -1;
     if (now - (this.lastPoolPush.get(t.mint) ?? 0) >= 1_000) {
       this.lastPoolPush.set(t.mint, now);
+      // S14: one entry per mint ever traded, never removed. Keep the most recent 1,000 (an entry only throttles a mint's price push to once a second).
+      if (this.lastPoolPush.size > 1_000) this.lastPoolPush.delete(this.lastPoolPush.keys().next().value as string);
       this.emit('price_update', { pool });
     }
   }
@@ -307,8 +316,8 @@ export class MemecoinAggregatorService extends EventEmitter {
       const entryPriceUsd = p.entryPriceSol * this.solPriceUsd;
       const currentPriceUsd = p.currentPriceSol * this.solPriceUsd;
       const costBasisUsd = (p.costBasisLamports / 1e9) * this.solPriceUsd;
-      const currentValueUsd = p.currentValueSol * this.solPriceUsd;
-      const unrealizedPnlUsd = p.unrealizedPnLSol * this.solPriceUsd;
+      const currentValueUsd = (p.currentValueSol ?? 0) * this.solPriceUsd;
+      const unrealizedPnlUsd = (p.unrealizedPnLSol ?? 0) * this.solPriceUsd;
 
       return {
         id: p.id,
@@ -323,10 +332,10 @@ export class MemecoinAggregatorService extends EventEmitter {
         costBasisUsd,
         currentValueUsd,
         unrealizedPnlUsd,
-        unrealizedPnlPct: p.unrealizedPnLPct,
+        unrealizedPnlPct: p.unrealizedPnLPct ?? 0,
         targetTpPct: this.config.takeProfitPct,
         targetSlPct: -this.config.stopLossPct,
-        priorityFeeSol: p.jitoTipLamports / 1e9,
+        priorityFeeSol: (p.jitoTipLamports ?? 0) / 1e9,
         openedAt: p.entryTimestamp,
         status: p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED' ? 'OPEN' : 'CLOSED',
         txHash: p.entryTxSignature,
@@ -417,6 +426,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     minConfluenceScore?: number;
     /** G1: run every gate and report what would be bought, without sending or filling anything. */
     dryRun?: boolean;
+    /** S16: the auto trader never trades against an invented pool (a PAPER fill on made-up price and liquidity is not evidence). */
+    noSyntheticPool?: boolean;
     /** G1: fixed order size in SOL (auto-snipe Devnet mode). Overrides sizing; the 10% ceiling still applies downstream. */
     amountSolOverride?: number;
     /** When the signal behind this trade happened (ms). Required for LIVE: the coordinator never defaults it to now. */
@@ -612,13 +623,13 @@ export class MemecoinAggregatorService extends EventEmitter {
             liquidityUsd: 15000,
             bondingCurveProgress: t.bondingCurveProgress || 50,
             isMigrated: t.complete,
-            volume5mUsd: t.volume5mUsd || 15000,
-            volume1hUsd: 45000,
-            volume24hUsd: 120000,
-            priceChange5mPct: 5.5,
-            priceChange1hPct: 18.2,
-            buys5m: t.buys5m || 40,
-            sells5m: t.sells5m || 8,
+            volume5mUsd: t.volume5mUsd ?? 0,
+            volume1hUsd: 0, // Q32: not provided by the callout feed; 0 is "unknown", not a made-up figure
+            volume24hUsd: 0,
+            priceChange5mPct: t.priceChange5mPct ?? 0,
+            priceChange1hPct: 0,
+            buys5m: t.buys5m ?? 0,
+            sells5m: t.sells5m ?? 0,
             top10HoldersPct: t.top10HoldersPct ?? 15,
             devHoldingPct: t.devHoldingPct ?? 0.8,
             isMintRevoked: t.isMintRevoked ?? true,
@@ -628,13 +639,14 @@ export class MemecoinAggregatorService extends EventEmitter {
             rugcheckScore: (t.rugcheckScore as any) || 'SAFE',
             createdAgo: t.timeAgoStr || 'Just now',
             trendingRank: 1,
+            unverified: true, // Q32
           };
           this.pools.unshift(pool);
         }
       } catch {}
     }
 
-    if (!pool && executionCoordinator.getExecutionMode() === 'PAPER') {
+    if (!pool && !params.noSyntheticPool && executionCoordinator.getExecutionMode() === 'PAPER') {
       const priceUsd = 0.000045;
       const priceNative = priceUsd / this.solPriceUsd;
       pool = {
@@ -667,6 +679,10 @@ export class MemecoinAggregatorService extends EventEmitter {
         trendingRank: 1,
       };
       this.pools.unshift(pool);
+    }
+
+    if (pool && params.noSyntheticPool && (DEMO_POOL_IDS.has(pool.id) || pool.id.startsWith('pool-simulated-'))) {
+      return { success: false, message: `MARKET_DATA_UNAVAILABLE: ${cleanCa} has only a simulated pool; the auto trader does not trade against one.`, txHash: '' };
     }
 
     if (!pool) {
@@ -708,7 +724,7 @@ export class MemecoinAggregatorService extends EventEmitter {
 
     // Assign REAL_ONCHAIN provenance to all on-chain events discovered via WebSocket or RPC (B09)
     const isSyntheticPool =
-      DEMO_POOL_IDS.has(pool.id) || pool.id.startsWith('pool-simulated-');
+      DEMO_POOL_IDS.has(pool.id) || pool.id.startsWith('pool-simulated-') || pool.id.startsWith('pool-callout-'); // Q32: placeholders are not REAL_*
     // The synthetic-pool check always wins over an explicit provenance param (A5).
     const provenance: SignalProvenance = isSyntheticPool
       ? 'SYNTHETIC_TEST'

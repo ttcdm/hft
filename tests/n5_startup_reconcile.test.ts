@@ -106,6 +106,36 @@ describe('N5-N9: startup reconciliation does not wedge readiness on states that 
     expect(workstationDb.loadTransactions().find((t) => t.signature === sig)!.reconciliationState).toBe('PENDING');
   });
 
+  it('S10: a sell still PENDING (its details unreadable) keeps its position open through an empty wallet, and the retry applies it WITH its PnL', async () => {
+    const id = `s10_${uid()}`;
+    livePosition(id); // cost basis 0.1 SOL, 1000 raw tokens
+    const sig = `s10sell_${uid()}`;
+    workstationDb.saveTransaction({ signature: sig, orderId: `o_${uid()}`, correlationId: 'c', mint, direction: 'SELL', submissionTransport: 'SOLANA_RPC', submissionTime: Date.now() - 5000, reconciliationState: 'PENDING', networkFeeLamports: 5000, jitoTipLamports: 0, executionMode: 'LIVE' } as any);
+    const confirmed = { context: { slot: 1 }, value: [{ slot: 5, confirmations: null, err: null, confirmationStatus: 'finalized' }] };
+    conn.getSignatureStatuses = vi.fn(async () => confirmed);
+    conn.getTransaction = vi.fn(async () => null); // confirmed, but the details cannot be read yet
+    conn.getTokenAccountBalance = vi.fn(async () => ({ value: { amount: '0' } })); // the sell landed, so the wallet holds nothing
+    vi.spyOn(coordinator as any, 'scheduleReconcileRetry').mockImplementation(() => undefined);
+
+    const first = await coordinator.startupReconciliation();
+    const afterFirst = workstationDb.loadPositions().find((p) => p.id === id)!;
+    expect(afterFirst.status).toBe('OPEN'); // was CLOSED by RECONCILED_ZERO_BALANCE with the cost basis zeroed
+    expect(afterFirst.costBasisLamports).toBe(100_000_000);
+    expect(first.status).toBe('RECONCILIATION_MISMATCH');
+    expect(first.details).toMatch(/not settled yet/);
+    expect(workstationDb.loadTransactions().find((t) => t.signature === sig)!.reconciliationState).toBe('PENDING');
+
+    // the next pass can read the transaction: the sell is applied with its realized PnL (0.12 SOL received against 0.1 cost)
+    conn.getTransaction = vi.fn(async () => ({ slot: 5, blockTime: 1, meta: { err: null, fee: 5000 } }));
+    vi.spyOn(TradeReconciler, 'recoverInterruptedTransaction').mockResolvedValue({ recovered: true, type: 'SELL', mint, remainingTokensRaw: '0', tokensSoldRaw: '1000', tokenBeforeRaw: '1000', solReceivedLamports: 120_000_000, blockTime: 1, slot: 5 } as any);
+    const second = await coordinator.startupReconciliation({ fresh: true });
+    const closed = workstationDb.loadPositions().find((p) => p.id === id)!;
+    expect(closed.status).toBe('CLOSED');
+    expect(closed.realizedPnLSol).toBeCloseTo(0.02, 9); // the PnL the old order lost
+    expect(closed.exitTxSignature).toBe(sig);
+    expect(second.status).toBe('EXECUTION_READY');
+  });
+
   it('R7: a hung reconciliation is cut off, reported as a mismatch, and the next call starts a fresh pass', async () => {
     await coordinator.startupReconciliation(); // let the boot pass the constructor started finish, so the next call starts a new one
     (coordinator as any).reconcileTimeoutMs = 50;

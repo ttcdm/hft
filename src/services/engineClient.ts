@@ -12,6 +12,7 @@ let cachedSessionToken: string | null = null;
 
 export function setOperatorSessionToken(token: string) {
   cachedSessionToken = token ? token.trim() : null;
+  if (cachedSessionToken) authRequired = false;
   if (typeof window !== 'undefined') {
     if (token && token.trim()) {
       localStorage.setItem('apex_operator_token', token.trim());
@@ -37,8 +38,20 @@ export async function getOperatorSessionToken(): Promise<string> {
   return '';
 }
 
+// Q42: after a 401 with no token, every poller would re-send its request and re-open the token prompt every few seconds. Until the
+// operator enters a token, authenticated calls answer 401 locally (no network) and the prompt event fires once.
+let authRequired = false;
+
+export function isAuthRequired(): boolean {
+  return authRequired;
+}
+
 export async function authFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const token = await getOperatorSessionToken();
+  const urlText = typeof input === 'string' ? input : input instanceof URL ? input.pathname : (input as Request).url;
+  if (authRequired && !token && !urlText.includes('/api/auth')) {
+    return new Response(JSON.stringify({ error: 'Operator token required' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+  }
   const headers = new Headers(init?.headers || {});
   if (token) {
     headers.set('x-session-token', token);
@@ -52,7 +65,8 @@ export async function authFetch(input: RequestInfo | URL, init?: RequestInit): P
     try {
       if (typeof window !== 'undefined') {
         localStorage.removeItem('apex_operator_token');
-        window.dispatchEvent(new CustomEvent('apex:auth-required'));
+        if (!authRequired) window.dispatchEvent(new CustomEvent('apex:auth-required'));
+        authRequired = true;
       }
       cachedSessionToken = null;
     } catch {}
@@ -86,6 +100,7 @@ class EngineClient {
   private calloutSnipedCallbacks: Set<CalloutSnipedCallback> = new Set();
   private memecoinSnapshotCallbacks: Set<MemecoinSnapshotCallback> = new Set();
   private sniperTradeCallbacks: Set<SniperTradeCallback> = new Set();
+  private actionErrorCallbacks: Set<(m: { action?: string; error: string }) => void> = new Set();
   private pollingInterval: any = null;
   private recentWal: EngineWALEntry[] = [];
   private lastTelemetry: EngineTelemetryData | null = null;
@@ -149,6 +164,10 @@ class EngineClient {
               this.lastMemecoinSnapshot.positions = msg.data.positions;
             }
             this.memecoinSnapshotCallbacks.forEach((cb) => cb(msg.data));
+          } else if (msg.type === 'AUTH_ERROR') {
+            // Q36: the server refused a WebSocket command. Say so; a silent drop looks like the click worked.
+            const m = { action: msg.action as string | undefined, error: String(msg.error || 'Command refused by the server') };
+            this.actionErrorCallbacks.forEach((cb) => cb(m));
           } else if (msg.type === 'SNIPER_TRADE' && msg.data) {
             this.sniperTradeCallbacks.forEach((cb) => cb(msg.data));
           }
@@ -235,6 +254,11 @@ class EngineClient {
     return () => this.memecoinSnapshotCallbacks.delete(cb);
   }
 
+  public onActionError(cb: (m: { action?: string; error: string }) => void) {
+    this.actionErrorCallbacks.add(cb);
+    return () => { this.actionErrorCallbacks.delete(cb); };
+  }
+
   public onSniperTrade(cb: SniperTradeCallback) {
     this.sniperTradeCallbacks.add(cb);
     return () => this.sniperTradeCallbacks.delete(cb);
@@ -244,16 +268,16 @@ class EngineClient {
     return this.isConnected;
   }
 
-  public wsSnipePumpCallout(calloutId: string, amountUsd: number = 5.0, jitoTipSol: number = 0.005, slippagePct: number = 6.0) {
-    this.sendAction('SNIPE_PUMP_CALLOUT', { calloutId, amountUsd, jitoTipSol, slippagePct });
+  public wsSnipePumpCallout(calloutId: string, amountUsd: number = 5.0, jitoTipSol: number = 0.005, slippagePct: number = 6.0, confirmLive = false) {
+    this.sendAction('SNIPE_PUMP_CALLOUT', { calloutId, amountUsd, jitoTipSol, slippagePct, ...(confirmLive ? { confirmLive: true } : {}) });
   }
 
   public wsToggleCallerSubscription(userId: string) {
     this.sendAction('TOGGLE_CALLER_SNIPE', { userId });
   }
 
-  public wsSnipeMemecoin(params: { contractAddress: string; amountUsd: number; jitoTipSol?: number; slippagePct?: number }) {
-    this.sendAction('SNIPE_MEMECOIN', params);
+  public wsSnipeMemecoin(params: { contractAddress: string; amountUsd: number; jitoTipSol?: number; slippagePct?: number }, confirmLive = false) {
+    this.sendAction('SNIPE_MEMECOIN', { ...params, ...(confirmLive ? { confirmLive: true } : {}) });
   }
 
   public wsClosePosition(positionId: string, sellPct: number = 100) {
@@ -261,8 +285,11 @@ class EngineClient {
   }
 
   public sendAction(action: string, payload: Record<string, any> = {}) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ action, ...payload }));
+    // Q36: the server checks the operator token on every mutating WebSocket command, so each one carries it. With no token, use REST,
+    // which reports the refusal instead of the socket dropping it.
+    const token = cachedSessionToken || (typeof window !== 'undefined' ? localStorage.getItem('apex_operator_token') : null);
+    if (this.ws && this.ws.readyState === WebSocket.OPEN && token) {
+      this.ws.send(JSON.stringify({ action, ...payload, sessionToken: token.trim() }));
     } else {
       // REST fallback
       const endpointMap: Record<string, string> = {
@@ -275,12 +302,22 @@ class EngineClient {
       };
 
       const url = endpointMap[action];
+      const fail = (error: string) => this.actionErrorCallbacks.forEach((cb) => cb({ action, error }));
       if (url) {
         authFetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
-        }).catch(() => {});
+        })
+          .then(async (r) => {
+            if (!r.ok) {
+              const j = await r.json().catch(() => null);
+              fail(`${j?.error || j?.message || 'Request refused'} (HTTP ${r.status})`);
+            }
+          })
+          .catch((e) => fail(`Could not reach the server: ${e?.message || 'network error'}`));
+      } else {
+        fail('Not sent: the live connection is down and this command has no REST fallback.');
       }
     }
   }
@@ -322,16 +359,20 @@ class EngineClient {
     }
   }
 
-  public async setMicro10Mode(enabled: boolean) {
+  public async setMicro10Mode(enabled: boolean): Promise<{ ok: boolean; error?: string }> {
     try {
       const res = await authFetch('/api/engine/mode/micro-10', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled }),
       });
-      return await res.json();
-    } catch (e) {
-      console.error(e);
+      if (!res.ok) {
+        const j = await res.json().catch(() => null);
+        return { ok: false, error: `${j?.error || j?.message || 'Request refused'} (HTTP ${res.status})` };
+      }
+      return { ok: true };
+    } catch (e: any) {
+      return { ok: false, error: `Could not reach the server: ${e?.message || 'network error'}` };
     }
   }
 
@@ -457,12 +498,12 @@ class EngineClient {
     jitoTipSol?: number;
     slippagePct?: number;
     signalId?: string;
-  }) {
+  }, confirmLive = false) {
     try {
       const res = await authFetch('/api/memecoins/trade', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(params),
+        body: JSON.stringify({ ...params, ...(confirmLive ? { confirmLive: true } : {}) }),
       });
       return await res.json();
     } catch (e) {

@@ -2,9 +2,18 @@ name: Apex Quant Engine CI/CD
 
 on:
   push:
-    branches: [main, master, develop]
+    branches: ['**']   # S25: any branch, so a work branch such as overnight/integration is checked before it is proposed
   pull_request:
     branches: [main, master]
+  workflow_dispatch:
+
+# S25: CI only reads the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   validate-and-build:
@@ -32,6 +41,9 @@ jobs:
       - name: Run Test Suites
         run: npm test
 
+      - name: No new facade tests (tests that touch no production code; baseline in tests/facade-baseline.json)
+        run: npm run test:facades
+
       - name: Production Build Compilation
         run: npm run build
         env:
@@ -48,6 +60,12 @@ jobs:
 
       - name: Localnet end-to-end (real pump programs in an in-process bank, loopback only)
         run: npm run localnet:e2e
+
+      - name: Devnet seeding script proof (local chain, incl. forced 429 and sweep)
+        run: npm run localnet:seed
+
+      - name: Seeding from a separate funder keeps the wallet audit quiet (local chain, app in DEVNET_LIVE)
+        run: npm run localnet:seed-audit
 
   validate-rust:
     name: Validate Rust HFT Engine

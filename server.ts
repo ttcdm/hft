@@ -4,17 +4,18 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'node:fs';
-import crypto from 'crypto';
 import http from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer, createLogger } from 'vite';
 import { secretPathGuard, viteDevServerOptions } from './server/security/secretPaths';
 import { GoogleGenAI } from '@google/genai';
 import { hftEngine } from './server/engine/engine';
-import { socialScanner } from './server/socialScanner';
+import { socialScanner, isTelegramTradeCommand } from './server/socialScanner';
 import { memecoinAggregator } from './server/memecoinAggregator';
+import { onChainPoolStats } from './server/market/poolStats';
+import { wireWatchPins } from './server/signals/watchPins';
 import { realismEngine } from './server/realismEngine';
-import { pumpFunService } from './server/pumpfunService';
+import { pumpFunService, pumpBootMode } from './server/pumpfunService';
 import { pumpFeedListener } from './server/solana/pumpFeedListener';
 import { autoSnipeController } from './server/auto/controller';
 import { watchWindow } from './server/signals/watchWindow';
@@ -68,6 +69,7 @@ import {
 export { isAllowedClientOrigin };
 import {
   Logger,
+  endpointOrigin,
   correlationIdMiddleware,
   errorHandler,
   rateLimiter,
@@ -257,6 +259,8 @@ wss.on('connection', (ws: WebSocket, req: any) => {
       if (parsed.action === 'SNIPE_PUMP_CALLOUT') {
         const input = validateTradeInput(CalloutSnipeSchema, parsed);
         if (input.status === 'invalid') return rejectWsInput(input.issues);
+        const refused = liveGate(parsed); // S1
+        if (refused) return void ws.send(JSON.stringify({ type: 'CALLOUT_SNIPE_RESULT', data: { success: false, message: refused } }));
         const result = await pumpFunService.snipeCallout(
           input.data.calloutId,
           input.data.amountUsd,
@@ -279,6 +283,8 @@ wss.on('connection', (ws: WebSocket, req: any) => {
       if (parsed.action === 'SNIPE_MEMECOIN') {
         const input = validateTradeInput(OperatorSnipeSchema, parsed);
         if (input.status === 'invalid') return rejectWsInput(input.issues);
+        const refused = liveGate(parsed); // S1
+        if (refused) return void ws.send(JSON.stringify({ type: 'MEMECOIN_SNIPE_RESULT', data: { success: false, message: refused } }));
         const result = await memecoinAggregator.executeSnipe({ ...input.data, provenance: OPERATOR_PROVENANCE, signalTimestamp: Date.now() });
         ws.send(JSON.stringify({ type: 'MEMECOIN_SNIPE_RESULT', data: result }));
       }
@@ -321,6 +327,7 @@ watchWindow.setScoreFn((mint) => {
   return pool ? memecoinAggregator.evaluateTokenConfluence(pool).score : null;
 });
 watchWindow.attach(pumpFeedListener);
+wireWatchPins(watchWindow, memecoinAggregator, onChainPoolStats); // S4: a watched mint keeps its pool and its trade stats until the verdict
 wireFunderLookup(watchWindow, new FunderLookup(() => executionCoordinator.getConnection())); // Q6b
 watchWindow.on('release', (r) => broadcastWs({ type: 'WATCH_RELEASE', data: r }));
 watchWindow.start();
@@ -493,54 +500,7 @@ app.get('/api/health', (req, res) => {
 // 3. Market data proxy routes (orderbook, trades, ticker) live in server/market/marketRoutes.ts (B2).
 registerMarketRoutes(app);
 
-// 3h. Account Portfolio & Balance Retrieval
-app.get('/api/account/balance', requireOperatorAuth, async (req, res) => {
-  if (req.query.secret || req.query.apiSecret || req.query.apiKey) {
-    return res.status(400).json({
-      error: 'CRITICAL_SECURITY_VIOLATION',
-      message: 'Credentials must NEVER be passed via URL query parameters. Use HTTP headers (x-mbx-apikey, x-mbx-apisecret).',
-    });
-  }
-  const apiKey = req.headers['x-mbx-apikey'] as string;
-  const apiSecret = (req.headers['x-mbx-apisecret'] || req.headers['x-api-secret']) as string;
-
-  if (apiKey && apiSecret) {
-    try {
-      const timestamp = Date.now();
-      const queryString = `timestamp=${timestamp}`;
-      const signature = crypto.createHmac('sha256', apiSecret).update(queryString).digest('hex');
-      const apiRes = await fetch(`https://testnet.binance.vision/api/v3/account?${queryString}&signature=${signature}`, {
-        headers: { 'X-MBX-APIKEY': apiKey },
-      });
-      if (apiRes.ok) {
-        const data = await apiRes.json();
-        const balances = (data.balances || [])
-          .filter((b: any) => parseFloat(b.free) > 0 || parseFloat(b.locked) > 0)
-          .map((b: any) => ({
-            asset: b.asset,
-            free: parseFloat(b.free),
-            locked: parseFloat(b.locked),
-            totalUsd: parseFloat(b.free) * (b.asset === 'USDT' ? 1 : b.asset === 'BTC' ? 68900 : 2800),
-          }));
-        return res.json({ source: 'BINANCE_TESTNET', balances, canTrade: data.canTrade });
-      }
-    } catch {
-      // fallback
-    }
-  }
-
-  // Institutional paper balances
-  res.json({
-    source: 'APEX_INSTITUTIONAL_LEDGER',
-    balances: [
-      { asset: 'USDT', free: 345250.0, locked: 12000.0, totalUsd: 357250.0 },
-      { asset: 'BTC', free: 2.154, locked: 0.25, totalUsd: 165645.0 },
-      { asset: 'ETH', free: 15.42, locked: 2.0, totalUsd: 49472.0 },
-      { asset: 'SOL', free: 85.0, locked: 0.0, totalUsd: 12087.0 },
-    ],
-    canTrade: true,
-  });
-});
+// 3h. (removed, Q57) /api/account/balance was a Binance-testnet route with invented "institutional" balances and hardcoded BTC/ETH prices; nothing in src/ called it.
 
 // 4. Automated Unit Testing Suite Runner (200 Quantitative HFT & Bonding Curve Test Cases)
 app.get('/api/unit-tests', requireOperatorAuth, (req, res) => {
@@ -783,6 +743,19 @@ app.get('/api/social/signals', requireOperatorAuth, (req, res) => {
   });
 });
 
+/**
+ * S1: while LIVE is armed, EVERY entry point that can open a position needs `confirmLive: true` (the UI sends it after the operator
+ * confirmed a dialog naming the cluster): the HTTP routes below, the two WebSocket snipe actions, and the Telegram /snipe and /buy
+ * commands. This is a guard against an accidental or scripted one-click trade, NOT a security boundary: the flag is a client
+ * assertion, and the operator token is what actually authorises the request.
+ */
+const liveGate = (body: unknown) => liveConfirmationRefusal(executionCoordinator.isLiveArmed(), allowedCluster(), body as { confirmLive?: unknown } | undefined);
+const requireLiveConfirmation: express.RequestHandler = (req, res, next) => {
+  const refusal = liveGate(req.body);
+  if (!refusal) return next();
+  res.status(409).json({ success: false, status: 'REJECTED', error: refusal, result: { success: false, message: refusal } });
+};
+
 app.post('/api/social/signals/snipe', requireOperatorAuth, validateTradeBody(SignalSnipeSchema), async (req, res) => {
   const { signalId } = req.body;
   const unconfirmed = liveConfirmationRefusal(executionCoordinator.isLiveArmed(), allowedCluster(), req.body); // Q10b
@@ -836,7 +809,7 @@ app.post('/api/telegram/webhook', requireOperatorAuth, async (req, res) => {
   const { message } = req.body;
   const text = message?.text || req.body?.text || '';
   // Q23: /snipe and /buy are one-click trades, so they need the same live confirmation as the other trade routes
-  if (/^\s*\/(snipe|buy)\b/.test(text)) {
+  if (isTelegramTradeCommand(text)) {
     const unconfirmed = liveConfirmationRefusal(executionCoordinator.isLiveArmed(), allowedCluster(), req.body);
     if (unconfirmed) return res.status(409).json({ ok: false, result: { reply: `❌ SNIPE REJECTED: ${unconfirmed}` } });
   }
@@ -1010,12 +983,14 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, async (req, res) =
       })),
       activeCalloutsCount: hotCallouts.length,
       multiCallerConfluenceCount: confluenceCallouts.length,
+      // Q33: what "confluence" is here, said where it is shown
+      confluenceMeaning: 'The token is on both the pump.fun recent list and the DexScreener paid-boost list. The listed callers are placeholder names assigned by list position, not people who called it.',
       confluenceTokens: confluenceCallouts.map((c) => ({
         symbol: c.token.symbol,
         mint: c.token.mint,
         action: c.hftAction,
         confluenceCount: c.confluenceCount,
-        callers: [`@${c.caller.userId}`, ...c.otherCallers],
+        callers: [`@${c.caller.userId}`, ...(c.otherCallers ?? [])],
       })),
     },
     simulationScopeMatrix: [
@@ -1111,7 +1086,7 @@ app.get('/api/memecoins/positions', requireOperatorAuth, (req, res) => {
   });
 });
 
-app.post('/api/memecoins/trade', requireOperatorAuth, validateTradeBody(OperatorSnipeSchema), async (req, res) => {
+app.post('/api/memecoins/trade', requireOperatorAuth, requireLiveConfirmation, validateTradeBody(OperatorSnipeSchema), async (req, res) => {
   const result = await memecoinAggregator.executeSnipe({ ...req.body, provenance: OPERATOR_PROVENANCE, signalTimestamp: Date.now() });
 
   res.json({
@@ -1260,7 +1235,7 @@ app.get('/api/wallet/state', requireOperatorAuth, (req, res) => {
   res.json({
     success: true,
     data: walletTrader.getState(),
-    config: walletTrader.getConfig(),
+    config: { ...walletTrader.getConfig(), rpcEndpoint: endpointOrigin(walletTrader.getConfig().rpcEndpoint) }, // Q54: no key from the URL path or query
   });
 });
 
@@ -1269,7 +1244,7 @@ app.post('/api/wallet/config', requireOperatorAuth, validateBody(WalletConfigSch
     const updated = await walletTrader.updateConfig(req.body);
     res.json({
       success: true,
-      config: updated,
+      config: { ...updated, rpcEndpoint: endpointOrigin(updated.rpcEndpoint) },
       state: walletTrader.getState(),
     });
   } catch (err: any) {
@@ -1295,7 +1270,7 @@ app.post('/api/wallet/toggle-trading', requireOperatorAuth, validateTradeBody(Ar
   });
 });
 
-app.post('/api/wallet/snipe', requireOperatorAuth, validateBody(LiveSnipeOrderSchema), async (req, res) => {
+app.post('/api/wallet/snipe', requireOperatorAuth, requireLiveConfirmation, validateBody(LiveSnipeOrderSchema), async (req, res) => {
   // The operator's request is the signal; a client-supplied signalTimestamp is ignored so the age check cannot be dodged.
   const result = await walletTrader.executeLiveSnipe({ ...req.body, signalTimestamp: Date.now() });
   if (!result.success) {
@@ -1319,6 +1294,13 @@ app.post('/api/wallet/close-position', requireOperatorAuth, validateBody(ClosePo
     data: result,
     state: walletTrader.getState(),
   });
+});
+
+// S13: the Telegram /panic_sell stops new entries the same way the HTTP panic does.
+socialScanner.setPanicHook(async () => {
+  riskEngine.setKillSwitch(true);
+  executionCoordinator.armLiveTrading(false);
+  await autoSnipeController.kill({ exitAll: false, reason: 'telegram panic' });
 });
 
 app.post('/api/wallet/panic-liquidate', requireOperatorAuth, async (req, res) => {
@@ -1361,7 +1343,7 @@ app.get('/api/diagnostics/system', requireOperatorAuth, (req, res) => {
       walletSolBalance: diag.walletSolBalance,
       walletPubkey: diag.activeWalletAddress,
       signerStatus,
-      rpcEndpoint: resolveRpcUrl(),
+      rpcEndpoint: endpointOrigin(diag.rpcEndpoint || resolveRpcUrl()), // Q54: the endpoint in use (it changes on a switch), host only
       allowedCluster: allowedCluster(),
       rpcLatencyMs: diag.rpcLatencyMs,
       databaseFile: 'apex_workstation.db',
@@ -1502,7 +1484,7 @@ app.post('/api/execution/kill-switch', requireOperatorAuth, (req, res) => {
   });
 });
 
-app.post('/api/execution/trade', requireOperatorAuth, validateTradeBody(OperatorExecuteTradeSchema), async (req, res) => {
+app.post('/api/execution/trade', requireOperatorAuth, requireLiveConfirmation, validateTradeBody(OperatorExecuteTradeSchema), async (req, res) => {
   try {
     // Provenance and source are set here. A client cannot choose them (the schema rejects them).
     const result = await executionCoordinator.executeTrade({
@@ -1650,10 +1632,10 @@ async function startServer() {
 
   // Test/offline switch: the behaviour tests spawn this server and must not reach Coinbase, CoinGecko, Binance, pump.fun or
   // DexScreener (the vitest network guard cannot see child processes). Production leaves it unset.
-  if (process.env.APEX_DISABLE_EXTERNAL_FEEDS !== 'true') {
-    solPriceService.startAutoRefresh();
-    pumpFunService.startBackground();
-  }
+  const externalFeedsDisabled = process.env.APEX_DISABLE_EXTERNAL_FEEDS === 'true';
+  solPriceService.startForBoot(externalFeedsDisabled); // feeds off + localnet: one refresh so LOCALNET_FIXED is set; feeds off elsewhere: nothing
+  const pumpBoot = pumpBootMode();
+  if (pumpBoot !== 'OFF') pumpFunService.startBackground({ httpPollers: pumpBoot === 'FULL' }); // S28: WS_ONLY = log stream only, no HTTP pollers
   // N18: bound the append-only audit tables (default 90 days; APEX_RETENTION_DAYS, 0 disables). Once at boot, then daily.
   const retentionDays = process.env.APEX_RETENTION_DAYS === undefined ? 90 : Number(process.env.APEX_RETENTION_DAYS);
   const prune = () => {

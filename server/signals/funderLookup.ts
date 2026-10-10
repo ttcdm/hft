@@ -4,6 +4,8 @@ import { Logger } from '../middleware/enterprise';
 export const FUNDER_LOOKUP_CONCURRENCY = 4;
 export const FUNDER_LOOKUP_MAX_PER_MINT = 150;
 export const FUNDER_SIGNATURE_PAGE = 1000;
+/** S4c: an RPC error is retried after these delays (then the wallet stays unknown). Public RPCs rate-limit; one error used to pin the wallet unknown for the candidate's life. */
+export const FUNDER_RETRY_DELAYS_MS = [1_500, 4_000, 10_000];
 
 export type FunderResult =
   | { funder: string; reason?: undefined }
@@ -20,13 +22,13 @@ export type FunderResult =
  */
 export class FunderLookup {
   private cache = new Map<string, FunderResult>();
-  private queue: Array<{ wallet: string; mint: string }> = [];
+  private queue: Array<{ wallet: string; mint: string; attempt: number }> = [];
   private inFlight = 0;
   private perMint = new Map<string, number>();
   private queued = new Set<string>();
   private listeners: Array<(wallet: string, result: FunderResult) => void> = [];
 
-  constructor(private getConnection: () => Connection | null, private opts: { concurrency?: number; maxPerMint?: number; cacheSize?: number } = {}) {}
+  constructor(private getConnection: () => Connection | null, private opts: { concurrency?: number; maxPerMint?: number; cacheSize?: number; retryDelaysMs?: number[] } = {}) {}
 
   public onResult(fn: (wallet: string, result: FunderResult) => void): void {
     this.listeners.push(fn);
@@ -45,7 +47,7 @@ export class FunderLookup {
     this.perMint.set(mint, used + 1);
     if (this.perMint.size > 500) this.perMint.delete(this.perMint.keys().next().value as string);
     this.queued.add(wallet);
-    this.queue.push({ wallet, mint });
+    this.queue.push({ wallet, mint, attempt: 0 });
     this.pump();
   }
 
@@ -54,15 +56,27 @@ export class FunderLookup {
     while (this.inFlight < max && this.queue.length > 0) {
       const job = this.queue.shift()!;
       this.inFlight++;
+      let retrying = false;
       this.lookup(job.wallet)
         .then((result) => {
+          const delays = this.opts.retryDelaysMs ?? FUNDER_RETRY_DELAYS_MS;
+          if (result.reason === 'ERROR' && job.attempt < delays.length) {
+            // S4c: keep the wallet in `queued` while it waits, so a second request for it does not start a parallel lookup.
+            retrying = true;
+            const timer = setTimeout(() => {
+              this.queue.push({ ...job, attempt: job.attempt + 1 });
+              this.pump();
+            }, delays[job.attempt]);
+            timer.unref?.();
+            return;
+          }
           if (result.reason !== 'ERROR') this.remember(job.wallet, result);
           for (const fn of this.listeners) fn(job.wallet, result);
         })
         .catch(() => undefined)
         .finally(() => {
           this.inFlight--;
-          this.queued.delete(job.wallet);
+          if (!retrying) this.queued.delete(job.wallet);
           this.pump();
         });
     }

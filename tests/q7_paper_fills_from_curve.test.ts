@@ -63,7 +63,7 @@ describe('Q7: PAPER fills are priced from the curve', () => {
     expect(res.fillPriceSol).toBeCloseTo(res.quotePriceSol!, 12); // a paper fill is the quote: no invented slippage breach
 
     const cost = pos.costBasisLamports;
-    const tip = pos.jitoTipLamports;
+    const tip = pos.jitoTipLamports ?? 0;
     const closed = await executionCoordinator.closePosition(pos.id, 100, 'MANUAL');
     expect(closed.success, closed.error).toBe(true);
     const net = refSellNet(expectedTokens);

@@ -61,20 +61,26 @@ async function poll(): Promise<void> {
   } catch { /* keep the last answer; it goes stale on its own */ }
 }
 
+/**
+ * Subscribe to the shared poller. Every subscriber is notified on every tick, including a tick whose poll failed: that is what lets all of
+ * them see the answer go stale together (S18: only the first subscriber's callback used to be called on a failed poll, so the banner said
+ * MODE UNKNOWN while a modal button still said "(LIVE ARMED)").
+ */
+export function subscribeTradingMode(fn: () => void): () => void {
+  subscribers.add(fn);
+  if (!timer) {
+    void poll();
+    timer = setInterval(() => { void poll(); subscribers.forEach((f) => f()); }, 5000);
+  }
+  return () => {
+    subscribers.delete(fn);
+    if (subscribers.size === 0 && timer) { clearInterval(timer); timer = null; }
+  };
+}
+
 export function useTradingMode(): TradingModeInfo {
   const [, bump] = useState(0);
-  useEffect(() => {
-    const fn = () => bump((n) => n + 1);
-    subscribers.add(fn);
-    if (!timer) {
-      void poll();
-      timer = setInterval(() => { void poll(); fn(); }, 5000);
-    }
-    return () => {
-      subscribers.delete(fn);
-      if (subscribers.size === 0 && timer) { clearInterval(timer); timer = null; }
-    };
-  }, []);
+  useEffect(() => subscribeTradingMode(() => bump((n) => n + 1)), []);
   return describeTradingMode(latest?.audit, latest?.at ?? null);
 }
 

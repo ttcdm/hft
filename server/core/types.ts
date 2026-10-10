@@ -4,6 +4,7 @@ export type ProtocolExecutionMode = 'LIVE' | 'PAPER';
 export type SignalProvenance =
   | 'LIVE_PUMP_STREAM'
   | 'REAL_ONCHAIN'
+  | 'PUMP_HTTP_API' // Q33: the pump.fun / DexScreener HTTP lists; market data, not an on-chain event and not a social post
   | 'REAL_SOCIAL'
   | 'COPY_TRADE'
   | 'MANUAL_OPERATOR'
@@ -15,6 +16,7 @@ export type SignalProvenance =
 export const LIVE_APPROVED_PROVENANCES: readonly SignalProvenance[] = [
   'LIVE_PUMP_STREAM',
   'REAL_ONCHAIN',
+  'PUMP_HTTP_API',
   'REAL_SOCIAL',
   'COPY_TRADE',
   'MANUAL_OPERATOR',

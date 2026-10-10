@@ -256,10 +256,29 @@ export default function App() {
     []
   );
 
+  // R25: the header must show the server's kill-switch state, not a local guess: a panic liquidation, the RPC auto-trip, another
+  // tab or a reload all change it without this component knowing.
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const r = await authFetch('/api/diagnostics/system');
+        if (!r.ok) return;
+        const j = await r.json();
+        if (alive && typeof j?.systemAudit?.killSwitchActive === 'boolean') setIsHalted(j.systemAudit.killSwitchActive);
+      } catch { /* keep what is shown */ }
+    };
+    load();
+    const t = setInterval(load, 5000);
+    return () => { alive = false; clearInterval(t); };
+  }, []);
+
   // Emergency kill switch: the server decides. The UI only shows "halted" after the server confirmed it.
+  const killInFlight = useRef(false);
   const toggleKillSwitch = async () => {
+    if (killInFlight.current) return; // R33: a second click while the first request is out must not send the opposite value
+    killInFlight.current = true;
     const nextHalted = !isHalted;
-    hftAudio.playKillSwitch();
     try {
       const res = await authFetch('/api/execution/kill-switch', {
         method: 'POST',
@@ -271,6 +290,7 @@ export default function App() {
         throw new Error(body.error || `server answered HTTP ${res.status}`);
       }
       setIsHalted(nextHalted);
+      hftAudio.playKillSwitch(); // R33: after the server confirmed, not before
       if (nextHalted) {
         triggerAlert(
           'CRITICAL',
@@ -278,7 +298,17 @@ export default function App() {
           'The server refuses new orders and has disarmed LIVE trading. Open positions are NOT sold: close them from the Plug & Play panel.'
         );
       } else {
-        triggerAlert('INFO', 'KILL SWITCH RESET', 'New orders are allowed again. LIVE trading stays disarmed until you arm it.');
+        // R26: the reset lifts only the kill switch. An open circuit breaker or an all-trading halt still refuses orders.
+        const blockers: string[] = [];
+        if (body.circuitBreaker === 'OPEN') blockers.push('the circuit breaker is still OPEN');
+        if (body.haltReason) blockers.push(`all trading is still halted (${body.haltReason})`);
+        triggerAlert(
+          blockers.length ? 'WARNING' : 'INFO',
+          'KILL SWITCH RESET',
+          blockers.length
+            ? `The kill switch is off, but new orders are still refused: ${blockers.join('; ')}. LIVE trading stays disarmed until you arm it.`
+            : 'The kill switch is off. LIVE trading stays disarmed until you arm it.'
+        );
       }
     } catch (err: any) {
       triggerAlert(
@@ -286,6 +316,8 @@ export default function App() {
         'KILL SWITCH NOT CONFIRMED',
         `The server did not confirm the kill switch (${err?.message || 'request failed'}). Assume trading is NOT halted; sign in as operator and retry.`
       );
+    } finally {
+      killInFlight.current = false;
     }
   };
 

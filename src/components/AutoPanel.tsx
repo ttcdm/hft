@@ -25,9 +25,9 @@ export function AutoModeBadge({ mode, halted }: { mode: AutoMode | null; halted?
   );
 }
 
-export function AutoPanelView({ status, onMode, onKill, onResume, code, onCode, busy }: {
+export function AutoPanelView({ status, onMode, onKill, onResume, code, onCode, busy, error }: {
   status: AutoStatusData | null; onMode?: (m: AutoMode) => void; onKill?: () => void; onResume?: () => void;
-  code?: string; onCode?: (c: string) => void; busy?: boolean;
+  code?: string; onCode?: (c: string) => void; busy?: boolean; error?: string | null;
 }) {
   if (!status) return <section className="rounded-lg border border-slate-800 bg-[#0B0F17] p-3 text-xs text-slate-500" data-testid="auto-panel">Auto-snipe: sign in as operator to read the controller.</section>;
   const s = status.stats;
@@ -46,6 +46,7 @@ export function AutoPanelView({ status, onMode, onKill, onResume, code, onCode, 
         ))}
       </div>
       <input value={code ?? ''} onChange={(e) => onCode?.(e.target.value)} placeholder="DEVNET_LIVE confirmation code" className="w-full mb-2 px-2 py-1 rounded bg-slate-900 border border-slate-700 font-mono text-[11px]" />
+      {error && <p className="text-red-400 mb-2" data-testid="auto-error">{error}</p>}
       {status.haltReason && <p className="text-red-400 mb-2" data-testid="halt-reason">ALL TRADING HALTED: {status.haltReason} <button onClick={onResume} className="underline ml-1">clear halt</button></p>}
       {status.killReason && <p className="text-amber-400 mb-1">Killed: {status.killReason}</p>}
       {status.downgradeReason && <p className="text-amber-400 mb-1" data-testid="downgrade-reason">Dropped to SHADOW: {status.downgradeReason}</p>}
@@ -100,16 +101,22 @@ export function AutoPanel() {
   const [busy, setBusy] = useState(false);
   const shown = local ?? status;
   useEffect(() => { setLocal(null); }, [status]);
+  const [error, setError] = useState<string | null>(null);
   const post = useCallback(async (path: string, body: unknown) => {
     setBusy(true);
+    setError(null);
     try {
       const r = await authFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-      const j = await r.json();
-      if (j.status) setLocal({ ...j.status, stats: shown?.stats });
+      const j = await r.json().catch(() => null);
+      // R31: a refusal (400/403/409/429) carries its reason in the body; show it instead of dropping it
+      if (!r.ok) setError(`${j?.error || j?.message || 'Request refused'} (HTTP ${r.status})`);
+      if (j?.status) setLocal({ ...j.status, stats: shown?.stats });
+    } catch (e: any) {
+      setError(`Could not reach the server (${e?.message || 'network error'}). Nothing was changed as far as the panel knows; check the status above.`);
     } finally { setBusy(false); }
   }, [shown]);
   return (
-    <AutoPanelView status={shown} busy={busy} code={code} onCode={setCode}
+    <AutoPanelView status={shown} busy={busy} error={error} code={code} onCode={setCode}
       onMode={(m) => post('/api/auto/mode', { mode: m, confirmationCode: m === 'DEVNET_LIVE' ? code : undefined })}
       onKill={() => post('/api/auto/kill', { exitAll: true, reason: 'operator kill from panel' })}
       onResume={() => post('/api/auto/resume', { clearHalt: true })} />

@@ -36,6 +36,7 @@ interface SystemAudit {
   walletPubkey: string;
   signerStatus: 'READY' | 'LOCKED' | 'NOT_CONFIGURED';
   rpcEndpoint: string;
+  allowedCluster?: string;
   rpcLatencyMs: number;
   databaseFile: string;
   dbDriver: string;
@@ -51,6 +52,7 @@ interface RiskControls {
   maxAggregateExposureSol: number;
   dailyLossSoFarSol: number;
   circuitBreakerTripped: boolean;
+  circuitBreakerState?: 'CLOSED' | 'OPEN' | 'HALF_OPEN';
 }
 
 export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = ({ isOpen, onClose }) => {
@@ -364,10 +366,10 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
             <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-0.5">Circuit Breaker</span>
             <span
               className={`font-bold text-xs ${
-                riskControls?.circuitBreakerTripped ? 'text-rose-400' : 'text-emerald-400'
+                riskControls?.circuitBreakerState === 'OPEN' ? 'text-rose-400' : riskControls?.circuitBreakerState === 'HALF_OPEN' ? 'text-amber-400' : 'text-emerald-400'
               }`}
             >
-              {riskControls?.circuitBreakerTripped ? 'TRIPPED (HALTED)' : 'NORMAL (ACTIVE)'}
+              {riskControls?.circuitBreakerState === 'OPEN' ? 'TRIPPED (HALTED)' : riskControls?.circuitBreakerState === 'HALF_OPEN' ? 'RECOVERING (HALF-OPEN)' : riskControls ? 'NORMAL (ACTIVE)' : '—'}
             </span>
           </div>
 
@@ -663,7 +665,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
 
                 <div className="flex items-center space-x-3 pt-2">
                   <button
-                    onClick={handleGenerateKeypair}
+                    onClick={() => handleGenerateKeypair(false)}
                     disabled={isLoading}
                     className="px-3.5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs flex items-center space-x-1.5"
                   >
@@ -727,12 +729,13 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
               <span>CONFIRM LIVE SOLANA BROADCAST</span>
             </div>
             <p className="text-xs text-slate-300 leading-relaxed">
-              You are about to arm real-money live trading on the Solana mainnet. Any snipes will consume real SOL from your funded hot wallet via Jito MEV bundles.
+              You are about to arm live trading on {systemAudit?.allowedCluster ?? 'the configured cluster'}. Snipes will spend SOL from the local signer wallet as ordinary transactions
+              (Jito bundles exist only on mainnet, which this build does not use).
             </p>
             <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 text-[11px] space-y-1 font-mono text-slate-400">
-              <div>• Tier: MICRO_10 (0.02 SOL max order size)</div>
-              <div>• Daily Drawdown Cap: 20% (~$2.50 USD)</div>
-              <div>• Jito Priority Tip: {jitoTipSol} SOL</div>
+              <div>• Max order size: {riskControls ? `${riskControls.maxPositionSol} SOL` : '—'}</div>
+              <div>• Daily loss limit: {riskControls ? `${riskControls.maxDailyLossSol} SOL` : '—'}</div>
+              <div>• Max total exposure: {riskControls ? `${riskControls.maxAggregateExposureSol} SOL` : '—'}</div>
             </div>
             <div>
               <label className="block text-[11px] font-bold text-slate-400 mb-1">

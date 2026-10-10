@@ -243,7 +243,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
       onAlertTrigger?.(
         'INFO',
         `SNIPED ${sig.tokenTicker}`,
-        `Executed $${amount.toFixed(2)} on ${sig.chain} via Jito Bundle. CA: ${sig.contractAddress.slice(0, 10)}...`
+        `${/^PAPER/i.test(String(res.tradeResult.txHash ?? '')) ? 'Paper fill' : 'Sent'} for $${amount.toFixed(2)} on ${sig.chain}${res.tradeResult.txHash ? ` (${String(res.tradeResult.txHash).slice(0, 14)}...)` : ''}. CA: ${sig.contractAddress.slice(0, 10)}...`
       );
       // Update signal status locally
       setSignals((prev) =>
@@ -270,6 +270,9 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
         res.result.message
       );
       refreshData();
+    } else {
+      // R29: a refused close used to vanish silently
+      onAlertTrigger?.('WARNING', 'CLOSE NOT DONE', res?.result?.message || res?.error || 'The server did not close the position.');
     }
   };
 

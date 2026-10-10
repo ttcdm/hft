@@ -27,7 +27,7 @@ import { TradeTape } from './server/market/tradeTape';
 import { runComprehensiveTestSuite } from './server/unitTestCases';
 import { registerMarketRoutes } from './server/market/marketRoutes';
 import { walletTrader } from './server/walletTrader';
-import { resolveRpcUrl } from './server/solana/clusterGuard';
+import { resolveRpcUrl, allowedCluster } from './server/solana/clusterGuard';
 import {
   ArmSchema,
   AutoModeSchema,
@@ -1342,6 +1342,7 @@ app.get('/api/diagnostics/system', requireOperatorAuth, (req, res) => {
       walletPubkey: diag.activeWalletAddress,
       signerStatus,
       rpcEndpoint: resolveRpcUrl(),
+      allowedCluster: allowedCluster(),
       rpcLatencyMs: diag.rpcLatencyMs,
       databaseFile: 'apex_workstation.db',
       dbDriver: 'node:sqlite (WAL mode enabled)',
@@ -1355,7 +1356,9 @@ app.get('/api/diagnostics/system', requireOperatorAuth, (req, res) => {
       maxDailyLossSol: riskLimits.maxDailyLossSol,
       maxAggregateExposureSol: riskLimits.maxAggregateExposureSol,
       dailyLossSoFarSol: riskEngine.getDailyLossSol(),
-      circuitBreakerTripped: riskEngine.isKillSwitchActive(),
+      // R28: the circuit breaker's own state, not the kill-switch flag (that one is systemAudit.killSwitchActive)
+      circuitBreakerState: riskEngine.getCircuitBreakerState(),
+      circuitBreakerTripped: riskEngine.getCircuitBreakerState() === 'OPEN',
     },
     executionMetrics: dbMetrics,
   });
@@ -1472,6 +1475,9 @@ app.post('/api/execution/kill-switch', requireOperatorAuth, (req, res) => {
   res.json({
     success: true,
     killSwitchActive: riskEngine.isKillSwitchActive(),
+    // R26: resetting the switch does not lift an open circuit breaker or an all-trading halt; say so, so the UI cannot claim "allowed again"
+    circuitBreaker: riskEngine.getCircuitBreakerState(),
+    haltReason: executionCoordinator.getHaltReason(),
     message: activate ? 'EMERGENCY KILL SWITCH TRIPPED. All trading halted.' : 'Kill switch reset.',
   });
 });

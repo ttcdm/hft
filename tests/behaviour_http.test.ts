@@ -81,6 +81,26 @@ describe('kill switch input is strict (R6s)', () => {
   });
 });
 
+describe('R26: a kill-switch reset says what still blocks orders', () => {
+  it('the reset response carries the circuit-breaker state and any halt reason, so the UI cannot claim "allowed again"', async () => {
+    const rpc = await startRpcStub(LOCALNET_STUB_GENESIS);
+    try {
+      const app = await startApp(dir(), { SOLANA_RPC_URL: rpc.url, ALLOWED_CLUSTER: 'localnet', LOCALNET_GENESIS_HASH: LOCALNET_STUB_GENESIS }); handles.push(app);
+      const on = await app.call('POST', '/api/execution/kill-switch', { activate: true });
+      expect(on.json.killSwitchActive).toBe(true);
+      const off = await app.call('POST', '/api/execution/kill-switch', { activate: false });
+      expect(off.json.killSwitchActive).toBe(false);
+      expect(off.json.circuitBreaker).toBe('CLOSED');
+      expect(off.json.haltReason).toBeNull();
+      // R28: the diagnostics card reads the breaker's own state
+      const diag = await app.call('GET', '/api/diagnostics/system');
+      expect(diag.json.riskControls.circuitBreakerState).toBe('CLOSED');
+      expect(diag.json.riskControls.circuitBreakerTripped).toBe(false);
+      expect(diag.json.systemAudit.allowedCluster).toBe('localnet');
+    } finally { await rpc.close(); }
+  }, 90_000);
+});
+
 describe('PAPER never sends, and the kill switch refuses new trades', () => {
   let rpc: RpcStub; let app: AppHandle;
   beforeAll(async () => {
@@ -272,7 +292,7 @@ describe('boolean fields are read strictly: the string "false" is false', () => 
 });
 
 describe('POST /api/auto/kill with exitAll closes the open positions (seeded state, real server)', () => {
-  const seed = (dbPath: string, ids: string[]) => {
+  const seed = (dbPath: string, ids: string[], autoOwned: string[]) => {
     const db = new WorkstationDatabase(dbPath);
     const now = Date.now();
     for (const id of ids) {
@@ -282,6 +302,8 @@ describe('POST /api/auto/kill with exitAll closes the open positions (seeded sta
         venue: 'PUMP_BONDING_CURVE', executionMode: 'PAPER', entryTxSignature: `PAPER:${id}`, entryTimestamp: now, lastMarkTimestamp: now, recordUpdatedAt: now, updatedAt: now,
       } as any);
     }
+    // R23: only positions the auto controller bought (a BOUGHT decision row) belong to "kill auto"; the other is a manual position
+    for (const id of autoOwned) db.logDecision({ autoMode: 'PAPER', mint: 'M'.repeat(43), symbol: 'KILL', source: 'test', stage: 'fill', outcome: 'BOUGHT', reason: 'seeded', positionId: id } as any);
     (db as any).db.close();
   };
   const statuses = async (app: { call: (m: 'GET', r: string) => Promise<{ json: any }> }, ids: string[]) => {
@@ -290,12 +312,12 @@ describe('POST /api/auto/kill with exitAll closes the open positions (seeded sta
     return ids.map((id) => rows.find((p) => p.id === id)?.status);
   };
 
-  it('exitAll "false" leaves the positions open; exitAll true closes them and reports how many', async () => {
+  it('exitAll "false" leaves the positions open; exitAll true closes only what auto bought, never a manual position', async () => {
     const rpc = await startRpcStub(LOCALNET_STUB_GENESIS);
     try {
       const d = dir();
-      const ids = ['kill-a', 'kill-b'];
-      seed(`${d}/app.db`, ids);
+      const ids = ['kill-a', 'kill-manual'];
+      seed(`${d}/app.db`, ids, ['kill-a']);
       const app = await startApp(d, { SOLANA_RPC_URL: rpc.url, ALLOWED_CLUSTER: 'localnet', LOCALNET_GENESIS_HASH: LOCALNET_STUB_GENESIS }); handles.push(app);
       expect(await statuses(app, ids)).toEqual(['OPEN', 'OPEN']);
 
@@ -306,8 +328,8 @@ describe('POST /api/auto/kill with exitAll closes the open positions (seeded sta
 
       const yes = await app.call('POST', '/api/auto/kill', { exitAll: true });
       expect(yes.status).toBe(200);
-      expect(yes.json.closed).toBe(2);
-      expect(await statuses(app, ids)).toEqual(['CLOSED', 'CLOSED']);
+      expect(yes.json.closed).toBe(1);
+      expect(await statuses(app, ids)).toEqual(['CLOSED', 'OPEN']); // the manual position is still there
       expect(sends(rpc)).toBe(0); // PAPER: closing never reaches the RPC as a send
     } finally { await rpc.close(); }
   }, 90_000);

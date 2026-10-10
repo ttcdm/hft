@@ -258,12 +258,15 @@ export class AutoSnipeController extends EventEmitter {
     this.mode = 'OFF';
     this.killed = true;
     this.killReason = opts.reason || 'operator kill';
-    const ids = this.session?.positionIds ?? [];
+    // R23: "sell what it bought" means the positions the auto controller opened: this session's, plus any the journal records as
+    // BOUGHT by auto (a restart empties the in-memory session). A position the operator opened by hand is never in either set.
+    const owned = new Set<string>(this.session?.positionIds ?? []);
+    for (const d of workstationDb.loadDecisions({ outcome: 'BOUGHT', limit: 5000 })) if (d.positionId) owned.add(d.positionId);
     this.session = null;
     let closed = 0;
     if (opts.exitAll) {
       for (const p of workstationDb.loadPositions(undefined, 'ACTIVE')) {
-        if (ids.length && !ids.includes(p.id)) continue;
+        if (!owned.has(p.id)) continue;
         const r = await executionCoordinator.closePosition(p.id, 100, 'MANUAL');
         if (r.success) closed++;
       }

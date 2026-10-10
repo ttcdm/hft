@@ -20,6 +20,15 @@ const status = (over: Partial<AutoStatusData> = {}): AutoStatusData => ({
   ...over,
 });
 
+describe('R31: the auto panel shows why a request was refused', () => {
+  it('renders the error line when one is given, and nothing when there is none', () => {
+    const withErr = renderToStaticMarkup(<AutoPanelView status={status()} error="DEVNET_LIVE is refused: wrong confirmation code (HTTP 403)" />);
+    expect(withErr).toContain('data-testid="auto-error"');
+    expect(withErr).toContain('wrong confirmation code (HTTP 403)');
+    expect(renderToStaticMarkup(<AutoPanelView status={status()} />)).not.toContain('auto-error');
+  });
+});
+
 describe('H3: auto-snipe panel', () => {
   it('renders mode switch, budgets, stage counts and kill button; PnL and win rate are dashes until something closed', () => {
     const html = renderToStaticMarkup(<AutoPanelView status={status()} />);

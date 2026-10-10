@@ -11,7 +11,12 @@ const PORT = 3188, PW = 'visualtest-pw-123456';
 const widths = (process.env.WIDTHS || '1280,1440,1920').split(',').map(Number);
 const dbp = '/tmp/apex-visual-r3.db'; for (const s of ['', '-shm', '-wal']) try { fs.unlinkSync(dbp + s); } catch {}
 const env = { PATH: process.env.PATH, HOME: process.env.HOME, NODE_ENV: 'production', APP_PORT: String(PORT), OPERATOR_PASSWORD: PW, APEX_ENV_FILE: '', TEST_DB_PATH: dbp, APEX_DB_PATH: dbp };
-const srv = process.env.FIXTURE ? spawn('npx', ['tsx', 'scripts/visual/serve_fixture.ts'], { cwd: process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'] }) : spawn(process.execPath, ['dist/server.cjs'], { cwd: process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'] });
+// A server already on this port would answer instead of the one started below (old code, old data): refuse to run.
+if (require('child_process').spawnSync('bash', ['-c', `exec 3<>/dev/tcp/127.0.0.1/${PORT}`], { stdio: 'ignore' }).status === 0) { console.error(`FAIL: something is already listening on port ${PORT}; stop it first (pkill -f serve_fixture)`); process.exit(1); }
+const srv = process.env.FIXTURE ? spawn('npx', ['tsx', 'scripts/visual/serve_fixture.ts'], { cwd: process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'], detached: true }) : spawn(process.execPath, ['dist/server.cjs'], { cwd: process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });
+// npx/tsx start grandchildren: kill the whole process group, or an orphan keeps port 3188 and the next run silently talks to old code
+const stopSrv = () => { try { process.kill(-srv.pid, 'SIGKILL'); } catch { try { srv.kill('SIGKILL'); } catch {} } };
+process.on('exit', stopSrv);
 let slog = ''; srv.stdout.on('data', d => slog += d); srv.stderr.on('data', d => slog += d);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const report = [];
@@ -65,9 +70,29 @@ const audit = () => {
       const text = await p.locator('body').innerText();
       // The paper exit monitor acts on the seeded rows while the app runs: FIXD (+40%) trips take-profit, FIXE (-20%) trips stop-loss.
       // The table must show those real outcomes (status + the live PnL of the row that is still open), not placeholders.
-      const expect = [['FIXD +40% partial', /FIXD[\s\S]{0,200}\+40(\.\d+)?%[\s\S]{0,120}PARTIALLY_CLOSED/], ['FIXE stopped out', /FIXE[\s\S]{0,200}CLOSED/], ['PAPER mode label', /PAPER/]];
+      const expect = [['FIXD +40% partial', /FIXD[\s\S]{0,200}\+40(\.\d+)?%[\s\S]{0,120}PARTIALLY_CLOSED/], ['FIXE stopped out', /FIXE[\s\S]{0,200}CLOSED/], ['PAPER mode label', /PAPER/], ['circuit breaker card reads its own state', /Circuit Breaker\s*NORMAL \(ACTIVE\)/i]];
       for (const [name, re] of expect) report.push({ W, name: 'value:' + name, ok: re.test(text) });
     });
+    // R30: the arm dialog must name the real cluster and the configured limits, not "Solana mainnet / Jito bundles / 0.02 SOL" literals
+    await step('values-arm-dialog', async () => {
+      await p.locator('#btn-nav-plug-and-play').click({ timeout: 3000 }); await p.waitForTimeout(1200);
+      await p.getByText(/ARM LIVE TRADING/).first().click({ timeout: 3000 }); await p.waitForTimeout(800);
+      const text = await p.locator('body').innerText();
+      report.push({ W, name: 'value:arm dialog names devnet', ok: /arm live trading on (devnet|localnet)/i.test(text) });
+      report.push({ W, name: 'value:arm dialog has no mainnet claim', ok: !/real-money live trading on the Solana mainnet/i.test(text) });
+      report.push({ W, name: 'value:arm dialog shows configured limits', ok: /Max order size: [0-9.]+ SOL/.test(text) && /Daily loss limit: [0-9.]+ SOL/.test(text) });
+    });
+    await p.reload({ waitUntil: 'load' }); await p.waitForTimeout(3000);
+    // R25: a kill switch set on the server (not by this page) must show in the header, and clear again when the server clears it
+    await step('values-kill-switch-from-server', async () => {
+      const call = (activate) => fetch(`http://127.0.0.1:${PORT}/api/execution/kill-switch`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${login.token}` }, body: JSON.stringify({ activate }) });
+      try {
+        await call(true);
+        await p.waitForFunction(() => /RESUME/.test(document.body.innerText), null, { timeout: 8000 }).then(() => report.push({ W, name: 'value:header shows server kill switch', ok: true }), () => report.push({ W, name: 'value:header shows server kill switch', ok: false }));
+      } finally { await call(false); }
+      await p.waitForFunction(() => !/RESUME/.test(document.body.innerText), null, { timeout: 8000 }).then(() => report.push({ W, name: 'value:header clears when the server clears it', ok: true }), () => report.push({ W, name: 'value:header clears when the server clears it', ok: false }));
+    });
+    await p.reload({ waitUntil: 'load' }); await p.waitForTimeout(3000);
     // direct header buttons then dropdown items
     const headerIds = ['btn-capital-tier-toggle', 'btn-auto-profit-ticker', 'btn-engine-console', 'btn-open-backtest', 'btn-unit-tests', 'btn-operator-auth', 'btn-deploy-algorithm', 'btn-audio-toggle'];
     const reload = async () => { await p.reload({ waitUntil: 'load' }); await p.waitForTimeout(3000); };
@@ -91,5 +116,5 @@ const audit = () => {
   }
   fs.writeFileSync(`${OUT}/report.json`, JSON.stringify(report, null, 1));
   for (const r of report) console.log(r.W, r.name, r.error || r.note || '', (r.issues || []).length ? '\n   ' + r.issues.join('\n   ') : '', r.errs ? JSON.stringify(r.errs) + JSON.stringify(r.bad) : '');
-  await b.close(); srv.kill();
-})().catch(e => { console.error('FAIL', e); srv.kill(); process.exit(1); });
+  await b.close(); stopSrv();
+})().catch(e => { console.error('FAIL', e); stopSrv(); process.exit(1); });

@@ -18,6 +18,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint . && tsc --noEmit",
     "test": "vitest run",
+    "test:facades": "tsx scripts/find_facade_tests.ts --baseline tests/facade-baseline.json",
     "test:long": "vitest run -c vitest.long.config.ts",
     "signer:import": "tsx scripts/import_signer.ts",
     "smoke": "tsx scripts/smoke.ts",

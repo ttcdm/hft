@@ -4,6 +4,13 @@
  *
  * Usage: npx tsx scripts/find_facade_tests.ts [path ...]   (default: tests/)
  * Exit code 1 when any facade test is found.
+ *
+ *   --baseline <file>        fail only on facade tests that are NOT listed in the baseline (CI: `npm run test:facades`); also reports baseline
+ *                            entries that no longer exist, so the list shrinks when a facade test is fixed
+ *   --write-baseline <file>  write the current findings as the baseline (a reviewed, deliberate act)
+ *
+ * Production code is server/, src/ and scripts/ (S22: scripts/ used to be missed, so a test of devnet_seed.ts was reported as a facade).
+ * Both *.test.ts and *.test.tsx are scanned.
  */
 import fs from 'fs';
 import path from 'path';
@@ -18,17 +25,17 @@ export interface FacadeFinding {
 const TEST_CALLEES = new Set(['it', 'test']);
 
 function isProductionSpecifier(spec: string): boolean {
-  return /(^|\/)(server|src)(\/|$)/.test(spec) && !spec.includes('node_modules') && spec.startsWith('.');
+  return /(^|\/)(server|src|scripts)(\/|$)/.test(spec) && !spec.includes('node_modules') && spec.startsWith('.');
 }
 
 function collectTestFiles(target: string): string[] {
   const stat = fs.statSync(target);
-  if (stat.isFile()) return target.endsWith('.test.ts') ? [target] : [];
+  if (stat.isFile()) return /\.test\.tsx?$/.test(target) ? [target] : [];
   const out: string[] = [];
   for (const entry of fs.readdirSync(target, { withFileTypes: true })) {
     const full = path.join(target, entry.name);
     if (entry.isDirectory()) out.push(...collectTestFiles(full));
-    else if (entry.name.endsWith('.test.ts')) out.push(full);
+    else if (/\.test\.tsx?$/.test(entry.name)) out.push(full);
   }
   return out;
 }
@@ -177,8 +184,26 @@ export function findFacadeTests(files: string[]): FacadeFinding[] {
   return findings;
 }
 
+export const facadeKey = (f: FacadeFinding): string => `${f.file.replace(/\\/g, '/')}::${f.title}`;
+
+/** New = found now but not in the baseline. Fixed = in the baseline but no longer found. Keys ignore line numbers, so editing a test file does not churn the list. */
+export function compareToBaseline(findings: FacadeFinding[], baseline: string[]): { added: string[]; fixed: string[] } {
+  const now = new Map<string, number>();
+  for (const f of findings) now.set(facadeKey(f), (now.get(facadeKey(f)) ?? 0) + 1);
+  const was = new Map<string, number>();
+  for (const k of baseline) was.set(k, (was.get(k) ?? 0) + 1);
+  const added: string[] = []; const fixed: string[] = [];
+  for (const [k, n] of now) for (let i = 0; i < n - (was.get(k) ?? 0); i++) added.push(k);
+  for (const [k, n] of was) for (let i = 0; i < n - (now.get(k) ?? 0); i++) fixed.push(k);
+  return { added, fixed };
+}
+
 function main() {
-  const targets = process.argv.slice(2);
+  const argv = process.argv.slice(2);
+  const opt = (name: string): string | undefined => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : undefined; };
+  const baselineFile = opt('--baseline');
+  const writeBaseline = opt('--write-baseline');
+  const targets = argv.filter((a, i) => !a.startsWith('--') && argv[i - 1] !== '--baseline' && argv[i - 1] !== '--write-baseline');
   const roots = targets.length > 0 ? targets : ['tests'];
   const allFiles = roots.flatMap((r) => collectTestFiles(r));
   // *.repo.test.ts files assert on repository files (config, ignore rules, docs), not production logic.
@@ -186,6 +211,19 @@ function main() {
   const repoFiles = allFiles.filter((f) => f.endsWith('.repo.test.ts'));
   const files = allFiles.filter((f) => !f.endsWith('.repo.test.ts'));
   const findings = findFacadeTests(files);
+  if (writeBaseline) {
+    fs.writeFileSync(writeBaseline, JSON.stringify(findings.map(facadeKey).sort(), null, 0).replace(/","/g, '",\n"').replace(/^\[/, '[\n').replace(/\]$/, '\n]') + '\n');
+    console.log(`wrote ${findings.length} entries to ${writeBaseline}`);
+    return process.exit(0);
+  }
+  if (baselineFile) {
+    const baseline: string[] = JSON.parse(fs.readFileSync(baselineFile, 'utf8'));
+    const { added, fixed } = compareToBaseline(findings, baseline);
+    for (const k of added) console.log(`NEW facade test: ${k}`);
+    if (fixed.length) console.log(`${fixed.length} baseline entr${fixed.length === 1 ? 'y is' : 'ies are'} gone (fixed or renamed); regenerate with --write-baseline to shrink the list`);
+    console.log(`${findings.length} facade test(s) found, ${baseline.length} in the baseline, ${added.length} new.`);
+    return process.exit(added.length > 0 ? 1 : 0);
+  }
   for (const f of findings) {
     console.log(`${f.file}:${f.line}  ${f.title}`);
   }

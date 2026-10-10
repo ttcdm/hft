@@ -447,7 +447,7 @@ export class PumpFeedListener extends EventEmitter {
         (logs: Logs, ctx: Context) => {
           this.eventsReceived++;
           try {
-            for (const trade of this.parseTradeLogs(logs, ctx)) this.ingestTradeEvent(trade);
+            const trades = this.parseTradeLogs(logs, ctx);
             const event = this.parseLogs(logs, ctx);
             if (event) {
               this.eventsParsed++;
@@ -471,6 +471,9 @@ export class PumpFeedListener extends EventEmitter {
                 Logger.warn(`PumpFeedListener subscriber error: ${emitErr?.message || emitErr}`);
               }
             }
+            // Q6d: the trades of a create transaction (the dev buy) are ingested AFTER its create event, so a watch started by the
+            // create already exists to receive them. Before, they were emitted first and no subscriber was watching yet.
+            for (const trade of trades) this.ingestTradeEvent(trade);
           } catch (err: any) {
             Logger.warn(`PumpFeedListener error processing log: ${err.message}`);
           }

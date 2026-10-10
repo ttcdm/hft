@@ -5,8 +5,8 @@ import type { AutoMode } from './controller';
  * Triggers PAUSE BUYS only; exits keep running. The one exception is an unexplained wallet change, which halts everything.
  */
 export const EXPECTANCY_WINDOW = 20;
-/** One-sided 80% normal quantile. */
-export const Z_80 = 1.2816;
+/** One-sided 80% normal quantile (Q30: this was 1.2816, the 90% value). */
+export const Z_80 = 0.8416;
 export const MAX_CONSECUTIVE_LOSSES = 8;
 export const MAX_SLIPPAGE_BREACHES = 2;
 export const READINESS_RED_LIMIT_MS = 10_000;

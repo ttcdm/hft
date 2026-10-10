@@ -312,12 +312,12 @@ export function isAutoSnipeEnvEnabled(): boolean {
 
 /**
  * Demo callers are SYNTHETIC_TEST. A real-feed token with no attributed caller comes from pump.fun/DexScreener market
- * data, not from a social post, so it is REAL_ONCHAIN. REAL_SOCIAL is reserved for a callout traced to an actual
+ * data, not from a social post, so it is PUMP_HTTP_API (it was labelled REAL_ONCHAIN, which claims an on-chain event). REAL_SOCIAL is reserved for a callout traced to an actual
  * social post, which no code path produces yet.
  */
 export function calloutProvenance(callout: PumpFunHotCallout): SignalProvenance {
   if (DEMO_CALLER_IDS.has(callout.caller.userId)) return 'SYNTHETIC_TEST';
-  if (callout.caller.userId === UNATTRIBUTED_CALLER.userId) return 'REAL_ONCHAIN';
+  if (callout.caller.userId === UNATTRIBUTED_CALLER.userId) return 'PUMP_HTTP_API'; // Q33: it came from an HTTP list, not the chain
   return 'REAL_SOCIAL';
 }
 

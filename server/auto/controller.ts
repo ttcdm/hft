@@ -356,7 +356,7 @@ export class AutoSnipeController extends EventEmitter {
 
     const ctx = {
       mode: this.mode,
-      closedNetPnlSol: workstationDb.loadEvidenceClosedTrades(execMode).map((p) => p.realizedPnLSol ?? 0),
+      closedNetPnlSol: this.sessionEvidencePnl(execMode),
       dailyTotalPnlSol: riskEngine.getDailyTotalPnLSol(execMode),
       maxDailyLossSol: riskEngine.effectiveMaxDailyLossSol(),
       slippageBreaches: this.slippageBreaches,
@@ -411,6 +411,20 @@ export class AutoSnipeController extends EventEmitter {
       this.emit('mode', { mode: this.mode, reason });
     }
     return { explained: audit.explained, unexplainedSol: audit.unexplainedSol };
+  }
+
+  /**
+   * Q30: the trades the expectancy and loss-streak triggers judge. Only positions the auto trader opened (this session's, or recorded as
+   * BOUGHT in the journal) that closed since this session started, in this execution mode. Before, every closed trade of every mode and
+   * every origin counted, so the old losses that tripped a trigger re-tripped it within seconds of the operator turning auto back on.
+   */
+  private sessionEvidencePnl(execMode: 'PAPER' | 'LIVE'): number[] {
+    const since = this.session?.startedAt ?? 0;
+    const owned = new Set<string>(this.session?.positionIds ?? []);
+    for (const d of workstationDb.loadDecisions({ outcome: 'BOUGHT', limit: 5000 })) if (d.positionId) owned.add(d.positionId);
+    return workstationDb.loadEvidenceClosedTrades(execMode)
+      .filter((p) => owned.has(p.id) && (p.lastUpdatedTimestamp ?? 0) >= since)
+      .map((p) => p.realizedPnLSol ?? 0);
   }
 
   /** Clear an all-trading halt. Does not turn auto trading back on: the operator still sets a mode. */

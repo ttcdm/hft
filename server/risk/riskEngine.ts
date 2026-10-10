@@ -76,7 +76,9 @@ export class HardenedRiskEngine {
   /** Daily loss stop in SOL: pinned value if set explicitly, else maxDailyLossUsd / live SOL price, else the safe default. */
   public effectiveMaxDailyLossSol(): number {
     if (this.dailyLossLimitPinned) return this.limits.maxDailyLossSol;
-    const px = solPriceService.lastKnownPrice();
+    // Q56: a price older than an hour no longer converts the USD limit; the fixed SOL default applies until a fresh one is read.
+    const reading = solPriceService.getPrice();
+    const px = reading.usd !== null && (reading.ageMs ?? Infinity) <= 60 * 60_000 ? reading.usd : null;
     return px ? executionConfig.getConfig().maxDailyLossUsd / px : this.limits.maxDailyLossSol;
   }
 

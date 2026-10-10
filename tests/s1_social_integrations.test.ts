@@ -43,7 +43,7 @@ describe('S1: Telegram / social integrations', () => {
       s.ingestLiveTokenSignal(liveTokenInput({ mint: MINT_A.toLowerCase() }));
       s.ingestLiveTokenSignal(liveTokenInput({ mint: '' }));
       expect(s.getSignals()).toHaveLength(1);
-      expect(s.getSignals()[0].provenance).toBe('REAL_ONCHAIN');
+      expect(s.getSignals()[0].provenance).toBe('PUMP_HTTP_API');
     });
 
     it('ingestLiveTokenSignal: picks the source from available socials and extracts handles', () => {
@@ -211,7 +211,7 @@ describe('S1: Telegram / social integrations', () => {
       expect(socialScanner.getSignals().filter((s) => s.contractAddress === MINT_A)).toHaveLength(1);
     });
 
-    it('R20: a manual snipe carries the callout\'s provenance (a demo caller is SYNTHETIC_TEST, an unattributed one REAL_ONCHAIN) and its own timestamp', async () => {
+    it('R20: a manual snipe carries the callout\'s provenance (a demo caller is SYNTHETIC_TEST, an unattributed one PUMP_HTTP_API) and its own timestamp', async () => {
       const snipe = vi.spyOn(memecoinAggregator, 'executeSnipe').mockResolvedValue({ success: false, message: 'stubbed', txHash: '' } as any);
       const at = Date.now() - 5_000;
       const callout = (id: string, userId: string) => ({ id, calloutId: id, token: { mint: MINT_A }, caller: { userId }, calloutTimestamp: at, status: 'NEW' });

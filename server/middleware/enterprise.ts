@@ -52,6 +52,15 @@ export class Logger {
   }
 }
 
+/**
+ * Q54: an RPC or Jito URL can carry a key in its path (`/v2/<key>`), its query or its user-info. For logs and API replies keep only
+ * scheme and host, which is what an operator needs to see which endpoint is in use.
+ */
+export function endpointOrigin(url: string | undefined | null): string {
+  if (!url) return '';
+  try { const u = new URL(url); return `${u.protocol}//${u.host}`; } catch { return '[unparseable endpoint]'; }
+}
+
 const SENSITIVE_QUERY_PARAM = /secret|key|token|signature|sig|password|passwd|auth|credential|private|mnemonic|seed/i;
 
 /** URL safe to log: values of query parameters whose names look like credentials are replaced with [REDACTED]. */

@@ -121,9 +121,9 @@ describe('A5: fake callers cannot drive auto-snipe', () => {
     expect(callout.status).toBe('ACTIVE');
   });
 
-  it('labels an unattributed real-feed token REAL_ONCHAIN, never REAL_SOCIAL', () => {
+  it('labels an unattributed real-feed token PUMP_HTTP_API, never REAL_SOCIAL', () => {
     const unattributed = makeCallout(makeCaller({ userId: 'unattributed' }), 'A5MintUnattr1111111111111111111111111111');
-    expect(calloutProvenance(unattributed)).toBe('REAL_ONCHAIN');
+    expect(calloutProvenance(unattributed)).toBe('PUMP_HTTP_API');
   });
 
   it('labels a demo caller SYNTHETIC_TEST and a named real caller REAL_SOCIAL', () => {

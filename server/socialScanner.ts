@@ -211,7 +211,7 @@ export class SocialAlphaScanner {
   private telegramConfig: TelegramBotConfig = {
     botToken: process.env.TELEGRAM_BOT_TOKEN || '',
     chatId: process.env.TELEGRAM_CHAT_ID || '',
-    webhookActive: true,
+    webhookActive: false, // Q34: no webhook is registered with Telegram; the /status reply must not say LIVE WEBHOOK
     autoForwardAlerts: true,
     snipeThresholdScore: 85,
   };
@@ -638,7 +638,7 @@ export class SocialAlphaScanner {
     // K5 (#15): this is a token discovered on the pump.fun feed, not a post by a known account. Nothing is invented about
     // the author, the audience, the confidence or the intent: tier, confidence, sentiment and engagement metrics are
     // unknown, the signal is unverified, and the suggested action is to review it, never SNIPE_IMMEDIATE.
-    const source: SocialSource = hasTwitter ? 'X_TWITTER' : 'TELEGRAM';
+    const source: SocialSource = hasTwitter ? 'X_TWITTER' : hasTelegram ? 'TELEGRAM' : 'PUMP_FEED';
     const authorHandle = tokenData.callerHandle
       ? tokenData.callerHandle
       : hasTwitter
@@ -663,7 +663,7 @@ export class SocialAlphaScanner {
 
     const newSignal: SocialSignal = {
       id: `sig-live-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      provenance: 'REAL_ONCHAIN',
+      provenance: 'PUMP_HTTP_API', // Q33
       source,
       authorHandle,
       authorDisplayName,

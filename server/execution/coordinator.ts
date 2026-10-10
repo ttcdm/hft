@@ -37,7 +37,7 @@ import { paperEngine, PaperExecutionEngine } from './paperEngine';
 import { workstationDb } from '../db/database';
 import { getRandomJitoTipAccount, TOKEN_2022_PROGRAM_ID } from '../solana/programs';
 import { executionConfig } from '../solana/executionConfig';
-import { Logger } from '../middleware/enterprise';
+import { Logger, endpointOrigin } from '../middleware/enterprise';
 import { allowedCluster, assertClusterAllowed, resolveRpcUrl } from '../solana/clusterGuard';
 import { PumpCurveService, TradeQuote, PumpMarketState, fetchTokenHolderDistribution } from '../solana/pumpCurve';
 import { TradeReconciler, RealMarkPriceService, PreTradeSnapshot } from './reconciliation';
@@ -452,7 +452,7 @@ export class ExecutionCoordinator {
       this.jitoTransport = new JitoTransport(this.connection);
       this.rpcTransport = new SolanaRpcTransport(this.connection);
 
-      Logger.info(`Switched Solana RPC endpoint to ${newEndpoint} (${latency}ms)`);
+      Logger.info(`Switched Solana RPC endpoint to ${endpointOrigin(newEndpoint)} (${latency}ms)`);
       await this.syncRealWalletBalance();
       return { success: true, latencyMs: latency };
     } catch (err: any) {
@@ -464,7 +464,7 @@ export class ExecutionCoordinator {
   // Update Jito Block Engine URL
   public setJitoBlockEngineUrl(url: string) {
     this.jitoTransport.setBlockEngineUrl(url);
-    Logger.info(`Updated Jito Block Engine URL to ${url}`);
+    Logger.info(`Updated Jito Block Engine URL to ${endpointOrigin(url)}`);
   }
 
   /**
@@ -1523,6 +1523,8 @@ export class ExecutionCoordinator {
           landedSlot = postConfirmCheck.slot;
           break;
         }
+        // Q52: a transaction seen REVERTED on chain stays reverted; sending the same transaction again cannot change that.
+        if (lastConfirmDefinite) break;
       }
     }
 
@@ -1791,11 +1793,8 @@ export class ExecutionCoordinator {
 
     // Pre-trade capital sizing check: ensure order does not exceed 10% of spendable bankroll (B12)
     // C5: the configured paper bankroll (default 0.07 SOL), never an invented 1.0
-    const paperSpendable = CapitalSizer.calculateSpendableBankroll(
-      this.realWalletBalanceSol !== null ? this.realWalletBalanceSol : executionConfig.getConfig().paperBankrollSol,
-      0.015,
-      this.inFlightReservedSol
-    );
+    const paperBalanceSol = this.realWalletBalanceSol !== null ? this.realWalletBalanceSol : executionConfig.getConfig().paperBankrollSol;
+    const paperSpendable = CapitalSizer.calculateSpendableBankroll(paperBalanceSol, 0.015, this.inFlightReservedSol);
     const maxPaperOrderSol = Number((paperSpendable * 0.10).toFixed(6));
     if (paperSpendable > 0 && req.amountSol > maxPaperOrderSol + 0.000001) {
       return { rejection: {
@@ -1808,6 +1807,8 @@ export class ExecutionCoordinator {
     }
 
     // Evaluate Risk in Paper Mode
+    // Q51: read the open positions now (the caller's list is from before the awaits above)
+    const paperOpenNow = workstationDb.loadPositions('PAPER', 'ACTIVE');
     const riskDecision = riskEngine.evaluateOrder({
       mint: req.mint,
       orderSizeSol: req.amountSol,
@@ -1818,9 +1819,11 @@ export class ExecutionCoordinator {
       jitoTipLamports: paperTip.tipLamports,
       signalTimestamp: req.signalTimestamp || now,
       marketDataTimestamp: req.marketDataTimestamp || now,
-      currentOpenPositionsCount: openPositions.length,
-      currentTotalExposureSol: totalExposureSol,
-      walletSpendableSol: paperSpendable,
+      currentOpenPositionsCount: paperOpenNow.length,
+      currentTotalExposureSol: paperOpenNow.reduce((acc, p) => acc + p.costBasisLamports / 1e9, 0),
+      // Q50: the risk engine applies the 0.015 reserve itself, so it gets the balance net of in-flight orders only (as LIVE does, N12);
+      // `paperSpendable` already had the reserve taken off, and passing it charged the reserve twice.
+      walletSpendableSol: Math.max(0, paperBalanceSol - this.inFlightReservedSol),
       executionMode: 'PAPER',
     });
 
@@ -1965,7 +1968,7 @@ export class ExecutionCoordinator {
           success: false,
           lifecycleState: 'RISK_REJECTED',
           executionMode: 'LIVE',
-          error: `PROVENANCE_VIOLATION: Live trading requires LIVE_PUMP_STREAM, REAL_ONCHAIN, REAL_SOCIAL, COPY_TRADE, or MANUAL_OPERATOR provenance. Observed: '${req.provenance}'.`,
+          error: `PROVENANCE_VIOLATION: Live trading requires LIVE_PUMP_STREAM, REAL_ONCHAIN, PUMP_HTTP_API, REAL_SOCIAL, COPY_TRADE, or MANUAL_OPERATOR provenance. Observed: '${req.provenance}'.`,
           correlationId,
         };
       }
@@ -2268,6 +2271,10 @@ export class ExecutionCoordinator {
       };
     }
 
+    // Q51: count and exposure are read now, not from the snapshot taken before the awaits above, and they include the buys of other mints
+    // that are in flight (not positions yet). There is no await between this read, the risk check and the reservation below.
+    const freshOpen = workstationDb.loadPositions(this.executionMode, 'ACTIVE');
+    const freshExposureSol = freshOpen.reduce((acc, p) => acc + p.costBasisLamports / 1e9, 0) + this.inFlightReservedSol;
     const riskDecision = riskEngine.evaluateOrder({
       mint: req.mint,
       orderSizeSol: req.amountSol,
@@ -2279,8 +2286,8 @@ export class ExecutionCoordinator {
       signalTimestamp: req.signalTimestamp as number,
       marketDataTimestamp: marketState.marketDataTimestamp,
       // R3: adopted wallet dust is not a position the app chose to open; it must not fill the position cap forever.
-      currentOpenPositionsCount: openPositions.filter((p) => !isRecoveredPosition(p)).length,
-      currentTotalExposureSol: totalExposureSol,
+      currentOpenPositionsCount: freshOpen.filter((p) => !isRecoveredPosition(p)).length + this.inFlightBuyMints.size,
+      currentTotalExposureSol: freshExposureSol,
       // N12: the risk engine applies the minimum reserve itself, so it gets the balance net of in-flight orders only. `spendable` already
       // has the reserve and the in-flight amount taken off; passing it (minus in-flight again) charged both twice. Rent held in token accounts
       // is not in getBalance, so it is not subtracted either.
@@ -2971,11 +2978,10 @@ export class ExecutionCoordinator {
           ...SolanaTransactionBuilder.createComputeBudgetInstructions(250000, executionConfig.getConfig().priorityFeeMicrolamports),
           ...pumpSwapSell.instructions,
           ...(closeAtaEffective ? [createCloseAccountInstruction(associatedUser, seller, seller, [], tokenProgramToUse)] : []),
-          SystemProgram.transfer({
-            fromPubkey: seller,
-            toPubkey: jitoTipAccount,
-            lamports: expectedJitoTipLamports,
-          }),
+          // Q52: no tip transfer when the tip is 0 (the builder guards the same way)
+          ...(expectedJitoTipLamports > 0
+            ? [SystemProgram.transfer({ fromPubkey: seller, toPubkey: jitoTipAccount, lamports: expectedJitoTipLamports })]
+            : []),
         ];
 
         v0Tx = await txBuilder.buildCustomVersionedTransaction(this.connection, seller, instructions);
@@ -3296,7 +3302,11 @@ export class ExecutionCoordinator {
       // or undo a partial; skip it and let the next pass re-evaluate from the current row.
       const current = workstationDb.loadPositions(undefined, undefined).find((p) => p.id === pos.id);
       if (!current || current.status === 'CLOSED' || current.tokenQuantityRaw !== loadedQty.get(pos.id)) continue;
-      workstationDb.savePosition(pos);
+      try {
+        workstationDb.saveExitState(pos); // S11: only the exit engine's fields, so a stale copy cannot undo a sell; Q56: a failing write must not stop the exits in this pass
+      } catch (err: any) {
+        Logger.error(`[B13 ExitEngine] could not persist the trailing state of ${pos.symbol || pos.mint}: ${err.message}. Exit evaluation continues.`);
+      }
 
       if (decision.shouldExit) {
         const waitMs = this.exitRetryWaitMs(pos.id, now);

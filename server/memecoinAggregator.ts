@@ -623,13 +623,13 @@ export class MemecoinAggregatorService extends EventEmitter {
             liquidityUsd: 15000,
             bondingCurveProgress: t.bondingCurveProgress || 50,
             isMigrated: t.complete,
-            volume5mUsd: t.volume5mUsd || 15000,
-            volume1hUsd: 45000,
-            volume24hUsd: 120000,
-            priceChange5mPct: 5.5,
-            priceChange1hPct: 18.2,
-            buys5m: t.buys5m || 40,
-            sells5m: t.sells5m || 8,
+            volume5mUsd: t.volume5mUsd ?? 0,
+            volume1hUsd: 0, // Q32: not provided by the callout feed; 0 is "unknown", not a made-up figure
+            volume24hUsd: 0,
+            priceChange5mPct: t.priceChange5mPct ?? 0,
+            priceChange1hPct: 0,
+            buys5m: t.buys5m ?? 0,
+            sells5m: t.sells5m ?? 0,
             top10HoldersPct: t.top10HoldersPct ?? 15,
             devHoldingPct: t.devHoldingPct ?? 0.8,
             isMintRevoked: t.isMintRevoked ?? true,
@@ -639,6 +639,7 @@ export class MemecoinAggregatorService extends EventEmitter {
             rugcheckScore: (t.rugcheckScore as any) || 'SAFE',
             createdAgo: t.timeAgoStr || 'Just now',
             trendingRank: 1,
+            unverified: true, // Q32
           };
           this.pools.unshift(pool);
         }
@@ -723,7 +724,7 @@ export class MemecoinAggregatorService extends EventEmitter {
 
     // Assign REAL_ONCHAIN provenance to all on-chain events discovered via WebSocket or RPC (B09)
     const isSyntheticPool =
-      DEMO_POOL_IDS.has(pool.id) || pool.id.startsWith('pool-simulated-');
+      DEMO_POOL_IDS.has(pool.id) || pool.id.startsWith('pool-simulated-') || pool.id.startsWith('pool-callout-'); // Q32: placeholders are not REAL_*
     // The synthetic-pool check always wins over an explicit provenance param (A5).
     const provenance: SignalProvenance = isSyntheticPool
       ? 'SYNTHETIC_TEST'

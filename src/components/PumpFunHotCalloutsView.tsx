@@ -373,7 +373,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                   </span>
                 </div>
                 <div className="text-[11px] text-slate-400">
-                  Toggle Auto-Snipe on specific callers below or in the Leaderboard to automatically snipe their signals.
+                  The per-caller auto-snipe toggle only marks a caller on this screen; nothing buys because of it. Auto trading is controlled in the Auto panel.
                 </div>
               </div>
             </div>
@@ -817,7 +817,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                               ? 'bg-rose-500/20 text-rose-300 border-rose-500/50 shadow-sm'
                               : 'bg-[#141B2D] text-slate-400 border-[#1E293B] hover:text-white hover:border-slate-600'
                           }`}
-                          title={c.caller.isAutoSnipeSubscribed ? 'Click to disable auto-snipe for this caller' : 'Click to automatically snipe all callouts from this caller'}
+                          title={c.caller.isAutoSnipeSubscribed ? 'Click to unmark this caller (a screen marker only; nothing buys because of it)' : 'Click to mark this caller (a screen marker only; nothing buys because of it)'}
                         >
                           <Bot className="w-3 h-3 text-cyan-400" />
                           <span>{c.caller.isAutoSnipeSubscribed ? 'AUTO-SNIPE: ON' : 'AUTO-SNIPE: OFF'}</span>
@@ -988,7 +988,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 Autonomous Pump.fun Callout Sniper Parameters
               </h3>
               <p className="text-xs text-slate-400 mt-0.5">
-                Automatically snipe when high-winrate callers or multi-caller confluence trigger (a real transaction only when LIVE is armed; PAPER sends nothing).
+                These rules are stored and shown here; no code acts on them. Auto trading is controlled in the Auto panel (a real transaction only when LIVE is armed; PAPER sends nothing).
               </p>
             </div>
 

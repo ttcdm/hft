@@ -83,10 +83,12 @@ This document outlines structural, economic, and operational risks inherent to a
 
 ---
 
+**Operator token lifetime (Q54).** A token set in `OPERATOR_AUTH_TOKEN` is valid until the process stops (its session record is set for 365 days). To revoke it, change `OPERATOR_AUTH_TOKEN` and restart; `POST /api/auth/rotate` revokes every token but also the configured one, so set the new value in the environment as well. RPC and Jito URLs are logged and returned by the API as scheme and host only, because their keys often sit in the path.
+
 ## 5. Emergency Procedures
 
 1. **Immediate Execution Halt:** Engage the Hardware Kill Switch via the UI or `POST /api/live/disarm`. This halts order generation and trips the circuit breaker.
-2. **Panic Liquidation:** Initiate sequential exit via `POST /api/order/panic-liquidate`. This disarms live trading first, then liquidates all active positions.
+2. **Panic Liquidation:** `POST /api/wallet/panic-liquidate` (or Telegram `/panic_sell`). It turns the kill switch on, disarms live trading and stops auto first, then sells every active position. **Decision (Q53): panic sells everything the app holds in the wallet, including balances it adopted at startup (RECOVERED) that it never bought, and rows of every mode.** It is an emergency exit, so it does not apply the "only what auto bought" scoping that auto's own kill uses (R23). If you hold a balance you want kept, do not use panic; close positions one by one.
 3. **Wallet Balance Sweep:** In the event of an infrastructure anomaly, transfer all remaining SOL out of the trading keypair to a designated cold wallet via standard CLI tools (`solana transfer`).
 
 ## 6. Settings that are stored but change nothing (checked against the code, Q34)
@@ -103,7 +105,12 @@ These can be set (some from the UI) and are saved, but no code path reads them t
 | `requireMintRevoked` | `server/memecoinAggregator.ts` config | Accepted and stored. The mint-authority rule is enforced by the eligibility gate, not by this field. |
 | `ENABLE_SYNTHETIC_SOCIAL` | `server/solana/executionConfig.ts` | Read into the config object, never consulted. |
 
-Also: Jito bundles are used only on mainnet-beta, which this build does not use. On devnet and localnet the app sends ordinary transactions with a priority fee.
+| `minConfidenceScore` | `server/memecoinAggregator.ts` config | Accepted and stored, never read. |
+| Two "auto snipe" switches | env `AUTO_SNIPE_ENABLED` (`server/auto/controller.ts`) and the UI/config flag in `server/memecoinAggregator.ts` | Only the env flag and the Auto panel's mode decide whether auto trades. The other flag is stored only. |
+| `walletAddress`, `jitoTipAccount`, `wsRpcEndpoint`, `autoStartTrading` (wallet config body) | `server/execution/schemas`/`walletTrader.updateConfig` | Accepted by the schema, never applied by `updateConfig`. |
+| `priorityTipSol` on close-position | `ClosePositionSchema` | Labelled placeholder; ignored. |
+
+Also: the per-caller auto-snipe toggle and the callout auto-snipe rules in the Hot Callouts screen now say on screen that they are markers only. Jito bundles are used only on mainnet-beta, which this build does not use. On devnet and localnet the app sends ordinary transactions with a priority fee.
 
 ## 7. What the live confirmation (`confirmLive`) is, and is not (S1)
 
@@ -136,3 +143,11 @@ The seeded devnet token (`scripts/devnet_seed.ts`) is **not expected to be bough
 - **Finality is instant.** The in-process validator reports `finalized` for every landed signature at once. The "sent and unknown" class (SELL_PENDING_VERIFICATION, blockhash expiry, processed to confirmed) therefore runs only through explicit fault injection. Step (g) of `npm run localnet:e2e` covers "landed but the response was withheld", not "sent and the outcome is unknown". Devnet is the first place those paths meet real latency.
 - **The `localnet_*` methods are harness-only.** No production code calls them (`grep` finds none), so `localnet_setAccount` cannot be reached from the app.
 - **A buyer funded through a program call is untested.** The validator's `getTransaction` (`jsonParsed`) understands only direct system transfers. A buyer funded by a CPI (the case S4d's public-funder list handles) has no localnet test.
+
+## 10. Persistence and journal limits (Q55, Q56)
+
+- **The WAL (`server/engine/wal.ts`) is decorative.** It belongs to the BTC simulation engine: sequence and checksum restart at 0 at every boot into an append-only file, there is no `error` listener, and nothing reads it back. It is not a recovery source. Position and order recovery come from SQLite plus the startup reconciliation against the chain.
+- **No multi-statement transactions.** Each save is its own statement. The mark and exit-state writes now touch only their own columns and never a CLOSED row (S11), which closes the known race, but a crash between two statements of a trade can still leave the order and the position out of step; startup reconciliation repairs that against the chain.
+- **Unbounded tables.** `positions`, `orders` and `transactions` are never pruned, and `loadPositions()` scans the table in several loops. Fine for a devnet session; revisit before long runs.
+- **Operator alerts are in memory only.** A restart forgets them (the journal keeps the events they came from).
+- **SOL price.** A reading outside $1 to $100,000, or more than 2x away from a reading under 10 minutes old, is rejected. A price older than an hour no longer converts the USD daily-loss limit; the fixed SOL default applies until a fresh price is read.

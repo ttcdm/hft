@@ -353,7 +353,7 @@ export class WorkstationDatabase {
     // Q2: adopted balances (no known cost) and rows closed because the wallet held nothing (cost 0, realized 0) say nothing about an edge.
     return closed
       .filter((p) => !unverified.has(p.id) && !p.entryTxSignature?.startsWith('RECOVERED:') && !p.exitReason?.startsWith('RECONCILED_ZERO_BALANCE'))
-      .sort((a, b) => (a.updatedAt ?? 0) - (b.updatedAt ?? 0));
+      .sort((a, b) => (a.lastUpdatedTimestamp ?? 0) - (b.lastUpdatedTimestamp ?? 0)); // Q30: this sorted on a field that does not exist, so "the last 20" were the oldest 20
   }
 
   /**
@@ -695,6 +695,20 @@ export class WorkstationDatabase {
       now, now,
       pos.id
     );
+    return Number((r as any).changes) > 0;
+  }
+
+  /** Q56 / S11: the exit engine's own fields (high-water mark, trailing stop, stage) for an open row, nothing else. */
+  public saveExitState(pos: NormalizedPosition): boolean {
+    const now = Date.now();
+    const r = this.db.prepare(`
+      UPDATE positions SET
+        high_water_mark_sol = CASE WHEN ? > 0 THEN ? ELSE high_water_mark_sol END,
+        trailing_stop_sol = CASE WHEN ? > 0 THEN ? ELSE trailing_stop_sol END,
+        exit_stage = ?,
+        record_updated_at = ?, updated_at = ?
+      WHERE id = ? AND status != 'CLOSED'
+    `).run(pos.highWaterMarkSol ?? 0, pos.highWaterMarkSol ?? 0, pos.trailingStopSol ?? 0, pos.trailingStopSol ?? 0, pos.exitStage ?? 0, now, now, pos.id);
     return Number((r as any).changes) > 0;
   }
 

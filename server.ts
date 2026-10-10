@@ -4,7 +4,6 @@ import express from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'node:fs';
-import crypto from 'crypto';
 import http from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer, createLogger } from 'vite';
@@ -70,6 +69,7 @@ import {
 export { isAllowedClientOrigin };
 import {
   Logger,
+  endpointOrigin,
   correlationIdMiddleware,
   errorHandler,
   rateLimiter,
@@ -500,54 +500,7 @@ app.get('/api/health', (req, res) => {
 // 3. Market data proxy routes (orderbook, trades, ticker) live in server/market/marketRoutes.ts (B2).
 registerMarketRoutes(app);
 
-// 3h. Account Portfolio & Balance Retrieval
-app.get('/api/account/balance', requireOperatorAuth, async (req, res) => {
-  if (req.query.secret || req.query.apiSecret || req.query.apiKey) {
-    return res.status(400).json({
-      error: 'CRITICAL_SECURITY_VIOLATION',
-      message: 'Credentials must NEVER be passed via URL query parameters. Use HTTP headers (x-mbx-apikey, x-mbx-apisecret).',
-    });
-  }
-  const apiKey = req.headers['x-mbx-apikey'] as string;
-  const apiSecret = (req.headers['x-mbx-apisecret'] || req.headers['x-api-secret']) as string;
-
-  if (apiKey && apiSecret) {
-    try {
-      const timestamp = Date.now();
-      const queryString = `timestamp=${timestamp}`;
-      const signature = crypto.createHmac('sha256', apiSecret).update(queryString).digest('hex');
-      const apiRes = await fetch(`https://testnet.binance.vision/api/v3/account?${queryString}&signature=${signature}`, {
-        headers: { 'X-MBX-APIKEY': apiKey },
-      });
-      if (apiRes.ok) {
-        const data = await apiRes.json();
-        const balances = (data.balances || [])
-          .filter((b: any) => parseFloat(b.free) > 0 || parseFloat(b.locked) > 0)
-          .map((b: any) => ({
-            asset: b.asset,
-            free: parseFloat(b.free),
-            locked: parseFloat(b.locked),
-            totalUsd: parseFloat(b.free) * (b.asset === 'USDT' ? 1 : b.asset === 'BTC' ? 68900 : 2800),
-          }));
-        return res.json({ source: 'BINANCE_TESTNET', balances, canTrade: data.canTrade });
-      }
-    } catch {
-      // fallback
-    }
-  }
-
-  // Institutional paper balances
-  res.json({
-    source: 'APEX_INSTITUTIONAL_LEDGER',
-    balances: [
-      { asset: 'USDT', free: 345250.0, locked: 12000.0, totalUsd: 357250.0 },
-      { asset: 'BTC', free: 2.154, locked: 0.25, totalUsd: 165645.0 },
-      { asset: 'ETH', free: 15.42, locked: 2.0, totalUsd: 49472.0 },
-      { asset: 'SOL', free: 85.0, locked: 0.0, totalUsd: 12087.0 },
-    ],
-    canTrade: true,
-  });
-});
+// 3h. (removed, Q57) /api/account/balance was a Binance-testnet route with invented "institutional" balances and hardcoded BTC/ETH prices; nothing in src/ called it.
 
 // 4. Automated Unit Testing Suite Runner (200 Quantitative HFT & Bonding Curve Test Cases)
 app.get('/api/unit-tests', requireOperatorAuth, (req, res) => {
@@ -1030,6 +983,8 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, async (req, res) =
       })),
       activeCalloutsCount: hotCallouts.length,
       multiCallerConfluenceCount: confluenceCallouts.length,
+      // Q33: what "confluence" is here, said where it is shown
+      confluenceMeaning: 'The token is on both the pump.fun recent list and the DexScreener paid-boost list. The listed callers are placeholder names assigned by list position, not people who called it.',
       confluenceTokens: confluenceCallouts.map((c) => ({
         symbol: c.token.symbol,
         mint: c.token.mint,
@@ -1280,7 +1235,7 @@ app.get('/api/wallet/state', requireOperatorAuth, (req, res) => {
   res.json({
     success: true,
     data: walletTrader.getState(),
-    config: walletTrader.getConfig(),
+    config: { ...walletTrader.getConfig(), rpcEndpoint: endpointOrigin(walletTrader.getConfig().rpcEndpoint) }, // Q54: no key from the URL path or query
   });
 });
 
@@ -1289,7 +1244,7 @@ app.post('/api/wallet/config', requireOperatorAuth, validateBody(WalletConfigSch
     const updated = await walletTrader.updateConfig(req.body);
     res.json({
       success: true,
-      config: updated,
+      config: { ...updated, rpcEndpoint: endpointOrigin(updated.rpcEndpoint) },
       state: walletTrader.getState(),
     });
   } catch (err: any) {
@@ -1388,7 +1343,7 @@ app.get('/api/diagnostics/system', requireOperatorAuth, (req, res) => {
       walletSolBalance: diag.walletSolBalance,
       walletPubkey: diag.activeWalletAddress,
       signerStatus,
-      rpcEndpoint: resolveRpcUrl(),
+      rpcEndpoint: endpointOrigin(diag.rpcEndpoint || resolveRpcUrl()), // Q54: the endpoint in use (it changes on a switch), host only
       allowedCluster: allowedCluster(),
       rpcLatencyMs: diag.rpcLatencyMs,
       databaseFile: 'apex_workstation.db',

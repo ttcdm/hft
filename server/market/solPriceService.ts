@@ -24,6 +24,8 @@ export class SolPriceUnavailableError extends Error {
 }
 
 export const SOL_PRICE_MAX_AGE_MS = 120_000;
+export const SOL_PRICE_MIN_USD = 1;
+export const SOL_PRICE_MAX_USD = 100_000;
 
 const parse = (v: unknown): number | null => {
   const n = typeof v === 'string' ? parseFloat(v) : typeof v === 'number' ? v : NaN;
@@ -58,11 +60,16 @@ export class SolPriceService {
   }
 
   /** Records a reading. Used by refresh() and by tests that need a deterministic price. */
-  public setPrice(usd: number, source: string, asOf = Date.now()) {
-    if (parse(usd) === null) return;
+  public setPrice(usd: number, source: string, asOf = Date.now()): boolean {
+    if (parse(usd) === null) return false;
+    // Q56: a sanity band. SOL outside $1 to $100,000, or a jump of more than 2x either way against a reading under 10 minutes old, is a bad
+    // feed (a wrong unit, a different asset, a fat-finger fixed price), not a market. It would size every order and the SOL loss cap.
+    if (usd < SOL_PRICE_MIN_USD || usd > SOL_PRICE_MAX_USD) return false;
+    if (this.usd !== null && asOf - this.asOf < 10 * 60_000 && (usd > this.usd * 2 || usd < this.usd / 2)) return false;
     this.usd = usd;
     this.source = source;
     this.asOf = asOf;
+    return true;
   }
 
   public reset() {
@@ -127,10 +134,7 @@ export class SolPriceService {
     for (const [name, read] of sources) {
       try {
         const px = await read();
-        if (px !== null) {
-          this.setPrice(px, name);
-          break;
-        }
+        if (px !== null && this.setPrice(px, name)) break; // a reading outside the sanity band is skipped; the next source is tried
       } catch {
         // try the next source
       }

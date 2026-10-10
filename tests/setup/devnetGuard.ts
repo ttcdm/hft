@@ -14,7 +14,9 @@ import { solPriceService } from '../../server/market/solPriceService';
 const LOOPBACK = new Set(['127.0.0.1', 'localhost', '::1', '0.0.0.0', '']);
 const realConnect = net.Socket.prototype.connect;
 (net.Socket.prototype as any).connect = function (this: net.Socket, ...args: any[]) {
-  const first = args[0];
+  // net.connect() hands Socket.connect an already-normalized [options, cb] array; unwrap it, otherwise
+  // the host reads as undefined and every plain http/ws connection would pass as "loopback".
+  const first = Array.isArray(args[0]) ? args[0][0] : args[0];
   let host: string | undefined;
   if (first && typeof first === 'object') {
     if (typeof first.path === 'string') return (realConnect as any).apply(this, args);

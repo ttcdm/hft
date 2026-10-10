@@ -1,3 +1,4 @@
+import { PillState, readPillState, signedUsd, pillTone } from '../utils/pnlPill';
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Activity,
@@ -77,11 +78,7 @@ export const Header: React.FC<HeaderProps> = ({
   const toolsMenuRef = useRef<HTMLDivElement | null>(null);
 
   // Live Auto-Profit Ticker State (fetched from walletTrader) - Clean initial state (B22)
-  const [profitSummary, setProfitSummary] = useState<{
-    totalPnLUsd: number;
-    totalPnLPct: number;
-    activeCount: number;
-  }>({ totalPnLUsd: 0.0, totalPnLPct: 0.0, activeCount: 0 });
+  const [profitSummary, setProfitSummary] = useState<PillState | null>(null);
 
   useEffect(() => {
     const fetchProfit = async () => {
@@ -89,13 +86,7 @@ export const Header: React.FC<HeaderProps> = ({
         const res = await authFetch('/api/wallet/state');
         if (res.ok) {
           const json = await res.json();
-          if (json.data) {
-            setProfitSummary({
-              totalPnLUsd: Number(json.data.totalPnLUsd || 0),
-              totalPnLPct: Number(json.data.totalPnLPct || 0),
-              activeCount: Number(json.data.activePositionsCount || 0),
-            });
-          }
+          setProfitSummary(readPillState(json.data));
         }
       } catch {}
     };
@@ -244,20 +235,20 @@ export const Header: React.FC<HeaderProps> = ({
           </button>
         )}
 
-        {/* Live Auto-Profit Pill (Clickable directly to Plug & Play Console) */}
+        {/* Q35: today's realized and the open positions' marked P&L, as the server reports them (a dash when it cannot say) */}
         <button
           id="btn-auto-profit-ticker"
           onClick={() => handleNavClick('PLUG_AND_PLAY')}
-          title="Real-Time Autonomous Profit Generator Active. Click to view live wallet positions and take profits."
-          className="hidden min-[1500px]:flex items-center space-x-1.5 px-2.5 py-1 rounded-lg bg-emerald-950/70 hover:bg-emerald-900/70 border border-emerald-500/40 text-[11px] font-mono text-emerald-300 transition shadow-sm shadow-emerald-500/15 group"
+          title="Realized profit today (net of fees) and the marked profit of the open positions, from the server. Click for the wallet positions."
+          className={`hidden min-[1500px]:flex items-center space-x-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-mono transition ${
+            { up: 'bg-emerald-950/70 border-emerald-500/40 text-emerald-300', down: 'bg-rose-950/70 border-rose-500/40 text-rose-300', flat: 'bg-slate-900 border-slate-700 text-slate-300', unknown: 'bg-slate-900 border-slate-700 text-slate-500' }[pillTone(profitSummary)]
+          }`}
         >
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping inline-block" />
-          <span className="font-bold tracking-tight text-emerald-200">
-            +${profitSummary.totalPnLUsd.toFixed(2)}
-          </span>
-          <span className="text-[10px] text-emerald-400/80">
-            (+{profitSummary.totalPnLPct.toFixed(1)}%)
-          </span>
+          <span className="text-[10px] opacity-70">today</span>
+          <span className="font-bold tracking-tight">{signedUsd(profitSummary?.realizedUsd)}</span>
+          <span className="text-[10px] opacity-70">open</span>
+          <span className="font-bold tracking-tight">{signedUsd(profitSummary?.unrealizedUsd)}</span>
+          <span className="text-[10px] opacity-70">({profitSummary?.openCount ?? '—'})</span>
         </button>
 
         {/* Direct Quant Tools (Expanded on 2XL screens) */}

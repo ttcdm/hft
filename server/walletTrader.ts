@@ -41,12 +41,18 @@ export interface LiveWalletState {
   solBalance: number | null;
   allocatedSol: number;
   availableSol: number;
-  solPriceUsd: number;
-  totalPortfolioValueUsd: number;
+  solPriceUsd: number | null;
+  totalPortfolioValueUsd: number | null;
   activePositions: NormalizedPosition[];
+  /** Q35: the header pill reads these; it used to read two fields that were never sent. */
+  activePositionsCount: number;
   closedPositionsCount: number;
+  /** Realized today (EST/NY), net of fees, from the realized-events ledger. */
   totalRealizedPnLSol: number;
-  totalRealizedPnLUsd: number;
+  totalRealizedPnLUsd: number | null;
+  /** Marked profit or loss of the open positions (recovered dust is 0 by Q2). */
+  totalUnrealizedPnLSol: number;
+  totalUnrealizedPnLUsd: number | null;
   totalJitoTipsPaidSol: number;
   executionMode: ExecutionMode;
   isLiveTradingActive: boolean;
@@ -283,6 +289,7 @@ class PlugAndPlayWalletTrader extends EventEmitter {
 
     const solPriceUsd = solPriceService.lastKnownPrice(); // null when no price has ever been read
     const totalPortfolioValueUsd = solPriceUsd === null ? null : (availableSol + totalOpenValue) * solPriceUsd;
+    const totalUnrealizedPnLSol = activePositions.reduce((s, p) => s + (Number.isFinite(p.unrealizedPnLSol) ? p.unrealizedPnLSol : 0), 0);
     const totalRealizedPnLSol = workstationDb.getDailyRealizedPnLSol(mode);
     const totalRealizedPnLUsd = solPriceUsd === null ? null : totalRealizedPnLSol * solPriceUsd;
 
@@ -305,9 +312,12 @@ class PlugAndPlayWalletTrader extends EventEmitter {
       solPriceUsd: solPriceUsd === null ? null : Number(solPriceUsd.toFixed(2)),
       totalPortfolioValueUsd: totalPortfolioValueUsd === null ? null : Number(totalPortfolioValueUsd.toFixed(2)),
       activePositions,
+      activePositionsCount: activePositions.length,
       closedPositionsCount: closedPositions.length,
       totalRealizedPnLSol: Number(totalRealizedPnLSol.toFixed(4)),
       totalRealizedPnLUsd: totalRealizedPnLUsd === null ? null : Number(totalRealizedPnLUsd.toFixed(2)),
+      totalUnrealizedPnLSol: Number(totalUnrealizedPnLSol.toFixed(6)),
+      totalUnrealizedPnLUsd: solPriceUsd === null ? null : Number((totalUnrealizedPnLSol * solPriceUsd).toFixed(2)),
       totalJitoTipsPaidSol: Number(totalJitoTipsPaidSol.toFixed(4)),
       executionMode: mode,
       isLiveTradingActive: executionCoordinator.isLiveArmed(),

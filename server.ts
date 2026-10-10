@@ -959,6 +959,7 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, async (req, res) =
   res.json({
     timestamp: Date.now(),
     totalAuditTimeMs: Date.now() - tStart,
+    cluster: allowedCluster(), // Q10a: the cluster this server is configured for, shown next to the RPC probe
     connections: {
       xTwitter: {
         service: 'X.com / Twitter API v2 (api.twitter.com)',

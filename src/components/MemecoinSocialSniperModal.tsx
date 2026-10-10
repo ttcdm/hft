@@ -1,3 +1,4 @@
+import { probeBadge, probeLatency, hostOfService } from '../utils/probeBadge';
 import React, { useState, useEffect } from 'react';
 import {
   Send,
@@ -1560,14 +1561,14 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                             : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
                         }`}
                       >
-                        {diagnosticsResult.connections.xTwitter?.testResult?.reachable ? 'REACHABLE • 200 OK' : 'PENDING'}
+                        {probeBadge(diagnosticsResult.connections.xTwitter?.testResult, 'REACHABLE').text}
                       </span>
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Endpoint: <code className="text-slate-300">https://api.twitter.com</code>
                     </div>
                     <div className="text-[11px] text-slate-300">
-                      Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.xTwitter?.testResult?.latencyMs || 65}ms</strong> | Mode: {diagnosticsResult.connections.xTwitter?.testResult?.bearerAuthorized ? 'AUTHENTICATED' : 'LIVE METADATA FEED'}
+                      Latency: <strong className="text-cyan-400">{probeLatency(diagnosticsResult.connections.xTwitter?.testResult?.latencyMs)}</strong> | Mode: {diagnosticsResult.connections.xTwitter?.testResult?.bearerAuthorized ? 'AUTHENTICATED' : 'LIVE METADATA FEED'}
                     </div>
                     <p className="text-slate-400 text-[10px] border-t border-slate-800 pt-1">
                       {diagnosticsResult.connections.xTwitter?.testResult?.diagnosis ||
@@ -1582,9 +1583,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <Flame className="w-3.5 h-3.5 text-emerald-400" />
                         <span>Pump.fun Live Coin Stream</span>
                       </span>
-                      <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                        200 OK • LIVE
-                      </span>
+                      {(() => { const b = probeBadge(diagnosticsResult.connections.pumpFun.testResult, 'REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${b.ok ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'}`}>{b.text}</span>); })()}
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Endpoint: <code className="text-slate-300">frontend-api-v3.pump.fun/coins</code>
@@ -1604,9 +1603,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <TrendingUp className="w-3.5 h-3.5 text-cyan-400" />
                         <span>DexScreener Boosted Feed</span>
                       </span>
-                      <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                        200 OK • LIVE
-                      </span>
+                      {(() => { const b = probeBadge(diagnosticsResult.connections.dexScreener.testResult, 'REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${b.ok ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'}`}>{b.text}</span>); })()}
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Endpoint: <code className="text-slate-300">api.dexscreener.com/token-boosts</code>
@@ -1626,12 +1623,10 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <Server className="w-3.5 h-3.5 text-purple-400" />
                         <span>Solana Validator JSON-RPC</span>
                       </span>
-                      <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                        HEALTH OK • LIVE
-                      </span>
+                      {(() => { const b = probeBadge(diagnosticsResult.connections.solanaRpc.testResult, 'RPC REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${b.ok ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'}`}>{b.text}</span>); })()}
                     </div>
                     <div className="text-slate-400 text-[11px]">
-                      Endpoint: <code className="text-slate-300">api.mainnet-beta.solana.com</code>
+                      Endpoint: <code className="text-slate-300">{hostOfService(diagnosticsResult.connections.solanaRpc.service)}</code>{diagnosticsResult.cluster ? <span className="ml-2 text-amber-300">cluster: {diagnosticsResult.cluster}</span> : null}
                     </div>
                     <div className="text-[11px] text-slate-300">
                       Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.solanaRpc.testResult.latencyMs}ms</strong> | Cluster Slot: #{diagnosticsResult.connections.solanaRpc.testResult.slot}
@@ -1721,7 +1716,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
             <div className="p-3 border-t border-[#1E293B] bg-[#0E1424] flex items-center justify-between">
               <div className="text-[11px] text-slate-400 flex items-center space-x-1.5">
                 <Info className="w-3.5 h-3.5 text-cyan-400" />
-                <span>Zero real capital at risk during paper trading. All market telemetry is 100% production live.</span>
+                <span>Paper trades risk no real capital. The status above is from the probe that just ran; a trade is only as live as the mode shown in the header.</span>
               </div>
               <div className="flex items-center space-x-2">
                 <button

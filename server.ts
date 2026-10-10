@@ -14,7 +14,7 @@ import { hftEngine } from './server/engine/engine';
 import { socialScanner, isTelegramTradeCommand } from './server/socialScanner';
 import { memecoinAggregator } from './server/memecoinAggregator';
 import { realismEngine } from './server/realismEngine';
-import { pumpFunService } from './server/pumpfunService';
+import { pumpFunService, pumpBootMode } from './server/pumpfunService';
 import { pumpFeedListener } from './server/solana/pumpFeedListener';
 import { autoSnipeController } from './server/auto/controller';
 import { watchWindow } from './server/signals/watchWindow';
@@ -1669,7 +1669,8 @@ async function startServer() {
   // DexScreener (the vitest network guard cannot see child processes). Production leaves it unset.
   const externalFeedsDisabled = process.env.APEX_DISABLE_EXTERNAL_FEEDS === 'true';
   solPriceService.startForBoot(externalFeedsDisabled); // feeds off + localnet: one refresh so LOCALNET_FIXED is set; feeds off elsewhere: nothing
-  if (!externalFeedsDisabled) pumpFunService.startBackground();
+  const pumpBoot = pumpBootMode();
+  if (pumpBoot !== 'OFF') pumpFunService.startBackground({ httpPollers: pumpBoot === 'FULL' }); // S28: WS_ONLY = log stream only, no HTTP pollers
   // N18: bound the append-only audit tables (default 90 days; APEX_RETENTION_DAYS, 0 disables). Once at boot, then daily.
   const retentionDays = process.env.APEX_RETENTION_DAYS === undefined ? 90 : Number(process.env.APEX_RETENTION_DAYS);
   const prune = () => {

@@ -321,6 +321,17 @@ export function calloutProvenance(callout: PumpFunHotCallout): SignalProvenance 
   return 'REAL_SOCIAL';
 }
 
+/**
+ * S28: what the server starts at boot. FULL: the log stream plus the HTTP pollers. WS_ONLY: only the log stream, which is
+ * what a loopback-only server needs so auto mode can be driven by a local chain's create events. OFF: nothing.
+ * WS_ONLY needs the operator's APEX_PUMP_WS_ONLY=true together with disabled external feeds, and is honoured only on
+ * ALLOWED_CLUSTER=localnet, where the websocket is a loopback validator; anywhere else it falls back to OFF.
+ */
+export function pumpBootMode(env: NodeJS.ProcessEnv = process.env): 'FULL' | 'WS_ONLY' | 'OFF' {
+  if (env.APEX_DISABLE_EXTERNAL_FEEDS !== 'true') return 'FULL';
+  return env.APEX_PUMP_WS_ONLY === 'true' && env.ALLOWED_CLUSTER === 'localnet' ? 'WS_ONLY' : 'OFF';
+}
+
 export class PumpFunService extends EventEmitter {
   private callers: PumpFunCaller[] = isDemoMode() ? [...INITIAL_CALLERS] : [];
   private hotCallouts: PumpFunHotCallout[] = [];
@@ -349,12 +360,15 @@ export class PumpFunService extends EventEmitter {
     });
   }
 
-  /** Begin the on-chain feed and the HTTP fallback poll. Called once by the server, never on import. */
-  public startBackground(): void {
+  /**
+   * Begin the on-chain feed and, unless `httpPollers` is false, the pump.fun / DexScreener HTTP fallback poll. Called once by the server,
+   * never on import. `httpPollers: false` is for a server whose only feed is a loopback chain (S28).
+   */
+  public startBackground(opts: { httpPollers?: boolean } = {}): void {
     if (this.backgroundStarted) return;
     this.backgroundStarted = true;
     pumpFeedListener.start().catch(() => {});
-    this.initPolling();
+    if (opts.httpPollers !== false) this.initPolling();
   }
 
   /**

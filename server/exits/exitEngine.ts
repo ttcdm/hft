@@ -32,6 +32,12 @@ export class ExitEngine {
   public static readonly HARD_STOP_LOSS_PCT = -20.0;
   public static readonly TRAILING_STOP_TRIGGER_PCT = 15.0;
   public static readonly TRAILING_STOP_RATCHET_RATIO = 0.85; // 15% below HWM
+  /**
+   * S3: the first trailing stop is never below entry plus the round trip's cost. At +15%, HWM * 0.85 is 0.9775 x entry, a stop that
+   * "locks in" a loss of about 5% after fees. The stop is max(HWM * 0.85, entry * 1.03): 3% covers the curve fee each way and slippage
+   * on a round trip (and is far below the ~25% a 0.005 SOL order needs to cover its fixed per-wallet costs, which no ratio can fix).
+   */
+  public static readonly TRAILING_STOP_MIN_ENTRY_MULTIPLE = 1.03;
   public static readonly STAGE_2_TRAILING_RATIO = 0.90;      // 10% below HWM for remaining 34%
   public static readonly TP1_TRIGGER_PCT = 30.0;
   public static readonly TP1_SELL_PCT = 33;
@@ -44,7 +50,7 @@ export class ExitEngine {
    * Evaluates exit conditions for an active position based on:
    * 1. Profit percentage: ((currentPrice - entryPrice) / entryPrice) * 100
    * 2. High-Water Mark: max(highWaterMarkSol, currentPriceSol)
-   * 3. Monotonic trailing stop: ratchets to HWM * 0.85 once profit >= +15%
+   * 3. Monotonic trailing stop: ratchets to max(HWM * 0.85, entry * 1.03) once profit >= +15%
    * 4. 3-stage take-profit ladder:
    *    - Stage 0 -> 1: sell 33% @ +30%
    *    - Stage 1 -> 2: sell 33% @ +60%
@@ -74,8 +80,8 @@ export class ExitEngine {
       // Stage 2: Remaining 34% trails with a 10% stop below HWM (candidateStop = newHwm * 0.90)
       candidateStop = newHwm * ExitEngine.STAGE_2_TRAILING_RATIO;
     } else if (profitPct >= ExitEngine.TRAILING_STOP_TRIGGER_PCT) {
-      // Ratchets to newHwm * 0.85 once profit >= +15%
-      candidateStop = newHwm * ExitEngine.TRAILING_STOP_RATCHET_RATIO;
+      // Ratchets to newHwm * 0.85 once profit >= +15%, but never below entry * 1.03 (S3)
+      candidateStop = Math.max(newHwm * ExitEngine.TRAILING_STOP_RATCHET_RATIO, entryPriceSol * ExitEngine.TRAILING_STOP_MIN_ENTRY_MULTIPLE);
     }
 
     // Monotonicity guarantee: trailing stop price can NEVER decrease

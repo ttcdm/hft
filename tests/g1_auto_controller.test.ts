@@ -115,6 +115,16 @@ describe('G1: auto-snipe controller', () => {
     expect(autoSnipeController.getMode()).toBe('OFF');
   });
 
+  it('S12: PAPER sizes its session from the paper bankroll, not from whatever the real wallet holds', async () => {
+    const { executionConfig } = await import('../server/solana/executionConfig');
+    const paper = executionConfig.getConfig().paperBankrollSol;
+    vi.spyOn(executionCoordinator, 'getRealWalletBalanceSol').mockReturnValue(123.456);
+    await setAutoMode('PAPER');
+    const s = autoSnipeController.getStatus().session!;
+    expect(s.startingBankrollSol).toBe(paper);
+    expect(s.budgets.maxSpendSol).toBeCloseTo(PAPER_SESSION_BUDGETS.maxSpendBankrollMultiple * paper, 9);
+  });
+
   it('budgets: running out of buys, spend or loss drops the controller to SHADOW', async () => {
     const stub = (id: string, amountSol: number) =>
       vi.spyOn(memecoinAggregator, 'executeSnipe').mockResolvedValue({ success: true, message: 'ok', txHash: 't', amountSol, positionId: id, feesPaidLamports: 0 });

@@ -277,7 +277,9 @@ export class AutoSnipeController extends EventEmitter {
     this.attempted.clear();
     this.mode = next;
     if (next === 'PAPER' || next === 'DEVNET_LIVE') {
-      const bankroll = executionCoordinator.getRealWalletBalanceSol() ?? executionConfig.getConfig().paperBankrollSol;
+      // S12: only DEVNET_LIVE sizes from the real wallet; PAPER trades a simulated bankroll, so its budgets must not depend on what the wallet holds.
+      const paperBankroll = executionConfig.getConfig().paperBankrollSol;
+      const bankroll = next === 'DEVNET_LIVE' ? (executionCoordinator.getRealWalletBalanceSol() ?? paperBankroll) : paperBankroll;
       const budgets: SessionBudgets = next === 'PAPER'
         ? { maxBuys: PAPER_SESSION_BUDGETS.maxBuys, maxSpendSol: PAPER_SESSION_BUDGETS.maxSpendBankrollMultiple * bankroll, maxLossFraction: PAPER_SESSION_BUDGETS.maxLossFraction, maxDurationMs: PAPER_SESSION_BUDGETS.maxDurationMs }
         : { ...SESSION_BUDGETS };

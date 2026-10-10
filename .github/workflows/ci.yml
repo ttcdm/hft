@@ -49,6 +49,9 @@ jobs:
       - name: Localnet end-to-end (real pump programs in an in-process bank, loopback only)
         run: npm run localnet:e2e
 
+      - name: Devnet seeding script proof (local chain, incl. forced 429 and sweep)
+        run: npm run localnet:seed
+
   validate-rust:
     name: Validate Rust HFT Engine
     runs-on: ubuntu-latest

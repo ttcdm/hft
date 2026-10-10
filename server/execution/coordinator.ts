@@ -81,6 +81,7 @@ export interface ExecutionResponse {
 /** Exit reasons that run even while all trading is halted (see closePosition). */
 // A blockhash lives ~60-90s; after this a sent-but-unseen sell can no longer land.
 const PENDING_SELL_WINDOW_MS = 100_000;
+const ORPHAN_MAX_AGE_MS = 15 * 60_000;
 
 export const PROTECTIVE_EXIT_REASONS = /^(STOP_LOSS|TRAILING_STOP|EMERGENCY_PANIC_LIQUIDATION|MANUAL|Manual Close)$/;
 
@@ -599,19 +600,30 @@ export class ExecutionCoordinator {
           // Query ATA balance using position's actual token program (supports Token-2022 & standard SPL)
           const tokenProgramId = pos.baseTokenProgram ? new PublicKey(pos.baseTokenProgram) : undefined;
           const ata = PumpCurveService.getAssociatedTokenAddress(mintPubkey, walletPubkey, tokenProgramId);
-          const balRes = await this.connection.getTokenAccountBalance(ata, 'confirmed').catch(() => null);
-          const onChainAmount = balRes?.value?.amount ? BigInt(balRes.value.amount) : 0n;
+          // N5: "the account does not exist" is a confirmed zero; any other RPC failure is unknown and must not close a position.
+          let onChainAmount: bigint | null = null;
+          try {
+            const balRes = await this.connection.getTokenAccountBalance(ata, 'confirmed');
+            onChainAmount = BigInt(balRes?.value?.amount ?? '0');
+          } catch (e: any) {
+            if (/could not find account|Invalid param/i.test(String(e?.message))) onChainAmount = 0n;
+            else throw e;
+          }
 
           if (onChainAmount <= 0n) {
-            mismatchesCount++;
-            issues.push(
-              `Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) recorded active in DB, but on-chain balance is 0`
-            );
-            // Flag position with reconciliation warning
-            pos.exitReason = 'RECONCILIATION_MISMATCH: Zero on-chain token balance';
+            // The tokens are gone (sold or moved outside this app). Left OPEN this position blocks arming until someone edits the DB,
+            // while the exit loop keeps trying to sell an empty account. Close it with the reason on the record, and say so.
+            pos.status = 'CLOSED';
+            pos.tokenQuantityRaw = '0';
+            pos.costBasisLamports = 0;
+            pos.exitReason = 'RECONCILED_ZERO_BALANCE: no tokens in the wallet at startup reconciliation';
+            pos.lastUpdatedTimestamp = Date.now();
             workstationDb.savePosition(pos);
+            this.raiseOperatorAlert('POSITION_GONE', `Position ${pos.symbol || pos.mint.slice(0, 6)} was recorded open but the wallet holds none of it. Closed in the database; realized PnL for it is unknown.`, pos.id);
+            issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) had no on-chain balance: closed in the database`);
           }
         } catch (e: any) {
+          mismatchesCount++; // unknown is not fine: an unreadable balance keeps readiness at MISMATCH, but never closes the position
           issues.push(`Failed to verify on-chain balance for ${pos.symbol}: ${e.message}`);
         }
       }
@@ -644,6 +656,12 @@ export class ExecutionCoordinator {
             if (txDetails?.meta?.err) {
               pTx.reconciliationState = 'REVERTED';
               pTx.error = JSON.stringify(txDetails.meta.err);
+            } else if (!txDetails) {
+              // N9: the signature is confirmed but its details are not readable yet. Leave it PENDING, say so, and look again soon
+              // instead of waiting for the next restart.
+              mismatchesCount++;
+              issues.push(`Transaction ${pTx.signature.slice(0, 8)}... is confirmed but its details are not readable yet; retrying`);
+              this.scheduleReconcileRetry();
             } else if (txDetails) {
               pTx.landingSlot = txDetails.slot;
               pTx.networkFeeLamports = txDetails.meta?.fee || 5000;
@@ -672,7 +690,7 @@ export class ExecutionCoordinator {
                   } else if (recovery.type === 'SELL') {
                     const targetPos = workstationDb
                       .loadPositions()
-                      .find((p) => p.mint === recovery.mint && (p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED'));
+                      .find((p) => p.mint === recovery.mint && p.executionMode === 'LIVE' && (p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED'));
                     if (targetPos) {
                       const remainingTokens = BigInt(recovery.remainingTokensRaw ?? '0');
                       const tokensSold = BigInt(recovery.tokensSoldRaw ?? '0');
@@ -701,6 +719,11 @@ export class ExecutionCoordinator {
                       workstationDb.savePosition(targetPos);
                       pTx.reconciliationState = 'RECONCILED';
                       Logger.info(`Successfully recovered interrupted SELL trade for ${recovery.mint} (${pTx.signature})`);
+                    } else if (workstationDb.loadPositions('LIVE').some((p) => p.mint === recovery.mint && p.status === 'CLOSED')) {
+                      // N8: the position is already closed (the sell was applied some other way); there is nothing left to apply.
+                      // Left RECONCILIATION_REQUIRED this row would hold readiness at MISMATCH forever.
+                      pTx.reconciliationState = 'RECONCILED';
+                      pTx.error = 'position already closed; sell not re-applied';
                     } else {
                       pTx.reconciliationState = 'RECONCILIATION_REQUIRED';
                       mismatchesCount++;
@@ -772,6 +795,18 @@ export class ExecutionCoordinator {
     return { status, mismatchesCount, details };
   }
 
+  private reconcileRetryTimer: NodeJS.Timeout | null = null;
+
+  /** One follow-up reconciliation pass shortly after a pass found something not readable yet. */
+  private scheduleReconcileRetry(delayMs = 15_000): void {
+    if (this.reconcileRetryTimer) return;
+    this.reconcileRetryTimer = setTimeout(() => {
+      this.reconcileRetryTimer = null;
+      void this.startupReconciliation().catch(() => undefined);
+    }, delayMs);
+    this.reconcileRetryTimer.unref?.();
+  }
+
   /** Position for a buy rebuilt from confirmed on-chain data. Entry price is the curve price paid; cost basis is the whole wallet delta. */
   private positionFromRecoveredBuy(
     pTx: { signature: string; mint: string; jitoTipLamports: number; executionMode: ExecutionMode },
@@ -841,6 +876,12 @@ export class ExecutionCoordinator {
         } else if (recovery.error && /reverted/i.test(recovery.error)) {
           t.reconciliationState = 'REVERTED';
           t.error = recovery.error;
+          workstationDb.saveTransaction(t);
+        } else if (recovery.error && /not found on-chain/i.test(recovery.error) && Date.now() - t.submissionTime > ORPHAN_MAX_AGE_MS) {
+          // N6: a transaction that is still not on chain long after its blockhash expired never landed. Any tokens it did buy would be
+          // found by the wallet scan; leaving the row open would hold readiness at MISMATCH forever.
+          t.reconciliationState = 'TIMED_OUT';
+          t.error = 'never landed: not found on chain after the blockhash window';
           workstationDb.saveTransaction(t);
         } else {
           stillOrphaned.push(t.signature);
@@ -3112,6 +3153,10 @@ export class ExecutionCoordinator {
   }
 
   public cleanup() {
+    if (this.reconcileRetryTimer) {
+      clearTimeout(this.reconcileRetryTimer);
+      this.reconcileRetryTimer = null;
+    }
     if (this.autoTpSlInterval) {
       clearInterval(this.autoTpSlInterval);
       this.autoTpSlInterval = null;

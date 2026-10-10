@@ -1302,7 +1302,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       expect(phantomPos).toBeUndefined();
     });
 
-    it('5.6: flags RECONCILIATION_MISMATCH when database records active position but on-chain balance is 0', async () => {
+    it('5.6: closes a position the database records as active when its on-chain balance is 0, and says why', async () => {
       const ghostPosId = `ghost_pos_${Date.now()}`;
       const ghostPos: NormalizedPosition = {
         id: ghostPosId,
@@ -1340,12 +1340,14 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
 
       const res = await coordinator.startupReconciliation();
 
-      expect(res.status).toBe('RECONCILIATION_MISMATCH');
-      expect(res.mismatchesCount).toBeGreaterThanOrEqual(1);
-      expect(res.details).toContain('on-chain balance is 0');
+      // N5: a confirmed zero balance used to hold readiness at MISMATCH until the DB was edited by hand; the position is now closed with
+      // the reason recorded (tests/n5_startup_reconcile.test.ts covers the readiness side).
+      expect(res.details).toContain('had no on-chain balance');
 
-      const updatedGhost = workstationDb.loadPositions('LIVE', 'OPEN').find((p) => p.id === ghostPosId);
-      expect(updatedGhost?.exitReason).toContain('RECONCILIATION_MISMATCH');
+      expect(workstationDb.loadPositions('LIVE', 'OPEN').find((p) => p.id === ghostPosId)).toBeUndefined();
+      const updatedGhost = workstationDb.loadPositions('LIVE').find((p) => p.id === ghostPosId);
+      expect(updatedGhost?.status).toBe('CLOSED');
+      expect(updatedGhost?.exitReason).toContain('RECONCILED_ZERO_BALANCE');
     });
   });
 });

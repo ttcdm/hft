@@ -4,7 +4,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { describe, it, expect } from 'vitest';
 import { Keypair, Transaction } from '@solana/web3.js';
-import { DEVNET_GENESIS_HASH, SeedGuardError, withRetry, retryingConnection, saveWalletFile, loadWalletFile, sweepFromFile, DEFAULT_WALLET_DIR } from '../scripts/devnet_seed';
+import { DEVNET_GENESIS_HASH, SeedGuardError, withRetry, retryingConnection, saveWalletFile, loadWalletFile, loadFunderKeypair, sweepFromFile, DEFAULT_WALLET_DIR } from '../scripts/devnet_seed';
 
 /** 143: the first devnet run died on a 429 after funding 20 wallets whose keys were only in memory. */
 const noSleep = async () => undefined;
@@ -87,5 +87,55 @@ describe('143: seed run survives rate limits and can always get its money back',
     expect(r.status).toBe(2);
     r = run(['--sweep'], { SEED_RPC_URL: 'https://api.devnet.solana.com' });
     expect(r.status).toBe(2); expect(r.stderr).toMatch(/wallet file path/);
+  });
+});
+
+/** 144: a separate funder, so the app's wallet audit has nothing to halt on. */
+describe('144: separate seed funder keyfile', () => {
+  const mk = (mode: number, content?: string) => {
+    const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'seedf-')), 'funder.json');
+    const kp = Keypair.generate();
+    fs.writeFileSync(f, content ?? JSON.stringify(Array.from(kp.secretKey)), { mode });
+    fs.chmodSync(f, mode);
+    return { f, kp };
+  };
+  it('loads a 0600 keypair file and returns the same key', () => {
+    const { f, kp } = mk(0o600);
+    expect(loadFunderKeypair(f).publicKey.toBase58()).toBe(kp.publicKey.toBase58());
+  });
+  it('refuses any other mode, a missing file, and a malformed file, without leaking the key', () => {
+    for (const mode of [0o644, 0o640, 0o400, 0o666]) {
+      const { f, kp } = mk(mode);
+      let msg = '';
+      try { loadFunderKeypair(f); } catch (e: any) { msg = e.message; expect(e).toBeInstanceOf(SeedGuardError); }
+      expect(msg, mode.toString(8)).toMatch(/must be mode 0600/);
+      expect(msg).not.toContain(String(kp.secretKey[0] + ',' + kp.secretKey[1]));
+    }
+    expect(() => loadFunderKeypair('/nonexistent/funder.json')).toThrow(SeedGuardError);
+    const bad = mk(0o600, '[1,2,3]');
+    expect(() => loadFunderKeypair(bad.f)).toThrow(/64 bytes/);
+    const garbage = mk(0o600, 'SECRETSECRETSECRET');
+    let m = ''; try { loadFunderKeypair(garbage.f); } catch (e: any) { m = e.message; }
+    expect(m).not.toContain('SECRETSECRET');
+  });
+  it('the CLI rejects a world-readable keyfile (flag or env) with exit 2 before connecting, and prints no key bytes', () => {
+    const { f, kp } = mk(0o644);
+    const run = (args: string[], env: Record<string, string>) => spawnSync(process.execPath, ['--import', 'tsx', 'scripts/devnet_seed.ts', ...args], { env: { PATH: process.env.PATH, HOME: process.env.HOME, APEX_ENV_FILE: '', SEED_RPC_URL: 'https://api.devnet.solana.com', ...env }, encoding: 'utf8', timeout: 60_000 });
+    for (const r of [run(['--funder-keyfile', f, '--execute'], {}), run(['--execute'], { SEED_FUNDER_KEYPAIR_PATH: f })]) {
+      expect(r.status).toBe(2);
+      expect(r.stderr).toMatch(/must be mode 0600/);
+      expect(r.stdout + r.stderr).not.toContain(Buffer.from(kp.secretKey).toString('base64'));
+    }
+    const r = run(['--funder-keyfile'], {});
+    expect(r.status).toBe(2); expect(r.stderr).toMatch(/needs a file path/);
+    // the devnet guards still apply with a keyfile: a mainnet URL is refused first
+    const ok = mk(0o600);
+    expect(run(['--funder-keyfile', ok.f, '--execute'], { SEED_RPC_URL: 'https://api.mainnet-beta.solana.com' }).status).toBe(2);
+  });
+  it('the saved wallet file records the funder, so sweeps return SOL to the separate wallet', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'seedw-'));
+    const separate = Keypair.generate().publicKey;
+    const file = saveWalletFile(dir, Keypair.generate().publicKey, separate, [Keypair.generate()]);
+    expect(loadWalletFile(file).funder.toBase58()).toBe(separate.toBase58());
   });
 });

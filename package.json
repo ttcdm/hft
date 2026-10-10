@@ -25,7 +25,8 @@
     "devnet:e2e": "node --require ./scripts/devnet_guard.cjs --import tsx scripts/devnet_e2e.ts",
     "postinstall": "node scripts/patch-anchor.cjs",
     "localnet:auto": "tsx scripts/localnet/auto_run.ts",
-    "localnet:seed": "tsx scripts/localnet/seed_proof.ts"
+    "localnet:seed": "tsx scripts/localnet/seed_proof.ts",
+    "localnet:seed-audit": "tsx scripts/localnet/seed_audit_proof.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

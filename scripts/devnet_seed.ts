@@ -6,6 +6,7 @@
  *   npx tsx scripts/devnet_seed.ts                 dry run (the default): checks everything, prints the plan, sends nothing
  *   npx tsx scripts/devnet_seed.ts --execute       spends devnet SOL (needs the operator's go-ahead)
  *   npx tsx scripts/devnet_seed.ts --sweep .overnight/seed-wallets/<mint>.json     bring the SOL in a saved run's buyer wallets back to its funder
+ *   --funder-keyfile <file> (or SEED_FUNDER_KEYPAIR_PATH): pay from a separate devnet wallet, not the app wallet
  *   options: --buyers 30  --buy-sol 0.01  --window-s 30  --cap-sol 0.45  --no-sweep
  *
  * The funder is the wallet the app uses (OPERATOR_PRIVATE_KEY / SOLANA_PRIVATE_KEY / SIGNER_KEYPAIR_PATH, read from `.env`).
@@ -19,6 +20,11 @@
  *   - any failure after funding sweeps the buyer wallets back to the funder before the script exits;
  *   - `--sweep <file>` recovers the SOL from a saved wallet file (also used if a run is killed outright);
  *   - SEED_RPC_URL (checked by the same devnet guards) overrides SOLANA_RPC_URL, so a private devnet RPC can be used.
+ *
+ * A separate funder: the app's own auto controller (DEVNET_LIVE) halts ALL trading when its wallet changes by an amount its decision
+ * journal does not explain, which is exactly what funding 30 buyers from the app wallet looks like. So the seed can be paid from a
+ * different devnet wallet: SEED_FUNDER_KEYPAIR_PATH or --funder-keyfile <file> (a Solana keypair JSON, mode 0600). The saved wallet
+ * file records that funder, so the automatic sweep and `--sweep` return the SOL to it. The key is never printed.
  */
 import fs from 'node:fs';
 import path from 'node:path';
@@ -120,6 +126,20 @@ export async function sweepWallets(conn: Connection, wallets: Keypair[], to: Pub
     try { const now = await conn.getBalance(kp.publicKey, 'confirmed'); if (now < was) swept += was - now - 5_000; } catch { /* unknown: not counted */ }
   }
   return swept;
+}
+
+/** Reads a Solana keypair JSON for the seed funder. Refuses anything but mode 0600; no error message contains key material. */
+export function loadFunderKeypair(file: string): Keypair {
+  let st: fs.Stats;
+  try { st = fs.statSync(file); } catch { throw new SeedGuardError(`funder keyfile ${file} cannot be read`); }
+  if (!st.isFile()) throw new SeedGuardError(`funder keyfile ${file} is not a file`);
+  const mode = st.mode & 0o777;
+  if (mode !== 0o600) throw new SeedGuardError(`funder keyfile ${file} must be mode 0600 (it is 0${mode.toString(8)}); run: chmod 600 ${file}`);
+  try {
+    const arr = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!Array.isArray(arr) || arr.length !== 64) throw new Error('shape');
+    return Keypair.fromSecretKey(Uint8Array.from(arr));
+  } catch { throw new SeedGuardError(`funder keyfile ${file} is not a Solana keypair JSON (an array of 64 bytes)`); }
 }
 
 export interface SeedSigner {
@@ -381,6 +401,9 @@ async function main() {
   try {
     if (!rpcUrl) throw new SeedGuardError('SEED_RPC_URL / SOLANA_RPC_URL is not set (the script never falls back to a default)');
     assertDevnetTarget(rpcUrl);
+    const keyfile = val('funder-keyfile') || (process.env.SEED_FUNDER_KEYPAIR_PATH || '').trim() || undefined;
+    if (flag('funder-keyfile') && (!keyfile || keyfile.startsWith('--'))) throw new SeedGuardError('--funder-keyfile needs a file path');
+    if (keyfile && !flag('sweep')) loadFunderKeypair(keyfile); // a bad keyfile fails here, before any connection
     const conn = new Connection(rpcUrl, { commitment: 'confirmed', disableRetryOnRateLimit: false });
     if (flag('sweep')) {
       const file = val('sweep');
@@ -389,12 +412,25 @@ async function main() {
       console.log(JSON.stringify(r, null, 2));
       return;
     }
-    const { localSigner } = await import('../server/solana/signer');
-    const pub = localSigner.getPublicKey?.();
-    if (!pub) throw new SeedGuardError('no funder wallet: set OPERATOR_PRIVATE_KEY or SIGNER_KEYPAIR_PATH in .env');
-    const kp = localSigner.exportKeypair();
-    if (!kp) throw new Error('funder keypair is not readable');
-    const signer: SeedSigner = { publicKey: pub, sign: async (tx) => { tx.partialSign(kp); } };
+    // A separate funder keeps the app's wallet audit quiet; without one the app wallet pays (and the audit will see a drain).
+    let signer: SeedSigner;
+    if (keyfile) {
+      const kp = loadFunderKeypair(keyfile);
+      signer = { publicKey: kp.publicKey, sign: async (tx) => { tx.partialSign(kp); } };
+      console.log(`funder: ${kp.publicKey.toBase58()} (separate seed wallet from ${keyfile})`);
+      try {
+        const { localSigner } = await import('../server/solana/signer');
+        if (localSigner.getPublicKey?.().equals(kp.publicKey)) console.log('WARNING: that keyfile IS the app wallet; the app\'s wallet audit will halt auto trading while the seed funds buyers');
+      } catch { /* no app wallet configured: nothing to compare */ }
+    } else {
+      const { localSigner } = await import('../server/solana/signer');
+      const pub = localSigner.getPublicKey?.();
+      if (!pub) throw new SeedGuardError('no funder wallet: set OPERATOR_PRIVATE_KEY or SIGNER_KEYPAIR_PATH in .env, or give --funder-keyfile / SEED_FUNDER_KEYPAIR_PATH');
+      const kp = localSigner.exportKeypair();
+      if (!kp) throw new Error('funder keypair is not readable');
+      signer = { publicKey: pub, sign: async (tx) => { tx.partialSign(kp); } };
+      console.log(`funder: ${pub.toBase58()} (the APP wallet: its auto controller will see this as an unexplained balance change and halt trading)`);
+    }
     const report = await runSeed({
       connection: conn, signer, allowedGenesis: DEVNET_GENESIS_HASH,
       buyers: val('buyers') ? Number(val('buyers')) : undefined, buySol: val('buy-sol') ? Number(val('buy-sol')) : undefined,

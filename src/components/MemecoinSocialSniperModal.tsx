@@ -1,6 +1,7 @@
 import { signalFeedBadge } from '../utils/signalBadge';
 import { probeBadge, probeLatency, hostOfService } from '../utils/probeBadge';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
+import { isMainnetCluster } from '../utils/tokenLinks';
 import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
 import React, { useState, useEffect } from 'react';
 import {
@@ -361,10 +362,6 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                 <h2 className="text-base sm:text-lg font-bold text-white tracking-wide">
                   Telegram & X Market Maker Intelligence & Memecoin Sniper Swarm
                 </h2>
-                <span className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 flex items-center space-x-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping"></span>
-                  <span>LIVE INGESTION</span>
-                </span>
                 {isWsLive && (
                   <span className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 flex items-center space-x-1">
                     <Radio className="w-3 h-3 text-cyan-400 animate-pulse" />
@@ -373,7 +370,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                 )}
               </div>
               <p className="text-xs text-slate-400 mt-0.5">
-                Aggregating Pump.fun, Raydium, DexScreener, Uniswap/Base with automated Jito MEV bundle execution.
+                Aggregating Pump.fun, Raydium, DexScreener and Uniswap/Base signals. Orders run through the execution engine in the mode shown in the banner; PAPER sends nothing.
               </p>
             </div>
           </div>
@@ -663,6 +660,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
                           {/* Live Platform Feed Links */}
                           <div className="flex flex-wrap items-center gap-1.5">
+                            {isMainnetCluster(tradingMode.cluster) ? (
+                              <>
                             {/* Pump.fun Link */}
                             <a
                               href={`https://pump.fun/coin/${sig.contractAddress}`}
@@ -688,6 +687,10 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                               <span>DexScreener</span>
                               <ExternalLink className="w-2 h-2 text-cyan-400" />
                             </a>
+                              </>
+                            ) : (
+                              <span className="text-slate-600 text-[10px] font-mono" title="Mainnet-only sites do not list this token unless the server is on mainnet">no mainnet links</span>
+                            )}
 
                             {/* X.com Link */}
                             <a
@@ -755,7 +758,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                           {sig.status === 'SNIPED' ? (
                             <span className="px-3 py-1.5 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 text-xs font-bold flex items-center space-x-1.5">
                               <CheckCircle2 className="w-3.5 h-3.5" />
-                              <span>SNIPED IN BLOCK SLOT</span>
+                              <span>SNIPED</span>
                             </span>
                           ) : (
                             <button
@@ -1506,7 +1509,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                   <h3 className="text-sm font-bold text-white flex items-center space-x-2">
                     <span>Live External Pipes & Simulation Scope Audit</span>
                     <span className="px-2 py-0.5 rounded-full text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                      LIVE AUDIT
+                      AUDIT
                     </span>
                   </h3>
                   <p className="text-xs text-slate-400">
@@ -1586,7 +1589,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                       Endpoint: <code className="text-slate-300">https://api.twitter.com</code>
                     </div>
                     <div className="text-[11px] text-slate-300">
-                      Latency: <strong className="text-cyan-400">{probeLatency(diagnosticsResult.connections.xTwitter?.testResult?.latencyMs)}</strong> | Mode: {diagnosticsResult.connections.xTwitter?.testResult?.bearerAuthorized ? 'AUTHENTICATED' : 'LIVE METADATA FEED'}
+                      Latency: <strong className="text-cyan-400">{probeLatency(diagnosticsResult.connections.xTwitter?.testResult?.latencyMs)}</strong> | Mode: {diagnosticsResult.connections.xTwitter?.testResult?.bearerAuthorized ? 'AUTHENTICATED' : 'NO BEARER TOKEN (public metadata only)'}
                     </div>
                     <p className="text-slate-400 text-[10px] border-t border-slate-800 pt-1">
                       {diagnosticsResult.connections.xTwitter?.testResult?.diagnosis ||

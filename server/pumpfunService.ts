@@ -662,14 +662,14 @@ export class PumpFunService extends EventEmitter {
           sells5m: pair?.txns?.m5?.sells ?? null,
           priceChange5mPct: pair?.priceChange?.m5 ?? null,
           top10HoldersPct: c.top10_holders_pct ?? null,
-          devHoldingPct: c.complete ? 0.0 : (c.dev_holding_pct ?? null),
+          devHoldingPct: c.dev_holding_pct ?? null, // S20: a migrated token is not assumed to have 0% dev holding
           isMintRevoked: c.is_mint_revoked ?? null,
           isFreezeRevoked: c.is_freeze_revoked ?? null,
           rugcheckScore: evaluateTokenSafety({
             mint,
             isMintRevoked: c.is_mint_revoked ?? null,
             isFreezeRevoked: c.is_freeze_revoked ?? null,
-            devHoldingPct: c.complete ? 0.0 : (c.dev_holding_pct ?? null),
+            devHoldingPct: c.dev_holding_pct ?? null, // S20: a migrated token is not assumed to have 0% dev holding
             top10HoldersPct: c.top10_holders_pct ?? null,
             curveProgress,
             hasSocials: !!(c.twitter || c.telegram || c.website || pair?.info?.socials?.length),

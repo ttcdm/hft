@@ -239,7 +239,8 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
       if (!res.ok) throw new Error(data.error || 'Snipe order failed');
 
       setStatusMessage({
-        text: `Snipe executed successfully! ID: ${data.data?.positionId} (TX: ${data.data?.txSignature?.slice(0, 16)}...)`,
+        // S19: a paper fill sends nothing, so it must not read as a transaction
+        text: `${tradingMode.live ? 'Snipe sent' : 'PAPER fill recorded (nothing sent)'}. ID: ${data.data?.positionId}${data.data?.txSignature ? ` (TX: ${data.data.txSignature.slice(0, 16)}...)` : ''}`,
         type: 'success',
       });
       setManualMint('');
@@ -342,10 +343,10 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
             <div className="flex items-center space-x-1.5">
               <span
                 className={`w-2 h-2 rounded-full ${
-                  systemAudit?.isLiveArmed ? 'bg-rose-400 animate-ping' : 'bg-emerald-400'
+                  !systemAudit ? 'bg-slate-500' : systemAudit.isLiveArmed ? 'bg-rose-400 animate-ping' : 'bg-emerald-400'
                 }`}
               />
-              <span className={`font-bold ${systemAudit?.isLiveArmed ? 'text-rose-400' : 'text-emerald-400'}`}>
+              <span className={`font-bold ${!systemAudit ? 'text-slate-400' : systemAudit.isLiveArmed ? 'text-rose-400' : 'text-emerald-400'}`}>
                 {systemAudit?.mode || 'UNKNOWN'}
               </span>
             </div>
@@ -680,7 +681,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                     <span>Generate Local Signer Keypair</span>
                   </button>
                   <span className="text-[11px] text-slate-400">
-                    Fund this address with 0.07 SOL to begin live trading.
+                    Fund this address with devnet SOL before arming LIVE; how much depends on the order size you set.
                   </span>
                 </div>
               </div>

@@ -71,6 +71,19 @@ export function sanitizeTelegramUrl(raw?: string | null): string | undefined {
   return `https://t.me/${handle}`;
 }
 
+/** S20: only a known mainnet cluster may link to the mainnet-only sites. Unknown (the server has not answered yet) is NOT mainnet. */
+export function isMainnetCluster(cluster?: string | null): boolean {
+  return cluster === 'mainnet-beta' || cluster === 'mainnet';
+}
+
+/** S20: a Solscan account link that names the cluster, so a devnet / localnet wallet never opens as a mainnet page. */
+export function solscanAccountUrl(address: string, cluster?: string | null): string | null {
+  if (cluster === 'devnet') return `https://solscan.io/account/${address}?cluster=devnet`;
+  if (cluster === 'localnet') return `https://solscan.io/account/${address}?cluster=custom&customUrl=http%3A%2F%2Flocalhost%3A8899`;
+  if (isMainnetCluster(cluster)) return `https://solscan.io/account/${address}`;
+  return null;
+}
+
 export function getTokenExternalLinks(params: {
   mintOrCa: string;
   symbol: string;

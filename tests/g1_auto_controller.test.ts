@@ -70,6 +70,22 @@ describe('G1: auto-snipe controller', () => {
     expect(autoSnipeController.getDecisions(1)[0].outcome).toBe('WOULD_BUY');
   });
 
+  it('R5: the mode the controller checked travels with the trade, and the coordinator refuses it if the mode changed in between', async () => {
+    await setAutoMode('PAPER');
+    const snipe = vi.spyOn(memecoinAggregator, 'executeSnipe');
+    // the mode flips to LIVE after the controller's check and before the trade reaches the coordinator
+    const realExecute = executionCoordinator.executeTrade.bind(executionCoordinator);
+    const exec = vi.spyOn(executionCoordinator, 'executeTrade').mockImplementation(async (req) => {
+      (executionCoordinator as any).executionMode = 'LIVE';
+      return realExecute(req);
+    });
+    const d = await autoSnipeController.submitCandidate(cand(newPool()));
+    expect(snipe.mock.calls[0][0].expectedMode).toBe('PAPER');
+    expect(exec.mock.calls[0][0].executionMode).toBe('PAPER');
+    expect(d.outcome).toBe('REJECTED');
+    expect(d.reason).toMatch(/MODE_CHANGED/);
+  });
+
   it('SHADOW applies the same gates as a fill: a token the filter rejects is REJECTED, not "would buy"', async () => {
     await setAutoMode('SHADOW');
     const mint = newPool();
@@ -163,7 +179,14 @@ describe('G1: auto-snipe controller', () => {
     vi.spyOn(executionCoordinator, 'isLiveArmed').mockReturnValue(true);
     await autoSnipeController.setMode('DEVNET_LIVE', { confirmationCode: DEVNET_CONFIRMATION_CODE });
     const snipe = vi.spyOn(memecoinAggregator, 'executeSnipe').mockResolvedValue({ success: true, message: 'ok', txHash: 't', amountSol: AUTO_DEVNET_ORDER_SOL, positionId: 'dv1', feesPaidLamports: 0 });
+    // R3: an adopted airdrop (RECOVERED) is not a position the app chose; it must not take the only slot
+    workstationDb.savePosition({
+      id: 'dv-recovered', mint: Keypair.generate().publicKey.toBase58(), symbol: 'DUST', name: 'DUST', tokenDecimals: 6, tokenQuantityRaw: '5',
+      entryPriceSol: 1e-9, currentPriceSol: 1e-9, currentValueSol: 0, costBasisLamports: 0, realizedPnLSol: 0, status: 'OPEN',
+      venue: 'PUMP_BONDING_CURVE', executionMode: 'LIVE', entryTxSignature: 'RECOVERED:dust', entryTimestamp: Date.now(), recordUpdatedAt: Date.now(), updatedAt: Date.now(),
+    } as any);
     const d = await autoSnipeController.submitCandidate(cand(newPool()));
+    workstationDb.savePosition({ ...workstationDb.loadPositions().find((p) => p.id === 'dv-recovered')!, status: 'CLOSED' } as any);
     expect(d.outcome).toBe('BOUGHT');
     expect(snipe.mock.calls[0][0].amountSolOverride).toBe(AUTO_DEVNET_ORDER_SOL);
 

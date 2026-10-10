@@ -200,4 +200,22 @@ describe('P4: sell preflight, slippage ladder and retry backoff', () => {
       expect(closeSpy.mock.calls.some((c) => c[0] === posId && c[2] === 'STOP_LOSS')).toBe(true);
     });
   });
+
+  it('R10: a sell that cannot be quoted sends nothing, does not advance backoff or the slippage ladder, and raises its own alert', async () => {
+    simulate.mockResolvedValue({ context: { slot: 1 }, value: { err: null, logs: [] } });
+    quoteSpy.mockImplementation(() => { throw new Error('OFFICIAL_PUMP_QUOTE_FAILED: Official SDK sell quote calculation failed or unavailable in LIVE mode'); });
+    for (let i = 0; i < 4; i++) {
+      const res = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(res.error).toMatch(/^OFFICIAL_PUMP_QUOTE_FAILED/);
+    }
+    expect(submit).not.toHaveBeenCalled();
+    expect(coordinator.getExitFailureCount(posId)).toBe(0);
+    expect(coordinator.exitRetryWaitMs(posId)).toBe(0);
+    expect(coordinator.getOperatorAlerts().some((a) => a.code === 'EXIT_QUOTE_FAILING' && a.positionId === posId)).toBe(true);
+    // once it quotes again and sells, the alert clears
+    quoteSpy.mockReturnValue({ expectedJitoTipLamports: 1000, minOutputLamports: 1 } as any);
+    const ok = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+    expect(ok.success).toBe(true);
+    expect(coordinator.getOperatorAlerts().some((a) => a.code === 'EXIT_QUOTE_FAILING')).toBe(false);
+  });
 });

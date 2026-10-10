@@ -229,12 +229,15 @@ export class WorkstationDatabase {
         .get() as { event_type: string; payload_json: string } | undefined;
       if (!row || row.event_type !== 'TRADING_HALTED') return null;
       return String(JSON.parse(row.payload_json)?.reason ?? 'halted before restart');
-    } catch {
-      return null;
+    } catch (err: any) {
+      // R8: an unreadable journal is not "no halt". Fail closed: report a halt whose reason says why, so an operator looks before trading.
+      Logger.error(`Halt state could not be read: ${err.message}`);
+      return `HALT_STATE_UNREADABLE: could not read the persisted halt state (${String(err.message).slice(0, 80)}); clear it explicitly once the database is healthy`;
     }
   }
 
-  public logJournal(eventType: string, correlationId: string, mode: ExecutionMode, payload: Record<string, any>) {
+  /** Returns false when the row could not be written (the error is logged; callers that must know, like halt persistence, check it). */
+  public logJournal(eventType: string, correlationId: string, mode: ExecutionMode, payload: Record<string, any>): boolean {
     try {
       const stmt = this.db.prepare(`
         INSERT INTO system_journal (event_type, correlation_id, execution_mode, payload_json, created_at)
@@ -244,8 +247,10 @@ export class WorkstationDatabase {
         typeof value === 'bigint' ? value.toString() : value
       );
       stmt.run(eventType, correlationId, mode, payloadJson, Date.now());
+      return true;
     } catch (err: any) {
       Logger.error(`Journal logging failed: ${err.message}`);
+      return false;
     }
   }
 

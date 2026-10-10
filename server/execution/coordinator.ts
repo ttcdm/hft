@@ -58,6 +58,10 @@ export interface ExecuteTradeRequest {
   liquidityUsd?: number;
   signalTimestamp?: number;
   marketDataTimestamp?: number;
+  /**
+   * The mode the caller sized and gated this trade for (R5). If the coordinator's mode is different when the trade arrives (LIVE was armed or
+   * disarmed during the caller's awaits), the trade is refused instead of running in the other mode.
+   */
   executionMode?: ExecutionMode;
 }
 
@@ -82,6 +86,9 @@ export interface ExecutionResponse {
 // A blockhash lives ~60-90s; after this a sent-but-unseen sell can no longer land.
 const PENDING_SELL_WINDOW_MS = 100_000;
 const ORPHAN_MAX_AGE_MS = 15 * 60_000;
+
+/** A balance found in the wallet that this app never bought (cost basis unknown): watched with a hard stop, not a trade the app chose. */
+export const isRecoveredPosition = (p: { entryTxSignature?: string }): boolean => !!p.entryTxSignature?.startsWith('RECOVERED:');
 
 export const PROTECTIVE_EXIT_REASONS = /^(STOP_LOSS|TRAILING_STOP|EMERGENCY_PANIC_LIQUIDATION|MANUAL|Manual Close)$/;
 
@@ -561,9 +568,25 @@ export class ExecutionCoordinator {
     details: string;
   }> {
     if (!this.reconcileInFlight) {
-      this.reconcileInFlight = this.runStartupReconciliation().finally(() => {
-        this.reconcileInFlight = null;
+      // R7: no await inside a pass has a timeout of its own, so a hung RPC call would make every later Reconcile click join the same
+      // hung promise and readiness would say "in progress" forever. Bound the whole pass; on timeout record it as a mismatch and let the next call start fresh.
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('RECONCILIATION_TIMED_OUT')), this.reconcileTimeoutMs);
+        timer.unref?.();
       });
+      const run = Promise.race([this.runStartupReconciliation(), timeout])
+        .catch((err: Error) => {
+          if (err.message !== 'RECONCILIATION_TIMED_OUT') throw err; // a real failure still rejects, as before
+          const details = `Reconciliation did not finish within ${Math.round(this.reconcileTimeoutMs / 1000)}s (an RPC call is hanging); run it again`;
+          this.lastStartupReconciliation = { status: 'RECONCILIATION_MISMATCH', checkedAt: Date.now(), details };
+          return { status: 'RECONCILIATION_MISMATCH' as const, mismatchesCount: 1, details };
+        })
+        .finally(() => {
+          if (timer) clearTimeout(timer);
+          if (this.reconcileInFlight === run) this.reconcileInFlight = null;
+        });
+      this.reconcileInFlight = run;
     }
     return this.reconcileInFlight;
   }
@@ -796,6 +819,7 @@ export class ExecutionCoordinator {
   }
 
   private reconcileRetryTimer: NodeJS.Timeout | null = null;
+  private reconcileTimeoutMs = 90_000;
 
   /** One follow-up reconciliation pass shortly after a pass found something not readable yet. */
   private scheduleReconcileRetry(delayMs = 15_000): void {
@@ -1867,6 +1891,16 @@ export class ExecutionCoordinator {
       return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: this.executionMode, error: `TRADING_HALTED: ${this.haltReason}`, correlationId };
     }
 
+    if (req.executionMode && req.executionMode !== this.executionMode) {
+      return {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: this.executionMode,
+        error: `MODE_CHANGED: the trade was prepared for ${req.executionMode} but the coordinator is now ${this.executionMode}; refused rather than run in the other mode`,
+        correlationId,
+      };
+    }
+
     workstationDb.logJournal('TRADE_REQUEST_RECEIVED', correlationId, this.executionMode, {
       ...req,
       executionMode: this.executionMode,
@@ -2174,7 +2208,8 @@ export class ExecutionCoordinator {
       jitoTipLamports: quote.expectedJitoTipLamports,
       signalTimestamp: req.signalTimestamp as number,
       marketDataTimestamp: marketState.marketDataTimestamp,
-      currentOpenPositionsCount: openPositions.length,
+      // R3: adopted wallet dust is not a position the app chose to open; it must not fill the position cap forever.
+      currentOpenPositionsCount: openPositions.filter((p) => !isRecoveredPosition(p)).length,
       currentTotalExposureSol: totalExposureSol,
       // N12: the risk engine applies the minimum reserve itself, so it gets the balance net of in-flight orders only. `spendable` already
       // has the reserve and the in-flight amount taken off; passing it (minus in-flight again) charged both twice. Rent held in token accounts
@@ -2500,7 +2535,10 @@ export class ExecutionCoordinator {
     if (this.haltReason) return;
     this.haltReason = reason;
     // Only the process-wide coordinator persists a halt (it is the only one that restores it); a script or test coordinator must not halt the next real boot.
-    if (this.isDefaultSingleton) workstationDb.logJournal('TRADING_HALTED', 'halt', this.executionMode, { reason });
+    if (this.isDefaultSingleton && !workstationDb.logJournal('TRADING_HALTED', 'halt', this.executionMode, { reason })) {
+      // R8: the halt holds in memory but will not survive a restart; say so instead of letting the operator assume it will.
+      this.raiseOperatorAlert('HALT_NOT_PERSISTED', `The halt could not be written to the database (${reason}). It holds until this process restarts; after a restart trading would not be halted. Fix the database and halt again.`);
+    }
     this.raiseOperatorAlert('TRADING_HALTED', `All trading including exits is halted: ${reason}`);
   }
 
@@ -2534,14 +2572,24 @@ export class ExecutionCoordinator {
 
   /** Errors that mean no send was attempted, so they neither cost fees nor count toward backoff. */
   private static isNonAttemptExitError(error?: string): boolean {
-    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found)/.test(error);
+    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found)/.test(error) || ExecutionCoordinator.isQuoteFailure(error);
+  }
+
+  /** R10: the sell could not even be quoted (fail-closed quote, fee config, market state). Nothing was sent, and widening slippage cannot help. */
+  private static isQuoteFailure(error?: string): boolean {
+    return !!error && /^(OFFICIAL_PUMP_QUOTE_FAILED|DYNAMIC_FEE_CALCULATION_FAILED|FEE_RECIPIENT_UNRESOLVED|UNSUPPORTED_QUOTE_MINT|Cannot fetch market state)/.test(error);
   }
 
   private recordExitOutcome(positionId: string, res: { success: boolean; error?: string }, mode?: string): void {
     if (res.success) {
       this.exitFailures.delete(positionId);
       this.clearOperatorAlert('EXIT_FAILING', positionId);
+      this.clearOperatorAlert('EXIT_QUOTE_FAILING', positionId);
       return;
+    }
+    if (mode === 'LIVE' && ExecutionCoordinator.isQuoteFailure(res.error)) {
+      // No fee was spent and the ladder must not advance, but a stop-loss that cannot be priced is exactly what an operator must hear about.
+      this.raiseOperatorAlert('EXIT_QUOTE_FAILING', `Exit for position ${positionId.slice(0, 8)} cannot be quoted, so nothing is being sent (${String(res.error).slice(0, 140)}). Retrying every tick; close it manually if this persists.`, positionId);
     }
     if (mode !== 'LIVE' || ExecutionCoordinator.isNonAttemptExitError(res.error)) return;
     const count = (this.exitFailures.get(positionId)?.count ?? 0) + 1;

@@ -7,7 +7,7 @@ import { solPriceService } from './market/solPriceService';
 import { workstationDb } from './db/database';
 import { evaluateTokenSafety } from './risk/tokenSafety';
 import { pumpFeedListener, PumpCreateEvent } from './solana/pumpFeedListener';
-import { SignalProvenance, ConfluenceBreakdown } from './core/types';
+import { SignalProvenance, ConfluenceBreakdown, ExecutionMode } from './core/types';
 import { CapitalSizer } from './capital/capitalSizer';
 import { ConfluenceEngine, isConfluencePassed, MIN_CONFLUENCE_SCORE } from './signals/confluenceEngine';
 import { curveVelocityEvaluator } from './signals/curveVelocityEvaluator';
@@ -385,6 +385,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     amountSolOverride?: number;
     /** When the signal behind this trade happened (ms). Required for LIVE: the coordinator never defaults it to now. */
     signalTimestamp?: number;
+    /** R5: the coordinator mode the caller checked before its awaits; the coordinator refuses the trade if the mode has changed since. */
+    expectedMode?: ExecutionMode;
   }): Promise<{
     success: boolean;
     message: string;
@@ -718,6 +720,7 @@ export class MemecoinAggregatorService extends EventEmitter {
       provenance,
       liquidityUsd: pool.liquidityUsd,
       signalTimestamp: params.signalTimestamp,
+      executionMode: params.expectedMode,
     });
 
     if (!execRes.success) {

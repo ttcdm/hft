@@ -105,4 +105,17 @@ describe('N5-N9: startup reconciliation does not wedge readiness on states that 
     expect(retry).toHaveBeenCalled();
     expect(workstationDb.loadTransactions().find((t) => t.signature === sig)!.reconciliationState).toBe('PENDING');
   });
+
+  it('R7: a hung reconciliation is cut off, reported as a mismatch, and the next call starts a fresh pass', async () => {
+    await coordinator.startupReconciliation(); // let the boot pass the constructor started finish, so the next call starts a new one
+    (coordinator as any).reconcileTimeoutMs = 50;
+    const hung = vi.spyOn(coordinator as any, 'runStartupReconciliation').mockImplementationOnce(() => new Promise(() => undefined));
+    const first = await coordinator.startupReconciliation();
+    expect(first.status).toBe('RECONCILIATION_MISMATCH');
+    expect(first.details).toMatch(/did not finish/);
+    expect(coordinator.canExecuteLive().reasons.join(' ')).toMatch(/unresolved issues|reconciliation/i);
+    const second = await coordinator.startupReconciliation(); // not joined to the hung promise
+    expect(hung).toHaveBeenCalledTimes(2);
+    expect(second.details).not.toMatch(/did not finish/);
+  });
 });

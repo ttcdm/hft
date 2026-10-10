@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import { workstationDb } from '../db/database';
-import { executionCoordinator } from '../execution/coordinator';
+import { executionCoordinator, isRecoveredPosition } from '../execution/coordinator';
 import { memecoinAggregator } from '../memecoinAggregator';
 import { solPriceService } from '../market/solPriceService';
 import { executionConfig } from '../solana/executionConfig';
@@ -407,7 +407,7 @@ export class AutoSnipeController extends EventEmitter {
     if (mode === 'DEVNET_LIVE' && (coordMode !== 'LIVE' || !armed)) {
       return this.record(c, 'REJECTED', 'mode', `DEVNET_LIVE auto refused: the coordinator is ${coordMode} and LIVE is ${armed ? 'armed' : 'not armed'}; it must be LIVE and armed`);
     }
-    if (mode === 'DEVNET_LIVE' && open.length >= DEVNET_MAX_OPEN_POSITIONS) {
+    if (mode === 'DEVNET_LIVE' && open.filter((p) => !isRecoveredPosition(p)).length >= DEVNET_MAX_OPEN_POSITIONS) { // R3: adopted dust does not take the slot
       return this.record(c, 'DROPPED', 'budget', `DEVNET_MAX_OPEN_POSITIONS (${DEVNET_MAX_OPEN_POSITIONS}) reached`);
     }
     if (downgraded) {
@@ -441,6 +441,8 @@ export class AutoSnipeController extends EventEmitter {
         minConfluenceScore: verdict.state === 'READY' ? HOT_MIN_SCORE : undefined,
         // The signal behind an auto buy is the watch window's release; LIVE refuses a trade without one.
         signalTimestamp: verdict.releasedAt,
+        // R5: the mode checked above; the coordinator refuses the trade if LIVE was armed or disarmed during the awaits in executeSnipe.
+        expectedMode: coordMode,
       };
       if (shadow) params.dryRun = true;
       if (this.mode === 'DEVNET_LIVE') {

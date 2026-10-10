@@ -76,3 +76,25 @@ describe('L8: an all-trading halt survives a restart', () => {
     expect(auditWalletChange(1.0, after - 0.05, buy).explained).toBe(false); // a real 0.05 SOL drain on top still halts
   });
 });
+
+describe('R8: halt persistence fails loud, not open', () => {
+  it('an unreadable journal reads as a halt, and a halt that cannot be written raises HALT_NOT_PERSISTED', async () => {
+    const { WorkstationDatabase } = await import('../server/db/database');
+    const db = new WorkstationDatabase(':memory:');
+    expect(db.getPersistedHaltReason()).toBeNull(); // healthy and empty: no halt
+    (db as any).db.close();
+    expect(db.getPersistedHaltReason()).toMatch(/^HALT_STATE_UNREADABLE/);
+    expect(db.logJournal('X', 'c', 'PAPER', {})).toBe(false);
+
+    const { ExecutionCoordinator } = await import('../server/execution/coordinator');
+    const { workstationDb } = await import('../server/db/database');
+    const { MockSolanaRpc } = await import('./e2e/helpers/mockRpc');
+    const rpc = new MockSolanaRpc();
+    const coordinator = new ExecutionCoordinator(rpc.createConnection(), true);
+    vi.spyOn(workstationDb, 'logJournal').mockReturnValue(false);
+    coordinator.haltAll('disk full test');
+    expect(coordinator.getOperatorAlerts().some((a) => a.code === 'HALT_NOT_PERSISTED')).toBe(true);
+    expect(coordinator.getHaltReason()).toBe('disk full test');
+    coordinator.cleanup();
+  });
+});

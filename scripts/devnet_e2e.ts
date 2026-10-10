@@ -67,7 +67,7 @@ async function main() {
     console.error(`ABORT: genesis ${genesis} is not devnet`);
     process.exit(2);
   }
-  rec('cluster', true, `genesis hash == devnet (${genesis})`);
+  console.log(`INFO  cluster: genesis hash == devnet (${genesis}); anything else aborted above`); // a statement of fact, not a pass
   // The only place the real-money flag is flipped, and only after the assertion above.
   process.env.ALLOW_LIVE_REAL_MONEY_TRADING = 'true';
 
@@ -113,7 +113,7 @@ async function main() {
     rec('mint', false, 'no usable active pump.fun devnet mint; pass DEVNET_MINTS=<comma list> (they go stale fast)');
     return finish();
   }
-  rec('mint', true, mint);
+  console.log(`INFO  mint: ${mint}`); // the failure case above is recorded; this line is not a pass
   const mintPk = new PublicKey(mint);
 
   if (phase === 'main') {
@@ -201,7 +201,8 @@ async function main() {
   // (b) 50% close, (c) 100% close
   const c50 = await coordinator.closePosition(pos.id, 50, 'e2e 50%');
   rec('(b) close 50%', c50.success, c50.error || `pnl=${c50.pnlSol}`);
-  rec('(b) ATA after 50%', true, `chain=${await ataBalance()}`);
+  const ataAfter50 = await ataBalance();
+  rec('(b) ATA after 50% holds roughly half (between 40% and 60% of before)', onchain > 0n && ataAfter50 * 100n >= onchain * 40n && ataAfter50 * 100n <= onchain * 60n, `before=${onchain} after=${ataAfter50}`);
   const c100 = await coordinator.closePosition(pos.id, 100, 'e2e 100%');
   rec('(c) close 100%', c100.success, c100.error || `pnl=${c100.pnlSol}`);
   const after = await conn.getBalance(kp.publicKey);

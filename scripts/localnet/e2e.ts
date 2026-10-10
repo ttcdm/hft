@@ -97,7 +97,7 @@ async function main() {
       if (line) { clearTimeout(t); resolve(JSON.parse(line)); }
     });
   });
-  rec('validator', true, `${info.url} genesis ${info.genesisHash} (LiteSVM + real pump program binaries, not solana-test-validator)`);
+  rec('validator', !!info.url && !!info.genesisHash, `${info.url} genesis ${info.genesisHash} (LiteSVM + real pump program binaries, not solana-test-validator)`);
   const conn = new Connection(info.url, 'confirmed');
 
   // ---- throwaway keys, funded only by the local validator ----
@@ -200,7 +200,7 @@ async function main() {
   let mintH: PublicKey;
   try {
     mint = await createCoin();
-    rec('seed: create_v2', true, `mint ${mint.toBase58()} created by the real pump program`);
+    rec('seed: create_v2', !!lastCreate?.signature, `mint ${mint.toBase58()} created by the real pump program`);
     {
       // L5: the pump feed decoder must agree with the program's own account for a REAL create_v2 event log.
       const { PumpFeedListener } = await import('../../server/solana/pumpFeedListener');
@@ -230,7 +230,7 @@ async function main() {
     mintF = await seedCoin();
     mintG = await seedCoin();
     mintH = await seedCoin();
-    rec('seed: 5 more coins (revert, failed-send, restart, sell-in-flight, PumpSwap scenarios)', true, [mintD, mintE, mintF, mintG, mintH].map((m) => m.toBase58()).join(' '));
+    rec('seed: 5 more coins (revert, failed-send, restart, sell-in-flight, PumpSwap scenarios)', new Set([mintD, mintE, mintF, mintG, mintH].map((m) => m.toBase58())).size === 5, [mintD, mintE, mintF, mintG, mintH].map((m) => m.toBase58()).join(' '));
   } catch (e: any) {
     rec('seed market', false, String(e?.stack || e).slice(0, 600));
     return finish();
@@ -273,7 +273,7 @@ async function main() {
 
   let { base, proc } = await startServer();
   let call = api(base);
-  rec('server boot', true, `${base} (ALLOWED_CLUSTER=localnet, RPC ${info.url}, real .env not read)`);
+  rec('server boot', /^http:\/\/127\.0\.0\.1:\d+$/.test(base), `${base} (ALLOWED_CLUSTER=localnet, RPC ${info.url}, real .env not read)`);
 
   const health = await call('GET', '/api/health');
   rec('GET /api/health', health.status === 200, `status ${health.status}`);

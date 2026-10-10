@@ -46,6 +46,9 @@ jobs:
       - name: Runtime Smoke Test (boot bundle, auth, websocket)
         run: npm run smoke
 
+      - name: Localnet end-to-end (real pump programs in an in-process bank, loopback only)
+        run: npm run localnet:e2e
+
   validate-rust:
     name: Validate Rust HFT Engine
     runs-on: ubuntu-latest

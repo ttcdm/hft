@@ -104,6 +104,12 @@ async function main(): Promise<void> {
     APEX_DB_PATH: path.join(scratchDir, 'smoke.db'),
     SIGNER_KEYPAIR_PATH: path.join(scratchDir, 'no-keypair.json'),
     APEX_WAL_PATH: path.join(scratchDir, 'engine.wal'), // never the checkout's apex_engine.wal
+    // Q47: without these the app probed api.devnet.solana.com on every CI run. A closed loopback port keeps the run offline.
+    ALLOWED_CLUSTER: 'localnet',
+    LOCALNET_GENESIS_HASH: '11111111111111111111111111111111',
+    SOLANA_RPC_URL: 'http://127.0.0.1:9',
+    SOLANA_WS_URL: 'ws://127.0.0.1:9',
+    JITO_BLOCK_ENGINE_URL: 'http://127.0.0.1:9',
     APEX_DISABLE_EXTERNAL_FEEDS: 'true', // no price or pump feeds: the smoke run must not depend on, or talk to, the internet
   };
 

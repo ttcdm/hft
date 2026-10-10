@@ -358,7 +358,7 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
 
       it('the wallet already has it: the same order passes the gate and is sent', async () => {
         closeAllActive(); armLive(); realRent();
-        vi.spyOn((coordinator as any).connection, 'getAccountInfo').mockResolvedValue({ lamports: 1_844_400, data: Buffer.alloc(137), owner: Keypair.generate().publicKey, executable: false } as any);
+        vi.spyOn((coordinator as any).connection, 'getAccountInfo').mockResolvedValue({ lamports: 1_346_200, data: Buffer.alloc(137), owner: Keypair.generate().publicKey, executable: false } as any);
         submit.mockResolvedValue({ success: false, signature: '', transport: 'SOLANA_RPC', error: 'x', lifecycleState: 'SUBMIT_FAILED' });
         await buy();
         expect(submit).toHaveBeenCalledTimes(1);

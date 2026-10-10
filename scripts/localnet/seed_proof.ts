@@ -75,6 +75,14 @@ async function main() {
   const spent = (before - after) / LAMPORTS_PER_SOL;
   rec('spend within the hard cap', spent <= HARD_CAP_SOL && spent <= rep.plan.capSol, `funder spent ${spent.toFixed(4)} SOL (cap ${rep.plan.capSol}, hard ${HARD_CAP_SOL})`);
   rec('about 30 buys landed', rep.buysLanded >= 28, `${rep.buysLanded}/${rep.plan.buyers}${rep.buyers.filter((b) => b.error).length ? ' errors: ' + [...new Set(rep.buyers.filter((b) => b.error).map((b) => b.error))].join(' | ') : ''}`);
+  // S6b: the rent constant the cost gate charges for a wallet's first pump buy must equal what the real program actually made the wallet pay.
+  {
+    const { userVolumeAccumulatorPda } = await import('@pump-fun/pump-sdk');
+    const { PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS } = await import('../../server/risk/riskEngine');
+    const firstBuyer = rep.buyers.find((b) => b.signature);
+    const acc = firstBuyer ? await conn.getAccountInfo(userVolumeAccumulatorPda(new PublicKey(firstBuyer.wallet)), 'confirmed') : null;
+    rec('first-buy rent constant equals the accumulator the program created', !!acc && acc.data.length === 137 && acc.lamports === PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS, acc ? `${acc.lamports} lamports, ${acc.data.length} bytes (constant ${PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS})` : 'no accumulator');
+  }
   rec('buys inside about 30 s', (rep.buyWindowMs ?? 1e9) < 40_000, `${((rep.buyWindowMs ?? 0) / 1000).toFixed(1)} s`);
 
   // 4. what is in the transactions

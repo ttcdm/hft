@@ -103,10 +103,10 @@ describe('C7: live-path correctness', () => {
     });
 
     it('S6: unrefunded rent is part of the round-trip cost; the accumulator rent is (137 + 128) x 6,960 and a 0.005 SOL first order fails the 20% gate', () => {
-      expect(PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS).toBe(1_844_400);
-      expect(estimateRoundTripCostLamports({ ...base, nonRefundableRentLamports: PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS })).toBe(estimateRoundTripCostLamports(base) + 1_844_400);
+      expect(PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS).toBe(1_346_200);
+      expect(estimateRoundTripCostLamports({ ...base, nonRefundableRentLamports: PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS })).toBe(estimateRoundTripCostLamports(base) + 1_346_200);
       expect(estimateRoundTripCostLamports(base) > MAX_ROUND_TRIP_COST_FRACTION * 0.005 * 1e9).toBe(false); // without the rent it passed
-      expect(estimateRoundTripCostLamports({ ...base, nonRefundableRentLamports: 1_844_400 }) > MAX_ROUND_TRIP_COST_FRACTION * 0.005 * 1e9).toBe(true);
+      expect(estimateRoundTripCostLamports({ ...base, nonRefundableRentLamports: 1_346_200 }) > MAX_ROUND_TRIP_COST_FRACTION * 0.005 * 1e9).toBe(true);
     });
 
     it('a 0.01 SOL order is above the 20% floor at these costs and a 0.1 SOL order is below it', () => {

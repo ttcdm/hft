@@ -320,13 +320,17 @@ export const riskEngine = new HardenedRiskEngine();
 /** Max share of an order that may go to round-trip execution cost before the entry is refused. */
 export const MAX_ROUND_TRIP_COST_FRACTION = 0.2;
 
-/** Solana rent: lamports per byte of account data (the 2-year exemption rate, 3,480 x 2), the same on mainnet, devnet and testnet. */
-export const RENT_LAMPORTS_PER_BYTE = 6_960;
+/**
+ * Rent-exempt lamports per byte of account data, including the 128-byte header. Measured, not assumed: the user_volume_accumulator
+ * (137 bytes) that the real pump program creates holds 1,346,200 lamports on the local chain and on devnet (S6b), which is
+ * 265 x 5,080. (An earlier 6,960 was the old 3,480 x 2 figure and over-counted by 37%.)
+ */
+export const RENT_LAMPORTS_PER_BYTE = 5_080;
 /**
  * S6: the pump program creates a UserVolumeAccumulator (137 bytes, measured on the local chain with the real program binary) the first time
- * a wallet buys anything on pump.fun, and charges the buyer its rent: (137 + 128) x 6,960 = 1,844,400 lamports (0.00184 SOL). Nothing
- * refunds it. A 0.005 SOL first order therefore starts 37% down before any fee; every later buy by the wallet does not pay it.
- * The token account's rent (Token-2022, 170 bytes: 2,074,080 lamports) is NOT counted: the exit closes the account and refunds it.
+ * a wallet buys anything on pump.fun, and charges the buyer its rent: (137 + 128) x 5,080 = 1,346,200 lamports (0.00135 SOL), the figure also read off the app wallet's account on devnet. Nothing
+ * refunds it. A 0.005 SOL first order therefore starts 27% down before any fee; every later buy by the wallet does not pay it.
+ * The token account's rent (Token-2022, 170 bytes: 1,513,840 lamports) is NOT counted: the exit closes the account and refunds it.
  */
 export const PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS = (137 + 128) * RENT_LAMPORTS_PER_BYTE;
 

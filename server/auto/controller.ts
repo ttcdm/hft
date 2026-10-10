@@ -110,6 +110,8 @@ export interface AutoStatus {
 }
 
 const MAX_DECISIONS = 500;
+/** Q27: the same unwatched / pending / dead mint from the same source is not journaled again for this long. */
+export const DROP_REPEAT_MS = 10 * 60_000;
 const MONITOR_INTERVAL_MS = 5_000;
 
 /** Map a rejection message to the pipeline stage that produced it. */
@@ -131,6 +133,8 @@ export class AutoSnipeController extends EventEmitter {
   private decisions: AutoDecision[] = [];
   private attempted = new Set<string>();
   private busy = false;
+  /** Q27: last watch-stage drop per mint, source, mode and verdict. */
+  private repeatDrops = new Map<string, { ts: number; decision: AutoDecision }>();
   /** Q29: the buy now in progress, so kill() and setMode() can wait for it instead of racing it. */
   private inflight: Promise<void> | null = null;
   private triggers: KillTrigger[] = [];
@@ -454,6 +458,13 @@ export class AutoSnipeController extends EventEmitter {
    */
   public async submitCandidate(c: AutoCandidate): Promise<AutoDecision> {
     const key = c.mint.toLowerCase();
+    // Q27: the 5s candidate loops resubmit the same mints forever. A drop that depends only on the watch verdict (never watched, still
+    // watching, dead) cannot change until the verdict does, so a repeat inside DROP_REPEAT_MS gets the earlier decision and no new rows
+    // (it used to write a QUEUED and a DROPPED row per mint per tick: about 34k rows a day).
+    const v0 = this.mode === 'OFF' ? null : watchWindow.getVerdict(c.mint);
+    const repeatKey = `${key}|${c.source}|${this.mode}|${v0?.state ?? 'NONE'}`;
+    const prior = this.repeatDrops.get(repeatKey);
+    if (prior && Date.now() - prior.ts < DROP_REPEAT_MS) return { ...prior.decision };
     workstationDb.logDecision({ autoMode: this.mode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'queue', outcome: 'QUEUED', reason: 'candidate received' });
     if (this.mode === 'OFF') return this.record(c, 'DROPPED', 'auto', 'AUTO_OFF');
     const downgraded = this.enforceBudgets();
@@ -466,9 +477,13 @@ export class AutoSnipeController extends EventEmitter {
     // G2b: only watch-window releases get this far. HOT goes straight to the execution stages; READY must also clear
     // the confluence score (>= 70) here; DEAD, still-watching and never-watched candidates are dropped.
     const verdict = watchWindow.getVerdict(c.mint);
-    if (!verdict) return this.record(c, 'DROPPED', 'watch', 'NOT_IN_WATCH_WINDOW');
-    if (verdict.state === 'WATCHING') return this.record(c, 'DROPPED', 'watch', 'WATCH_PENDING: still in the watch window');
-    if (verdict.state === 'DEAD') return this.record(c, 'DROPPED', 'watch', `WATCH_DEAD: ${verdict.reason}`);
+    if (!verdict || verdict.state === 'WATCHING' || verdict.state === 'DEAD') {
+      const reason = !verdict ? 'NOT_IN_WATCH_WINDOW' : verdict.state === 'WATCHING' ? 'WATCH_PENDING: still in the watch window' : `WATCH_DEAD: ${verdict.reason}`;
+      const dropped = this.record(c, 'DROPPED', 'watch', reason);
+      if (this.repeatDrops.size >= 500) this.repeatDrops.delete(this.repeatDrops.keys().next().value as string);
+      this.repeatDrops.set(repeatKey, { ts: Date.now(), decision: dropped });
+      return dropped;
+    }
 
     const mode = this.mode;
     // The coordinator's mode can change after the auto mode was set (someone arms LIVE, or disarms it). Every candidate

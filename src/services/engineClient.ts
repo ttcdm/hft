@@ -347,7 +347,7 @@ class EngineClient {
     return null;
   }
 
-  public async downloadWalJournal() {
+  public async downloadWalJournal(): Promise<{ ok: boolean; error?: string }> {
     // A plain navigation cannot carry the Authorization header, so fetch with auth and save the blob.
     try {
       const res = await authFetch('/api/engine/wal/export');
@@ -357,13 +357,14 @@ class EngineClient {
       a.href = url;
       a.download = `apex_engine_journal_${Date.now()}.wal`;
       a.click();
-      URL.revokeObjectURL(url);
-    } catch (e) {
+      setTimeout(() => URL.revokeObjectURL(url), 30_000); // R34: revoking right after click() can cancel the download
+      return { ok: true };
+    } catch (e: any) {
       console.error('WAL export failed:', e);
+      return { ok: false, error: String(e?.message || e) };
     }
   }
 
-  // ---------------- SOCIAL SCANNER & TELEGRAM ALPHA ----------------
   public async getSocialSignals() {
     try {
       const res = await authFetch('/api/social/signals');

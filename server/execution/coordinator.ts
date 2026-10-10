@@ -573,11 +573,26 @@ export class ExecutionCoordinator {
   // Startup Reconciliation checking database, on-chain balances, and transport health.
   // Single-flight: a second call (e.g. POST /api/execution/reconcile during boot) joins the run in progress, so two
   // passes never recover the same pending transaction or rewrite the same positions at once.
-  public startupReconciliation(): Promise<{
+  // `fresh` (the operator's Reconcile click) never takes the result of a run that started before the click: it waits for the run in
+  // progress and then runs once more, shared by every fresh caller meanwhile (R17: the click is usually made after fixing something).
+  private reconcileFollowUp: Promise<{ status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE'; mismatchesCount: number; details: string }> | null = null;
+  public startupReconciliation(opts: { fresh?: boolean } = {}): Promise<{
     status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE';
     mismatchesCount: number;
     details: string;
   }> {
+    if (opts.fresh && this.reconcileInFlight) {
+      if (!this.reconcileFollowUp) {
+        const follow: NonNullable<typeof this.reconcileFollowUp> = this.reconcileInFlight
+          .catch(() => undefined)
+          .then(() => {
+            if (this.reconcileFollowUp === follow) this.reconcileFollowUp = null; // later fresh callers start their own
+            return this.startupReconciliation();
+          });
+        this.reconcileFollowUp = follow;
+      }
+      return this.reconcileFollowUp;
+    }
     if (!this.reconcileInFlight) {
       // R7: no await inside a pass has a timeout of its own, so a hung RPC call would make every later Reconcile click join the same
       // hung promise and readiness would say "in progress" forever. Bound the whole pass; on timeout record it as a mismatch and let the next call start fresh.
@@ -1157,6 +1172,8 @@ export class ExecutionCoordinator {
         if (mark && mark.priceSol > 0) {
           this.applyMarkPrice(pos, mark.priceSol, mark.source, mark.timestamp, mark.poolAddress);
         } else if (!priceMap || !priceMap[pos.mint]) {
+          const rejected = PumpCurveService.getMintRejection(pos.mint);
+          if (rejected) this.raiseOperatorAlert('MARK_MINT_REJECTED', `${pos.symbol || pos.mint.slice(0, 6)} cannot be marked: ${rejected}. The position keeps its last mark and goes stale.`, pos.id); // R19
           // Mark age increases honestly
           const baseTimestamp = pos.lastMarkTimestamp || pos.lastUpdatedTimestamp;
           pos.markAgeMs = now - baseTimestamp;
@@ -3006,7 +3023,11 @@ export class ExecutionCoordinator {
         pos.executionMode === 'LIVE' ? 'LIVE' : 'PAPER'
       );
       const mark = marks[pos.mint];
-      if (!mark || !(mark.priceSol > 0)) return false;
+      if (!mark || !(mark.priceSol > 0)) {
+        const rejected = PumpCurveService.getMintRejection(pos.mint);
+        if (rejected) this.raiseOperatorAlert('MARK_MINT_REJECTED', `${pos.symbol || pos.mint.slice(0, 6)} cannot be marked: ${rejected}. The position keeps its last mark and goes stale.`, pos.id); // R19
+        return false;
+      }
       this.applyMarkPrice(pos, mark.priceSol, mark.source, mark.timestamp, mark.poolAddress);
       return true;
     } catch (err: any) {

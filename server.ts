@@ -1516,7 +1516,7 @@ app.post('/api/execution/close', requireOperatorAuth, validateTradeBody(Operator
 
 app.post('/api/execution/reconcile', requireOperatorAuth, async (req, res) => {
   try {
-    const result = await executionCoordinator.startupReconciliation();
+    const result = await executionCoordinator.startupReconciliation({ fresh: true }); // R17: a click never reads a run that began before it
     res.json({ success: true, result });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });

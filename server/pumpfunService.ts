@@ -869,6 +869,7 @@ export class PumpFunService extends EventEmitter {
       slippagePct: maxSlippagePct,
       signalId: callout.id,
       signalTimestamp: callout.calloutTimestamp,
+      provenance: calloutProvenance(callout), // R20: a demo callout is SYNTHETIC_TEST here too, not whatever executeSnipe defaults to
     });
 
     if (tradeRes.success) {

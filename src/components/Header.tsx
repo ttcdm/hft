@@ -466,7 +466,7 @@ export const Header: React.FC<HeaderProps> = ({
               ? 'bg-emerald-500/15 hover:bg-emerald-500/25 border-emerald-500/50 text-emerald-400 shadow-lg shadow-emerald-500/15'
               : 'bg-red-500/15 hover:bg-red-500/25 border-red-500/50 text-red-400 shadow-lg shadow-red-500/15 animate-pulse'
           }`}
-          title="EMERGENCY CIRCUIT BREAKER - Immediately freeze all trading loops and open orders"
+          title="KILL SWITCH - the server refuses new orders and disarms LIVE trading. Open positions are not sold; protective exits keep running."
         >
           {isHalted ? (
             <>

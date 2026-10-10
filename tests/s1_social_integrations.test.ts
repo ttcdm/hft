@@ -211,6 +211,17 @@ describe('S1: Telegram / social integrations', () => {
       expect(socialScanner.getSignals().filter((s) => s.contractAddress === MINT_A)).toHaveLength(1);
     });
 
+    it('R20: a manual snipe carries the callout\'s provenance (a demo caller is SYNTHETIC_TEST, an unattributed one REAL_ONCHAIN) and its own timestamp', async () => {
+      const snipe = vi.spyOn(memecoinAggregator, 'executeSnipe').mockResolvedValue({ success: false, message: 'stubbed', txHash: '' } as any);
+      const at = Date.now() - 5_000;
+      const callout = (id: string, userId: string) => ({ id, calloutId: id, token: { mint: MINT_A }, caller: { userId }, calloutTimestamp: at, status: 'NEW' });
+      (svc as any).hotCallouts.push(callout('r20-demo', 'sol_cabal_insider'), callout('r20-real', 'someone_real'));
+      await svc.snipeCallout('r20-demo');
+      await svc.snipeCallout('r20-real');
+      expect(snipe.mock.calls[0][0]).toMatchObject({ provenance: 'SYNTHETIC_TEST', signalTimestamp: at });
+      expect(snipe.mock.calls[1][0]).toMatchObject({ provenance: 'REAL_SOCIAL', signalTimestamp: at });
+    });
+
     it('snipeCallout of an unknown id does nothing', async () => {
       const snipe = vi.spyOn(memecoinAggregator, 'executeSnipe');
       const r = await svc.snipeCallout('does-not-exist');

@@ -499,6 +499,10 @@ export async function fetchTokenHolderDistribution(
 
 export class PumpCurveService {
   public static cachedGlobal: any = null;
+  /** R19: mints whose account is not owned by a token program, with the reason, so the mark path can alert instead of falling through to PumpSwap. */
+  private static mintRejections = new Map<string, string>();
+  public static getMintRejection(mint: string): string | undefined { return PumpCurveService.mintRejections.get(mint); }
+  public static clearMintRejections(): void { PumpCurveService.mintRejections.clear(); }
   public static cachedFeeConfig: any = null;
   public static fetchTokenHolderDistribution = fetchTokenHolderDistribution;
   private static cacheTimestamp = 0;
@@ -601,8 +605,10 @@ export class PumpCurveService {
       // The token program is the mint account's owner, never inferred from its contents. Any other owner is not a mint.
       if (!finalMintInfo.owner.equals(TOKEN_PROGRAM_ID) && !finalMintInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {
         Logger.error(`Mint ${mint.toBase58()} is owned by ${finalMintInfo.owner.toBase58()}, not a token program`);
+        PumpCurveService.mintRejections.set(mint.toBase58(), `its account is owned by ${finalMintInfo.owner.toBase58()}, not a token program`);
         return null;
       }
+      PumpCurveService.mintRejections.delete(mint.toBase58());
       let baseTokenProgram = TOKEN_PROGRAM_ID;
       let token2022Report: Token2022ExtensionReport | undefined = undefined;
       if (finalMintInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {

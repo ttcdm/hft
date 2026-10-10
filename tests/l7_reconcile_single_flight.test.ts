@@ -31,4 +31,27 @@ describe('L7: startupReconciliation is single-flight', () => {
     await expect(coord.startupReconciliation()).resolves.toMatchObject({ status: 'OFFLINE' });
     expect(run).toHaveBeenCalledTimes(2);
   });
+
+  it('R17: a fresh call (the operator clicking Reconcile) never reads a run that began earlier; concurrent fresh calls share one follow-up run', async () => {
+    const coord = make();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let n = 0;
+    const run = vi.spyOn(coord as any, 'runStartupReconciliation').mockImplementation(async () => {
+      n++;
+      if (n === 1) await gate; // the boot pass, started before the operator fixed something
+      return { status: n === 1 ? 'RECONCILIATION_MISMATCH' : 'EXECUTION_READY', mismatchesCount: 0, details: `run ${n}` };
+    });
+    const boot = coord.startupReconciliation();
+    const click1 = coord.startupReconciliation({ fresh: true });
+    const click2 = coord.startupReconciliation({ fresh: true });
+    expect(click2).toBe(click1); // both clicks share the one follow-up
+    expect(click1).not.toBe(boot);
+    release();
+    expect((await boot).details).toBe('run 1');
+    expect((await click1).details).toBe('run 2'); // a new pass, not the boot pass's answer
+    expect(run).toHaveBeenCalledTimes(2);
+    // with nothing in flight a fresh call is just a run
+    expect((await coord.startupReconciliation({ fresh: true })).details).toBe('run 3');
+  });
 });

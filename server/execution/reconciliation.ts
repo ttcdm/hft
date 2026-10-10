@@ -649,6 +649,9 @@ export class RealMarkPriceService {
               timestamp: now,
             };
           }
+        } else if (!state && PumpCurveService.getMintRejection(mintStr)) {
+          // R19: the mint is not a token mint at all; asking PumpSwap about it would only hide that. The caller alerts.
+          continue;
         } else {
           // If bonding curve completed or not found, check canonical PumpSwap AMM pool
           const { PumpSwapVenueService } = await import('../solana/pumpSwapService');

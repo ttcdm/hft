@@ -316,7 +316,7 @@ export const UnitTestModal: React.FC<UnitTestModalProps> = ({
                   <span className="font-bold text-white">
                     STATUS:{' '}
                     {activeSuite === 'HIGH_STAKES_CLIENT'
-                      ? clientSummary?.status || (progress.current > 0 ? 'ALL_TESTS_PASSED' : 'READY')
+                      ? clientSummary?.status || (progress.current > 0 ? 'RUNNING' : 'READY')
                       : serverSuiteResult?.status || 'READY'}
                   </span>
                 </>

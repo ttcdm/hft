@@ -39,6 +39,9 @@ interface EngineConsoleModalProps {
   onSelectSymbol?: (symbol: string) => void;
 }
 
+/** R35: a latency figure, or "n/a" when the telemetry has none (never "n/aµs", never an invented number). */
+export const fmtMicros = (v: number | null | undefined): string => (typeof v === 'number' && Number.isFinite(v) ? `${v.toFixed(1)}µs` : 'n/a');
+
 export const EngineConsoleModal: React.FC<EngineConsoleModalProps> = ({
   isOpen,
   onClose,
@@ -53,6 +56,11 @@ export const EngineConsoleModal: React.FC<EngineConsoleModalProps> = ({
   const [rustFiles, setRustFiles] = useState<Record<string, string>>({});
   const [selectedRustFile, setSelectedRustFile] = useState<string>('src/main.rs');
   const [copiedFile, setCopiedFile] = useState(false);
+  const [walExportError, setWalExportError] = useState<string | null>(null);
+  const exportWal = async () => {
+    const r = await engineClient.downloadWalJournal();
+    setWalExportError(r.ok ? null : `WAL export failed: ${r.error}`);
+  };
   const walEndRef = useRef<HTMLDivElement>(null);
 
   // AS Math Config State
@@ -291,12 +299,13 @@ export const EngineConsoleModal: React.FC<EngineConsoleModalProps> = ({
 
             {/* Export WAL */}
             <button
-              onClick={() => engineClient.downloadWalJournal()}
+              onClick={exportWal}
               className="px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 transition flex items-center space-x-1"
             >
               <Download className="w-3.5 h-3.5 text-cyan-400" />
               <span>Export .wal</span>
             </button>
+            {walExportError && <span className="text-rose-400" data-testid="wal-export-error">{walExportError}</span>}
           </div>
         </div>
 
@@ -349,14 +358,14 @@ export const EngineConsoleModal: React.FC<EngineConsoleModalProps> = ({
                   </div>
                   <div className="mt-2 flex items-baseline space-x-1">
                     <span className="text-2xl font-bold font-mono text-amber-400">
-                      {telemetry?.tickToTradeStats.medianMicros.toFixed(1) || '58.4'}
+                      {fmtMicros(telemetry?.tickToTradeStats?.medianMicros)}
                     </span>
-                    <span className="text-xs font-mono text-slate-400">µs (median)</span>
+                    <span className="text-xs font-mono text-slate-400">(median)</span>
                   </div>
                   <div className="mt-2 text-[10px] font-mono text-slate-400 grid grid-cols-3 gap-1 pt-1.5 border-t border-slate-800">
-                    <div>Min: <span className="text-emerald-400 font-semibold">{telemetry?.tickToTradeStats.minMicros.toFixed(1) ?? 'n/a'}µs</span></div>
-                    <div>P99: <span className="text-amber-300 font-semibold">{telemetry?.tickToTradeStats.p99Micros.toFixed(1) ?? 'n/a'}µs</span></div>
-                    <div>Max: <span className="text-rose-400 font-semibold">{telemetry?.tickToTradeStats.maxMicros.toFixed(1) ?? 'n/a'}µs</span></div>
+                    <div>Min: <span className="text-emerald-400 font-semibold">{fmtMicros(telemetry?.tickToTradeStats?.minMicros)}</span></div>
+                    <div>P99: <span className="text-amber-300 font-semibold">{fmtMicros(telemetry?.tickToTradeStats?.p99Micros)}</span></div>
+                    <div>Max: <span className="text-rose-400 font-semibold">{fmtMicros(telemetry?.tickToTradeStats?.maxMicros)}</span></div>
                   </div>
                 </div>
 
@@ -576,7 +585,7 @@ export const EngineConsoleModal: React.FC<EngineConsoleModalProps> = ({
                     <span>Auto-scroll</span>
                   </label>
                   <button
-                    onClick={() => engineClient.downloadWalJournal()}
+                    onClick={exportWal}
                     className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700 text-[11px] flex items-center space-x-1"
                   >
                     <Download className="w-3 h-3" />

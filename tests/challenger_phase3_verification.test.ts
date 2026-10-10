@@ -519,7 +519,7 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
       expect(totalLoss <= -0.02).toBe(true);
     });
 
-    it('B20-ADV.2: Cumulative calculation (closed PnL + open unrealized PnL + fees) triggers DAILY_LOSS_LIMIT', () => {
+    it('B20-ADV.2: Cumulative calculation (closed PnL + open unrealized PnL) triggers DAILY_LOSS_LIMIT', () => {
       const memDb = new WorkstationDatabase(':memory:');
 
       // 1. Closed position with -0.008 SOL realized loss
@@ -541,8 +541,8 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
         lastUpdatedTimestamp: Date.now(),
       });
 
-      // 2. Open position with -0.010 SOL unrealized loss (cost 0.015, value 0.005)
-      // tokenQuantityRaw: 1,000,000 with 6 decimals = 1.0 token. 1.0 * 0.005 = 0.005 SOL value.
+      // 2. Open position with -0.013 SOL unrealized loss (cost 0.015, value 0.002)
+      // tokenQuantityRaw: 1,000,000 with 6 decimals = 1.0 token. 1.0 * 0.002 = 0.002 SOL value.
       memDb.savePosition({
         id: 'open-loss',
         mint: Keypair.generate().publicKey.toBase58(),
@@ -552,7 +552,7 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
         tokenQuantityRaw: '1000000',
         costBasisLamports: 15_000_000, // 0.015 SOL
         entryPriceSol: 0.015,
-        currentPriceSol: 0.005,
+        currentPriceSol: 0.002,
         realizedPnLSol: 0,
         entryTxSignature: 'sig-o1',
         entryTimestamp: Date.now() - 1800000,
@@ -560,7 +560,7 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
         status: 'OPEN',
       });
 
-      // 3. Transactions with fees = 0.003 SOL
+      // 3. A landed trade's fees (0.003 SOL) are inside its position's basis and must not be subtracted again (Q3)
       memDb.saveTransaction({
         signature: 'tx-fee-1',
         orderId: 'ord-fee-1',
@@ -575,7 +575,7 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
         executionMode: 'LIVE',
       });
 
-      // Total PnL = -0.008 (closed) + (-0.010 unrealized) - 0.003 (fees) = -0.021 SOL
+      // Total PnL = -0.008 (closed) + (-0.013 unrealized) = -0.021 SOL
       const dailyTotal = memDb.getDailyTotalPnLSol('LIVE');
       expect(dailyTotal).toBeCloseTo(-0.021, 4);
 

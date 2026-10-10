@@ -141,6 +141,17 @@ export class WorkstationDatabase {
         error TEXT
       );
 
+      -- Q3b: one row per change of a position's realized PnL (an exit fill), so "realized today" is the sum of today's fills and not
+      -- the whole history of any row a mark tick rewrote today
+      CREATE TABLE IF NOT EXISTS realized_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        position_id TEXT NOT NULL,
+        execution_mode TEXT NOT NULL,
+        delta_lamports INTEGER NOT NULL,
+        ts INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_realized_events_ts ON realized_events (execution_mode, ts);
+
       CREATE TABLE IF NOT EXISTS risk_decisions (
         id TEXT PRIMARY KEY,
         mint TEXT NOT NULL,
@@ -191,6 +202,17 @@ export class WorkstationDatabase {
     this.ensureColumn('positions', 'trailing_stop_sol', 'REAL DEFAULT 0.0');
     this.ensureColumn('positions', 'exit_stage', 'INTEGER DEFAULT 0');
     this.ensureColumn('positions', 'record_updated_at', 'INTEGER NOT NULL DEFAULT 0');
+
+    // Rows that carry realized PnL from before realized_events existed: one event at their updated_at, which is what the daily figure used.
+    try {
+      const n = (this.db.prepare('SELECT COUNT(*) AS n FROM realized_events').get() as any).n;
+      if (n === 0) {
+        this.db.exec(`INSERT INTO realized_events (position_id, execution_mode, delta_lamports, ts)
+          SELECT id, execution_mode, realized_pnl_lamports, updated_at FROM positions WHERE realized_pnl_lamports != 0`);
+      }
+    } catch (err: any) {
+      Logger.warn(`realized_events backfill failed: ${err.message}`);
+    }
 
     this.ensureColumn('orders', 'correlation_id', "TEXT NOT NULL DEFAULT ''");
     this.ensureColumn('orders', 'symbol', "TEXT NOT NULL DEFAULT ''");
@@ -587,6 +609,10 @@ export class WorkstationDatabase {
         updated_at = excluded.updated_at
     `);
 
+    const realizedLamports = Math.round((pos.realizedPnLSol ?? 0) * 1e9);
+    const previous = this.db.prepare('SELECT realized_pnl_lamports AS r FROM positions WHERE id = ?').get(pos.id) as { r: number } | undefined;
+    const realizedDelta = realizedLamports - (previous?.r ?? 0);
+
     stmt.run(
       pos.id,
       pos.mint,
@@ -620,6 +646,9 @@ export class WorkstationDatabase {
       now,
       now
     );
+    if (realizedDelta !== 0) {
+      this.db.prepare('INSERT INTO realized_events (position_id, execution_mode, delta_lamports, ts) VALUES (?, ?, ?, ?)').run(pos.id, pos.executionMode, realizedDelta, now);
+    }
   }
 
   public loadPositions(mode?: ExecutionMode, status?: 'OPEN' | 'PARTIALLY_CLOSED' | 'CLOSED' | 'ACTIVE'): NormalizedPosition[] {
@@ -730,9 +759,9 @@ export class WorkstationDatabase {
     const startMs = startOfDay.getTime();
 
     const stmt = this.db.prepare(`
-      SELECT COALESCE(SUM(realized_pnl_lamports), 0) as total_pnl_lamports
-      FROM positions
-      WHERE execution_mode = ? AND (status = 'CLOSED' OR status = 'PARTIALLY_CLOSED') AND updated_at >= ?
+      SELECT COALESCE(SUM(delta_lamports), 0) as total_pnl_lamports
+      FROM realized_events
+      WHERE execution_mode = ? AND ts >= ?
     `);
     const res = stmt.get(mode, startMs) as any;
     return (res?.total_pnl_lamports || 0) / 1e9;
@@ -751,11 +780,33 @@ export class WorkstationDatabase {
       (sum, pos) => sum + (pos.unrealizedPnLSol ?? 0),
       0
     );
-    const feesPaidSol = this.getDailyFeesPaidLamports(mode) / 1e9;
-    return Number((closedPnL + openUnrealizedPnL - feesPaidSol).toFixed(6));
+    // Q3: realized and unrealized PnL already contain every fee, tip and rent of the trades that produced a position (cost basis is the
+    // whole wallet delta, proceeds are post-fee). Only the fee of a transaction that landed and failed has no position to sit in.
+    const unbookedFeesSol = this.getDailyUnbookedFeesLamports(mode) / 1e9;
+    return Number((closedPnL + openUnrealizedPnL - unbookedFeesSol).toFixed(6));
   }
 
-  // Calculate actual daily fees from reconciled transactions
+  /**
+   * Q3: network fees (not Jito tips: a failed bundle does not pay its tip) of transactions that landed on chain and failed today.
+   * Their cost is in no position's basis. Pre-written PENDING rows, rows that never reached the chain and rows that became positions
+   * are not counted. A revert path has to record the landing slot for its fee to show up here.
+   */
+  public getDailyUnbookedFeesLamports(mode: ExecutionMode): number {
+    const startOfDay = new Date();
+    startOfDay.setUTCHours(0, 0, 0, 0);
+    try {
+      const res = this.db.prepare(`
+        SELECT COALESCE(SUM(network_fee_lamports), 0) as total_fees
+        FROM transactions
+        WHERE execution_mode = ? AND submission_time >= ? AND reconciliation_state = 'REVERTED' AND landing_slot IS NOT NULL AND landing_slot > 0
+      `).get(mode, startOfDay.getTime()) as any;
+      return res?.total_fees || 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  // Fees of every transaction row today in any state (a display figure; the loss gates use getDailyUnbookedFeesLamports)
   public getDailyFeesPaidLamports(mode: ExecutionMode): number {
     const startOfDay = new Date();
     startOfDay.setUTCHours(0, 0, 0, 0);

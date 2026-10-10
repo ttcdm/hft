@@ -393,7 +393,7 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
       });
     });
 
-    it('B20.1: getDailyTotalPnLSol accurately sums closed PnL, open unrealized PnL, and fees', () => {
+    it('B20.1: getDailyTotalPnLSol sums closed PnL and open unrealized PnL; the fees of landed trades are already inside them (Q3)', () => {
       const mint1 = Keypair.generate().publicKey.toBase58();
       const mint2 = Keypair.generate().publicKey.toBase58();
 
@@ -434,7 +434,7 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
         status: 'OPEN',
       });
 
-      // 3. Transactions with fees paid (0.001 SOL total)
+      // 3. A landed trade's fee and tip (0.001 SOL) are part of its position's cost basis, so they must not be subtracted again
       db.saveTransaction({
         signature: 'tx-1',
         orderId: 'ord-1',
@@ -449,9 +449,9 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
         executionMode: 'LIVE',
       });
 
-      // Daily Total PnL = -0.005 (realized) + (-0.012 unrealized) - 0.001 (fees) = -0.018 SOL
+      // Daily Total PnL = -0.005 (realized) + (-0.012 unrealized) = -0.017 SOL; Q3: the 0.001 SOL fee is not taken a second time
       const totalPnL = db.getDailyTotalPnLSol('LIVE');
-      expect(totalPnL).toBeCloseTo(-0.018, 4);
+      expect(totalPnL).toBeCloseTo(-0.017, 4);
     });
 
     it('B20.2: risk engine halts trading when open position unrealized drawdown breaches daily loss threshold', () => {

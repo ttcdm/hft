@@ -486,7 +486,7 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
       });
     });
 
-    it('accurately computes complex multi-leg portfolio daily PnL (realized + unrealized - fees)', () => {
+    it('accurately computes complex multi-leg portfolio daily PnL (realized + unrealized; fees are inside each position basis)', () => {
       const now = Date.now();
 
       // Closed winning trade (+0.010 SOL)
@@ -581,10 +581,10 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
       // Expected Daily Total PnL:
       // Closed: +0.010 - 0.015 = -0.005 SOL
       // Unrealized: (0.012 - 0.008) + (0.003 - 0.025) = +0.004 - 0.022 = -0.018 SOL
-      // Fees: -0.002 SOL
-      // Total = -0.005 + (-0.018) - 0.002 = -0.025000 SOL
+      // Fees: the 0.002 SOL of the RECONCILED trade is already inside its position's cost basis, so it is not taken a second time (Q3)
+      // Total = -0.005 + (-0.018) = -0.023000 SOL
       const dailyTotalPnL = db.getDailyTotalPnLSol('LIVE');
-      expect(dailyTotalPnL).toBeCloseTo(-0.025, 4);
+      expect(dailyTotalPnL).toBeCloseTo(-0.023, 4);
     });
 
     it('strictly isolates PAPER and LIVE modes in daily total PnL', () => {

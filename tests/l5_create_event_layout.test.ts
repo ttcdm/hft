@@ -29,16 +29,27 @@ describe('L5: CreateEvent decoding follows the pump IDL', () => {
     expect(ev.initialPriceSol).toBeCloseTo(Number(ev.virtualSolReserves) / Number(ev.virtualTokenReserves) / 1000, 18);
   });
 
-  it('distinct reserves survive the round trip (a decoder reading the wrong offsets cannot pass this)', () => {
+  it('distinct reserves are read from the IDL offsets (bytes laid out here by hand, not by the production encoder)', () => {
+    // T5: the old version encoded with PumpFeedListener.encodeCreateEventLog and decoded with the same module, so a shared offset
+    // bug passed. This lays the bytes out from the pump IDL independently: disc, 3 length-prefixed strings, mint, bonding_curve,
+    // user, creator, i64 timestamp, then virtual_token, virtual_sol, real_token, token_total_supply as u64 LE.
     const mint = new PublicKey('CzLSujWBLFsSjncfkh59rQD4NJYsZUMffEFrNJfiBAGS');
-    const creator = new PublicKey('7xK9nMQk3mPzV1W8L5tG7yD2jX4vB6nS8cF9eR3tY1uQ');
-    const log = PumpFeedListener.encodeCreateEventLog({
-      name: 'N', symbol: 'S', uri: 'u', mint, creator,
-      virtualTokenReserves: 1_111_111_111_111_111n, virtualSolReserves: 22_222_222_222n, realTokenReserves: 333_333_333_333_333n, tokenTotalSupply: 999_999_999_999_999n,
-    });
+    const curve = new PublicKey('7xK9nMQk3mPzV1W8L5tG7yD2jX4vB6nS8cF9eR3tY1uQ');
+    const user = new PublicKey('4Nd1mBQtrMJVYVfKGfVtaTgnxC7yJrBPJ5U1s5j9Pump');
+    const creator = new PublicKey('11111111111111111111111111111112');
+    const str = (v: string) => { const b = Buffer.from(v, 'utf8'); const len = Buffer.alloc(4); len.writeUInt32LE(b.length); return Buffer.concat([len, b]); };
+    const u64 = (n: bigint) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(n); return b; };
+    const ts = Buffer.alloc(8); ts.writeBigInt64LE(1_700_000_000n);
+    const data = Buffer.concat([
+      Buffer.from('1b72a94ddeeb6376', 'hex'), str('Name'), str('SYM'), str('https://u'),
+      mint.toBuffer(), curve.toBuffer(), user.toBuffer(), creator.toBuffer(), ts,
+      u64(1_111_111_111_111_111n), u64(22_222_222_222n), u64(333_333_333_333_333n), u64(999_999_999_999_999n),
+    ]);
     const l = new PumpFeedListener();
-    const ev = l.parseLogs({ err: null, signature: 's', logs: PumpFeedListener.asPumpInvocation(log) } as any, { slot: 1 })!;
+    const ev = l.parseLogs({ err: null, signature: 's', logs: PumpFeedListener.asPumpInvocation(`Program data: ${data.toString('base64')}`) } as any, { slot: 1 })!;
     l.destroy();
+    expect(ev).not.toBeNull();
+    expect([ev.name, ev.symbol, ev.mint, ev.creator, ev.user]).toEqual(['Name', 'SYM', mint.toBase58(), creator.toBase58(), user.toBase58()]);
     expect([ev.virtualTokenReserves, ev.virtualSolReserves, ev.realTokenReserves, ev.tokenTotalSupply]).toEqual([1_111_111_111_111_111n, 22_222_222_222n, 333_333_333_333_333n, 999_999_999_999_999n]);
   });
 

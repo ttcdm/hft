@@ -213,6 +213,9 @@ export class WorkstationDatabase {
       CREATE INDEX IF NOT EXISTS idx_journal_created ON system_journal(created_at);
       CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts);
       CREATE INDEX IF NOT EXISTS idx_decisions_mint ON decisions(mint);
+      CREATE INDEX IF NOT EXISTS idx_tx_order ON transactions(order_id);
+      CREATE INDEX IF NOT EXISTS idx_tx_mint ON transactions(mint);
+      CREATE INDEX IF NOT EXISTS idx_risk_decisions_created ON risk_decisions(created_at);
     `);
     Logger.info(`SQLite persistence initialized at ${this.dbPath}`);
   }
@@ -482,32 +485,68 @@ export class WorkstationDatabase {
     }
   }
 
+  /**
+   * N18: the append-only audit tables (risk_decisions, decisions, system_journal) grew without bound. Rows older than the retention
+   * window are deleted. Kept regardless of age because something still reads them: the halt journal (the latest row decides whether
+   * trading is halted after a restart) and PAPER_FILL_GATES (marks which old paper fills are unverified, for the closed-trade statistics).
+   * Positions, orders and transactions are never pruned. Returns the number of rows deleted per table.
+   */
+  public pruneOldRows(retentionDays: number, now: number = Date.now()): { riskDecisions: number; decisions: number; journal: number } {
+    if (!Number.isFinite(retentionDays) || retentionDays < 1) return { riskDecisions: 0, decisions: 0, journal: 0 };
+    const cutoff = now - retentionDays * 86_400_000;
+    const run = (sql: string, ...args: number[]) => Number((this.db.prepare(sql).run(...args) as any).changes ?? 0);
+    try {
+      return {
+        riskDecisions: run('DELETE FROM risk_decisions WHERE created_at < ?', cutoff),
+        decisions: run('DELETE FROM decisions WHERE ts < ?', cutoff),
+        journal: run(`DELETE FROM system_journal WHERE created_at < ? AND event_type NOT IN ('TRADING_HALTED','TRADING_HALT_CLEARED','PAPER_FILL_GATES')`, cutoff),
+      };
+    } catch (e: any) {
+      Logger.error(`Retention prune failed: ${e?.message ?? e}`);
+      return { riskDecisions: 0, decisions: 0, journal: 0 };
+    }
+  }
+
   public loadTransactions(orderId?: string): PersistedTransaction[] {
     try {
       const stmt = orderId
         ? this.db.prepare('SELECT * FROM transactions WHERE order_id = ?')
         : this.db.prepare('SELECT * FROM transactions');
-      const rows = (orderId ? stmt.all(orderId) : stmt.all()) as any[];
-      return rows.map((r) => ({
-        signature: r.signature,
-        bundleId: r.bundle_id || undefined,
-        orderId: r.order_id,
-        correlationId: r.correlation_id,
-        mint: r.mint,
-        direction: r.direction as 'BUY' | 'SELL',
-        submissionTransport: r.submission_transport as 'SOLANA_RPC' | 'JITO' | 'PAPER',
-        submissionTime: r.submission_time,
-        landingSlot: r.landing_slot || undefined,
-        confirmationTime: r.confirmation_time || undefined,
-        reconciliationState: r.reconciliation_state,
-        networkFeeLamports: r.network_fee_lamports,
-        jitoTipLamports: r.jito_tip_lamports,
-        executionMode: r.execution_mode as ExecutionMode,
-        error: r.error || undefined,
-      }));
+      return this.mapTransactions((orderId ? stmt.all(orderId) : stmt.all()) as any[]);
     } catch {
       return [];
     }
+  }
+
+  /** N18: transactions in the given reconciliation states, read through idx_tx_reconciliation instead of scanning the whole table. */
+  public loadTransactionsInStates(states: string[]): PersistedTransaction[] {
+    if (states.length === 0) return [];
+    try {
+      const rows = this.db.prepare(`SELECT * FROM transactions WHERE reconciliation_state IN (${states.map(() => '?').join(',')})`).all(...states) as any[];
+      return this.mapTransactions(rows);
+    } catch {
+      return [];
+    }
+  }
+
+  private mapTransactions(rows: any[]): PersistedTransaction[] {
+    return rows.map((r) => ({
+      signature: r.signature,
+      bundleId: r.bundle_id || undefined,
+      orderId: r.order_id,
+      correlationId: r.correlation_id,
+      mint: r.mint,
+      direction: r.direction as 'BUY' | 'SELL',
+      submissionTransport: r.submission_transport as 'SOLANA_RPC' | 'JITO' | 'PAPER',
+      submissionTime: r.submission_time,
+      landingSlot: r.landing_slot || undefined,
+      confirmationTime: r.confirmation_time || undefined,
+      reconciliationState: r.reconciliation_state,
+      networkFeeLamports: r.network_fee_lamports,
+      jitoTipLamports: r.jito_tip_lamports,
+      executionMode: r.execution_mode as ExecutionMode,
+      error: r.error || undefined,
+    }));
   }
 
   public savePosition(pos: NormalizedPosition) {

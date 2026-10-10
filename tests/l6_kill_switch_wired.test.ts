@@ -20,10 +20,8 @@ describe('L6: the header kill switch calls the server', () => {
     expect(fn).not.toMatch(/matching engine threads|Safe liquidation armed|CME\/NY4/);
   });
 
-  it('the server endpoint it calls trips the risk engine and disarms LIVE (behaviour behind the button)', async () => {
-    const { riskEngine } = await import('../server/risk/riskEngine');
-    riskEngine.setKillSwitch(true);
-    expect(riskEngine.isKillSwitchActive()).toBe(true);
-    riskEngine.setKillSwitch(false);
-  });
+  // T6: the behaviour behind the button (endpoint -> risk engine, LIVE disarmed, trades refused as KILL_SWITCH_ACTIVE, strict input) is
+  // asserted over real HTTP in tests/behaviour_http.test.ts ('PAPER never sends, and the kill switch refuses new trades', 'arming policy
+  // and readiness', 'kill switch input is strict'). The three source checks above stay because there is no DOM test environment; they
+  // are source reads of App.tsx, not behaviour, and the Chromium click-through (scripts/visual) is the real check of the button.
 });

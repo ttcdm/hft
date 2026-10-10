@@ -47,6 +47,7 @@ describe('P3b: untracked wallet token balances', () => {
     TradeReconciler.txFetchRetryDelaysMs = [400, 800, 1600, 3200, 6400];
     coordinator.cleanup();
     vi.restoreAllMocks();
+    vi.unstubAllEnvs(); // T14: restored even when a test fails before its own cleanup line
   });
 
   const posFor = (mint: PublicKey) => workstationDb.loadPositions().find((p) => p.mint === mint.toBase58() && p.status !== 'CLOSED');
@@ -178,7 +179,6 @@ describe('P3b: untracked wallet token balances', () => {
       reprice(p, 0.0014);
       await coordinator.evaluateAndProcessExits();
       expect(close.mock.calls.some((c) => c[0] === p.id && /TAKE_PROFIT/.test(String(c[2])))).toBe(true);
-      vi.unstubAllEnvs();
     });
   });
 

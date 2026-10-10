@@ -2,6 +2,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import { Keypair } from '@solana/web3.js';
+import { WorkstationDatabase } from '../server/db/database';
 import { startApp, startRpcStub, scratchDir, haltInSeparateProcess, MAINNET_GENESIS, LOCALNET_STUB_GENESIS, type AppHandle, type RpcStub } from './helpers/liveServer';
 
 /**
@@ -266,6 +267,48 @@ describe('boolean fields are read strictly: the string "false" is false', () => 
       // arm:"false" must not be read as arm:true (it would then reach the confirmation-code check instead of a plain disarm)
       const disarm = await app.call('POST', '/api/execution/arm', { arm: 'false' });
       expect(disarm.status).toBe(200);
+    } finally { await rpc.close(); }
+  }, 90_000);
+});
+
+describe('POST /api/auto/kill with exitAll closes the open positions (seeded state, real server)', () => {
+  const seed = (dbPath: string, ids: string[]) => {
+    const db = new WorkstationDatabase(dbPath);
+    const now = Date.now();
+    for (const id of ids) {
+      db.savePosition({
+        id, mint: Keypair.generate().publicKey.toBase58(), symbol: 'KILL', name: 'Kill test', tokenDecimals: 6, tokenQuantityRaw: '1000000000',
+        entryPriceSol: 1e-7, currentPriceSol: 1e-7, currentValueSol: 100, costBasisLamports: 100_000_000_000, realizedPnLSol: 0, status: 'OPEN',
+        venue: 'PUMP_BONDING_CURVE', executionMode: 'PAPER', entryTxSignature: `PAPER:${id}`, entryTimestamp: now, lastMarkTimestamp: now, recordUpdatedAt: now, updatedAt: now,
+      } as any);
+    }
+    (db as any).db.close();
+  };
+  const statuses = async (app: { call: (m: 'GET', r: string) => Promise<{ json: any }> }, ids: string[]) => {
+    const r = await app.call('GET', '/api/workstation/positions');
+    const rows: any[] = r.json?.positions ?? [];
+    return ids.map((id) => rows.find((p) => p.id === id)?.status);
+  };
+
+  it('exitAll "false" leaves the positions open; exitAll true closes them and reports how many', async () => {
+    const rpc = await startRpcStub(LOCALNET_STUB_GENESIS);
+    try {
+      const d = dir();
+      const ids = ['kill-a', 'kill-b'];
+      seed(`${d}/app.db`, ids);
+      const app = await startApp(d, { SOLANA_RPC_URL: rpc.url, ALLOWED_CLUSTER: 'localnet', LOCALNET_GENESIS_HASH: LOCALNET_STUB_GENESIS }); handles.push(app);
+      expect(await statuses(app, ids)).toEqual(['OPEN', 'OPEN']);
+
+      const no = await app.call('POST', '/api/auto/kill', { exitAll: false });
+      expect(no.status).toBe(200);
+      expect(no.json.closed).toBe(0);
+      expect(await statuses(app, ids)).toEqual(['OPEN', 'OPEN']);
+
+      const yes = await app.call('POST', '/api/auto/kill', { exitAll: true });
+      expect(yes.status).toBe(200);
+      expect(yes.json.closed).toBe(2);
+      expect(await statuses(app, ids)).toEqual(['CLOSED', 'CLOSED']);
+      expect(sends(rpc)).toBe(0); // PAPER: closing never reaches the RPC as a send
     } finally { await rpc.close(); }
   }, 90_000);
 });

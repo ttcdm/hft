@@ -881,7 +881,7 @@ export class ExecutionCoordinator {
     if (localSigner.getStatus() !== 'READY') return { recovered, stillOrphaned };
     const wallet = localSigner.getPublicKey();
     const candidates = workstationDb
-      .loadTransactions()
+      .loadTransactionsInStates(['RECONCILIATION_REQUIRED'])
       .filter((t) => t.direction === 'BUY' && t.executionMode === 'LIVE' && t.reconciliationState === 'RECONCILIATION_REQUIRED');
     for (const t of candidates) {
       try {
@@ -944,7 +944,7 @@ export class ExecutionCoordinator {
     );
     // A buy still waiting for recovery (RECONCILIATION_REQUIRED / PENDING) owns its mint: recoverOrphanedBuys handles it.
     const inRecovery = new Set(
-      workstationDb.loadTransactions()
+      workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED', 'PENDING'])
         .filter((t) => t.direction === 'BUY' && t.executionMode === 'LIVE' && (t.reconciliationState === 'RECONCILIATION_REQUIRED' || t.reconciliationState === 'PENDING'))
         .map((t) => t.mint)
     );

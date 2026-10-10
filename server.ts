@@ -1569,6 +1569,11 @@ app.get('/api/workstation/events', requireOperatorAuth, (req, res) => {
   });
 });
 
+// R10s: an unknown /api path is a 404 JSON, never the SPA's index.html with a 200 (the auth gate has already answered unauthenticated callers).
+app.use('/api', (req, res) => {
+  res.status(404).json({ success: false, error: `No such API route: ${req.method} ${req.path}` });
+});
+
 // Centralized error-handling middleware
 app.use(errorHandler);
 
@@ -1619,6 +1624,14 @@ async function startServer() {
     solPriceService.startAutoRefresh();
     pumpFunService.startBackground();
   }
+  // N18: bound the append-only audit tables (default 90 days; APEX_RETENTION_DAYS, 0 disables). Once at boot, then daily.
+  const retentionDays = process.env.APEX_RETENTION_DAYS === undefined ? 90 : Number(process.env.APEX_RETENTION_DAYS);
+  const prune = () => {
+    const r = workstationDb.pruneOldRows(retentionDays);
+    if (r.riskDecisions + r.decisions + r.journal > 0) Logger.info(`Retention: pruned ${r.riskDecisions} risk decisions, ${r.decisions} decisions, ${r.journal} journal rows older than ${retentionDays} days`);
+  };
+  prune();
+  setInterval(prune, 86_400_000).unref();
   autoSnipeController.startMonitor(); // G3: kill-switch triggers and wallet audit (inert while the mode is OFF)
   server.listen(PORT, BIND_HOST, () => {
     console.log(`[APEX QUANT HFT] Autonomous Execution Engine running on ${BIND_HOST}:${PORT}`);

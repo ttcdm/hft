@@ -46,7 +46,20 @@ describe('L9: mark-feed health is real, and a LIVE buy with nothing spendable is
     const trade = vi.spyOn(executionCoordinator, 'executeTrade');
     const res = await memecoinAggregator.executeSnipe({ contractAddress: Keypair.generate().publicKey.toBase58(), amountUsd: 5, platform: 'PUMP_FUN', provenance: 'REAL_ONCHAIN', signalTimestamp: Date.now() } as any);
     expect(res.success).toBe(false);
-    expect(res.message).toMatch(/NO_SPENDABLE_BANKROLL|WALLET_BALANCE|Capital sizing/);
+    // T2: the refusal is the sizer's own (spendable <= 0 never returns approved), which comes before the aggregator's NO_SPENDABLE_BANKROLL branch
+    expect(res.message).toMatch(/Capital sizing failed \(INSUFFICIENT_SPENDABLE_BANKROLL\)/);
+    expect(trade).not.toHaveBeenCalled();
+  });
+
+  it('control: with a funded wallet the same snipe gets past the spendable check and is stopped by the next gate (market data), so the refusal above is the spendable check', async () => {
+    solPriceService.setPrice(150, 'TEST_FIXTURE');
+    vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('LIVE');
+    vi.spyOn(executionCoordinator, 'getRealWalletBalanceSol').mockReturnValue(1.0);
+    const trade = vi.spyOn(executionCoordinator, 'executeTrade');
+    const res = await memecoinAggregator.executeSnipe({ contractAddress: Keypair.generate().publicKey.toBase58(), amountUsd: 5, platform: 'PUMP_FUN', provenance: 'REAL_ONCHAIN', signalTimestamp: Date.now() } as any);
+    expect(res.success).toBe(false);
+    expect(res.message).not.toMatch(/NO_SPENDABLE_BANKROLL|Capital sizing|INSUFFICIENT/);
+    expect(res.message).toMatch(/MARKET_DATA_UNAVAILABLE/); // the stub RPC has no curve: the later gate answers
     expect(trade).not.toHaveBeenCalled();
   });
 });

@@ -60,7 +60,7 @@ describe('Q8: wallet audit ignores trades in flight and PAPER deltas', () => {
   it('a PAPER exit journals no wallet delta; a LIVE exit does', async () => {
     for (const mode of ['PAPER', 'LIVE'] as const) {
       vi.spyOn(workstationDb, 'loadPositions').mockReturnValue([{ id: `p-${mode}`, mint: `m-${mode}`, symbol: 'Q8', executionMode: mode, costBasisLamports: 5_000_000 } as any]);
-      vi.spyOn(executionCoordinator as any, 'closePositionImpl').mockResolvedValue({ success: true, pnlSol: 0.001, status: 'CLOSED' });
+      vi.spyOn(executionCoordinator as any, 'closePositionImpl').mockResolvedValue({ success: true, pnlSol: 0.001, status: 'CLOSED', solMoved: 0.006 }); // S2: the impl reports what it moved
       const log = vi.spyOn(workstationDb, 'logDecision');
       await executionCoordinator.closePosition(`p-${mode}`, 100, 'STOP_LOSS');
       const row = log.mock.calls.map((c) => c[0]).find((r) => r.outcome === 'EXITED')!;

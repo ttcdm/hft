@@ -237,6 +237,45 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
     });
   });
 
+  describe('S2: the exit journals the SOL this call actually moved', () => {
+    const exitedDelta = (spy: ReturnType<typeof vi.spyOn>) => (spy.mock.calls.map((c) => c[0] as any).find((r) => r.outcome === 'EXITED'))?.solDelta;
+    const balance = (amount: string) => { (coordinator as any).connection.getTokenAccountBalance = vi.fn(async () => ({ value: { amount } })); };
+
+    it('a normal full exit journals cost basis + realized PnL', async () => {
+      const log = vi.spyOn(workstationDb, 'logDecision');
+      balance('1000000000');
+      await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(exitedDelta(log)).toBeCloseTo(0.1 - 0.05, 9);
+    });
+
+    it('an empty wallet closes the row with nothing sent and journals 0, not the cost basis as an inflow', async () => {
+      const log = vi.spyOn(workstationDb, 'logDecision');
+      balance('0');
+      const res = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(res.success).toBe(true);
+      expect(submit).not.toHaveBeenCalled();
+      expect(exitedDelta(log)).toBe(0); // was +0.1 SOL of credit that never arrived
+    });
+
+    it('a sell clamped to a smaller wallet journals the clamped basis (0.06), not the row basis (0.1)', async () => {
+      const log = vi.spyOn(workstationDb, 'logDecision');
+      balance('600000000');
+      await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(exitedDelta(log)).toBeCloseTo(0.06 - 0.05, 9); // was 0.1 - 0.05
+    });
+
+    it('adopting an earlier sell journals 0: that sell moved the SOL, this call moved none', async () => {
+      (TradeReconciler.reconcileSellTransaction as any).mockResolvedValue({ success: false, reconciliationState: 'RECONCILIATION_REQUIRED', error: 'fill unreadable' });
+      await coordinator.closePosition(posId, 100, 'STOP_LOSS'); // sent, fill unreadable: pending
+      const log = vi.spyOn(workstationDb, 'logDecision');
+      balance('0'); // the wallet shows the sell landed
+      const again = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(again.success).toBe(true);
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(exitedDelta(log)).toBe(0);
+    });
+  });
+
   describe('Q16/Q17: LIVE entry guards', () => {
     const buy = () => coordinator.executeTrade({
       signalTimestamp: Date.now(), mint: VALID_PUMP_MINT_1.toBase58(), symbol: 'Q16', name: 'Q16', amountSol: 0.005,

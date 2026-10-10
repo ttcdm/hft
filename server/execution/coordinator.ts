@@ -2704,7 +2704,7 @@ export class ExecutionCoordinator {
     positionId: string,
     sellPct: number = 100,
     reason: string = 'Manual Close'
-  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string }> {
+  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number }> {
     // A halt stops entries and discretionary exits. It never stops the exits that protect the wallet: stop-loss, trailing stop,
     // an operator's manual close and panic liquidation (a halt that froze a losing position would be the opposite of its purpose).
     if (this.haltReason && !PROTECTIVE_EXIT_REASONS.test(reason)) {
@@ -2717,7 +2717,6 @@ export class ExecutionCoordinator {
       const res = await this.closePositionImpl(positionId, sellPct, reason);
       this.recordExitOutcome(positionId, res, before?.executionMode);
       if (res.success && before) {
-        const fraction = Math.min(100, Math.max(1, sellPct)) / 100;
         workstationDb.logDecision({
           autoMode: 'n/a',
           mint: before.mint,
@@ -2728,8 +2727,12 @@ export class ExecutionCoordinator {
           reason,
           inputs: { sellPct, mode: before.executionMode, pnlSol: res.pnlSol },
           positionId,
-          // Q8: only a LIVE exit moves the wallet; a PAPER exit journaled a delta the balance never showed, which the wallet audit read as a drain
-          solDelta: before.executionMode === 'LIVE' ? (before.costBasisLamports / 1e9) * fraction + res.pnlSol : undefined,
+          // Q8: only a LIVE exit moves the wallet; a PAPER exit journaled a delta the balance never showed, which the wallet audit read as a drain.
+          // S2: and only what THIS call actually moved. Adopting an earlier sell, closing an empty wallet without a send, and a sell clamped
+          // to a smaller wallet balance all used to journal the pre-clamp cost basis as an inflow that never arrived (a phantom credit that
+          // the DEVNET_LIVE audit then read as an unexplained change). closePositionImpl reports the SOL it moved; a LIVE success that
+          // reports none journals 0, which fails safe (any real inflow it missed shows up as unexplained and halts).
+          solDelta: before.executionMode === 'LIVE' ? (res.solMoved ?? 0) : undefined,
         });
       }
       return res;
@@ -2742,7 +2745,7 @@ export class ExecutionCoordinator {
     positionId: string,
     sellPct: number,
     reason: string
-  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string }> {
+  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number }> {
     if (this.inFlightPositionExits.has(positionId)) {
       return { success: false, pnlSol: 0, error: 'EXIT_IN_PROGRESS: An exit transaction for this position is already in progress.' };
     }
@@ -2861,7 +2864,7 @@ export class ExecutionCoordinator {
           workstationDb.savePosition(target);
           this.raiseOperatorAlert('SELL_ADOPTED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed but its fill could not be read. The position now matches the wallet; realized PnL for it was not recorded.`, positionId);
           await this.syncRealWalletBalance();
-          return { success: true, pnlSol: 0, status: target.status };
+          return { success: true, pnlSol: 0, status: target.status, solMoved: 0 }; // S2: the earlier sell moved the SOL; this call moved none
         }
         if (Date.now() - pendingSell.ts < PENDING_SELL_WINDOW_MS) {
           return { success: false, pnlSol: 0, error: `SELL_PENDING_VERIFICATION: sell ${pendingSell.signature.slice(0, 8)} was sent and is not confirmed or expired yet; not selling again` };
@@ -2890,7 +2893,7 @@ export class ExecutionCoordinator {
             target.exitReason = 'RECONCILED_ZERO_BALANCE: the wallet held no tokens when the sell was prepared';
             workstationDb.savePosition(target);
             this.raiseOperatorAlert('POSITION_BALANCE_MISSING', `${target.symbol || target.mint} was closed without a sell: the wallet held none of it. Realized PnL for it was not recorded.`, positionId);
-            return { success: true, pnlSol: 0, status: 'CLOSED' };
+            return { success: true, pnlSol: 0, status: 'CLOSED', solMoved: 0 }; // S2: nothing was sent, so nothing moved
           }
           target.costBasisLamports = Math.round(target.costBasisLamports * Number(held) / Number(totalTokensRaw));
           target.tokenQuantityRaw = held.toString();
@@ -3053,6 +3056,9 @@ export class ExecutionCoordinator {
         return { success: false, pnlSol: 0, error: subRes.error || 'Failed to submit or confirm sell bundle' };
       }
 
+      // S2: the basis being sold, AFTER any clamp to the wallet balance above (target.costBasisLamports was scaled there)
+      const costSoldSol = (target.costBasisLamports / 1e9) * fraction;
+
       // Reconcile real proceeds from confirmed transaction
       const sellRecon = await TradeReconciler.reconcileSellTransaction(
         this.connection,
@@ -3094,6 +3100,7 @@ export class ExecutionCoordinator {
         success: true,
         pnlSol: sellRecon.actualRealizedPnLSol,
         status: target.status,
+        solMoved: costSoldSol + sellRecon.actualRealizedPnLSol,
       };
     } catch (err: any) {
       return { success: false, pnlSol: 0, error: err.message };

@@ -27,6 +27,10 @@ const rec = (step: string, ok: boolean, detail: string) => {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${step}: ${detail}`);
 };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// S7: neither the driver nor the server it spawns may append to the checkout's apex_engine.wal.
+const checkoutWal = path.join(ROOT, 'apex_engine.wal');
+const walSize = (): number | null => (fs.existsSync(checkoutWal) ? fs.statSync(checkoutWal).size : null);
+const walBefore = walSize();
 
 /** Startup reconciliation (including the wallet token scan) finishes in the background; arming before it is refused by design. */
 async function waitCanArm(call: (m: string, p: string, b?: unknown) => Promise<any>, timeoutMs = 60_000) {
@@ -251,6 +255,7 @@ async function main() {
       SOLANA_RPC_URL: info.url,
       ENABLE_RPC_FALLBACK: 'true',
       APEX_DB_PATH: path.join(scratch, 'app.db'),
+      APEX_WAL_PATH: path.join(scratch, 'app.wal'), // S7: without this the server wrote cwd/apex_engine.wal in the checkout
       SIGNER_KEYPAIR_PATH: keyPath,
       // Set only after the driver asserted (above) that the RPC reports the local validator's genesis hash.
       LOCALNET_SOL_PRICE_USD: '150', // labelled LOCALNET_FIXED in the price service; a local validator has no market
@@ -533,6 +538,7 @@ async function cleanup() {
 main()
   .catch((e) => rec('harness error', false, String(e?.stack || e).slice(0, 800)))
   .finally(async () => {
+    rec('the checkout apex_engine.wal was not written by this run', walSize() === walBefore, `${walBefore ?? 'absent'} -> ${walSize() ?? 'absent'} bytes`);
     const bad = results.filter((r) => !r.ok);
     console.log(`\n${results.length - bad.length}/${results.length} steps passed (scratch ${scratch})`);
     if (bad.length || process.env.LOCALNET_VERBOSE) {

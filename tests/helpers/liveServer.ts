@@ -96,7 +96,7 @@ export function throwawayKeyFile(dir: string): string {
   return f;
 }
 
-const baseEnv = (dir: string, extra: Record<string, string>): Record<string, string> => ({
+export const baseEnv = (dir: string, extra: Record<string, string>): Record<string, string> => ({
   PATH: process.env.PATH ?? '',
   HOME: process.env.HOME ?? dir,
   NODE_ENV: 'production',
@@ -104,6 +104,10 @@ const baseEnv = (dir: string, extra: Record<string, string>): Record<string, str
   APEX_DB_PATH: path.join(dir, 'app.db'),
   SIGNER_KEYPAIR_PATH: throwawayKeyFile(dir),
   OPERATOR_PASSWORD: 'behaviour-test-password',
+  // S7: no test child may default to a public RPC (it is outside the vitest network guard): a closed loopback port on the local cluster.
+  SOLANA_RPC_URL: 'http://127.0.0.1:9',
+  ALLOWED_CLUSTER: 'localnet',
+  LOCALNET_GENESIS_HASH: LOCALNET_STUB_GENESIS,
   SOLANA_WS_URL: 'ws://127.0.0.1:9',
   JITO_BLOCK_ENGINE_URL: 'http://127.0.0.1:9',
   APEX_DISABLE_EXTERNAL_FEEDS: 'true', // no price/pump feeds from a child process: it is outside the vitest network guard

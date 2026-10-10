@@ -289,6 +289,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     pool.devHoldingPct = m.devHoldingPct ?? -1;
     if (now - (this.lastPoolPush.get(t.mint) ?? 0) >= 1_000) {
       this.lastPoolPush.set(t.mint, now);
+      // S14: one entry per mint ever traded, never removed. Keep the most recent 1,000 (an entry only throttles a mint's price push to once a second).
+      if (this.lastPoolPush.size > 1_000) this.lastPoolPush.delete(this.lastPoolPush.keys().next().value as string);
       this.emit('price_update', { pool });
     }
   }

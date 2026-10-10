@@ -43,6 +43,14 @@ export class CurveVelocityEvaluator {
 
   private readonly maxTransitionsPerMint = 120;
   private readonly maxTradeFlowsPerMint = 600;
+  /** S14: the number of mints kept, oldest first out. Per-mint lists were bounded; the maps themselves grew for as long as the feed ran. */
+  private readonly maxMints = 1_000;
+
+  private trimMints(): void {
+    for (const m of [this.transitionsByMint, this.tradeFlowsByMint]) {
+      while (m.size > this.maxMints) m.delete(m.keys().next().value as string);
+    }
+  }
 
   /**
    * Record a bonding curve reserve transition at a specific Solana slot.
@@ -60,6 +68,7 @@ export class CurveVelocityEvaluator {
     if (!list) {
       list = [];
       this.transitionsByMint.set(cleanMint, list);
+      this.trimMints();
     }
 
     list.push({
@@ -93,6 +102,7 @@ export class CurveVelocityEvaluator {
     if (!flows) {
       flows = [];
       this.tradeFlowsByMint.set(cleanMint, flows);
+      this.trimMints();
     }
 
     flows.push({

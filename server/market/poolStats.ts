@@ -5,6 +5,9 @@ export const CURVE_GRADUATION_SOL = 85;
 export const POOL_STATS_WINDOW_MS = 5 * 60_000;
 const MAX_TRADES_KEPT = 2_000;
 const MAX_MINTS_KEPT = 300;
+/** S14: wallets tracked per mint. Above this (plus slack) zero balances go first, then the smallest holders. */
+const MAX_HOLDERS_KEPT = 5_000;
+const HOLDER_TRIM_SLACK = 500;
 
 export interface MeasuredPoolStats {
   /** SOL per token from the last trade's virtual reserves. */
@@ -36,6 +39,8 @@ interface PoolState {
   trades: Array<{ at: number; isBuy: boolean; sol: number; priceSol: number }>;
   /** Token balances built from every trade since creation. Exact when the whole history was seen (the watch starts at the create). */
   balances: Map<string, bigint>;
+  /** S14: sum of `balances`, kept incrementally so `get` needs no pass over every holder for it. */
+  outOfCurve: bigint;
   seen: Set<string>;
   tradeCount: number;
 }
@@ -73,7 +78,7 @@ export class OnChainPoolStats {
       realSolReserves: 0,
       realTokenReserves: opts.realTokenReserves ?? null,
       initialRealTokenReserves: opts.realTokenReserves ?? null,
-      trades: [], balances: new Map(), seen: new Set(), tradeCount: 0,
+      trades: [], balances: new Map(), outOfCurve: 0n, seen: new Set(), tradeCount: 0,
     });
   }
 
@@ -102,8 +107,23 @@ export class OnChainPoolStats {
     if (s.trades.length > MAX_TRADES_KEPT) s.trades.shift();
     const prev = s.balances.get(t.user) ?? 0n;
     const next = t.isBuy ? prev + t.tokenAmount : prev - t.tokenAmount;
-    s.balances.set(t.user, next > 0n ? next : 0n);
+    const nextBal = next > 0n ? next : 0n;
+    s.balances.set(t.user, nextBal);
+    s.outOfCurve += nextBal - prev;
+    if (s.balances.size > MAX_HOLDERS_KEPT + HOLDER_TRIM_SLACK) this.trimHolders(s);
     return true;
+  }
+
+  /** S14: back to MAX_HOLDERS_KEPT wallets: empty ones first, then the smallest. The insiders' balances are never dropped. */
+  private trimHolders(s: PoolState): void {
+    for (const [w, v] of s.balances) if (v === 0n && !s.insiders.has(w)) s.balances.delete(w);
+    if (s.balances.size <= MAX_HOLDERS_KEPT) return;
+    const droppable = [...s.balances.entries()].filter(([w]) => !s.insiders.has(w)).sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
+    for (const [w, v] of droppable) {
+      if (s.balances.size <= MAX_HOLDERS_KEPT) break;
+      s.balances.delete(w);
+      s.outOfCurve -= v;
+    }
   }
 
   public get(mint: string, now = Date.now()): MeasuredPoolStats | null {
@@ -114,9 +134,17 @@ export class OnChainPoolStats {
     const priceChange5mPct = base && base > 0 ? (s.priceSol / base - 1) * 100 : 0;
 
     const supply = Number(s.supplyRaw);
-    const held = [...s.balances.entries()].sort((a, b) => (b[1] > a[1] ? 1 : b[1] < a[1] ? -1 : 0));
-    const outOfCurve = held.reduce((a, [, v]) => a + Number(v), 0);
-    const top10 = held.slice(0, 10).reduce((a, [, v]) => a + Number(v), 0);
+    // S14: this runs on every trade; the total is kept incrementally and the top ten is a single pass, not a sort of every holder.
+    const outOfCurve = Number(s.outOfCurve);
+    const topTen: bigint[] = [];
+    for (const v of s.balances.values()) {
+      if (topTen.length === 10 && v <= topTen[9]) continue;
+      let i = topTen.length;
+      while (i > 0 && topTen[i - 1] < v) i--;
+      topTen.splice(i, 0, v);
+      if (topTen.length > 10) topTen.pop();
+    }
+    const top10 = topTen.reduce((a, v) => a + Number(v), 0);
     const dev = [...s.insiders].reduce((a, w) => a + Number(s.balances.get(w) ?? 0n), 0);
     return {
       priceSol: s.priceSol,

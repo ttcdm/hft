@@ -22,6 +22,7 @@ import {
 } from 'lucide-react';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
 import { authFetch } from '../services/engineClient';
+import { positionPnlCell } from '../utils/positionPnl';
 
 interface PlugAndPlayTradingModalProps {
   isOpen: boolean;
@@ -582,9 +583,8 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                             <td className="p-2.5 font-mono">{((pos.costBasisLamports ?? 0) / 1e9).toFixed(4)} SOL</td>
                             <td className="p-2.5 font-mono">{(pos.currentValueSol ?? 0).toFixed(4)} SOL</td>
                             <td className="p-2.5 font-mono font-bold">
-                              <span className={(pos.unrealizedPnLPct ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                                {(pos.unrealizedPnLPct ?? 0) >= 0 ? '+' : ''}
-                                {(pos.unrealizedPnLPct ?? 0).toFixed(1)}%
+                              <span className={positionPnlCell(pos).positive ? 'text-emerald-400' : 'text-rose-400'}>
+                                {positionPnlCell(pos).text}
                               </span>
                             </td>
                             <td className="p-2.5">

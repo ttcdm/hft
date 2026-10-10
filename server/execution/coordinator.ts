@@ -1027,6 +1027,7 @@ export class ExecutionCoordinator {
    * C7c: SOL locked as rent in the token accounts of open LIVE positions (paper positions have no account). Uses the
    * SPL rent-exempt minimum for every account; a Token-2022 account with extensions needs more, so for those it is a floor.
    */
+  /** Rent held in open positions' token accounts. Display only: it is already outside the wallet balance, so spendable does not subtract it. */
   public getRentLockedSol(): number {
     const open = workstationDb.loadPositions(undefined, 'ACTIVE').filter((p) => p.executionMode === 'LIVE');
     return (open.length * CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS) / 1e9;
@@ -1034,7 +1035,7 @@ export class ExecutionCoordinator {
 
   public getSpendableBankrollSol(): number {
     const raw = this.realWalletBalanceSol ?? 0;
-    return CapitalSizer.calculateSpendableBankroll(raw, 0.015, this.inFlightReservedSol, this.getRentLockedSol());
+    return CapitalSizer.calculateSpendableBankroll(raw, 0.015, this.inFlightReservedSol);
   }
 
   public isLiveArmed(): boolean {
@@ -2073,7 +2074,7 @@ export class ExecutionCoordinator {
 
     // 3. Pre-Trade Capital Sizing (B12): spendable bankroll and 10% ceiling check
     const rawWalletBalance = this.realWalletBalanceSol ?? 0;
-    const spendable = CapitalSizer.calculateSpendableBankroll(rawWalletBalance, 0.015, this.inFlightReservedSol, this.getRentLockedSol());
+    const spendable = CapitalSizer.calculateSpendableBankroll(rawWalletBalance, 0.015, this.inFlightReservedSol);
 
     if (spendable <= 0) {
       return {
@@ -2175,7 +2176,10 @@ export class ExecutionCoordinator {
       marketDataTimestamp: marketState.marketDataTimestamp,
       currentOpenPositionsCount: openPositions.length,
       currentTotalExposureSol: totalExposureSol,
-      walletSpendableSol: Math.max(0, spendable - this.inFlightReservedSol),
+      // N12: the risk engine applies the minimum reserve itself, so it gets the balance net of in-flight orders only. `spendable` already
+      // has the reserve and the in-flight amount taken off; passing it (minus in-flight again) charged both twice. Rent held in token accounts
+      // is not in getBalance, so it is not subtracted either.
+      walletSpendableSol: Math.max(0, rawWalletBalance - this.inFlightReservedSol),
       executionMode: 'LIVE',
     });
 

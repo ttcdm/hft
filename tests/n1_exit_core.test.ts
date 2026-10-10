@@ -233,4 +233,29 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
     await coordinator.evaluateAndProcessExits();
     expect((coordinator as any).exitFailures.has('gone-position')).toBe(false);
   });
+
+  it('N12: spendable does not subtract rent already outside the wallet, and the risk engine gets the balance net of in-flight only (the reserve is applied once)', async () => {
+    (coordinator as any).realWalletBalanceSol = 0.2;
+    (coordinator as any).inFlightReservedSol = 0.01;
+    // a LIVE position is open (its token-account rent is NOT part of the 0.2 SOL balance)
+    expect(workstationDb.loadPositions('LIVE', 'ACTIVE').length).toBeGreaterThan(0);
+    expect(coordinator.getSpendableBankrollSol()).toBeCloseTo(0.2 - 0.015 - 0.01, 6);
+
+    for (const p of workstationDb.loadPositions(undefined, 'ACTIVE')) {
+      workstationDb.savePosition({ ...p, status: 'CLOSED', tokenQuantityRaw: '0', costBasisLamports: 0, currentValueSol: 0, currentPriceSol: p.entryPriceSol, realizedPnLSol: 0 } as any);
+    }
+    vi.spyOn(workstationDb, 'getDailyTotalPnLSol').mockReturnValue(0);
+    const evaluate = vi.spyOn(riskEngine, 'evaluateOrder');
+    (coordinator as any).executionMode = 'LIVE';
+    (coordinator as any).isLiveTradingArmed = true;
+    (coordinator as any).inFlightReservedSol = 0;
+    submit.mockResolvedValue({ success: false, signature: '', transport: 'SOLANA_RPC', error: 'x', lifecycleState: 'SUBMIT_FAILED' });
+    (riskEngine as any).lastTradeFailureTimestamp = 0;
+    await coordinator.executeTrade({
+      signalTimestamp: Date.now(), mint: VALID_PUMP_MINT_1.toBase58(), symbol: 'N12', name: 'N12', amountSol: 0.005,
+      source: 'AUTO_SNIPER', provenance: 'REAL_ONCHAIN', eligibilityReport: createPassingEligibilityReport(VALID_PUMP_MINT_1.toBase58()),
+    } as any);
+    expect(evaluate).toHaveBeenCalled();
+    expect(evaluate.mock.calls[0][0].walletSpendableSol).toBeCloseTo(0.2, 6); // balance - in-flight (0), no reserve and no rent taken off yet
+  });
 });

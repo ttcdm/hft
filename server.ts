@@ -1667,10 +1667,9 @@ async function startServer() {
 
   // Test/offline switch: the behaviour tests spawn this server and must not reach Coinbase, CoinGecko, Binance, pump.fun or
   // DexScreener (the vitest network guard cannot see child processes). Production leaves it unset.
-  if (process.env.APEX_DISABLE_EXTERNAL_FEEDS !== 'true') {
-    solPriceService.startAutoRefresh();
-    pumpFunService.startBackground();
-  }
+  const externalFeedsDisabled = process.env.APEX_DISABLE_EXTERNAL_FEEDS === 'true';
+  solPriceService.startForBoot(externalFeedsDisabled); // feeds off + localnet: one refresh so LOCALNET_FIXED is set; feeds off elsewhere: nothing
+  if (!externalFeedsDisabled) pumpFunService.startBackground();
   // N18: bound the append-only audit tables (default 90 days; APEX_RETENTION_DAYS, 0 disables). Once at boot, then daily.
   const retentionDays = process.env.APEX_RETENTION_DAYS === undefined ? 90 : Number(process.env.APEX_RETENTION_DAYS);
   const prune = () => {

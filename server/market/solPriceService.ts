@@ -89,6 +89,16 @@ export class SolPriceService {
     this.timer = null;
   }
 
+  /**
+   * Boot wiring. External feeds on: keep the price fresh in the background. External feeds off (tests, loopback-only servers): no
+   * background polling and no public host, but on a local validator one refresh still runs, because doRefresh() is the only reader of
+   * LOCALNET_SOL_PRICE_USD and without it the first LIVE buy answers SOL_PRICE_UNAVAILABLE. On devnet/mainnet nothing runs.
+   */
+  public startForBoot(externalFeedsDisabled: boolean) {
+    if (!externalFeedsDisabled) return this.startAutoRefresh();
+    if (allowedCluster() === 'localnet') void this.refresh();
+  }
+
   /** Reads from the public sources in order. Concurrent calls share one request. Never throws. */
   public refresh(): Promise<SolPriceReading> {
     if (this.inFlight) return this.inFlight;

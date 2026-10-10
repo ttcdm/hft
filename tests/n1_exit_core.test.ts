@@ -55,7 +55,16 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
     vi.spyOn(localSigner, 'signTransaction').mockImplementation(async (tx: any) => tx);
     PumpCurveService.cachedGlobal = { feeRecipient: DUMMY_FEE_RECIPIENT.toBase58() };
     PumpCurveService.cachedFeeConfig = { feeBps: 100 };
+    // The constructor starts initializeConnection() unawaited; its wallet-balance sync (the mock RPC answers 0.07 SOL) used to land at a
+    // timing-dependent moment inside a test and overwrite the balance the test had set. Capture that run and let it finish first.
+    const realInit = (ExecutionCoordinator.prototype as any).initializeConnection;
+    let initDone: Promise<unknown> = Promise.resolve();
+    vi.spyOn(ExecutionCoordinator.prototype as any, 'initializeConnection').mockImplementation(function (this: any) {
+      initDone = Promise.resolve(realInit.call(this));
+      return initDone;
+    });
     coordinator = new ExecutionCoordinator(mockRpc.createConnection());
+    await initDone;
     simulate = vi.fn(async () => ({ context: { slot: 1 }, value: { err: null, logs: [] } }));
     (coordinator as any).connection.simulateTransaction = simulate;
     vi.spyOn(PumpSwapVenueService, 'resolveVenue').mockResolvedValue({ venue: 'PUMP_BONDING_CURVE' } as any);

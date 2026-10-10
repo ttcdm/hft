@@ -5,9 +5,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import bs58 from 'bs58';
-import { LocalKeypairSigner, localSigner } from '../../../server/solana/signer';
-import { AuthManager, authManager } from '../../../server/middleware/auth';
-import { COMPUTE_BUDGET_PROGRAM_ID } from '../../../server/solana/programs';
+import { LocalKeypairSigner } from '../../../server/solana/signer';
+import { AuthManager } from '../../../server/middleware/auth';
 
 // RFC 8410: id-Ed25519 SPKI public key DER prefix (12 bytes)
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
@@ -156,51 +155,8 @@ describe('Tier 5: Production Readiness — Secrets, Keypair Management & Cryptog
     });
   });
 
-  // =========================================================================
-  // 3. Export Safety & Confirmation Gating
-  // =========================================================================
-  describe('Export Safety & Confirmation Gating', () => {
-    it('SKI-8: private key export fails closed without exact confirmation code', () => {
-      const targetPath = path.join(tempKeyDir, 'export_test.json');
-      const signer = new LocalKeypairSigner();
-      (signer as any).keypairPath = targetPath;
-      signer.generateDedicatedTradingKeypair(true);
-
-      expect(() => {
-        signer.exportKeypairSafely('WRONG_CODE');
-      }).toThrow(/Invalid export confirmation code\. Export rejected\./);
-
-      expect(() => {
-        signer.exportKeypairSafely('');
-      }).toThrow(/Invalid export confirmation code\. Export rejected\./);
-    });
-
-    it('SKI-9: private key export succeeds with CONFIRM_EXPORT_PRIVATE_KEY and returns verifiable 64-byte key', () => {
-      const targetPath = path.join(tempKeyDir, 'export_test.json');
-      const signer = new LocalKeypairSigner();
-      (signer as any).keypairPath = targetPath;
-      const { publicKey } = signer.generateDedicatedTradingKeypair(true);
-
-      const exported = signer.exportKeypairSafely('CONFIRM_EXPORT_PRIVATE_KEY');
-      expect(exported.secretKeyBase58).toBeDefined();
-
-      const decodedBytes = bs58.decode(exported.secretKeyBase58);
-      expect(decodedBytes.length).toBe(64);
-
-      const recoveredKp = Keypair.fromSecretKey(decodedBytes);
-      expect(recoveredKp.publicKey.toBase58()).toBe(publicKey);
-    });
-
-    it('SKI-10: private key export fails closed if signer is NOT_CONFIGURED', () => {
-      const signer = new LocalKeypairSigner();
-      expect(signer.getStatus()).toBe('NOT_CONFIGURED');
-
-      expect(() => {
-        signer.exportKeypairSafely('CONFIRM_EXPORT_PRIVATE_KEY');
-      }).toThrow(/No keypair configured to export/);
-    });
-  });
-
+  // 3. Export of the private key: removed (108). `exportKeypairSafely` had no caller in server/, src/, scripts/ or any route; the
+  // key can only leave the process by the operator reading the key file. Its three tests (SKI-8, SKI-9, SKI-10) went with it.
   // =========================================================================
   // 4. Cryptographic Signer Isolation & Fail-Closed Invariants
   // =========================================================================

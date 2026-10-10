@@ -272,6 +272,21 @@ describe('G1: auto-snipe controller', () => {
     expect(autoSnipeController.getStatus().killReason).toBe('test');
   });
 
+  it('R23: after a restart (in-memory session lost) kill+exitAll still closes what auto bought, and leaves a manual position open', async () => {
+    await setAutoMode('PAPER');
+    const d = await autoSnipeController.submitCandidate(cand(newPool()));
+    expect(d.outcome, d.reason).toBe('BOUGHT');
+    const bought = workstationDb.loadPositions().find((p) => p.id === d.positionId)!;
+    const manualId = `manual-${Date.now()}`;
+    workstationDb.savePosition({ ...bought, id: manualId, mint: Keypair.generate().publicKey.toBase58(), entryTxSignature: `PAPER:${manualId}` } as any);
+    (autoSnipeController as any).session = null; // what a process restart does to the controller
+    const r = await autoSnipeController.kill({ exitAll: true, reason: 'after-restart' });
+    expect(r.closed).toBe(1);
+    const rows = workstationDb.loadPositions();
+    expect(rows.find((p) => p.id === d.positionId)!.status).toBe('CLOSED');
+    expect(rows.find((p) => p.id === manualId)!.status).toBe('OPEN');
+  });
+
   it('both candidate sources hand over to the controller and never call execution directly', () => {
     const fn = (src: string, start: string, end: string) => src.slice(src.indexOf(start), src.indexOf(end, src.indexOf(start)));
     const pump = fs.readFileSync('server/pumpfunService.ts', 'utf8');

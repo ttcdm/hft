@@ -142,18 +142,6 @@ export class LocalKeypairSigner implements TransactionSigner {
     };
   }
 
-  public exportKeypairSafely(confirmationCode: string): { secretKeyBase58: string } {
-    if (confirmationCode !== 'CONFIRM_EXPORT_PRIVATE_KEY') {
-      throw new Error('Invalid export confirmation code. Export rejected.');
-    }
-    if (!this.keypair) {
-      throw new Error('No keypair configured to export.');
-    }
-    return {
-      secretKeyBase58: bs58.encode(this.keypair.secretKey),
-    };
-  }
-
   public generateNewKeypair(forceOverwrite = false): string {
     return this.generateDedicatedTradingKeypair(forceOverwrite).publicKey;
   }

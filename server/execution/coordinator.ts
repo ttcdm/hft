@@ -78,6 +78,9 @@ export interface ExecutionResponse {
 }
 
 /** Exit reasons that run even while all trading is halted (see closePosition). */
+// A blockhash lives ~60-90s; after this a sent-but-unseen sell can no longer land.
+const PENDING_SELL_WINDOW_MS = 100_000;
+
 export const PROTECTIVE_EXIT_REASONS = /^(STOP_LOSS|TRAILING_STOP|EMERGENCY_PANIC_LIQUIDATION|MANUAL|Manual Close)$/;
 
 export class ExecutionCoordinator {
@@ -1197,6 +1200,8 @@ export class ExecutionCoordinator {
     slot?: number;
     error?: string;
     lifecycleState: 'CONFIRMED' | 'SUBMIT_FAILED' | 'REVERTED';
+    /** N2: submitted but never seen failing on chain (timeout / RPC error). It may still land; do not treat as a revert. */
+    unconfirmed?: boolean;
   }> {
     const { tx, orderId, correlationId, side, mint, mintPubkey, owner, tokenProgram, preSnapshot, jitoTipLamports } = params;
     const cfg = executionConfig.getConfig();
@@ -1255,6 +1260,7 @@ export class ExecutionCoordinator {
     let lastSignature = '';
     let lastBundleId: string | undefined;
     let lastError: string | undefined = jitoUnhealthyReason;
+    let lastConfirmDefinite = false;
     let landedSlot: number | undefined;
     let jitoLanded = false;
     let blockhashExpired = false;
@@ -1323,6 +1329,7 @@ export class ExecutionCoordinator {
         break;
       } else {
         lastError = confirmRes.error || 'Transaction dropped or expired on Solana';
+        lastConfirmDefinite = confirmRes.lifecycleState === 'REVERTED';
         // Check if it landed despite confirm timing out
         const postConfirmCheck = await this.checkIfTransactionLanded(submitRes.signature, submitRes.bundleId, owner, mintPubkey, tokenProgram, preSnapshot, side, orderId);
         if (postConfirmCheck.landed) {
@@ -1445,6 +1452,7 @@ export class ExecutionCoordinator {
           transport: 'SOLANA_RPC',
           error: rpcConfirm.error || 'RPC fallback transaction dropped or unconfirmed',
           lifecycleState: 'REVERTED',
+          unconfirmed: rpcConfirm.lifecycleState !== 'REVERTED',
         };
       }
     }
@@ -1457,6 +1465,7 @@ export class ExecutionCoordinator {
       transport: 'JITO',
       error: lastError || 'Transaction unconfirmed or dropped across Jito attempts',
       lifecycleState: lastError?.includes('Failed to submit') ? 'SUBMIT_FAILED' : 'REVERTED',
+      unconfirmed: !!lastSignature && !lastError?.includes('Failed to submit') && !lastConfirmDefinite,
     };
   }
 
@@ -2164,6 +2173,37 @@ export class ExecutionCoordinator {
         jitoTipLamports: resolvedTip.tipLamports,
       });
 
+      if (!subRes.success && subRes.unconfirmed && subRes.signature) {
+        // N2: the buy was sent and never seen failing. It can still land after this returns, so it is not "reverted":
+        // keep it open for reconciliation and let orphan recovery adopt the tokens (and give them a stop-loss) if it does.
+        riskEngine.recordTradeFailure();
+        workstationDb.saveTransaction({
+          signature: subRes.signature,
+          bundleId: subRes.bundleId,
+          orderId: clientOrderId,
+          correlationId,
+          mint: req.mint,
+          direction: 'BUY',
+          submissionTransport: subRes.transport,
+          submissionTime: Date.now(),
+          reconciliationState: 'RECONCILIATION_REQUIRED',
+          networkFeeLamports: 5000,
+          jitoTipLamports: resolvedTip.tipLamports,
+          executionMode: 'LIVE',
+          error: `UNCONFIRMED: ${subRes.error || 'no confirmation before timeout'}`,
+        });
+        this.scheduleOrphanRecovery();
+        return {
+          success: false,
+          lifecycleState: 'RECONCILIATION_REQUIRED',
+          executionMode: 'LIVE',
+          txSignature: subRes.signature,
+          bundleId: subRes.bundleId,
+          error: `UNCONFIRMED: ${subRes.error || 'no confirmation before timeout'}. The transaction was sent and may still land; it is being watched, do not retry the buy.`,
+          correlationId,
+        };
+      }
+
       if (!subRes.success || !subRes.signature) {
         riskEngine.recordTradeFailure();
         workstationDb.saveTransaction({
@@ -2494,6 +2534,44 @@ export class ExecutionCoordinator {
         return { success: false, pnlSol: 0, error: 'Calculated sell quantity is zero' };
       }
 
+      // N3: an earlier sell of this position was sent but its outcome is unknown. Selling again could double-sell a partial, so
+      // read the wallet first: if the balance dropped the sell landed (adopt it), if not wait out the blockhash window.
+      const pendingSell = this.pendingSells.get(positionId);
+      if (pendingSell) {
+        const tp = target.baseTokenProgram ? new PublicKey(target.baseTokenProgram) : TOKEN_PROGRAM_ID;
+        let onChain: bigint | null = null;
+        try {
+          const bal = await this.connection.getTokenAccountBalance(PumpCurveService.getAssociatedTokenAddress(mintPubkey, seller, tp), 'confirmed');
+          onChain = BigInt(bal?.value?.amount ?? '0');
+        } catch (e: any) {
+          // an unreadable ATA balance after a sell that closed the account means it is gone
+          onChain = /could not find account|Invalid param/i.test(String(e?.message)) ? 0n : null;
+        }
+        if (onChain !== null && onChain < totalTokensRaw) {
+          this.pendingSells.delete(positionId);
+          target.exitReason = reason;
+          target.exitTxSignature = pendingSell.signature;
+          target.lastUpdatedTimestamp = Date.now();
+          if (onChain === 0n) {
+            target.status = 'CLOSED';
+            target.tokenQuantityRaw = '0';
+            target.costBasisLamports = 0;
+          } else {
+            target.status = 'PARTIALLY_CLOSED';
+            target.costBasisLamports = Math.round(target.costBasisLamports * Number(onChain) / Number(totalTokensRaw));
+            target.tokenQuantityRaw = onChain.toString();
+          }
+          workstationDb.savePosition(target);
+          this.raiseOperatorAlert('SELL_ADOPTED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed but its fill could not be read. The position now matches the wallet; realized PnL for it was not recorded.`, positionId);
+          await this.syncRealWalletBalance();
+          return { success: true, pnlSol: 0, status: target.status };
+        }
+        if (Date.now() - pendingSell.ts < PENDING_SELL_WINDOW_MS) {
+          return { success: false, pnlSol: 0, error: `SELL_PENDING_VERIFICATION: sell ${pendingSell.signature.slice(0, 8)} was sent and is not confirmed or expired yet; not selling again` };
+        }
+        this.pendingSells.delete(positionId);
+      }
+
       // CloseAccount only succeeds on an empty token account. If the wallet holds more than this sell (dust, an airdrop) or the balance
       // cannot be read, a close instruction would revert the whole sell and the stop-loss with it, so keep the account open (critique #9).
       let closeAtaEffective = closeAta;
@@ -2642,6 +2720,7 @@ export class ExecutionCoordinator {
       });
 
       if (!subRes.success || !subRes.signature) {
+        if (subRes.unconfirmed && subRes.signature) this.pendingSells.set(positionId, { signature: subRes.signature, ts: Date.now() });
         return { success: false, pnlSol: 0, error: subRes.error || 'Failed to submit or confirm sell bundle' };
       }
 
@@ -2659,6 +2738,7 @@ export class ExecutionCoordinator {
       );
 
       if (!sellRecon.success) {
+        this.pendingSells.set(positionId, { signature: subRes.signature, ts: Date.now() });
         return { success: false, pnlSol: 0, error: sellRecon.error };
       }
 
@@ -2750,12 +2830,27 @@ export class ExecutionCoordinator {
   }
 
   // Evaluate dynamic exit conditions for all active positions and execute exits via ExitEngine (B13)
-  public async evaluateAndProcessExits(): Promise<void> {
+  private exitPassInFlight: Promise<void> | null = null;
+  private pendingSells = new Map<string, { signature: string; ts: number }>();
+
+  // N1: one pass at a time. A pass awaits sells that can outlast the 3s timer; an overlapping pass would see the same
+  // ACTIVE row and sell it again, or write back its stale copy over a position the first pass already closed.
+  public evaluateAndProcessExits(): Promise<void> {
+    if (this.exitPassInFlight) return this.exitPassInFlight;
+    const run = this.runExitPass().finally(() => {
+      if (this.exitPassInFlight === run) this.exitPassInFlight = null;
+    });
+    this.exitPassInFlight = run;
+    return run;
+  }
+
+  private async runExitPass(): Promise<void> {
     try {
       await this.updatePositionMarkPrices();
     } catch {}
 
     const positions = workstationDb.loadPositions(undefined, 'ACTIVE');
+    const loadedQty = new Map(positions.map((p) => [p.id, p.tokenQuantityRaw]));
     const now = Date.now();
     // Nothing LIVE is open, so there is no mark to be stale (see the feed heartbeat): reset the clock here too.
     if (!positions.some((p) => p.executionMode === 'LIVE')) {
@@ -2819,6 +2914,11 @@ export class ExecutionCoordinator {
       pos.trailingStopSol = decision.newTrailingStopSol;
       pos.exitStage = decision.shouldExit ? priorExitStage : decision.newExitStage;
       pos.lastUpdatedTimestamp = now;
+      // N1: this row was loaded before the awaits above (and before earlier positions' sells in this pass). If a manual
+      // close, partial sell or reconcile changed it since, writing the stale copy back would resurrect a sold position
+      // or undo a partial; skip it and let the next pass re-evaluate from the current row.
+      const current = workstationDb.loadPositions(undefined, undefined).find((p) => p.id === pos.id);
+      if (!current || current.status === 'CLOSED' || current.tokenQuantityRaw !== loadedQty.get(pos.id)) continue;
       workstationDb.savePosition(pos);
 
       if (decision.shouldExit) {

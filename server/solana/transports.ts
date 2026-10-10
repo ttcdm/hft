@@ -176,7 +176,8 @@ export class SolanaRpcTransport implements ExecutionTransport {
         signature,
         confirmed: false,
         confirmDurationMs: Math.round(performance.now() - t0),
-        lifecycleState: 'REVERTED',
+        // An RPC exception while polling says nothing about the transaction: it may still land. Not a revert (N2).
+        lifecycleState: 'TIMED_OUT',
         error: err.message,
       };
     }

@@ -350,7 +350,10 @@ export class WorkstationDatabase {
   public loadEvidenceClosedTrades(mode?: ExecutionMode): NormalizedPosition[] {
     const closed = this.loadPositions(mode, 'CLOSED');
     const unverified = this.getUnverifiedFillIds();
-    return closed.filter((p) => !unverified.has(p.id)).sort((a, b) => (a.updatedAt ?? 0) - (b.updatedAt ?? 0));
+    // Q2: adopted balances (no known cost) and rows closed because the wallet held nothing (cost 0, realized 0) say nothing about an edge.
+    return closed
+      .filter((p) => !unverified.has(p.id) && !p.entryTxSignature?.startsWith('RECOVERED:') && !p.exitReason?.startsWith('RECONCILED_ZERO_BALANCE'))
+      .sort((a, b) => (a.updatedAt ?? 0) - (b.updatedAt ?? 0));
   }
 
   /**
@@ -646,7 +649,8 @@ export class WorkstationDatabase {
       now,
       now
     );
-    if (realizedDelta !== 0) {
+    // Q2: selling an adopted balance returns money with no known cost; it is not a day's profit
+    if (realizedDelta !== 0 && !pos.entryTxSignature?.startsWith('RECOVERED:')) {
       this.db.prepare('INSERT INTO realized_events (position_id, execution_mode, delta_lamports, ts) VALUES (?, ?, ?, ?)').run(pos.id, pos.executionMode, realizedDelta, now);
     }
   }
@@ -677,8 +681,11 @@ export class WorkstationDatabase {
     return rows.map((r) => {
       const costSol = r.cost_basis_lamports / 1e9;
       const valSol = (Number(r.token_quantity_raw) / Math.pow(10, r.token_decimals)) * r.current_price_sol;
-      const unrealizedSol = valSol - costSol;
-      const unrealizedPct = costSol > 0 ? (unrealizedSol / costSol) * 100 : 0;
+      // Q2: an adopted wallet balance has no known cost (basis 0, entry price = the mark at adoption), so value - 0 is not a gain. Its
+      // unrealized PnL is unknown and reported as 0 everywhere (daily loss gate, kill switch, dashboards).
+      const adopted = typeof r.entry_tx_signature === 'string' && r.entry_tx_signature.startsWith('RECOVERED:');
+      const unrealizedSol = adopted ? 0 : valSol - costSol;
+      const unrealizedPct = !adopted && costSol > 0 ? (unrealizedSol / costSol) * 100 : 0;
 
       const markTs = (r.last_mark_timestamp && r.last_mark_timestamp > 0)
         ? r.last_mark_timestamp

@@ -644,46 +644,6 @@ export class ExecutionCoordinator {
     // 2. Query real wallet SOL
     await this.syncRealWalletBalance();
 
-    // 3. Verify ALL active LIVE positions (OPEN and PARTIALLY_CLOSED) against on-chain token accounts
-    if (signerStatus === 'READY') {
-      const walletPubkey = localSigner.getPublicKey();
-      const activeLivePositions = workstationDb.loadPositions('LIVE', 'ACTIVE');
-
-      for (const pos of activeLivePositions) {
-        try {
-          const mintPubkey = new PublicKey(pos.mint);
-          // Query ATA balance using position's actual token program (supports Token-2022 & standard SPL)
-          const tokenProgramId = pos.baseTokenProgram ? new PublicKey(pos.baseTokenProgram) : undefined;
-          const ata = PumpCurveService.getAssociatedTokenAddress(mintPubkey, walletPubkey, tokenProgramId);
-          // N5: "the account does not exist" is a confirmed zero; any other RPC failure is unknown and must not close a position.
-          let onChainAmount: bigint | null = null;
-          try {
-            const balRes = await this.connection.getTokenAccountBalance(ata, 'confirmed');
-            onChainAmount = BigInt(balRes?.value?.amount ?? '0');
-          } catch (e: any) {
-            if (/could not find account|Invalid param/i.test(String(e?.message))) onChainAmount = 0n;
-            else throw e;
-          }
-
-          if (onChainAmount <= 0n) {
-            // The tokens are gone (sold or moved outside this app). Left OPEN this position blocks arming until someone edits the DB,
-            // while the exit loop keeps trying to sell an empty account. Close it with the reason on the record, and say so.
-            pos.status = 'CLOSED';
-            pos.tokenQuantityRaw = '0';
-            pos.costBasisLamports = 0;
-            pos.exitReason = 'RECONCILED_ZERO_BALANCE: no tokens in the wallet at startup reconciliation';
-            pos.lastUpdatedTimestamp = Date.now();
-            workstationDb.savePosition(pos);
-            this.raiseOperatorAlert('POSITION_GONE', `Position ${pos.symbol || pos.mint.slice(0, 6)} was recorded open but the wallet holds none of it. Closed in the database; realized PnL for it is unknown.`, pos.id);
-            issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) had no on-chain balance: closed in the database`);
-          }
-        } catch (e: any) {
-          mismatchesCount++; // unknown is not fine: an unreadable balance keeps readiness at MISMATCH, but never closes the position
-          issues.push(`Failed to verify on-chain balance for ${pos.symbol}: ${e.message}`);
-        }
-      }
-    }
-
     // 4. Resolve pending transactions from previous runs with actual on-chain transaction verification
     const pendingTxs = workstationDb.getPendingTransactions();
     if (pendingTxs.length > 0) {
@@ -804,6 +764,48 @@ export class ExecutionCoordinator {
           }
         } catch (err: any) {
           Logger.warn(`Failed to reconcile pending transaction ${pTx.signature}: ${err.message}`);
+        }
+      }
+    }
+
+    // 4b. (Q18: after the pending transactions, not before.) Verify ALL active LIVE positions (OPEN and PARTIALLY_CLOSED) against on-chain token accounts
+    // A SELL that landed just before a crash is applied by step 4 above, with its realized PnL. Running this zero-balance close first
+    // would close the position with cost 0 and realized PnL lost.
+    if (signerStatus === 'READY') {
+      const walletPubkey = localSigner.getPublicKey();
+      const activeLivePositions = workstationDb.loadPositions('LIVE', 'ACTIVE');
+
+      for (const pos of activeLivePositions) {
+        try {
+          const mintPubkey = new PublicKey(pos.mint);
+          // Query ATA balance using position's actual token program (supports Token-2022 & standard SPL)
+          const tokenProgramId = pos.baseTokenProgram ? new PublicKey(pos.baseTokenProgram) : undefined;
+          const ata = PumpCurveService.getAssociatedTokenAddress(mintPubkey, walletPubkey, tokenProgramId);
+          // N5: "the account does not exist" is a confirmed zero; any other RPC failure is unknown and must not close a position.
+          let onChainAmount: bigint | null = null;
+          try {
+            const balRes = await this.connection.getTokenAccountBalance(ata, 'confirmed');
+            onChainAmount = BigInt(balRes?.value?.amount ?? '0');
+          } catch (e: any) {
+            if (/could not find account|Invalid param/i.test(String(e?.message))) onChainAmount = 0n;
+            else throw e;
+          }
+
+          if (onChainAmount <= 0n) {
+            // The tokens are gone (sold or moved outside this app). Left OPEN this position blocks arming until someone edits the DB,
+            // while the exit loop keeps trying to sell an empty account. Close it with the reason on the record, and say so.
+            pos.status = 'CLOSED';
+            pos.tokenQuantityRaw = '0';
+            pos.costBasisLamports = 0;
+            pos.exitReason = 'RECONCILED_ZERO_BALANCE: no tokens in the wallet at startup reconciliation';
+            pos.lastUpdatedTimestamp = Date.now();
+            workstationDb.savePosition(pos);
+            this.raiseOperatorAlert('POSITION_GONE', `Position ${pos.symbol || pos.mint.slice(0, 6)} was recorded open but the wallet holds none of it. Closed in the database; realized PnL for it is unknown.`, pos.id);
+            issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) had no on-chain balance: closed in the database`);
+          }
+        } catch (e: any) {
+          mismatchesCount++; // unknown is not fine: an unreadable balance keeps readiness at MISMATCH, but never closes the position
+          issues.push(`Failed to verify on-chain balance for ${pos.symbol}: ${e.message}`);
         }
       }
     }

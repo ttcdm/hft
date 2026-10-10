@@ -194,6 +194,7 @@ async function main() {
   let mintD: PublicKey;
   let mintE: PublicKey;
   let mintF: PublicKey;
+  let mintG: PublicKey;
   try {
     mint = await createCoin();
     rec('seed: create_v2', true, `mint ${mint.toBase58()} created by the real pump program`);
@@ -224,7 +225,8 @@ async function main() {
     mintD = await seedCoin();
     mintE = await seedCoin();
     mintF = await seedCoin();
-    rec('seed: 3 more coins (revert, failed-send, restart scenarios)', true, [mintD, mintE, mintF].map((m) => m.toBase58()).join(' '));
+    mintG = await seedCoin();
+    rec('seed: 4 more coins (revert, failed-send, restart, sell-in-flight scenarios)', true, [mintD, mintE, mintF, mintG].map((m) => m.toBase58()).join(' '));
   } catch (e: any) {
     rec('seed market', false, String(e?.stack || e).slice(0, 600));
     return finish();
@@ -382,9 +384,48 @@ async function main() {
     if (!recovered) await sleep(500);
   }
   rec('(f) restart: position recovered from the chain', !!recovered && chainAfterKill !== null && BigInt(recovered.tokenQuantityRaw) === chainAfterKill, `reconcile ${recon.status} ${JSON.stringify(recon.body).slice(0, 160)}; db=${recovered?.tokenQuantityRaw} chain=${chainAfterKill}; re-arm ${armAgain.status} ${JSON.stringify(armAgain.body).slice(0, 900)}`);
+  // Q1: every fresh coin seeds to the identical curve, so a recovered 0.02 SOL buy must carry the same entry price as the live (a) buy.
+  // Before the fix the recovery path counted the account rent as part of the cost and the entry came out ~27% too high.
+  const entryRatio = recovered && buy.body?.fillPriceSol ? recovered.entryPriceSol / buy.body.fillPriceSol : NaN;
+  rec('(f) Q1: recovered buy carries the same entry price as a live buy of the same size', Math.abs(entryRatio - 1) < 0.02, `recovered entry ${recovered?.entryPriceSol} vs live fill ${buy.body?.fillPriceSol}; ratio ${entryRatio}`);
   if (recovered) {
     const closeRecovered = await call('POST', '/api/execution/close', { positionId: recovered.id, sellPct: 100, reason: 'localnet recovered position' });
     rec('(f) recovered position can be sold', closeRecovered.status === 200 && closeRecovered.body?.success, JSON.stringify(closeRecovered.body).slice(0, 260));
+  }
+
+  // ---- (g) Q18: the app dies right after a SELL lands on-chain, before it records the result ----
+  await sleep(16_000);
+  const buyG = await call('POST', '/api/execution/trade', { mint: mintG.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02 });
+  rec('(g) buy for the sell-in-flight scenario', buyG.status === 200 && buyG.body?.success, JSON.stringify(buyG.body).slice(0, 200));
+  if (buyG.body?.positionId) {
+    await rpcCall(info.url, 'localnet_holdNextResponse', []);
+    const sellInFlight = fetch(`${base}/api/execution/close`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ positionId: buyG.body.positionId, sellPct: 100, reason: 'localnet Q18' }) }).catch(() => null);
+    let heldSell: string[] = [];
+    for (let i = 0; i < 60 && !heldSell.length; i++) {
+      await sleep(250);
+      heldSell = (await rpcCall(info.url, 'localnet_stats', [])).held;
+    }
+    rec('(g) sell landed on-chain with its response withheld', heldSell.length >= 1, `signature ${heldSell[heldSell.length - 1] ?? 'none'}`);
+    proc.kill('SIGKILL');
+    await sellInFlight;
+    await sleep(500);
+    const ataAfterSellKill = await ata(mintG);
+    ({ base, proc } = await startServer());
+    call = api(base);
+    await waitCanArm(call);
+    let after: any = null;
+    for (let i = 0; i < 40; i++) {
+      const list: any = await positions();
+      const arr = Array.isArray(list) ? list : list?.positions || [];
+      after = arr.find((x: any) => x.id === buyG.body.positionId) ?? null;
+      if (!after || after.status === 'CLOSED') break;
+      await sleep(500);
+    }
+    const hist: any = (await call('GET', '/api/workstation/positions?status=CLOSED')).body;
+    const closedArr = Array.isArray(hist) ? hist : hist?.positions || [];
+    const closedRow = closedArr.find((x: any) => x.id === buyG.body.positionId) ?? after;
+    rec('(g) Q18: restart records the sell that already happened, with its realized PnL', !!closedRow && closedRow.status === 'CLOSED' && closedRow.realizedPnLSol !== 0 && (ataAfterSellKill === null || ataAfterSellKill === 0n),
+      `chain ATA ${ataAfterSellKill}; position ${JSON.stringify(closedRow ? { status: closedRow.status, realizedPnLSol: closedRow.realizedPnLSol } : null)}`);
   }
 
   // ---- kill switch over HTTP ----

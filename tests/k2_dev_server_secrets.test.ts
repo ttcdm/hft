@@ -88,3 +88,19 @@ describe('K2 #21: dev server does not serve secret or state files', () => {
     for (const p of LEAKS) expect((await get(base, p)).text, p).not.toContain(SECRET);
   });
 });
+
+describe('F2: the hardened dev server still serves Vite itself', () => {
+  it('serves /@vite/client and node_modules modules, while secrets stay 404', async () => {
+    fs.mkdirSync(path.join(root, 'node_modules/fakepkg'), { recursive: true });
+    fs.writeFileSync(path.join(root, 'node_modules/fakepkg/index.js'), 'export default 1;');
+    const base = await boot({ guard: true, hardenedVite: true });
+    expect((await get(base, '/@vite/client')).status).toBe(200);
+    expect((await get(base, '/node_modules/fakepkg/index.js')).status).toBe(200);
+    for (const p of LEAKS) {
+      const r = await get(base, p);
+      expect(r.text, p).not.toContain(SECRET);
+    }
+    fs.writeFileSync(path.join(root, 'node_modules/fakepkg/.env'), SECRET);
+    expect((await get(base, '/node_modules/fakepkg/.env')).text).not.toContain(SECRET);
+  });
+});

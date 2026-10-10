@@ -20,14 +20,29 @@ const toRegex = (glob: string) => new RegExp('^' + glob.replace(/[.+^${}()|[\]\\
 const denyRes = DENY_FILE_GLOBS.map(toRegex);
 const allowRes = ALLOW_FILE_GLOBS.map(toRegex);
 
-/** true when `relPath` (POSIX-style, relative to the repo root) may be shipped. */
-export function isShippable(relPath: string): boolean {
+/**
+ * F2: the dev server must still reach Vite's own client and pre-bundled deps under node_modules (/@vite/client,
+ * /node_modules/.vite/deps/...). node_modules holds no secrets, so it is denied for releases but not for dev serving.
+ */
+export const DEV_DENY_DIRS = DENY_DIRS.filter((d) => d !== 'node_modules');
+
+function allowedPath(relPath: string, denyDirs: string[]): boolean {
   const parts = relPath.replace(/\\/g, '/').split('/').filter(Boolean);
   if (parts.length === 0) return false;
-  if (parts.slice(0, -1).some((d) => DENY_DIRS.includes(d))) return false;
+  if (parts.slice(0, -1).some((d) => denyDirs.includes(d))) return false;
   const base = parts[parts.length - 1];
   if (allowRes.some((r) => r.test(base))) return true;
   return !denyRes.some((r) => r.test(base));
+}
+
+/** true when `relPath` (POSIX-style, relative to the repo root) may be shipped. */
+export function isShippable(relPath: string): boolean {
+  return allowedPath(relPath, DENY_DIRS);
+}
+
+/** true when the dev server may serve `relPath`: same secret-file rules, but node_modules is allowed (F2). */
+export function isServableInDev(relPath: string): boolean {
+  return allowedPath(relPath, DEV_DENY_DIRS);
 }
 
 /** Lines for `.dockerignore`, generated from the same lists so the two cannot drift. */
@@ -43,7 +58,7 @@ export function dockerignoreLines(): string[] {
 export function viteFsDeny(): string[] {
   return [
     '.env', '.env.*', '*.{crt,pem}',
-    ...DENY_DIRS.map((d) => `**/${d}/**`),
+    ...DEV_DENY_DIRS.map((d) => `**/${d}/**`),
     ...DENY_FILE_GLOBS.filter((g) => !ALLOW_FILE_GLOBS.includes(g)).map((g) => `**/${g}`),
   ];
 }
@@ -70,7 +85,7 @@ export function secretPathGuard(root: string) {
     const segments = p.split('/').filter((s) => s && s !== '.');
     const normalized: string[] = [];
     for (const s of segments) { if (s === '..') normalized.pop(); else normalized.push(s); }
-    if (normalized.length > 0 && !isShippable(normalized.join('/'))) {
+    if (normalized.length > 0 && !isServableInDev(normalized.join('/'))) {
       res.statusCode = 404;
       res.end('Not found');
       return;

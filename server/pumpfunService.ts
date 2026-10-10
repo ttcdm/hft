@@ -1,3 +1,4 @@
+import { solPriceService } from './market/solPriceService';
 import {
   PumpFunCaller,
   PumpFunHotCallout,
@@ -17,6 +18,7 @@ import {
   ConfluenceFactorsInput,
 } from './signals/confluenceEngine';
 import { ConfluenceBreakdown, SignalProvenance } from './core/types';
+import { autoSnipeController } from './auto/controller';
 
 interface AutoSnipeRules {
   minCallerWinRate2x: number;
@@ -25,7 +27,8 @@ interface AutoSnipeRules {
   maxEntryMultiple: number;
   maxElapsedSeconds: number;
   snipeAmountUsd: number;
-  jitoPriorityTipSol: number;
+  /** Explicit operator override only; absent means the dynamic tip policy decides (C6). */
+  jitoPriorityTipSol?: number;
 }
 
 // Canonical Top Callers Leaderboard modeled on Pump.fun's live API capture
@@ -299,14 +302,23 @@ function isDemoMode(): boolean {
   return process.env.DEMO_MODE === 'true';
 }
 
-/** Auto-snipe is off unless explicitly enabled via AUTO_SNIPE_ENABLED=true (A5). */
+/**
+ * Auto-snipe is off unless explicitly enabled via AUTO_SNIPE_ENABLED=true (A5).
+ * PLACEHOLDER: no caller left after G1; the auto-snipe controller reads the env itself. Kept, not removed, until the removal audit (H4).
+ */
 export function isAutoSnipeEnvEnabled(): boolean {
   return process.env.AUTO_SNIPE_ENABLED === 'true';
 }
 
-/** Demo and unattributed callers never carry a REAL_* provenance. */
+/**
+ * Demo callers are SYNTHETIC_TEST. A real-feed token with no attributed caller comes from pump.fun/DexScreener market
+ * data, not from a social post, so it is REAL_ONCHAIN. REAL_SOCIAL is reserved for a callout traced to an actual
+ * social post, which no code path produces yet.
+ */
 export function calloutProvenance(callout: PumpFunHotCallout): SignalProvenance {
-  return DEMO_CALLER_IDS.has(callout.caller.userId) ? 'SYNTHETIC_TEST' : 'REAL_SOCIAL';
+  if (DEMO_CALLER_IDS.has(callout.caller.userId)) return 'SYNTHETIC_TEST';
+  if (callout.caller.userId === UNATTRIBUTED_CALLER.userId) return 'REAL_ONCHAIN';
+  return 'REAL_SOCIAL';
 }
 
 export class PumpFunService extends EventEmitter {
@@ -325,8 +337,9 @@ export class PumpFunService extends EventEmitter {
     maxEntryMultiple: 1.35,
     maxElapsedSeconds: 60,
     snipeAmountUsd: 5.0, // Scaled for $10 Micro Account
-    jitoPriorityTipSol: 0.005,
   };
+
+  private backgroundStarted = false;
 
   constructor() {
     super();
@@ -334,6 +347,12 @@ export class PumpFunService extends EventEmitter {
     pumpFeedListener.on('create_event', (event: PumpCreateEvent) => {
       this.handleOnChainCreateEvent(event);
     });
+  }
+
+  /** Begin the on-chain feed and the HTTP fallback poll. Called once by the server, never on import. */
+  public startBackground(): void {
+    if (this.backgroundStarted) return;
+    this.backgroundStarted = true;
     pumpFeedListener.start().catch(() => {});
     this.initPolling();
   }
@@ -366,8 +385,8 @@ export class PumpFunService extends EventEmitter {
       total_supply: Number(event.tokenTotalSupply),
       virtual_sol_reserves: Number(event.virtualSolReserves),
       virtual_token_reserves: Number(event.virtualTokenReserves),
-      usd_market_cap: event.initialMarketCapSol * 145,
-      market_cap_usd: event.initialMarketCapSol * 145,
+      usd_market_cap: event.initialMarketCapSol * (solPriceService.lastKnownPrice() ?? 0),
+      market_cap_usd: event.initialMarketCapSol * (solPriceService.lastKnownPrice() ?? 0),
       reply_count: 0,
       last_reply: null,
       nsfw: false,
@@ -528,35 +547,41 @@ export class PumpFunService extends EventEmitter {
               .map((u) => `@${u.userId}`)
           : [];
 
-      // Calculate bonding curve progress
-      // Pump.fun bonding curves reach completion (~100%) when ~85 SOL is collected
+      // Bonding curve progress comes from the curve's own reserves: tokens sold out of the 793.1M
+      // that sit on the curve. Market cap is NOT a proxy (it moves with SOL price and supply).
+      // With no reserve fields the progress is unknown and reported as 0 (lowest curve score).
+      const CURVE_TOKENS = 793_100_000_000_000; // initial real token reserves, 6 decimals
+      const INITIAL_VIRTUAL_TOKENS = 1_073_000_000_000_000;
       let curveProgress: number;
       if (c.complete) {
         curveProgress = 100;
-      } else if (c.market_cap_quote) {
-        curveProgress = Math.min(99.5, Number(((c.market_cap_quote / 85) * 100).toFixed(1)));
-      } else if (c.market_cap) {
-        curveProgress = Math.min(99.5, Number(((c.market_cap / 85) * 100).toFixed(1)));
+      } else if (Number(c.real_token_reserves) > 0 || c.real_token_reserves === 0) {
+        curveProgress = Math.min(99.5, Math.max(0, Number(((1 - Number(c.real_token_reserves) / CURVE_TOKENS) * 100).toFixed(1))));
+      } else if (Number(c.virtual_token_reserves) > 0) {
+        const realTokens = Number(c.virtual_token_reserves) - (INITIAL_VIRTUAL_TOKENS - CURVE_TOKENS);
+        curveProgress = Math.min(99.5, Math.max(0, Number(((1 - realTokens / CURVE_TOKENS) * 100).toFixed(1))));
       } else {
-        curveProgress = Math.min(95, 30 + (index * 7) % 65);
+        curveProgress = 0;
       }
 
       // Real-world pricing & multiples
+      // B3: unknown price is 0 (never an invented number)
       const currentPriceUsd = pair?.priceUsd
         ? parseFloat(pair.priceUsd)
         : c.usd_market_cap
         ? c.usd_market_cap / 1_000_000_000
-        : 0.000085 + (index * 0.000015);
+        : 0;
 
       const currentMarketCapUsd = pair?.fdv
         ? pair.fdv
         : c.usd_market_cap || c.market_cap_usd || currentPriceUsd * 1_000_000_000;
 
       // Token trade & creation timestamp from on-chain data
-      const tokenTradeTime = c.last_trade_timestamp || c.created_timestamp || now - 45000;
-      const elapsedMs = Math.max(2000, now - tokenTradeTime);
+      // B3: with no timestamp the age is unknown; treat it as stale so it can never qualify as a fresh INSTANT_SNIPE.
+      const tokenTradeTime = c.last_trade_timestamp || c.created_timestamp || 0;
+      const elapsedMs = tokenTradeTime > 0 ? Math.max(2000, now - tokenTradeTime) : 3_600_000;
       const elapsedSeconds = Math.floor(elapsedMs / 1000);
-      const calloutTimestamp = tokenTradeTime;
+      const calloutTimestamp = tokenTradeTime > 0 ? tokenTradeTime : now - elapsedMs;
 
       // Base launch valuation floor on Pump.fun is ~30 SOL virtual reserve ($5,000 USD)
       const baseLaunchMarketCapUsd = 5000;
@@ -583,13 +608,13 @@ export class PumpFunService extends EventEmitter {
       // Callout note generated from real on-chain metrics
       let calloutNote: string;
       if (confluenceCount >= 2) {
-        calloutNote = `🚨 MULTI-CALLER CONFLUENCE (Pump.fun Velocity + DexScreener Boosted): Called by @${caller.userId}${otherCallers.length > 0 ? ' & ' + otherCallers.join(', ') : ''}. Curve: ${curveProgress}% | 5m Vol: $${(pair?.volume?.m5 || 8500).toLocaleString()}. Elevated to INSTANT_SNIPE.`;
+        calloutNote = `🚨 MULTI-CALLER CONFLUENCE (Pump.fun Velocity + DexScreener Boosted): Called by @${caller.userId}${otherCallers.length > 0 ? ' & ' + otherCallers.join(', ') : ''}. Curve: ${curveProgress}% | 5m Vol: ${pair?.volume?.m5 != null ? '$' + Number(pair.volume.m5).toLocaleString() : 'n/a'}. Elevated to INSTANT_SNIPE.`;
       } else if (curveProgress >= 80) {
-        calloutNote = `⚡ GRADUATION IMMINENT: Bonding curve is ${curveProgress}% filled. Raydium/PumpSwap AMM migration trigger at 85 SOL.`;
+        calloutNote = `⚡ GRADUATION IMMINENT: Bonding curve is ${curveProgress}% filled. PumpSwap AMM migration happens when the curve's tokens are sold out.`;
       } else if (isBoosted) {
-        calloutNote = `🔥 DEXSCREENER BOOSTED: High social velocity detected with ${pair?.txns?.m5?.buys || 45} buys in last 5m.`;
+        calloutNote = `🔥 DEXSCREENER BOOSTED: ${pair?.txns?.m5?.buys !== undefined ? `${pair.txns.m5.buys} buys in the last 5m` : 'order flow not available'}.`;
       } else {
-        calloutNote = `On-chain accumulation by top wallet. Dev holding is ${c.complete ? '0.0%' : '0.8%'}, freeze revoked. Rapid momentum expansion.`;
+        calloutNote = `Live pump.fun token. Curve ${curveProgress}%. Holder, dev and authority data: ${c.top10_holders_pct != null || c.dev_holding_pct != null ? 'partial' : 'not provided by the feed'}.`;
       }
 
       const isAlreadySniped = this.snipedMints.has(mint.toLowerCase());
@@ -605,21 +630,23 @@ export class PumpFunService extends EventEmitter {
           imageUri: c.image_uri || 'https://images.unsplash.com/photo-1622979135225-d2ba269bc1df?w=120&auto=format&fit=crop&q=80',
           description: c.description || 'Verified token from Pump.fun hot callouts discovery engine.',
           bondingCurveProgress: curveProgress,
-          bondingCurveAddress: c.bonding_curve || 'CN35wYHmtBB6G8oPfTtUadQfMELytTsxUyEr3CTPsTka',
+          bondingCurveAddress: c.bonding_curve || '',
           associatedBondingCurve: c.associated_bonding_curve,
-          creator: c.creator || 'AHuDJooRChxq4B8X6GmzSfVmJTaVLq4',
+          creator: c.creator || '',
           calloutPriceUsd,
           currentPriceUsd,
           marketCapAtCalloutUsd,
           currentMarketCapUsd,
-          athPriceSol: (c.ath_market_cap || currentMarketCapUsd) / 185,
-          peakMultiple: Math.max(currentMultiple, Number((currentMultiple * 1.35).toFixed(2))),
+          athPriceSol: solPriceService.lastKnownPrice() ? (c.ath_market_cap || currentMarketCapUsd) / solPriceService.lastKnownPrice()! : 0,
+          peakMultiple: currentMultiple, // B3: the true peak is not in the feed; never invent a 1.35x
           currentMultiple,
           complete: c.complete || curveProgress >= 100,
           raydiumPool: c.raydium_pool,
-          volume5mUsd: pair?.volume?.m5 || 12400 + index * 1500,
-          buys5m: pair?.txns?.m5?.buys || 64 + index * 8,
-          sells5m: pair?.txns?.m5?.sells || 12 + index * 2,
+          // B3: null means "not provided". Never filled with invented numbers.
+          volume5mUsd: pair?.volume?.m5 ?? null,
+          buys5m: pair?.txns?.m5?.buys ?? null,
+          sells5m: pair?.txns?.m5?.sells ?? null,
+          priceChange5mPct: pair?.priceChange?.m5 ?? null,
           top10HoldersPct: c.top10_holders_pct ?? null,
           devHoldingPct: c.complete ? 0.0 : (c.dev_holding_pct ?? null),
           isMintRevoked: c.is_mint_revoked ?? null,
@@ -686,10 +713,11 @@ export class PumpFunService extends EventEmitter {
 
   // Evaluate if any fresh hot callouts trigger the auto-snipe rules
   private async evaluateAutoSnipeTriggers() {
-    if (!isAutoSnipeEnvEnabled()) return;
+    // G1: candidate source only. With the controller OFF there is nothing to evaluate for.
+    if (autoSnipeController.getMode() === 'OFF') return;
     const rules = this.autoSnipeRules;
 
-    for (const callout of this.hotCallouts) {
+    for (const callout of this.getHotCallouts()) {
       if (callout.status !== 'ACTIVE') continue;
       const mintKey = callout.token.mint.toLowerCase();
       if (this.snipedMints.has(mintKey)) {
@@ -725,18 +753,26 @@ export class PumpFunService extends EventEmitter {
         callout.status = 'SNIPED';
 
         // Execute snipe routed through the central canonical coordinator
-        const tradeRes = await memecoinAggregator.executeSnipe({
-          contractAddress: callout.token.mint,
-          amountUsd: rules.snipeAmountUsd,
-          platform: 'PUMP_FUN',
-          jitoTipSol: rules.jitoPriorityTipSol,
-          slippagePct: 6.0,
+        // G1: this is a candidate source only. The auto-snipe controller owns the decision and the execution.
+        const decision = await autoSnipeController.submitCandidate({
+          mint: callout.token.mint,
+          symbol: callout.token.symbol,
+          source: 'PUMPFUN_CALLOUT',
           signalId: callout.id,
           provenance: calloutProvenance(callout),
+          amountUsd: rules.snipeAmountUsd,
+          slippagePct: 6.0,
+          jitoTipSol: rules.jitoPriorityTipSol,
           enforceConfluence: rules.autoSnipeOnConfluence,
         });
 
-        this.emit('callout_sniped', { callout, tradeRes, confluence });
+        if (decision.outcome === 'DROPPED' && !['POSITION_ALREADY_OPEN', 'ALREADY_ATTEMPTED_THIS_SESSION'].includes(decision.reason)) {
+          // Nothing was tried (controller said no for a session-level reason): keep the candidate available.
+          this.snipedMints.delete(mintKey);
+          callout.status = 'ACTIVE';
+          continue;
+        }
+        this.emit('callout_sniped', { callout, decision, confluence });
       }
     }
   }
@@ -745,30 +781,22 @@ export class PumpFunService extends EventEmitter {
    * Evaluate multi-factor confluence score for a callout using ConfluenceEngine (B14)
    */
   public evaluateCalloutConfluence(callout: PumpFunHotCallout): ConfluenceBreakdown {
-    const t = callout.token;
-    const priceChange5mPct = t.currentMultiple > 1 ? Math.min(100, (t.currentMultiple - 1) * 35) : 0;
-    const liquidityUsd = t.bondingCurveProgress > 0 ? (t.bondingCurveProgress / 100) * 85 * 145 * 2 : 10000;
-    const top10HoldersPct =
-      t.top10HoldersPct !== null && t.top10HoldersPct !== undefined && t.top10HoldersPct >= 0
-        ? t.top10HoldersPct
-        : 15;
-    const devHoldingPct =
-      t.devHoldingPct !== null && t.devHoldingPct !== undefined && t.devHoldingPct >= 0
-        ? t.devHoldingPct
-        : 0.0;
-
+    const t = callout.token as any;
+    const num = (n: unknown): number | null => (typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : null);
+    // B3: only measured values go in. Unknown stays null and earns no points. There is no real social call yet,
+    // so the social factor is not awarded (it used to be hardcoded to true).
     const input: ConfluenceFactorsInput = {
       mint: t.mint,
       creatorAddress: t.creator,
-      priceChange5mPct,
-      liquidityUsd,
-      top10HoldersPct,
+      priceChange5mPct: typeof t.priceChange5mPct === 'number' ? t.priceChange5mPct : null,
+      liquidityUsd: null, // no measured liquidity in the callout feed (the old value was a curve-progress x 145 guess)
+      top10HoldersPct: num(t.top10HoldersPct),
       bondingCurveProgress: t.bondingCurveProgress,
-      buys5m: t.buys5m,
-      sells5m: t.sells5m,
-      devHoldingPct,
-      hasVerifiedSocialCall: true,
-      socialCallCount: Math.max(1, callout.confluenceCount),
+      buys5m: num(t.buys5m),
+      sells5m: num(t.sells5m),
+      devHoldingPct: num(t.devHoldingPct),
+      hasVerifiedSocialCall: false,
+      socialCallCount: 0,
     };
 
     return ConfluenceEngine.calculate(input);
@@ -818,7 +846,7 @@ export class PumpFunService extends EventEmitter {
   public async snipeCallout(
     calloutId: string,
     amountUsd: number = 5.0,
-    jitoTipSol: number = 0.005,
+    jitoTipSol?: number,
     maxSlippagePct: number = 6.0
   ): Promise<{ success: boolean; message: string; txHash?: string }> {
     const target = calloutId.trim().toLowerCase();
@@ -840,6 +868,8 @@ export class PumpFunService extends EventEmitter {
       jitoTipSol,
       slippagePct: maxSlippagePct,
       signalId: callout.id,
+      signalTimestamp: callout.calloutTimestamp,
+      provenance: calloutProvenance(callout), // R20: a demo callout is SYNTHETIC_TEST here too, not whatever executeSnipe defaults to
     });
 
     if (tradeRes.success) {

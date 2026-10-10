@@ -3,16 +3,46 @@ import { EventEmitter } from 'events';
 import { PUMP_FUN_PROGRAM_ID } from './programs';
 import { Logger } from '../middleware/enterprise';
 import { executionCoordinator } from '../execution/coordinator';
+import { curveVelocityEvaluator } from '../signals/curveVelocityEvaluator';
+import { creatorRiskScorer } from '../signals/creatorRiskScorer';
 
 // Anchor CreateEvent 8-byte discriminator: sha256("event:CreateEvent")[0..8]
 // Hex: 1b72a94ddeeb6376
 export const PUMP_CREATE_EVENT_DISCRIMINATOR = Buffer.from('1b72a94ddeeb6376', 'hex');
+
+// Anchor TradeEvent 8-byte discriminator: sha256("event:TradeEvent")[0..8]
+export const PUMP_TRADE_EVENT_DISCRIMINATOR = Buffer.from('bddb7fd34ee661ee', 'hex');
+
+/** Hard cap on how long a create event waits for the creator-history lookup before scoring continues without it. */
+export const CREATOR_RISK_TIMEOUT_MS = 300;
+
+/**
+ * Decoded pump.fun TradeEvent (fixed prefix of the IDL in @pump-fun/pump-sdk 1.37:
+ * mint, sol_amount, token_amount, is_buy, user, timestamp, virtual/real reserves).
+ * UNVERIFIED against live logs: trades may be emitted through a self-CPI that logsSubscribe cannot see.
+ */
+export interface PumpTradeEvent {
+  signature: string;
+  slot: number;
+  mint: string;
+  solAmountLamports: bigint;
+  tokenAmount: bigint;
+  isBuy: boolean;
+  user: string;
+  timestampSec: number;
+  virtualSolReserves: bigint;
+  virtualTokenReserves: bigint;
+  realSolReserves: bigint;
+  realTokenReserves: bigint;
+}
 
 export interface PumpCreateEvent {
   signature: string;
   slot: number;
   mint: string;
   creator: string;
+  /** The signer of the create transaction (R14). Usually also makes the dev buy and can differ from `creator` in create_v2. */
+  user?: string;
   bondingCurve: string;
   name: string;
   symbol: string;
@@ -35,6 +65,7 @@ export interface PumpFeedListenerTelemetry {
   subscriptionId: number | null;
   eventsReceived: number;
   eventsParsed: number;
+  tradesParsed: number;
   lastEventTimestamp: number;
   lastEventAgeMs: number;
   averageParseLatencyMs: number;
@@ -52,6 +83,7 @@ export class PumpFeedListener extends EventEmitter {
   private status: 'ACTIVE' | 'CONNECTING' | 'RECONNECTING' | 'DISCONNECTED' | 'ERROR' = 'DISCONNECTED';
   private eventsReceived: number = 0;
   private eventsParsed: number = 0;
+  private tradesParsed: number = 0;
   private lastEventTimestamp: number = 0;
   private totalParseLatencyMs: number = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
@@ -103,8 +135,8 @@ export class PumpFeedListener extends EventEmitter {
     const symbolBuf = Buffer.from(params.symbol, 'utf8');
     const uriBuf = Buffer.from(params.uri, 'utf8');
 
-    // 8 disc + (4+name) + (4+sym) + (4+uri) + 32 mint + 32 curve + 32 creator
-    const baseLen = 8 + 4 + nameBuf.length + 4 + symbolBuf.length + 4 + uriBuf.length + 32 + 32 + 32;
+    // IDL order: 8 disc + (4+name) + (4+sym) + (4+uri) + mint + bonding_curve + user + creator + i64 timestamp + 4 x u64 reserves
+    const baseLen = 8 + 4 + nameBuf.length + 4 + symbolBuf.length + 4 + uriBuf.length + 32 * 4 + 8 + 4 * 8;
     const buf = Buffer.alloc(baseLen);
     let offset = 0;
 
@@ -132,9 +164,154 @@ export class PumpFeedListener extends EventEmitter {
     curvePubkey.toBuffer().copy(buf, offset);
     offset += 32;
 
+    // user (signer of the create) then creator
     creatorPubkey.toBuffer().copy(buf, offset);
+    offset += 32;
+    creatorPubkey.toBuffer().copy(buf, offset);
+    offset += 32;
+
+    buf.writeBigInt64LE(BigInt(Math.floor(Date.now() / 1000)), offset);
+    offset += 8;
+    for (const v of [
+      params.virtualTokenReserves ?? 1_073_000_000_000_000n,
+      params.virtualSolReserves ?? 30_000_000_000n,
+      params.realTokenReserves ?? 793_100_000_000_000n,
+      params.tokenTotalSupply ?? 1_000_000_000_000_000n,
+    ]) {
+      buf.writeBigUInt64LE(v, offset);
+      offset += 8;
+    }
 
     return `Program data: ${buf.toString('base64')}`;
+  }
+
+  /** Serialize a TradeEvent into Anchor log format. For deterministic tests and log-fixture replay. */
+  public static encodeTradeEventLog(params: {
+    mint: PublicKey | string;
+    solAmountLamports: bigint;
+    tokenAmount: bigint;
+    isBuy: boolean;
+    user: PublicKey | string;
+    timestampSec: number;
+    virtualSolReserves: bigint;
+    virtualTokenReserves: bigint;
+    realSolReserves: bigint;
+    realTokenReserves: bigint;
+  }): string {
+    const pk = (k: PublicKey | string) => (typeof k === 'string' ? new PublicKey(k) : k);
+    const buf = Buffer.alloc(8 + 32 + 8 + 8 + 1 + 32 + 8 + 8 + 8 + 8 + 8);
+    let o = 0;
+    PUMP_TRADE_EVENT_DISCRIMINATOR.copy(buf, o); o += 8;
+    pk(params.mint).toBuffer().copy(buf, o); o += 32;
+    buf.writeBigUInt64LE(params.solAmountLamports, o); o += 8;
+    buf.writeBigUInt64LE(params.tokenAmount, o); o += 8;
+    buf.writeUInt8(params.isBuy ? 1 : 0, o); o += 1;
+    pk(params.user).toBuffer().copy(buf, o); o += 32;
+    buf.writeBigInt64LE(BigInt(params.timestampSec), o); o += 8;
+    buf.writeBigUInt64LE(params.virtualSolReserves, o); o += 8;
+    buf.writeBigUInt64LE(params.virtualTokenReserves, o); o += 8;
+    buf.writeBigUInt64LE(params.realSolReserves, o); o += 8;
+    buf.writeBigUInt64LE(params.realTokenReserves, o);
+    return `Program data: ${buf.toString('base64')}`;
+  }
+
+
+  /**
+   * R13: keep a `Program data:` line only when the innermost program running at that point is the pump program. Any program can
+   * emit `sol_log_data` with pump's event discriminator in a transaction that merely mentions pump, and logsSubscribe(pump) delivers
+   * that transaction; without this check a forged CreateEvent/TradeEvent would set attacker-chosen reserves (price, paper fill, board).
+   * Other log lines pass through unchanged.
+   */
+  public static pumpOwnedLogs(lines: string[]): string[] {
+    const pump = PUMP_FUN_PROGRAM_ID.toBase58();
+    const stack: string[] = [];
+    const out: string[] = [];
+    for (const line of lines) {
+      const invoke = /^Program (\S+) invoke \[\d+\]/.exec(line);
+      if (invoke) { stack.push(invoke[1]); out.push(line); continue; }
+      const done = /^Program (\S+) (success|failed)/.exec(line);
+      if (done) { if (stack.length && stack[stack.length - 1] === done[1]) stack.pop(); out.push(line); continue; }
+      if (line.startsWith('Program data: ')) {
+        if (stack.length && stack[stack.length - 1] === pump) out.push(line);
+        continue;
+      }
+      out.push(line);
+    }
+    return out;
+  }
+
+  /** Test helper: the log lines a real pump instruction would produce around one event line. */
+  public static asPumpInvocation(eventLine: string): string[] {
+    const pump = PUMP_FUN_PROGRAM_ID.toBase58();
+    return [`Program ${pump} invoke [1]`, eventLine, `Program ${pump} success`];
+  }
+
+  /** Decode every TradeEvent in a transaction's logs (a tx can contain several). Never throws. */
+  public parseTradeLogs(logs: Logs, ctx?: { slot: number }): PumpTradeEvent[] {
+    if (logs.err) return [];
+    const out: PumpTradeEvent[] = [];
+    for (const log of PumpFeedListener.pumpOwnedLogs(logs.logs)) {
+      if (!log.startsWith('Program data: ')) continue;
+      try {
+        const buf = Buffer.from(log.slice('Program data: '.length).trim(), 'base64');
+        if (buf.length < 129 || !buf.subarray(0, 8).equals(PUMP_TRADE_EVENT_DISCRIMINATOR)) continue;
+        let o = 8;
+        const mint = new PublicKey(buf.subarray(o, o + 32)).toBase58(); o += 32;
+        const solAmountLamports = buf.readBigUInt64LE(o); o += 8;
+        const tokenAmount = buf.readBigUInt64LE(o); o += 8;
+        const isBuy = buf.readUInt8(o) === 1; o += 1;
+        const user = new PublicKey(buf.subarray(o, o + 32)).toBase58(); o += 32;
+        const timestampSec = Number(buf.readBigInt64LE(o)); o += 8;
+        const virtualSolReserves = buf.readBigUInt64LE(o); o += 8;
+        const virtualTokenReserves = buf.readBigUInt64LE(o); o += 8;
+        const realSolReserves = buf.readBigUInt64LE(o); o += 8;
+        const realTokenReserves = buf.readBigUInt64LE(o);
+        out.push({
+          signature: logs.signature, slot: ctx?.slot ?? 0, mint, solAmountLamports, tokenAmount, isBuy, user,
+          timestampSec, virtualSolReserves, virtualTokenReserves, realSolReserves, realTokenReserves,
+        });
+      } catch {
+        // malformed data: skip
+      }
+    }
+    return out;
+  }
+
+  /** Feed one decoded trade into the curve velocity evaluator and notify subscribers. */
+  public ingestTradeEvent(trade: PumpTradeEvent): void {
+    const ts = Date.now();
+    curveVelocityEvaluator.recordTradeFlow(trade.mint, Number(trade.solAmountLamports) / 1e9, trade.isBuy, ts, trade.slot);
+    curveVelocityEvaluator.recordTransition(trade.mint, trade.slot, Number(trade.realSolReserves) / 1e9, ts);
+    this.tradesParsed++;
+    try {
+      this.emit('trade_event', trade);
+    } catch (emitErr: any) {
+      Logger.warn(`PumpFeedListener trade subscriber error: ${emitErr?.message || emitErr}`);
+    }
+  }
+
+  /** Mint -> creator for tokens seen in create events, so later scoring can find the creator. */
+  private creatorByMint: Map<string, string> = new Map();
+  public getCreatorForMint(mint: string): string | undefined {
+    return this.creatorByMint.get(mint);
+  }
+
+  /**
+   * Score a new token's creator from their transaction history, capped at CREATOR_RISK_TIMEOUT_MS. On timeout the
+   * lookup keeps running and fills the scorer's per-creator cache, so a later confluence read still sees it.
+   * A creator with no report scores 0 creator-risk points (missing is never safe).
+   */
+  public async scoreCreator(event: PumpCreateEvent): Promise<boolean> {
+    this.creatorByMint.set(event.mint, event.creator);
+    if (this.creatorByMint.size > 5000) {
+      const first = this.creatorByMint.keys().next().value;
+      if (first !== undefined) this.creatorByMint.delete(first);
+    }
+    const conn = this.connection || executionCoordinator.getConnection();
+    if (!conn) return false;
+    const lookup = creatorRiskScorer.evaluateCreator(conn, event.creator).then(() => true).catch(() => false);
+    const timeout = new Promise<boolean>((resolve) => setTimeout(() => resolve(false), CREATOR_RISK_TIMEOUT_MS));
+    return Promise.race([lookup, timeout]);
   }
 
   /**
@@ -146,13 +323,13 @@ export class PumpFeedListener extends EventEmitter {
     const slot = ctx?.slot ?? 0;
     const signature = logs.signature;
 
-    for (const log of logs.logs) {
+    for (const log of PumpFeedListener.pumpOwnedLogs(logs.logs)) {
       // 1. Binary Anchor Event: Program data: <base64>
       if (log.startsWith('Program data: ')) {
         const b64Data = log.slice('Program data: '.length).trim();
         try {
           const buf = Buffer.from(b64Data, 'base64');
-          if (buf.length >= 116) {
+          if (buf.length >= 8 + 12 + 4 * 32 + 8 + 32) {
             // Verify Anchor discriminator
             const disc = buf.subarray(0, 8);
             if (disc.equals(PUMP_CREATE_EVENT_DISCRIMINATOR)) {
@@ -192,34 +369,25 @@ export class PumpFeedListener extends EventEmitter {
               const bondingCurvePubkey = new PublicKey(buf.subarray(offset, offset + 32));
               offset += 32;
 
-              // Read user/creator (32 bytes)
-              if (offset + 32 > buf.length) continue;
+              // IDL (pump-sdk 1.37) order after the strings: mint, bonding_curve, user, creator, timestamp(i64), then
+              // virtual_token_reserves, virtual_sol_reserves, real_token_reserves, token_total_supply (u64 each).
+              // The reserves are read, never assumed: an event too short to carry them is skipped, not filled with canonical numbers.
+              if (offset + 32 + 32 + 8 + 4 * 8 > buf.length) continue;
+              const userPubkey = new PublicKey(buf.subarray(offset, offset + 32));
+              offset += 32; // user (the signer of the create; the token creator is the next field)
               const creatorPubkey = new PublicKey(buf.subarray(offset, offset + 32));
               offset += 32;
-
-              // Canonical initial reserves for Pump.fun V2 bonding curves
-              let virtualTokenReserves = 1_073_000_000_000_000n;
-              let virtualSolReserves = 30_000_000_000n;
-              let realTokenReserves = 793_100_000_000_000n;
-              const realSolReserves = 0n;
-              let tokenTotalSupply = 1_000_000_000_000_000n;
-
-              if (offset + 8 <= buf.length) {
-                virtualTokenReserves = buf.readBigUInt64LE(offset);
-                offset += 8;
-              }
-              if (offset + 8 <= buf.length) {
-                virtualSolReserves = buf.readBigUInt64LE(offset);
-                offset += 8;
-              }
-              if (offset + 8 <= buf.length) {
-                realTokenReserves = buf.readBigUInt64LE(offset);
-                offset += 8;
-              }
-              if (offset + 8 <= buf.length) {
-                tokenTotalSupply = buf.readBigUInt64LE(offset);
-                offset += 8;
-              }
+              offset += 8; // timestamp
+              const virtualTokenReserves = buf.readBigUInt64LE(offset);
+              offset += 8;
+              const virtualSolReserves = buf.readBigUInt64LE(offset);
+              offset += 8;
+              const realTokenReserves = buf.readBigUInt64LE(offset);
+              offset += 8;
+              const tokenTotalSupply = buf.readBigUInt64LE(offset);
+              offset += 8;
+              const realSolReserves = 0n; // a fresh curve holds no SOL; not part of the event
+              if (virtualTokenReserves === 0n) continue;
 
               const initialPriceSol = Number(virtualSolReserves) / Number(virtualTokenReserves) / 1000;
               const initialMarketCapSol = (Number(tokenTotalSupply) / 1e6) * initialPriceSol;
@@ -230,6 +398,7 @@ export class PumpFeedListener extends EventEmitter {
                 slot,
                 mint: mintPubkey.toBase58(),
                 creator: creatorPubkey.toBase58(),
+                user: userPubkey.toBase58(),
                 bondingCurve: bondingCurvePubkey.toBase58(),
                 name,
                 symbol,
@@ -250,48 +419,6 @@ export class PumpFeedListener extends EventEmitter {
           }
         } catch {
           // ignore invalid base64 or buffer reads
-        }
-      }
-
-      // 2. Structured text log fallback (for simulations, custom RPC log filters, or test fixtures)
-      if (log.includes('CreateEvent:') || (log.includes('Instruction: Create') && log.includes('mint='))) {
-        const mintMatch = log.match(/mint=([1-9A-HJ-NP-Za-km-z]{32,44})/);
-        const creatorMatch = log.match(/(?:creator|user)=([1-9A-HJ-NP-Za-km-z]{32,44})/);
-        const curveMatch = log.match(/(?:bonding_curve|curve)=([1-9A-HJ-NP-Za-km-z]{32,44})/);
-        const symbolMatch = log.match(/symbol=([A-Za-z0-9_$]+)/);
-        const nameMatch = log.match(/name=([^,;]+)/);
-
-        if (mintMatch) {
-          const mint = mintMatch[1];
-          const creator = creatorMatch ? creatorMatch[1] : '11111111111111111111111111111111';
-          const bondingCurve = curveMatch
-            ? curveMatch[1]
-            : PumpFeedListener.deriveBondingCurvePda(mint).toBase58();
-          const symbol = symbolMatch ? symbolMatch[1] : mint.slice(0, 5).toUpperCase();
-          const name = nameMatch ? nameMatch[1].trim() : `Token ${symbol}`;
-          const parseLatencyMs = Number((performance.now() - t0).toFixed(3));
-
-          return {
-            signature,
-            slot,
-            mint,
-            creator,
-            bondingCurve,
-            name,
-            symbol,
-            uri: '',
-            virtualTokenReserves: 1_073_000_000_000_000n,
-            virtualSolReserves: 30_000_000_000n,
-            realTokenReserves: 793_100_000_000_000n,
-            realSolReserves: 0n,
-            tokenTotalSupply: 1_000_000_000_000_000n,
-            initialPriceSol: 30 / 1_073_000_000,
-            initialMarketCapSol: 27.958993,
-            receivedAt: Date.now(),
-            parsedAt: Date.now(),
-            parseLatencyMs,
-            source: 'RPC_LOGS',
-          };
         }
       }
     }
@@ -320,6 +447,7 @@ export class PumpFeedListener extends EventEmitter {
         (logs: Logs, ctx: Context) => {
           this.eventsReceived++;
           try {
+            const trades = this.parseTradeLogs(logs, ctx);
             const event = this.parseLogs(logs, ctx);
             if (event) {
               this.eventsParsed++;
@@ -333,6 +461,9 @@ export class PumpFeedListener extends EventEmitter {
                 Logger.warn(`PumpFeedListener coordinator record error: ${coordErr?.message || coordErr}`);
               }
 
+              // C2: look the creator up in the background (300ms cap) so the score is cached by the time it is needed
+              this.scoreCreator(event).catch(() => {});
+
               // Emit event to subscribers
               try {
                 this.emit('create_event', event);
@@ -340,6 +471,9 @@ export class PumpFeedListener extends EventEmitter {
                 Logger.warn(`PumpFeedListener subscriber error: ${emitErr?.message || emitErr}`);
               }
             }
+            // Q6d: the trades of a create transaction (the dev buy) are ingested AFTER its create event, so a watch started by the
+            // create already exists to receive them. Before, they were emitted first and no subscriber was watching yet.
+            for (const trade of trades) this.ingestTradeEvent(trade);
           } catch (err: any) {
             Logger.warn(`PumpFeedListener error processing log: ${err.message}`);
           }
@@ -405,6 +539,7 @@ export class PumpFeedListener extends EventEmitter {
       subscriptionId: this.subscriptionId,
       eventsReceived: this.eventsReceived,
       eventsParsed: this.eventsParsed,
+      tradesParsed: this.tradesParsed,
       lastEventTimestamp: this.lastEventTimestamp,
       lastEventAgeMs: this.lastEventTimestamp > 0 ? now - this.lastEventTimestamp : -1,
       averageParseLatencyMs:

@@ -142,12 +142,12 @@ describe('Phase 1 Remediation Suite (B03, B04, B05, B15, B16, B18, B22)', () => 
   // B22: Header Telemetry Clean Initialization
   // =========================================================================
   describe('B22: Header Initial Profit State', () => {
-    it('Header.tsx initializes profit summary to $0.00 (0.0%) 0 Active without hardcoded +$4.22', () => {
+    it('Header.tsx starts with an unknown profit pill (dashes), never a hardcoded +$4.22', () => {
       const headerCode = fs.readFileSync(path.join(process.cwd(), 'src/components/Header.tsx'), 'utf8');
       expect(headerCode.includes('totalPnLUsd: 4.22')).toBe(false);
       expect(headerCode.includes('totalPnLPct: 42.2')).toBe(false);
       expect(headerCode.includes('activeCount: 2')).toBe(false);
-      expect(headerCode).toContain('{ totalPnLUsd: 0.0, totalPnLPct: 0.0, activeCount: 0 }');
+      expect(headerCode).toContain('useState<PillState | null>(null)');
     });
   });
 

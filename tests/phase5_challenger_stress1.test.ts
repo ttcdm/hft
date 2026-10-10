@@ -1,3 +1,4 @@
+import { seedSurge } from './fixtures/velocity';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { PublicKey } from '@solana/web3.js';
 import {
@@ -358,7 +359,7 @@ describe('Adversarial Stress & Empirical Challenge Suite: Alpha Pipeline Integra
       const report = await scorer.evaluateCreator(mockFailingConnection, CREATOR_ADDR);
 
       expect(report.isBurner).toBe(true);
-      expect(report.confluenceScore).toBe(1);
+      expect(report.confluenceScore).toBe(0); // C2: a failed lookup earns no points
       expect(report.riskScore).toBe(30);
       expect(report.riskFlags).toContain('RPC_HISTORY_QUERY_FAILED');
       expect(report.details).toContain('RPC error querying creator history');
@@ -411,7 +412,7 @@ describe('Adversarial Stress & Empirical Challenge Suite: Alpha Pipeline Integra
         priceChange5mPct: 500.0, // max 20 pts
         liquidityUsd: 10_000_000, // max 15 pts
         top10HoldersPct: 2.0,    // max 15 pts
-        bondingCurveProgress: 99.0, // max 15 pts
+        bondingCurveProgress: 99.0, curveVelocityMetrics: { velocityScore: 15 } as any, // C2: measured velocity stands in for the removed progress fallback // max 15 pts
         buys5m: 5000,
         sells5m: 10,             // max 20 pts
         devHoldingPct: 0.0,      // max 5 pts
@@ -452,7 +453,7 @@ describe('Adversarial Stress & Empirical Challenge Suite: Alpha Pipeline Integra
         priceChange5mPct: 30.0,  // Math.round((30/40)*20) = 15
         liquidityUsd: 48_000,    // Math.round((48000/60000)*15) = 12
         top10HoldersPct: 10.0,   // <= 15 -> 15
-        bondingCurveProgress: 92,// >= 90 -> 15
+        bondingCurveProgress: 92, curveVelocityMetrics: { velocityScore: 15 } as any, // C2: measured velocity stands in for the removed progress fallback// >= 90 -> 15
         buys5m: 25,
         sells5m: 25,             // buyRatio 0.5 -> 10
         devHoldingPct: 0,
@@ -632,6 +633,7 @@ describe('Adversarial Stress & Empirical Challenge Suite: Alpha Pipeline Integra
       };
       (memecoinAggregator as any).pools.unshift(customPool);
 
+      seedSurge(customMint); // C2: velocity must be measured
       const evalScore = memecoinAggregator.evaluateTokenConfluence(customMint).score;
       expect(evalScore).toBeGreaterThanOrEqual(60);
       expect(evalScore).toBeLessThan(85);
@@ -777,6 +779,7 @@ describe('Adversarial Stress & Empirical Challenge Suite: Alpha Pipeline Integra
           currentMultiple: 2.5,
           complete: false,
           volume5mUsd: 25000,
+          priceChange5mPct: 40, // B3: measured 5m change; missing data scores 0 and is no longer derived from the multiple
           buys5m: 85,
           sells5m: 15,
           top10HoldersPct: 14.0,

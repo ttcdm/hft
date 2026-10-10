@@ -44,7 +44,7 @@ function mockPassingLiveReadiness(coord: ExecutionCoordinator, liveKeypair: Keyp
   });
 }
 
-describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety & Panic Exit', () => {
+describe('Tier 5 [mock-level]: Live Trading Workflows, Token Safety & Panic Exit', () => {
   let mockRpc: MockSolanaRpc;
   let mockJito: MockJitoEngine;
   let testDb: TestDatabase;
@@ -101,6 +101,7 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
       staleReport.evaluatedAt = Date.now() - 65_000; // 65 seconds ago (exceeds 60s max age)
 
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'STALE',
         name: 'Stale Report Token',
@@ -134,6 +135,7 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
       unverifiedReport.failedCount = 1;
 
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'UNVER',
         name: 'Unverified Dev Token',
@@ -164,6 +166,7 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
       });
 
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'T2022',
         name: 'Token 2022 Token',
@@ -185,6 +188,7 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
       vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockResolvedValue(graduatedState);
 
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'GRAD',
         name: 'Graduated Token',
@@ -201,6 +205,7 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
 
     it('LWP-5: Live Buy fails closed if eligibility report mint does not match trade mint', async () => {
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'MISMATCH',
         name: 'Mismatch Token',
@@ -264,7 +269,9 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
         error: 'Confirmed transaction resulted in zero token balance increase',
       });
 
+      const scheduled = vi.spyOn(coordinator as any, 'scheduleOrphanRecovery').mockImplementation(() => {});
       const result = await coordinator.executeTrade({
+        signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'ZEROTOK',
         name: 'Zero Tokens Token',
@@ -277,6 +284,8 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
       expect(result.success).toBe(false);
       expect(result.lifecycleState).toBe('RECONCILIATION_REQUIRED');
       expect(result.error).toMatch(/RECONCILIATION FAILED/);
+      // P3: an unread landed buy schedules background recovery so its tokens cannot stay without a position
+      expect(scheduled).toHaveBeenCalledTimes(1);
 
       // Invariant: Position MUST NOT be marked OPEN in SQLite
       const positions = workstationDb.loadPositions('LIVE');
@@ -316,6 +325,29 @@ describe('Tier 5: Production Readiness — Live Trading Workflows, Token Safety 
       const res = await coordinator.closePosition(dustPosId, 50, 'TAKE_PROFIT');
       expect(res.success).toBe(false);
       expect(res.error).toBe('DUST_POSITION_EXIT_UNECONOMICAL');
+    });
+
+    it('LWP-7b: hard-stop and trailing-stop exits bypass the dust check; take-profit and stale exits do not (C7b)', async () => {
+      const mkDust = (suffix: string) => {
+        const id = `dust_bypass_${suffix}_${Date.now()}`;
+        workstationDb.savePosition({
+          id, mint: VALID_PUMP_MINT_1.toBase58(), symbol: 'DUST', name: 'Dust Coin', tokenDecimals: 6,
+          tokenQuantityRaw: '100', entryPriceSol: 0.000001, currentPriceSol: 0.0000001, currentValueSol: 0.00000001,
+          costBasisLamports: 1_000_000, realizedPnLSol: 0, status: 'OPEN', venue: 'PUMP_BONDING_CURVE',
+          executionMode: 'LIVE', entryTxSignature: `sig_dust_${suffix}`, entryTimestamp: Date.now(),
+          recordUpdatedAt: Date.now(), updatedAt: Date.now(),
+        } as any);
+        return id;
+      };
+      for (const reason of ['STOP_LOSS', 'TRAILING_STOP']) {
+        // 50%: a partial exit gets no ATA rent credit, so only the bypass keeps it from the dust check
+        const res = await coordinator.closePosition(mkDust(reason), 50, reason);
+        expect(res.error, reason).not.toBe('DUST_POSITION_EXIT_UNECONOMICAL');
+      }
+      for (const reason of ['TAKE_PROFIT_1', 'STALE_POSITION']) {
+        const res = await coordinator.closePosition(mkDust(reason), 50, reason);
+        expect(res.error, reason).toBe('DUST_POSITION_EXIT_UNECONOMICAL');
+      }
     });
 
     it('LWP-8: prevents concurrent duplicate exit submissions for the same position with EXIT_IN_PROGRESS', async () => {

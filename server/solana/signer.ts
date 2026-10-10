@@ -2,6 +2,7 @@ import { Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
 import fs from 'fs';
 import path from 'path';
 import bs58 from 'bs58';
+import { parseSecretKey } from './parseSecretKey';
 import crypto from 'crypto';
 import { SignerStatus } from '../core/types';
 import { Logger } from '../middleware/enterprise';
@@ -28,16 +29,13 @@ export class LocalKeypairSigner implements TransactionSigner {
   }
 
   private initializeSigner() {
+    // Q5: the file this signer would write to is known up front, also when the key itself came from the environment.
+    this.keypairPath = process.env.SIGNER_KEYPAIR_PATH || path.join(process.cwd(), '.apex_trading_keypair.json');
     const envPrivateKey = process.env.OPERATOR_PRIVATE_KEY || process.env.SOLANA_PRIVATE_KEY;
     if (envPrivateKey) {
       try {
         const raw = envPrivateKey.trim();
-        let secretKeyBytes: Uint8Array;
-        if (raw.startsWith('[') && raw.endsWith(']')) {
-          secretKeyBytes = Uint8Array.from(JSON.parse(raw));
-        } else {
-          secretKeyBytes = bs58.decode(raw);
-        }
+        const secretKeyBytes = parseSecretKey(raw);
         if (secretKeyBytes.length === 64) {
           this.setKeypair(Keypair.fromSecretKey(secretKeyBytes));
           Logger.info(`Local hot signer loaded securely from environment: ${this.keypair!.publicKey.toBase58().slice(0, 4)}...${this.keypair!.publicKey.toBase58().slice(-4)}`);
@@ -58,13 +56,7 @@ export class LocalKeypairSigner implements TransactionSigner {
     try {
       if (fs.existsSync(targetPath)) {
         const raw = fs.readFileSync(targetPath, 'utf8').trim();
-        let secretKeyBytes: Uint8Array;
-
-        if (raw.startsWith('[') && raw.endsWith(']')) {
-          secretKeyBytes = Uint8Array.from(JSON.parse(raw));
-        } else {
-          secretKeyBytes = bs58.decode(raw);
-        }
+        const secretKeyBytes = parseSecretKey(raw);
 
         if (secretKeyBytes.length === 64) {
           this.setKeypair(Keypair.fromSecretKey(secretKeyBytes));
@@ -107,6 +99,14 @@ export class LocalKeypairSigner implements TransactionSigner {
   public generateDedicatedTradingKeypair(forceOverwrite = false): { publicKey: string; path: string } {
     const targetPath = this.keypairPath || path.join(process.cwd(), '.apex_trading_keypair.json');
 
+    // Q5: a key that is already loaded (from OPERATOR_PRIVATE_KEY, SIGNER_KEYPAIR_PATH or the default file) is never swapped at runtime:
+    // open positions are sold with the key that bought them, and after a restart the environment key would win over a new file anyway.
+    if (this.keypair && !forceOverwrite) {
+      throw new Error(
+        `A signing key already exists in this process (${this.keypair.publicKey.toBase58().slice(0, 4)}...). It is not replaced at runtime; set up a new key with: npm run signer:import, then restart.`
+      );
+    }
+
     if (fs.existsSync(targetPath) && !forceOverwrite) {
       throw new Error(
         `A keypair file already exists at ${targetPath}. Explicit forceOverwrite: true confirmation required to prevent permanent loss of funds.`
@@ -135,13 +135,7 @@ export class LocalKeypairSigner implements TransactionSigner {
       );
     }
 
-    const raw = secretKeyInput.trim();
-    let secretKeyBytes: Uint8Array;
-    if (raw.startsWith('[') && raw.endsWith(']')) {
-      secretKeyBytes = Uint8Array.from(JSON.parse(raw));
-    } else {
-      secretKeyBytes = bs58.decode(raw);
-    }
+    const secretKeyBytes = parseSecretKey(secretKeyInput);
 
     if (secretKeyBytes.length !== 64) {
       throw new Error(`Invalid secret key length. Expected 64 bytes, got ${secretKeyBytes.length}.`);
@@ -155,18 +149,6 @@ export class LocalKeypairSigner implements TransactionSigner {
     return {
       publicKey: kp.publicKey.toBase58(),
       path: targetPath,
-    };
-  }
-
-  public exportKeypairSafely(confirmationCode: string): { secretKeyBase58: string } {
-    if (confirmationCode !== 'CONFIRM_EXPORT_PRIVATE_KEY') {
-      throw new Error('Invalid export confirmation code. Export rejected.');
-    }
-    if (!this.keypair) {
-      throw new Error('No keypair configured to export.');
-    }
-    return {
-      secretKeyBase58: bs58.encode(this.keypair.secretKey),
     };
   }
 

@@ -1,5 +1,5 @@
 {
-  "name": "react-example",
+  "name": "apex-quant-hft",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -14,15 +14,18 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "package:clean": "rm -rf .env .operator_session* *.keypair.json *.signer.json *.db *.db-wal *.db-shm *.wal node_modules dist coverage",
-    "package:release": "rm -f release.zip && zip -r -q release.zip . -x '.git*' '.env*' '*operator_session*' '*.keypair.json' '*.signer.json' '*.db*' '*.wal' 'node_modules/*' 'dist/*' 'coverage/*' 'target/*' '*.log'",
+    "package:release": "tsx scripts/package_release.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint . && tsc --noEmit",
     "test": "vitest run",
-    "test:filtered": "vitest run tests/accountingAndReconciliation.test.ts tests/authAndSecurity.test.ts tests/riskEngine.test.ts tests/solanaTransactionBuilder.test.ts tests/challenger_m1_protocol_correctness.test.ts tests/challenger_phase3_verification.test.ts tests/plugAndPlayZeroConfig.test.ts tests/e2e/",
     "signer:import": "tsx scripts/import_signer.ts",
+    "smoke": "tsx scripts/smoke.ts",
+    "localnet:e2e": "tsx scripts/localnet/e2e.ts",
     "test:devnet": "tsx scripts/test_devnet_execution.ts",
     "devnet:e2e": "node --require ./scripts/devnet_guard.cjs --import tsx scripts/devnet_e2e.ts",
-    "postinstall": "node scripts/patch-anchor.cjs"
+    "postinstall": "node scripts/patch-anchor.cjs",
+    "localnet:auto": "tsx scripts/localnet/auto_run.ts",
+    "localnet:seed": "tsx scripts/localnet/seed_proof.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -55,6 +58,7 @@
     "autoprefixer": "^10.4.21",
     "esbuild": "^0.25.0",
     "eslint": "^10.10.0",
+    "litesvm": "1.6.0",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",

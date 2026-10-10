@@ -298,7 +298,7 @@ describe('Tier 2: Boundary & Corner Cases (Features 6 - 10)', () => {
         isFreezeAuthorityRevoked: true,
         isMintAuthorityRevoked: true,
         devHoldingPct: 2.0,
-        top10HoldersPct: 25.0,
+        top10HoldersPct: 15.0,
         liquidityUsd: 15000,
       });
       expect(passReport.isEligible).toBe(true);

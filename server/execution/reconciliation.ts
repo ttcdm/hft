@@ -19,7 +19,16 @@ export interface BuyReconciliationResult {
   tokensReceivedHuman: number;
   actualNetworkFeeLamports: number;
   actualJitoTipLamports: number;
+  /** Price the curve charged per token: SOL that went to the curve (fees included) / tokens. Excludes rent, tip and network fees. This is what marks are comparable with, so it is the exit engine's entry price. */
   effectiveFillPriceSol: number;
+  /** Whole wallet SOL delta per token (rent, tip and fees included). The true cost; PnL accounting uses actualSolSpentLamports. */
+  allInFillPriceSol?: number;
+  /** SOL that went to the curve: wallet delta minus network fee, tip and token-account rent opened by this tx. */
+  curveSpendLamports?: number;
+  /** Lamports locked in token accounts this tx created (the buyer's ATA). */
+  tokenAccountRentLamports?: number;
+  /** Rent for other accounts the buyer funded in the same tx (e.g. a pump per-user account on a first buy). */
+  otherNewAccountRentLamports?: number;
   slot: number;
   error?: string;
 }
@@ -41,7 +50,54 @@ export interface SellReconciliationResult {
   error?: string;
 }
 
+/**
+ * F1/Q1: lamports the buyer funded into accounts this transaction created, other than the wallet and the excluded keys (its token
+ * account, counted separately). An account with no lamports before and some after was created and funded by the tx (on devnet, the
+ * pump per-user volume account, 1,346,200 lamports on a first buy). It is rent, not curve spend. Shared by the live reconcile and
+ * the interrupted-transaction recovery so both price an entry the same way.
+ */
+export function otherNewAccountRent(
+  keyAt: (i: number) => string | undefined,
+  count: number,
+  preBalances: number[] | undefined,
+  postBalances: number[] | undefined,
+  exclude: Set<string>,
+): number {
+  let total = 0;
+  for (let i = 0; i < count; i++) {
+    const key = keyAt(i);
+    if (!key || exclude.has(key)) continue;
+    const pre = preBalances?.[i] ?? 0;
+    const post = postBalances?.[i] ?? 0;
+    if (pre === 0 && post > 0) total += post;
+  }
+  return total;
+}
+
 export class TradeReconciler {
+  /**
+   * Delays between getTransaction retries when the RPC has not indexed a just-confirmed signature yet (returns null) or errors.
+   * About 12s in total. Tests set this to [] to skip waiting.
+   */
+  public static txFetchRetryDelaysMs: number[] = [400, 800, 1600, 3200, 6400];
+
+  private static async fetchConfirmedTx(connection: Connection, signature: string) {
+    const delays = TradeReconciler.txFetchRetryDelaysMs;
+    let lastErr: any = null;
+    for (let attempt = 0; attempt <= delays.length; attempt++) {
+      try {
+        const tx = await connection.getTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
+        if (tx && tx.meta) return tx;
+        lastErr = null;
+      } catch (e: any) {
+        lastErr = e;
+      }
+      if (attempt < delays.length) await new Promise((r) => setTimeout(r, delays[attempt]));
+    }
+    if (lastErr) throw lastErr;
+    return null;
+  }
+
   // Capture pre-trade on-chain state
   public static async capturePreTradeSnapshot(
     connection: Connection,
@@ -101,10 +157,7 @@ export class TradeReconciler {
     const mintStr = mint.toBase58();
 
     try {
-      const tx = await connection.getTransaction(signature, {
-        maxSupportedTransactionVersion: 0,
-        commitment: 'confirmed',
-      });
+      const tx = await TradeReconciler.fetchConfirmedTx(connection, signature);
 
       if (!tx || !tx.meta) {
         return {
@@ -214,7 +267,34 @@ export class TradeReconciler {
       }
 
       const tokensReceivedHuman = Number(tokensReceivedBigInt) / Math.pow(10, tokenDecimals);
-      const effectiveFillPriceSol = (actualSolSpentLamports / 1e9) / tokensReceivedHuman;
+      // Split the wallet delta: rent opened for the buyer's token account, the tip and the network/priority fee are not
+      // what the curve charged. Marks come from the curve, so the stop-loss must compare against the curve price paid.
+      let tokenAccountRentLamports = 0;
+      const ataKey = PumpCurveService.getAssociatedTokenAddress(mint, wallet, tokenProgram).toBase58();
+      for (let i = 0; i < accountKeys.length; i++) {
+        if (accountKeys.get(i)?.toBase58() === ataKey) {
+          const pre = tx.meta.preBalances[i] ?? 0;
+          const post = tx.meta.postBalances[i] ?? 0;
+          tokenAccountRentLamports = Math.max(0, post - pre);
+          break;
+        }
+      }
+      // F1: the pump program can also make the buyer fund other new accounts in the same tx (on devnet, a pump-owned per-user
+      // account of 1,346,200 lamports on the first buy). That rent is not curve spend either. Any account other than the
+      // wallet and its token account that had no lamports before and has some after was created (and funded) by this tx.
+      const otherNewAccountRentLamports = otherNewAccountRent(
+        (i) => accountKeys.get(i)?.toBase58(),
+        accountKeys.length,
+        tx.meta.preBalances,
+        tx.meta.postBalances,
+        new Set([walletStr, ataKey]),
+      );
+      const nonCurveLamports =
+        actualNetworkFeeLamports + expectedJitoTipLamports + tokenAccountRentLamports + otherNewAccountRentLamports;
+      let curveSpendLamports = actualSolSpentLamports - nonCurveLamports;
+      if (!(curveSpendLamports > 0)) curveSpendLamports = actualSolSpentLamports; // cannot split: fall back to the whole delta
+      const effectiveFillPriceSol = (curveSpendLamports / 1e9) / tokensReceivedHuman;
+      const allInFillPriceSol = (actualSolSpentLamports / 1e9) / tokensReceivedHuman;
 
       Logger.info(`Reconciled BUY fill for ${mintStr}: ${tokensReceivedHuman.toFixed(4)} tokens for ${(actualSolSpentLamports / 1e9).toFixed(5)} SOL (effective price: ${effectiveFillPriceSol.toFixed(8)} SOL)`);
 
@@ -228,6 +308,10 @@ export class TradeReconciler {
         actualNetworkFeeLamports,
         actualJitoTipLamports: expectedJitoTipLamports,
         effectiveFillPriceSol,
+        allInFillPriceSol,
+        curveSpendLamports,
+        tokenAccountRentLamports,
+        otherNewAccountRentLamports,
         slot,
       };
     } catch (err: any) {
@@ -264,10 +348,7 @@ export class TradeReconciler {
     const mintStr = mint.toBase58();
 
     try {
-      const tx = await connection.getTransaction(signature, {
-        maxSupportedTransactionVersion: 0,
-        commitment: 'confirmed',
-      });
+      const tx = await TradeReconciler.fetchConfirmedTx(connection, signature);
 
       if (!tx || !tx.meta) {
         return {
@@ -400,7 +481,8 @@ export class TradeReconciler {
   public static async recoverInterruptedTransaction(
     connection: Connection,
     signature: string,
-    wallet: PublicKey
+    wallet: PublicKey,
+    expectedJitoTipLamports: number = 0
   ): Promise<{
     recovered: boolean;
     type: 'BUY' | 'SELL';
@@ -417,15 +499,16 @@ export class TradeReconciler {
     solSpentLamports?: number;
     solReceivedLamports?: number;
     networkFeeLamports?: number;
+    /** BUY only: SOL that went to the curve (wallet delta minus fee, tip and rent of the token account this tx opened). */
+    curveSpendLamports?: number;
+    tokenAccountRentLamports?: number;
+    otherNewAccountRentLamports?: number;
     slot?: number;
     blockTime?: number;
     error?: string;
   }> {
     try {
-      const txDetails = await connection.getTransaction(signature, {
-        maxSupportedTransactionVersion: 0,
-        commitment: 'confirmed',
-      });
+      const txDetails = await TradeReconciler.fetchConfirmedTx(connection, signature);
 
       if (!txDetails) {
         return { recovered: false, type: 'BUY', error: 'Transaction not found on-chain' };
@@ -508,6 +591,27 @@ export class TradeReconciler {
         }
       }
 
+      let tokenAccountRentLamports = 0;
+      if (type === 'BUY' && matchedMint) {
+        const tb = postTokens.find((p) => p.mint === matchedMint);
+        if (tb && txDetails.meta?.preBalances && txDetails.meta?.postBalances) {
+          tokenAccountRentLamports = Math.max(0, (txDetails.meta.postBalances[tb.accountIndex] ?? 0) - (txDetails.meta.preBalances[tb.accountIndex] ?? 0));
+        }
+      }
+      let otherNewAccountRentLamports = 0;
+      if (type === 'BUY' && matchedMint) {
+        try {
+          const keys = txDetails.transaction.message.getAccountKeys();
+          const tb = postTokens.find((p) => p.mint === matchedMint);
+          const exclude = new Set<string>([walletStr]);
+          const tokenAcct = tb ? keys.get(tb.accountIndex)?.toBase58() : undefined;
+          if (tokenAcct) exclude.add(tokenAcct);
+          otherNewAccountRentLamports = otherNewAccountRent((i) => keys.get(i)?.toBase58(), keys.length, txDetails.meta?.preBalances, txDetails.meta?.postBalances, exclude);
+        } catch { /* address-table keys not resolvable: fall back to the old split */ }
+      }
+      let curveSpendLamports = solSpentLamports - networkFeeLamports - expectedJitoTipLamports - tokenAccountRentLamports - otherNewAccountRentLamports;
+      if (!(curveSpendLamports > 0)) curveSpendLamports = solSpentLamports;
+
       if (matchedMint && tokenDelta > 0n) {
         return {
           recovered: true,
@@ -525,6 +629,9 @@ export class TradeReconciler {
           solSpentLamports,
           solReceivedLamports,
           networkFeeLamports,
+          curveSpendLamports,
+          tokenAccountRentLamports,
+          otherNewAccountRentLamports,
           slot: txDetails.slot,
           blockTime: txDetails.blockTime ? txDetails.blockTime * 1000 : Date.now(),
         };
@@ -578,6 +685,9 @@ export class RealMarkPriceService {
               timestamp: now,
             };
           }
+        } else if (!state && PumpCurveService.getMintRejection(mintStr)) {
+          // R19: the mint is not a token mint at all; asking PumpSwap about it would only hide that. The caller alerts.
+          continue;
         } else {
           // If bonding curve completed or not found, check canonical PumpSwap AMM pool
           const { PumpSwapVenueService } = await import('../solana/pumpSwapService');
@@ -586,7 +696,8 @@ export class RealMarkPriceService {
             result[mintStr] = {
               priceSol: poolState.spotPriceSol,
               source: 'ON_CHAIN_PUMPSWAP_POOL',
-              timestamp: now,
+              // N16: the pool state is cached for up to 15 s; stamping it "now" would hide a stale price from the staleness check.
+              timestamp: poolState.marketDataTimestamp || now,
               poolAddress: poolState.poolAddress.toBase58(),
             };
           }

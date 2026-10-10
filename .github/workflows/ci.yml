@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        node-version: [20.x, 22.x]
+        node-version: [22.x]  # node:sqlite needs >= 22.5
 
     steps:
       - name: Checkout Repository
@@ -42,6 +42,12 @@ jobs:
           test -f dist/server.cjs || exit 1
           test -f dist/index.html || exit 1
           echo "Production artifacts verified successfully."
+
+      - name: Runtime Smoke Test (boot bundle, auth, websocket)
+        run: npm run smoke
+
+      - name: Localnet end-to-end (real pump programs in an in-process bank, loopback only)
+        run: npm run localnet:e2e
 
   validate-rust:
     name: Validate Rust HFT Engine

@@ -1,3 +1,4 @@
+import { setAutoMode, releaseHotCallouts } from './fixtures/auto';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair, PublicKey } from '@solana/web3.js';
 import {
@@ -25,7 +26,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
   // Valid Base58 address (generated via Keypair)
   const VALID_CREATOR_BASE58 = '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';
 
-  beforeEach(() => {
+  beforeEach(async () => {
     curveVelocityEvaluator.clear();
     creatorRiskScorer.clearCache();
     memecoinAggregator.setConfluenceGating(false);
@@ -33,6 +34,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
     (pumpfunService as any).hotCallouts = [];
     vi.restoreAllMocks();
     vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
+    await setAutoMode('PAPER'); // G1: the controller owns auto trading; PAPER sends candidates on to executeSnipe
   });
 
   afterEach(() => {
@@ -278,7 +280,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
       expect(report).toBeDefined();
       expect(report.creatorAddress).toBe(VALID_CREATOR_BASE58);
       expect(report.riskScore).toBe(30);
-      expect(report.confluenceScore).toBe(1);
+      expect(report.confluenceScore).toBe(0); // C2: a failed lookup earns no points
       expect(report.isBurner).toBe(true);
       expect(report.riskFlags).toContain('RPC_HISTORY_QUERY_FAILED');
       expect(report.details).toContain('ETIMEDOUT');
@@ -294,7 +296,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
 
       const report = await scorer.evaluateCreator(rateLimitedRpc, VALID_CREATOR_BASE58);
       expect(report.riskScore).toBe(30);
-      expect(report.confluenceScore).toBe(1);
+      expect(report.confluenceScore).toBe(0); // C2: a failed lookup earns no points
       expect(report.isBurner).toBe(true);
       expect(report.riskFlags).toContain('RPC_HISTORY_QUERY_FAILED');
     });
@@ -309,7 +311,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
 
       const report = await scorer.evaluateCreator(throwingStringRpc, VALID_CREATOR_BASE58);
       expect(report.riskScore).toBe(30);
-      expect(report.confluenceScore).toBe(1);
+      expect(report.confluenceScore).toBe(0); // C2: a failed lookup earns no points
       expect(report.isBurner).toBe(true);
       expect(report.details).toContain('RPC socket terminated abruptly');
     });
@@ -335,7 +337,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
 
       const report = await scorer.evaluateCreator(dummyRpc, malformedAddress);
       expect(report.riskScore).toBe(30);
-      expect(report.confluenceScore).toBe(1);
+      expect(report.confluenceScore).toBe(0); // C2: a failed lookup earns no points
       expect(report.riskFlags).toContain('RPC_HISTORY_QUERY_FAILED');
     });
   });
@@ -450,6 +452,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
       (pumpfunService as any).hotCallouts = [callout69];
       const snipeSpy = vi.spyOn(memecoinAggregator, 'executeSnipe');
 
+      releaseHotCallouts(pumpfunService);
       await (pumpfunService as any).evaluateAutoSnipeTriggers();
 
       // STRICT CHECK: Snipe MUST NOT execute because 69 < 70
@@ -488,6 +491,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
 
       (pumpfunService as any).hotCallouts = [callout70];
 
+      releaseHotCallouts(pumpfunService);
       await (pumpfunService as any).evaluateAutoSnipeTriggers();
 
       // STRICT CHECK: Boundary score 70 MUST trigger snipe
@@ -531,6 +535,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
 
       (pumpfunService as any).hotCallouts = [callout71];
 
+      releaseHotCallouts(pumpfunService);
       await (pumpfunService as any).evaluateAutoSnipeTriggers();
 
       expect(snipeSpy).toHaveBeenCalledTimes(1);
@@ -561,6 +566,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
       const snipeSpy = vi.spyOn(memecoinAggregator, 'executeSnipe');
       (pumpfunService as any).hotCallouts = [highSingleCallerCallout];
 
+      releaseHotCallouts(pumpfunService);
       await (pumpfunService as any).evaluateAutoSnipeTriggers();
 
       // Confluence requires multi-caller corroboration (confluenceCount >= 2)
@@ -597,6 +603,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
       (pumpfunService as any).hotCallouts = [callout];
 
       try {
+        releaseHotCallouts(pumpfunService);
         await (pumpfunService as any).evaluateAutoSnipeTriggers();
         expect(snipeSpy).toHaveBeenCalledTimes(0);
         expect(callout.status).toBe('ACTIVE');

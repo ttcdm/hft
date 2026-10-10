@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useRef, useEffect } from 'react';
+import { SyntheticBanner } from './SyntheticBanner';
 import {
   X,
   Play,
@@ -254,10 +255,10 @@ export const BacktestModal: React.FC<BacktestModalProps> = ({
             <div>
               <div className="flex items-center space-x-2">
                 <h3 className="text-sm font-bold text-white uppercase tracking-wider">
-                  60-Day Quantitative Historical Backtest
+                  60-Day Simulated Backtest
                 </h3>
                 <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 font-semibold">
-                  Last 2 Months: July 11 – Sept 9, 2026
+                  Synthetic 60-day window
                 </span>
               </div>
               <p className="text-[11px] text-slate-400">
@@ -273,6 +274,7 @@ export const BacktestModal: React.FC<BacktestModalProps> = ({
             <X className="w-4 h-4" />
           </button>
         </div>
+        <SyntheticBanner className="mx-5 mt-3" />
 
         {/* PARAMETER CONFIGURATION TOOLBAR */}
         <div className="p-3 bg-[#080B12] border-b border-[#1E293B] flex flex-wrap items-center justify-between gap-2.5 text-xs">

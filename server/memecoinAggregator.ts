@@ -3,10 +3,12 @@ import { EventEmitter } from 'events';
 import { PublicKey } from '@solana/web3.js';
 import { PumpCurveService } from './solana/pumpCurve';
 import { executionCoordinator } from './execution/coordinator';
+import { solPriceService } from './market/solPriceService';
 import { workstationDb } from './db/database';
 import { evaluateTokenSafety } from './risk/tokenSafety';
-import { pumpFeedListener, PumpCreateEvent } from './solana/pumpFeedListener';
-import { SignalProvenance, ConfluenceBreakdown } from './core/types';
+import { pumpFeedListener, PumpCreateEvent, PumpTradeEvent } from './solana/pumpFeedListener';
+import { onChainPoolStats } from './market/poolStats';
+import { SignalProvenance, ConfluenceBreakdown, ExecutionMode } from './core/types';
 import { CapitalSizer } from './capital/capitalSizer';
 import { ConfluenceEngine, isConfluencePassed, MIN_CONFLUENCE_SCORE } from './signals/confluenceEngine';
 import { curveVelocityEvaluator } from './signals/curveVelocityEvaluator';
@@ -105,14 +107,17 @@ const DEMO_POOL_IDS: ReadonlySet<string> = new Set(INITIAL_POOLS.map((p) => p.id
 
 export class MemecoinAggregatorService extends EventEmitter {
   private pools: MemecoinPool[] = [];
-  private solPriceUsd = 145.0;
+  // C3: the SOL/USD price comes from the single SolPriceService. 0 here means "no price known"; every code path that
+  // converts USD to SOL is guarded in executeSnipe (LIVE needs a fresh price, PAPER needs a last known one).
+  private get solPriceUsd(): number {
+    return solPriceService.lastKnownPrice() ?? 0;
+  }
   private simulationTimer: NodeJS.Timeout | null = null;
   private config: SniperBotConfig = {
     isAutoSnipeEnabled: false,
     minConfidenceScore: 80,
     defaultSnipeAmountUsd: 5.0,
     maxSlippagePct: 6.0,
-    jitoTipSol: 0.002,
     takeProfitPct: 45.0,
     stopLossPct: 20.0,
     trailingStopEnabled: true,
@@ -123,7 +128,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     telegramChatId: '',
     telegramWebhookActive: false,
   };
-  private isConfluenceGatingEnabled: boolean = false;
+  // C2: on by default. Operators can still switch it off explicitly with setConfluenceGating(false).
+  private isConfluenceGatingEnabled: boolean = true;
 
   constructor() {
     super();
@@ -138,6 +144,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     pumpFeedListener.on('create_event', (event: PumpCreateEvent) => {
       this.ingestOnChainCreateEvent(event);
     });
+    // Q6: a pool made from a create event holds zeros for everything a trade reveals. Trades fill them in.
+    pumpFeedListener.on('trade_event', (t: PumpTradeEvent) => this.applyTradeToPool(t));
 
     this.startAutonomousSniperLoop();
   }
@@ -147,14 +155,17 @@ export class MemecoinAggregatorService extends EventEmitter {
   private startAutonomousSniperLoop() {
     if (this.autoSniperTimer) return;
     this.autoSniperTimer = setInterval(async () => {
-      if (!this.config.isAutoSnipeEnabled || process.env.AUTO_SNIPE_ENABLED !== 'true') return;
-      
+      // G1: this loop is a candidate source. The controller owns the mode, budgets and execution.
+      if (!this.config.isAutoSnipeEnabled) return;
+
       const mode = executionCoordinator.getExecutionMode();
       const activePositions = executionCoordinator.getPositions(mode, 'ACTIVE');
       if (activePositions.length >= 3) return;
 
       try {
         const { pumpFunService, calloutProvenance } = await import('./pumpfunService');
+        const { autoSnipeController } = await import('./auto/controller');
+        if (autoSnipeController.getMode() === 'OFF') return;
         const callouts = pumpFunService.getHotCallouts();
 
         for (const c of callouts) {
@@ -163,11 +174,12 @@ export class MemecoinAggregatorService extends EventEmitter {
           const alreadyOpen = activePositions.some((p) => p.mint.toLowerCase() === mint.toLowerCase());
           if (alreadyOpen) continue;
 
-          await this.executeSnipe({
-            contractAddress: mint,
+          await autoSnipeController.submitCandidate({
+            mint,
+            symbol: c.token.symbol,
+            source: 'AGGREGATOR_LOOP',
             amountUsd: this.config.defaultSnipeAmountUsd || 5.0,
-            platform: 'PUMP_FUN',
-            jitoTipSol: this.config.jitoTipSol || 0.002,
+            jitoTipSol: this.config.jitoTipSol,
             slippagePct: this.config.maxSlippagePct || 6.0,
             signalId: c.id,
             provenance: calloutProvenance(c),
@@ -224,6 +236,7 @@ export class MemecoinAggregatorService extends EventEmitter {
       sells5m: 0,
       top10HoldersPct: -1, // -1 denotes UNKNOWN until on-chain holder query
       devHoldingPct: -1,   // -1 denotes UNKNOWN until on-chain holder query
+      authoritiesVerified: false, // placeholders until the curve is read at execution
       isMintRevoked: true,
       isFreezeRevoked: true,
       isLpBurned: false,
@@ -237,8 +250,40 @@ export class MemecoinAggregatorService extends EventEmitter {
       this.pools = this.pools.slice(0, 200);
     }
 
+    onChainPoolStats.track(cleanCa, {
+      insiders: [event.creator, event.user],
+      supplyRaw: event.tokenTotalSupply,
+      createPriceSol: event.initialPriceSol,
+      realTokenReserves: event.realTokenReserves,
+    });
     this.emit('pool_added', pool);
     return pool;
+  }
+
+  private lastPoolPush = new Map<string, number>();
+
+  /** Q6: fold one decoded trade into its pool (price, liquidity, curve progress, order flow, holder shares). */
+  public applyTradeToPool(t: PumpTradeEvent, now = Date.now()): void {
+    if (!onChainPoolStats.record(t, now)) return;
+    const pool = this.pools.find((p) => p.contractAddress === t.mint);
+    const m = onChainPoolStats.get(t.mint, now);
+    if (!pool || !m) return;
+    const solUsd = this.solPriceUsd;
+    pool.priceNative = m.priceSol;
+    pool.priceUsd = m.priceSol * solUsd;
+    pool.marketCapUsd = m.priceSol * 1_000_000_000 * solUsd;
+    pool.liquidityUsd = m.realSolReserves * solUsd * 2;
+    pool.bondingCurveProgress = Number(m.curveProgressPct.toFixed(1));
+    pool.priceChange5mPct = m.priceChange5mPct;
+    pool.buys5m = m.buys5m;
+    pool.sells5m = m.sells5m;
+    pool.volume5mUsd = m.volume5mSol * solUsd;
+    pool.top10HoldersPct = m.top10HoldersPct ?? -1;
+    pool.devHoldingPct = m.devHoldingPct ?? -1;
+    if (now - (this.lastPoolPush.get(t.mint) ?? 0) >= 1_000) {
+      this.lastPoolPush.set(t.mint, now);
+      this.emit('price_update', { pool });
+    }
   }
 
   public getPools(platform?: string, chain?: string): MemecoinPool[] {
@@ -289,14 +334,16 @@ export class MemecoinAggregatorService extends EventEmitter {
     });
   }
 
-  public getConfig(): SniperBotConfig {
-    return this.config;
+  /** The config as it may leave this process (HTTP, WebSocket, events): the Telegram bot token is never included, only whether one is set. */
+  public getConfig(): SniperBotConfig & { telegramBotTokenSet: boolean } {
+    return { ...this.config, telegramBotToken: '', telegramBotTokenSet: Boolean(this.config.telegramBotToken) };
   }
 
-  public updateConfig(newConfig: Partial<SniperBotConfig>): SniperBotConfig {
+  public updateConfig(newConfig: Partial<SniperBotConfig>): SniperBotConfig & { telegramBotTokenSet: boolean } {
     this.config = { ...this.config, ...newConfig };
-    this.emit('config_updated', this.config);
-    return this.config;
+    const out = this.getConfig();
+    this.emit('config_updated', out);
+    return out;
   }
 
   public setConfluenceGating(enabled: boolean): void {
@@ -320,20 +367,25 @@ export class MemecoinAggregatorService extends EventEmitter {
     }
 
     const mint = pool ? pool.contractAddress : typeof poolOrMint === 'string' ? poolOrMint : '';
-    const priceChange5mPct = pool?.priceChange5mPct ?? 0;
-    const liquidityUsd = pool?.liquidityUsd ?? 0;
-    const top10HoldersPct = pool?.top10HoldersPct !== undefined && pool.top10HoldersPct >= 0 ? pool.top10HoldersPct : 20;
+    // C2: unknown stays null (scores 0 and is listed as missing), never a defaulted 0
+    const fin = (n: unknown): number | null => (typeof n === 'number' && Number.isFinite(n) ? n : null);
+    const priceChange5mPct = fin(pool?.priceChange5mPct);
+    const liquidityUsd = fin(pool?.liquidityUsd);
+    // B3: -1 / undefined mean UNKNOWN. Unknown is passed as null and scores 0; it used to default to 20% (10 free points).
+    const top10HoldersPct = pool?.top10HoldersPct !== undefined && pool.top10HoldersPct >= 0 ? pool.top10HoldersPct : null;
     const bondingCurveProgress = pool?.bondingCurveProgress ?? 0;
-    const buys5m = pool?.buys5m ?? 0;
-    const sells5m = pool?.sells5m ?? 0;
-    const devHoldingPct = pool?.devHoldingPct !== undefined && pool.devHoldingPct >= 0 ? pool.devHoldingPct : 0;
-    const hasVerifiedSocialCall =
-      (pool?.trendingRank !== undefined && pool.trendingRank > 0) ||
-      (pool?.volume5mUsd !== undefined && pool.volume5mUsd > 10000);
-    const socialCallCount = pool?.trendingRank ? Math.max(1, 4 - pool.trendingRank) : 0;
+    const buys5m = fin(pool?.buys5m);
+    const sells5m = fin(pool?.sells5m);
+    // Unknown dev holding used to default to 0% (the full 5 dev-risk points).
+    const devHoldingPct = pool?.devHoldingPct !== undefined && pool.devHoldingPct >= 0 ? pool.devHoldingPct : null;
+    // C2: a DexScreener trending rank or a volume figure is not a verified social call, so the social factor is
+    // not awarded here (it used to be inferred from trendingRank / volume > $10k).
+    const hasVerifiedSocialCall = false;
+    const socialCallCount = 0;
 
     const breakdown = ConfluenceEngine.calculate({
       mint,
+      creatorAddress: pumpFeedListener.getCreatorForMint(mint),
       priceChange5mPct,
       liquidityUsd,
       top10HoldersPct,
@@ -363,12 +415,51 @@ export class MemecoinAggregatorService extends EventEmitter {
     provenance?: SignalProvenance;
     enforceConfluence?: boolean;
     minConfluenceScore?: number;
-  }): Promise<{ success: boolean; message: string; txHash: string; position?: SniperPosition; confluenceScore?: number }> {
+    /** G1: run every gate and report what would be bought, without sending or filling anything. */
+    dryRun?: boolean;
+    /** G1: fixed order size in SOL (auto-snipe Devnet mode). Overrides sizing; the 10% ceiling still applies downstream. */
+    amountSolOverride?: number;
+    /** When the signal behind this trade happened (ms). Required for LIVE: the coordinator never defaults it to now. */
+    signalTimestamp?: number;
+    /** R5: the coordinator mode the caller checked before its awaits; the coordinator refuses the trade if the mode has changed since. */
+    expectedMode?: ExecutionMode;
+  }): Promise<{
+    success: boolean;
+    message: string;
+    txHash: string;
+    position?: SniperPosition;
+    confluenceScore?: number;
+    dryRun?: boolean;
+    amountSol?: number;
+    positionId?: string;
+    feesPaidLamports?: number;
+    /** G3: quoted and filled price (SOL/token) and the slippage cap, so the auto controller can count slippage breaches. */
+    quotePriceSol?: number;
+    fillPriceSol?: number;
+    slippageBps?: number;
+    gates?: Record<string, unknown>;
+  }> {
     const cleanCa = params.contractAddress.trim();
 
     // Sizing via CapitalSizer (B12): determine spendable bankroll and 10% ceiling
     const executionMode = executionCoordinator.getExecutionMode();
-    const walletBalanceSol = executionCoordinator.getRealWalletBalanceSol() ?? 0.07;
+    // C3: LIVE needs a fresh SOL/USD price (fail closed). PAPER may use the last known one, but not none.
+    if (executionMode === 'LIVE') {
+      try {
+        solPriceService.requireFreshPrice();
+      } catch (e: any) {
+        return { success: false, message: `REJECTED: ${e.message}`, txHash: '' };
+      }
+    } else if (solPriceService.lastKnownPrice() === null) {
+      return { success: false, message: 'REJECTED: SOL_PRICE_UNAVAILABLE: no SOL/USD price has been read yet', txHash: '' };
+    }
+    // C3: LIVE never assumes a wallet balance. With no real balance read, reject; PAPER keeps the 0.07 SOL paper default
+    // (C5 moves that default into the configured paper bankroll).
+    const realWalletBalanceSol = executionCoordinator.getRealWalletBalanceSol();
+    if (executionMode === 'LIVE' && (realWalletBalanceSol === null || realWalletBalanceSol === undefined)) {
+      return { success: false, message: 'REJECTED: WALLET_BALANCE_UNKNOWN: no real wallet balance has been read', txHash: '' };
+    }
+    const walletBalanceSol = realWalletBalanceSol ?? 0.07;
     const historicalStats = CapitalSizer.getHistoricalTradeStats(executionMode);
     const sizingResult = CapitalSizer.calculateOrderSize({
       walletBalanceSol,
@@ -390,6 +481,12 @@ export class MemecoinAggregatorService extends EventEmitter {
         message: `REJECTED: Capital sizing failed (${sizingResult.rejectionReason})`,
         txHash: '',
       };
+    }
+
+    // A LIVE buy sized against a bankroll with nothing spendable would skip the 10% cap below (it only applies when spendable > 0)
+    // and go out at the full requested size. Refuse instead.
+    if (executionMode === 'LIVE' && !params.dryRun && !(sizingResult.spendableBankrollSol > 0)) {
+      return { success: false, message: 'REJECTED: NO_SPENDABLE_BANKROLL: the wallet has nothing spendable after the reserve, rent and in-flight orders', txHash: '' };
     }
 
     let amountSol: number;
@@ -421,7 +518,7 @@ export class MemecoinAggregatorService extends EventEmitter {
     }
 
     const slippageBps = Math.round((params.slippagePct || this.config.maxSlippagePct) * 100);
-    const jitoTipSol = params.jitoTipSol || this.config.jitoTipSol;
+    const jitoTipSol = params.jitoTipSol || this.config.jitoTipSol || undefined;
 
     let pool = this.pools.find((p) => p.contractAddress.toLowerCase() === cleanCa.toLowerCase());
 
@@ -467,6 +564,7 @@ export class MemecoinAggregatorService extends EventEmitter {
             devHoldingPct: -1,   // -1 denotes UNKNOWN / unindexed
             isMintRevoked: state.isMintAuthorityRevoked,
             isFreezeRevoked: state.isFreezeAuthorityRevoked,
+            authoritiesVerified: true,
             isLpBurned: false,
             rugcheckScore: evaluateTokenSafety(
               {
@@ -525,6 +623,7 @@ export class MemecoinAggregatorService extends EventEmitter {
             devHoldingPct: t.devHoldingPct ?? 0.8,
             isMintRevoked: t.isMintRevoked ?? true,
             isFreezeRevoked: t.isFreezeRevoked ?? true,
+            authoritiesVerified: t.isMintRevoked != null && t.isFreezeRevoked != null,
             isLpBurned: false,
             rugcheckScore: (t.rugcheckScore as any) || 'SAFE',
             createdAgo: t.timeAgoStr || 'Just now',
@@ -615,6 +714,37 @@ export class MemecoinAggregatorService extends EventEmitter {
       ? 'SYNTHETIC_TEST'
       : params.provenance || 'REAL_ONCHAIN';
 
+    if (params.amountSolOverride && params.amountSolOverride > 0) {
+      amountSol = params.amountSolOverride;
+      amountUsd = amountSol * this.solPriceUsd;
+    }
+
+    if (params.dryRun) {
+      const preview = await executionCoordinator.previewBuy({
+        mint: pool.contractAddress,
+        symbol: pool.symbol,
+        name: pool.name,
+        amountSol,
+        currentPriceSol: pool.priceNative,
+        slippageBps,
+        jitoTipSol,
+        source: 'AUTO_SNIPER',
+        provenance,
+        liquidityUsd: pool.liquidityUsd,
+      });
+      if (preview.status === 'REJECTED') {
+        return { success: false, message: preview.error, txHash: '', confluenceScore: confluenceEval.score, dryRun: true };
+      }
+      return {
+        success: true,
+        message: `DRY_RUN would buy $${pool.symbol}: ${amountSol} SOL at ${preview.quotePriceSol} SOL/token, tip ${preview.tipLamports} lamports`,
+        txHash: '',
+        confluenceScore: confluenceEval.score,
+        dryRun: true,
+        amountSol,
+      };
+    }
+
     // Dispatch execution strictly through central ExecutionCoordinator
     const execRes = await executionCoordinator.executeTrade({
       mint: pool.contractAddress,
@@ -627,6 +757,8 @@ export class MemecoinAggregatorService extends EventEmitter {
       source: 'AUTO_SNIPER',
       provenance,
       liquidityUsd: pool.liquidityUsd,
+      signalTimestamp: params.signalTimestamp,
+      executionMode: params.expectedMode,
     });
 
     if (!execRes.success) {
@@ -653,6 +785,13 @@ export class MemecoinAggregatorService extends EventEmitter {
       message,
       txHash: execRes.txSignature || execRes.positionId || '',
       confluenceScore: confluenceEval.score,
+      amountSol,
+      positionId: execRes.positionId,
+      feesPaidLamports: execRes.feesPaidLamports,
+      quotePriceSol: execRes.quotePriceSol ?? pool.priceNative,
+      fillPriceSol: execRes.fillPriceSol,
+      slippageBps,
+      gates: execRes.gates,
     };
   }
 
@@ -692,7 +831,7 @@ export class MemecoinAggregatorService extends EventEmitter {
       this.pools.forEach((pool) => {
         const deltaPct = (Math.random() - 0.5) * 1.2;
         pool.priceUsd = Math.max(0.000001, pool.priceUsd * (1 + deltaPct / 100));
-        pool.priceNative = pool.priceUsd / this.solPriceUsd;
+        if (this.solPriceUsd > 0) pool.priceNative = pool.priceUsd / this.solPriceUsd;
         pool.marketCapUsd = Math.round(pool.priceUsd * 1000000000);
       });
 

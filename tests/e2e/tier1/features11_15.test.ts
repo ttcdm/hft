@@ -40,6 +40,7 @@ describe('Tier 1: Feature Coverage (Features 11 - 15)', () => {
   afterEach(async () => {
     coordinator?.cleanup();
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
     await mockJito.stop();
     mockRpc.clear();
   });
@@ -103,7 +104,9 @@ describe('Tier 1: Feature Coverage (Features 11 - 15)', () => {
       expect(['HEALTHY', 'DEGRADED', 'DISCONNECTED']).toContain(diag.pumpFeedHealth);
     });
 
-    it('F12.3: Stale strategy feed sets pumpFeedHealth to degraded or disconnected', () => {
+    it('F12.3: Stale strategy feed sets pumpFeedHealth to degraded or disconnected (required on mainnet, waived off it)', () => {
+      expect(coordinator.getLiveReadiness().components.pumpFeed.required).toBe(false);
+      vi.stubEnv('ALLOWED_CLUSTER', 'mainnet-beta');
       const readiness = coordinator.getLiveReadiness();
       expect(['DEGRADED', 'DISCONNECTED']).toContain(readiness.components.pumpFeed.status);
       expect(readiness.components.pumpFeed.healthy).toBe(false);

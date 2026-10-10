@@ -348,7 +348,7 @@ export class SolanaTransactionBuilder {
       );
     }
 
-    const recentBlockhash = await this.getRecentBlockhash(connection);
+    const recentBlockhash = await this.getRecentBlockhash(connection, true); // a trade is built with a fresh blockhash: a cached one could be most of the way to expiry before it is even sent
 
     const messageV0 = new TransactionMessage({
       payerKey: params.buyer,
@@ -402,7 +402,7 @@ export class SolanaTransactionBuilder {
       );
     }
 
-    const recentBlockhash = await this.getRecentBlockhash(connection);
+    const recentBlockhash = await this.getRecentBlockhash(connection, true); // a trade is built with a fresh blockhash: a cached one could be most of the way to expiry before it is even sent
 
     const messageV0 = new TransactionMessage({
       payerKey: params.seller,
@@ -418,7 +418,7 @@ export class SolanaTransactionBuilder {
     payer: PublicKey,
     instructions: TransactionInstruction[]
   ): Promise<VersionedTransaction> {
-    const recentBlockhash = await this.getRecentBlockhash(connection);
+    const recentBlockhash = await this.getRecentBlockhash(connection, true); // a trade is built with a fresh blockhash: a cached one could be most of the way to expiry before it is even sent
     const messageV0 = new TransactionMessage({
       payerKey: payer,
       recentBlockhash,

@@ -80,8 +80,14 @@ export function getTokenExternalLinks(params: {
   twitter?: string;
   telegram?: string;
   website?: string;
+  /**
+   * Q41: the cluster the server trades on. On devnet / localnet a token does not exist on the mainnet-only sites, and Solscan needs the
+   * cluster in the URL. Omitted or mainnet: the links are unchanged.
+   */
+  cluster?: string | null;
 }): TokenLinkItem[] {
-  const { mintOrCa, symbol, chain = 'SOLANA', platform = 'PUMP_FUN', twitter, telegram, website } = params;
+  const { mintOrCa, symbol, chain = 'SOLANA', platform = 'PUMP_FUN', twitter, telegram, website, cluster } = params;
+  const testCluster = cluster === 'devnet' || cluster === 'localnet' ? cluster : null;
   const ca = (mintOrCa || '').trim();
   const sym = (symbol || '').trim().replace('$', '');
   const chainUpper = (chain || 'SOLANA').toUpperCase();
@@ -111,7 +117,8 @@ export function getTokenExternalLinks(params: {
 
   // Block Explorer (Solscan / Basescan / Etherscan)
   let explorerName = 'Solscan';
-  let explorerUrl = ca ? `https://solscan.io/token/${ca}` : `https://solscan.io`;
+  const clusterQuery = testCluster === 'devnet' ? '?cluster=devnet' : testCluster === 'localnet' ? '?cluster=custom&customUrl=http%3A%2F%2Flocalhost%3A8899' : '';
+  let explorerUrl = ca ? `https://solscan.io/token/${ca}${clusterQuery}` : `https://solscan.io`;
   if (isBase) {
     explorerName = 'Basescan';
     explorerUrl = ca ? `https://basescan.org/token/${ca}` : `https://basescan.org`;
@@ -257,6 +264,17 @@ export function getTokenExternalLinks(params: {
       badgeBgClass: 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border-emerald-500/30',
       isAvailable: true,
     });
+  }
+
+  if (testCluster) {
+    // These sites index mainnet only: a devnet / localnet mint is not there, and a link to a mainnet page for the same address misleads.
+    const mainnetOnly = new Set(['dexscreener', 'pumpfun', 'gmgn', 'birdeye', 'photon', 'bullx', 'axiom']);
+    for (const item of items) {
+      if (mainnetOnly.has(item.id)) {
+        item.isAvailable = false;
+        item.description = `Mainnet only: this token is on ${testCluster}, so ${item.shortName} does not list it`;
+      }
+    }
   }
 
   return items;

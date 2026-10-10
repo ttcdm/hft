@@ -63,13 +63,7 @@ export const AiDiagnosticsModal: React.FC<AiDiagnosticsModalProps> = ({
 
       const data = await res.json();
       if (!res.ok) {
-        if (data.offlineAnalysis) {
-          setResult({
-            analysis: `[Offline Diagnostic Engine]: ${data.offlineAnalysis.recommendation}\n\nEstimated Sharpe: ${data.offlineAnalysis.estimatedSharpe}\nRisk Assessment: ${data.offlineAnalysis.riskScore}\n\n(Note: Configure GEMINI_API_KEY in AI Studio Settings to activate full Deep Thinking Mode with gemini-3.1-pro-preview)`,
-          });
-        } else {
-          setError(data.error || 'Diagnostic request failed.');
-        }
+        setError(data.error || 'Diagnostic request failed.'); // Q38: no canned analysis when the model is unavailable
       } else {
         setResult(data);
       }
@@ -174,7 +168,7 @@ export const AiDiagnosticsModal: React.FC<AiDiagnosticsModalProps> = ({
             <button
               onClick={handleRunAnalysis}
               disabled={loading}
-              className="px-4 py-2 rounded-lg bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-500 hover:to-cyan-500 text-white font-bold text-xs flex items-center space-x-1.5 shadow-lg shadow-cyan-500/20 disabled:opacity-50"
+              className="px-4 py-2 rounded-lg whitespace-nowrap bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-500 hover:to-cyan-500 text-white font-bold text-xs flex items-center space-x-1.5 shadow-lg shadow-cyan-500/20 disabled:opacity-50"
             >
               {loading ? (
                 <>

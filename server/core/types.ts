@@ -190,13 +190,22 @@ export interface LiveReadiness {
   reasons: string[];
   components: {
     rpc: { healthy: boolean; latencyMs: number; status: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' };
-    pumpFeed: { healthy: boolean; lastEventAgeMs: number; status: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' | 'WARMING_UP' };
+    pumpFeed: { healthy: boolean; lastEventAgeMs: number; status: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' | 'WARMING_UP'; required?: boolean; mainnetApiLastEventAgeMs?: number };
     markFeed: { healthy: boolean; lastMarkAgeMs: number; status: 'HEALTHY' | 'DEGRADED' | 'STALE' };
     jito: { healthy: boolean; status: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' | 'OFFLINE' | 'NOT_CONFIGURED' };
     db: { healthy: boolean; status: 'HEALTHY' | 'DEGRADED' | 'ERROR' };
     signer: { healthy: boolean; status: SignerStatus };
   };
   checkedAt: number;
+}
+
+export interface OperatorAlert {
+  code: string;
+  message: string;
+  positionId?: string;
+  raisedAt: number;
+  lastSeenAt: number;
+  cleared: boolean;
 }
 
 export interface SystemDiagnostics {
@@ -211,6 +220,7 @@ export interface SystemDiagnostics {
   rpcHealth: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED';
   pumpFeedHealth: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' | 'WARMING_UP';
   positionMarkHealth: 'HEALTHY' | 'DEGRADED' | 'STALE';
+  operatorAlerts?: OperatorAlert[];
   marketFeedHealth: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' | 'WARMING_UP';
   marketFeedLastEventMsAgo: number;
   jitoHealth: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' | 'NOT_CONFIGURED';

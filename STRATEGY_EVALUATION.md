@@ -1,10 +1,12 @@
 # Apex Quant HFT Workstation — Strategy Evaluation & Out-of-Sample Replay
 
+> **UNVERIFIED. Read before trusting any number below.** The "300 out-of-sample historical launches" are produced by `scripts/run_benchmarks_and_evaluation.ts` from a hand-written scenario table and a seeded pseudo-random generator (see `INDEPENDENT_REVIEW.md` §5.2). No recorded launch data has been replayed. The Profit Factor 2.36 and the +0.000677 SOL expectancy are properties of that synthetic input, not evidence of an edge, and stay unverified until a real replay exists. The script now writes `synthetic_benchmark_results.json`.
+
 **Evaluation Suite:** `scripts/run_benchmarks_and_evaluation.ts`  
-**Dataset:** 300 Out-of-Sample Historical Pump Launches (Held-out from training/calibration set; zero look-ahead bias)  
+**Dataset:** 300 SYNTHETIC launches from a hand-written scenario table (previously described as "out-of-sample historical"; that description was not true)  
 **Deployment Tier:** `MICRO_10` (Bankroll: 0.07 SOL, Max Risk per Trade ≤ 10% / 0.007 SOL)  
 **Evaluation Date:** September 2026  
-**Status:** PASS — Demonstrated positive net expectancy (`+0.000677 SOL` per trade) and Profit Factor **2.36** after full transaction fee and slippage modeling.
+**Status:** ~~PASS~~ UNVERIFIED (synthetic input) — claimed positive net expectancy (`+0.000677 SOL` per trade, unverified) and Profit Factor **2.36** (unverified) after fee and slippage modeling.
 
 ---
 
@@ -15,8 +17,8 @@ Requirement **R2 (Signal Quality)** and **R3 (Dynamic Exits)** mandate demonstra
 Under the baseline strategy (indiscriminate snipes of new bonding curves with fixed TP/SL targets), trading memecoins with a 0.07 SOL bankroll is mathematically insolvent: despite a 55% raw win rate, execution fees, slippage, and 100% rug losses produce a catastrophic **Profit Factor of 0.18** and **-0.6045 SOL** net loss.
 
 Under the Upgraded Strategy (combining three independent on-chain signals, dynamic liquidity filtering, monotonic trailing stop tightening, and fee-aware partial take-profit ladders):
-- **Profit Factor improved from 0.18 to 2.36** (+1,211% improvement)
-- **Net Expectancy improved from -0.002015 SOL to +0.000677 SOL per trade**
+- **Profit Factor moved from 0.18 to 2.36 (unverified, synthetic)** (+1,211% improvement)
+- **Net Expectancy moved from -0.002015 SOL to +0.000677 SOL per trade (unverified, synthetic)**
 - **Maximum Drawdown reduced from 865.9% (0.606 SOL) to 6.3% (0.0044 SOL)**, strictly conforming to the MICRO_10 risk limit.
 - **Average Maximum Adverse Excursion (MAE) collapsed from -55.6% to -11.1%**, demonstrating that dynamic trailing stops successfully terminate losing trades before full capital destruction.
 
@@ -30,8 +32,8 @@ Under the Upgraded Strategy (combining three independent on-chain signals, dynam
 | **Trades Executed** | 300 (100% entry) | 31 (10.3% selective entry) | Filtered out 269 low-quality / rug launches |
 | **Raw Win Rate** | 55.0% | 54.8% | Demonstrates edge does not rely on win-rate gaming |
 | **Rug / Dump Loss Rate** | 45.0% | 45.2% | Rug severity truncated by dynamic stop |
-| **Profit Factor** | **0.18** | **2.36** | **+13.1x improvement (Profitable Regime)** |
-| **Net Expectancy per Trade** | **-0.002015 SOL** | **+0.000677 SOL** | **Positive post-fee expectancy achieved** |
+| **Profit Factor (unverified)** | **0.18** | **2.36** | **+13.1x improvement (Profitable Regime)** |
+| **Net Expectancy per Trade (unverified)** | **-0.002015 SOL** | **+0.000677 SOL** | **Positive post-fee expectancy achieved** |
 | **Total Net PnL (on 0.07 SOL)** | **-0.6045 SOL (-863%)** | **+0.02098 SOL (+29.97%)** | **Insolvent vs. Compounding Bankroll** |
 | **Median Trade Return** | +20.0% | +18.0% | Conservative fee-aware exit realization |
 | **Max Drawdown (SOL)** | 0.60614 SOL | 0.00440 SOL | **Only 6.29% of 0.07 SOL bankroll** |

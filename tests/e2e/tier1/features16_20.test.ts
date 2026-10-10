@@ -269,7 +269,7 @@ describe('Tier 1: Feature Coverage (Features 16 - 20)', () => {
         mint: '55555555555555555555555555555555',
         symbol: 'SOCIAL',
         name: 'Social Callout',
-        amountSol: 0.02,
+        amountSol: 0.005,
         jitoTipSol: 0.0005,
         source: 'HOT_CALLOUT',
         provenance: 'REAL_SOCIAL',
@@ -290,7 +290,7 @@ describe('Tier 1: Feature Coverage (Features 16 - 20)', () => {
         priceChange5mPct: 25.0,
         liquidityUsd: 35000,
         top10HoldersPct: 18.0,
-        bondingCurveProgress: 75,
+        bondingCurveProgress: 75, curveVelocityMetrics: { velocityScore: 12 } as any, // C2: measured velocity stands in for the removed progress fallback
         buys5m: 45,
         sells5m: 10,
         devHoldingPct: 1.0,
@@ -311,7 +311,7 @@ describe('Tier 1: Feature Coverage (Features 16 - 20)', () => {
         priceChange5mPct: 500,
         liquidityUsd: 1_000_000,
         top10HoldersPct: 5,
-        bondingCurveProgress: 95,
+        bondingCurveProgress: 95, curveVelocityMetrics: { velocityScore: 15 } as any, // C2: measured velocity stands in for the removed progress fallback
         buys5m: 500,
         sells5m: 2,
         devHoldingPct: 0,
@@ -324,7 +324,7 @@ describe('Tier 1: Feature Coverage (Features 16 - 20)', () => {
         priceChange5mPct: -80,
         liquidityUsd: 500,
         top10HoldersPct: 85,
-        bondingCurveProgress: 10,
+        bondingCurveProgress: 10, curveVelocityMetrics: { velocityScore: 4 } as any, // C2: measured velocity stands in for the removed progress fallback
         buys5m: 2,
         sells5m: 50,
         devHoldingPct: 40,
@@ -339,7 +339,7 @@ describe('Tier 1: Feature Coverage (Features 16 - 20)', () => {
         priceChange5mPct: 0,
         liquidityUsd: 5000,
         top10HoldersPct: 12.0, // <= 15%
-        bondingCurveProgress: 50,
+        bondingCurveProgress: 50, curveVelocityMetrics: { velocityScore: 8 } as any, // C2: measured velocity stands in for the removed progress fallback
         buys5m: 10,
         sells5m: 10,
         devHoldingPct: 2.0,
@@ -355,7 +355,7 @@ describe('Tier 1: Feature Coverage (Features 16 - 20)', () => {
         priceChange5mPct: 0,
         liquidityUsd: 5000,
         top10HoldersPct: 30,
-        bondingCurveProgress: 50,
+        bondingCurveProgress: 50, curveVelocityMetrics: { velocityScore: 8 } as any, // C2: measured velocity stands in for the removed progress fallback
         buys5m: 80,
         sells5m: 20, // 80% buy ratio
         devHoldingPct: 2.0,
@@ -371,7 +371,7 @@ describe('Tier 1: Feature Coverage (Features 16 - 20)', () => {
         priceChange5mPct: 10,
         liquidityUsd: 15000,
         top10HoldersPct: 25,
-        bondingCurveProgress: 60,
+        bondingCurveProgress: 60, curveVelocityMetrics: { velocityScore: 8 } as any, // C2: measured velocity stands in for the removed progress fallback
         buys5m: 20,
         sells5m: 5,
         devHoldingPct: 1.0,

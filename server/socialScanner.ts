@@ -67,7 +67,7 @@ const INITIAL_SIGNALS: SocialSignal[] = [
       twitter: 'https://x.com/search?q=%24GOAT+solana',
       telegram: 'https://t.me/sol_cabal_insider_bot',
     },
-    isLiveFeed: true,
+    isLiveFeed: false,
   },
   {
     id: 'sig-002',
@@ -99,7 +99,7 @@ const INITIAL_SIGNALS: SocialSignal[] = [
       website: 'https://www.moodengsol.com/',
       dexScreener: 'https://dexscreener.com/solana/ED5nyyWEzpPPiWimP8vYm7sD7TD3LAt3Q3gRTWHzPJBY',
     },
-    isLiveFeed: true,
+    isLiveFeed: false,
   },
   {
     id: 'sig-003',
@@ -131,7 +131,7 @@ const INITIAL_SIGNALS: SocialSignal[] = [
       twitter: 'https://x.com/search?q=%24PNUT+solana',
       telegram: 'https://t.me/raydium_clmm_scanner',
     },
-    isLiveFeed: true,
+    isLiveFeed: false,
   },
   {
     id: 'sig-004',
@@ -162,7 +162,7 @@ const INITIAL_SIGNALS: SocialSignal[] = [
       dexScreener: 'https://dexscreener.com/solana/HeLp6NuQkmYB4pYWo2zYs22mESHXPQYzXbB8n4V98jwC',
       website: 'https://ai16z.ai',
     },
-    isLiveFeed: true,
+    isLiveFeed: false,
   },
   {
     id: 'sig-005',
@@ -193,7 +193,7 @@ const INITIAL_SIGNALS: SocialSignal[] = [
       dexScreener: 'https://dexscreener.com/solana/Df6yfrKC8kZE3KNkrHERKzAChSxGQW5v68tK4yWBpump',
       twitter: 'https://x.com/search?q=%24CHILLGUY+solana',
     },
-    isLiveFeed: true,
+    isLiveFeed: false,
   },
 ];
 
@@ -226,7 +226,8 @@ export class SocialAlphaScanner {
   public updateTelegramConfig(cfg: Partial<TelegramBotConfig>): TelegramBotConfig {
     // S1: only known keys with the right types are accepted (no mass assignment from the request body).
     const next: Partial<TelegramBotConfig> = {};
-    if (typeof cfg?.botToken === 'string') next.botToken = cfg.botToken.trim();
+    // R4s: the UI never receives the stored token, so it posts '' on Save Config; an empty token means "unchanged", never "wipe".
+    if (typeof cfg?.botToken === 'string' && cfg.botToken.trim() !== '') next.botToken = cfg.botToken.trim();
     if (typeof cfg?.chatId === 'string') next.chatId = cfg.chatId.trim();
     if (typeof cfg?.webhookActive === 'boolean') next.webhookActive = cfg.webhookActive;
     if (typeof cfg?.autoForwardAlerts === 'boolean') next.autoForwardAlerts = cfg.autoForwardAlerts;
@@ -275,7 +276,7 @@ export class SocialAlphaScanner {
     const trimmed = commandText.trim();
     if (trimmed.startsWith('/start') || trimmed.startsWith('/help')) {
       return {
-        reply: `⚡ APEX QUANT TELEGRAM BOT ONLINE\nAvailable Commands:\n/snipe <CA> [amount_usd] - Instantly snipes token with Jito priority tip\n/signals - Lists top 3 high-confidence market maker signals\n/positions - View open memecoin positions and PnL\n/status - Check bot connection & execution telemetry\n/panic_sell - Liquidate all open positions immediately`,
+        reply: `⚡ APEX QUANT TELEGRAM BOT ONLINE\nAvailable Commands:\n/snipe <CA> [amount_usd] - Buys the token (paper or live, whichever mode is active)\n/signals - Lists top 3 high-confidence market maker signals\n/positions - View open memecoin positions and PnL\n/status - Check bot connection & execution telemetry\n/panic_sell - Liquidate all open positions immediately`,
       };
     }
 
@@ -287,7 +288,7 @@ export class SocialAlphaScanner {
       const text = top3
         .map(
           (s) =>
-            `🎯 ${s.tokenTicker} (${s.source}) - Confidence: ${s.confidenceScore}%\nCA: ${s.contractAddress}\n${s.rawText.slice(0, 90)}...`
+            `🎯 ${s.tokenTicker} (${s.source}) - Confidence: ${s.confidenceScore === null ? 'n/a' : s.confidenceScore + '%'}\nCA: ${s.contractAddress}\n${s.rawText.slice(0, 90)}...`
         )
         .join('\n\n');
       return { reply: `📊 Top Social & MM Signals:\n\n${text}` };
@@ -319,23 +320,27 @@ export class SocialAlphaScanner {
       }
       let totalRealized = 0;
       const closedNames: string[] = [];
+      const failedNames: string[] = []; // Q23: a close that failed is reported, never counted as sold
       for (const p of positions) {
-        const res = await memecoinAggregator.closePosition(p.id, 100);
+        const res = await memecoinAggregator.closePosition(p.id, 100).catch((e: any) => ({ success: false as const, realizedPnl: 0, message: e?.message }));
         if (res.success) {
           totalRealized += res.realizedPnl || 0;
           closedNames.push(p.tokenTicker);
+        } else {
+          failedNames.push(`${p.tokenTicker}${(res as any).message ? ` (${(res as any).message})` : ''}`);
         }
       }
+      const head = failedNames.length === 0 ? '🚨 EMERGENCY DUMP COMPLETE' : `⚠️ EMERGENCY DUMP INCOMPLETE: ${failedNames.length} position(s) STILL OPEN`;
       return {
-        reply: `🚨 EMERGENCY DUMP EXECUTED:\nLiquidated ${closedNames.length} tokens: ${closedNames.join(', ')}\nTotal Realized PnL: ${totalRealized >= 0 ? '+' : ''}$${totalRealized.toFixed(2)}`,
-        actionTaken: 'PANIC_SELL_EXECUTED',
+        reply: `${head}:\nClosed ${closedNames.length}: ${closedNames.join(', ') || 'none'}${failedNames.length ? `\nStill open: ${failedNames.join(', ')}` : ''}\nRealized PnL of the closed: ${totalRealized >= 0 ? '+' : ''}$${totalRealized.toFixed(2)}`,
+        actionTaken: failedNames.length === 0 ? 'PANIC_SELL_EXECUTED' : 'PANIC_SELL_PARTIAL',
       };
     }
 
     if (trimmed.startsWith('/status')) {
       const positions = memecoinAggregator.getPositions();
       return {
-        reply: `🟢 APEX QUANT TELEGRAM BOT ENGINE STATUS:\n• Connection: ${this.telegramConfig.webhookActive ? 'LIVE WEBHOOK ACTIVE' : 'POLLING ACTIVE'}\n• Alert Chat: ${this.telegramConfig.chatId || '@apex_alpha_vip_snipers'}\n• Active Alpha Signals: ${this.signals.length}\n• Open Positions: ${positions.length}\n• MEV Tip Target: Jito Validator Tip Floor\n• Latency: ~28ms RTT`,
+        reply: `🟢 APEX QUANT TELEGRAM BOT ENGINE STATUS:\n• Connection: ${this.telegramConfig.webhookActive ? 'LIVE WEBHOOK ACTIVE' : 'POLLING ACTIVE'}\n• Alert Chat: ${this.telegramConfig.chatId || 'not set'}\n• Active Alpha Signals: ${this.signals.length}\n• Open Positions: ${positions.length}`,
       };
     }
 
@@ -360,13 +365,13 @@ export class SocialAlphaScanner {
       const snipeResult = await memecoinAggregator.executeSnipe({
         contractAddress: ca,
         amountUsd: amount,
-        jitoTipSol: 0.005,
+        signalTimestamp: Date.now(), // an operator command is its own signal
       });
 
       if (snipeResult.success) {
         const pos = snipeResult.position;
         return {
-          reply: `🚀 SNIPER ORDER EXECUTED via Telegram!\nToken: $${pos?.tokenTicker || 'TOKEN'}\nCA: ${ca}\nNotional: $${amount.toFixed(2)}\nExecution Price: $${(pos?.entryPriceUsd || 0).toFixed(6)}\nPriority Fee: 0.005 SOL (Jito MEV Bundle)\nTx Hash: ${snipeResult.txHash}\nStatus: CONFIRMED in Block Slot`,
+          reply: `🚀 SNIPER ORDER FILLED via Telegram:\nToken: $${pos?.tokenTicker || 'TOKEN'}\nCA: ${ca}\nNotional: $${amount.toFixed(2)}\nExecution Price: $${(pos?.entryPriceUsd || 0).toFixed(6)}\nTx: ${snipeResult.txHash || 'none (paper fill)'}`,
           actionTaken: 'SNIPED_FROM_TELEGRAM',
         };
       } else {
@@ -611,6 +616,9 @@ export class SocialAlphaScanner {
     const hasTwitter = !!tokenData.twitter;
     const hasTelegram = !!tokenData.telegram;
 
+    // K5 (#15): this is a token discovered on the pump.fun feed, not a post by a known account. Nothing is invented about
+    // the author, the audience, the confidence or the intent: tier, confidence, sentiment and engagement metrics are
+    // unknown, the signal is unverified, and the suggested action is to review it, never SNIPE_IMMEDIATE.
     const source: SocialSource = hasTwitter ? 'X_TWITTER' : 'TELEGRAM';
     const authorHandle = tokenData.callerHandle
       ? tokenData.callerHandle
@@ -618,22 +626,21 @@ export class SocialAlphaScanner {
       ? `@${tokenData.twitter!.split('/').filter(Boolean).pop()}`
       : hasTelegram
       ? tokenData.telegram!.split('/').filter(Boolean).pop()!
-      : '@pump_velocity_bot';
+      : '@pump_feed';
 
-    const authorDisplayName = hasTwitter
-      ? `${tokenData.name} (X Official)`
-      : hasTelegram
-      ? `${tokenData.name} Telegram Community`
-      : 'Pump.fun High Velocity Bot';
+    const authorDisplayName = tokenData.name;
 
-    const rawText = tokenData.isBoosted
-      ? `🚨 DEXSCREENER BOOSTED & PUMP.FUN CONFLUENCE: $${tokenData.symbol} curve at ${tokenData.curveProgress}%. Verified socials: ${hasTwitter ? 'X.com' : ''} ${hasTelegram ? 'Telegram' : ''}. Volume: $${(tokenData.volume5mUsd || 5000).toLocaleString()}.`
-      : `🔥 NEW REAL ON-CHAIN LAUNCH: $${tokenData.symbol} on Pump.fun bonding curve. Curve progress: ${tokenData.curveProgress}%. Market cap: $${(tokenData.marketCapUsd || 7500).toLocaleString()}. Active community links verified.`;
+    const facts = [
+      `$${tokenData.symbol} is on the pump.fun bonding curve`,
+      `curve progress ${tokenData.curveProgress}%`,
+      tokenData.marketCapUsd !== undefined ? `market cap $${Math.round(tokenData.marketCapUsd).toLocaleString()}` : null,
+      tokenData.volume5mUsd !== undefined ? `5m volume $${Math.round(tokenData.volume5mUsd).toLocaleString()}` : null,
+      tokenData.isBoosted ? 'DexScreener boost active' : null,
+      hasTwitter || hasTelegram ? `links listed by the token (not checked): ${[hasTwitter ? 'X' : '', hasTelegram ? 'Telegram' : ''].filter(Boolean).join(', ')}` : 'no social links listed',
+    ].filter(Boolean);
+    const rawText = `${facts.join('. ')}.`;
 
-    const externalUrl =
-      tokenData.twitter ||
-      tokenData.telegram ||
-      `https://pump.fun/coin/${tokenData.mint}`;
+    const externalUrl = tokenData.twitter || tokenData.telegram || `https://pump.fun/coin/${tokenData.mint}`;
 
     const newSignal: SocialSignal = {
       id: `sig-live-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
@@ -641,8 +648,8 @@ export class SocialAlphaScanner {
       source,
       authorHandle,
       authorDisplayName,
-      authorTier: tokenData.isBoosted ? 'TOP_KOL' : 'CABAL_TRACKER',
-      verified: true,
+      authorTier: 'UNVERIFIED',
+      verified: false,
       timestamp: Date.now(),
       timeStr: 'Just now',
       rawText,
@@ -650,23 +657,18 @@ export class SocialAlphaScanner {
       tokenName: tokenData.name,
       contractAddress: tokenData.mint,
       chain: 'SOLANA',
-      signalPattern: tokenData.curveProgress >= 80 ? 'MIGRATION_SNIPE' : 'CABAL_LAUNCH',
-      confidenceScore: tokenData.isBoosted ? 95 : 88,
-      sentimentScore: 0.85,
-      liquidityUsd: Math.floor((tokenData.marketCapUsd || 8000) * 0.22),
-      marketCapUsd: tokenData.marketCapUsd || 8000,
-      metrics: {
-        views: tokenData.isBoosted ? 38500 : 12400,
-        reposts: tokenData.isBoosted ? 412 : 86,
-        subscribers: 15200,
-      },
-      actionSuggested: 'SNIPE_IMMEDIATE',
+      signalPattern: tokenData.curveProgress >= 80 ? 'MIGRATION_SNIPE' : 'UNCLASSIFIED',
+      confidenceScore: null,
+      sentimentScore: null,
+      ...(tokenData.marketCapUsd !== undefined ? { marketCapUsd: tokenData.marketCapUsd } : {}),
+      metrics: {},
+      actionSuggested: 'REVIEW',
       status: 'NEW',
       externalUrl,
       socials: {
-        twitter: tokenData.twitter || `https://x.com/search?q=%24${tokenData.symbol}+solana`,
-        telegram: tokenData.telegram,
-        website: tokenData.website,
+        ...(tokenData.twitter ? { twitter: tokenData.twitter } : {}),
+        ...(tokenData.telegram ? { telegram: tokenData.telegram } : {}),
+        ...(tokenData.website ? { website: tokenData.website } : {}),
         pumpFun: `https://pump.fun/coin/${tokenData.mint}`,
         dexScreener: `https://dexscreener.com/solana/${tokenData.mint}`,
       },

@@ -28,6 +28,8 @@ const FORBIDDEN_TRADE_KEYS = [
   'signalTimestamp',
   'marketDataTimestamp',
   'source',
+  'dryRun',
+  'amountSolOverride',
 ] as const;
 
 function rejectForbiddenKeys(value: unknown, ctx: z.RefinementCtx) {
@@ -47,7 +49,8 @@ const address = z.string().trim().regex(SOLANA_ADDRESS, 'must be a valid Base58 
 const id = z.string().trim().min(1).max(128);
 
 const amountUsd = z.coerce.number().positive().max(100_000).default(5.0);
-const jitoTipSol = z.coerce.number().min(0).max(0.1).default(0.005);
+/** Optional: absent means the executionConfig dynamic tip policy decides (C6). */
+const jitoTipSol = z.coerce.number().min(0).max(0.1).optional();
 const slippagePct = z.coerce.number().min(0.5).max(50).default(8.0);
 const sellPct = z.coerce.number().min(1).max(100).default(100);
 
@@ -81,15 +84,17 @@ export const SignalSnipeSchema = z
     platform: z.string().trim().max(32).optional(),
     jitoTipSol,
     slippagePct,
+    confirmLive: z.boolean().optional(),
   })
   .loose()
   .superRefine(rejectForbiddenKeys)
-  .transform(({ signalId, amountUsd, platform, jitoTipSol, slippagePct }) => ({
+  .transform(({ signalId, amountUsd, platform, jitoTipSol, slippagePct, confirmLive }) => ({
     signalId,
     amountUsd,
     platform,
     jitoTipSol,
     slippagePct,
+    confirmLive,
   }));
 
 /** POST /api/pumpfun/callouts/snipe, WS SNIPE_PUMP_CALLOUT. */
@@ -99,10 +104,31 @@ export const CalloutSnipeSchema = z
     amountUsd,
     jitoTipSol,
     slippagePct: z.coerce.number().min(0.5).max(50).default(6.0),
+    confirmLive: z.boolean().optional(),
   })
   .loose()
   .superRefine(rejectForbiddenKeys)
-  .transform(({ calloutId, amountUsd, jitoTipSol, slippagePct }) => ({ calloutId, amountUsd, jitoTipSol, slippagePct }));
+  .transform(({ calloutId, amountUsd, jitoTipSol, slippagePct, confirmLive }) => ({ calloutId, amountUsd, jitoTipSol, slippagePct, confirmLive }));
+
+/** POST /api/pumpfun/callouts/rules. Only these keys, inside these bounds, reach the rules object (Q25: it used to be a spread of the raw body). */
+export const AutoSnipeRulesSchema = z
+  .object({
+    minCallerWinRate2x: z.number().min(0).max(100).optional(),
+    minAvgMultiple: z.number().min(0).max(1000).optional(),
+    autoSnipeOnConfluence: z.boolean().optional(),
+    maxEntryMultiple: z.number().min(1).max(100).optional(),
+    maxElapsedSeconds: z.number().min(1).max(3600).optional(),
+    snipeAmountUsd: z.number().min(0.01).max(1000).optional(),
+    jitoPriorityTipSol: z.number().min(0).max(0.1).optional(),
+  })
+  .loose()
+  .transform((o) => {
+    const out: Record<string, number | boolean> = {};
+    for (const k of ['minCallerWinRate2x', 'minAvgMultiple', 'autoSnipeOnConfluence', 'maxEntryMultiple', 'maxElapsedSeconds', 'snipeAmountUsd', 'jitoPriorityTipSol'] as const) {
+      if (o[k] !== undefined) out[k] = o[k] as number | boolean;
+    }
+    return out;
+  });
 
 /** POST /api/memecoins/close, POST /api/execution/close, WS CLOSE_POSITION. */
 export const OperatorCloseSchema = z
@@ -139,11 +165,36 @@ export const OperatorExecuteTradeSchema = z
     liquidityUsd,
   }));
 
+/**
+ * A boolean from JSON or a form: true/false or the strings "true"/"false". `z.coerce.boolean()` turns the STRING "false"
+ * into true (any non-empty string is truthy), which would arm, or sell everything, on a request that said the opposite.
+ */
+const strictBool = z.preprocess((v) => (v === 'true' ? true : v === 'false' ? false : v), z.boolean());
+
 /** POST /api/execution/arm and POST /api/wallet/toggle-trading. */
 export const ArmSchema = z.object({
-  arm: z.coerce.boolean().optional(),
-  active: z.coerce.boolean().optional(),
+  arm: strictBool.optional(),
+  active: strictBool.optional(),
   confirmationCode: z.string().max(64).optional(),
+});
+
+/** POST /api/auto/mode (G1). */
+export const KillSwitchSchema = z.object({ activate: strictBool });
+
+export const AutoModeSchema = z.object({
+  mode: z.enum(['OFF', 'SHADOW', 'PAPER', 'DEVNET_LIVE']),
+  confirmationCode: z.string().max(64).optional(),
+});
+
+/** POST /api/auto/kill (G1). */
+export const AutoKillSchema = z.object({
+  exitAll: strictBool.optional(),
+  reason: z.string().trim().max(200).optional(),
+});
+
+/** POST /api/auto/resume (G3): clear an all-trading halt. It never turns auto trading back on. */
+export const AutoResumeSchema = z.object({
+  clearHalt: z.boolean().optional(),
 });
 
 /** WS TOGGLE_CALLER_SNIPE, POST /api/pumpfun/callouts/toggle-autosnipe. */

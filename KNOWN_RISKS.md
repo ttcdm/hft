@@ -88,3 +88,19 @@ This document outlines structural, economic, and operational risks inherent to a
 1. **Immediate Execution Halt:** Engage the Hardware Kill Switch via the UI or `POST /api/live/disarm`. This halts order generation and trips the circuit breaker.
 2. **Panic Liquidation:** Initiate sequential exit via `POST /api/order/panic-liquidate`. This disarms live trading first, then liquidates all active positions.
 3. **Wallet Balance Sweep:** In the event of an infrastructure anomaly, transfer all remaining SOL out of the trading keypair to a designated cold wallet via standard CLI tools (`solana transfer`).
+
+## 6. Settings that are stored but change nothing (checked against the code, Q34)
+
+These can be set (some from the UI) and are saved, but no code path reads them to decide anything. Do not rely on them.
+
+| Setting | Where it lives | What it actually does |
+|---|---|---|
+| `snipeThresholdScore` (Telegram config) | `server/socialScanner.ts` | Stored and returned only. The auto-snipe score gate is the confluence gate (70), set in the confluence engine. |
+| `autoForwardAlerts` (Telegram config) | `server/socialScanner.ts` | Stored only. Nothing forwards alerts to Telegram. |
+| `webhookActive` (Telegram config) | `server/socialScanner.ts` | Changes the word in the `/status` reply. No webhook is registered with Telegram. |
+| `isAutoSnipeEnvEnabled()` | `server/pumpfunService.ts` | Defined, never called. |
+| `isAutoSnipeSubscribed` / `toggleCallerAutoSnipe` | `server/pumpfunService.ts` | Flips a flag shown in the UI. No code buys because of it. |
+| `requireMintRevoked` | `server/memecoinAggregator.ts` config | Accepted and stored. The mint-authority rule is enforced by the eligibility gate, not by this field. |
+| `ENABLE_SYNTHETIC_SOCIAL` | `server/solana/executionConfig.ts` | Read into the config object, never consulted. |
+
+Also: Jito bundles are used only on mainnet-beta, which this build does not use. On devnet and localnet the app sends ordinary transactions with a priority fee.

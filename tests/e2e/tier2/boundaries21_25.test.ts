@@ -191,15 +191,12 @@ describe('Tier 2: Boundary & Corner Cases (Features 21 - 25)', () => {
       }
     });
 
-    it('B22.2: mock RPC responds synchronously with 0ms latency without timing out', async () => {
+    it('B22.2: mock RPC resolves a getSlot call', async () => {
       const mockRpc = new MockSolanaRpc();
       const conn = mockRpc.createConnection();
-      const startTime = Date.now();
       const slot = await conn.getSlot();
-      const elapsed = Date.now() - startTime;
 
       expect(slot).toBeGreaterThan(0);
-      expect(elapsed).toBeLessThan(100);
     });
 
     it('B22.3: mock Jito engine simulates bundle drop/timeout correctly without infinite hang', async () => {

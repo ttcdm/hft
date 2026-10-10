@@ -347,11 +347,24 @@ class EngineClient {
     return null;
   }
 
-  public downloadWalJournal() {
-    window.location.href = '/api/engine/wal/export';
+  public async downloadWalJournal(): Promise<{ ok: boolean; error?: string }> {
+    // A plain navigation cannot carry the Authorization header, so fetch with auth and save the blob.
+    try {
+      const res = await authFetch('/api/engine/wal/export');
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const url = URL.createObjectURL(await res.blob());
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `apex_engine_journal_${Date.now()}.wal`;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 30_000); // R34: revoking right after click() can cancel the download
+      return { ok: true };
+    } catch (e: any) {
+      console.error('WAL export failed:', e);
+      return { ok: false, error: String(e?.message || e) };
+    }
   }
 
-  // ---------------- SOCIAL SCANNER & TELEGRAM ALPHA ----------------
   public async getSocialSignals() {
     try {
       const res = await authFetch('/api/social/signals');
@@ -362,12 +375,12 @@ class EngineClient {
     return { status: 'ERROR', signals: [] };
   }
 
-  public async snipeSocialSignal(signalId: string, amountUsd: number = 5.0, jitoTipSol: number = 0.005, slippagePct: number = 8.0) {
+  public async snipeSocialSignal(signalId: string, amountUsd: number = 5.0, jitoTipSol: number = 0.005, slippagePct: number = 8.0, confirmLive = false) {
     try {
       const res = await authFetch('/api/social/signals/snipe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ signalId, amountUsd, jitoTipSol, slippagePct }),
+        body: JSON.stringify({ signalId, amountUsd, jitoTipSol, slippagePct, ...(confirmLive ? { confirmLive: true } : {}) }),
       });
       return await res.json();
     } catch (e) {
@@ -540,12 +553,12 @@ class EngineClient {
     return null;
   }
 
-  public async snipePumpFunCallout(calloutId: string, amountUsd?: number, jitoTipSol?: number, slippagePct?: number) {
+  public async snipePumpFunCallout(calloutId: string, amountUsd?: number, jitoTipSol?: number, slippagePct?: number, confirmLive = false) {
     try {
       const res = await authFetch('/api/pumpfun/callouts/snipe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ calloutId, amountUsd, jitoTipSol, slippagePct }),
+        body: JSON.stringify({ calloutId, amountUsd, jitoTipSol, slippagePct, ...(confirmLive ? { confirmLive: true } : {}) }),
       });
       return await res.json();
     } catch (e) {

@@ -22,9 +22,14 @@ FROM node:22-alpine AS runner
 
 WORKDIR /app
 
+# Inside the container the app must listen on all interfaces for the published port to work; docker-compose.yml publishes it on
+# the host's loopback only. APEX_CONTAINER stops the generated operator token being printed into container logs.
 ENV NODE_ENV=production \
     PORT=3000 \
-    BIND_HOST=0.0.0.0
+    BIND_HOST=0.0.0.0 \
+    ALLOW_PUBLIC_BIND=true \
+    APEX_CONTAINER=true \
+    ALLOWED_CLUSTER=devnet
 
 # Install runtime utilities
 RUN apk add --no-cache curl wget
@@ -44,6 +49,6 @@ USER node
 EXPOSE 3000
 
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
-  CMD wget --spider -q http://127.0.0.1:3000/api/health || exit 1
+  CMD wget -q -O /dev/null http://127.0.0.1:3000/api/health || exit 1
 
 CMD ["node", "dist/server.cjs"]

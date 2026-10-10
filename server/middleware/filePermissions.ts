@@ -30,10 +30,25 @@ export function findLoosePermissions(
   return findings;
 }
 
-/** Secret-bearing files the server reads at startup. */
+/** Top-level file names in the project root that hold secrets or state (copies of .env, wallet files, databases, logs). */
+const SECRET_NAME_PATTERNS: RegExp[] = [
+  /^\.env(\..+)?$/, /^env\..*\.txt$/, /^env\.txt$/, /keypair.*\.json$/, /\.signer\.json$/, /^\.operator_session/,
+  /\.db(-.+)?$/, /\.wal$/, /\.log$/,
+];
+
+/** Secret-bearing files the server reads at startup, plus look-alikes sitting in the project root (env.txt, .env.bak-*, db/wal, server.log). Warn-only: nothing is ever chmod-ed. */
 export function defaultSecretFilePaths(env: NodeJS.ProcessEnv = process.env, cwd: string = process.cwd()): string[] {
   const keypair = env.SIGNER_KEYPAIR_PATH || path.join(cwd, '.apex_trading_keypair.json');
-  return [path.join(cwd, '.env'), keypair];
+  const found = new Set<string>([path.join(cwd, '.env'), keypair]);
+  try {
+    for (const name of fs.readdirSync(cwd)) {
+      if (name === '.env.example') continue;
+      if (SECRET_NAME_PATTERNS.some((r) => r.test(name))) found.add(path.join(cwd, name));
+    }
+  } catch {
+    // unreadable cwd: keep the two fixed paths
+  }
+  return [...found];
 }
 
 export function loosePermissionWarnings(findings: LoosePermissionFinding[]): string[] {

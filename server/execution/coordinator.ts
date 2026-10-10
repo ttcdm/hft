@@ -1,11 +1,13 @@
-import dotenv from 'dotenv';
-dotenv.config();
+import '../loadEnv'; // must stay the first import
+import bs58 from 'bs58';
+import { solPriceService } from '../market/solPriceService';
 import { Connection, PublicKey, SystemProgram, VersionedTransaction } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID, createCloseAccountInstruction } from '@solana/spl-token';
 import {
   ExecutionMode,
   NormalizedPosition,
   SystemDiagnostics,
+  OperatorAlert,
   ExecutionLifecycleState,
   DataSource,
   SignalProvenance,
@@ -13,18 +15,30 @@ import {
   LiveReadiness,
   isLiveApprovedProvenance,
 } from '../core/types';
+/** C4: a mark older than this is not trusted for exits; the position is re-read directly first. */
+/** Sell slippage by number of consecutive failed exit attempts on a position (critique #4). A stop-loss in a fast dump must eventually clear. */
+export const SELL_SLIPPAGE_LADDER_BPS = [800, 1500, 2500, 4000];
+/** Auto-exit retry backoff after a failed attempt: base * 2^(n-1), capped. Each failed LIVE send can pay fees. */
+export const EXIT_RETRY_BASE_MS = 3_000;
+export const EXIT_RETRY_MAX_MS = 30_000;
+/** Consecutive failed exits before an operator alert is raised. */
+export const EXIT_FAILURE_ALERT_AFTER = 4;
+
+export const MARK_STALE_MS = 15_000;
+/** C4: if a direct read still fails after this long, raise an operator alert. */
+export const MARK_ALERT_AFTER_MS = 60_000;
 import { EligibilityFilter } from '../signals/eligibilityFilter';
 import { localSigner } from '../solana/signer';
 import { txBuilder, SolanaTransactionBuilder, PumpBuyParams, PumpSellParams } from '../solana/transactionBuilder';
 import { SolanaRpcTransport, JitoTransport } from '../solana/transports';
-import { riskEngine } from '../risk/riskEngine';
-import { paperEngine } from './paperEngine';
+import { riskEngine, estimateRoundTripCostLamports, MAX_ROUND_TRIP_COST_FRACTION } from '../risk/riskEngine';
+import { paperEngine, PaperExecutionEngine } from './paperEngine';
 import { workstationDb } from '../db/database';
 import { getRandomJitoTipAccount, TOKEN_2022_PROGRAM_ID } from '../solana/programs';
 import { executionConfig } from '../solana/executionConfig';
 import { Logger } from '../middleware/enterprise';
-import { assertClusterAllowed, resolveRpcUrl } from '../solana/clusterGuard';
-import { PumpCurveService, TradeQuote, fetchTokenHolderDistribution } from '../solana/pumpCurve';
+import { allowedCluster, assertClusterAllowed, resolveRpcUrl } from '../solana/clusterGuard';
+import { PumpCurveService, TradeQuote, PumpMarketState, fetchTokenHolderDistribution } from '../solana/pumpCurve';
 import { TradeReconciler, RealMarkPriceService, PreTradeSnapshot } from './reconciliation';
 export type { PreTradeSnapshot };
 import { CapitalSizer } from '../capital/capitalSizer';
@@ -44,6 +58,10 @@ export interface ExecuteTradeRequest {
   liquidityUsd?: number;
   signalTimestamp?: number;
   marketDataTimestamp?: number;
+  /**
+   * The mode the caller sized and gated this trade for (R5). If the coordinator's mode is different when the trade arrives (LIVE was armed or
+   * disarmed during the caller's awaits), the trade is refused instead of running in the other mode.
+   */
   executionMode?: ExecutionMode;
 }
 
@@ -55,17 +73,35 @@ export interface ExecutionResponse {
   txSignature?: string;
   bundleId?: string;
   fillPriceSol?: number;
+  /** Q7: the price the order was quoted at (curve execution price, fees included), so a caller measures slippage against the quote and not a stale pool price. */
+  quotePriceSol?: number;
   tokensReceived?: number;
   executionMode: ExecutionMode;
   feesPaidLamports?: number;
   error?: string;
+  /** Which gates a PAPER fill passed (C5). */
+  gates?: Record<string, unknown>;
   correlationId: string;
 }
+
+/** Exit reasons that run even while all trading is halted (see closePosition). */
+// A blockhash lives ~60-90s; after this a sent-but-unseen sell can no longer land.
+const PENDING_SELL_WINDOW_MS = 100_000;
+const ORPHAN_MAX_AGE_MS = 15 * 60_000;
+
+/** A balance found in the wallet that this app never bought (cost basis unknown): watched with a hard stop, not a trade the app chose. */
+export const isRecoveredPosition = (p: { entryTxSignature?: string }): boolean => !!p.entryTxSignature?.startsWith('RECOVERED:');
+
+// Q11: the reasons the operator routes actually pass ('Manual user order' from POST /api/wallet/close, 'Aggregator Close' from the WS
+// CLOSE_POSITION / aggregator close route, 'Operator close' from POST /api/execution/close) count as manual closes, as the halt alert promises.
+export const PROTECTIVE_EXIT_REASONS = /^(STOP_LOSS|TRAILING_STOP|EMERGENCY_PANIC_LIQUIDATION|MANUAL|Manual Close|Manual user order|Aggregator Close|Operator close)$/;
 
 export class ExecutionCoordinator {
   private executionMode: ExecutionMode = 'PAPER';
   private isLiveTradingArmed: boolean = false;
   private inFlightReservedSol: number = 0;
+  /** Q8: exits between the first line of closePosition and the journal row that records their fill. */
+  private exitsInFlight = 0;
   private inFlightPositionExits: Set<string> = new Set<string>();
   private inFlightBuyMints: Set<string> = new Set<string>();
   private connection: Connection;
@@ -74,6 +110,8 @@ export class ExecutionCoordinator {
   private rpcHealth: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' = 'DISCONNECTED';
   private pumpFeedHealth: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' = 'DISCONNECTED';
   private lastPumpFeedTimestamp: number = 0;
+  /** Last time the (mainnet-only) pump.fun HTTP API answered while trading on another cluster. */
+  private lastMainnetApiTimestamp: number = 0;
   private readonly startedAt: number = Date.now();
   private readonly startupGracePeriodMs: number = parseInt(process.env.STARTUP_GRACE_PERIOD_MS || '300000', 10); // 5-minute initialization grace period (B02)
   private positionMarkHealth: 'HEALTHY' | 'DEGRADED' | 'STALE' = 'HEALTHY';
@@ -116,6 +154,15 @@ export class ExecutionCoordinator {
     }
     this.jitoTransport = new JitoTransport(this.connection);
     this.rpcTransport = new SolanaRpcTransport(this.connection);
+    if (this.isDefaultSingleton) {
+      // A halt (for example an unexplained wallet drain) must outlive a restart; only an operator clears it.
+      const persisted = workstationDb.getPersistedHaltReason();
+      if (persisted) {
+        this.haltReason = persisted;
+        Logger.error(`[HALT] Trading is still halted from before the restart: ${persisted}`);
+        this.raiseOperatorAlert('TRADING_HALTED', `All trading is halted (restored after a restart): ${persisted}. Protective exits (stop-loss, trailing stop, manual close, panic) still run; clear it with POST /api/auto/resume {clearHalt:true}.`);
+      }
+    }
     this.initializeConnection();
     this.startAutoPositionMonitor();
     this.startMarketFeedHeartbeat();
@@ -128,7 +175,20 @@ export class ExecutionCoordinator {
         const slot = await this.connection.getSlot('processed');
         const latency = Math.round(performance.now() - t0);
         if (slot > 0) {
-          this.recordRpcHeartbeat(slot, latency);
+          const hadProblem = this.clusterProblem !== null;
+          if (await this.verifyCluster()) {
+            this.recordRpcHeartbeat(slot, latency);
+            // The boot pass skipped reconciliation (genesis unreadable or wrong, or the first connect failed outright - F3):
+            // run it once now that the RPC is up and verified. startupReconciliation is single-flight, so this cannot overlap
+            // a pass that is already running.
+            if (this.lastStartupReconciliation === null && (hadProblem || this.bootConnectFailed)) {
+              this.bootConnectFailed = false;
+              void this.syncRealWalletBalance()
+                .catch(() => undefined)
+                .then(() => this.startupReconciliation())
+                .catch(() => undefined);
+            }
+          }
         }
       } catch {
         this.rpcHealth = 'DISCONNECTED';
@@ -145,7 +205,16 @@ export class ExecutionCoordinator {
         this.pumpFeedHealth = 'HEALTHY';
       }
 
-      // Check position mark freshness
+      // Check position mark freshness. The clock belongs to open LIVE positions: with none open there is nothing to be
+      // stale, so it resets (otherwise the feed read STALE 90 s after the last close and blocked arming until a restart),
+      // and a PAPER position that cannot be priced (e.g. a mainnet-only mint on devnet) never turns the feed red.
+      let liveOpen: boolean;
+      try {
+        liveOpen = workstationDb.loadPositions('LIVE', 'ACTIVE').length > 0;
+      } catch {
+        liveOpen = true; // cannot tell: keep the clock running rather than hide a dead feed
+      }
+      if (!liveOpen) this.lastPositionMarkTimestamp = 0;
       const markAge = this.lastPositionMarkTimestamp > 0 ? now - this.lastPositionMarkTimestamp : 0;
       if (markAge > 90000) {
         this.positionMarkHealth = 'STALE';
@@ -173,15 +242,42 @@ export class ExecutionCoordinator {
       const t0 = performance.now();
       const slot = await this.connection.getSlot('processed');
       this.rpcLatencyMs = Math.round(performance.now() - t0);
-      this.rpcHealth = this.rpcLatencyMs > 800 ? 'DEGRADED' : 'HEALTHY';
-      Logger.info(`Solana RPC connected: Slot ${slot}, Latency ${this.rpcLatencyMs}ms`);
+      // An RPC that answers for a cluster other than the allowed one is not "healthy": readiness must refuse to arm on it,
+      // not wait for the first send to find out (the send path still re-checks). Started now, awaited after the Jito probe.
+      const clusterCheck = this.verifyCluster();
       await this.jitoTransport.probe();
       this.startJitoProbeLoop();
+      if (!(await clusterCheck)) {
+        Logger.warn(`Solana RPC is not on the allowed cluster: ${this.clusterProblem}. Staying DISCONNECTED; the heartbeat re-checks.`);
+        return;
+      }
+      this.rpcHealth = this.rpcLatencyMs > 800 ? 'DEGRADED' : 'HEALTHY';
+      Logger.info(`Solana RPC connected: Slot ${slot}, Latency ${this.rpcLatencyMs}ms`);
       await this.syncRealWalletBalance();
       await this.startupReconciliation();
     } catch (err: any) {
       this.rpcHealth = 'DISCONNECTED';
+      this.bootConnectFailed = true; // F3: the heartbeat runs startup reconciliation once the RPC comes back
       Logger.warn(`Solana RPC connection failed: ${err.message}. Operating in safe paper/offline mode.`);
+    }
+  }
+
+  /** Why the RPC is not trusted (wrong genesis, or genesis unreadable); null once a check passes. Sticky across heartbeats. */
+  private clusterProblem: string | null = null;
+
+  /**
+   * Genesis check for readiness (not only for sends). Never throws: returns true when the RPC is on the allowed cluster.
+   * A failure pins rpcHealth to DISCONNECTED until a later check passes, so a healthy getSlot cannot hide a wrong cluster.
+   */
+  private async verifyCluster(): Promise<boolean> {
+    try {
+      await assertClusterAllowed(this.connection);
+      this.clusterProblem = null;
+      return true;
+    } catch (err: any) {
+      this.clusterProblem = err?.message ?? 'cluster check failed';
+      this.rpcHealth = 'DISCONNECTED';
+      return false;
     }
   }
 
@@ -234,7 +330,10 @@ export class ExecutionCoordinator {
     const pumpFeedStatus: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' | 'WARMING_UP' = isPumpFeedWarmingUp
       ? 'WARMING_UP'
       : this.pumpFeedHealth;
-    const pumpFeedHealthy = (this.pumpFeedHealth === 'HEALTHY' && pumpFeedAgeMs <= 120000) || isPumpFeedWarmingUp;
+    // The pump event stream and "real market events" are mainnet-activity signals. On devnet/localnet a quiet network is normal and the
+    // pump.fun HTTP API is a MAINNET data source (see recordPumpFeedEvent), so neither blocks readiness there.
+    const feedRequired = allowedCluster() === 'mainnet-beta';
+    const pumpFeedHealthy = !feedRequired || (this.pumpFeedHealth === 'HEALTHY' && pumpFeedAgeMs <= 120000) || isPumpFeedWarmingUp;
 
     if (!pumpFeedHealthy) {
       const feedAgeSec = this.lastPumpFeedTimestamp > 0 ? Math.round(pumpFeedAgeMs / 1000) : null;
@@ -249,6 +348,10 @@ export class ExecutionCoordinator {
       reasons.push(
         `Position mark feed is ${this.positionMarkHealth} (${markAgeMs === Infinity ? 'never marked' : `${Math.round(markAgeMs / 1000)}s ago`})`
       );
+    }
+
+    if (this.haltReason) {
+      reasons.push(`All trading is halted: ${this.haltReason}`);
     }
 
     if (riskEngine.isKillSwitchActive()) {
@@ -270,7 +373,7 @@ export class ExecutionCoordinator {
       ? now - this.lastRealMarketEventTimestamp
       : Infinity;
     const isRealMarketWarmingUp = this.lastRealMarketEventTimestamp === 0 && inGracePeriod;
-    if (realFeedAgeMs > 120000 && !isRealMarketWarmingUp) {
+    if (feedRequired && realFeedAgeMs > 120000 && !isRealMarketWarmingUp) {
       reasons.push(
         `Real on-chain market feed has no recent events (${
           realFeedAgeMs === Infinity ? 'never received' : Math.round(realFeedAgeMs / 1000) + 's ago'
@@ -291,6 +394,8 @@ export class ExecutionCoordinator {
           healthy: pumpFeedHealthy,
           lastEventAgeMs: pumpFeedAgeMs === Infinity ? -1 : pumpFeedAgeMs,
           status: pumpFeedStatus,
+          required: feedRequired,
+          mainnetApiLastEventAgeMs: this.lastMainnetApiTimestamp > 0 ? now - this.lastMainnetApiTimestamp : -1,
         },
         markFeed: {
           healthy: markFeedHealthy,
@@ -327,10 +432,14 @@ export class ExecutionCoordinator {
   // Update RPC endpoint with safe re-instantiation
   public async setRpcEndpoint(newEndpoint: string): Promise<{ success: boolean; latencyMs: number; error?: string }> {
     try {
+      if (resolveRpcUrl(newEndpoint) !== newEndpoint.trim()) {
+        throw new Error(`CLUSTER_GUARD: RPC endpoint rejected (looks like mainnet while ALLOWED_CLUSTER=${allowedCluster()})`);
+      }
       const newConn = new Connection(newEndpoint, {
         commitment: 'confirmed',
         confirmTransactionInitialTimeout: 30000,
       });
+      await assertClusterAllowed(newConn);
       const t0 = performance.now();
       await newConn.getSlot('processed');
       const latency = Math.round(performance.now() - t0);
@@ -414,8 +523,16 @@ export class ExecutionCoordinator {
     this.lastMarketEventTimestamp = now;
   }
 
+  /**
+   * The pump.fun HTTP API (source 'PUMPFUN_SERVICE') is a MAINNET data source. Polling it says nothing about the cluster being traded, so
+   * off mainnet it is recorded separately and never makes the pump feed or the real-market-event clock look healthy (critique K6).
+   */
   public recordPumpFeedEvent(source = 'PUMPFUN_STREAM', mint?: string) {
     const now = Date.now();
+    if (source === 'PUMPFUN_SERVICE' && allowedCluster() !== 'mainnet-beta') {
+      this.lastMainnetApiTimestamp = now;
+      return;
+    }
     this.lastPumpFeedTimestamp = now;
     this.pumpFeedHealth = 'HEALTHY';
     this.lastRealMarketEventTimestamp = now;
@@ -424,6 +541,7 @@ export class ExecutionCoordinator {
 
   public recordRpcHeartbeat(slot: number, latencyMs: number) {
     this.rpcLatencyMs = latencyMs;
+    if (this.clusterProblem) return; // a wrong-cluster RPC does not become healthy because getSlot answers
     this.rpcHealth = latencyMs > 800 ? 'DEGRADED' : 'HEALTHY';
   }
 
@@ -454,8 +572,58 @@ export class ExecutionCoordinator {
     this.recordSyntheticMarketEvent('LEGACY_DISPATCH');
   }
 
-  // Startup Reconciliation checking database, on-chain balances, and transport health
-  public async startupReconciliation(): Promise<{
+  /** F3: the first RPC connect at boot failed, so startup reconciliation has not run yet. */
+  private bootConnectFailed = false;
+  private reconcileInFlight: Promise<{ status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE'; mismatchesCount: number; details: string }> | null = null;
+
+  // Startup Reconciliation checking database, on-chain balances, and transport health.
+  // Single-flight: a second call (e.g. POST /api/execution/reconcile during boot) joins the run in progress, so two
+  // passes never recover the same pending transaction or rewrite the same positions at once.
+  // `fresh` (the operator's Reconcile click) never takes the result of a run that started before the click: it waits for the run in
+  // progress and then runs once more, shared by every fresh caller meanwhile (R17: the click is usually made after fixing something).
+  private reconcileFollowUp: Promise<{ status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE'; mismatchesCount: number; details: string }> | null = null;
+  public startupReconciliation(opts: { fresh?: boolean } = {}): Promise<{
+    status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE';
+    mismatchesCount: number;
+    details: string;
+  }> {
+    if (opts.fresh && this.reconcileInFlight) {
+      if (!this.reconcileFollowUp) {
+        const follow: NonNullable<typeof this.reconcileFollowUp> = this.reconcileInFlight
+          .catch(() => undefined)
+          .then(() => {
+            if (this.reconcileFollowUp === follow) this.reconcileFollowUp = null; // later fresh callers start their own
+            return this.startupReconciliation();
+          });
+        this.reconcileFollowUp = follow;
+      }
+      return this.reconcileFollowUp;
+    }
+    if (!this.reconcileInFlight) {
+      // R7: no await inside a pass has a timeout of its own, so a hung RPC call would make every later Reconcile click join the same
+      // hung promise and readiness would say "in progress" forever. Bound the whole pass; on timeout record it as a mismatch and let the next call start fresh.
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('RECONCILIATION_TIMED_OUT')), this.reconcileTimeoutMs);
+        timer.unref?.();
+      });
+      const run = Promise.race([this.runStartupReconciliation(), timeout])
+        .catch((err: Error) => {
+          if (err.message !== 'RECONCILIATION_TIMED_OUT') throw err; // a real failure still rejects, as before
+          const details = `Reconciliation did not finish within ${Math.round(this.reconcileTimeoutMs / 1000)}s (an RPC call is hanging); run it again`;
+          this.lastStartupReconciliation = { status: 'RECONCILIATION_MISMATCH', checkedAt: Date.now(), details };
+          return { status: 'RECONCILIATION_MISMATCH' as const, mismatchesCount: 1, details };
+        })
+        .finally(() => {
+          if (timer) clearTimeout(timer);
+          if (this.reconcileInFlight === run) this.reconcileInFlight = null;
+        });
+      this.reconcileInFlight = run;
+    }
+    return this.reconcileInFlight;
+  }
+
+  private async runStartupReconciliation(): Promise<{
     status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE';
     mismatchesCount: number;
     details: string;
@@ -463,6 +631,9 @@ export class ExecutionCoordinator {
     const now = Date.now();
     let mismatchesCount = 0;
     const issues: string[] = [];
+
+    // 0. A reconcile never vouches for an RPC on the wrong cluster (it would otherwise make a mainnet-answering RPC armable).
+    if (!(await this.verifyCluster())) issues.push(`RPC is not on the allowed cluster: ${this.clusterProblem}`);
 
     // 1. Check signer status
     const signerStatus = localSigner.getStatus();
@@ -472,35 +643,6 @@ export class ExecutionCoordinator {
 
     // 2. Query real wallet SOL
     await this.syncRealWalletBalance();
-
-    // 3. Verify ALL active LIVE positions (OPEN and PARTIALLY_CLOSED) against on-chain token accounts
-    if (signerStatus === 'READY') {
-      const walletPubkey = localSigner.getPublicKey();
-      const activeLivePositions = workstationDb.loadPositions('LIVE', 'ACTIVE');
-
-      for (const pos of activeLivePositions) {
-        try {
-          const mintPubkey = new PublicKey(pos.mint);
-          // Query ATA balance using position's actual token program (supports Token-2022 & standard SPL)
-          const tokenProgramId = pos.baseTokenProgram ? new PublicKey(pos.baseTokenProgram) : undefined;
-          const ata = PumpCurveService.getAssociatedTokenAddress(mintPubkey, walletPubkey, tokenProgramId);
-          const balRes = await this.connection.getTokenAccountBalance(ata, 'confirmed').catch(() => null);
-          const onChainAmount = balRes?.value?.amount ? BigInt(balRes.value.amount) : 0n;
-
-          if (onChainAmount <= 0n) {
-            mismatchesCount++;
-            issues.push(
-              `Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) recorded active in DB, but on-chain balance is 0`
-            );
-            // Flag position with reconciliation warning
-            pos.exitReason = 'RECONCILIATION_MISMATCH: Zero on-chain token balance';
-            workstationDb.savePosition(pos);
-          }
-        } catch (e: any) {
-          issues.push(`Failed to verify on-chain balance for ${pos.symbol}: ${e.message}`);
-        }
-      }
-    }
 
     // 4. Resolve pending transactions from previous runs with actual on-chain transaction verification
     const pendingTxs = workstationDb.getPendingTransactions();
@@ -529,6 +671,12 @@ export class ExecutionCoordinator {
             if (txDetails?.meta?.err) {
               pTx.reconciliationState = 'REVERTED';
               pTx.error = JSON.stringify(txDetails.meta.err);
+            } else if (!txDetails) {
+              // N9: the signature is confirmed but its details are not readable yet. Leave it PENDING, say so, and look again soon
+              // instead of waiting for the next restart.
+              mismatchesCount++;
+              issues.push(`Transaction ${pTx.signature.slice(0, 8)}... is confirmed but its details are not readable yet; retrying`);
+              this.scheduleReconcileRetry();
             } else if (txDetails) {
               pTx.landingSlot = txDetails.slot;
               pTx.networkFeeLamports = txDetails.meta?.fee || 5000;
@@ -545,51 +693,19 @@ export class ExecutionCoordinator {
                 const recovery = await TradeReconciler.recoverInterruptedTransaction(
                   this.connection,
                   pTx.signature,
-                  walletPubkey
+                  walletPubkey,
+                  pTx.jitoTipLamports
                 );
 
                 if (recovery.recovered && recovery.mint) {
                   if (recovery.type === 'BUY' && recovery.tokenQuantityRaw) {
-                    const tokenQty = Number(recovery.tokenQuantityRaw) / Math.pow(10, recovery.tokenDecimals ?? 6);
-                    const effectivePrice =
-                      (recovery.solSpentLamports ?? 0) > 0 && tokenQty > 0
-                        ? ((recovery.solSpentLamports ?? 0) / 1e9) / tokenQty
-                        : 0;
-
-                    const recoveredPos: NormalizedPosition = {
-                      id: pTx.signature,
-                      mint: recovery.mint,
-                      symbol: pTx.mint ? pTx.mint.slice(0, 5).toUpperCase() : recovery.mint.slice(0, 5).toUpperCase(),
-                      name: `Recovered ${recovery.mint.slice(0, 4)}...${recovery.mint.slice(-4)}`,
-                      tokenDecimals: recovery.tokenDecimals ?? 6,
-                      baseTokenProgram: recovery.baseTokenProgram,
-                      tokenQuantityRaw: recovery.tokenQuantityRaw,
-                      costBasisLamports: recovery.solSpentLamports ?? 0,
-                      entryPriceSol: effectivePrice,
-                      currentPriceSol: effectivePrice,
-                      currentValueSol: (recovery.solSpentLamports ?? 0) / 1e9,
-                      unrealizedPnLSol: 0,
-                      unrealizedPnLPct: 0,
-                      realizedPnLSol: 0,
-                      entryTxSignature: pTx.signature,
-                      entrySlot: recovery.slot ?? txDetails.slot,
-                      entryTimestamp: recovery.blockTime ?? Date.now(),
-                      entryFeeLamports: recovery.networkFeeLamports ?? 5000,
-                      priorityFeeLamports: 0,
-                      jitoTipLamports: pTx.jitoTipLamports,
-                      markSource: 'RECONCILED_ON_CHAIN',
-                      markAgeMs: 0,
-                      executionMode: pTx.executionMode,
-                      status: 'OPEN',
-                      lastUpdatedTimestamp: Date.now(),
-                    };
-                    workstationDb.savePosition(recoveredPos);
+                    workstationDb.savePosition(this.positionFromRecoveredBuy(pTx, recovery, txDetails.slot));
                     pTx.reconciliationState = 'RECONCILED';
                     Logger.info(`Successfully recovered interrupted BUY position for ${recovery.mint} (${pTx.signature})`);
                   } else if (recovery.type === 'SELL') {
                     const targetPos = workstationDb
                       .loadPositions()
-                      .find((p) => p.mint === recovery.mint && (p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED'));
+                      .find((p) => p.mint === recovery.mint && p.executionMode === 'LIVE' && (p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED'));
                     if (targetPos) {
                       const remainingTokens = BigInt(recovery.remainingTokensRaw ?? '0');
                       const tokensSold = BigInt(recovery.tokensSoldRaw ?? '0');
@@ -618,6 +734,11 @@ export class ExecutionCoordinator {
                       workstationDb.savePosition(targetPos);
                       pTx.reconciliationState = 'RECONCILED';
                       Logger.info(`Successfully recovered interrupted SELL trade for ${recovery.mint} (${pTx.signature})`);
+                    } else if (workstationDb.loadPositions('LIVE').some((p) => p.mint === recovery.mint && p.status === 'CLOSED')) {
+                      // N8: the position is already closed (the sell was applied some other way); there is nothing left to apply.
+                      // Left RECONCILIATION_REQUIRED this row would hold readiness at MISMATCH forever.
+                      pTx.reconciliationState = 'RECONCILED';
+                      pTx.error = 'position already closed; sell not re-applied';
                     } else {
                       pTx.reconciliationState = 'RECONCILIATION_REQUIRED';
                       mismatchesCount++;
@@ -647,6 +768,72 @@ export class ExecutionCoordinator {
       }
     }
 
+    // 4b. (Q18: after the pending transactions, not before.) Verify ALL active LIVE positions (OPEN and PARTIALLY_CLOSED) against on-chain token accounts
+    // A SELL that landed just before a crash is applied by step 4 above, with its realized PnL. Running this zero-balance close first
+    // would close the position with cost 0 and realized PnL lost.
+    if (signerStatus === 'READY') {
+      const walletPubkey = localSigner.getPublicKey();
+      const activeLivePositions = workstationDb.loadPositions('LIVE', 'ACTIVE');
+
+      for (const pos of activeLivePositions) {
+        try {
+          const mintPubkey = new PublicKey(pos.mint);
+          // Query ATA balance using position's actual token program (supports Token-2022 & standard SPL)
+          const tokenProgramId = pos.baseTokenProgram ? new PublicKey(pos.baseTokenProgram) : undefined;
+          const ata = PumpCurveService.getAssociatedTokenAddress(mintPubkey, walletPubkey, tokenProgramId);
+          // N5: "the account does not exist" is a confirmed zero; any other RPC failure is unknown and must not close a position.
+          let onChainAmount: bigint | null = null;
+          try {
+            const balRes = await this.connection.getTokenAccountBalance(ata, 'confirmed');
+            onChainAmount = BigInt(balRes?.value?.amount ?? '0');
+          } catch (e: any) {
+            if (/could not find account|Invalid param/i.test(String(e?.message))) onChainAmount = 0n;
+            else throw e;
+          }
+
+          if (onChainAmount <= 0n) {
+            // The tokens are gone (sold or moved outside this app). Left OPEN this position blocks arming until someone edits the DB,
+            // while the exit loop keeps trying to sell an empty account. Close it with the reason on the record, and say so.
+            pos.status = 'CLOSED';
+            pos.tokenQuantityRaw = '0';
+            pos.costBasisLamports = 0;
+            pos.exitReason = 'RECONCILED_ZERO_BALANCE: no tokens in the wallet at startup reconciliation';
+            pos.lastUpdatedTimestamp = Date.now();
+            workstationDb.savePosition(pos);
+            this.raiseOperatorAlert('POSITION_GONE', `Position ${pos.symbol || pos.mint.slice(0, 6)} was recorded open but the wallet holds none of it. Closed in the database; realized PnL for it is unknown.`, pos.id);
+            issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) had no on-chain balance: closed in the database`);
+          }
+        } catch (e: any) {
+          mismatchesCount++; // unknown is not fine: an unreadable balance keeps readiness at MISMATCH, but never closes the position
+          issues.push(`Failed to verify on-chain balance for ${pos.symbol}: ${e.message}`);
+        }
+      }
+    }
+
+    // 5. Landed LIVE buys whose fill could not be read earlier (RECONCILIATION_REQUIRED) still hold tokens with no stop-loss.
+    if (signerStatus === 'READY') {
+      const orphans = await this.recoverOrphanedBuys();
+      if (orphans.stillOrphaned.length > 0) {
+        mismatchesCount += orphans.stillOrphaned.length;
+        issues.push(`${orphans.stillOrphaned.length} landed buy(s) have no position record: ${orphans.stillOrphaned.map((x) => x.slice(0, 8)).join(',')}`);
+      }
+    }
+
+    // 6. Tokens in the wallet that no position covers (a lost buy record, a manual transfer) get a position so the exit engine watches them.
+    if (signerStatus === 'READY') {
+      try {
+        const scan = await this.scanUntrackedWalletTokens();
+        if (scan.untracked.length > 0) {
+          issues.push(`${scan.untracked.length} wallet token balance(s) had no position: ${scan.adopted.length} adopted for exit monitoring, ${scan.untracked.length - scan.adopted.length} unpriced`);
+        }
+      } catch (e: any) {
+        // Unknown is not "fine": a wallet balance with no stop-loss is exactly what this scan exists to find.
+        Logger.warn(`Untracked-balance scan failed: ${e.message}`);
+        mismatchesCount++;
+        issues.push(`Wallet token scan failed (${String(e.message).slice(0, 80)}); untracked balances cannot be ruled out`);
+      }
+    }
+
     let status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE';
     if (this.rpcHealth === 'DISCONNECTED') {
       status = 'OFFLINE';
@@ -663,6 +850,204 @@ export class ExecutionCoordinator {
 
     Logger.info(`Startup Reconciliation result: ${status} (${details})`);
     return { status, mismatchesCount, details };
+  }
+
+  private reconcileRetryTimer: NodeJS.Timeout | null = null;
+  private reconcileTimeoutMs = 90_000;
+
+  /** One follow-up reconciliation pass shortly after a pass found something not readable yet. */
+  private scheduleReconcileRetry(delayMs = 15_000): void {
+    if (this.reconcileRetryTimer) return;
+    this.reconcileRetryTimer = setTimeout(() => {
+      this.reconcileRetryTimer = null;
+      void this.startupReconciliation().catch(() => undefined);
+    }, delayMs);
+    this.reconcileRetryTimer.unref?.();
+  }
+
+  /** Position for a buy rebuilt from confirmed on-chain data. Entry price is the curve price paid; cost basis is the whole wallet delta. */
+  private positionFromRecoveredBuy(
+    pTx: { signature: string; mint: string; jitoTipLamports: number; executionMode: ExecutionMode },
+    recovery: Awaited<ReturnType<typeof TradeReconciler.recoverInterruptedTransaction>>,
+    fallbackSlot: number
+  ): NormalizedPosition {
+    const tokenQty = Number(recovery.tokenQuantityRaw) / Math.pow(10, recovery.tokenDecimals ?? 6);
+    const spent = recovery.solSpentLamports ?? 0;
+    const curveSpend = recovery.curveSpendLamports ?? spent;
+    const effectivePrice = curveSpend > 0 && tokenQty > 0 ? curveSpend / 1e9 / tokenQty : 0;
+    return {
+      id: pTx.signature,
+      mint: recovery.mint!,
+      symbol: pTx.mint ? pTx.mint.slice(0, 5).toUpperCase() : recovery.mint!.slice(0, 5).toUpperCase(),
+      name: `Recovered ${recovery.mint!.slice(0, 4)}...${recovery.mint!.slice(-4)}`,
+      tokenDecimals: recovery.tokenDecimals ?? 6,
+      baseTokenProgram: recovery.baseTokenProgram,
+      tokenQuantityRaw: recovery.tokenQuantityRaw!,
+      costBasisLamports: spent,
+      entryPriceSol: effectivePrice,
+      currentPriceSol: effectivePrice,
+      currentValueSol: spent / 1e9,
+      unrealizedPnLSol: 0,
+      unrealizedPnLPct: 0,
+      realizedPnLSol: 0,
+      entryTxSignature: pTx.signature,
+      entrySlot: recovery.slot ?? fallbackSlot,
+      entryTimestamp: recovery.blockTime ?? Date.now(),
+      entryFeeLamports: recovery.networkFeeLamports ?? 5000,
+      priorityFeeLamports: 0,
+      jitoTipLamports: pTx.jitoTipLamports,
+      markSource: 'RECONCILED_ON_CHAIN',
+      markAgeMs: 0,
+      executionMode: pTx.executionMode,
+      status: 'OPEN',
+      lastUpdatedTimestamp: Date.now(),
+    };
+  }
+
+  /**
+   * Orphaned buys (critique #3): a LIVE buy confirmed but its fill could not be read (getTransaction null at that moment), so the row sits
+   * at RECONCILIATION_REQUIRED with tokens in the wallet and no position, hence no stop-loss. Re-read each such signature and open the position.
+   * Idempotent: a signature that already has a position is just marked RECONCILED.
+   */
+  public async recoverOrphanedBuys(): Promise<{ recovered: string[]; stillOrphaned: string[] }> {
+    const recovered: string[] = [];
+    const stillOrphaned: string[] = [];
+    if (localSigner.getStatus() !== 'READY') return { recovered, stillOrphaned };
+    const wallet = localSigner.getPublicKey();
+    const candidates = workstationDb
+      .loadTransactionsInStates(['RECONCILIATION_REQUIRED'])
+      .filter((t) => t.direction === 'BUY' && t.executionMode === 'LIVE' && t.reconciliationState === 'RECONCILIATION_REQUIRED');
+    for (const t of candidates) {
+      try {
+        if (workstationDb.loadPositions().some((p) => p.entryTxSignature === t.signature)) {
+          t.reconciliationState = 'RECONCILED';
+          workstationDb.saveTransaction(t);
+          continue;
+        }
+        const recovery = await TradeReconciler.recoverInterruptedTransaction(this.connection, t.signature, wallet, t.jitoTipLamports);
+        if (recovery.recovered && recovery.type === 'BUY' && recovery.mint && recovery.tokenQuantityRaw) {
+          workstationDb.savePosition(this.positionFromRecoveredBuy(t, recovery, t.landingSlot ?? 0));
+          t.reconciliationState = 'RECONCILED';
+          workstationDb.saveTransaction(t);
+          recovered.push(t.signature);
+          Logger.warn(`Recovered orphaned LIVE buy ${t.signature} for ${recovery.mint}: position opened with stop-loss coverage`);
+        } else if (recovery.error && /reverted/i.test(recovery.error)) {
+          t.reconciliationState = 'REVERTED';
+          t.error = recovery.error;
+          workstationDb.saveTransaction(t);
+        } else if (recovery.error && /not found on-chain/i.test(recovery.error) && Date.now() - t.submissionTime > ORPHAN_MAX_AGE_MS) {
+          // N6: a transaction that is still not on chain long after its blockhash expired never landed. Any tokens it did buy would be
+          // found by the wallet scan; leaving the row open would hold readiness at MISMATCH forever.
+          t.reconciliationState = 'TIMED_OUT';
+          t.error = 'never landed: not found on chain after the blockhash window';
+          workstationDb.saveTransaction(t);
+        } else {
+          stillOrphaned.push(t.signature);
+        }
+      } catch (e: any) {
+        Logger.warn(`Orphaned buy recovery failed for ${t.signature}: ${e.message}`);
+        stillOrphaned.push(t.signature);
+      }
+    }
+    return { recovered, stillOrphaned };
+  }
+
+  /**
+   * Scan the wallet's SPL and Token-2022 accounts for non-zero balances that no active LIVE position covers. Each one that has a readable
+   * pump curve / PumpSwap price gets a position flagged RECOVERED (entry price = current mark, cost basis unknown = 0) so stop-loss and
+   * trailing-stop run on it; every one raises an UNTRACKED_TOKEN_BALANCE alert. Balances with no pump price are only alerted, never traded.
+   */
+  public async scanUntrackedWalletTokens(): Promise<{ untracked: string[]; adopted: string[] }> {
+    const untracked: string[] = [];
+    const adopted: string[] = [];
+    if (localSigner.getStatus() !== 'READY') return { untracked, adopted };
+    const wallet = localSigner.getPublicKey();
+    const held = new Map<string, { raw: bigint; decimals: number; program: PublicKey }>();
+    for (const program of [TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID]) {
+      const res = await this.connection.getParsedTokenAccountsByOwner(wallet, { programId: program }, 'confirmed');
+      for (const acc of res.value) {
+        const info = (acc.account.data as any)?.parsed?.info;
+        const amount = BigInt(info?.tokenAmount?.amount ?? '0');
+        if (!info?.mint || amount <= 0n) continue;
+        const prev = held.get(info.mint);
+        held.set(info.mint, { raw: (prev?.raw ?? 0n) + amount, decimals: info.tokenAmount.decimals ?? 6, program });
+      }
+    }
+    const active = new Set(
+      workstationDb.loadPositions('LIVE', 'ACTIVE').map((p) => p.mint)
+    );
+    // A buy still waiting for recovery (RECONCILIATION_REQUIRED / PENDING) owns its mint: recoverOrphanedBuys handles it.
+    const inRecovery = new Set(
+      workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED', 'PENDING'])
+        .filter((t) => t.direction === 'BUY' && t.executionMode === 'LIVE' && (t.reconciliationState === 'RECONCILIATION_REQUIRED' || t.reconciliationState === 'PENDING'))
+        .map((t) => t.mint)
+    );
+    const missing = [...held.keys()].filter((m) => !active.has(m) && !inRecovery.has(m));
+    if (missing.length === 0) return { untracked, adopted };
+    let marks: Record<string, { priceSol: number; source: string; timestamp: number; poolAddress?: string }> = {};
+    try {
+      marks = (await RealMarkPriceService.queryOnChainMarkPrices(this.connection, missing, 'LIVE')) as any;
+    } catch (e: any) {
+      Logger.warn(`Mark read for untracked balances failed: ${e.message}`);
+    }
+    for (const mint of missing) {
+      untracked.push(mint);
+      const h = held.get(mint)!;
+      const mark = marks[mint];
+      if (mark && mark.priceSol > 0) {
+        const now = Date.now();
+        const qty = Number(h.raw) / Math.pow(10, h.decimals);
+        workstationDb.savePosition({
+          id: `recovered-${mint}`,
+          mint,
+          symbol: mint.slice(0, 5).toUpperCase(),
+          name: 'RECOVERED untracked wallet balance',
+          tokenDecimals: h.decimals,
+          baseTokenProgram: h.program.toBase58(),
+          tokenQuantityRaw: h.raw.toString(),
+          costBasisLamports: 0, // unknown: PnL for this position is not meaningful
+          entryPriceSol: mark.priceSol,
+          currentPriceSol: mark.priceSol,
+          currentValueSol: Number((qty * mark.priceSol).toFixed(6)),
+          unrealizedPnLSol: 0,
+          unrealizedPnLPct: 0,
+          realizedPnLSol: 0,
+          entryTxSignature: `RECOVERED:${mint}`,
+          entryTimestamp: now,
+          markSource: 'RECONCILED_ON_CHAIN',
+          markAgeMs: 0,
+          lastMarkTimestamp: mark.timestamp || now,
+          venue: mark.source === 'ON_CHAIN_PUMPSWAP_POOL' ? 'PUMPSWAP' : 'PUMP_BONDING_CURVE',
+          poolAddress: mark.poolAddress,
+          executionMode: 'LIVE',
+          status: 'OPEN',
+          lastUpdatedTimestamp: now,
+        } as NormalizedPosition);
+        adopted.push(mint);
+        this.raiseOperatorAlert('UNTRACKED_TOKEN_BALANCE', `Wallet held ${h.raw} raw of ${mint} with no position. Adopted as RECOVERED with entry price = current mark; stop-loss now applies. Cost basis unknown.`, `recovered-${mint}`);
+      } else {
+        this.raiseOperatorAlert('UNTRACKED_TOKEN_BALANCE', `Wallet holds ${h.raw} raw of ${mint} with no position and no readable pump price. Not traded; sell manually if unwanted.`, `untracked-${mint}`);
+      }
+    }
+    return { untracked, adopted };
+  }
+
+  /** Delays (ms) at which a failed live-buy reconciliation is retried in the background. Tests set [] . */
+  public orphanRecoveryDelaysMs: number[] = [5_000, 15_000, 45_000, 120_000, 300_000];
+
+  private scheduleOrphanRecovery(delays: number[] = this.orphanRecoveryDelaysMs): void {
+    if (delays.length === 0) return;
+    const [next, ...rest] = delays;
+    const timer = setTimeout(async () => {
+      try {
+        const r = await this.recoverOrphanedBuys();
+        if (r.stillOrphaned.length > 0) this.scheduleOrphanRecovery(rest);
+      } catch (e: any) {
+        Logger.warn(`Background orphan recovery error: ${e.message}`);
+        this.scheduleOrphanRecovery(rest);
+      }
+    }, next);
+    (timer as any).unref?.();
   }
 
   public async syncRealWalletBalance(): Promise<number | null> {
@@ -694,6 +1079,16 @@ export class ExecutionCoordinator {
 
   public getRealWalletBalanceSol(): number | null {
     return this.realWalletBalanceSol;
+  }
+
+  /**
+   * C7c: SOL locked as rent in the token accounts of open LIVE positions (paper positions have no account). Uses the
+   * SPL rent-exempt minimum for every account; a Token-2022 account with extensions needs more, so for those it is a floor.
+   */
+  /** Rent held in open positions' token accounts. Display only: it is already outside the wallet balance, so spendable does not subtract it. */
+  public getRentLockedSol(): number {
+    const open = workstationDb.loadPositions(undefined, 'ACTIVE').filter((p) => p.executionMode === 'LIVE');
+    return (open.length * CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS) / 1e9;
   }
 
   public getSpendableBankrollSol(): number {
@@ -785,6 +1180,8 @@ export class ExecutionCoordinator {
         if (mark && mark.priceSol > 0) {
           this.applyMarkPrice(pos, mark.priceSol, mark.source, mark.timestamp, mark.poolAddress);
         } else if (!priceMap || !priceMap[pos.mint]) {
+          const rejected = PumpCurveService.getMintRejection(pos.mint);
+          if (rejected) this.raiseOperatorAlert('MARK_MINT_REJECTED', `${pos.symbol || pos.mint.slice(0, 6)} cannot be marked: ${rejected}. The position keeps its last mark and goes stale.`, pos.id); // R19
           // Mark age increases honestly
           const baseTimestamp = pos.lastMarkTimestamp || pos.lastUpdatedTimestamp;
           pos.markAgeMs = now - baseTimestamp;
@@ -898,26 +1295,70 @@ export class ExecutionCoordinator {
         }
       } catch {}
 
-      // 5. Check wallet native SOL balance delta
-      try {
-        const currentSol = await this.connection.getBalance(owner, 'confirmed');
-        const prevSol = preSnapshot.walletSolLamports;
-        if (prevSol > 0) {
-          if (side === 'BUY' && prevSol - currentSol > 100_000) {
-            return { landed: true };
-          }
-          if (side === 'SELL' && currentSol - prevSol > 100_000) {
-            return { landed: true };
-          }
-        }
-      } catch {}
+      // The wallet's native SOL balance is deliberately NOT used: a drop of 100k lamports can come from a concurrent buy of another
+      // mint or any fee, and calling that "landed" would stop retries and the RPC fallback for a transaction that never landed (critique #5).
+      // Resubmitting the same signed transaction cannot double-fill (same signature), so "not landed" is the safe answer when unsure.
     }
 
     return { landed: false };
   }
 
+  /** true only when the cluster says this transaction's blockhash can no longer land. Unknown (RPC error) counts as not expired. */
+  private async isBlockhashExpired(tx: VersionedTransaction): Promise<boolean> {
+    try {
+      const res = await this.connection.isBlockhashValid(tx.message.recentBlockhash, { commitment: 'processed' });
+      return res?.value === false;
+    } catch {
+      return false;
+    }
+  }
+
   // Idempotent, bounded Jito retry loop with pre-checks and zero-double-fill RPC fallback (R0.6)
-  public async submitAndConfirmWithRetry(params: {
+  /**
+   * N20: the signature is known before anything is sent, so the PENDING row is written first. A crash between broadcast and
+   * response then leaves a row that startup recovery can resolve, instead of only a wallet scan with no cost basis.
+   */
+  public async submitAndConfirmWithRetry(
+    params: Parameters<ExecutionCoordinator['submitAndConfirmInner']>[0]
+  ): ReturnType<ExecutionCoordinator['submitAndConfirmInner']> {
+    const preSignature = this.signatureOf(params.tx);
+    if (preSignature) {
+      workstationDb.saveTransaction({
+        signature: preSignature,
+        orderId: params.orderId,
+        correlationId: params.correlationId,
+        mint: params.mint,
+        direction: params.side,
+        submissionTransport: 'JITO',
+        submissionTime: Date.now(),
+        reconciliationState: 'PENDING',
+        networkFeeLamports: 5000,
+        jitoTipLamports: params.jitoTipLamports,
+        executionMode: 'LIVE',
+      });
+    }
+    const res = await this.submitAndConfirmInner(params);
+    if (preSignature && !res.success && !res.unconfirmed) {
+      // Definitely not landing (never sent, rejected, or seen failing): do not leave a PENDING row to block readiness.
+      const rows = workstationDb.loadTransactions(params.orderId).filter((t) => t.signature === preSignature);
+      if (rows.some((t) => t.reconciliationState === 'PENDING')) {
+        workstationDb.saveTransaction({ ...rows[0], reconciliationState: 'REVERTED', error: res.error ?? 'not sent or rejected' });
+      }
+    }
+    return res;
+  }
+
+  private signatureOf(tx: any): string | null {
+    try {
+      const sig = tx?.signatures?.[0];
+      if (!sig || sig.every((b: number) => b === 0)) return null;
+      return bs58.encode(sig);
+    } catch {
+      return null;
+    }
+  }
+
+  private async submitAndConfirmInner(params: {
     tx: VersionedTransaction;
     orderId: string;
     correlationId: string;
@@ -936,6 +1377,8 @@ export class ExecutionCoordinator {
     slot?: number;
     error?: string;
     lifecycleState: 'CONFIRMED' | 'SUBMIT_FAILED' | 'REVERTED';
+    /** N2: submitted but never seen failing on chain (timeout / RPC error). It may still land; do not treat as a revert. */
+    unconfirmed?: boolean;
   }> {
     const { tx, orderId, correlationId, side, mint, mintPubkey, owner, tokenProgram, preSnapshot, jitoTipLamports } = params;
     const cfg = executionConfig.getConfig();
@@ -994,8 +1437,10 @@ export class ExecutionCoordinator {
     let lastSignature = '';
     let lastBundleId: string | undefined;
     let lastError: string | undefined = jitoUnhealthyReason;
+    let lastConfirmDefinite = false;
     let landedSlot: number | undefined;
     let jitoLanded = false;
+    let blockhashExpired = false;
 
     // Bounded Idempotent Jito Retry Loop
     for (let attempt = 0; attempt <= maxRetries; attempt++) {
@@ -1010,6 +1455,13 @@ export class ExecutionCoordinator {
             landedSlot = check.slot;
             break;
           }
+        }
+        // The same signed transaction is resent on each retry (same signature, so it cannot fill twice). Once its blockhash has
+        // expired and it has not landed, every further resend is wasted time, so stop and let the caller build a new transaction.
+        if (await this.isBlockhashExpired(tx)) {
+          blockhashExpired = true;
+          lastError = 'BLOCKHASH_EXPIRED: the transaction did not land and its blockhash is no longer valid; safe to retry with a new transaction';
+          break;
         }
         if (retryIntervalMs > 0) {
           await new Promise((r) => setTimeout(r, retryIntervalMs));
@@ -1054,6 +1506,7 @@ export class ExecutionCoordinator {
         break;
       } else {
         lastError = confirmRes.error || 'Transaction dropped or expired on Solana';
+        lastConfirmDefinite = confirmRes.lifecycleState === 'REVERTED';
         // Check if it landed despite confirm timing out
         const postConfirmCheck = await this.checkIfTransactionLanded(submitRes.signature, submitRes.bundleId, owner, mintPubkey, tokenProgram, preSnapshot, side, orderId);
         if (postConfirmCheck.landed) {
@@ -1104,6 +1557,18 @@ export class ExecutionCoordinator {
             lifecycleState: 'CONFIRMED',
           };
         }
+      }
+
+      // Sending an expired transaction through the RPC fallback cannot land. Checked after the landed check above, so "expired and not landed" is definitive.
+      if (blockhashExpired || ((lastSignature || lastBundleId) && (await this.isBlockhashExpired(tx)))) {
+        return {
+          success: false,
+          signature: lastSignature,
+          bundleId: lastBundleId,
+          transport: 'SOLANA_RPC',
+          error: 'BLOCKHASH_EXPIRED: the transaction did not land and its blockhash is no longer valid; safe to retry with a new transaction',
+          lifecycleState: 'SUBMIT_FAILED',
+        };
       }
 
       workstationDb.logJournal('FALLBACK_RPC_ATTEMPT', correlationId, 'LIVE', {
@@ -1164,6 +1629,7 @@ export class ExecutionCoordinator {
           transport: 'SOLANA_RPC',
           error: rpcConfirm.error || 'RPC fallback transaction dropped or unconfirmed',
           lifecycleState: 'REVERTED',
+          unconfirmed: rpcConfirm.lifecycleState !== 'REVERTED',
         };
       }
     }
@@ -1176,7 +1642,271 @@ export class ExecutionCoordinator {
       transport: 'JITO',
       error: lastError || 'Transaction unconfirmed or dropped across Jito attempts',
       lifecycleState: lastError?.includes('Failed to submit') ? 'SUBMIT_FAILED' : 'REVERTED',
+      unconfirmed: !!lastSignature && !lastError?.includes('Failed to submit') && !lastConfirmDefinite,
     };
+  }
+
+  /** Shared by LIVE and PAPER (C5): the same on-chain facts become the same eligibility inputs. */
+  private eligibilityInputFromMarket(
+    req: ExecuteTradeRequest,
+    marketState: any,
+    holderDist: { devHoldingPct: number; top10HoldersPct: number } | null,
+    liquidityUsd: number | undefined
+  ) {
+    return {
+      mint: req.mint,
+      symbol: req.symbol,
+      name: req.name,
+      creator: marketState.creator.toBase58(),
+      priceSol:
+        Number(marketState.virtualSolReserves) /
+        Number(marketState.virtualTokenReserves) /
+        (1e9 / Math.pow(10, marketState.tokenDecimals)),
+      liquidityUsd,
+      bondingCurveProgress: Number(
+        Math.min(100, (Number(marketState.realSolReserves) / (85 * 1e9)) * 100).toFixed(1)
+      ),
+      isMigrated: marketState.complete,
+      isMintAuthorityRevoked: marketState.isMintAuthorityRevoked,
+      isFreezeAuthorityRevoked: marketState.isFreezeAuthorityRevoked,
+      hasToken2022Extensions: marketState.baseTokenProgram?.equals(TOKEN_2022_PROGRAM_ID) ?? false,
+      // Pass the extension inspection result through. LIVE already refuses unsafe mints in fetchPumpMarketState,
+      // so a Token-2022 mint that reaches here with a report is explicitly safe; without this it was UNKNOWN and rejected.
+      token2022Safe: marketState.token2022Report ? marketState.token2022Report.isSafe : undefined,
+      unsupportedToken2022Extension:
+        marketState.token2022Report && !marketState.token2022Report.isSafe
+          ? marketState.token2022Report.unsupportedExtensionNames.join(',') || true
+          : undefined,
+      devHoldingPct: holderDist ? holderDist.devHoldingPct : null,
+      top10HoldersPct: holderDist ? holderDist.top10HoldersPct : null,
+    };
+  }
+
+  /**
+   * The single eligibility verdict used by BOTH modes (C5), so the same report gives the same accept/reject.
+   * Strict (LIVE, or PAPER with PAPER_STRICT_GATES=1) also rejects holder checks that are unverified;
+   * non-strict PAPER lets UNKNOWN pass but the caller records it as unverified on the fill.
+   */
+  private eligibilityVerdict(
+    eligibility: TokenEligibilityReport,
+    now: number,
+    mode: ExecutionMode,
+    correlationId: string,
+    strict: boolean = mode === 'LIVE'
+  ): ExecutionResponse | null {
+    const reject = (error: string): ExecutionResponse => ({
+      success: false,
+      lifecycleState: 'FILTER_REJECTED',
+      executionMode: mode,
+      error,
+      correlationId,
+    });
+    if (now - eligibility.evaluatedAt > 60000) {
+      return reject(`ELIGIBILITY_REPORT_STALE: Eligibility report evaluated ${Math.round((now - eligibility.evaluatedAt) / 1000)}s ago exceeds 60s max age for live trading.`);
+    }
+
+    const unsupportedExtensionCheck = eligibility.checks.find(
+      (c) => c.ruleId === 'TOKEN_2022_POLICY' && !c.passed
+    );
+    if (unsupportedExtensionCheck) {
+      return reject(`UNSUPPORTED_TOKEN_EXTENSION: ${unsupportedExtensionCheck.reason}`);
+    }
+
+    if (!eligibility.isEligible) {
+      const failReasons = eligibility.checks.filter((c) => !c.passed).map((c) => c.reason).join('; ');
+      return reject(`ELIGIBILITY_CHECK_FAILED: Token failed ${eligibility.failedCount} safety check(s): ${failReasons}`);
+    }
+
+    const hasUnverifiedHolders = eligibility.checks.some(
+      (c) =>
+        (c.ruleId === 'MAX_CREATOR_EXPOSURE' || c.ruleId === 'TOP_10_CONCENTRATION') &&
+        (!c.passed || String(c.observedValue).toLowerCase().includes('unknown') || String(c.observedValue).toLowerCase().includes('unverified'))
+    );
+    if (strict && hasUnverifiedHolders) {
+      return reject('SAFETY_CHECK_UNVERIFIED: Dev holding or top 10 holders distribution is unverified. Live trade rejected.');
+    }
+
+    return null;
+  }
+
+  /**
+   * Everything a PAPER buy must pass before a fill: price, the shared eligibility gate, capital ceiling and risk.
+   * Used by the paper fill itself and by previewBuy (auto-snipe Shadow mode), so a dry run runs the same gates.
+   */
+  private async evaluatePaperBuy(
+    req: ExecuteTradeRequest,
+    correlationId: string,
+    now: number,
+    openPositions: NormalizedPosition[],
+    totalExposureSol: number
+  ): Promise<
+    | { rejection: ExecutionResponse }
+    | { quotePriceSol: number; paperEligibility: { gates: Record<string, unknown> }; paperTip: ReturnType<typeof executionConfig.resolveDynamicJitoTip>; maxPaperOrderSol: number; curveState: PumpMarketState | null }
+  > {
+    let quotePriceSol = req.currentPriceSol;
+    // Q7: read the real curve for every paper order. Its price replaces the caller's (a WS pool's came from the create event), and the
+    // fill is quoted from its reserves and fee settings. null when the curve cannot be read (offline, migrated): the fill is then the MODEL.
+    let curveState: PumpMarketState | null = null;
+    try {
+      const state = await PumpCurveService.fetchPumpMarketState({ connection: this.connection, mint: new PublicKey(req.mint), executionMode: 'PAPER' });
+      if (state && !state.complete) {
+        curveState = state;
+        quotePriceSol = Number(state.virtualSolReserves) / Number(state.virtualTokenReserves) / (1e9 / Math.pow(10, state.tokenDecimals));
+      }
+    } catch {}
+
+    if (!quotePriceSol || quotePriceSol <= 0) {
+      return { rejection: {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'PAPER',
+        error: 'MARKET_DATA_UNAVAILABLE: No valid market price available to execute paper order',
+        correlationId,
+      } };
+    }
+
+    const paperEligibility = await this.runPaperEligibility(req, quotePriceSol, now, correlationId);
+    if (paperEligibility.verdict) {
+      workstationDb.logJournal('TRADE_FILTER_REJECTED', correlationId, 'PAPER', {
+        reason: paperEligibility.verdict.error,
+        gates: paperEligibility.gates,
+      });
+      return { rejection: paperEligibility.verdict };
+    }
+
+    // Resolve dynamic tip for paper mode to respect economic sanity bounds
+    const paperTip = executionConfig.resolveDynamicJitoTip({
+      tradeAmountSol: req.amountSol,
+      explicitTipSol: req.jitoTipSol,
+    });
+
+    // Pre-trade capital sizing check: ensure order does not exceed 10% of spendable bankroll (B12)
+    // C5: the configured paper bankroll (default 0.07 SOL), never an invented 1.0
+    const paperSpendable = CapitalSizer.calculateSpendableBankroll(
+      this.realWalletBalanceSol !== null ? this.realWalletBalanceSol : executionConfig.getConfig().paperBankrollSol,
+      0.015,
+      this.inFlightReservedSol
+    );
+    const maxPaperOrderSol = Number((paperSpendable * 0.10).toFixed(6));
+    if (paperSpendable > 0 && req.amountSol > maxPaperOrderSol + 0.000001) {
+      return { rejection: {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'PAPER',
+        error: `EXCEEDS_CAPITAL_CEILING: Trade size ${req.amountSol} SOL exceeds 10% spendable bankroll ceiling (${maxPaperOrderSol} SOL).`,
+        correlationId,
+      } };
+    }
+
+    // Evaluate Risk in Paper Mode
+    const riskDecision = riskEngine.evaluateOrder({
+      mint: req.mint,
+      orderSizeSol: req.amountSol,
+      expectedPriceSol: quotePriceSol,
+      slippageBps: req.slippageBps || 800,
+      estimatedPriceImpactBps: PaperExecutionEngine.estimateImpactBps(req.amountSol, req.liquidityUsd),
+      estimatedFeeLamports: 15000,
+      jitoTipLamports: paperTip.tipLamports,
+      signalTimestamp: req.signalTimestamp || now,
+      marketDataTimestamp: req.marketDataTimestamp || now,
+      currentOpenPositionsCount: openPositions.length,
+      currentTotalExposureSol: totalExposureSol,
+      walletSpendableSol: paperSpendable,
+      executionMode: 'PAPER',
+    });
+
+    if (!riskDecision.approved) {
+      workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'PAPER', {
+        reason: riskDecision.reasonCode,
+        message: riskDecision.message,
+      });
+      return { rejection: {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'PAPER',
+        error: `${riskDecision.reasonCode}: ${riskDecision.message}`,
+        correlationId,
+      } };
+    }
+    return { quotePriceSol, paperEligibility, paperTip, maxPaperOrderSol, curveState };
+  }
+
+
+  /**
+   * G1: run every PAPER-side gate for a buy (price, eligibility, capital ceiling, risk) and stop before any fill.
+   * Never touches the signer or the paper ledger, whatever the coordinator mode is. Used by auto-snipe Shadow mode.
+   */
+  public async previewBuy(req: ExecuteTradeRequest): Promise<
+    | { status: 'OK'; quotePriceSol: number; tipLamports: number; amountSol: number; gates: Record<string, unknown> }
+    | { status: 'REJECTED'; error: string; lifecycleState: ExecutionResponse['lifecycleState'] }
+  > {
+    const correlationId = `preview-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
+    const openPositions = workstationDb.loadPositions('PAPER', 'ACTIVE');
+    const totalExposureSol = openPositions.reduce((acc, p) => acc + p.costBasisLamports / 1e9, 0);
+    const evaluated = await this.evaluatePaperBuy(req, correlationId, Date.now(), openPositions, totalExposureSol);
+    if ('rejection' in evaluated) {
+      return { status: 'REJECTED', error: evaluated.rejection.error || 'REJECTED', lifecycleState: evaluated.rejection.lifecycleState };
+    }
+    return {
+      status: 'OK',
+      quotePriceSol: evaluated.quotePriceSol,
+      tipLamports: evaluated.paperTip.tipLamports,
+      amountSol: req.amountSol,
+      gates: evaluated.paperEligibility.gates,
+    };
+  }
+
+  /**
+   * C5: PAPER runs the same eligibility gate as LIVE. With a report supplied it is used as-is; otherwise the on-chain
+   * facts are read (best effort, 4s cap) and evaluated. Facts that cannot be read stay UNKNOWN: strict mode
+   * (PAPER_STRICT_GATES=1) rejects them like LIVE, default mode lets them through but records them as unverified.
+   */
+  private async runPaperEligibility(req: ExecuteTradeRequest, quotePriceSol: number, now: number, correlationId: string) {
+    const strict = executionConfig.getConfig().paperStrictGates;
+    let eligibility = req.eligibilityReport;
+    const needsFacts = !eligibility || eligibility.checks.some(
+      (c) => (c.ruleId === 'TOP_10_CONCENTRATION' || c.ruleId === 'MAX_CREATOR_EXPOSURE') && c.status === 'UNKNOWN'
+    );
+    if (needsFacts) {
+      const within = <T>(p: Promise<T>) =>
+        Promise.race([p, new Promise<never>((_, rej) => setTimeout(() => rej(new Error('timeout')), 4000))]);
+      let marketState: any = null;
+      let holderDist: { devHoldingPct: number; top10HoldersPct: number } | null = null;
+      try {
+        const mintPk = new PublicKey(req.mint);
+        marketState = await within(
+          PumpCurveService.fetchPumpMarketState({ connection: this.connection, mint: mintPk, executionMode: 'PAPER' })
+        );
+        if (marketState) {
+          holderDist = await within(
+            fetchTokenHolderDistribution(this.connection, mintPk, marketState.creator, marketState.bondingCurve)
+          );
+        }
+      } catch (err: any) {
+        Logger.debug(`[C5] Paper gate could not read on-chain facts for ${req.mint}: ${err.message}`);
+      }
+      const solUsd = solPriceService.lastKnownPrice();
+      if (marketState) {
+        const liquidityUsd = solUsd !== null ? (Number(marketState.realSolReserves) / 1e9) * solUsd * 2 : req.liquidityUsd;
+        eligibility = EligibilityFilter.evaluate(this.eligibilityInputFromMarket(req, marketState, holderDist, liquidityUsd), strict);
+      } else if (!eligibility) {
+        eligibility = EligibilityFilter.evaluate(
+          { mint: req.mint, symbol: req.symbol, name: req.name, priceSol: quotePriceSol, liquidityUsd: req.liquidityUsd },
+          strict
+        );
+      }
+    }
+    const verdict = this.eligibilityVerdict(eligibility!, now, 'PAPER', correlationId, strict);
+    const checks = eligibility!.checks;
+    const gates = {
+      strict,
+      eligibility: {
+        passed: checks.filter((c) => c.status === 'PASS' || (c.status === undefined && c.passed)).map((c) => c.ruleId),
+        failed: checks.filter((c) => c.status === 'FAIL' || (c.status === undefined && !c.passed)).map((c) => c.ruleId),
+        unverified: checks.filter((c) => c.status === 'UNKNOWN').map((c) => c.ruleId),
+      },
+    };
+    return { verdict, gates };
   }
 
   // Authoritative Central Execution Entrypoint
@@ -1184,6 +1914,20 @@ export class ExecutionCoordinator {
     const correlationId = `exec-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     const now = Date.now();
     this.recordMarketEvent();
+
+    if (this.haltReason) {
+      return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: this.executionMode, error: `TRADING_HALTED: ${this.haltReason}`, correlationId };
+    }
+
+    if (req.executionMode && req.executionMode !== this.executionMode) {
+      return {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: this.executionMode,
+        error: `MODE_CHANGED: the trade was prepared for ${req.executionMode} but the coordinator is now ${this.executionMode}; refused rather than run in the other mode`,
+        correlationId,
+      };
+    }
 
     workstationDb.logJournal('TRADE_REQUEST_RECEIVED', correlationId, this.executionMode, {
       ...req,
@@ -1218,6 +1962,19 @@ export class ExecutionCoordinator {
       }
     }
 
+    // The risk engine's signal-age limit only means something if the timestamp is the SOURCE event's. LIVE never defaults it to "now"
+    // (or to the market-data fetch time, which is also "now"): a caller that cannot say when the signal happened is refused.
+    if (this.executionMode === 'LIVE' && !(Number.isFinite(req.signalTimestamp) && (req.signalTimestamp as number) > 0 && (req.signalTimestamp as number) <= now + 5_000)) {
+      workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'LIVE', { reason: 'MISSING_SIGNAL_TIMESTAMP', signalTimestamp: req.signalTimestamp ?? null });
+      return {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'LIVE',
+        error: 'MISSING_SIGNAL_TIMESTAMP: LIVE trades must carry the time of the signal that triggered them (not in the future); it is never defaulted to now.',
+        correlationId,
+      };
+    }
+
     const openPositions = workstationDb.loadPositions(this.executionMode, 'ACTIVE');
     const totalExposureSol = openPositions.reduce((acc, p) => acc + p.costBasisLamports / 1e9, 0);
 
@@ -1225,85 +1982,19 @@ export class ExecutionCoordinator {
     // BRANCH A: PAPER EXECUTION
     // =========================================================================
     if (this.executionMode === 'PAPER') {
-      let quotePriceSol = req.currentPriceSol;
+      const evaluated = await this.evaluatePaperBuy(req, correlationId, now, openPositions, totalExposureSol);
+      if ('rejection' in evaluated) return evaluated.rejection;
+      const { quotePriceSol, paperEligibility, paperTip, maxPaperOrderSol, curveState } = evaluated;
 
-      // If price not provided, attempt querying real on-chain bonding curve
-      if (!quotePriceSol || quotePriceSol <= 0) {
+      // Q7: quote the fill from the curve that was just read. A quote that cannot be made (curve nearly complete, order larger than the
+      // curve holds) is a refusal, not a reason to fall back to the flat model.
+      let curveQuote: ReturnType<typeof PumpCurveService.calculateBuyQuote> | undefined;
+      if (curveState) {
         try {
-          const mintPubkey = new PublicKey(req.mint);
-          const state = await PumpCurveService.fetchPumpMarketState({
-            connection: this.connection,
-            mint: mintPubkey,
-            executionMode: 'PAPER',
-          });
-          if (state && !state.complete) {
-            quotePriceSol =
-              Number(state.virtualSolReserves) /
-              Number(state.virtualTokenReserves) /
-              (1e9 / Math.pow(10, state.tokenDecimals));
-          }
-        } catch {}
-      }
-
-      if (!quotePriceSol || quotePriceSol <= 0) {
-        return {
-          success: false,
-          lifecycleState: 'RISK_REJECTED',
-          executionMode: 'PAPER',
-          error: 'MARKET_DATA_UNAVAILABLE: No valid market price available to execute paper order',
-          correlationId,
-        };
-      }
-
-      // Resolve dynamic tip for paper mode to respect economic sanity bounds
-      const paperTip = executionConfig.resolveDynamicJitoTip({
-        tradeAmountSol: req.amountSol,
-        explicitTipSol: req.jitoTipSol,
-      });
-
-      // Pre-trade capital sizing check: ensure order does not exceed 10% of spendable bankroll (B12)
-      const paperSpendable = this.realWalletBalanceSol !== null
-        ? CapitalSizer.calculateSpendableBankroll(this.realWalletBalanceSol, 0.015, this.inFlightReservedSol)
-        : 1.0;
-      const maxPaperOrderSol = Number((paperSpendable * 0.10).toFixed(6));
-      if (paperSpendable > 0 && req.amountSol > maxPaperOrderSol + 0.000001) {
-        return {
-          success: false,
-          lifecycleState: 'RISK_REJECTED',
-          executionMode: 'PAPER',
-          error: `EXCEEDS_CAPITAL_CEILING: Trade size ${req.amountSol} SOL exceeds 10% spendable bankroll ceiling (${maxPaperOrderSol} SOL).`,
-          correlationId,
-        };
-      }
-
-      // Evaluate Risk in Paper Mode
-      const riskDecision = riskEngine.evaluateOrder({
-        mint: req.mint,
-        orderSizeSol: req.amountSol,
-        expectedPriceSol: quotePriceSol,
-        slippageBps: req.slippageBps || 800,
-        estimatedFeeLamports: 15000,
-        jitoTipLamports: paperTip.tipLamports,
-        signalTimestamp: req.signalTimestamp || now,
-        marketDataTimestamp: req.marketDataTimestamp || now,
-        currentOpenPositionsCount: openPositions.length,
-        currentTotalExposureSol: totalExposureSol,
-        walletSpendableSol: 1.0,
-        executionMode: 'PAPER',
-      });
-
-      if (!riskDecision.approved) {
-        workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'PAPER', {
-          reason: riskDecision.reasonCode,
-          message: riskDecision.message,
-        });
-        return {
-          success: false,
-          lifecycleState: 'RISK_REJECTED',
-          executionMode: 'PAPER',
-          error: `${riskDecision.reasonCode}: ${riskDecision.message}`,
-          correlationId,
-        };
+          curveQuote = PumpCurveService.calculateBuyQuote({ state: curveState, amountSol: req.amountSol, slippageBps: req.slippageBps || 800, jitoTipSol: paperTip.tipSol, executionMode: 'PAPER' });
+        } catch (e: any) {
+          return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'PAPER', error: `PAPER_QUOTE_FAILED: ${e.message}`, correlationId };
+        }
       }
 
       const paperRes = paperEngine.executePaperBuy({
@@ -1313,8 +2004,10 @@ export class ExecutionCoordinator {
         amountSol: req.amountSol,
         currentPriceSol: quotePriceSol,
         slippageBps: req.slippageBps || 800,
-        jitoTipSol: req.jitoTipSol || 0.002,
+        jitoTipSol: paperTip.tipSol,
         liquidityUsd: req.liquidityUsd,
+        curveQuote,
+        tokenDecimals: curveState?.tokenDecimals,
       });
 
       if (!paperRes.success) {
@@ -1329,12 +2022,22 @@ export class ExecutionCoordinator {
 
       riskEngine.recordTradeSuccess(req.mint);
 
+      const gates = {
+        ...paperEligibility.gates,
+        capitalCeiling: { maxOrderSol: maxPaperOrderSol, orderSol: req.amountSol, passed: true },
+        risk: { approved: true, tipLamports: paperTip.tipLamports, tipPolicy: paperTip.policyReason },
+        pricing: paperRes.pricing,
+      };
+      workstationDb.logJournal('PAPER_FILL_GATES', correlationId, 'PAPER', { mint: req.mint, orderId: paperRes.paperOrderId, gates });
+
       return {
         success: true,
+        gates,
         lifecycleState: 'CONFIRMED',
         positionId: paperRes.paperOrderId,
         txSignature: paperRes.paperOrderId,
         fillPriceSol: paperRes.fillPriceSol,
+        quotePriceSol: curveQuote?.executionPriceSol,
         tokensReceived: paperRes.tokensReceived,
         executionMode: 'PAPER',
         feesPaidLamports: paperRes.networkFeeLamports + paperRes.jitoTipLamports,
@@ -1423,83 +2126,37 @@ export class ExecutionCoordinator {
         Logger.warn(`Could not fetch token holder distribution for ${req.mint}: ${err.message}`);
       }
 
+      // C3: the liquidity gate needs the SOL/USD price. A missing or stale price fails closed in LIVE.
+      let liveSolUsd: number;
+      try {
+        liveSolUsd = solPriceService.requireFreshPrice();
+      } catch (e: any) {
+        return {
+          success: false,
+          lifecycleState: 'RISK_REJECTED',
+          executionMode: 'LIVE',
+          error: e.message,
+          correlationId,
+        };
+      }
+
       eligibility = EligibilityFilter.evaluate(
-        {
-          mint: req.mint,
-          symbol: req.symbol,
-          name: req.name,
-          creator: marketState.creator.toBase58(),
-          priceSol:
-            Number(marketState.virtualSolReserves) /
-            Number(marketState.virtualTokenReserves) /
-            (1e9 / Math.pow(10, marketState.tokenDecimals)),
-          liquidityUsd: (Number(marketState.realSolReserves) / 1e9) * 150 * 2,
-          bondingCurveProgress: Number(
-            Math.min(100, (Number(marketState.realSolReserves) / (85 * 1e9)) * 100).toFixed(1)
-          ),
-          isMigrated: marketState.complete,
-          isMintAuthorityRevoked: marketState.isMintAuthorityRevoked,
-          isFreezeAuthorityRevoked: marketState.isFreezeAuthorityRevoked,
-          hasToken2022Extensions: marketState.baseTokenProgram?.equals(TOKEN_2022_PROGRAM_ID) ?? false,
-          // Pass the extension inspection result through. LIVE already refuses unsafe mints in fetchPumpMarketState,
-          // so a Token-2022 mint that reaches here with a report is explicitly safe; without this it was UNKNOWN and rejected.
-          token2022Safe: marketState.token2022Report ? marketState.token2022Report.isSafe : undefined,
-          unsupportedToken2022Extension:
-            marketState.token2022Report && !marketState.token2022Report.isSafe
-              ? marketState.token2022Report.unsupportedExtensionNames.join(',') || true
-              : undefined,
-          devHoldingPct: holderDist ? holderDist.devHoldingPct : null,
-          top10HoldersPct: holderDist ? holderDist.top10HoldersPct : null,
-        },
+        this.eligibilityInputFromMarket(req, marketState, holderDist, (Number(marketState.realSolReserves) / 1e9) * liveSolUsd * 2),
         true
       );
     }
 
-    if (now - eligibility.evaluatedAt > 60000) {
-      return {
-        success: false,
-        lifecycleState: 'FILTER_REJECTED',
-        executionMode: 'LIVE',
-        error: `ELIGIBILITY_REPORT_STALE: Eligibility report evaluated ${Math.round((now - eligibility.evaluatedAt) / 1000)}s ago exceeds 60s max age for live trading.`,
-        correlationId,
-      };
-    }
+    const verdict = this.eligibilityVerdict(eligibility, now, 'LIVE', correlationId);
+    if (verdict) return verdict;
 
-    const unsupportedExtensionCheck = eligibility.checks.find(
-      (c) => c.ruleId === 'TOKEN_2022_POLICY' && !c.passed
-    );
-    if (unsupportedExtensionCheck) {
+    // Q16: one open LIVE row per mint. A second buy over the same token account leaves two rows against one balance (the N3 adoption and the
+    // N5 zero-balance check each compare one row with the whole account), and the risk engine's DUPLICATE_MINT is only a 30 s cooldown.
+    if (openPositions.some((p) => p.mint === req.mint)) {
       return {
         success: false,
-        lifecycleState: 'FILTER_REJECTED',
+        lifecycleState: 'RISK_REJECTED',
         executionMode: 'LIVE',
-        error: `UNSUPPORTED_TOKEN_EXTENSION: ${unsupportedExtensionCheck.reason}`,
-        correlationId,
-      };
-    }
-
-    if (!eligibility.isEligible) {
-      const failReasons = eligibility.checks.filter((c) => !c.passed).map((c) => c.reason).join('; ');
-      return {
-        success: false,
-        lifecycleState: 'FILTER_REJECTED',
-        executionMode: 'LIVE',
-        error: `ELIGIBILITY_CHECK_FAILED: Token failed ${eligibility.failedCount} safety check(s): ${failReasons}`,
-        correlationId,
-      };
-    }
-
-    const hasUnverifiedHolders = eligibility.checks.some(
-      (c) =>
-        (c.ruleId === 'MAX_CREATOR_EXPOSURE' || c.ruleId === 'TOP_10_CONCENTRATION') &&
-        (!c.passed || String(c.observedValue).toLowerCase().includes('unknown') || String(c.observedValue).toLowerCase().includes('unverified'))
-    );
-    if (hasUnverifiedHolders) {
-      return {
-        success: false,
-        lifecycleState: 'FILTER_REJECTED',
-        executionMode: 'LIVE',
-        error: 'SAFETY_CHECK_UNVERIFIED: Dev holding or top 10 holders distribution is unverified. Live trade rejected.',
+        error: `POSITION_ALREADY_OPEN: an open LIVE position in ${req.mint} exists; close it before buying the same mint again.`,
         correlationId,
       };
     }
@@ -1559,7 +2216,10 @@ export class ExecutionCoordinator {
       };
     }
 
-    const requiredSol = req.amountSol + (quote.expectedJitoTipLamports + quote.expectedPriorityFeeLamports + 5000) / 1e9;
+    // N13: reserve the worst case the transaction can spend, not the nominal order: the buy instruction may pull up to maxInputLamports
+    // (the slippage headroom, about 8% over the order) and the first buy of a mint also pays rent for the new token account.
+    const worstCaseOrderSol = Math.max(req.amountSol, Number(quote.maxInputLamports) / 1e9);
+    const requiredSol = worstCaseOrderSol + CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS / 1e9 + (quote.expectedJitoTipLamports + quote.expectedPriorityFeeLamports + 5000) / 1e9;
 
     // Check balance concurrency reservation
     if (rawWalletBalance - this.inFlightReservedSol - requiredSol < 0.015) {
@@ -1572,6 +2232,30 @@ export class ExecutionCoordinator {
       };
     }
 
+    // C7b: an entry whose round-trip execution cost (both tips, both base+priority fees, pump fees both sides)
+    // exceeds 20% of the order cannot realistically be profitable. The size is never rounded up to make it pass.
+    const roundTripCostLamports = estimateRoundTripCostLamports({
+      buyTipLamports: quote.expectedJitoTipLamports,
+      sellTipLamports: resolvedTip.tipLamports,
+      priorityFeeLamports: quote.expectedPriorityFeeLamports,
+      buyProtocolFeeLamports: quote.protocolFeeLamports,
+      buyCreatorFeeLamports: quote.creatorFeeLamports,
+    });
+    if (roundTripCostLamports > MAX_ROUND_TRIP_COST_FRACTION * req.amountSol * 1e9) {
+      workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'LIVE', {
+        reason: 'EXPECTED_EDGE_BELOW_EXECUTION_COST',
+        roundTripCostLamports,
+        orderLamports: Math.round(req.amountSol * 1e9),
+      });
+      return {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'LIVE',
+        error: `EXPECTED_EDGE_BELOW_EXECUTION_COST: Round-trip cost ${roundTripCostLamports} lamports exceeds ${MAX_ROUND_TRIP_COST_FRACTION * 100}% of the ${req.amountSol} SOL order.`,
+        correlationId,
+      };
+    }
+
     const riskDecision = riskEngine.evaluateOrder({
       mint: req.mint,
       orderSizeSol: req.amountSol,
@@ -1580,11 +2264,15 @@ export class ExecutionCoordinator {
       estimatedPriceImpactBps: quote.estimatedPriceImpactBps,
       estimatedFeeLamports: quote.expectedPriorityFeeLamports + 5000,
       jitoTipLamports: quote.expectedJitoTipLamports,
-      signalTimestamp: req.signalTimestamp || marketState.marketDataTimestamp,
+      signalTimestamp: req.signalTimestamp as number,
       marketDataTimestamp: marketState.marketDataTimestamp,
-      currentOpenPositionsCount: openPositions.length,
+      // R3: adopted wallet dust is not a position the app chose to open; it must not fill the position cap forever.
+      currentOpenPositionsCount: openPositions.filter((p) => !isRecoveredPosition(p)).length,
       currentTotalExposureSol: totalExposureSol,
-      walletSpendableSol: Math.max(0, spendable - this.inFlightReservedSol),
+      // N12: the risk engine applies the minimum reserve itself, so it gets the balance net of in-flight orders only. `spendable` already
+      // has the reserve and the in-flight amount taken off; passing it (minus in-flight again) charged both twice. Rent held in token accounts
+      // is not in getBalance, so it is not subtracted either.
+      walletSpendableSol: Math.max(0, rawWalletBalance - this.inFlightReservedSol),
       executionMode: 'LIVE',
     });
 
@@ -1613,6 +2301,17 @@ export class ExecutionCoordinator {
         lifecycleState: 'RISK_REJECTED',
         executionMode: 'LIVE',
         error: `DUPLICATE_MINT: A buy for ${req.mint} is already in flight.`,
+        correlationId,
+      };
+    }
+    // N4: a buy of this mint that was sent and is still unresolved may become a position any moment; a second buy now would double the exposure.
+    if (workstationDb.hasUnresolvedLiveBuy(req.mint)) {
+      workstationDb.logJournal('TRADE_REJECTED_UNRESOLVED_BUY', correlationId, 'LIVE', { mint: req.mint });
+      return {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'LIVE',
+        error: `UNRESOLVED_BUY: an earlier buy of ${req.mint} was sent and is not reconciled yet; waiting for it before buying again.`,
         correlationId,
       };
     }
@@ -1661,6 +2360,20 @@ export class ExecutionCoordinator {
       const v0Tx = await txBuilder.buildBuyTransaction(this.connection, buyParams);
       await localSigner.signTransaction(v0Tx);
 
+      // Q17: risk approval was several awaits ago (curve read, holder lookup, tip floor, blockhash, snapshot, sign). Disarm, a halt or the
+      // kill switch may have happened in between; nothing is sent after any of them.
+      if (!this.isLiveTradingArmed || this.executionMode !== 'LIVE' || this.haltReason || riskEngine.isKillSwitchActive()) {
+        const why = !this.isLiveTradingArmed || this.executionMode !== 'LIVE' ? 'live trading was disarmed' : this.haltReason ? `trading was halted (${this.haltReason})` : 'the kill switch was activated';
+        workstationDb.logJournal('TRADE_REVOKED_BEFORE_SEND', correlationId, 'LIVE', { mint: req.mint, reason: why });
+        return {
+          success: false,
+          lifecycleState: 'RISK_REJECTED',
+          executionMode: 'LIVE',
+          error: `ENTRY_REVOKED: ${why} after the order was approved; nothing was sent.`,
+          correlationId,
+        };
+      }
+
       // The tip transfer is an instruction inside the signed transaction, so it is paid on-chain whichever
       // transport lands it (Jito bundle or the RPC fallback). Accounting uses resolvedTip.tipLamports for both.
       // Record order in SQLite
@@ -1697,6 +2410,37 @@ export class ExecutionCoordinator {
         preSnapshot,
         jitoTipLamports: resolvedTip.tipLamports,
       });
+
+      if (!subRes.success && subRes.unconfirmed && subRes.signature) {
+        // N2: the buy was sent and never seen failing. It can still land after this returns, so it is not "reverted":
+        // keep it open for reconciliation and let orphan recovery adopt the tokens (and give them a stop-loss) if it does.
+        riskEngine.recordTradeFailure();
+        workstationDb.saveTransaction({
+          signature: subRes.signature,
+          bundleId: subRes.bundleId,
+          orderId: clientOrderId,
+          correlationId,
+          mint: req.mint,
+          direction: 'BUY',
+          submissionTransport: subRes.transport,
+          submissionTime: Date.now(),
+          reconciliationState: 'RECONCILIATION_REQUIRED',
+          networkFeeLamports: 5000,
+          jitoTipLamports: resolvedTip.tipLamports,
+          executionMode: 'LIVE',
+          error: `UNCONFIRMED: ${subRes.error || 'no confirmation before timeout'}`,
+        });
+        this.scheduleOrphanRecovery();
+        return {
+          success: false,
+          lifecycleState: 'RECONCILIATION_REQUIRED',
+          executionMode: 'LIVE',
+          txSignature: subRes.signature,
+          bundleId: subRes.bundleId,
+          error: `UNCONFIRMED: ${subRes.error || 'no confirmation before timeout'}. The transaction was sent and may still land; it is being watched, do not retry the buy.`,
+          correlationId,
+        };
+      }
 
       if (!subRes.success || !subRes.signature) {
         riskEngine.recordTradeFailure();
@@ -1758,6 +2502,9 @@ export class ExecutionCoordinator {
           executionMode: 'LIVE',
           error: reconciliation.error || 'Token balance increase not verified',
         });
+        // The buy landed but its fill is unread: keep retrying so the tokens get a position (and a stop-loss).
+        // Any non-RECONCILED outcome (including ERROR): the buy landed, so keep trying to give the tokens a position and a stop-loss.
+        this.scheduleOrphanRecovery();
 
         return {
           success: false,
@@ -1772,7 +2519,6 @@ export class ExecutionCoordinator {
 
       // 8. Reconciled Successfully: Persist verified OPEN position
       riskEngine.recordTradeSuccess(req.mint);
-      await this.syncRealWalletBalance();
 
       const livePosition: NormalizedPosition = {
         id: subRes.signature,
@@ -1804,9 +2550,19 @@ export class ExecutionCoordinator {
         lastUpdatedTimestamp: Date.now(),
       };
 
-      workstationDb.savePosition(livePosition);
+      // N11: the tokens are in the wallet. If the database refuses the position the buy must not turn into a "chain error" with an
+      // unwatched balance: keep the transaction row open for recovery (it rebuilds the position from chain data) and tell the operator.
+      let positionPersisted = true;
+      try {
+        workstationDb.savePosition(livePosition);
+      } catch (err: any) {
+        positionPersisted = false;
+        Logger.error(`Position write failed after a landed buy ${subRes.signature}: ${err.message}`);
+        this.raiseOperatorAlert('POSITION_NOT_PERSISTED', `A buy of ${req.symbol || req.mint} landed (${subRes.signature.slice(0, 8)}) but the database refused the position (${String(err.message).slice(0, 80)}). Recovery will rebuild it from chain data; until then it has no stop-loss.`, subRes.signature);
+        this.scheduleOrphanRecovery();
+      }
 
-      workstationDb.saveTransaction({
+      const ledgerWritten = workstationDb.saveTransaction({
         signature: subRes.signature,
         bundleId: subRes.bundleId,
         orderId: clientOrderId,
@@ -1817,11 +2573,19 @@ export class ExecutionCoordinator {
         submissionTime: Date.now(),
         landingSlot: reconciliation.slot,
         confirmationTime: Date.now(),
-        reconciliationState: 'RECONCILED',
+        reconciliationState: positionPersisted ? 'RECONCILED' : 'RECONCILIATION_REQUIRED',
         networkFeeLamports: reconciliation.actualNetworkFeeLamports,
         jitoTipLamports: resolvedTip.tipLamports,
         executionMode: 'LIVE',
       });
+      if (!ledgerWritten) {
+        this.raiseOperatorAlert('LEDGER_WRITE_FAILED', `The transaction row for a landed buy (${subRes.signature.slice(0, 8)}) could not be written; the position ${positionPersisted ? 'was saved' : 'was NOT saved either'}.`, subRes.signature);
+      }
+      try {
+        await this.syncRealWalletBalance();
+      } catch (err: any) {
+        Logger.warn(`Wallet balance sync after a landed buy failed: ${err.message}`); // the buy is done; a stale balance self-corrects on the next sync
+      }
 
       return {
         success: true,
@@ -1830,6 +2594,7 @@ export class ExecutionCoordinator {
         txSignature: subRes.signature,
         bundleId: subRes.bundleId,
         fillPriceSol: reconciliation.effectiveFillPriceSol,
+        quotePriceSol: quote.executionPriceSol,
         tokensReceived: reconciliation.tokensReceivedHuman,
         executionMode: 'LIVE',
         feesPaidLamports: reconciliation.actualNetworkFeeLamports + quote.expectedJitoTipLamports,
@@ -1853,10 +2618,130 @@ export class ExecutionCoordinator {
   }
 
   // Canonical Close Position supporting partial sells (1-100%) and real proceeds reconciliation
+  private haltReason: string | null = null;
+
+  /** G3: hard stop of ALL trading, exits included (used when the wallet balance changes for a reason the journal cannot explain). */
+  public haltAll(reason: string): void {
+    if (this.haltReason) return;
+    this.haltReason = reason;
+    // Only the process-wide coordinator persists a halt (it is the only one that restores it); a script or test coordinator must not halt the next real boot.
+    if (this.isDefaultSingleton && !workstationDb.logJournal('TRADING_HALTED', 'halt', this.executionMode, { reason })) {
+      // R8: the halt holds in memory but will not survive a restart; say so instead of letting the operator assume it will.
+      this.raiseOperatorAlert('HALT_NOT_PERSISTED', `The halt could not be written to the database (${reason}). It holds until this process restarts; after a restart trading would not be halted. Fix the database and halt again.`);
+    }
+    this.raiseOperatorAlert('TRADING_HALTED', `All trading including exits is halted: ${reason}`);
+  }
+
+  public clearHalt(): void {
+    if (this.haltReason && this.isDefaultSingleton) workstationDb.logJournal('TRADING_HALT_CLEARED', 'halt', this.executionMode, {});
+    this.haltReason = null;
+    this.clearOperatorAlert('TRADING_HALTED');
+  }
+
+  /** Q8: true while a LIVE buy is being sent/reconciled or an exit is between its send and its journal row. */
+  public hasTradeInFlight(): boolean {
+    return this.inFlightReservedSol > 0 || this.exitsInFlight > 0;
+  }
+
+  public getHaltReason(): string | null {
+    return this.haltReason;
+  }
+
+  private exitFailures = new Map<string, { count: number; nextAttemptAt: number; lastError: string }>();
+
+  /** Sell slippage for the next attempt on this position: starts at 800 bps and widens after each consecutive failure. */
+  public exitSlippageBps(positionId: string): number {
+    const n = this.exitFailures.get(positionId)?.count ?? 0;
+    return SELL_SLIPPAGE_LADDER_BPS[Math.min(n, SELL_SLIPPAGE_LADDER_BPS.length - 1)];
+  }
+
+  /** ms until the auto-exit loop may try this position again (0 when free). */
+  public exitRetryWaitMs(positionId: string, now: number = Date.now()): number {
+    const f = this.exitFailures.get(positionId);
+    return f ? Math.max(0, f.nextAttemptAt - now) : 0;
+  }
+
+  public getExitFailureCount(positionId: string): number {
+    return this.exitFailures.get(positionId)?.count ?? 0;
+  }
+
+  /**
+   * Errors that mean no send was attempted (or that an earlier send is still being waited for), so they neither cost fees nor count
+   * toward backoff or the EXIT_FAILING alert. Q12: waiting for a pending sell, an undeterminable venue, a missing signer and a zero
+   * quantity are not rejected sends; counting them walked the ladder to 4000 bps before the real resend.
+   */
+  private static isNonAttemptExitError(error?: string): boolean {
+    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found|SELL_PENDING_VERIFICATION|UNKNOWN_TRADING_VENUE|Signer is not configured|Calculated sell quantity is zero)/.test(error) || ExecutionCoordinator.isQuoteFailure(error);
+  }
+
+  /** R10: the sell could not even be quoted (fail-closed quote, fee config, market state). Nothing was sent, and widening slippage cannot help. */
+  private static isQuoteFailure(error?: string): boolean {
+    return !!error && /^(OFFICIAL_PUMP_QUOTE_FAILED|DYNAMIC_FEE_CALCULATION_FAILED|FEE_RECIPIENT_UNRESOLVED|UNSUPPORTED_QUOTE_MINT|Cannot fetch market state)/.test(error);
+  }
+
+  private recordExitOutcome(positionId: string, res: { success: boolean; error?: string }, mode?: string): void {
+    if (res.success) {
+      this.exitFailures.delete(positionId);
+      this.clearOperatorAlert('EXIT_FAILING', positionId);
+      this.clearOperatorAlert('EXIT_QUOTE_FAILING', positionId);
+      return;
+    }
+    if (mode === 'LIVE' && ExecutionCoordinator.isQuoteFailure(res.error)) {
+      // No fee was spent and the ladder must not advance, but a stop-loss that cannot be priced is exactly what an operator must hear about.
+      this.raiseOperatorAlert('EXIT_QUOTE_FAILING', `Exit for position ${positionId.slice(0, 8)} cannot be quoted, so nothing is being sent (${String(res.error).slice(0, 140)}). Retrying every tick; close it manually if this persists.`, positionId);
+    }
+    if (mode !== 'LIVE' || ExecutionCoordinator.isNonAttemptExitError(res.error)) return;
+    const count = (this.exitFailures.get(positionId)?.count ?? 0) + 1;
+    const wait = Math.min(EXIT_RETRY_MAX_MS, EXIT_RETRY_BASE_MS * 2 ** (count - 1));
+    this.exitFailures.set(positionId, { count, nextAttemptAt: Date.now() + wait, lastError: res.error || 'unknown' });
+    if (count >= EXIT_FAILURE_ALERT_AFTER) {
+      this.raiseOperatorAlert('EXIT_FAILING', `Exit for position ${positionId.slice(0, 8)} failed ${count} times in a row (last: ${res.error}). Retrying every ${Math.round(wait / 1000)}s with wider slippage; consider closing manually.`, positionId);
+    }
+  }
+
+  /** Close (part of) a position, and write the exit to the decision journal (G3). */
   public async closePosition(
     positionId: string,
     sellPct: number = 100,
     reason: string = 'Manual Close'
+  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string }> {
+    // A halt stops entries and discretionary exits. It never stops the exits that protect the wallet: stop-loss, trailing stop,
+    // an operator's manual close and panic liquidation (a halt that froze a losing position would be the opposite of its purpose).
+    if (this.haltReason && !PROTECTIVE_EXIT_REASONS.test(reason)) {
+      return { success: false, pnlSol: 0, error: `TRADING_HALTED: ${this.haltReason}` };
+    }
+    const before = workstationDb.loadPositions().find((p) => p.id === positionId);
+    // Q8: an exit is "in flight" until its fill is journaled, so the wallet audit does not look at the balance in between.
+    this.exitsInFlight++;
+    try {
+      const res = await this.closePositionImpl(positionId, sellPct, reason);
+      this.recordExitOutcome(positionId, res, before?.executionMode);
+      if (res.success && before) {
+        const fraction = Math.min(100, Math.max(1, sellPct)) / 100;
+        workstationDb.logDecision({
+          autoMode: 'n/a',
+          mint: before.mint,
+          symbol: before.symbol,
+          source: 'EXIT_ENGINE',
+          stage: 'exit',
+          outcome: 'EXITED',
+          reason,
+          inputs: { sellPct, mode: before.executionMode, pnlSol: res.pnlSol },
+          positionId,
+          // Q8: only a LIVE exit moves the wallet; a PAPER exit journaled a delta the balance never showed, which the wallet audit read as a drain
+          solDelta: before.executionMode === 'LIVE' ? (before.costBasisLamports / 1e9) * fraction + res.pnlSol : undefined,
+        });
+      }
+      return res;
+    } finally {
+      this.exitsInFlight--;
+    }
+  }
+
+  private async closePositionImpl(
+    positionId: string,
+    sellPct: number,
+    reason: string
   ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string }> {
     if (this.inFlightPositionExits.has(positionId)) {
       return { success: false, pnlSol: 0, error: 'EXIT_IN_PROGRESS: An exit transaction for this position is already in progress.' };
@@ -1895,7 +2780,11 @@ export class ExecutionCoordinator {
         const fees = estimatedFeeLamports / 1e9;
         const netProceeds = residualValue + (closeAta ? 0.00203928 : 0) - fees;
 
-        if (netProceeds <= 0) {
+        // Hard-stop and trailing-stop exits are never blocked by the dust check: a full exit closes the ATA and returns
+        // about 0.002 SOL of rent, and holding a falling position to avoid a tip is worse. The check only gates
+        // take-profit partials, the stale-position exit and manual closes.
+        const isProtectiveExit = reason === 'STOP_LOSS' || reason === 'TRAILING_STOP' || reason === 'EMERGENCY_PANIC_LIQUIDATION';
+        if (netProceeds <= 0 && !isProtectiveExit) {
           return {
             success: false,
             pnlSol: 0,
@@ -1907,7 +2796,18 @@ export class ExecutionCoordinator {
       // PAPER Sell Branch
       if (target.executionMode === 'PAPER') {
         await new Promise((r) => setTimeout(r, 10));
-        const res = paperEngine.executePaperSell(target.id, target.currentPriceSol, safeSellPct, reason);
+        // Q7: sell against the curve as it is now. Unreadable or migrated curve: the flat model, which the journal row says.
+        let sellQuote: ReturnType<typeof PumpCurveService.calculateSellQuote> | undefined;
+        try {
+          const state = await PumpCurveService.fetchPumpMarketState({ connection: this.connection, mint: new PublicKey(target.mint), executionMode: 'PAPER' });
+          if (state && !state.complete) {
+            const sold = (BigInt(target.tokenQuantityRaw) * BigInt(safeSellPct)) / 100n;
+            if (sold > 0n) sellQuote = PumpCurveService.calculateSellQuote({ state, tokenAmountRaw: sold, executionMode: 'PAPER' });
+          }
+        } catch {}
+        const res = paperEngine.executePaperSell(target.id, target.currentPriceSol, safeSellPct, reason, sellQuote && {
+          netSolOutLamports: sellQuote.expectedSolAmountLamports, executionPriceSol: sellQuote.executionPriceSol, spotPriceSol: sellQuote.spotPriceSol,
+        });
         return {
           success: res.success,
           pnlSol: res.realizedPnLSol,
@@ -1924,11 +2824,95 @@ export class ExecutionCoordinator {
     const seller = localSigner.getPublicKey();
     const mintPubkey = new PublicKey(target.mint);
 
-      const totalTokensRaw = BigInt(target.tokenQuantityRaw);
-      const amountTokensToSell = (totalTokensRaw * BigInt(safeSellPct)) / 100n;
+      let totalTokensRaw = BigInt(target.tokenQuantityRaw);
+      let amountTokensToSell = (totalTokensRaw * BigInt(safeSellPct)) / 100n;
 
       if (amountTokensToSell <= 0n) {
         return { success: false, pnlSol: 0, error: 'Calculated sell quantity is zero' };
+      }
+
+      // N3: an earlier sell of this position was sent but its outcome is unknown. Selling again could double-sell a partial, so
+      // read the wallet first: if the balance dropped the sell landed (adopt it), if not wait out the blockhash window.
+      const pendingSell = this.pendingSells.get(positionId);
+      if (pendingSell) {
+        const tp = target.baseTokenProgram ? new PublicKey(target.baseTokenProgram) : TOKEN_PROGRAM_ID;
+        let onChain: bigint | null = null;
+        try {
+          const bal = await this.connection.getTokenAccountBalance(PumpCurveService.getAssociatedTokenAddress(mintPubkey, seller, tp), 'confirmed');
+          onChain = BigInt(bal?.value?.amount ?? '0');
+        } catch (e: any) {
+          // an unreadable ATA balance after a sell that closed the account means it is gone
+          onChain = /could not find account|Invalid param/i.test(String(e?.message)) ? 0n : null;
+        }
+        if (onChain !== null && onChain < totalTokensRaw) {
+          this.pendingSells.delete(positionId);
+          target.exitReason = reason;
+          target.exitTxSignature = pendingSell.signature;
+          target.lastUpdatedTimestamp = Date.now();
+          if (onChain === 0n) {
+            target.status = 'CLOSED';
+            target.tokenQuantityRaw = '0';
+            target.costBasisLamports = 0;
+          } else {
+            target.status = 'PARTIALLY_CLOSED';
+            target.costBasisLamports = Math.round(target.costBasisLamports * Number(onChain) / Number(totalTokensRaw));
+            target.tokenQuantityRaw = onChain.toString();
+          }
+          workstationDb.savePosition(target);
+          this.raiseOperatorAlert('SELL_ADOPTED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed but its fill could not be read. The position now matches the wallet; realized PnL for it was not recorded.`, positionId);
+          await this.syncRealWalletBalance();
+          return { success: true, pnlSol: 0, status: target.status };
+        }
+        if (Date.now() - pendingSell.ts < PENDING_SELL_WINDOW_MS) {
+          return { success: false, pnlSol: 0, error: `SELL_PENDING_VERIFICATION: sell ${pendingSell.signature.slice(0, 8)} was sent and is not confirmed or expired yet; not selling again` };
+        }
+        this.pendingSells.delete(positionId);
+      }
+
+      // Q13: a 100% sell sells what the wallet holds. When the row says more than the wallet has (tokens moved outside the app, a partial
+      // that landed with no pending record), every attempt fails simulation and the stop-loss can never clear. Scale the row to the wallet
+      // (the N3 adoption arithmetic) and sell that; an empty wallet closes the row without a send.
+      if (safeSellPct >= 100) {
+        let held: bigint | null = null;
+        try {
+          const tp = target.baseTokenProgram ? new PublicKey(target.baseTokenProgram) : TOKEN_PROGRAM_ID;
+          const bal = await this.connection.getTokenAccountBalance(PumpCurveService.getAssociatedTokenAddress(mintPubkey, seller, tp), 'confirmed');
+          held = BigInt(bal?.value?.amount ?? '0');
+        } catch (e: any) {
+          held = /could not find account|Invalid param/i.test(String(e?.message)) ? 0n : null; // unreadable for another reason: sell what the row says
+        }
+        if (held !== null && held < totalTokensRaw) {
+          target.lastUpdatedTimestamp = Date.now();
+          if (held === 0n) {
+            target.status = 'CLOSED';
+            target.tokenQuantityRaw = '0';
+            target.costBasisLamports = 0;
+            target.exitReason = 'RECONCILED_ZERO_BALANCE: the wallet held no tokens when the sell was prepared';
+            workstationDb.savePosition(target);
+            this.raiseOperatorAlert('POSITION_BALANCE_MISSING', `${target.symbol || target.mint} was closed without a sell: the wallet held none of it. Realized PnL for it was not recorded.`, positionId);
+            return { success: true, pnlSol: 0, status: 'CLOSED' };
+          }
+          target.costBasisLamports = Math.round(target.costBasisLamports * Number(held) / Number(totalTokensRaw));
+          target.tokenQuantityRaw = held.toString();
+          workstationDb.savePosition(target);
+          this.raiseOperatorAlert('POSITION_BALANCE_CLAMPED', `${target.symbol || target.mint}: the position said ${totalTokensRaw} but the wallet holds ${held}; selling what the wallet holds.`, positionId);
+          totalTokensRaw = held;
+          amountTokensToSell = held;
+        }
+      }
+
+      // CloseAccount only succeeds on an empty token account. If the wallet holds more than this sell (dust, an airdrop) or the balance
+      // cannot be read, a close instruction would revert the whole sell and the stop-loss with it, so keep the account open (critique #9).
+      let closeAtaEffective = closeAta;
+      if (closeAta) {
+        closeAtaEffective = false;
+        try {
+          const tp = target.baseTokenProgram ? new PublicKey(target.baseTokenProgram) : TOKEN_PROGRAM_ID;
+          const ataBal = await this.connection.getTokenAccountBalance(PumpCurveService.getAssociatedTokenAddress(mintPubkey, seller, tp), 'confirmed');
+          closeAtaEffective = BigInt(ataBal?.value?.amount ?? '1') <= amountTokensToSell;
+        } catch {
+          // unreadable: keep the account
+        }
       }
 
       const { PumpSwapVenueService } = await import('../solana/pumpSwapService');
@@ -1943,6 +2927,7 @@ export class ExecutionCoordinator {
         };
       }
 
+      const sellSlippageBps = this.exitSlippageBps(positionId);
       let v0Tx: any;
       let expectedJitoTipLamports = resolvedTip.tipLamports;
       const jitoTipAccount = executionConfig.getJitoTipAccountPublicKey();
@@ -1962,7 +2947,7 @@ export class ExecutionCoordinator {
           seller,
           mintPubkey,
           amountTokensToSell,
-          800,
+          sellSlippageBps,
           posMode
         );
 
@@ -1970,7 +2955,7 @@ export class ExecutionCoordinator {
         const instructions = [
           ...SolanaTransactionBuilder.createComputeBudgetInstructions(250000, executionConfig.getConfig().priorityFeeMicrolamports),
           ...pumpSwapSell.instructions,
-          ...(closeAta ? [createCloseAccountInstruction(associatedUser, seller, seller, [], tokenProgramToUse)] : []),
+          ...(closeAtaEffective ? [createCloseAccountInstruction(associatedUser, seller, seller, [], tokenProgramToUse)] : []),
           SystemProgram.transfer({
             fromPubkey: seller,
             toPubkey: jitoTipAccount,
@@ -1993,7 +2978,7 @@ export class ExecutionCoordinator {
         const sellQuote = PumpCurveService.calculateSellQuote({
           state: marketState,
           tokenAmountRaw: amountTokensToSell,
-          slippageBps: 800,
+          slippageBps: sellSlippageBps,
           jitoTipSol: resolvedTip.tipSol,
           priorityFeeLamports: Math.round(executionConfig.getConfig().priorityFeeMicrolamports * 0.25),
           executionMode: posMode,
@@ -2024,10 +3009,10 @@ export class ExecutionCoordinator {
           priorityFeeMicroLamports: executionConfig.getConfig().priorityFeeMicrolamports,
           jitoTipLamports: BigInt(sellQuote.expectedJitoTipLamports),
           jitoTipAccount: jitoTipAccount,
-          closeAta,
+          closeAta: closeAtaEffective,
         };
 
-        v0Tx = await txBuilder.buildSellTransaction(this.connection, sellParams, closeAta);
+        v0Tx = await txBuilder.buildSellTransaction(this.connection, sellParams, closeAtaEffective);
       } else {
         return { success: false, pnlSol: 0, error: `Trading venue for mint ${target.mint} cannot be resolved or migrated to unknown DEX` };
       }
@@ -2041,6 +3026,13 @@ export class ExecutionCoordinator {
       );
 
       await localSigner.signTransaction(v0Tx);
+
+      // A sell that would revert (slippage breached, bad account) costs fees every time it lands. Simulate first and only send one that passes.
+      // If the simulation call itself fails, send anyway: a stop-loss must not be blocked by a flaky RPC.
+      const sim = await this.simulateSell(v0Tx);
+      if (!sim.ok) {
+        return { success: false, pnlSol: 0, error: `SELL_SIMULATION_FAILED: ${sim.error} (slippage ${sellSlippageBps} bps)` };
+      }
 
       const exitOrderId = `ord-exit-${positionId.slice(0, 8)}-${Date.now()}`;
       const subRes = await this.submitAndConfirmWithRetry({
@@ -2057,6 +3049,7 @@ export class ExecutionCoordinator {
       });
 
       if (!subRes.success || !subRes.signature) {
+        if (subRes.unconfirmed && subRes.signature) this.pendingSells.set(positionId, { signature: subRes.signature, ts: Date.now() });
         return { success: false, pnlSol: 0, error: subRes.error || 'Failed to submit or confirm sell bundle' };
       }
 
@@ -2074,6 +3067,7 @@ export class ExecutionCoordinator {
       );
 
       if (!sellRecon.success) {
+        this.pendingSells.set(positionId, { signature: subRes.signature, ts: Date.now() });
         return { success: false, pnlSol: 0, error: sellRecon.error };
       }
 
@@ -2093,6 +3087,7 @@ export class ExecutionCoordinator {
       }
 
       workstationDb.savePosition(target);
+      workstationDb.markTransactionReconciled(subRes.signature, { slot: sellRecon.slot, networkFeeLamports: sellRecon.actualNetworkFeeLamports });
       await this.syncRealWalletBalance();
 
       return {
@@ -2107,21 +3102,130 @@ export class ExecutionCoordinator {
     }
   }
 
+  private async simulateSell(tx: any): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const res = await this.connection.simulateTransaction(tx, { sigVerify: false, commitment: 'processed' });
+      if (res?.value?.err) {
+        // the program log tail says which program refused and why; the error code alone does not
+        const tail = (res.value.logs ?? []).filter((l) => !l.startsWith('Program data:')).slice(-6).join(' | ');
+        return { ok: false, error: `${JSON.stringify(res.value.err)}${tail ? ` [logs: ${tail}]` : ''}` };
+      }
+      return { ok: true };
+    } catch (e: any) {
+      Logger.warn(`Sell simulation unavailable (${e.message}); sending without it`);
+      return { ok: true };
+    }
+  }
+
+  /** C4: isolated per-position price read used when the shared mark feed has gone stale. */
+  private async refreshStaleMark(pos: NormalizedPosition): Promise<boolean> {
+    try {
+      const marks = await RealMarkPriceService.queryOnChainMarkPrices(
+        this.connection,
+        [pos.mint],
+        pos.executionMode === 'LIVE' ? 'LIVE' : 'PAPER'
+      );
+      const mark = marks[pos.mint];
+      if (!mark || !(mark.priceSol > 0)) {
+        const rejected = PumpCurveService.getMintRejection(pos.mint);
+        if (rejected) this.raiseOperatorAlert('MARK_MINT_REJECTED', `${pos.symbol || pos.mint.slice(0, 6)} cannot be marked: ${rejected}. The position keeps its last mark and goes stale.`, pos.id); // R19
+        return false;
+      }
+      this.applyMarkPrice(pos, mark.priceSol, mark.source, mark.timestamp, mark.poolAddress);
+      return true;
+    } catch (err: any) {
+      Logger.debug(`Direct mark read failed for ${pos.mint}: ${err.message}`);
+      return false;
+    }
+  }
+
+  private operatorAlerts: OperatorAlert[] = [];
+
+  /** Recent operator alerts (newest last). Surfaced in diagnostics. */
+  public getOperatorAlerts(): OperatorAlert[] {
+    return this.operatorAlerts.filter((a) => !a.cleared).map((a) => ({ ...a }));
+  }
+
+  private raiseOperatorAlert(code: string, message: string, positionId?: string) {
+    const now = Date.now();
+    const existing = this.operatorAlerts.find((a) => a.code === code && a.positionId === positionId && !a.cleared);
+    if (existing) {
+      existing.lastSeenAt = now;
+      return;
+    }
+    this.operatorAlerts.push({ code, message, positionId, raisedAt: now, lastSeenAt: now, cleared: false });
+    // N17: at the cap drop a cleared alert first; an uncleared one is only dropped when everything is uncleared.
+    if (this.operatorAlerts.length > 50) {
+      const cleared = this.operatorAlerts.findIndex((a) => a.cleared);
+      this.operatorAlerts.splice(cleared >= 0 ? cleared : 0, 1);
+    }
+    Logger.error(`[OPERATOR ALERT] ${code}: ${message}`);
+  }
+
+  private clearOperatorAlert(code: string, positionId?: string) {
+    for (const a of this.operatorAlerts) {
+      if (a.code === code && a.positionId === positionId) a.cleared = true;
+    }
+  }
+
   // Evaluate dynamic exit conditions for all active positions and execute exits via ExitEngine (B13)
-  public async evaluateAndProcessExits(): Promise<void> {
+  private exitPassInFlight: Promise<void> | null = null;
+  private pendingSells = new Map<string, { signature: string; ts: number }>();
+
+  // N1: one pass at a time. A pass awaits sells that can outlast the 3s timer; an overlapping pass would see the same
+  // ACTIVE row and sell it again, or write back its stale copy over a position the first pass already closed.
+  public evaluateAndProcessExits(): Promise<void> {
+    if (this.exitPassInFlight) return this.exitPassInFlight;
+    const run = this.runExitPass().finally(() => {
+      if (this.exitPassInFlight === run) this.exitPassInFlight = null;
+    });
+    this.exitPassInFlight = run;
+    return run;
+  }
+
+  private async runExitPass(): Promise<void> {
     try {
       await this.updatePositionMarkPrices();
     } catch {}
 
     const positions = workstationDb.loadPositions(undefined, 'ACTIVE');
+    const loadedQty = new Map(positions.map((p) => [p.id, p.tokenQuantityRaw]));
+    // N17: failure counters only matter for positions still open; drop the rest so the map cannot grow forever.
+    for (const id of this.exitFailures.keys()) if (!loadedQty.has(id)) this.exitFailures.delete(id);
     const now = Date.now();
+    // Nothing LIVE is open, so there is no mark to be stale (see the feed heartbeat): reset the clock here too.
+    if (!positions.some((p) => p.executionMode === 'LIVE')) {
+      this.lastPositionMarkTimestamp = 0;
+      this.positionMarkHealth = 'HEALTHY';
+    }
 
     for (const pos of positions) {
-      // Do not trigger exits on stale marks older than 15 seconds
-      const markAge = now - (pos.lastMarkTimestamp || pos.lastUpdatedTimestamp);
-      if (markAge > 15000) continue;
+      // C4: staleness is measured from the last real mark only. lastUpdatedTimestamp is rewritten on every tick
+      // and would hide a dead feed, so it is never a fallback; a never-marked position ages from its entry.
+      const markAge = now - (pos.lastMarkTimestamp || pos.entryTimestamp || now);
+      if (markAge > MARK_STALE_MS) {
+        // Before skipping, read this position's curve/pool directly. A fresh read lets the stop-loss run.
+        const refreshed = await this.refreshStaleMark(pos);
+        if (!refreshed) {
+          // Missing data is never "safe": exits cannot be priced, so say so loudly once the gap is long enough.
+          if (markAge > MARK_ALERT_AFTER_MS) {
+            this.raiseOperatorAlert(
+              'POSITION_MARK_UNAVAILABLE',
+              `No price for ${pos.symbol || pos.mint} for ${Math.round(markAge / 1000)}s and a direct curve/pool read failed. Stop-loss and take-profit cannot fire until a mark returns; consider closing manually.`,
+              pos.id
+            );
+          }
+          // A position nobody can price must age the mark feed from its entry, or an empty history would read as healthy.
+          if (pos.executionMode === 'LIVE' && this.lastPositionMarkTimestamp === 0) this.lastPositionMarkTimestamp = pos.entryTimestamp || now;
+          continue;
+        }
+        this.clearOperatorAlert('POSITION_MARK_UNAVAILABLE', pos.id);
+        if (pos.executionMode === 'LIVE') this.recordPositionMarkEvent();
+      } else if (pos.executionMode === 'LIVE') {
+        this.recordPositionMarkEvent(); // a real mark within the staleness window
+      }
 
-      const decision = ExitEngine.evaluate({
+      let decision = ExitEngine.evaluate({
         positionId: pos.id,
         entryPriceSol: pos.entryPriceSol,
         currentPriceSol: pos.currentPriceSol,
@@ -2132,6 +3236,19 @@ export class ExecutionCoordinator {
         currentTimestamp: now,
       });
 
+      // A RECOVERED position (a balance found in the wallet that this app never bought) has an entry price that is just the mark at
+      // adoption, so take-profit, trailing and stale exits would sell whatever lands in the wallet on an invented schedule. Only the
+      // hard stop applies, unless the operator opts in with AUTO_MANAGE_RECOVERED=true.
+      const ladderSuppressed = isRecoveredPosition(pos) && process.env.AUTO_MANAGE_RECOVERED !== 'true';
+      if (decision.shouldExit && decision.reason !== 'STOP_LOSS' && ladderSuppressed) {
+        decision = { ...decision, shouldExit: false, newExitStage: pos.exitStage ?? 0 };
+      }
+      if (ladderSuppressed) {
+        // R15: while the ladder is off, the high-water mark and trailing stop must not keep ratcheting up, or enabling
+        // AUTO_MANAGE_RECOVERED later would fire a trailing stop built from days of suppressed history at once.
+        decision = { ...decision, newHighWaterMarkSol: pos.highWaterMarkSol ?? decision.newHighWaterMarkSol, newTrailingStopSol: pos.trailingStopSol ?? decision.newTrailingStopSol };
+      }
+
       // Persist high_water_mark_sol and trailing_stop_sol to SQLite (B13). The exit stage only advances after the
       // sell actually fills: advancing it first would skip a take-profit stage when the sell reverts or is refused.
       const priorExitStage = pos.exitStage;
@@ -2139,9 +3256,16 @@ export class ExecutionCoordinator {
       pos.trailingStopSol = decision.newTrailingStopSol;
       pos.exitStage = decision.shouldExit ? priorExitStage : decision.newExitStage;
       pos.lastUpdatedTimestamp = now;
+      // N1: this row was loaded before the awaits above (and before earlier positions' sells in this pass). If a manual
+      // close, partial sell or reconcile changed it since, writing the stale copy back would resurrect a sold position
+      // or undo a partial; skip it and let the next pass re-evaluate from the current row.
+      const current = workstationDb.loadPositions(undefined, undefined).find((p) => p.id === pos.id);
+      if (!current || current.status === 'CLOSED' || current.tokenQuantityRaw !== loadedQty.get(pos.id)) continue;
       workstationDb.savePosition(pos);
 
       if (decision.shouldExit) {
+        const waitMs = this.exitRetryWaitMs(pos.id, now);
+        if (waitMs > 0) continue; // backing off after a failed attempt; the next tick past the deadline retries
         Logger.info(
           `[B13 ExitEngine] ${decision.reason} triggered for ${pos.symbol || pos.mint} (Sell ${decision.sellPercentage}%, PnL: ${decision.profitPct.toFixed(2)}%)`
         );
@@ -2205,6 +3329,7 @@ export class ExecutionCoordinator {
         ? 'WARMING_UP'
         : this.pumpFeedHealth,
       positionMarkHealth: this.positionMarkHealth,
+      operatorAlerts: this.getOperatorAlerts(),
       marketFeedHealth,
       marketFeedLastEventMsAgo: marketFeedLastEventMsAgo ?? 0,
       jitoHealth: jitoTelemetry.health === 'OFFLINE' ? 'DISCONNECTED' : jitoTelemetry.health,
@@ -2217,14 +3342,29 @@ export class ExecutionCoordinator {
       openPositionsCount: activePositions.length,
       dailyRealizedPnLSol: workstationDb.getDailyRealizedPnLSol(this.executionMode),
       dailyFeesPaidLamports: dailyFees,
-      totalTradesToday: activePositions.length,
-      lastConfirmedTradeTime: activePositions[0]?.entryTimestamp || null,
+      totalTradesToday: workstationDb.countReconciledTradesToday(this.executionMode),
+      lastConfirmedTradeTime: workstationDb.getLastConfirmedTradeTime(this.executionMode),
       dbPath: workstationDb.getDbPath(),
-      sqliteJournalOk: true,
+      sqliteJournalOk: this.checkSqliteJournalOk(),
     };
   }
 
+  private sqliteOkCache: { at: number; ok: boolean } | null = null;
+
+  /** Real check: the DB takes a write lock and reports a known journal mode. Cached 30s so status polling never contends with writers. */
+  private checkSqliteJournalOk(now: number = Date.now()): boolean {
+    if (this.sqliteOkCache && now - this.sqliteOkCache.at < 30_000) return this.sqliteOkCache.ok;
+    const mode = workstationDb.getJournalMode();
+    const ok = workstationDb.isWritable() && mode !== 'error' && mode !== 'unknown' && mode.toLowerCase() !== 'off';
+    this.sqliteOkCache = { at: now, ok };
+    return ok;
+  }
+
   public cleanup() {
+    if (this.reconcileRetryTimer) {
+      clearTimeout(this.reconcileRetryTimer);
+      this.reconcileRetryTimer = null;
+    }
     if (this.autoTpSlInterval) {
       clearInterval(this.autoTpSlInterval);
       this.autoTpSlInterval = null;

@@ -1,3 +1,4 @@
+import { PillState, readPillState, signedUsd, pillTone } from '../utils/pnlPill';
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Activity,
@@ -9,7 +10,6 @@ import {
   Sparkles,
   CheckCircle2,
   ShieldAlert,
-  Server,
   KeyRound,
   Lock,
   Coins,
@@ -24,6 +24,7 @@ import {
 import { PerformanceKPIs } from '../types';
 import { hftAudio } from '../utils/audio';
 import { authFetch } from '../services/engineClient';
+import { AutoHeaderBadge } from './AutoPanel';
 
 interface HeaderProps {
   kpis: PerformanceKPIs;
@@ -32,7 +33,6 @@ interface HeaderProps {
   onOpenDeployModal: () => void;
   onOpenAiDiagnostics: () => void;
   onOpenUnitTests: () => void;
-  onOpenGatewayModal: () => void;
   onOpenEngineConsole: () => void;
   onOpenMemecoinSniper?: () => void;
   onOpenRealismModal?: () => void;
@@ -57,7 +57,6 @@ export const Header: React.FC<HeaderProps> = ({
   onOpenDeployModal,
   onOpenAiDiagnostics,
   onOpenUnitTests,
-  onOpenGatewayModal,
   onOpenEngineConsole,
   onOpenMemecoinSniper,
   onOpenRealismModal,
@@ -79,11 +78,7 @@ export const Header: React.FC<HeaderProps> = ({
   const toolsMenuRef = useRef<HTMLDivElement | null>(null);
 
   // Live Auto-Profit Ticker State (fetched from walletTrader) - Clean initial state (B22)
-  const [profitSummary, setProfitSummary] = useState<{
-    totalPnLUsd: number;
-    totalPnLPct: number;
-    activeCount: number;
-  }>({ totalPnLUsd: 0.0, totalPnLPct: 0.0, activeCount: 0 });
+  const [profitSummary, setProfitSummary] = useState<PillState | null>(null);
 
   useEffect(() => {
     const fetchProfit = async () => {
@@ -91,13 +86,7 @@ export const Header: React.FC<HeaderProps> = ({
         const res = await authFetch('/api/wallet/state');
         if (res.ok) {
           const json = await res.json();
-          if (json.data) {
-            setProfitSummary({
-              totalPnLUsd: Number(json.data.totalPnLUsd || 0),
-              totalPnLPct: Number(json.data.totalPnLPct || 0),
-              activeCount: Number(json.data.activePositionsCount || 0),
-            });
-          }
+          setProfitSummary(readPillState(json.data));
         }
       } catch {}
     };
@@ -162,48 +151,11 @@ export const Header: React.FC<HeaderProps> = ({
               APEX QUANT
             </span>
 
-            {/* LIVE FEED SELECTOR */}
-            <div className="flex items-center space-x-1.5 px-2 py-0.5 rounded bg-[#0D131F] border border-[#1E293B]">
-              <span className="relative flex h-2 w-2">
-                <span
-                  className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
-                    isHalted ? 'bg-red-500' : 'bg-[#00E676]'
-                  }`}
-                />
-                <span
-                  className={`relative inline-flex rounded-full h-2 w-2 ${
-                    isHalted ? 'bg-red-500' : 'bg-[#00E676]'
-                  }`}
-                />
-              </span>
-              <select
-                aria-label="Active Exchange Feed"
-                value={activeFeed}
-                onChange={(e) => onSelectFeed(e.target.value)}
-                className="bg-transparent text-[10px] sm:text-[11px] font-mono font-bold text-cyan-400 outline-none cursor-pointer"
-              >
-                <option value="CME_AURORA" className="bg-[#0D131F] text-white">
-                  CME AURORA (0.42ms)
-                </option>
-                <option value="EQUINIX_NY4" className="bg-[#0D131F] text-white">
-                  EQUINIX NY4 (0.68ms)
-                </option>
-                <option value="BINANCE_CROSS" className="bg-[#0D131F] text-white">
-                  BINANCE SPOT (L2)
-                </option>
-                <option value="TOKYO_TY3" className="bg-[#0D131F] text-white">
-                  TOKYO TY3 (1.12ms)
-                </option>
-              </select>
-            </div>
+            {/* H3: the auto-snipe mode replaces the exchange selector */}
+            <AutoHeaderBadge />
           </div>
 
           <div className="hidden lg:flex items-center space-x-2 text-[10px] text-slate-400 font-mono mt-0.5">
-            <span className="text-emerald-400 flex items-center space-x-1">
-              <Server className="w-2.5 h-2.5 inline mr-1 text-emerald-400" />
-              Direct Kernel Bypass • PTP 1588v2
-            </span>
-            <span className="text-slate-500">|</span>
             <span className="text-slate-400 font-semibold">{timeString}</span>
           </div>
         </div>
@@ -238,8 +190,8 @@ export const Header: React.FC<HeaderProps> = ({
           title="Open Telegram Memecoin Feed Tracker & Pump.fun Hot Callouts"
         >
           <Radio className="w-3.5 h-3.5 text-rose-400 animate-pulse" />
-          <span className="hidden sm:inline">Telegram</span> Tracker
-          <span className="text-[9px] px-1.5 py-0.2 rounded bg-rose-500/20 text-rose-300 font-black border border-rose-500/30">
+          <span><span className="hidden sm:inline">Telegram </span>Tracker</span>
+          <span className="hidden min-[1536px]:inline text-[9px] px-1.5 py-0.2 rounded bg-rose-500/20 text-rose-300 font-black border border-rose-500/30">
             HOT 🔥
           </span>
         </button>
@@ -257,9 +209,6 @@ export const Header: React.FC<HeaderProps> = ({
         >
           <Zap className="w-3.5 h-3.5 text-amber-400" />
           <span>Plug & Play</span>
-          <span className="text-[9px] px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 font-black border border-emerald-500/30">
-            LIVE ⚡
-          </span>
         </button>
       </nav>
 
@@ -286,24 +235,24 @@ export const Header: React.FC<HeaderProps> = ({
           </button>
         )}
 
-        {/* Live Auto-Profit Pill (Clickable directly to Plug & Play Console) */}
+        {/* Q35: today's realized and the open positions' marked P&L, as the server reports them (a dash when it cannot say) */}
         <button
           id="btn-auto-profit-ticker"
           onClick={() => handleNavClick('PLUG_AND_PLAY')}
-          title="Real-Time Autonomous Profit Generator Active. Click to view live wallet positions and take profits."
-          className="hidden md:flex items-center space-x-1.5 px-2.5 py-1 rounded-lg bg-emerald-950/70 hover:bg-emerald-900/70 border border-emerald-500/40 text-[11px] font-mono text-emerald-300 transition shadow-sm shadow-emerald-500/15 group"
+          title="Realized profit today (net of fees) and the marked profit of the open positions, from the server. Click for the wallet positions."
+          className={`hidden min-[1500px]:flex items-center space-x-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-mono transition ${
+            { up: 'bg-emerald-950/70 border-emerald-500/40 text-emerald-300', down: 'bg-rose-950/70 border-rose-500/40 text-rose-300', flat: 'bg-slate-900 border-slate-700 text-slate-300', unknown: 'bg-slate-900 border-slate-700 text-slate-500' }[pillTone(profitSummary)]
+          }`}
         >
-          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping inline-block" />
-          <span className="font-bold tracking-tight text-emerald-200">
-            +${profitSummary.totalPnLUsd.toFixed(2)}
-          </span>
-          <span className="text-[10px] text-emerald-400/80">
-            (+{profitSummary.totalPnLPct.toFixed(1)}%)
-          </span>
+          <span className="text-[10px] opacity-70">today</span>
+          <span className="font-bold tracking-tight">{signedUsd(profitSummary?.realizedUsd)}</span>
+          <span className="text-[10px] opacity-70">open</span>
+          <span className="font-bold tracking-tight">{signedUsd(profitSummary?.unrealizedUsd)}</span>
+          <span className="text-[10px] opacity-70">({profitSummary?.openCount ?? '—'})</span>
         </button>
 
         {/* Direct Quant Tools (Expanded on 2XL screens) */}
-        <div className="hidden 2xl:flex items-center space-x-1.5">
+        <div className="hidden min-[1700px]:flex items-center space-x-1.5">
           <button
             id="btn-engine-console"
             onClick={onOpenEngineConsole}
@@ -329,16 +278,16 @@ export const Header: React.FC<HeaderProps> = ({
           <button
             id="btn-unit-tests"
             onClick={onOpenUnitTests}
-            title="700 High-Stakes Financial Unit Tests"
+            title="700 self-contained illustrative checks on toy numbers (not the repo test suite)"
             className="px-2 py-1 rounded-lg bg-[#141B2D] hover:bg-[#1E293B] border border-emerald-500/30 text-[11px] font-mono text-emerald-300 hover:text-white transition flex items-center space-x-1"
           >
             <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-            <span>700 Tests</span>
+            <span>700 Checks</span>
           </button>
         </div>
 
         {/* Quant Tools Dropdown Menu (Guarantees clean layout on all screens < 1536px) */}
-        <div className="relative 2xl:hidden" ref={toolsMenuRef}>
+        <div className="relative min-[1700px]:hidden" ref={toolsMenuRef}>
           <button
             id="btn-quant-tools-dropdown"
             onClick={() => setIsToolsOpen(!isToolsOpen)}
@@ -365,20 +314,6 @@ export const Header: React.FC<HeaderProps> = ({
                     <span>Core Engine</span>
                   </span>
                   <span className="text-[9px] px-1 rounded bg-emerald-500/20 text-emerald-300">ASYNC</span>
-                </button>
-
-                <button
-                  onClick={() => {
-                    onOpenGatewayModal();
-                    setIsToolsOpen(false);
-                  }}
-                  className="w-full text-left px-3 py-2 hover:bg-[#1A263D] flex items-center justify-between text-amber-300"
-                >
-                  <span className="flex items-center space-x-2">
-                    <KeyRound className="w-3.5 h-3.5" />
-                    <span>DMA Gateway & Risk</span>
-                  </span>
-                  <span className="text-[9px] px-1 rounded bg-amber-500/20 text-amber-300">DMA</span>
                 </button>
 
                 {onOpenBacktestModal && (
@@ -408,9 +343,9 @@ export const Header: React.FC<HeaderProps> = ({
                 >
                   <span className="flex items-center space-x-2">
                     <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>700 Unit Tests</span>
+                    <span>700 Self-Checks</span>
                   </span>
-                  <span className="text-[9px] px-1 rounded bg-emerald-500/20 text-emerald-300">LIVE</span>
+                  <span className="text-[9px] px-1 rounded bg-amber-500/20 text-amber-300">TOY MATH</span>
                 </button>
 
                 <button
@@ -436,7 +371,7 @@ export const Header: React.FC<HeaderProps> = ({
                       <Globe className="w-3.5 h-3.5 text-slate-400" />
                       <span>Co-Loc Realism</span>
                     </span>
-                    <span className="text-[9px] text-cyan-400">1.15ms</span>
+                    <span className="text-[9px] text-amber-300">ASSUMED</span>
                   </button>
                 )}
 
@@ -479,7 +414,7 @@ export const Header: React.FC<HeaderProps> = ({
             }
           >
             <Lock className="w-3 h-3" />
-            <span className="hidden sm:inline">{isOperatorAuthenticated ? 'AUTH' : 'LOG IN'}</span>
+            <span className="hidden min-[1440px]:inline">{isOperatorAuthenticated ? 'AUTH' : 'LOG IN'}</span>
           </button>
         )}
 
@@ -522,7 +457,7 @@ export const Header: React.FC<HeaderProps> = ({
               ? 'bg-emerald-500/15 hover:bg-emerald-500/25 border-emerald-500/50 text-emerald-400 shadow-lg shadow-emerald-500/15'
               : 'bg-red-500/15 hover:bg-red-500/25 border-red-500/50 text-red-400 shadow-lg shadow-red-500/15 animate-pulse'
           }`}
-          title="EMERGENCY CIRCUIT BREAKER - Immediately freeze all trading loops and open orders"
+          title="KILL SWITCH - the server refuses new orders and disarms LIVE trading. Open positions are not sold; protective exits keep running."
         >
           {isHalted ? (
             <>

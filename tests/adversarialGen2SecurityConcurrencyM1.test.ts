@@ -91,7 +91,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
         slippageBps: 800,
         protocolFeeLamports: 100_000,
         creatorFeeLamports: 0,
-        expectedJitoTipLamports: 1_000_000,
+        expectedJitoTipLamports: 100_000, // C7b: 10% per side would trip the 20% round-trip cost floor
         expectedPriorityFeeLamports: 25_000,
         estimatedPriceImpactBps: 50,
         marketDataSource: 'ON_CHAIN',
@@ -138,6 +138,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       );
 
       const req: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'LEAK1',
         name: 'Leak Probe 1',
@@ -166,6 +167,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       );
 
       const req: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'LEAK2',
         name: 'Leak Probe 2',
@@ -195,6 +197,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       );
 
       const req: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'LEAK3',
         name: 'Leak Probe 3',
@@ -224,6 +227,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       );
 
       const req: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'LEAK4',
         name: 'Leak Probe 4',
@@ -260,6 +264,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       );
 
       const req: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'LEAK5',
         name: 'Leak Probe 5',
@@ -288,6 +293,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       for (let i = 0; i < burstSize; i++) {
         promises.push(
           coordinator.executeTrade({
+            signalTimestamp: Date.now(),
             mint: testMintStr,
             symbol: `BURST_${i}`,
             name: `Burst Token ${i}`,
@@ -559,6 +565,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       const actualMint = testMintStr;
 
       const tradeReq: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: actualMint,
         symbol: 'MISMATCH',
         name: 'Mismatch Token',
@@ -590,6 +597,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       const lowercasedMint = 'czLSujWBLFsSjncfkh59rQD4NJYsZUMffEFrNJfiBAGS';
 
       const tradeReq: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'CASE',
         name: 'Case Test Token',
@@ -622,6 +630,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       const signSpy = vi.spyOn(localSigner, 'signTransaction');
 
       const tradeReq: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'NOPROCEED',
         name: 'No Proceed Token',
@@ -755,6 +764,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       );
 
       const tradeReq: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'LIVE_FAIL',
         name: 'Live Fail Token',
@@ -803,6 +813,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       };
 
       const tradeReq: ExecuteTradeRequest = {
+        signalTimestamp: Date.now(),
         mint: testMintStr,
         symbol: 'SPOOF_DEV',
         name: 'Spoofed Dev Token',
@@ -1056,6 +1067,8 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
         value: { amount: '500000000000', decimals: 6, uiAmount: 500000 },
       } as any);
 
+      // No wallet token balances to find; the scan itself is covered in p3b. (Without this stub it hit the real network.)
+      vi.spyOn(Connection.prototype, 'getParsedTokenAccountsByOwner').mockResolvedValue({ context: { slot: 280005000 }, value: [] } as any);
       const reconResult = await coordinator.startupReconciliation();
 
       // Transaction must now be marked RECONCILED
@@ -1153,6 +1166,8 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
         value: { amount: '500000000000', decimals: 6, uiAmount: 500000 },
       } as any);
 
+      // No wallet token balances to find; the scan itself is covered in p3b. (Without this stub it hit the real network.)
+      vi.spyOn(Connection.prototype, 'getParsedTokenAccountsByOwner').mockResolvedValue({ context: { slot: 280005000 }, value: [] } as any);
       const reconResult = await coordinator.startupReconciliation();
 
       const savedTx = workstationDb.loadTransactions().find((t) => t.signature === partSellSig);
@@ -1287,7 +1302,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       expect(phantomPos).toBeUndefined();
     });
 
-    it('5.6: flags RECONCILIATION_MISMATCH when database records active position but on-chain balance is 0', async () => {
+    it('5.6: closes a position the database records as active when its on-chain balance is 0, and says why', async () => {
       const ghostPosId = `ghost_pos_${Date.now()}`;
       const ghostPos: NormalizedPosition = {
         id: ghostPosId,
@@ -1325,12 +1340,14 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
 
       const res = await coordinator.startupReconciliation();
 
-      expect(res.status).toBe('RECONCILIATION_MISMATCH');
-      expect(res.mismatchesCount).toBeGreaterThanOrEqual(1);
-      expect(res.details).toContain('on-chain balance is 0');
+      // N5: a confirmed zero balance used to hold readiness at MISMATCH until the DB was edited by hand; the position is now closed with
+      // the reason recorded (tests/n5_startup_reconcile.test.ts covers the readiness side).
+      expect(res.details).toContain('had no on-chain balance');
 
-      const updatedGhost = workstationDb.loadPositions('LIVE', 'OPEN').find((p) => p.id === ghostPosId);
-      expect(updatedGhost?.exitReason).toContain('RECONCILIATION_MISMATCH');
+      expect(workstationDb.loadPositions('LIVE', 'OPEN').find((p) => p.id === ghostPosId)).toBeUndefined();
+      const updatedGhost = workstationDb.loadPositions('LIVE').find((p) => p.id === ghostPosId);
+      expect(updatedGhost?.status).toBe('CLOSED');
+      expect(updatedGhost?.exitReason).toContain('RECONCILED_ZERO_BALANCE');
     });
   });
 });

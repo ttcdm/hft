@@ -229,7 +229,7 @@ describe('Empirical Adversarial Challenger Suite: Protocol & Execution Correctne
       expect(check.landed).toBe(true);
     });
 
-    it('1.6: mid-flight landed detection discovers on-chain SOL balance decrease (>100k lamports) and suppresses duplicate execution', async () => {
+    it('1.6: a wallet SOL decrease alone is NOT treated as proof the tx landed (K4 #5: a concurrent buy of another mint looks the same)', async () => {
       const owner = Keypair.generate().publicKey;
       const mintPubkey = VALID_PUMP_MINT_1;
 
@@ -259,7 +259,8 @@ describe('Empirical Adversarial Challenger Suite: Protocol & Execution Correctne
         'BUY'
       );
 
-      expect(check.landed).toBe(true);
+      // Before K4b this returned landed:true from the 0.02 SOL drop alone. Resending the same signed tx cannot double-fill, so unsure means not landed.
+      expect(check.landed).toBe(false);
     });
 
     it('1.7: submitAndConfirmWithRetry suppresses RPC fallback when pre-fallback check detects landed Jito transaction', async () => {

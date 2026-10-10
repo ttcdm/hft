@@ -1,3 +1,7 @@
+import { signalFeedBadge } from '../utils/signalBadge';
+import { probeBadge, probeLatency, hostOfService } from '../utils/probeBadge';
+import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
+import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
 import React, { useState, useEffect } from 'react';
 import {
   Send,
@@ -108,6 +112,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const [telegramTestResult, setTelegramTestResult] = useState<any | null>(null);
   const [sendPingMsg, setSendPingMsg] = useState(false);
   const [isTestingDiagnostics, setIsTestingDiagnostics] = useState(false);
+  const tradingMode = useTradingMode();
   const [diagnosticsResult, setDiagnosticsResult] = useState<any | null>(null);
   const [showDiagnosticsModal, setShowDiagnosticsModal] = useState(false);
 
@@ -235,15 +240,18 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
   // Snipe a specific signal
   const handleSnipeSignal = async (sig: SocialSignal) => {
-    hftAudio.playOrderFill();
     const amount = capitalTier === 'MICRO_10' ? 5.0 : 25.0;
-    const res = await engineClient.snipeSocialSignal(sig.id, amount, sniperConfig.jitoTipSol, sniperConfig.maxSlippagePct);
+    // Q10b: while LIVE is armed this click sends a real transaction; say so and ask first
+    const warning = liveClickWarning(tradingMode, `Sniping ${sig.tokenTicker} for $${amount.toFixed(2)}`);
+    if (warning && !window.confirm(warning)) return;
+    hftAudio.playOrderFill();
+    const res = await engineClient.snipeSocialSignal(sig.id, amount, sniperConfig.jitoTipSol, sniperConfig.maxSlippagePct, tradingMode.live);
     
     if (res?.tradeResult?.success) {
       onAlertTrigger?.(
         'INFO',
         `SNIPED ${sig.tokenTicker}`,
-        `Executed $${amount.toFixed(2)} on ${sig.chain} via Jito Bundle. CA: ${sig.contractAddress.slice(0, 10)}...`
+        `${/^PAPER/i.test(String(res.tradeResult.txHash ?? '')) ? 'Paper fill' : 'Sent'} for $${amount.toFixed(2)} on ${sig.chain}${res.tradeResult.txHash ? ` (${String(res.tradeResult.txHash).slice(0, 14)}...)` : ''}. CA: ${sig.contractAddress.slice(0, 10)}...`
       );
       // Update signal status locally
       setSignals((prev) =>
@@ -270,6 +278,9 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
         res.result.message
       );
       refreshData();
+    } else {
+      // R29: a refused close used to vanish silently
+      onAlertTrigger?.('WARNING', 'CLOSE NOT DONE', res?.result?.message || res?.error || 'The server did not close the position.');
     }
   };
 
@@ -557,7 +568,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
               <div className="grid grid-cols-1 gap-3">
                 {signals.map((sig, sIdx) => {
                   const isTelegram = sig.source === 'TELEGRAM';
-                  const isHighConf = sig.confidenceScore >= 90;
+                  const isHighConf = sig.confidenceScore !== null && sig.confidenceScore >= 90;
 
                   return (
                     <div
@@ -604,7 +615,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                 : 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
                             }`}
                           >
-                            Confidence: {sig.confidenceScore}%
+                            Confidence: {sig.confidenceScore === null ? 'not scored' : `${sig.confidenceScore}%`}
                           </span>
                         </div>
                       </div>
@@ -724,11 +735,14 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                             )}
 
                             {/* Live Ingestion Indicator */}
-                            {sig.isLiveFeed && (
+                            {signalFeedBadge(sig) === 'LIVE' && (
                               <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 flex items-center space-x-1">
                                 <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
                                 <span>LIVE</span>
                               </span>
+                            )}
+                            {signalFeedBadge(sig) === 'SYNTHETIC' && (
+                              <span data-testid="synthetic-badge" className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-amber-500/15 text-amber-300 border border-amber-500/30">SYNTHETIC</span>
                             )}
                           </div>
                         </div>
@@ -746,7 +760,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                               className="px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs shadow-md shadow-emerald-950/40 flex items-center space-x-1.5 transition active:scale-95"
                             >
                               <Zap className="w-3.5 h-3.5" />
-                              <span>Snipe with {capitalTier === 'MICRO_10' ? '$5 Micro' : '$25'}</span>
+                              <span>Snipe with {capitalTier === 'MICRO_10' ? '$5 Micro' : '$25'} ({tradingMode.label})</span>
                             </button>
                           )}
                         </div>
@@ -814,7 +828,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                   <tbody className="divide-y divide-[#172033]">
                     {filteredPools.map((pool, pIdx) => {
                       const isPositive = pool.priceChange5mPct >= 0;
-                      const hasBonding = pool.bondingCurveProgress !== undefined && pool.bondingCurveProgress < 100;
+                      const hasBonding = !pool.isMigrated && pool.bondingCurveProgress !== undefined && pool.bondingCurveProgress < 100;
 
                       return (
                         <tr key={`pool-${pool.id}-${pool.contractAddress || ''}-${pIdx}`} className="hover:bg-[#12192C] transition">
@@ -894,9 +908,13 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                 </div>
                               </div>
                             ) : (
-                              <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                                🎓 Raydium Migrated
-                              </span>
+                              pool.isMigrated || (pool.bondingCurveProgress ?? 0) >= 100 ? (
+                                <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                                  🎓 Raydium Migrated
+                                </span>
+                              ) : (
+                                <span className="text-slate-500 text-[10px]">curve progress unknown</span>
+                              )
                             )}
                           </td>
 
@@ -917,16 +935,17 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                           {/* RugCheck Security */}
                           <td className="p-3">
                             <div className="space-y-0.5 text-[10px]">
-                              <div className="flex items-center space-x-1 text-emerald-400">
-                                <CheckCircle2 className="w-3 h-3" />
-                                <span>Mint Revoked</span>
-                              </div>
-                              <div className="flex items-center space-x-1 text-emerald-400">
-                                <CheckCircle2 className="w-3 h-3" />
-                                <span>Freeze Revoked</span>
-                              </div>
+                              {([['Mint', pool.authoritiesVerified === false ? null : pool.isMintRevoked], ['Freeze', pool.authoritiesVerified === false ? null : pool.isFreezeRevoked]] as const).map(([kind, v]) => {
+                                const b = authorityBadge(kind, v);
+                                return (
+                                  <div key={kind} className={`flex items-center space-x-1 ${authorityTone[b.tone]}`}>
+                                    <CheckCircle2 className="w-3 h-3" />
+                                    <span>{b.text}</span>
+                                  </div>
+                                );
+                              })}
                               <div className="text-slate-400">
-                                Top 10: <strong className="text-slate-200">{pool.top10HoldersPct}%</strong>
+                                Top 10: <strong className="text-slate-200">{holderPct(pool.top10HoldersPct)}</strong>
                               </div>
                             </div>
                           </td>
@@ -942,18 +961,18 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                   authorHandle: pool.platform,
                                   authorDisplayName: pool.name,
                                   authorTier: 'MARKET_MAKER_BOT',
-                                  verified: true,
+                                  verified: false,
                                   timestamp: Date.now(),
                                   timeStr: 'Now',
-                                  rawText: `Direct Snipe on ${pool.platform}`,
+                                  rawText: `Manual snipe of ${pool.symbol} from the ${pool.platform} pool list (operator-initiated, no signal scoring)`,
                                   tokenTicker: `$${pool.symbol}`,
                                   tokenName: pool.name,
                                   contractAddress: pool.contractAddress,
                                   chain: pool.chain,
                                   signalPattern: 'STEALTH_ACCUMULATION',
-                                  confidenceScore: 92,
-                                  sentimentScore: 0.85,
-                                  actionSuggested: 'SNIPE_IMMEDIATE',
+                                  confidenceScore: null,
+                                  sentimentScore: null,
+                                  actionSuggested: 'REVIEW',
                                   status: 'NEW',
                                   metrics: {},
                                 });
@@ -1557,14 +1576,14 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                             : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
                         }`}
                       >
-                        {diagnosticsResult.connections.xTwitter?.testResult?.reachable ? 'REACHABLE • 200 OK' : 'PENDING'}
+                        {probeBadge(diagnosticsResult.connections.xTwitter?.testResult, 'REACHABLE').text}
                       </span>
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Endpoint: <code className="text-slate-300">https://api.twitter.com</code>
                     </div>
                     <div className="text-[11px] text-slate-300">
-                      Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.xTwitter?.testResult?.latencyMs || 65}ms</strong> | Mode: {diagnosticsResult.connections.xTwitter?.testResult?.bearerAuthorized ? 'AUTHENTICATED' : 'LIVE METADATA FEED'}
+                      Latency: <strong className="text-cyan-400">{probeLatency(diagnosticsResult.connections.xTwitter?.testResult?.latencyMs)}</strong> | Mode: {diagnosticsResult.connections.xTwitter?.testResult?.bearerAuthorized ? 'AUTHENTICATED' : 'LIVE METADATA FEED'}
                     </div>
                     <p className="text-slate-400 text-[10px] border-t border-slate-800 pt-1">
                       {diagnosticsResult.connections.xTwitter?.testResult?.diagnosis ||
@@ -1579,9 +1598,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <Flame className="w-3.5 h-3.5 text-emerald-400" />
                         <span>Pump.fun Live Coin Stream</span>
                       </span>
-                      <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                        200 OK • LIVE
-                      </span>
+                      {(() => { const b = probeBadge(diagnosticsResult.connections.pumpFun.testResult, 'REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${b.ok ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'}`}>{b.text}</span>); })()}
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Endpoint: <code className="text-slate-300">frontend-api-v3.pump.fun/coins</code>
@@ -1601,9 +1618,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <TrendingUp className="w-3.5 h-3.5 text-cyan-400" />
                         <span>DexScreener Boosted Feed</span>
                       </span>
-                      <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                        200 OK • LIVE
-                      </span>
+                      {(() => { const b = probeBadge(diagnosticsResult.connections.dexScreener.testResult, 'REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${b.ok ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'}`}>{b.text}</span>); })()}
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Endpoint: <code className="text-slate-300">api.dexscreener.com/token-boosts</code>
@@ -1623,12 +1638,10 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <Server className="w-3.5 h-3.5 text-purple-400" />
                         <span>Solana Validator JSON-RPC</span>
                       </span>
-                      <span className="px-2 py-0.5 rounded text-[10px] bg-emerald-500/20 text-emerald-300 border border-emerald-500/40">
-                        HEALTH OK • LIVE
-                      </span>
+                      {(() => { const b = probeBadge(diagnosticsResult.connections.solanaRpc.testResult, 'RPC REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${b.ok ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'}`}>{b.text}</span>); })()}
                     </div>
                     <div className="text-slate-400 text-[11px]">
-                      Endpoint: <code className="text-slate-300">api.mainnet-beta.solana.com</code>
+                      Endpoint: <code className="text-slate-300">{hostOfService(diagnosticsResult.connections.solanaRpc.service)}</code>{diagnosticsResult.cluster ? <span className="ml-2 text-amber-300">cluster: {diagnosticsResult.cluster}</span> : null}
                     </div>
                     <div className="text-[11px] text-slate-300">
                       Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.solanaRpc.testResult.latencyMs}ms</strong> | Cluster Slot: #{diagnosticsResult.connections.solanaRpc.testResult.slot}
@@ -1718,7 +1731,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
             <div className="p-3 border-t border-[#1E293B] bg-[#0E1424] flex items-center justify-between">
               <div className="text-[11px] text-slate-400 flex items-center space-x-1.5">
                 <Info className="w-3.5 h-3.5 text-cyan-400" />
-                <span>Zero real capital at risk during paper trading. All market telemetry is 100% production live.</span>
+                <span>Paper trades risk no real capital. The status above is from the probe that just ran; a trade is only as live as the mode shown in the header.</span>
               </div>
               <div className="flex items-center space-x-2">
                 <button

@@ -1,5 +1,4 @@
-import dotenv from 'dotenv';
-dotenv.config();
+import './server/loadEnv'; // must stay the FIRST import: singletons built at import time read process.env
 import './suppress-warnings.cjs';
 import express from 'express';
 import cors from 'cors';
@@ -9,6 +8,7 @@ import crypto from 'crypto';
 import http from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer, createLogger } from 'vite';
+import { secretPathGuard, viteDevServerOptions } from './server/security/secretPaths';
 import { GoogleGenAI } from '@google/genai';
 import { hftEngine } from './server/engine/engine';
 import { socialScanner } from './server/socialScanner';
@@ -16,18 +16,33 @@ import { memecoinAggregator } from './server/memecoinAggregator';
 import { realismEngine } from './server/realismEngine';
 import { pumpFunService } from './server/pumpfunService';
 import { pumpFeedListener } from './server/solana/pumpFeedListener';
+import { autoSnipeController } from './server/auto/controller';
+import { watchWindow } from './server/signals/watchWindow';
+import { FunderLookup, wireFunderLookup } from './server/signals/funderLookup';
+import { buildBoard } from './server/board';
+import { PublicKey } from '@solana/web3.js';
+import { solPriceService } from './server/market/solPriceService';
+import { PumpCurveService } from './server/solana/pumpCurve';
+import { buildCurveDepth } from './server/market/curveDepth';
+import { TradeTape } from './server/market/tradeTape';
 import { runComprehensiveTestSuite } from './server/unitTestCases';
-import { run60DayBacktest } from './src/utils/backtestEngine';
+import { registerMarketRoutes } from './server/market/marketRoutes';
 import { walletTrader } from './server/walletTrader';
-import { resolveRpcUrl } from './server/solana/clusterGuard';
+import { resolveRpcUrl, allowedCluster } from './server/solana/clusterGuard';
+import { liveConfirmationRefusal } from './server/execution/liveConfirmation';
 import {
   ArmSchema,
+  AutoModeSchema,
+  AutoKillSchema,
+  AutoResumeSchema,
   CalloutSnipeSchema,
+  AutoSnipeRulesSchema,
   OPERATOR_PROVENANCE,
   OperatorCloseSchema,
   OperatorExecuteTradeSchema,
   OperatorSnipeSchema,
   SignalSnipeSchema,
+  KillSwitchSchema,
   SniperConfigPatchSchema,
   ToggleCallerSchema,
   validateTradeBody,
@@ -63,9 +78,10 @@ import {
   ClosePositionSchema,
 } from './server/middleware/enterprise';
 
-dotenv.config();
 
 const app = express();
+// Defense in depth with the normalized auth gate: `/API/...` must not reach a route at all.
+app.set('case sensitive routing', true);
 // Nginx/Cloud Run listens on 8080 in container; internal Node/Vite applet must listen on port 3000
 const PORT = parseInt(
   process.env.APP_PORT || (process.env.PORT && process.env.PORT !== '8080' ? process.env.PORT : '3000'),
@@ -263,7 +279,7 @@ wss.on('connection', (ws: WebSocket, req: any) => {
       if (parsed.action === 'SNIPE_MEMECOIN') {
         const input = validateTradeInput(OperatorSnipeSchema, parsed);
         if (input.status === 'invalid') return rejectWsInput(input.issues);
-        const result = await memecoinAggregator.executeSnipe({ ...input.data, provenance: OPERATOR_PROVENANCE });
+        const result = await memecoinAggregator.executeSnipe({ ...input.data, provenance: OPERATOR_PROVENANCE, signalTimestamp: Date.now() });
         ws.send(JSON.stringify({ type: 'MEMECOIN_SNIPE_RESULT', data: result }));
       }
       if (parsed.action === 'CLOSE_POSITION') {
@@ -297,6 +313,18 @@ pumpFunService.on('callouts_updated', (data) => {
 pumpFunService.on('callout_sniped', (data) => {
   broadcastWs({ type: 'CALLOUT_SNIPED', data });
 });
+
+// G2: watch window. Create events start a watch, decoded TradeEvents feed it. A release is information for the board;
+// it does not trade (the auto controller's own gates still decide).
+watchWindow.setScoreFn((mint) => {
+  const pool = memecoinAggregator.getPools().find((p) => p.contractAddress === mint);
+  return pool ? memecoinAggregator.evaluateTokenConfluence(pool).score : null;
+});
+watchWindow.attach(pumpFeedListener);
+wireFunderLookup(watchWindow, new FunderLookup(() => executionCoordinator.getConnection())); // Q6b
+watchWindow.on('release', (r) => broadcastWs({ type: 'WATCH_RELEASE', data: r }));
+watchWindow.start();
+autoSnipeController.attachWatchWindow(); // Q6f: HOT and READY releases are the auto candidates
 
 // Broadcast real-time Pump.fun V2 WebSocket CreateEvents (B08)
 pumpFeedListener.on('create_event', (data) => {
@@ -359,7 +387,7 @@ app.use(cors(corsPolicy));
 
 app.use(express.json());
 app.get('/favicon.ico', (req, res) => res.status(204).end());
-app.use('/api', rateLimiter({ maxTokens: 120, refillRatePerSec: 30 }));
+app.use('/api', rateLimiter({ maxTokens: Number(process.env.APEX_RATE_LIMIT_BURST) || 120, refillRatePerSec: 30 }));
 // A1: deny-by-default. Only GET /api/health and POST /api/auth/login are reachable without an operator token.
 app.use(apiAuthGate);
 
@@ -462,442 +490,8 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// 2. Real API Latency Testing Under Synthetic & Real Conditions
-app.post('/api/latency-probe', async (req, res) => {
-  const { target, samples = 5, injectedJitterMs = 0, packetLossRate = 0 } = req.body;
-  
-  const endpoints: Record<string, string> = {
-    cme: 'https://www.cmegroup.com',
-    binance: 'https://api.binance.com/api/v3/ping',
-    coinbase: 'https://api.exchange.coinbase.com/time',
-    kraken: 'https://api.kraken.com/0/public/Time',
-    nyse: 'https://www.nyse.com',
-  };
-
-  const url = endpoints[target] || endpoints.binance;
-  const pings: number[] = [];
-  let dropped = 0;
-
-  for (let i = 0; i < Math.min(samples, 10); i++) {
-    // Check synthetic packet drop
-    if (Math.random() * 100 < packetLossRate) {
-      dropped++;
-      continue;
-    }
-
-    const start = performance.now();
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 3500);
-      await fetch(url, { signal: controller.signal, method: 'HEAD', cache: 'no-store' }).catch(() => {});
-      clearTimeout(timeoutId);
-      const end = performance.now();
-      
-      // Calculate effective latency with synthetic jitter
-      const jitter = (Math.random() - 0.5) * injectedJitterMs;
-      const effectiveLatency = Math.max(0.18, (end - start) * 0.15 + jitter); // Scale to co-located speed
-      pings.push(Number(effectiveLatency.toFixed(3)));
-    } catch {
-      dropped++;
-    }
-  }
-
-  // Calculate p50, p90, p99
-  const sorted = [...pings].sort((a, b) => a - b);
-  const p50 = sorted[Math.floor(sorted.length * 0.5)] || 0.85;
-  const p90 = sorted[Math.floor(sorted.length * 0.9)] || 1.15;
-  const p99 = sorted[sorted.length - 1] || 1.42;
-  const avg = pings.length ? sorted.reduce((a, b) => a + b, 0) / pings.length : 0.88;
-
-  res.json({
-    target,
-    url,
-    totalSent: samples,
-    successfulFills: pings.length,
-    packetLossPct: Number(((dropped / samples) * 100).toFixed(1)),
-    avgLatencyMs: Number(avg.toFixed(3)),
-    p50Ms: Number(p50.toFixed(3)),
-    p90Ms: Number(p90.toFixed(3)),
-    p99Ms: Number(p99.toFixed(3)),
-    samples: pings,
-    timestamp: Date.now(),
-  });
-});
-
-// 3. Real L2 Order Book depth proxy with live exchange integration
-app.get('/api/market/orderbook', async (req, res) => {
-  const symbol = ((req.query.symbol as string) || 'BTCUSDT').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3000);
-    const apiRes = await fetch(`https://api.binance.com/api/v3/depth?symbol=${symbol}&limit=20`, {
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-
-    if (apiRes.ok) {
-      const data = await apiRes.json();
-      const bids = (data.bids || []).map((b: [string, string]) => [parseFloat(b[0]), parseFloat(b[1])]);
-      const asks = (data.asks || []).map((a: [string, string]) => [parseFloat(a[0]), parseFloat(a[1])]);
-
-      const bestBid = bids[0]?.[0] || 0;
-      const bestAsk = asks[0]?.[0] || 0;
-      const mid = bestBid && bestAsk ? (bestBid + bestAsk) / 2 : bestBid || bestAsk;
-      const spread = bestBid && bestAsk ? bestAsk - bestBid : 0.01;
-
-      return res.json({
-        source: 'BINANCE_LIVE_EDGE',
-        symbol,
-        lastUpdateId: data.lastUpdateId,
-        midPrice: mid,
-        spread: Number(spread.toFixed(4)),
-        bids,
-        asks,
-        timestamp: Date.now(),
-      });
-    }
-  } catch {
-    // Fallback if network blocked
-  }
-
-  const basePrice = symbol.includes('ETH') ? 2840.50 : symbol.includes('SOL') ? 142.20 : 68940.00;
-  const bids = Array.from({ length: 10 }, (_, i) => [
-    parseFloat((basePrice - (i + 1) * 0.5).toFixed(2)),
-    parseFloat((0.15 + Math.random() * 1.8).toFixed(3)),
-  ]);
-  const asks = Array.from({ length: 10 }, (_, i) => [
-    parseFloat((basePrice + (i + 1) * 0.5).toFixed(2)),
-    parseFloat((0.15 + Math.random() * 1.8).toFixed(3)),
-  ]);
-
-  res.json({
-    source: 'INTERNAL_FALLBACK_FEED',
-    symbol,
-    lastUpdateId: Date.now(),
-    midPrice: basePrice,
-    spread: 0.5,
-    bids,
-    asks,
-    timestamp: Date.now(),
-  });
-});
-
-// 3b. Real Executed Market Trades from Exchange Public Tape
-app.get('/api/market/trades', async (req, res) => {
-  const symbol = ((req.query.symbol as string) || 'BTCUSDT').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-  const limit = Math.min(parseInt((req.query.limit as string) || '30', 10), 100);
-
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3000);
-    const apiRes = await fetch(`https://api.binance.com/api/v3/trades?symbol=${symbol}&limit=${limit}`, {
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-
-    if (apiRes.ok) {
-      const trades = await apiRes.json();
-      const mapped = trades.map((t: any) => ({
-        id: t.id,
-        price: parseFloat(t.price),
-        size: parseFloat(t.qty),
-        notionalUsd: Number((parseFloat(t.price) * parseFloat(t.qty)).toFixed(2)),
-        timestamp: t.time,
-        isBuyerMaker: t.isBuyerMaker,
-        side: t.isBuyerMaker ? 'SELL' : 'BUY', // if buyer is maker, aggressive taker was seller
-        symbol,
-      }));
-
-      return res.json({
-        source: 'BINANCE_LIVE_TRADES',
-        symbol,
-        count: mapped.length,
-        trades: mapped.reverse(), // most recent first
-      });
-    }
-  } catch {
-    // Fallback if blocked
-  }
-
-  const now = Date.now();
-  const base = symbol.includes('ETH') ? 2840.5 : symbol.includes('SOL') ? 142.2 : 68940.0;
-  const mockTrades = Array.from({ length: 20 }, (_, i) => {
-    const price = base + (Math.random() - 0.5) * 4;
-    const size = Number((0.05 + Math.random() * 1.5).toFixed(3));
-    const isBuyerMaker = Math.random() > 0.5;
-    return {
-      id: 982340000 + i,
-      price: Number(price.toFixed(2)),
-      size,
-      notionalUsd: Number((price * size).toFixed(2)),
-      timestamp: now - i * 350,
-      isBuyerMaker,
-      side: isBuyerMaker ? 'SELL' : 'BUY',
-      symbol,
-    };
-  });
-
-  res.json({
-    source: 'INTERNAL_FALLBACK_TRADES',
-    symbol,
-    count: mockTrades.length,
-    trades: mockTrades,
-  });
-});
-
-// 3c. Real 24-Hour Ticker Statistics
-app.get('/api/market/ticker', async (req, res) => {
-  const symbol = ((req.query.symbol as string) || 'BTCUSDT').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 3000);
-    const apiRes = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`, {
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-
-    if (apiRes.ok) {
-      const data = await apiRes.json();
-      return res.json({
-        symbol,
-        lastPrice: parseFloat(data.lastPrice),
-        priceChange24h: parseFloat(data.priceChange),
-        priceChangePercent24h: parseFloat(data.priceChangePercent),
-        high24h: parseFloat(data.highPrice),
-        low24h: parseFloat(data.lowPrice),
-        volume24h: parseFloat(data.volume),
-        quoteVolume24h: parseFloat(data.quoteVolume),
-        timestamp: data.closeTime,
-      });
-    }
-  } catch {
-    // Fallback
-  }
-
-  res.json({
-    symbol,
-    lastPrice: 68940.0,
-    priceChange24h: 1240.5,
-    priceChangePercent24h: 1.83,
-    high24h: 69420.0,
-    low24h: 67500.0,
-    volume24h: 38240.5,
-    quoteVolume24h: 2635000000,
-    timestamp: Date.now(),
-  });
-});
-
-// 3d. Atomic Exchange Clock Synchronization & RTT Probe
-app.get('/api/exchange/time', async (req, res) => {
-  const tStart = performance.now();
-  try {
-    const apiRes = await fetch('https://api.binance.com/api/v3/time');
-    const tEnd = performance.now();
-    const rtt = tEnd - tStart;
-    if (apiRes.ok) {
-      const data = await apiRes.json();
-      const localTime = Date.now();
-      const serverTime = data.serverTime;
-      const clockDriftMs = localTime - (serverTime + rtt / 2);
-      return res.json({
-        status: 'SYNCED',
-        exchangeServerTime: serverTime,
-        localSystemTime: localTime,
-        rttMs: Number(rtt.toFixed(2)),
-        clockDriftMs: Number(clockDriftMs.toFixed(2)),
-        ntpAccuracy: 'HTTP RTT Binance Server-Time Estimation',
-      });
-    }
-  } catch {
-    // Fallback
-  }
-  res.json({
-    status: 'LOCAL_SYNC',
-    exchangeServerTime: Date.now(),
-    localSystemTime: Date.now(),
-    rttMs: 0.85,
-    clockDriftMs: 0,
-    ntpAccuracy: 'Local System Clock (Fallback)',
-  });
-});
-
-// 3e. In-Memory Store for Real-Flow Active Paper Orders
-interface StoredOrder {
-  orderId: string;
-  symbol: string;
-  side: 'BUY' | 'SELL';
-  type: 'LIMIT' | 'MARKET';
-  price: number;
-  quantity: number;
-  executedQty: number;
-  status: 'NEW' | 'FILLED' | 'CANCELLED' | 'REJECTED';
-  createdAt: number;
-  botId?: string;
-  botName?: string;
-  fillPrice?: number;
-  realizedPnl?: number;
-}
-const activeOrdersStore: Map<string, StoredOrder> = new Map();
-
-// 3f. Institutional Real Order Gateway with Pre-Trade Risk Checks
-app.post('/api/order/submit', requireOperatorAuth, async (req, res) => {
-  const {
-    symbol = 'BTCUSDT',
-    side = 'BUY',
-    type = 'LIMIT',
-    price,
-    quantity,
-    botId,
-    botName,
-    gatewayConfig,
-  } = req.body;
-
-  const sym = symbol.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-  const orderPrice = parseFloat(price);
-  const orderQty = parseFloat(quantity);
-  const notional = orderPrice * orderQty;
-
-  // Pre-Trade Risk Check 1: Max Notional
-  const maxNotional = gatewayConfig?.maxOrderNotional || 50000;
-  if (notional > maxNotional) {
-    return res.status(400).json({
-      error: 'PRE_TRADE_RISK_REJECTION',
-      reason: `Order notional ($${notional.toFixed(2)}) exceeds max allowed limit ($${maxNotional.toFixed(2)})`,
-      status: 'REJECTED',
-    });
-  }
-
-  // Pre-Trade Risk Check 2: Fat-Finger Deviation Check (Max 2.5% deviation from mid)
-  const fatFingerBand = gatewayConfig?.fatFingerBandPct || 2.5;
-  if (type === 'LIMIT' && orderPrice > 0) {
-    try {
-      const depthRes = await fetch(`https://api.binance.com/api/v3/ticker/price?symbol=${sym}`).catch(() => null);
-      if (depthRes && depthRes.ok) {
-        const pData = await depthRes.json();
-        const curPrice = parseFloat(pData.price);
-        const devPct = Math.abs((orderPrice - curPrice) / curPrice) * 100;
-        if (devPct > fatFingerBand) {
-          return res.status(400).json({
-            error: 'FAT_FINGER_REJECTION',
-            reason: `Price ($${orderPrice}) deviates ${devPct.toFixed(1)}% from market ($${curPrice}), exceeding ${fatFingerBand}% band.`,
-            status: 'REJECTED',
-          });
-        }
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  // Real Binance Testnet Order Execution (if API key and secret provided)
-  if (
-    gatewayConfig?.mode === 'BINANCE_TESTNET' &&
-    gatewayConfig.apiKey &&
-    gatewayConfig.apiSecret
-  ) {
-    try {
-      const timestamp = Date.now();
-      const params = new URLSearchParams({
-        symbol: sym,
-        side,
-        type,
-        quantity: orderQty.toFixed(5),
-        timestamp: timestamp.toString(),
-      });
-      if (type === 'LIMIT') {
-        params.append('price', orderPrice.toFixed(2));
-        params.append('timeInForce', 'GTC');
-      }
-
-      const queryString = params.toString();
-      const signature = crypto
-        .createHmac('sha256', gatewayConfig.apiSecret)
-        .update(queryString)
-        .digest('hex');
-
-      const fullUrl = `https://testnet.binance.vision/api/v3/order?${queryString}&signature=${signature}`;
-      const binanceRes = await fetch(fullUrl, {
-        method: 'POST',
-        headers: {
-          'X-MBX-APIKEY': gatewayConfig.apiKey,
-        },
-      });
-
-      const bData = await binanceRes.json();
-      if (!binanceRes.ok) {
-        return res.status(400).json({
-          error: 'BINANCE_TESTNET_ERROR',
-          message: bData.msg || 'Testnet rejected order',
-          code: bData.code,
-          status: 'REJECTED',
-        });
-      }
-
-      return res.json({
-        source: 'BINANCE_SPOT_TESTNET',
-        orderId: bData.orderId.toString(),
-        clientOrderId: bData.clientOrderId,
-        status: bData.status,
-        transactTime: bData.transactTime,
-        price: parseFloat(bData.price) || orderPrice,
-        executedQty: parseFloat(bData.executedQty),
-        cummulativeQuoteQty: parseFloat(bData.cummulativeQuoteQty),
-        fills: bData.fills || [],
-      });
-    } catch (e: any) {
-      return res.status(500).json({
-        error: 'GATEWAY_SUBMISSION_FAILED',
-        message: e.message,
-      });
-    }
-  }
-
-  // Real-Tape Paper Execution Gateway
-  const orderId = `AQ-${Date.now().toString(36).toUpperCase()}-${Math.floor(Math.random() * 900 + 100)}`;
-  const newOrder: StoredOrder = {
-    orderId,
-    symbol: sym,
-    side,
-    type,
-    price: orderPrice,
-    quantity: orderQty,
-    executedQty: 0,
-    status: 'NEW',
-    createdAt: Date.now(),
-    botId,
-    botName,
-  };
-
-  activeOrdersStore.set(orderId, newOrder);
-
-  res.json({
-    source: 'REAL_TAPE_PAPER_GATEWAY',
-    orderId,
-    symbol: sym,
-    side,
-    type,
-    price: orderPrice,
-    quantity: orderQty,
-    status: 'NEW',
-    transactTime: Date.now(),
-    message: 'Order placed in live queue. Will fill when real exchange trade crosses price level.',
-  });
-});
-
-// 3g. Cancel Order Endpoint
-app.post('/api/order/cancel', requireOperatorAuth, async (req, res) => {
-  const { orderId } = req.body;
-  if (!orderId) return res.status(400).json({ error: 'Missing orderId' });
-
-  if (activeOrdersStore.has(orderId)) {
-    const o = activeOrdersStore.get(orderId)!;
-    o.status = 'CANCELLED';
-    activeOrdersStore.set(orderId, o);
-    return res.json({ status: 'CANCELLED', orderId });
-  }
-
-  res.json({ status: 'CANCELLED', orderId });
-});
+// 3. Market data proxy routes (orderbook, trades, ticker) live in server/market/marketRoutes.ts (B2).
+registerMarketRoutes(app);
 
 // 3h. Account Portfolio & Balance Retrieval
 app.get('/api/account/balance', requireOperatorAuth, async (req, res) => {
@@ -949,24 +543,19 @@ app.get('/api/account/balance', requireOperatorAuth, async (req, res) => {
 });
 
 // 4. Automated Unit Testing Suite Runner (200 Quantitative HFT & Bonding Curve Test Cases)
-app.get('/api/unit-tests', (req, res) => {
+app.get('/api/unit-tests', requireOperatorAuth, (req, res) => {
   const suiteOutput = runComprehensiveTestSuite();
   res.json(suiteOutput);
 });
 
 // 5. AI Quant Diagnostics with High Thinking Mode (gemini-3.1-pro-preview) and Market Grounding (gemini-3.5-flash)
-app.post('/api/ai/diagnostics', async (req, res) => {
+app.post('/api/ai/diagnostics', requireOperatorAuth, async (req, res) => {
   const { mode = 'thinking', strategyConfig, telemetry, prompt } = req.body;
   const ai = getGenAI();
 
   if (!ai) {
     return res.status(503).json({
       error: 'GEMINI_API_KEY is not configured. Add it in AI Studio Settings to activate AI Quant Diagnostics.',
-      offlineAnalysis: {
-        recommendation: 'Risk profile looks balanced for high-watermark scaling. Recommended inventory gamma adjustment: 0.12.',
-        estimatedSharpe: 2.85,
-        riskScore: 'LOW_RISK',
-      },
     });
   }
 
@@ -1029,7 +618,7 @@ User Query: ${prompt || 'Perform full risk audit and latency sensitivity analysi
 });
 
 // 6. Raw Packet Logs Exporter (PCAP-JSON formatted)
-app.post('/api/export/packets', (req, res) => {
+app.post('/api/export/packets', requireOperatorAuth, (req, res) => {
   const { logs } = req.body;
   const rawData = {
     pcapHeader: {
@@ -1052,7 +641,7 @@ app.post('/api/export/packets', (req, res) => {
 });
 
 // 7. High-Performance Autonomous Execution Engine Endpoints
-app.get('/api/engine/status', (req, res) => {
+app.get('/api/engine/status', requireOperatorAuth, (req, res) => {
   res.json(hftEngine.getTelemetry());
 });
 
@@ -1088,7 +677,7 @@ app.post('/api/engine/config', requireOperatorAuth, (req, res) => {
   res.json({ status: 'OK', telemetry: hftEngine.getTelemetry() });
 });
 
-app.get('/api/engine/wal', (req, res) => {
+app.get('/api/engine/wal', requireOperatorAuth, (req, res) => {
   const limit = parseInt(req.query.limit as string) || 60;
   res.json({
     seqId: hftEngine.getWAL().getCurrentSeq(),
@@ -1096,7 +685,7 @@ app.get('/api/engine/wal', (req, res) => {
   });
 });
 
-app.get('/api/engine/wal/export', (req, res) => {
+app.get('/api/engine/wal/export', requireOperatorAuth, (req, res) => {
   const journal = hftEngine.getWAL().exportJournal();
   res.setHeader('Content-Type', 'text/plain');
   res.setHeader('Content-Disposition', 'attachment; filename="apex_engine_journal.wal"');
@@ -1108,12 +697,12 @@ app.post('/api/engine/risk/limits', requireOperatorAuth, (req, res) => {
   res.json({ status: 'OK', limits: hftEngine.getRiskEngine().getLimits() });
 });
 
-app.get('/api/engine/risk/limits', (req, res) => {
+app.get('/api/engine/risk/limits', requireOperatorAuth, (req, res) => {
   res.json(hftEngine.getRiskEngine().getLimits());
 });
 
 // 8. Standalone Rust Engine Source & $10 Micro-Capital Configuration
-app.get('/api/engine/rust/source', (req, res) => {
+app.get('/api/engine/rust/source', requireOperatorAuth, (req, res) => {
   try {
     const crateDir = path.join(process.cwd(), 'crates', 'apex_hft_engine');
 
@@ -1186,7 +775,7 @@ app.post('/api/engine/mode/micro-10', requireOperatorAuth, (req, res) => {
 // ============================================================================
 // 12. SOCIAL SCANNER (TELEGRAM & X.COM) ALPHA INTELLIGENCE ENDPOINTS
 // ============================================================================
-app.get('/api/social/signals', (req, res) => {
+app.get('/api/social/signals', requireOperatorAuth, (req, res) => {
   res.json({
     status: 'OK',
     count: socialScanner.getSignals().length,
@@ -1196,10 +785,17 @@ app.get('/api/social/signals', (req, res) => {
 
 app.post('/api/social/signals/snipe', requireOperatorAuth, validateTradeBody(SignalSnipeSchema), async (req, res) => {
   const { signalId } = req.body;
-  const sig = socialScanner.markSniped(signalId);
-  if (!sig) {
+  const unconfirmed = liveConfirmationRefusal(executionCoordinator.isLiveArmed(), allowedCluster(), req.body); // Q10b
+  if (unconfirmed) return res.status(409).json({ success: false, status: 'REJECTED', error: unconfirmed });
+  const existing = socialScanner.getSignals().find((s) => s.id === signalId);
+  if (!existing) {
     return res.status(404).json({ error: 'Signal not found' });
   }
+  // An unverified signal (live-ingested, no real scoring) must never reach a live trade.
+  if (executionCoordinator.isLiveArmed() && existing.verified !== true) {
+    return res.status(409).json({ error: 'UNVERIFIED_SIGNAL: refusing to snipe an unverified signal while LIVE is armed' });
+  }
+  const sig = socialScanner.markSniped(signalId)!;
 
   // Trigger sniper trade on the aggregator
   const tradeResult = await memecoinAggregator.executeSnipe({
@@ -1211,6 +807,7 @@ app.post('/api/social/signals/snipe', requireOperatorAuth, validateTradeBody(Sig
     signalId: sig.id,
     // Provenance comes from the stored signal (set when it was ingested), never from the request.
     provenance: sig.provenance,
+    signalTimestamp: sig.timestamp,
   });
 
   res.json({
@@ -1220,7 +817,7 @@ app.post('/api/social/signals/snipe', requireOperatorAuth, validateTradeBody(Sig
   });
 });
 
-app.get('/api/telegram/config', (req, res) => {
+app.get('/api/telegram/config', requireOperatorAuth, (req, res) => {
   res.json({
     status: 'OK',
     config: socialScanner.getTelegramConfigRedacted(),
@@ -1238,6 +835,11 @@ app.post('/api/telegram/config', requireOperatorAuth, (req, res) => {
 app.post('/api/telegram/webhook', requireOperatorAuth, async (req, res) => {
   const { message } = req.body;
   const text = message?.text || req.body?.text || '';
+  // Q23: /snipe and /buy are one-click trades, so they need the same live confirmation as the other trade routes
+  if (/^\s*\/(snipe|buy)\b/.test(text)) {
+    const unconfirmed = liveConfirmationRefusal(executionCoordinator.isLiveArmed(), allowedCluster(), req.body);
+    if (unconfirmed) return res.status(409).json({ ok: false, result: { reply: `❌ SNIPE REJECTED: ${unconfirmed}` } });
+  }
   const result = await socialScanner.processTelegramCommand(text);
 
   res.json({
@@ -1259,7 +861,7 @@ app.post('/api/social/test-twitter', requireOperatorAuth, async (req, res) => {
 });
 
 // Full External Connectivity Diagnostics & Simulation Scope Audit
-app.get('/api/connectivity/diagnostics', async (req, res) => {
+app.get('/api/connectivity/diagnostics', requireOperatorAuth, async (req, res) => {
   const tStart = Date.now();
 
   // 1. Telegram
@@ -1361,6 +963,7 @@ app.get('/api/connectivity/diagnostics', async (req, res) => {
   res.json({
     timestamp: Date.now(),
     totalAuditTimeMs: Date.now() - tStart,
+    cluster: allowedCluster(), // Q10a: the cluster this server is configured for, shown next to the RPC probe
     connections: {
       xTwitter: {
         service: 'X.com / Twitter API v2 (api.twitter.com)',
@@ -1418,27 +1021,35 @@ app.get('/api/connectivity/diagnostics', async (req, res) => {
     simulationScopeMatrix: [
       {
         subsystem: 'Pump.fun Token Discovery & Velocity',
-        nature: 'LIVE',
-        details:
-          'Fetches real new tokens and bonding curve progress via live HTTP GET requests to frontend-api-v3.pump.fun every 5s.',
+        nature: allowedCluster() === 'mainnet-beta' ? 'LIVE' : 'NOT_AVAILABLE_ON_THIS_CLUSTER',
+        details: allowedCluster() === 'mainnet-beta'
+          ? 'New launches and trades come from the program log stream (PumpFeedListener) on the configured RPC; the pump.fun HTTP API adds metadata.'
+          : `Cluster is ${allowedCluster()}: the pump.fun HTTP API only serves mainnet, so it yields no candidates here. Launches appear only if the pump program is deployed on this cluster and something creates tokens on it (the log stream reads the configured RPC).`,
       },
       {
         subsystem: 'DexScreener Boosted & Pool Metrics',
-        nature: 'LIVE',
-        details:
-          'Pulls live boosted tokens and 5-minute buy/sell ratios from api.dexscreener.com in real-time.',
+        nature: allowedCluster() === 'mainnet-beta' ? 'LIVE' : 'NOT_AVAILABLE_ON_THIS_CLUSTER',
+        details: allowedCluster() === 'mainnet-beta'
+          ? 'Boosted tokens and 5-minute buy/sell ratios from api.dexscreener.com.'
+          : 'DexScreener indexes mainnet only; it has no data for devnet or localnet tokens.',
       },
       {
         subsystem: 'Multi-Caller Confluence Engine',
         nature: 'LIVE_COMPUTATION',
         details:
-          'Evaluates intersection between live Pump.fun tokens and live DexScreener boosted coins in real-time to trigger INSTANT_SNIPE priority.',
+          'Scores a candidate from the signals it is given (score gate 70, maximum reachable 90 because the Social component is 0). It computes only from what the discovery sources above supply, so on devnet it scores watch-window candidates, not DexScreener boosts.',
+      },
+      {
+        subsystem: 'Auto mode (OFF / SHADOW / PAPER / DEVNET_LIVE)',
+        nature: 'PAPER_BY_DEFAULT',
+        details:
+          'Candidates come from the watch window (HOT/READY releases). PAPER fills and exits use the real curve maths, fees and tips, so a round trip at an unchanged curve loses about 3% plus tips; profit needs real price moves. PAPER has its own session budgets. Liquidity and distribution score components stay 0 until the pool has enough real SOL and 30 distinct buyers. DEVNET_LIVE is the only mode that signs transactions.',
       },
       {
         subsystem: 'Telegram Bot API Link',
-        nature: 'LIVE_READY',
+        nature: 'PARTIAL',
         details:
-          'Outbound HTTPS routing to api.telegram.org is verified. Webhook dispatcher processes /snipe, /signals, /positions, and broadcasts real messages when a live BotFather token is saved.',
+          'The command handler (/snipe, /signals, /positions, /status, /panic_sell) runs when something posts to the operator-authenticated /api/telegram/webhook. NOT implemented: setWebhook registration with Telegram, getUpdates polling, and alert forwarding (autoForwardAlerts is stored but never used). Outbound connectivity can be tested with a bot token; nothing is sent automatically.',
       },
       {
         subsystem: 'X.com / Twitter Feed & Social Ingestion',
@@ -1453,27 +1064,28 @@ app.get('/api/connectivity/diagnostics', async (req, res) => {
       },
       {
         subsystem: 'Order Execution & Paper Trading',
-        nature: 'SIMULATED',
-        details:
-          'All buy/sell snipes are paper-traded in-memory. Zero real Solana funds or private keys are exposed to the network.',
+        nature: executionCoordinator.isLiveArmed() ? 'LIVE_ARMED' : 'PAPER_BY_DEFAULT',
+        details: executionCoordinator.isLiveArmed()
+          ? 'LIVE is ARMED: snipes are signed with the configured wallet and submitted to the configured cluster RPC. Real funds on that cluster are at risk.'
+          : 'LIVE is not armed: snipes are paper-traded in memory against the curve quote. No transaction is signed or sent.',
       },
       {
         subsystem: 'Jito MEV Bundles & Priority Tips',
-        nature: 'SIMULATED_MODEL',
+        nature: executionCoordinator.isLiveArmed() ? 'LIVE_CLUSTER_DEPENDENT' : 'PAPER_ONLY',
         details:
-          'Priority tips (e.g. 0.005 SOL) and front-running protection are modeled with realistic slippage, fee deductions, and slot inclusion latencies rather than sending raw serialized transactions to Jito block engines.',
+          'Priority tips follow the executionConfig tip policy. Bundles go to Jito only on mainnet-beta (never enabled by default); on devnet or localnet the transaction goes to the cluster RPC with a priority fee and no bundle. In paper mode nothing is sent.',
       },
       {
         subsystem: 'Caller Persona Historical Track Records',
-        nature: 'STATISTICAL_ATTRIBUTION',
+        nature: 'NOT_VERIFIED',
         details:
-          'Caller win rates (1.2x, 1.5x, 2x) and wallet reputations are high-fidelity quantitative track records attributed algorithmically to live on-chain tokens.',
+          'Caller personas and their win rates are static configuration, not measured track records. Do not treat them as evidence about a caller.',
       },
       {
         subsystem: 'Microstructure & Latency Stress',
         nature: 'MATHEMATICAL_MODEL',
         details:
-          'Colocation delays (AWS Tokyo TY2 1.15ms vs AWS Oregon 94.8ms), FIFO queue priority, and market impact slippage follow the Avellaneda-Stoikov and Square-Root Law formulas.',
+          'Standalone formula calculators (Avellaneda-Stoikov, square-root impact). Their latency inputs are assumptions, not measurements, and they do not drive live order routing.',
       },
     ],
   });
@@ -1482,7 +1094,7 @@ app.get('/api/connectivity/diagnostics', async (req, res) => {
 // ============================================================================
 // 13. MULTI-PLATFORM MEMECOIN AGGREGATOR & SNIPER ENGINE ENDPOINTS
 // ============================================================================
-app.get('/api/memecoins/pools', (req, res) => {
+app.get('/api/memecoins/pools', requireOperatorAuth, (req, res) => {
   const { platform, chain } = req.query;
   const pools = memecoinAggregator.getPools(platform as string, chain as string);
   res.json({
@@ -1492,7 +1104,7 @@ app.get('/api/memecoins/pools', (req, res) => {
   });
 });
 
-app.get('/api/memecoins/positions', (req, res) => {
+app.get('/api/memecoins/positions', requireOperatorAuth, (req, res) => {
   res.json({
     status: 'OK',
     positions: memecoinAggregator.getPositions(),
@@ -1500,7 +1112,7 @@ app.get('/api/memecoins/positions', (req, res) => {
 });
 
 app.post('/api/memecoins/trade', requireOperatorAuth, validateTradeBody(OperatorSnipeSchema), async (req, res) => {
-  const result = await memecoinAggregator.executeSnipe({ ...req.body, provenance: OPERATOR_PROVENANCE });
+  const result = await memecoinAggregator.executeSnipe({ ...req.body, provenance: OPERATOR_PROVENANCE, signalTimestamp: Date.now() });
 
   res.json({
     status: result.success ? 'OK' : 'REJECTED',
@@ -1517,25 +1129,33 @@ app.post('/api/memecoins/close', requireOperatorAuth, validateTradeBody(Operator
   });
 });
 
-app.get('/api/memecoins/config', (req, res) => {
+/** The bot token is write-only: it never leaves the server once stored. */
+function redactSniperConfig<T extends { telegramBotToken?: string }>(c: T) {
+  return { ...c, telegramBotToken: '', telegramBotTokenSet: Boolean(c.telegramBotToken) };
+}
+
+app.get('/api/memecoins/config', requireOperatorAuth, (req, res) => {
   res.json({
     status: 'OK',
-    config: memecoinAggregator.getConfig(),
+    config: redactSniperConfig(memecoinAggregator.getConfig()),
   });
 });
 
 app.post('/api/memecoins/config', requireOperatorAuth, validateTradeBody(SniperConfigPatchSchema), (req, res) => {
-  const updated = memecoinAggregator.updateConfig(req.body);
+  // The UI never sees the stored token, so an empty field means "unchanged", not "erase".
+  const patch = { ...req.body };
+  if (!patch.telegramBotToken) delete patch.telegramBotToken;
+  const updated = memecoinAggregator.updateConfig(patch);
   res.json({
     status: 'OK',
-    config: updated,
+    config: redactSniperConfig(updated),
   });
 });
 
 // ============================================================================
 // 13b. PUMP.FUN HOT CALLOUTS & CALLER LEADERBOARD (REAL-WORLD ENGINE)
 // ============================================================================
-app.get('/api/pumpfun/callouts', (req, res) => {
+app.get('/api/pumpfun/callouts', requireOperatorAuth, (req, res) => {
   const status = pumpFunService.getStatus();
   res.json({
     status: 'OK',
@@ -1549,7 +1169,7 @@ app.get('/api/pumpfun/callouts', (req, res) => {
   });
 });
 
-app.get('/api/pumpfun/leaderboard', (req, res) => {
+app.get('/api/pumpfun/leaderboard', requireOperatorAuth, (req, res) => {
   res.json({
     status: 'OK',
     leaderboard: pumpFunService.getLeaderboard(),
@@ -1558,6 +1178,8 @@ app.get('/api/pumpfun/leaderboard', (req, res) => {
 
 app.post('/api/pumpfun/callouts/snipe', requireOperatorAuth, validateTradeBody(CalloutSnipeSchema), async (req, res) => {
   const { calloutId, amountUsd, jitoTipSol, slippagePct } = req.body;
+  const unconfirmed = liveConfirmationRefusal(executionCoordinator.isLiveArmed(), allowedCluster(), req.body); // Q10b
+  if (unconfirmed) return res.status(409).json({ success: false, status: 'REJECTED', error: unconfirmed, result: { success: false, message: unconfirmed } });
 
   const result = await pumpFunService.snipeCallout(calloutId, amountUsd, jitoTipSol, slippagePct);
 
@@ -1581,14 +1203,14 @@ app.post('/api/pumpfun/callouts/toggle-autosnipe', requireOperatorAuth, validate
   });
 });
 
-app.get('/api/pumpfun/callouts/rules', (req, res) => {
+app.get('/api/pumpfun/callouts/rules', requireOperatorAuth, (req, res) => {
   res.json({
     status: 'OK',
     rules: pumpFunService.getAutoSnipeRules(),
   });
 });
 
-app.post('/api/pumpfun/callouts/rules', requireOperatorAuth, (req, res) => {
+app.post('/api/pumpfun/callouts/rules', requireOperatorAuth, validateTradeBody(AutoSnipeRulesSchema), (req, res) => {
   const updated = pumpFunService.updateAutoSnipeRules(req.body);
   res.json({
     status: 'OK',
@@ -1596,11 +1218,11 @@ app.post('/api/pumpfun/callouts/rules', requireOperatorAuth, (req, res) => {
   });
 });
 
-app.get('/api/pumpfun/status', (req, res) => {
+app.get('/api/pumpfun/status', requireOperatorAuth, (req, res) => {
   res.json(pumpFunService.getStatus());
 });
 
-app.post('/api/pumpfun/refresh', async (req, res) => {
+app.post('/api/pumpfun/refresh', requireOperatorAuth, async (req, res) => {
   // A manual refresh only reloads the feed; it must never evaluate auto-snipe triggers (A5).
   await pumpFunService.syncRealWorldData({ evaluateTriggers: false });
   res.json({
@@ -1612,38 +1234,9 @@ app.post('/api/pumpfun/refresh', async (req, res) => {
 
 
 // ============================================================================
-// 13c. 60-DAY (LAST 2 MONTHS) COMPREHENSIVE BACKTESTING ENGINE
-// ============================================================================
-app.post('/api/backtest/run', (req, res) => {
-  try {
-    const config = req.body || {};
-    const result = run60DayBacktest(config);
-    res.json({
-      status: 'OK',
-      result,
-    });
-  } catch (err: any) {
-    res.status(500).json({ status: 'ERROR', message: err?.message || 'Backtest failed' });
-  }
-});
-
-app.get('/api/backtest/run', (req, res) => {
-  try {
-    const capitalTier = (req.query.capitalTier as any) || 'MICRO_10';
-    const result = run60DayBacktest({ capitalTier });
-    res.json({
-      status: 'OK',
-      result,
-    });
-  } catch (err: any) {
-    res.status(500).json({ status: 'ERROR', message: err?.message || 'Backtest failed' });
-  }
-});
-
-// ============================================================================
 // 14. REALISM & CO-LOCATION MICROSTRUCTURE CONFIG ENDPOINTS
 // ============================================================================
-app.get('/api/realism/config', (req, res) => {
+app.get('/api/realism/config', requireOperatorAuth, (req, res) => {
   res.json({
     status: 'OK',
     config: realismEngine.getConfig(),
@@ -1663,7 +1256,7 @@ app.post('/api/realism/config', requireOperatorAuth, (req, res) => {
 // ============================================================================
 // 15. PLUG-AND-PLAY WALLET ONBOARDING & LIVE AUTONOMOUS TRADING ENDPOINTS
 // ============================================================================
-app.get('/api/wallet/state', (req, res) => {
+app.get('/api/wallet/state', requireOperatorAuth, (req, res) => {
   res.json({
     success: true,
     data: walletTrader.getState(),
@@ -1671,13 +1264,17 @@ app.get('/api/wallet/state', (req, res) => {
   });
 });
 
-app.post('/api/wallet/config', requireOperatorAuth, validateBody(WalletConfigSchema), (req, res) => {
-  const updated = walletTrader.updateConfig(req.body);
-  res.json({
-    success: true,
-    config: updated,
-    state: walletTrader.getState(),
-  });
+app.post('/api/wallet/config', requireOperatorAuth, validateBody(WalletConfigSchema), async (req, res) => {
+  try {
+    const updated = await walletTrader.updateConfig(req.body);
+    res.json({
+      success: true,
+      config: updated,
+      state: walletTrader.getState(),
+    });
+  } catch (err: any) {
+    res.status(400).json({ success: false, error: err.message, state: walletTrader.getState() });
+  }
 });
 
 app.post('/api/wallet/toggle-trading', requireOperatorAuth, validateTradeBody(ArmSchema), (req, res) => {
@@ -1699,7 +1296,8 @@ app.post('/api/wallet/toggle-trading', requireOperatorAuth, validateTradeBody(Ar
 });
 
 app.post('/api/wallet/snipe', requireOperatorAuth, validateBody(LiveSnipeOrderSchema), async (req, res) => {
-  const result = await walletTrader.executeLiveSnipe(req.body);
+  // The operator's request is the signal; a client-supplied signalTimestamp is ignored so the age check cannot be dodged.
+  const result = await walletTrader.executeLiveSnipe({ ...req.body, signalTimestamp: Date.now() });
   if (!result.success) {
     return res.status(400).json({ success: false, error: result.error });
   }
@@ -1725,15 +1323,17 @@ app.post('/api/wallet/close-position', requireOperatorAuth, validateBody(ClosePo
 
 app.post('/api/wallet/panic-liquidate', requireOperatorAuth, async (req, res) => {
   const result = await walletTrader.panicLiquidateAll();
+  await autoSnipeController.kill({ exitAll: false, reason: 'panic liquidate' }); // Q37: a panic also stops auto; it must not re-buy after the exits
+  const failedList = result.failed.map((f) => `${f.symbol}: ${f.error}`).join('; ');
   res.json({
-    success: true,
-    message: `Emergency liquidation complete. Attempted: ${result.attemptedCount}, Succeeded: ${result.succeeded.length}, Failed: ${result.failed.length}`,
+    success: result.failed.length === 0,
+    message: `Emergency liquidation ${result.failed.length === 0 ? 'complete' : 'INCOMPLETE, positions still open'}. Attempted: ${result.attemptedCount}, Succeeded: ${result.succeeded.length}, Failed: ${result.failed.length}${failedList ? ` (${failedList})` : ''}. Kill switch on, live trading disarmed, auto stopped.`,
     data: result,
     state: walletTrader.getState(),
   });
 });
 
-app.post('/api/wallet/sync-rpc', async (req, res) => {
+app.post('/api/wallet/sync-rpc', requireOperatorAuth, async (req, res) => {
   const solBalance = await walletTrader.syncRpcBalance();
   res.json({
     success: true,
@@ -1745,7 +1345,7 @@ app.post('/api/wallet/sync-rpc', async (req, res) => {
 // ============================================================================
 // 16. CANONICAL DIAGNOSTICS & SYSTEM ARCHITECTURE AUDIT (SECTION 64)
 // ============================================================================
-app.get('/api/diagnostics/system', (req, res) => {
+app.get('/api/diagnostics/system', requireOperatorAuth, (req, res) => {
   const diag = executionCoordinator.getDiagnostics();
   const signerStatus = localSigner.getStatus();
   const dbMetrics = workstationDb.getExecutionMetrics();
@@ -1762,6 +1362,7 @@ app.get('/api/diagnostics/system', (req, res) => {
       walletPubkey: diag.activeWalletAddress,
       signerStatus,
       rpcEndpoint: resolveRpcUrl(),
+      allowedCluster: allowedCluster(),
       rpcLatencyMs: diag.rpcLatencyMs,
       databaseFile: 'apex_workstation.db',
       dbDriver: 'node:sqlite (WAL mode enabled)',
@@ -1775,13 +1376,15 @@ app.get('/api/diagnostics/system', (req, res) => {
       maxDailyLossSol: riskLimits.maxDailyLossSol,
       maxAggregateExposureSol: riskLimits.maxAggregateExposureSol,
       dailyLossSoFarSol: riskEngine.getDailyLossSol(),
-      circuitBreakerTripped: riskEngine.isKillSwitchActive(),
+      // R28: the circuit breaker's own state, not the kill-switch flag (that one is systemAudit.killSwitchActive)
+      circuitBreakerState: riskEngine.getCircuitBreakerState(),
+      circuitBreakerTripped: riskEngine.getCircuitBreakerState() === 'OPEN',
     },
     executionMetrics: dbMetrics,
   });
 });
 
-app.get('/api/execution/mode', (req, res) => {
+app.get('/api/execution/mode', requireOperatorAuth, (req, res) => {
   res.json({
     success: true,
     mode: executionCoordinator.getExecutionMode(),
@@ -1789,19 +1392,87 @@ app.get('/api/execution/mode', (req, res) => {
   });
 });
 
-app.get('/api/execution/can-arm', (req, res) => {
+app.get('/api/execution/can-arm', requireOperatorAuth, (req, res) => {
   res.json({
     success: true,
     ...executionCoordinator.canExecuteLive(),
   });
 });
 
-app.get('/api/execution/readiness', (req, res) => {
+app.get('/api/execution/readiness', requireOperatorAuth, (req, res) => {
   res.json({
     success: true,
     ...executionCoordinator.getLiveReadiness(),
   });
 });
+
+// G1: auto-snipe controller. Mode lives in memory only, so every restart comes back OFF.
+app.get('/api/auto/status', requireOperatorAuth, (req, res) => {
+  res.json({ success: true, ...autoSnipeController.getStatus(), stats: autoSnipeController.getJournalStats(), decisions: autoSnipeController.getDecisions(100) });
+});
+
+app.post('/api/auto/mode', requireOperatorAuth, validateTradeBody(AutoModeSchema), async (req, res) => {
+  const { mode, confirmationCode } = req.body;
+  const result = await autoSnipeController.setMode(mode, { confirmationCode });
+  res.status(result.ok ? 200 : 409).json({ success: result.ok, ...result, status: autoSnipeController.getStatus() });
+});
+
+app.post('/api/auto/kill', requireOperatorAuth, validateTradeBody(AutoKillSchema), async (req, res) => {
+  const result = await autoSnipeController.kill({ exitAll: req.body.exitAll, reason: req.body.reason });
+  res.json({ success: true, ...result, status: autoSnipeController.getStatus() });
+});
+
+// H2: bonding-curve depth ladder and the selected mint's trade tape. When the source fails: 503, no generated rows.
+const tradeTape = new TradeTape(
+  (mint) => pumpFeedListener.getCreatorForMint(mint),
+  () => {
+    try {
+      return localSigner.getStatus() === 'READY' ? localSigner.getPublicKey().toBase58() : null;
+    } catch {
+      return null;
+    }
+  }
+);
+tradeTape.attach(pumpFeedListener);
+
+app.get('/api/market/curve/:mint', requireOperatorAuth, async (req, res) => {
+  try {
+    const mint = new PublicKey(String(req.params.mint));
+    const mode = executionCoordinator.getExecutionMode();
+    const state = await PumpCurveService.fetchPumpMarketState({ connection: executionCoordinator.getConnection(), mint, executionMode: mode });
+    if (!state) return res.status(503).json({ success: false, source: 'UNAVAILABLE', error: 'bonding curve state could not be read' });
+    const held = workstationDb.loadPositions(undefined, 'ACTIVE').find((p) => p.mint === mint.toBase58());
+    const depth = buildCurveDepth(state, { mode, positionTokensRaw: held ? BigInt(held.tokenQuantityRaw) : null });
+    const sol = solPriceService.lastKnownPrice();
+    res.json({
+      success: true, ...depth, priceUsd: sol === null ? null : depth.spotPriceSol * sol, solUsd: sol,
+      note: state.complete ? 'Migrated to PumpSwap: pool reserves are not read yet, so no ladder.' : null,
+    });
+  } catch (e: any) {
+    res.status(503).json({ success: false, source: 'UNAVAILABLE', error: e?.message || 'curve unavailable' });
+  }
+});
+
+app.get('/api/market/trades/:mint', requireOperatorAuth, (req, res) => {
+  const mint = String(req.params.mint);
+  const rows = tradeTape.get(mint, 50);
+  res.json({ success: true, mint, source: rows.length ? 'PUMP_TRADE_EVENTS' : 'NO_DATA', trades: rows });
+});
+
+app.get('/api/board', requireOperatorAuth, (req, res) => {
+  res.json({ success: true, ...buildBoard() });
+});
+
+app.get('/api/watch', requireOperatorAuth, (req, res) => {
+  res.json({ success: true, ...watchWindow.getSnapshot() });
+});
+
+app.post('/api/auto/resume', requireOperatorAuth, validateTradeBody(AutoResumeSchema), (req, res) => {
+  res.json({ success: true, ...autoSnipeController.resume({ clearHalt: req.body.clearHalt }), status: autoSnipeController.getStatus() });
+});
+
+autoSnipeController.on('decision', (d) => broadcastWs({ type: 'AUTO_DECISION', data: d }));
+autoSnipeController.on('mode', (d) => broadcastWs({ type: 'AUTO_MODE', data: { ...d, status: autoSnipeController.getStatus() } }));
 
 app.post('/api/execution/arm', requireOperatorAuth, validateTradeBody(ArmSchema), (req, res) => {
   const { arm, confirmationCode } = req.body;
@@ -1813,14 +1484,20 @@ app.post('/api/execution/arm', requireOperatorAuth, validateTradeBody(ArmSchema)
 });
 
 app.post('/api/execution/kill-switch', requireOperatorAuth, (req, res) => {
-  const { activate } = req.body;
-  riskEngine.setKillSwitch(Boolean(activate));
+  // Explicit boolean only: an empty POST or {"activate":"false"} must not trip it, and must never silently reset it.
+  const parsed = KillSwitchSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ success: false, error: 'activate must be true or false' });
+  const { activate } = parsed.data;
+  riskEngine.setKillSwitch(activate);
   if (activate) {
     executionCoordinator.armLiveTrading(false);
   }
   res.json({
     success: true,
     killSwitchActive: riskEngine.isKillSwitchActive(),
+    // R26: resetting the switch does not lift an open circuit breaker or an all-trading halt; say so, so the UI cannot claim "allowed again"
+    circuitBreaker: riskEngine.getCircuitBreakerState(),
+    haltReason: executionCoordinator.getHaltReason(),
     message: activate ? 'EMERGENCY KILL SWITCH TRIPPED. All trading halted.' : 'Kill switch reset.',
   });
 });
@@ -1831,6 +1508,8 @@ app.post('/api/execution/trade', requireOperatorAuth, validateTradeBody(Operator
     const result = await executionCoordinator.executeTrade({
       ...req.body,
       source: 'MANUAL',
+      // The operator's request is the signal (K4a). The schema rejects a client-supplied signalTimestamp.
+      signalTimestamp: Date.now(),
       provenance: OPERATOR_PROVENANCE,
     });
     if (!result.success) {
@@ -1857,14 +1536,14 @@ app.post('/api/execution/close', requireOperatorAuth, validateTradeBody(Operator
 
 app.post('/api/execution/reconcile', requireOperatorAuth, async (req, res) => {
   try {
-    const result = await executionCoordinator.startupReconciliation();
+    const result = await executionCoordinator.startupReconciliation({ fresh: true }); // R17: a click never reads a run that began before it
     res.json({ success: true, result });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-app.get('/api/signer/status', (req, res) => {
+app.get('/api/signer/status', requireOperatorAuth, (req, res) => {
   const status = localSigner.getStatus();
   const pubkey = status === 'READY' ? localSigner.getPublicKey().toBase58() : null;
   res.json({
@@ -1883,6 +1562,10 @@ app.post('/api/signer/generate', requireOperatorAuth, (req, res) => {
         error: 'Overwriting an existing keypair over HTTP is disabled. Back it up and replace it with: npm run signer:import',
       });
     }
+    // Q5: positions bought with the current key can only be sold with it
+    if (workstationDb.loadPositions('LIVE', 'ACTIVE').length > 0) {
+      return res.status(409).json({ success: false, error: 'A signing key already exists for the open LIVE positions; it is not replaced while they are open.' });
+    }
     const pubkey = localSigner.generateNewKeypair(false);
     res.json({
       success: true,
@@ -1895,7 +1578,7 @@ app.post('/api/signer/generate', requireOperatorAuth, (req, res) => {
   }
 });
 
-app.get('/api/workstation/positions', (req, res) => {
+app.get('/api/workstation/positions', requireOperatorAuth, (req, res) => {
   const mode = (req.query.mode as any) || undefined;
   const status = (req.query.status as any) || undefined;
   const positions = executionCoordinator.getPositions(mode, status);
@@ -1906,7 +1589,7 @@ app.get('/api/workstation/positions', (req, res) => {
   });
 });
 
-app.get('/api/workstation/events', (req, res) => {
+app.get('/api/workstation/events', requireOperatorAuth, (req, res) => {
   const limit = Math.min(parseInt((req.query.limit as string) || '50', 10), 200);
   const events = workstationDb.getEvents(limit);
   res.json({
@@ -1916,10 +1599,23 @@ app.get('/api/workstation/events', (req, res) => {
   });
 });
 
+// R10s: an unknown /api path is a 404 JSON, never the SPA's index.html with a 200 (the auth gate has already answered unauthenticated callers).
+app.use('/api', (req, res) => {
+  res.status(404).json({ success: false, error: `No such API route: ${req.method} ${req.path}` });
+});
+
 // Centralized error-handling middleware
 app.use(errorHandler);
 
 // Vite middleware & Static SPA serving
+// One bad request must not take down the server and the trade monitor. Log it loudly and keep serving; the operator sees it in the logs.
+process.on('unhandledRejection', (reason) => {
+  Logger.error(`[PROCESS] unhandledRejection (process kept alive): ${reason instanceof Error ? reason.stack || reason.message : String(reason)}`);
+});
+process.on('uncaughtException', (err) => {
+  Logger.error(`[PROCESS] uncaughtException (process kept alive): ${err?.stack || err?.message || String(err)}`);
+});
+
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const customLogger = createLogger();
@@ -1937,13 +1633,12 @@ async function startServer() {
     };
 
     const vite = await createViteServer({
-      server: {
-        middlewareMode: true,
-        hmr: false,
-      },
+      server: viteDevServerOptions(),
       appType: 'spa',
       customLogger,
     });
+    // The project root is the Vite root: refuse secret and state files (env.txt, *.db, *.wal, *.log, keypairs, .overnight/...) before Vite sees the URL.
+    app.use(secretPathGuard(process.cwd()));
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
@@ -1953,6 +1648,21 @@ async function startServer() {
     });
   }
 
+  // Test/offline switch: the behaviour tests spawn this server and must not reach Coinbase, CoinGecko, Binance, pump.fun or
+  // DexScreener (the vitest network guard cannot see child processes). Production leaves it unset.
+  if (process.env.APEX_DISABLE_EXTERNAL_FEEDS !== 'true') {
+    solPriceService.startAutoRefresh();
+    pumpFunService.startBackground();
+  }
+  // N18: bound the append-only audit tables (default 90 days; APEX_RETENTION_DAYS, 0 disables). Once at boot, then daily.
+  const retentionDays = process.env.APEX_RETENTION_DAYS === undefined ? 90 : Number(process.env.APEX_RETENTION_DAYS);
+  const prune = () => {
+    const r = workstationDb.pruneOldRows(retentionDays);
+    if (r.riskDecisions + r.decisions + r.journal > 0) Logger.info(`Retention: pruned ${r.riskDecisions} risk decisions, ${r.decisions} decisions, ${r.journal} journal rows older than ${retentionDays} days`);
+  };
+  prune();
+  setInterval(prune, 86_400_000).unref();
+  autoSnipeController.startMonitor(); // G3: kill-switch triggers and wallet audit (inert while the mode is OFF)
   server.listen(PORT, BIND_HOST, () => {
     console.log(`[APEX QUANT HFT] Autonomous Execution Engine running on ${BIND_HOST}:${PORT}`);
   });

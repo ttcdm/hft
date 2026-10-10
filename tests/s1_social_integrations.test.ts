@@ -11,6 +11,10 @@ const liveTokenInput = (over: Record<string, any> = {}) => ({
 });
 
 describe('S1: Telegram / social integrations', () => {
+  beforeEach(() => {
+    memecoinAggregator.setConfluenceGating(false); // C2: gating is on by default; this test is about something else
+  });
+
   afterEach(() => {
     vi.restoreAllMocks();
     riskEngine.setKillSwitch(false);
@@ -207,6 +211,17 @@ describe('S1: Telegram / social integrations', () => {
       expect(socialScanner.getSignals().filter((s) => s.contractAddress === MINT_A)).toHaveLength(1);
     });
 
+    it('R20: a manual snipe carries the callout\'s provenance (a demo caller is SYNTHETIC_TEST, an unattributed one REAL_ONCHAIN) and its own timestamp', async () => {
+      const snipe = vi.spyOn(memecoinAggregator, 'executeSnipe').mockResolvedValue({ success: false, message: 'stubbed', txHash: '' } as any);
+      const at = Date.now() - 5_000;
+      const callout = (id: string, userId: string) => ({ id, calloutId: id, token: { mint: MINT_A }, caller: { userId }, calloutTimestamp: at, status: 'NEW' });
+      (svc as any).hotCallouts.push(callout('r20-demo', 'sol_cabal_insider'), callout('r20-real', 'someone_real'));
+      await svc.snipeCallout('r20-demo');
+      await svc.snipeCallout('r20-real');
+      expect(snipe.mock.calls[0][0]).toMatchObject({ provenance: 'SYNTHETIC_TEST', signalTimestamp: at });
+      expect(snipe.mock.calls[1][0]).toMatchObject({ provenance: 'REAL_SOCIAL', signalTimestamp: at });
+    });
+
     it('snipeCallout of an unknown id does nothing', async () => {
       const snipe = vi.spyOn(memecoinAggregator, 'executeSnipe');
       const r = await svc.snipeCallout('does-not-exist');
@@ -281,6 +296,15 @@ describe('S1: Telegram / social integrations', () => {
     });
   });
 
+  describe('diagnostics text matches reality (S1c)', () => {
+    it('says plainly that setWebhook, polling and alert forwarding are not implemented', async () => {
+      const fs = await import('fs');
+      const src = fs.readFileSync('server.ts', 'utf8');
+      expect(src).toContain('NOT implemented: setWebhook registration with Telegram, getUpdates polling, and alert forwarding');
+      expect(src).not.toContain('broadcasts real messages when a live BotFather token is saved');
+    });
+  });
+
   describe('route wiring (static)', () => {
     it('the Telegram webhook, config and test routes require operator auth', async () => {
       const fs = await import('fs');
@@ -288,6 +312,14 @@ describe('S1: Telegram / social integrations', () => {
       for (const route of ['/api/telegram/webhook', '/api/telegram/config', '/api/telegram/test-connection', '/api/social/test-twitter', '/api/social/signals/snipe']) {
         expect(src, route).toMatch(new RegExp(`app\\.post\\('${route}', requireOperatorAuth`));
       }
+    });
+
+    it('the snipe route refuses unverified signals while LIVE is armed (route-level; static check, no HTTP harness)', async () => {
+      const fs = await import('fs');
+      const src = fs.readFileSync('server.ts', 'utf8');
+      const block = src.slice(src.indexOf("'/api/social/signals/snipe'"), src.indexOf("'/api/telegram/config'"));
+      expect(block).toMatch(/isLiveArmed\(\)\s*&&\s*existing\.verified !== true/);
+      expect(block.indexOf('UNVERIFIED_SIGNAL')).toBeLessThan(block.indexOf('markSniped'));
     });
   });
 });

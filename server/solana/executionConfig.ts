@@ -1,6 +1,6 @@
 import { PublicKey } from '@solana/web3.js';
 import { getRandomJitoTipAccount } from './programs';
-import { resolveJitoUrl } from './clusterGuard';
+import { allowedCluster, resolveJitoUrl } from './clusterGuard';
 
 export interface AuthoritativeExecutionConfig {
   jitoBlockEngineUrl: string;
@@ -22,6 +22,10 @@ export interface AuthoritativeExecutionConfig {
   rpcFallbackTimeoutMs: number;
   bundleConfirmTimeoutMs: number;
   jitoProbeIntervalMs: number;
+  /** Paper bankroll used for sizing when no real wallet balance is known (C5). Default 0.07 SOL (~$10). */
+  paperBankrollSol: number;
+  /** PAPER_STRICT_GATES=1: paper trades reject on unverified (UNKNOWN) safety checks exactly like LIVE (C5). */
+  paperStrictGates: boolean;
 }
 
 /**
@@ -30,6 +34,40 @@ export interface AuthoritativeExecutionConfig {
  * TipLamports = Math.max(150_000, Math.min(1_000_000, Math.floor(tradeNotionalSol * 1e9 * 0.03)))
  * Default for 0.006 SOL trade is 180,000 lamports (0.00018 SOL).
  */
+/** Max Jito tip as a fraction of trade notional. Planning decision #1: 15% (the conservative option), not 25%. */
+export const ECONOMIC_TIP_CAP_FRACTION = 0.15;
+
+/**
+ * Max share of TOTAL supply the top 10 non-curve, non-creator holders may own (C1/C1b).
+ * Conservative overnight defaults, not validated on real launches; calibrate with recorded data
+ * (the C1 step 1 sample was impossible without network).
+ */
+export const MAX_TOP10_HOLDERS_PCT = 20;
+/** Max share of TOTAL supply the creator may hold (C1b). Same caveat as MAX_TOP10_HOLDERS_PCT. */
+export const MAX_CREATOR_HOLDING_PCT = 5;
+
+/** Minimum pool liquidity (USD) for the eligibility gate on mainnet and by default. */
+export const DEFAULT_MIN_LIQUIDITY_USD = 2000;
+
+/**
+ * D1: devnet and localnet pump curves hold a few cents to a few dollars of real SOL, so the mainnet minimum makes every
+ * test token ineligible. `MIN_LIQUIDITY_USD` may lower (or raise) it only off mainnet; on mainnet-beta it is ignored.
+ */
+export function minLiquidityUsd(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.MIN_LIQUIDITY_USD;
+  if (raw === undefined || raw === '') return DEFAULT_MIN_LIQUIDITY_USD;
+  const value = Number(raw);
+  if (allowedCluster(env) === 'mainnet-beta') {
+    console.warn(`MIN_LIQUIDITY_USD=${raw} ignored on mainnet-beta; using ${DEFAULT_MIN_LIQUIDITY_USD}`);
+    return DEFAULT_MIN_LIQUIDITY_USD;
+  }
+  if (!Number.isFinite(value) || value < 0) {
+    console.warn(`MIN_LIQUIDITY_USD=${raw} is not a non-negative number; using ${DEFAULT_MIN_LIQUIDITY_USD}`);
+    return DEFAULT_MIN_LIQUIDITY_USD;
+  }
+  return value;
+}
+
 export function calculateDynamicJitoTip(tradeNotionalSol: number): number {
   if (!Number.isFinite(tradeNotionalSol) || tradeNotionalSol <= 0) {
     return 180_000;
@@ -76,6 +114,8 @@ class ExecutionConfigManager {
       rpcFallbackTimeoutMs: parseInt(process.env.RPC_FALLBACK_TIMEOUT_MS || '15000', 10) || 15000,
       bundleConfirmTimeoutMs: parseInt(process.env.BUNDLE_CONFIRM_TIMEOUT_MS || '15000', 10) || 15000,
       jitoProbeIntervalMs: parseInt(process.env.JITO_PROBE_INTERVAL_MS || '15000', 10) || 15000,
+      paperBankrollSol: (() => { const v = parseFloat(process.env.PAPER_BANKROLL_SOL || ''); return Number.isFinite(v) && v > 0 ? v : 0.07; })(),
+      paperStrictGates: process.env.PAPER_STRICT_GATES === '1' || process.env.PAPER_STRICT_GATES === 'true',
     };
   }
 
@@ -148,7 +188,7 @@ class ExecutionConfigManager {
       let boundedLamports = Math.min(Math.max(explicitLamports, minFloorLamports), maxCeilingLamports);
       // Scale tip for micro-trades so execution cost stays strictly below risk threshold
       if (notionalSol && notionalSol > 0) {
-        const maxMicroTipLamports = Math.round(notionalSol * 0.15 * 1e9);
+        const maxMicroTipLamports = Math.round(notionalSol * ECONOMIC_TIP_CAP_FRACTION * 1e9);
         if (maxMicroTipLamports >= 10_000 && boundedLamports > maxMicroTipLamports) {
           boundedLamports = maxMicroTipLamports;
         }
@@ -195,10 +235,10 @@ class ExecutionConfigManager {
 
     // 4. Economic sanity check: tip should not exceed 15% of trade value (if tradeAmountSol provided)
     if (notionalSol && notionalSol > 0) {
-      const maxEconomicTipLamports = Math.round(notionalSol * 0.15 * 1e9);
+      const maxEconomicTipLamports = Math.round(notionalSol * ECONOMIC_TIP_CAP_FRACTION * 1e9);
       if (maxEconomicTipLamports >= 10_000 && calculatedLamports > maxEconomicTipLamports) {
         calculatedLamports = maxEconomicTipLamports;
-        reason += ` -> CAPPED by economic sanity rule (15% of ${notionalSol.toFixed(4)} SOL trade)`;
+        reason += ` -> CAPPED by economic sanity rule (${ECONOMIC_TIP_CAP_FRACTION * 100}% of ${notionalSol.toFixed(4)} SOL trade)`;
       }
     }
 

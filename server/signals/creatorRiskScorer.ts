@@ -88,7 +88,7 @@ export class CreatorRiskScorer {
       const fallbackReport: CreatorRiskReport = {
         creatorAddress,
         riskScore: 30,
-        confluenceScore: 1,
+        confluenceScore: 0, // C2: a failed lookup earns nothing
         isBurner: true,
         isFreshWallet: false,
         signatureCount: 0,
@@ -319,6 +319,12 @@ export class CreatorRiskScorer {
     else confluenceScore = 1;
 
     return { riskScore, confluenceScore, isBurner: false };
+  }
+
+  /** Cached report for a creator, or undefined when none has been evaluated (or it expired). Never calls the network. */
+  public getCachedReport(creatorAddress: string): CreatorRiskReport | undefined {
+    const cached = this.cache.get(creatorAddress.trim());
+    return cached && cached.expiresAt > Date.now() ? cached.report : undefined;
   }
 
   public clearCache(): void {

@@ -14,6 +14,7 @@ import {
 } from '@pump-fun/pump-sdk';
 import { PUMP_FUN_PROGRAM_ID, PUMP_FUN_FEE_RECIPIENT } from './programs';
 import { Logger } from '../middleware/enterprise';
+import { executionConfig } from './executionConfig';
 import { ExecutionMode, TriState } from '../core/types';
 
 export type { ExecutionMode };
@@ -66,6 +67,10 @@ export interface Token2022ExtensionReport {
   isSafe: boolean;
 }
 
+/**
+ * Token-2022 ExtensionType numbers, as in the installed @solana/spl-token (ExtensionType enum).
+ * Note 16/17 are the confidential transfer FEE extensions and MetadataPointer is 18; a test cross-checks these against the library.
+ */
 export const EXTENSION_TYPE_NAMES: Record<number, string> = {
   0: 'Uninitialized',
   1: 'TransferFeeConfig',
@@ -83,20 +88,27 @@ export const EXTENSION_TYPE_NAMES: Record<number, string> = {
   13: 'NonTransferableAccount',
   14: 'TransferHook',
   15: 'TransferHookAccount',
-  16: 'MetadataPointer',
-  17: 'TokenMetadata',
-  18: 'GroupPointer',
-  19: 'TokenGroup',
-  20: 'GroupMemberPointer',
-  21: 'TokenGroupMember',
-  22: 'ConfidentialTransferFeeConfig',
-  23: 'ConfidentialTransferFeeAmount',
-  24: 'ScaledUiAmountMint',
-  25: 'Pausable',
-  26: 'PausableAccount',
+  16: 'ConfidentialTransferFeeConfig',
+  17: 'ConfidentialTransferFeeAmount',
+  18: 'MetadataPointer',
+  19: 'TokenMetadata',
+  20: 'GroupPointer',
+  21: 'TokenGroup',
+  22: 'GroupMemberPointer',
+  23: 'TokenGroupMember',
+  24: 'ConfidentialMintBurn',
+  25: 'ScaledUiAmountMint',
+  26: 'Pausable',
+  27: 'PausableAccount',
+  28: 'PermissionedBurn',
 };
 
-export const ALLOWED_SAFE_EXTENSIONS = new Set<number>([16, 17, 18, 19, 20, 21]);
+export const ALLOWED_SAFE_EXTENSIONS = new Set<number>([18, 19, 20, 21, 22, 23]);
+
+/** A base SPL Mint is 82 bytes. Token-2022 pads mints with extensions to the 165-byte Account size, then 1 account-type byte (1 = Mint), then TLV. */
+export const MINT_BASE_LEN = 82;
+export const TOKEN_ACCOUNT_BASE_LEN = 165;
+export const ACCOUNT_TYPE_MINT = 1;
 
 export interface PumpMarketState {
   mint: PublicKey;
@@ -189,35 +201,38 @@ export function inspectToken2022Extensions(data: Buffer | Uint8Array): Token2022
   let hasCorruptTlv = false;
 
   const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  if (buf.length > 82) {
-    let offset = 82;
-    if (offset < buf.length) {
-      offset += 1;
-    }
-    while (offset + 4 <= buf.length) {
-      const extensionType = buf.readUInt16LE(offset);
-      const extensionLength = buf.readUInt16LE(offset + 2);
+  if (buf.length > MINT_BASE_LEN) {
+    if (buf.length <= TOKEN_ACCOUNT_BASE_LEN || buf[TOKEN_ACCOUNT_BASE_LEN] !== ACCOUNT_TYPE_MINT) {
+      // Longer than a base mint but without the padded account-type marker: not a layout we understand.
+      hasCorruptTlv = true;
+    } else {
+      let offset = TOKEN_ACCOUNT_BASE_LEN + 1;
+      while (offset + 4 <= buf.length) {
+        const extensionType = buf.readUInt16LE(offset);
+        const extensionLength = buf.readUInt16LE(offset + 2);
+        if (extensionType === 0) break; // Uninitialized: zero padding, end of TLV (same rule as spl-token)
 
-      if (offset + 4 + extensionLength > buf.length) {
-        hasCorruptTlv = true;
-        break;
+        if (offset + 4 + extensionLength > buf.length) {
+          hasCorruptTlv = true;
+          break;
+        }
+
+        detectedExtensionTypes.push(extensionType);
+        if (!ALLOWED_SAFE_EXTENSIONS.has(extensionType)) {
+          unsupportedExtensionTypes.push(extensionType);
+          unsupportedExtensionNames.push(EXTENSION_TYPE_NAMES[extensionType] || `UnknownExtension(${extensionType})`);
+        }
+
+        if (extensionType === 1 || extensionType === 2) hasTransferFee = true;
+        if (extensionType === 9 || extensionType === 13) isNonTransferable = true;
+        if (extensionType === 12) hasPermanentDelegate = true;
+        if (extensionType === 14 || extensionType === 15) hasTransferHook = true;
+        if (extensionType === 6) hasDefaultAccountState = true;
+        if (extensionType === 4 || extensionType === 5 || extensionType === 16 || extensionType === 17 || extensionType === 24) hasConfidentialTransfers = true;
+        if (extensionType === 26 || extensionType === 27) isPausable = true;
+
+        offset += 4 + extensionLength;
       }
-
-      detectedExtensionTypes.push(extensionType);
-      if (!ALLOWED_SAFE_EXTENSIONS.has(extensionType)) {
-        unsupportedExtensionTypes.push(extensionType);
-        unsupportedExtensionNames.push(EXTENSION_TYPE_NAMES[extensionType] || `UnknownExtension(${extensionType})`);
-      }
-
-      if (extensionType === 1 || extensionType === 2 || extensionType === 22 || extensionType === 23) hasTransferFee = true;
-      if (extensionType === 9 || extensionType === 13) isNonTransferable = true;
-      if (extensionType === 12) hasPermanentDelegate = true;
-      if (extensionType === 14 || extensionType === 15) hasTransferHook = true;
-      if (extensionType === 6) hasDefaultAccountState = true;
-      if (extensionType === 4 || extensionType === 5) hasConfidentialTransfers = true;
-      if (extensionType === 25 || extensionType === 26) isPausable = true;
-
-      offset += 4 + extensionLength;
     }
   }
 
@@ -414,17 +429,11 @@ export async function fetchTokenHolderDistribution(
     nonBondingCirculatingSupply = nonCurveAccounts.reduce((sum, acc) => sum + BigInt(acc.amount), 0n);
   }
 
-  // Calculate top 10 holders concentration (excluding bonding curve)
-  const top10Accounts = nonCurveAccounts.slice(0, 10);
-  const top10Amount = top10Accounts.reduce((sum, acc) => sum + BigInt(acc.amount), 0n);
-  const top10HoldersPct = nonBondingCirculatingSupply > 0n
-    ? Number(((Number(top10Amount) / Number(nonBondingCirculatingSupply)) * 100).toFixed(2))
-    : 0;
-
   // Calculate creator holding
   let creatorBalance = 0n;
+  const creatorAddrsForExclusion = new Set<string>();
   if (creator) {
-    const creatorAddresses = new Set<string>();
+    const creatorAddresses = creatorAddrsForExclusion;
     creatorAddresses.add(creator.toBase58());
     try {
       const creatorAtaSpl = PumpCurveService.getAssociatedTokenAddress(mint, creator, TOKEN_PROGRAM_ID);
@@ -455,15 +464,20 @@ export async function fetchTokenHolderDistribution(
     }
   }
 
-  const devHoldingPct = nonBondingCirculatingSupply > 0n
-    ? Number(((Number(creatorBalance) / Number(nonBondingCirculatingSupply)) * 100).toFixed(2))
-    : 0;
+  // C1: concentration is a share of TOTAL supply. The bonding curve and the
+  // creator are excluded from the top-10 list (creator is scored via devHoldingPct).
+  const holderAddrs = new Set<string>(creatorAddrsForExclusion);
+  const top10Accounts = nonCurveAccounts.filter((acc) => !holderAddrs.has(acc.address.toBase58())).slice(0, 10);
+  const top10Amount = top10Accounts.reduce((sum, acc) => sum + BigInt(acc.amount), 0n);
+  const pctOfTotal = (amt: bigint) =>
+    totalSupply > 0n ? Number(((Number(amt) / Number(totalSupply)) * 100).toFixed(2)) : 0;
+  const top10HoldersPct = pctOfTotal(top10Amount);
+
+  const devHoldingPct = pctOfTotal(creatorBalance);
 
   const topHolders = nonCurveAccounts.map((acc) => {
     const amountBig = BigInt(acc.amount);
-    const pct = nonBondingCirculatingSupply > 0n
-      ? Number(((Number(amountBig) / Number(nonBondingCirculatingSupply)) * 100).toFixed(2))
-      : 0;
+    const pct = pctOfTotal(amountBig);
     return {
       address: acc.address.toBase58(),
       amount: amountBig,
@@ -485,6 +499,10 @@ export async function fetchTokenHolderDistribution(
 
 export class PumpCurveService {
   public static cachedGlobal: any = null;
+  /** R19: mints whose account is not owned by a token program, with the reason, so the mark path can alert instead of falling through to PumpSwap. */
+  private static mintRejections = new Map<string, string>();
+  public static getMintRejection(mint: string): string | undefined { return PumpCurveService.mintRejections.get(mint); }
+  public static clearMintRejections(): void { PumpCurveService.mintRejections.clear(); }
   public static cachedFeeConfig: any = null;
   public static fetchTokenHolderDistribution = fetchTokenHolderDistribution;
   private static cacheTimestamp = 0;
@@ -584,7 +602,13 @@ export class PumpCurveService {
         return null;
       }
 
-      // Determine correct token program (SPL Token vs Token-2022)
+      // The token program is the mint account's owner, never inferred from its contents. Any other owner is not a mint.
+      if (!finalMintInfo.owner.equals(TOKEN_PROGRAM_ID) && !finalMintInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {
+        Logger.error(`Mint ${mint.toBase58()} is owned by ${finalMintInfo.owner.toBase58()}, not a token program`);
+        PumpCurveService.mintRejections.set(mint.toBase58(), `its account is owned by ${finalMintInfo.owner.toBase58()}, not a token program`);
+        return null;
+      }
+      PumpCurveService.mintRejections.delete(mint.toBase58());
       let baseTokenProgram = TOKEN_PROGRAM_ID;
       let token2022Report: Token2022ExtensionReport | undefined = undefined;
       if (finalMintInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {
@@ -814,14 +838,14 @@ export class PumpCurveService {
       state = paramsOrState.state;
       solAmountSol = paramsOrState.amountSol;
       slippageBps = paramsOrState.slippageBps ?? 800;
-      jitoTipSol = paramsOrState.jitoTipSol ?? 0.002;
+      jitoTipSol = paramsOrState.jitoTipSol ?? executionConfig.getConfig().defaultJitoTipSol;
       priorityFeeLamports = paramsOrState.priorityFeeLamports ?? 25000;
       executionMode = paramsOrState.executionMode;
     } else {
       state = paramsOrState;
       solAmountSol = solAmountArg!;
       slippageBps = slippageBpsArg ?? 800;
-      jitoTipSol = jitoTipSolArg ?? 0.002;
+      jitoTipSol = jitoTipSolArg ?? executionConfig.getConfig().defaultJitoTipSol;
       priorityFeeLamports = priorityFeeLamportsArg ?? 25000;
       if (modeArg !== 'LIVE' && modeArg !== 'PAPER') {
         throw new Error('CRITICAL_CONFIG_ERROR: executionMode ("LIVE" | "PAPER") is strictly required for calculateBuyQuote');
@@ -971,6 +995,14 @@ export class PumpCurveService {
       customTokensToReceiveRaw = state.virtualTokenReserves - newVirtualTokens;
     }
 
+    if (isLiveMode && customTokensToReceiveRaw > state.realTokenReserves) {
+      // The program caps a buy at what is left on the curve (and completes it). That is not a math error, but this app
+      // does not size final-fill buys: refuse with a plain reason instead of tripping the discrepancy alarm below.
+      throw new Error(
+        `CURVE_NEARLY_COMPLETE: a ${solAmountSol} SOL buy needs ${customTokensToReceiveRaw} tokens but only ${state.realTokenReserves} remain on the curve. Use a smaller size.`
+      );
+    }
+
     if (!sdkQuoteSucceeded) {
       tokensToReceiveRaw = customTokensToReceiveRaw;
     } else if (isLiveMode) {
@@ -1050,14 +1082,14 @@ export class PumpCurveService {
       state = paramsOrState.state;
       tokenAmountRaw = paramsOrState.tokenAmountRaw;
       slippageBps = paramsOrState.slippageBps ?? 800;
-      jitoTipSol = paramsOrState.jitoTipSol ?? 0.002;
+      jitoTipSol = paramsOrState.jitoTipSol ?? executionConfig.getConfig().defaultJitoTipSol;
       priorityFeeLamports = paramsOrState.priorityFeeLamports ?? 25000;
       executionMode = paramsOrState.executionMode;
     } else {
       state = paramsOrState;
       tokenAmountRaw = tokenAmountRawArg!;
       slippageBps = slippageBpsArg ?? 800;
-      jitoTipSol = jitoTipSolArg ?? 0.002;
+      jitoTipSol = jitoTipSolArg ?? executionConfig.getConfig().defaultJitoTipSol;
       priorityFeeLamports = priorityFeeLamportsArg ?? 25000;
       if (modeArg !== 'LIVE' && modeArg !== 'PAPER') {
         throw new Error('CRITICAL_CONFIG_ERROR: executionMode ("LIVE" | "PAPER") is strictly required for calculateSellQuote');
@@ -1178,22 +1210,23 @@ export class PumpCurveService {
 
     const customGrossSolOut = state.virtualSolReserves - newVirtualSol;
 
-    if (!sdkQuoteSucceeded) {
-      grossSolOutLamports = customGrossSolOut;
-    } else if (isLiveMode) {
-      // R0.2: Cross-check custom quote math against official SDK and require exact integer-semantic agreement
-      if (customGrossSolOut !== grossSolOutLamports) {
+    // The official SDK function returns the NET amount (curve output minus protocol and creator fee, each fee rounded up).
+    // Comparing the app's GROSS curve output to it made every LIVE sell fail QUOTE_MATH_DISCREPANCY whenever the fee is
+    // non-zero, and treating the SDK value as gross charged the fee twice (found by the localnet end-to-end run).
+    const ceilFee = (amount: bigint, bps: number) => (amount * BigInt(bps) + 9999n) / 10000n;
+    const grossSolOut = customGrossSolOut;
+    const protocolFeeLamports = ceilFee(grossSolOut, protocolFeeBps);
+    const creatorFeeLamports = state.creator.equals(PublicKey.default) ? 0n : ceilFee(grossSolOut, creatorFeeBps);
+    const netSolOutLamports = grossSolOut - protocolFeeLamports - creatorFeeLamports;
+
+    if (sdkQuoteSucceeded && isLiveMode) {
+      // R0.2: cross-check the app's net proceeds against the official SDK's and require exact integer agreement.
+      if (netSolOutLamports !== grossSolOutLamports) {
         throw new Error(
-          `QUOTE_MATH_DISCREPANCY: Custom sell math (${customGrossSolOut}) diverges from official SDK (${grossSolOutLamports}) in LIVE mode. Failing closed.`
+          `QUOTE_MATH_DISCREPANCY: Custom sell math (${netSolOutLamports} net) diverges from official SDK (${grossSolOutLamports} net) in LIVE mode. Failing closed.`
         );
       }
     }
-
-    const totalFeeBps = BigInt(protocolFeeBps + creatorFeeBps);
-    const totalFeeLamports = (grossSolOutLamports * totalFeeBps) / 10000n;
-    const protocolFeeLamports = totalFeeBps > 0n ? (totalFeeLamports * BigInt(protocolFeeBps)) / totalFeeBps : 0n;
-    const creatorFeeLamports = totalFeeLamports - protocolFeeLamports;
-    const netSolOutLamports = grossSolOutLamports - totalFeeLamports;
 
     // Spot price in SOL per human token
     const spotPriceSol =

@@ -220,14 +220,16 @@ export type AuthorTier =
   | 'MARKET_MAKER_BOT'
   | 'TOP_KOL'
   | 'DEV_DEPLOYER'
-  | 'SMART_WALLET';
+  | 'SMART_WALLET'
+  | 'UNVERIFIED'; // discovered on the feed; nothing is known about who is behind it
 
 export type SignalPattern =
   | 'STEALTH_ACCUMULATION'
   | 'CABAL_LAUNCH'
   | 'MM_VOLUME_BOT'
   | 'MIGRATION_SNIPE'
-  | 'KOL_COORDINATED';
+  | 'KOL_COORDINATED'
+  | 'UNCLASSIFIED';
 
 export type SignalProvenance =
   | 'LIVE_PUMP_STREAM'
@@ -256,8 +258,8 @@ export interface SocialSignal {
   contractAddress: string;
   chain: 'SOLANA' | 'BASE' | 'ETHEREUM' | 'TRON';
   signalPattern: SignalPattern;
-  confidenceScore: number; // 0 - 100
-  sentimentScore: number; // -1.0 to +1.0
+  confidenceScore: number | null; // 0 - 100; null = not scored
+  sentimentScore: number | null; // -1.0 to +1.0; null = not scored
   liquidityUsd?: number;
   marketCapUsd?: number;
   metrics: {
@@ -266,7 +268,7 @@ export interface SocialSignal {
     subscribers?: number;
     whaleCount?: number;
   };
-  actionSuggested: 'SNIPE_IMMEDIATE' | 'MONITOR_VOLUME' | 'AVOID_HONEYPOT';
+  actionSuggested: 'SNIPE_IMMEDIATE' | 'MONITOR_VOLUME' | 'AVOID_HONEYPOT' | 'REVIEW';
   status: 'NEW' | 'SNIPED' | 'DISMISSED';
   externalUrl?: string;
   socials?: {
@@ -312,6 +314,11 @@ export interface MemecoinPool {
   devHoldingPct: number;
   isMintRevoked: boolean;
   isFreezeRevoked: boolean;
+  /**
+   * Q10d: false when isMintRevoked / isFreezeRevoked are placeholders (a pool made from a create event, a demo pool) and have not been read
+   * from the chain. The execution path reads the chain itself; this flag only stops a screen from showing a placeholder as a fact.
+   */
+  authoritiesVerified?: boolean;
   isLpBurned: boolean;
   rugcheckScore: 'SAFE' | 'CAUTION' | 'DANGEROUS';
   createdAgo: string;
@@ -346,7 +353,7 @@ export interface SniperBotConfig {
   minConfidenceScore: number;
   defaultSnipeAmountUsd: number;
   maxSlippagePct: number;
-  jitoTipSol: number;
+  jitoTipSol?: number; // optional operator override; absent = dynamic policy (C6)
   takeProfitPct: number;
   stopLossPct: number;
   trailingStopEnabled: boolean;
@@ -448,9 +455,11 @@ export interface PumpFunHotCallout {
     currentMultiple: number;
     complete: boolean; // Raydium / PumpSwap migration status
     raydiumPool?: string;
-    volume5mUsd: number;
-    buys5m: number;
-    sells5m: number;
+    // null = not provided by the feed (never an invented value)
+    volume5mUsd: number | null;
+    buys5m: number | null;
+    sells5m: number | null;
+    priceChange5mPct?: number | null;
     top10HoldersPct: number;
     devHoldingPct: number;
     isMintRevoked: boolean;

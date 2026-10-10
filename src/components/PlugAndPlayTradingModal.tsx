@@ -1,3 +1,4 @@
+import { ARMED_MESSAGE, PANIC_CONFIRM_TEXT, panicOutcome } from '../utils/tradingCopy';
 import React, { useState, useEffect } from 'react';
 import {
   Wallet,
@@ -22,6 +23,7 @@ import {
 } from 'lucide-react';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
 import { authFetch } from '../services/engineClient';
+import { positionPnlCell } from '../utils/positionPnl';
 
 interface PlugAndPlayTradingModalProps {
   isOpen: boolean;
@@ -36,6 +38,7 @@ interface SystemAudit {
   walletPubkey: string;
   signerStatus: 'READY' | 'LOCKED' | 'NOT_CONFIGURED';
   rpcEndpoint: string;
+  allowedCluster?: string;
   rpcLatencyMs: number;
   databaseFile: string;
   dbDriver: string;
@@ -51,6 +54,7 @@ interface RiskControls {
   maxAggregateExposureSol: number;
   dailyLossSoFarSol: number;
   circuitBreakerTripped: boolean;
+  circuitBreakerState?: 'CLOSED' | 'OPEN' | 'HALF_OPEN';
 }
 
 export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = ({ isOpen, onClose }) => {
@@ -82,9 +86,9 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   const fetchSystemData = async () => {
     try {
       const [diagRes, posRes, evRes] = await Promise.all([
-        fetch('/api/diagnostics/system'),
-        fetch('/api/workstation/positions'),
-        fetch('/api/workstation/events?limit=25'),
+        authFetch('/api/diagnostics/system'),
+        authFetch('/api/workstation/positions'),
+        authFetch('/api/workstation/events?limit=25'),
       ]);
 
       if (diagRes.ok) {
@@ -150,7 +154,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
       if (!res.ok) throw new Error(data.error || 'Failed to arm live trading');
 
       setStatusMessage({
-        text: 'LIVE TRADING ARMED: On-chain transactions will now execute via Jito MEV bundles with real SOL.',
+        text: ARMED_MESSAGE(systemAudit?.allowedCluster),
         type: 'success',
       });
       setShowArmConfirmModal(false);
@@ -171,7 +175,11 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ arm: false }),
       });
-      await res.json();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.success === false) {
+        setStatusMessage({ text: data.message || data.error || `Disarm failed (HTTP ${res.status}). Live trading may still be armed.`, type: 'error' });
+        return;
+      }
       setStatusMessage({ text: 'Trading disarmed. Defaulting safely to paper simulation mode.', type: 'info' });
       await fetchSystemData();
     } catch (err: any) {
@@ -253,12 +261,13 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   };
 
   const handlePanicLiquidate = async () => {
-    if (!confirm('EMERGENCY: Are you sure you want to close ALL open positions immediately and trip the circuit breaker?')) return;
+    if (!confirm(PANIC_CONFIRM_TEXT)) return;
     try {
       setIsLoading(true);
       const res = await authFetch('/api/wallet/panic-liquidate', { method: 'POST' });
-      const data = await res.json();
-      setStatusMessage({ text: data.message, type: 'error' });
+      const data = await res.json().catch(() => ({}));
+      setStatusMessage(panicOutcome(res.ok, res.status, data));
+      if (!res.ok) return;
       await fetchSystemData();
     } catch (err: any) {
       setStatusMessage({ text: err.message || 'Panic liquidate failed', type: 'error' });
@@ -283,12 +292,14 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                 <h2 className="text-base sm:text-lg font-bold text-white tracking-wide">SOLANA TRADING WORKSTATION</h2>
                 <span
                   className={`px-2 py-0.5 text-xs font-bold rounded ${
-                    systemAudit?.isLiveArmed
-                      ? 'bg-rose-500/20 text-rose-400 border border-rose-500/40 animate-pulse'
-                      : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                    !systemAudit
+                      ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                      : systemAudit.isLiveArmed
+                        ? 'bg-rose-500/20 text-rose-400 border border-rose-500/40 animate-pulse'
+                        : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
                   }`}
                 >
-                  {systemAudit?.isLiveArmed ? 'LIVE BROADCAST ACTIVE' : 'PAPER TRADING (SAFE)'}
+                  {!systemAudit ? 'MODE UNKNOWN' : systemAudit.isLiveArmed ? 'LIVE BROADCAST ACTIVE' : 'PAPER TRADING'}
                 </span>
                 <span className="px-1.5 py-0.5 text-[10px] font-mono rounded bg-slate-800 text-slate-300 border border-slate-700">
                   MICRO $10 TIER
@@ -328,7 +339,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                 }`}
               />
               <span className={`font-bold ${systemAudit?.isLiveArmed ? 'text-rose-400' : 'text-emerald-400'}`}>
-                {systemAudit?.mode || 'PAPER'}
+                {systemAudit?.mode || 'UNKNOWN'}
               </span>
             </div>
           </div>
@@ -336,7 +347,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
           <div className="p-2.5 rounded-lg bg-slate-900/80 border border-slate-800">
             <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-0.5">Wallet Balance</span>
             <span className="text-white font-bold text-sm">
-              {systemAudit?.walletSolBalance !== null ? `${systemAudit?.walletSolBalance} SOL` : 'Unconfirmed'}
+              {systemAudit?.walletSolBalance != null ? `${systemAudit.walletSolBalance} SOL` : 'Unconfirmed'}
             </span>
           </div>
 
@@ -356,10 +367,10 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
             <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-0.5">Circuit Breaker</span>
             <span
               className={`font-bold text-xs ${
-                riskControls?.circuitBreakerTripped ? 'text-rose-400' : 'text-emerald-400'
+                riskControls?.circuitBreakerState === 'OPEN' ? 'text-rose-400' : riskControls?.circuitBreakerState === 'HALF_OPEN' ? 'text-amber-400' : 'text-emerald-400'
               }`}
             >
-              {riskControls?.circuitBreakerTripped ? 'TRIPPED (HALTED)' : 'NORMAL (ACTIVE)'}
+              {riskControls?.circuitBreakerState === 'OPEN' ? 'TRIPPED (HALTED)' : riskControls?.circuitBreakerState === 'HALF_OPEN' ? 'RECOVERING (HALF-OPEN)' : riskControls ? 'NORMAL (ACTIVE)' : '—'}
             </span>
           </div>
 
@@ -368,7 +379,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
               <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-0.5">RPC Latency</span>
               <span className="text-cyan-400 font-bold text-sm flex items-center">
                 <Radio className="w-3.5 h-3.5 mr-1" />
-                {systemAudit?.rpcLatencyMs || 0} ms
+                {systemAudit?.rpcLatencyMs != null ? `${systemAudit.rpcLatencyMs} ms` : 'n/a'}
               </span>
             </div>
             <button
@@ -401,7 +412,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                 : 'border-transparent text-slate-400 hover:text-slate-200'
             }`}
           >
-            Open Positions ({positions.filter((p) => p.status === 'OPEN').length})
+            Open Positions ({positions.filter((p) => p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED').length})
           </button>
           <button
             onClick={() => setActiveTab('RISK_LOGS')}
@@ -458,8 +469,8 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                 </h3>
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-slate-300 text-[11px] leading-relaxed">
                   <div className="p-2.5 rounded-lg bg-slate-900/60 border border-slate-800 space-y-1">
-                    <strong className="text-white block">1. Micro-Capital $10 Envelope:</strong>
-                    Max trade size is capped strictly at 0.02 SOL (~$2.90 USD). Max aggregate exposure is capped at 0.06 SOL (~$8.70 USD) to ensure rent exemption and transaction fees are preserved.
+                    <strong className="text-white block">1. Server-enforced size caps:</strong>
+                    Max trade size and aggregate exposure are capped by the server's risk limits (MAX_POSITION_SIZE_SOL and the capital tier), and a SOL reserve for rent and fees is kept back. The live numbers are on the wallet strip, not here.
                   </div>
                   <div className="p-2.5 rounded-lg bg-slate-900/60 border border-slate-800 space-y-1">
                     <strong className="text-white block">2. Signer Isolation & Security:</strong>
@@ -467,7 +478,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                   </div>
                   <div className="p-2.5 rounded-lg bg-slate-900/60 border border-slate-800 space-y-1">
                     <strong className="text-white block">3. Isolated Paper Engine:</strong>
-                    The HFT OrderBook/Avellaneda-Stoikov engine on BTC/ETH is purely simulated in-memory and isolated from real-money Solana wallet logic.
+                    The BTC/ETH engine console is a simulation and does not touch the Solana wallet. Paper snipes are modeled fills against the curve quote.
                   </div>
                   <div className="p-2.5 rounded-lg bg-slate-900/60 border border-slate-800 space-y-1">
                     <strong className="text-white block">4. Deterministic SQLite Storage:</strong>
@@ -553,28 +564,27 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                     </thead>
                     <tbody className="divide-y divide-slate-800 bg-slate-900/40">
                       {positions
-                        .filter((p) => !positionSearchQuery || p.symbol.toLowerCase().includes(positionSearchQuery.toLowerCase()))
+                        .filter((p) => !positionSearchQuery || (p.symbol ?? '').toLowerCase().includes(positionSearchQuery.toLowerCase()))
                         .map((pos) => (
                           <tr key={pos.id}>
                             <td className="p-2.5 font-mono">
-                              <div className="font-bold text-white">${pos.symbol}</div>
+                              <div className="font-bold text-white">${pos.symbol || pos.mint.slice(0, 6)}</div>
                               <span className="text-[10px] text-slate-400 truncate block max-w-[140px]">{pos.mint}</span>
                             </td>
                             <td className="p-2.5">
                               <span
                                 className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
-                                  pos.mode === 'LIVE' ? 'bg-rose-500/20 text-rose-300' : 'bg-emerald-500/20 text-emerald-300'
+                                  pos.executionMode === 'LIVE' ? 'bg-rose-500/20 text-rose-300' : 'bg-emerald-500/20 text-emerald-300'
                                 }`}
                               >
-                                {pos.mode}
+                                {pos.executionMode}
                               </span>
                             </td>
                             <td className="p-2.5 font-mono">{((pos.costBasisLamports ?? 0) / 1e9).toFixed(4)} SOL</td>
                             <td className="p-2.5 font-mono">{(pos.currentValueSol ?? 0).toFixed(4)} SOL</td>
                             <td className="p-2.5 font-mono font-bold">
-                              <span className={(pos.unrealizedPnlPct ?? 0) >= 0 ? 'text-emerald-400' : 'text-rose-400'}>
-                                {(pos.unrealizedPnlPct ?? 0) >= 0 ? '+' : ''}
-                                {(pos.unrealizedPnlPct ?? 0).toFixed(1)}%
+                              <span className={positionPnlCell(pos).positive ? 'text-emerald-400' : 'text-rose-400'}>
+                                {positionPnlCell(pos).text}
                               </span>
                             </td>
                             <td className="p-2.5">
@@ -587,7 +597,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                               </span>
                             </td>
                             <td className="p-2.5 text-right">
-                              {pos.status === 'OPEN' && (
+                              {(pos.status === 'OPEN' || pos.status === 'PARTIALLY_CLOSED') && (
                                 <button
                                   onClick={() => handleClosePosition(pos.id)}
                                   className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-rose-300 text-[11px] font-bold"
@@ -655,7 +665,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
 
                 <div className="flex items-center space-x-3 pt-2">
                   <button
-                    onClick={handleGenerateKeypair}
+                    onClick={() => handleGenerateKeypair(false)}
                     disabled={isLoading}
                     className="px-3.5 py-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs flex items-center space-x-1.5"
                   >
@@ -675,7 +685,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
         <div className="p-4 border-t border-slate-800 bg-slate-950 flex flex-col sm:flex-row items-center justify-between gap-3">
           <div className="flex items-center space-x-2 text-xs text-slate-400">
             <Shield className="w-4 h-4 text-emerald-400" />
-            <span>Risk-governed execution. Jito MEV protection on all on-chain broadcasts.</span>
+            <span>Risk-governed execution. Jito bundles are used on mainnet-beta only; devnet and localnet send plain transactions.</span>
           </div>
 
           <div className="flex items-center space-x-2.5 w-full sm:w-auto">
@@ -719,12 +729,13 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
               <span>CONFIRM LIVE SOLANA BROADCAST</span>
             </div>
             <p className="text-xs text-slate-300 leading-relaxed">
-              You are about to arm real-money live trading on the Solana mainnet. Any snipes will consume real SOL from your funded hot wallet via Jito MEV bundles.
+              You are about to arm live trading on {systemAudit?.allowedCluster ?? 'the configured cluster'}. Snipes will spend SOL from the local signer wallet as ordinary transactions
+              (Jito bundles exist only on mainnet, which this build does not use).
             </p>
             <div className="p-3 rounded-lg bg-slate-950 border border-slate-800 text-[11px] space-y-1 font-mono text-slate-400">
-              <div>• Tier: MICRO_10 (0.02 SOL max order size)</div>
-              <div>• Daily Drawdown Cap: 20% (~$2.50 USD)</div>
-              <div>• Jito Priority Tip: {jitoTipSol} SOL</div>
+              <div>• Max order size: {riskControls ? `${riskControls.maxPositionSol} SOL` : '—'}</div>
+              <div>• Daily loss limit: {riskControls ? `${riskControls.maxDailyLossSol} SOL` : '—'}</div>
+              <div>• Max total exposure: {riskControls ? `${riskControls.maxAggregateExposureSol} SOL` : '—'}</div>
             </div>
             <div>
               <label className="block text-[11px] font-bold text-slate-400 mb-1">

@@ -1,5 +1,7 @@
 # Apex HFT Execution Engine (Rust)
 
+> **STATUS: not used.** Nothing in this repository builds, links, spawns or calls this crate (no `npm` script, no `server/` import, no CI step). Latency figures quoted elsewhere for it were never measured by this project.
+
 > **ARCHITECTURAL BOUNDARY & ROLE NOTICE (B21):**
 > `crates/apex_hft_engine` is a standalone, ultra-low-latency reference benchmark and simulation harness for centralized exchange (CEX) L2 order book matching and Avellaneda-Stoikov market making.
 > **Production Solana DEX execution** (Pump.fun V2 bonding curves, PumpSwap AMM pools, Jito bundle transport, on-chain position monitoring, and wallet signing) is driven entirely by the TypeScript engine located in `server/`. The Rust crate serves as an independent quantitative benchmark and does NOT broadcast Solana blockchain transactions.

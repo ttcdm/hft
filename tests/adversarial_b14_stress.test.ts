@@ -1,3 +1,5 @@
+import { setAutoMode, releaseHotCallouts } from './fixtures/auto';
+import { seedSurge, clearVelocity } from './fixtures/velocity';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair, PublicKey } from '@solana/web3.js';
 import {
@@ -25,13 +27,14 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
   const MINT_B = 'MintAdversarial2222222222222222222222222222222';
   const CREATOR_ADDR = 'CreatorStressTestWallet11111111111111111111111';
 
-  beforeEach(() => {
+  beforeEach(async () => {
     curveVelocityEvaluator.clear();
     creatorRiskScorer.clearCache();
     memecoinAggregator.setConfluenceGating(false);
     (pumpfunService as any).snipedMints.clear();
     vi.restoreAllMocks();
     vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
+    await setAutoMode('PAPER'); // G1: the controller owns auto trading; PAPER sends candidates on to executeSnipe
   });
 
   afterEach(() => {
@@ -287,7 +290,7 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
       const report = await scorer.evaluateCreator(failingRpc as any, pubkey);
 
       expect(report.isBurner).toBe(true);
-      expect(report.confluenceScore).toBe(1); // Conservative fallback
+      expect(report.confluenceScore).toBe(0); // C2: a failed lookup earns no points
       expect(report.riskFlags).toContain('RPC_HISTORY_QUERY_FAILED');
       expect(report.details).toContain('RPC rate limit exceeded');
     });
@@ -425,7 +428,7 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
         priceChange5mPct: 200,
         liquidityUsd: 1_000_000,
         top10HoldersPct: 0,
-        bondingCurveProgress: 100,
+        bondingCurveProgress: 100, curveVelocityMetrics: { velocityScore: 15 } as any, // C2: measured velocity stands in for the removed progress fallback
         buys5m: 1000,
         sells5m: 0,
         devHoldingPct: 0,
@@ -480,7 +483,8 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
 
       // 1. With enforceConfluence = true -> Score is 68 -> REJECTED
       const evalRes = memecoinAggregator.evaluateTokenConfluence(borderlinePool68);
-      expect(evalRes.score).toBe(68);
+      // C2: no measured velocity -> 0 curve points (progress no longer buys any): 15+10+10+16+5 = 56
+      expect(evalRes.score).toBe(56);
       expect(evalRes.passed).toBe(false);
 
       const rejectedSnipe = await memecoinAggregator.executeSnipe({
@@ -489,12 +493,12 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
         enforceConfluence: true,
       });
       expect(rejectedSnipe.success).toBe(false);
-      expect(rejectedSnipe.message).toContain('REJECTED: Confluence score 68/100 failed minimum threshold of 70');
+      expect(rejectedSnipe.message).toContain('REJECTED: Confluence score 56/100 failed minimum threshold of 70');
 
-      // 2. Now boost token slightly (add verified social trending rank -> +5 social pts -> score 73)
-      borderlinePool68.trendingRank = 3; // Rank 3 gives Math.max(1, 4 - 3) * 5 = 5 pts
+      // 2. Now give it measured trade flow: a real surge on the curve earns the full 15 velocity points -> 71
+      seedSurge(borderlinePool68.contractAddress);
       const evalRes73 = memecoinAggregator.evaluateTokenConfluence(borderlinePool68);
-      expect(evalRes73.score).toBe(73);
+      expect(evalRes73.score).toBe(71);
       expect(evalRes73.passed).toBe(true);
 
       vi.spyOn(executionCoordinator, 'executeTrade').mockResolvedValueOnce({
@@ -511,7 +515,8 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
         enforceConfluence: true,
       });
       expect(approvedSnipe.success).toBe(true);
-      expect(approvedSnipe.confluenceScore).toBe(73);
+      expect(approvedSnipe.confluenceScore).toBe(71);
+      clearVelocity(borderlinePool68.contractAddress);
     });
 
     it('respects global setConfluenceGating flag across all snipes', async () => {
@@ -717,6 +722,7 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
       (pumpfunService as any).hotCallouts = [mockCallout];
       const snipeSpy = vi.spyOn(memecoinAggregator, 'executeSnipe');
 
+      releaseHotCallouts(pumpfunService);
       await (pumpfunService as any).evaluateAutoSnipeTriggers();
 
       // Even with 5 callers, composite score is poor (< 70) so snipe is BLOCKED
@@ -764,6 +770,7 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
           currentMultiple: 1.25,
           complete: false,
           volume5mUsd: 30000,
+          priceChange5mPct: 40, // B3: measured 5m change; missing data scores 0 and is no longer derived from the multiple
           buys5m: 90,
           sells5m: 10,
           top10HoldersPct: 12.0,
@@ -782,6 +789,7 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
         status: 'ACTIVE',
       };
 
+      seedSurge(highQualityCallout.token.mint); // C2: velocity must be measured
       (pumpfunService as any).hotCallouts = [highQualityCallout];
       const snipeSpy = vi.spyOn(memecoinAggregator, 'executeSnipe').mockResolvedValueOnce({
         success: true,
@@ -789,6 +797,7 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
         txHash: 'tx-snipe-confluence-ok',
       });
 
+      releaseHotCallouts(pumpfunService);
       await (pumpfunService as any).evaluateAutoSnipeTriggers();
 
       // Triggered snipe through confluence path

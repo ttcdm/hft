@@ -81,12 +81,12 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
       expect(dist.nonBondingCirculatingSupply).toBe(300000000000000n);
       expect(dist.creatorBalance).toBe(24000000000000n);
 
-      // Creator holds 24M / 300M non-bonding supply = 8.00%
-      expect(dist.devHoldingPct).toBe(8.0);
+      // C1: creator holds 24M / 1B total supply = 2.4%
+      expect(dist.devHoldingPct).toBe(2.4);
 
       // Top 10 non-bonding accounts:
-      // Creator (24M) + 9 holders * 6M (54M) = 78M tokens out of 300M = 26.00%
-      expect(dist.top10HoldersPct).toBe(26.0);
+      // C1: creator excluded; 10 non-creator holders = 56M of 1B total = 5.6%
+      expect(dist.top10HoldersPct).toBe(5.6);
     });
 
     it('B01.2: EligibilityFilter passes when verified metrics satisfy thresholds and rejects when exceeded', () => {
@@ -97,8 +97,8 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
           symbol: 'SAFE',
           name: 'Safe Token',
           liquidityUsd: 15000,
-          devHoldingPct: 4.5, // <= 10.0% threshold
-          top10HoldersPct: 22.0, // <= 40.0% threshold
+          devHoldingPct: 4.5, // <= 5.0% threshold (C1b)
+          top10HoldersPct: 12.0, // <= 20.0% threshold (C1b)
           isMintAuthorityRevoked: true,
           isFreezeAuthorityRevoked: true,
         },
@@ -119,8 +119,8 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
           symbol: 'RUG',
           name: 'Rug Token',
           liquidityUsd: 15000,
-          devHoldingPct: 18.5, // > 10.0% -> Excessive creator exposure
-          top10HoldersPct: 62.0, // > 40.0% -> High cartel dump risk
+          devHoldingPct: 18.5, // > 5.0% -> Excessive creator exposure
+          top10HoldersPct: 62.0, // > 20.0% -> High cartel dump risk
           isMintAuthorityRevoked: true,
           isFreezeAuthorityRevoked: true,
         },
@@ -161,7 +161,7 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
       } as unknown as Connection;
 
       const dist = await PumpCurveService.fetchTokenHolderDistribution(mockConn, mint, creator, bondingCurve);
-      expect(dist.devHoldingPct).toBe(3.0);
+      expect(dist.devHoldingPct).toBe(0.9); // C1: share of total supply
       expect(dist.devHoldingPct).toBeLessThanOrEqual(10.0);
       expect(dist.top10HoldersPct).toBeLessThanOrEqual(40.0);
     });
@@ -393,7 +393,7 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
       });
     });
 
-    it('B20.1: getDailyTotalPnLSol accurately sums closed PnL, open unrealized PnL, and fees', () => {
+    it('B20.1: getDailyTotalPnLSol sums closed PnL and open unrealized PnL; the fees of landed trades are already inside them (Q3)', () => {
       const mint1 = Keypair.generate().publicKey.toBase58();
       const mint2 = Keypair.generate().publicKey.toBase58();
 
@@ -434,7 +434,7 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
         status: 'OPEN',
       });
 
-      // 3. Transactions with fees paid (0.001 SOL total)
+      // 3. A landed trade's fee and tip (0.001 SOL) are part of its position's cost basis, so they must not be subtracted again
       db.saveTransaction({
         signature: 'tx-1',
         orderId: 'ord-1',
@@ -449,9 +449,9 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
         executionMode: 'LIVE',
       });
 
-      // Daily Total PnL = -0.005 (realized) + (-0.012 unrealized) - 0.001 (fees) = -0.018 SOL
+      // Daily Total PnL = -0.005 (realized) + (-0.012 unrealized) = -0.017 SOL; Q3: the 0.001 SOL fee is not taken a second time
       const totalPnL = db.getDailyTotalPnLSol('LIVE');
-      expect(totalPnL).toBeCloseTo(-0.018, 4);
+      expect(totalPnL).toBeCloseTo(-0.017, 4);
     });
 
     it('B20.2: risk engine halts trading when open position unrealized drawdown breaches daily loss threshold', () => {

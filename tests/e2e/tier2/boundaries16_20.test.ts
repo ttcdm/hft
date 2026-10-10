@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { executionConfig } from '../../../server/solana/executionConfig';
+import { executionConfig, ECONOMIC_TIP_CAP_FRACTION } from '../../../server/solana/executionConfig';
 import { HardenedRiskEngine } from '../../../server/risk/riskEngine';
 import { WorkstationDatabase } from '../../../server/db/database';
 import { ExitEngine } from '../../../server/exits/exitEngine';
@@ -61,11 +61,14 @@ describe('Tier 2: Boundary & Corner Cases (Features 16 - 20)', () => {
       expect(tip.policyReason).toContain('CAPPED by operator maximum');
     });
 
-    it('B16.4: trade amount where 25% economic cap is below minFloorLamports respects minFloorLamports', () => {
-      const tip = executionConfig.resolveDynamicJitoTip({
-        tradeAmountSol: 0.0001, // 25% = 0.000025 SOL < minJitoTipSol (0.0001)
+    // Decision #1 (planning thread): the economic tip cap is 15% of notional, as in the code. Read from executionConfig.
+    it('B16.4: a cap below 10,000 lamports is ignored and minFloorLamports is respected; above it the 15% cap wins', () => {
+      const tiny = executionConfig.resolveDynamicJitoTip({
+        tradeAmountSol: 0.00005, // 15% = 7,500 lamports < 10,000: cap not applied
       });
-      expect(tip.tipSol).toBeGreaterThanOrEqual(executionConfig.getConfig().minJitoTipSol);
+      expect(tiny.tipSol).toBeGreaterThanOrEqual(executionConfig.getConfig().minJitoTipSol);
+      const small = executionConfig.resolveDynamicJitoTip({ tradeAmountSol: 0.0001 }); // 15% = 15,000 lamports
+      expect(small.tipLamports).toBe(Math.round(0.0001 * ECONOMIC_TIP_CAP_FRACTION * 1e9));
     });
 
     it('B16.5: explicit tip override exceeding operator max ceiling is clamped down to operator max', () => {

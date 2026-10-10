@@ -52,6 +52,30 @@ export class Logger {
   }
 }
 
+const SENSITIVE_QUERY_PARAM = /secret|key|token|signature|sig|password|passwd|auth|credential|private|mnemonic|seed/i;
+
+/** URL safe to log: values of query parameters whose names look like credentials are replaced with [REDACTED]. */
+export function redactUrl(url: string | undefined): string {
+  if (!url) return '';
+  const q = url.indexOf('?');
+  if (q < 0) return url;
+  const base = url.slice(0, q);
+  const hash = url.indexOf('#', q);
+  const query = url.slice(q + 1, hash < 0 ? undefined : hash);
+  const tail = hash < 0 ? '' : url.slice(hash);
+  const out = query
+    .split('&')
+    .map((pair) => {
+      const eq = pair.indexOf('=');
+      const rawName = eq < 0 ? pair : pair.slice(0, eq);
+      let name = rawName;
+      try { name = decodeURIComponent(rawName.replace(/\+/g, ' ')); } catch { /* keep raw */ }
+      return SENSITIVE_QUERY_PARAM.test(name) ? `${rawName}=[REDACTED]` : pair;
+    })
+    .join('&');
+  return `${base}?${out}${tail}`;
+}
+
 // Correlation ID Middleware
 export function correlationIdMiddleware(req: Request, res: Response, next: NextFunction) {
   const correlationId = (req.headers['x-correlation-id'] as string) || crypto.randomUUID();
@@ -61,9 +85,9 @@ export function correlationIdMiddleware(req: Request, res: Response, next: NextF
   const start = performance.now();
   res.on('finish', () => {
     const durationMs = Number((performance.now() - start).toFixed(2));
-    Logger.info(`${req.method} ${req.originalUrl} [${res.statusCode}] - ${durationMs}ms`, {
+    Logger.info(`${req.method} ${redactUrl(req.originalUrl)} [${res.statusCode}] - ${durationMs}ms`, {
       correlationId,
-      endpoint: req.originalUrl,
+      endpoint: redactUrl(req.originalUrl),
       method: req.method,
       statusCode: res.statusCode,
       durationMs,
@@ -121,7 +145,7 @@ export function errorHandler(err: any, req: Request, res: Response, next: NextFu
 
   Logger.error(`Error processing request: ${message}`, {
     correlationId,
-    endpoint: req.originalUrl,
+    endpoint: redactUrl(req.originalUrl),
     method: req.method,
     statusCode,
     code,
@@ -189,7 +213,9 @@ export const WalletConfigSchema = z.object({
     .string()
     .url('RPC Endpoint must be a valid HTTP or HTTPS URL')
     .refine(isSafeExternalUrl, 'RPC Endpoint cannot point to private metadata services or use embedded credentials')
-    .default(DEFAULT_RPC_URL),
+    // Absent leaves the current endpoint alone. (A default here silently re-pointed the RPC at the public devnet URL on every
+    // config save, which also fails the cluster check when running against a local validator.)
+    .optional(),
   wsRpcEndpoint: z
     .string()
     .url('WebSocket RPC must be a valid WS or WSS URL')
@@ -207,7 +233,7 @@ export const WalletConfigSchema = z.object({
     .string()
     .regex(SOLANA_ADDRESS_REGEX, 'Invalid Jito tip account public key')
     .default('96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5'),
-  jitoTipSol: z.number().min(0.0001).max(0.2).default(0.002),
+  jitoTipSol: z.number().min(0.0001).max(0.2).optional(), // absent leaves the stored value alone (C6)
   slippageToleranceBps: z.number().min(10).max(5000).default(600), // 6.0% default for meme volatility
   capitalTier: z.enum(['MICRO_10', 'INSTITUTIONAL', 'CUSTOM']).default('MICRO_10'),
   allocatedSol: z.number().min(0.01).max(5000).default(0.07), // ~0.07 SOL = ~$10
@@ -233,7 +259,7 @@ export const LiveSnipeOrderSchema = z.object({
     .regex(SOLANA_ADDRESS_REGEX, 'Target token mint must be a valid Base58 Solana address'),
   amountSol: z.number().positive('Snipe amount must be greater than 0').max(10.0),
   slippagePct: z.number().min(0.5).max(50.0).default(6.0),
-  jitoTipSol: z.number().min(0.0001).max(0.1).default(0.005),
+  jitoTipSol: z.number().min(0.0001).max(0.1).optional(), // absent -> dynamic tip policy (C6)
   callerHandle: z.string().optional(),
   confluenceScore: z.number().min(0).max(100).optional(),
 });
@@ -241,7 +267,8 @@ export const LiveSnipeOrderSchema = z.object({
 export const ClosePositionSchema = z.object({
   positionId: z.string().min(1, 'positionId is required'),
   sellPct: z.number().min(1).max(100).default(100),
-  priorityTipSol: z.number().min(0.0001).max(0.1).default(0.005),
+  // PLACEHOLDER: parsed but never read by the close-position handler; no default so nothing implies a tip is sent.
+  priorityTipSol: z.number().min(0.0001).max(0.1).optional(),
 });
 
 // Middleware factory for Zod validation

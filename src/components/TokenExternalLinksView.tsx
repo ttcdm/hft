@@ -13,6 +13,7 @@ import {
   Send,
 } from 'lucide-react';
 import { getTokenExternalLinks, TokenLinkItem } from '../utils/tokenLinks';
+import { useTradingMode } from '../utils/tradingMode';
 
 interface TokenInlineExternalLinksProps {
   mintOrCa: string;
@@ -40,6 +41,7 @@ export const TokenInlineExternalLinks: React.FC<TokenInlineExternalLinksProps> =
   compact = false,
 }) => {
   const [copied, setCopied] = useState(false);
+  const mode = useTradingMode();
   const links = getTokenExternalLinks({
     mintOrCa,
     symbol,
@@ -49,6 +51,7 @@ export const TokenInlineExternalLinks: React.FC<TokenInlineExternalLinksProps> =
     twitter,
     telegram,
     website,
+    cluster: mode.cluster,
   });
 
   const handleCopy = (e: React.MouseEvent) => {
@@ -227,10 +230,12 @@ export const TokenExternalLinksModal: React.FC<TokenExternalLinksModalProps> = (
   tokenData,
 }) => {
   const [copied, setCopied] = useState(false);
+  const mode = useTradingMode();
 
   if (!isOpen || !tokenData) return null;
 
   const links = getTokenExternalLinks({
+    cluster: mode.cluster,
     mintOrCa: tokenData.mintOrCa,
     symbol: tokenData.symbol,
     name: tokenData.name,

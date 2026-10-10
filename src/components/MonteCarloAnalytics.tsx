@@ -1,6 +1,7 @@
 import React, { useRef, useEffect, useState } from 'react';
 import { PieChart, TrendingUp, RefreshCw, Layers } from 'lucide-react';
 import { generateMonteCarloTrajectories } from '../utils/math';
+import { SyntheticBanner } from './SyntheticBanner';
 
 interface MonteCarloAnalyticsProps {
   currentPrice: number;
@@ -160,11 +161,14 @@ export const MonteCarloAnalytics: React.FC<MonteCarloAnalyticsProps> = ({
         </div>
       </div>
 
+      <SyntheticBanner />
+
+      {/* PLACEHOLDER: the exposure bar below is hard-coded illustration, not read from any account (flagged in B4, not removed) */}
       {/* MULTI-ASSET EXPOSURE ALLOCATION BAR */}
       <div>
         <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 mb-1">
-          <span>Multi-Asset Portfolio Exposure</span>
-          <span className="text-slate-300">Total Net Delta: $1,245,000</span>
+          <span>Multi-Asset Portfolio Exposure (illustrative)</span>
+          <span className="text-slate-500">not connected to any account</span>
         </div>
 
         <div className="h-3 w-full rounded overflow-hidden flex font-mono text-[9px] font-bold text-black">

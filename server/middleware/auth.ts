@@ -2,7 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { Logger } from './enterprise';
+import { Logger, redactUrl } from './enterprise';
 
 export interface OperatorSession {
   token: string;
@@ -55,12 +55,18 @@ export class AuthManager {
     };
     this.sessions.set(token, session);
 
-    // Prominently print generated fallback token to stdout in a highlighted banner (B04)
-    console.log('\n' + '='.repeat(80));
-    console.log('⚠️  NO OPERATOR_AUTH_TOKEN CONFIGURED IN ENVIRONMENT — GENERATED VOLATILE TOKEN:');
-    console.log(`🔑  ${token}`);
-    console.log('    Use this token to authenticate in the UI, or set OPERATOR_AUTH_TOKEN in .env');
-    console.log('='.repeat(80) + '\n');
+    if (process.env.APEX_CONTAINER === 'true') {
+      // Container logs are collected and shipped: never print a credential there. A volatile token nobody can read is useless,
+      // so tell the operator to set one (docker-compose.yml requires OPERATOR_AUTH_TOKEN).
+      console.log('NO OPERATOR_AUTH_TOKEN CONFIGURED: a volatile token was generated but is NOT printed in a container. Set OPERATOR_AUTH_TOKEN (16+ chars) and restart.');
+    } else {
+      // Prominently print generated fallback token to stdout in a highlighted banner (B04)
+      console.log('\n' + '='.repeat(80));
+      console.log('⚠️  NO OPERATOR_AUTH_TOKEN CONFIGURED IN ENVIRONMENT — GENERATED VOLATILE TOKEN:');
+      console.log(`🔑  ${token}`);
+      console.log('    Use this token to authenticate in the UI, or set OPERATOR_AUTH_TOKEN in .env');
+      console.log('='.repeat(80) + '\n');
+    }
 
     Logger.info('Operator session initialized in secure volatile memory (zero disk persistence).');
 
@@ -132,9 +138,10 @@ export class AuthManager {
     }
 
     if (credentials.password) {
-      const inputBuffer = Buffer.from(credentials.password, 'utf8');
-      const expectedBuffer = Buffer.from(envPassword, 'utf8');
-      if (inputBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(inputBuffer, expectedBuffer)) {
+      // R9s: compare fixed-length HMACs, so neither the length nor the content of the password shows in the timing.
+      const key = crypto.randomBytes(32);
+      const digest = (v: string) => crypto.createHmac('sha256', key).update(v, 'utf8').digest();
+      if (crypto.timingSafeEqual(digest(credentials.password), digest(envPassword))) {
         const session = this.createSession('OPERATOR');
         return { success: true, token: session.token };
       }
@@ -186,7 +193,7 @@ export function requireOperatorAuth(req: Request, res: Response, next: NextFunct
   const token = extractOperatorToken(req);
 
   if (!token || !authManager.validateToken(token)) {
-    Logger.warn(`Unauthorized mutation attempt blocked on ${req.method} ${req.originalUrl} from ${req.ip}`);
+    Logger.warn(`Unauthorized mutation attempt blocked on ${req.method} ${redactUrl(req.originalUrl)} from ${req.ip}`);
     return sendUnauthorized(req, res);
   }
 
@@ -196,19 +203,43 @@ export function requireOperatorAuth(req: Request, res: Response, next: NextFunct
 // A1: the only /api routes reachable without an operator token. Everything else is denied by default.
 export const PUBLIC_API_ALLOWLIST: ReadonlyArray<{ method: string; path: string }> = [
   { method: 'GET', path: '/api/health' },
+  { method: 'HEAD', path: '/api/health' }, // R5s: probes (wget --spider, curl -I) send HEAD; Express answers it from the GET route
   { method: 'POST', path: '/api/auth/login' },
   { method: 'OPTIONS', path: '*' },
 ];
 
+/**
+ * The path as the router will see it: percent-decoded, duplicate slashes collapsed, lower-cased. Express matches routes
+ * case-insensitively, so an auth check that compares case-sensitively (`/API/...`) is bypassed.
+ */
+export function normalizeApiPath(raw: string): string {
+  // An absolute-form request target (`GET http://x/api/wallet/state`) is routed by its path, so reduce it to the path first.
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
+    try {
+      raw = new URL(raw).pathname;
+    } catch {
+      return '/api/__unparseable__'; // cannot be matched to a route; treat as an API path so the gate demands a token
+    }
+  }
+  let p = raw.split('?')[0];
+  try {
+    p = decodeURIComponent(p);
+  } catch {
+    // an undecodable path cannot match a route, but keep checking the raw text
+  }
+  return p.replace(/\/{2,}/g, '/').toLowerCase();
+}
+
 export function isPublicApiRoute(method: string, pathname: string): boolean {
   const m = method.toUpperCase();
-  const p = pathname.length > 1 && pathname.endsWith('/') ? pathname.slice(0, -1) : pathname;
+  const norm = normalizeApiPath(pathname);
+  const p = norm.length > 1 && norm.endsWith('/') ? norm.slice(0, -1) : norm;
   return PUBLIC_API_ALLOWLIST.some((r) => r.method === m && (r.path === '*' || r.path === p));
 }
 
 // Deny-by-default gate for every /api route. Mount it with app.use(apiAuthGate) before any route.
 export function apiAuthGate(req: Request, res: Response, next: NextFunction) {
-  const pathname = (req.originalUrl || req.url || '').split('?')[0];
+  const pathname = normalizeApiPath(req.originalUrl || req.url || '');
   if (!pathname.startsWith('/api')) return next();
   if (isPublicApiRoute(req.method, pathname)) return next();
   const token = extractOperatorToken(req);

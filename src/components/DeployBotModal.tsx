@@ -106,7 +106,7 @@ export const DeployBotModal: React.FC<DeployBotModalProps> = ({
       assetClass: formData.assetClass,
       symbol: formData.symbol,
       isRunning: true,
-      winRate: 65 + Math.random() * 8,
+      winRate: 0, // no trades yet; nothing to measure
       pnl: 0,
       tradesCount: 0,
       opsPerSec: formData.opsPerSec,
@@ -140,7 +140,7 @@ export const DeployBotModal: React.FC<DeployBotModalProps> = ({
           <span className="text-[10px] font-mono text-slate-400 uppercase tracking-wider block mb-1.5">
             Institutional Strategy Presets
           </span>
-          <div className="grid grid-cols-2 gap-1.5 max-h-28 overflow-y-auto pr-1">
+          <div className="grid grid-cols-2 gap-1.5 max-h-40 overflow-y-auto pr-1">
             {PRESET_STRATEGIES.map((p) => (
               <button
                 key={p.name}
@@ -286,7 +286,7 @@ export const DeployBotModal: React.FC<DeployBotModalProps> = ({
               className="px-5 py-2 rounded bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-500 hover:to-cyan-500 text-white font-bold flex items-center space-x-1.5 shadow-lg shadow-cyan-500/20"
             >
               <Plus className="w-3.5 h-3.5" />
-              <span>Deploy to CME / NY4 Engine</span>
+              <span>Deploy Strategy</span>
             </button>
           </div>
         </form>

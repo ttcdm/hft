@@ -112,10 +112,9 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
       const bondingCurveAta = PumpCurveService.getAssociatedTokenAddress(mint, bondingCurve, TOKEN_PROGRAM_ID);
       const creatorAta = PumpCurveService.getAssociatedTokenAddress(mint, creator, TOKEN_PROGRAM_ID);
 
-      // Total supply: 1B. Bonding curve: 700M. Non-bonding circulating: 300M.
-      // Creator holds 45M tokens = 15.00% of non-bonding circulating supply
+      // C1: total supply 300M. Bonding curve: 210M. Creator holds 45M = 15.00% of TOTAL supply.
       const mockHolders = [
-        { address: bondingCurveAta, amount: '700000000000000', decimals: 6, uiAmount: 700000000 },
+        { address: bondingCurveAta, amount: '210000000000000', decimals: 6, uiAmount: 210000000 },
         { address: creatorAta, amount: '45000000000000', decimals: 6, uiAmount: 45000000 },
         ...Array.from({ length: 9 }, () => ({
           address: Keypair.generate().publicKey,
@@ -128,15 +127,15 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
       const mockConn = {
         getTokenLargestAccounts: async () => ({ value: mockHolders, context: { slot: 400 } }),
         getTokenSupply: async () => ({
-          value: { amount: '1000000000000000', decimals: 6, uiAmount: 1000000000 },
+          value: { amount: '300000000000000', decimals: 6, uiAmount: 300000000 },
           context: { slot: 400 },
         }),
       } as unknown as Connection;
 
       const dist = await fetchTokenHolderDistribution(mockConn, mint, creator, bondingCurve);
       expect(dist.devHoldingPct).toBe(15.0);
-      // Top 10 = creator 45M + 9 * 5M = 90M / 300M = 30.0%
-      expect(dist.top10HoldersPct).toBe(30.0);
+      // C1: creator excluded; 9 * 5M = 45M / 300M = 15.0%
+      expect(dist.top10HoldersPct).toBe(15.0);
 
       // Feed into EligibilityFilter in LIVE mode
       const report = EligibilityFilter.evaluate(
@@ -167,9 +166,9 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
       const bondingCurveAta = PumpCurveService.getAssociatedTokenAddress(mint, bondingCurve, TOKEN_PROGRAM_ID);
       const creatorAta = PumpCurveService.getAssociatedTokenAddress(mint, creator, TOKEN_PROGRAM_ID);
 
-      // Circulating: 200M. Creator holds 4M (2%). Top 2 holds 80M (40%). Total top 10 = 50%.
+      // C1: total supply 200M. Creator holds 4M (2%). Whale 80M (40%) + 8 * 2M (8%) = 48% of TOTAL, creator excluded.
       const mockHolders = [
-        { address: bondingCurveAta, amount: '800000000000000', decimals: 6, uiAmount: 800000000 },
+        { address: bondingCurveAta, amount: '100000000000000', decimals: 6, uiAmount: 100000000 },
         { address: Keypair.generate().publicKey, amount: '80000000000000', decimals: 6, uiAmount: 80000000 }, // 40%
         { address: creatorAta, amount: '4000000000000', decimals: 6, uiAmount: 4000000 }, // 2%
         ...Array.from({ length: 8 }, () => ({
@@ -183,15 +182,14 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
       const mockConn = {
         getTokenLargestAccounts: async () => ({ value: mockHolders, context: { slot: 500 } }),
         getTokenSupply: async () => ({
-          value: { amount: '1000000000000000', decimals: 6, uiAmount: 1000000000 },
+          value: { amount: '200000000000000', decimals: 6, uiAmount: 200000000 },
           context: { slot: 500 },
         }),
       } as unknown as Connection;
 
       const dist = await fetchTokenHolderDistribution(mockConn, mint, creator, bondingCurve);
       expect(dist.devHoldingPct).toBe(2.0);
-      // Top 10 = 80M + 4M + 16M = 100M / 200M = 50.0%
-      expect(dist.top10HoldersPct).toBe(50.0);
+      expect(dist.top10HoldersPct).toBe(48.0);
 
       const report = EligibilityFilter.evaluate(
         {
@@ -210,7 +208,7 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
       expect(report.isEligible).toBe(false);
       const top10Check = report.checks.find((c) => c.ruleId === 'TOP_10_CONCENTRATION');
       expect(top10Check?.status).toBe('FAIL');
-      expect(top10Check?.observedValue).toBe('50.0%');
+      expect(top10Check?.observedValue).toBe('48.0%');
     });
 
     it('queries creator ATA via getTokenAccountBalance fallback if creator is not in top 20 accounts', async () => {
@@ -240,7 +238,7 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
         }),
         getTokenAccountBalance: async (ata: PublicKey) => {
           if (ata.equals(creatorAta)) {
-            // Creator has 15M tokens (5.0% of 300M non-bonding)
+            // Creator has 15M tokens (1.5% of 1B total supply)
             return { value: { amount: '15000000000000', decimals: 6, uiAmount: 15000000 }, context: { slot: 600 } };
           }
           throw new Error('Account not found');
@@ -249,7 +247,7 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
 
       const dist = await fetchTokenHolderDistribution(mockConn, mint, creator, bondingCurve);
       expect(dist.creatorBalance).toBe(15000000000000n);
-      expect(dist.devHoldingPct).toBe(5.0);
+      expect(dist.devHoldingPct).toBe(1.5);
     });
   });
 
@@ -440,15 +438,15 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
       });
       expect(tip2x.tipLamports).toBe(360_000);
 
-      // Scenario B: Extreme urgency multiplier bounded by economic sanity (25% of trade value)
-      // Trade: 0.010 SOL (10,000,000 lamports). 25% sanity ceiling = 2,500,000 lamports.
+      // Scenario B: Extreme urgency multiplier bounded by economic sanity (15% of trade value, planning decision #1)
+      // Trade: 0.010 SOL (10,000,000 lamports). 15% sanity ceiling = 1,500,000 lamports.
       // Base dynamic tip = 300,000 lamports. Urgency = 20x -> 6,000,000 lamports.
-      // Must be capped by operator ceiling (0.05 SOL = 50M) and economic sanity rule (25% = 2.5M).
+      // Must be capped by operator ceiling (0.05 SOL = 50M) and economic sanity rule (15% = 1.5M).
       const extremeTip = executionConfig.resolveDynamicJitoTip({
         tradeAmountSol: 0.010,
         urgencyMultiplier: 20.0,
       });
-      expect(extremeTip.tipLamports).toBe(2_500_000);
+      expect(extremeTip.tipLamports).toBe(1_500_000);
       expect(extremeTip.policyReason).toContain('CAPPED by economic sanity rule');
 
       // Scenario C: Live Jito floor with urgency multiplier
@@ -488,7 +486,7 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
       });
     });
 
-    it('accurately computes complex multi-leg portfolio daily PnL (realized + unrealized - fees)', () => {
+    it('accurately computes complex multi-leg portfolio daily PnL (realized + unrealized; fees are inside each position basis)', () => {
       const now = Date.now();
 
       // Closed winning trade (+0.010 SOL)
@@ -583,10 +581,10 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
       // Expected Daily Total PnL:
       // Closed: +0.010 - 0.015 = -0.005 SOL
       // Unrealized: (0.012 - 0.008) + (0.003 - 0.025) = +0.004 - 0.022 = -0.018 SOL
-      // Fees: -0.002 SOL
-      // Total = -0.005 + (-0.018) - 0.002 = -0.025000 SOL
+      // Fees: the 0.002 SOL of the RECONCILED trade is already inside its position's cost basis, so it is not taken a second time (Q3)
+      // Total = -0.005 + (-0.018) = -0.023000 SOL
       const dailyTotalPnL = db.getDailyTotalPnLSol('LIVE');
-      expect(dailyTotalPnL).toBeCloseTo(-0.025, 4);
+      expect(dailyTotalPnL).toBeCloseTo(-0.023, 4);
     });
 
     it('strictly isolates PAPER and LIVE modes in daily total PnL', () => {

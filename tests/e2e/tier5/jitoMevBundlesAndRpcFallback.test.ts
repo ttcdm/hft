@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
 import { JitoTransport, SolanaRpcTransport } from '../../../server/solana/transports';
-import { executionConfig, calculateDynamicJitoTip, calculateDynamicJitoTipSol } from '../../../server/solana/executionConfig';
+import { executionConfig, ECONOMIC_TIP_CAP_FRACTION, calculateDynamicJitoTip, calculateDynamicJitoTipSol } from '../../../server/solana/executionConfig';
 import { ExecutionCoordinator, PreTradeSnapshot } from '../../../server/execution/coordinator';
 import { localSigner } from '../../../server/solana/signer';
 import { workstationDb } from '../../../server/db/database';
@@ -11,7 +11,7 @@ import { MockJitoEngine } from '../helpers/mockJito';
 import { TestDatabase } from '../helpers/testDb';
 import { VALID_PUMP_MINT_1, DUMMY_FEE_RECIPIENT, DUMMY_BUYBACK_FEE_RECIPIENT } from '../helpers/simulatedStates';
 
-describe('Tier 5: Production Readiness — Jito MEV Bundles, Tip Policies & Zero-Double-Fill RPC Fallback', () => {
+describe('Tier 5 [mock-level]: Jito MEV Bundles, Tip Policies & Zero-Double-Fill RPC Fallback', () => {
   let mockRpc: MockSolanaRpc;
   let mockJito: MockJitoEngine;
   let testDb: TestDatabase;
@@ -84,20 +84,20 @@ describe('Tier 5: Production Readiness — Jito MEV Bundles, Tip Policies & Zero
       expect(calculateDynamicJitoTip(-1)).toBe(180_000);
     });
 
-    it('JMB-2: resolveDynamicJitoTip caps tip at 25% of trade notional for economic sanity', () => {
-      // Micro trade of 0.0008 SOL (800,000 lamports)
-      // 25% cap = 200,000 lamports. 3% is below floor so base = 150,000 lamports.
+    // Decision #1 (planning thread): economic cap is 15% of notional (ECONOMIC_TIP_CAP_FRACTION), not 25%.
+    it('JMB-2: resolveDynamicJitoTip caps tip at 15% of trade notional for economic sanity', () => {
+      // Micro trade of 0.0008 SOL (800,000 lamports): 15% cap = 120,000 lamports, below the 150,000 base -> capped.
       const res = executionConfig.resolveDynamicJitoTip({
         tradeNotionalSol: 0.0008,
       });
-      expect(res.tipLamports).toBe(150_000);
+      expect(res.tipLamports).toBe(Math.round(0.0008 * ECONOMIC_TIP_CAP_FRACTION * 1e9));
+      expect(res.tipLamports).toBe(120_000);
 
-      // Ultra-micro trade of 0.0004 SOL (400,000 lamports)
-      // 25% cap is 100,000 lamports. But floor is 150,000 lamports -> rule respects floor if cap < floor
+      // Ultra-micro trade of 0.0004 SOL: 15% cap = 60,000 lamports (>= 10,000 so the cap applies even below the floor).
       const resMicro = executionConfig.resolveDynamicJitoTip({
         tradeNotionalSol: 0.0004,
       });
-      expect(resMicro.tipLamports).toBe(150_000);
+      expect(resMicro.tipLamports).toBe(60_000);
     });
 
     it('JMB-3: explicit tip override is respected while strictly bounded by operator bounds', () => {
@@ -356,7 +356,8 @@ describe('Tier 5: Production Readiness — Jito MEV Bundles, Tip Policies & Zero
       expect(res.slot).toBe(280000200);
 
       // Verify SQLite records both transactions under the SAME logical orderId
-      const txs = workstationDb.loadTransactions('ord-test-rpc-fallback');
+      // (the write-ahead PENDING row for the tx's own signature is a third row here only because the mocked transports invent signatures)
+      const txs = workstationDb.loadTransactions('ord-test-rpc-fallback').filter((t) => t.signature.startsWith('sig_'));
       expect(txs.length).toBe(2);
       expect(txs[0].submissionTransport).toBe('JITO');
       expect(txs[1].submissionTransport).toBe('SOLANA_RPC');

@@ -7,6 +7,7 @@ import {
 import {
   CreatorRiskReport,
   CreatorRiskScorer,
+  creatorRiskScorer,
 } from './creatorRiskScorer';
 
 export const MIN_CONFLUENCE_SCORE = 70;
@@ -18,14 +19,18 @@ export function isConfluencePassed(score: number): boolean {
   return typeof score === 'number' && !isNaN(score) && score >= MIN_CONFLUENCE_SCORE;
 }
 
+/** A metric is "known" only when it is a finite number. null/undefined/NaN mean missing and earn no points (B3). */
+const known = (n: number | null | undefined): n is number => typeof n === 'number' && Number.isFinite(n);
+
 export interface ConfluenceFactorsInput {
-  priceChange5mPct: number;
-  liquidityUsd: number;
-  top10HoldersPct: number;
+  // null / undefined = the data source did not provide it. Missing data scores 0 for that factor, never a default.
+  priceChange5mPct: number | null;
+  liquidityUsd: number | null;
+  top10HoldersPct: number | null;
   bondingCurveProgress: number;
-  buys5m: number;
-  sells5m: number;
-  devHoldingPct: number;
+  buys5m: number | null;
+  sells5m: number | null;
+  devHoldingPct: number | null;
   hasVerifiedSocialCall: boolean;
   socialCallCount: number;
 
@@ -53,22 +58,29 @@ export class ConfluenceEngine {
   public static calculate(input: ConfluenceFactorsInput): ConfluenceBreakdown {
     // 1. Momentum Score (0 - 20)
     // Scaled around 0-50% 5m change
+    const missing: string[] = [];
+    if (!known(input.priceChange5mPct)) missing.push('momentum');
+    if (!known(input.liquidityUsd)) missing.push('liquidity');
+    if (!known(input.top10HoldersPct)) missing.push('distribution');
+    if (!known(input.buys5m) || !known(input.sells5m)) missing.push('orderflow');
     let momentumScore = 0;
-    if (input.priceChange5mPct > 0) {
+    if (known(input.priceChange5mPct) && input.priceChange5mPct > 0) {
       momentumScore = Math.min(20, Math.round((input.priceChange5mPct / 40) * 20));
     }
 
     // 2. Liquidity Score (0 - 15)
     // Scaled around $10k - $100k depth
     let liquidityScore = 0;
-    if (input.liquidityUsd >= 5000) {
+    if (known(input.liquidityUsd) && input.liquidityUsd >= 5000) {
       liquidityScore = Math.min(15, Math.round((input.liquidityUsd / 60000) * 15));
     }
 
     // 3. Holder Distribution Score (0 - 15)
     // Low top-10 concentration gives max points
     let holderScore = 0;
-    if (input.top10HoldersPct <= 15) {
+    if (!known(input.top10HoldersPct)) {
+      holderScore = 0;
+    } else if (input.top10HoldersPct <= 15) {
       holderScore = 15;
     } else if (input.top10HoldersPct <= 30) {
       holderScore = 10;
@@ -91,22 +103,16 @@ export class ConfluenceEngine {
     } else if (input.mint && curveVelocityEvaluator.hasData(input.mint)) {
       curveScore = curveVelocityEvaluator.getMetrics(input.mint).velocityScore;
     } else {
-      // Fallback: sweet spot is 60% - 95% curve completion
-      if (input.bondingCurveProgress >= 90) {
-        curveScore = 15;
-      } else if (input.bondingCurveProgress >= 70) {
-        curveScore = 12;
-      } else if (input.bondingCurveProgress >= 40) {
-        curveScore = 8;
-      } else {
-        curveScore = 4;
-      }
+      // C2: no measured velocity means no velocity points. The old fallback awarded up to 15 points from curve
+      // progress alone (>= 90% got the maximum), which scored a nearly-finished curve as if it were accelerating.
+      curveScore = 0;
+      missing.push('velocity');
     }
 
     // 5. Buy/Sell Imbalance Score (0 - 20)
     // Higher buy ratio (> 75% buys) gives max points
     let imbalanceScore = 0;
-    const totalTx = input.buys5m + input.sells5m;
+    const totalTx = known(input.buys5m) && known(input.sells5m) ? input.buys5m + input.sells5m : 0;
     if (totalTx > 10) {
       const buyRatio = input.buys5m / totalTx;
       imbalanceScore = Math.round(buyRatio * 20);
@@ -115,8 +121,10 @@ export class ConfluenceEngine {
     // 6. Creator Risk Score (0 - 5)
     // Priority: Real on-chain creator transaction history & burner wallet detection
     let creatorRiskScore = 0;
-    if (input.creatorRiskReport) {
-      creatorRiskScore = input.creatorRiskReport.confluenceScore;
+    const creatorReport =
+      input.creatorRiskReport ?? (input.creatorAddress ? creatorRiskScorer.getCachedReport(input.creatorAddress) : undefined);
+    if (creatorReport) {
+      creatorRiskScore = creatorReport.confluenceScore;
     } else if (input.isCreatorBurner === true) {
       creatorRiskScore = 0;
     } else if (input.creatorWalletAgeSeconds !== undefined || input.creatorSignatureCount !== undefined) {
@@ -127,7 +135,9 @@ export class ConfluenceEngine {
       }).confluenceScore;
     } else {
       // Fallback: 0% dev holding = 5 points
-      if (input.devHoldingPct <= 0.1) {
+      if (!known(input.devHoldingPct)) {
+        missing.push('creator');
+      } else if (input.devHoldingPct <= 0.1) {
         creatorRiskScore = 5;
       } else if (input.devHoldingPct <= 2.5) {
         creatorRiskScore = 3;
@@ -154,7 +164,7 @@ export class ConfluenceEngine {
         socialScore
     );
 
-    const explanation = `Confluence ${compositeScore}/100: Momentum (${momentumScore}/20), Liquidity (${liquidityScore}/15), Distribution (${holderScore}/15), Curve (${curveScore}/15), OrderFlow (${imbalanceScore}/20), DevRisk (${creatorRiskScore}/5), Social (${socialScore}/10)`;
+    const explanation = `Confluence ${compositeScore}/100: Momentum (${momentumScore}/20), Liquidity (${liquidityScore}/15), Distribution (${holderScore}/15), Curve (${curveScore}/15), OrderFlow (${imbalanceScore}/20), DevRisk (${creatorRiskScore}/5), Social (${socialScore}/10)${missing.length ? ` [missing data, scored 0: ${missing.join(', ')}]` : ''}`;
 
     return {
       momentumScore,

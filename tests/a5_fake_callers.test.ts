@@ -1,3 +1,4 @@
+import { setAutoMode, resetAuto } from './fixtures/auto';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { memecoinAggregator } from '../server/memecoinAggregator';
 import { pumpFunService, calloutProvenance } from '../server/pumpfunService';
@@ -68,25 +69,34 @@ function makeCallout(caller: PumpFunCaller, mint: string, confluenceCount = 1): 
 }
 
 describe('A5: fake callers cannot drive auto-snipe', () => {
+  // snipedMints is the one piece of private state the evaluator mutates; save and restore it around each test.
+  let savedSniped: string[];
   beforeEach(() => {
+    memecoinAggregator.setConfluenceGating(false); // C2: gating is on by default; this test is about something else
+    savedSniped = [...(pumpFunService as any).snipedMints];
     (pumpFunService as any).snipedMints.clear();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await resetAuto();
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
+    (pumpFunService as any).snipedMints.clear();
+    for (const m of savedSniped) (pumpFunService as any).snipedMints.add(m);
   });
 
   it('starts with no callers when DEMO_MODE is not true', () => {
+    vi.stubEnv('DEMO_MODE', '');
     expect(process.env.DEMO_MODE).not.toBe('true');
     expect(pumpFunService.getLeaderboard()).toEqual([]);
   });
 
   it('never fires a snipe when AUTO_SNIPE_ENABLED is unset, even for a strong caller', async () => {
+    await setAutoMode('PAPER'); // the controller is armed; the env flag is one of its inputs and is now turned off
     vi.stubEnv('AUTO_SNIPE_ENABLED', '');
     const snipeSpy = vi.spyOn(memecoinAggregator, 'executeSnipe');
     const callout = makeCallout(makeCaller({ isAutoSnipeSubscribed: true }), 'A5MintDisabled1111111111111111111111111111');
-    (pumpFunService as any).hotCallouts = [callout];
+    vi.spyOn(pumpFunService, 'getHotCallouts').mockReturnValue([callout]);
 
     await (pumpFunService as any).evaluateAutoSnipeTriggers();
 
@@ -95,7 +105,7 @@ describe('A5: fake callers cannot drive auto-snipe', () => {
   });
 
   it('does not treat a caller subscription as a standalone trigger', async () => {
-    vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
+    await setAutoMode('PAPER');
     const snipeSpy = vi.spyOn(memecoinAggregator, 'executeSnipe');
     const weakSubscribed = makeCaller({
       isAutoSnipeSubscribed: true,
@@ -103,7 +113,7 @@ describe('A5: fake callers cannot drive auto-snipe', () => {
       avgMultiple: 1,
     });
     const callout = makeCallout(weakSubscribed, 'A5MintSubscribed111111111111111111111111111', 1);
-    (pumpFunService as any).hotCallouts = [callout];
+    vi.spyOn(pumpFunService, 'getHotCallouts').mockReturnValue([callout]);
 
     await (pumpFunService as any).evaluateAutoSnipeTriggers();
 
@@ -111,7 +121,12 @@ describe('A5: fake callers cannot drive auto-snipe', () => {
     expect(callout.status).toBe('ACTIVE');
   });
 
-  it('labels a demo caller SYNTHETIC_TEST and a real-feed caller REAL_SOCIAL', () => {
+  it('labels an unattributed real-feed token REAL_ONCHAIN, never REAL_SOCIAL', () => {
+    const unattributed = makeCallout(makeCaller({ userId: 'unattributed' }), 'A5MintUnattr1111111111111111111111111111');
+    expect(calloutProvenance(unattributed)).toBe('REAL_ONCHAIN');
+  });
+
+  it('labels a demo caller SYNTHETIC_TEST and a named real caller REAL_SOCIAL', () => {
     const demo = makeCallout(makeCaller({ userId: 'sol_cabal_insider' }), 'A5MintDemo11111111111111111111111111111111');
     const real = makeCallout(makeCaller({ userId: 'real_feed_caller' }), 'A5MintReal11111111111111111111111111111111');
     expect(calloutProvenance(demo)).toBe('SYNTHETIC_TEST');

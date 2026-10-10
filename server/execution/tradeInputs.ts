@@ -110,6 +110,26 @@ export const CalloutSnipeSchema = z
   .superRefine(rejectForbiddenKeys)
   .transform(({ calloutId, amountUsd, jitoTipSol, slippagePct, confirmLive }) => ({ calloutId, amountUsd, jitoTipSol, slippagePct, confirmLive }));
 
+/** POST /api/pumpfun/callouts/rules. Only these keys, inside these bounds, reach the rules object (Q25: it used to be a spread of the raw body). */
+export const AutoSnipeRulesSchema = z
+  .object({
+    minCallerWinRate2x: z.number().min(0).max(100).optional(),
+    minAvgMultiple: z.number().min(0).max(1000).optional(),
+    autoSnipeOnConfluence: z.boolean().optional(),
+    maxEntryMultiple: z.number().min(1).max(100).optional(),
+    maxElapsedSeconds: z.number().min(1).max(3600).optional(),
+    snipeAmountUsd: z.number().min(0.01).max(1000).optional(),
+    jitoPriorityTipSol: z.number().min(0).max(0.1).optional(),
+  })
+  .loose()
+  .transform((o) => {
+    const out: Record<string, number | boolean> = {};
+    for (const k of ['minCallerWinRate2x', 'minAvgMultiple', 'autoSnipeOnConfluence', 'maxEntryMultiple', 'maxElapsedSeconds', 'snipeAmountUsd', 'jitoPriorityTipSol'] as const) {
+      if (o[k] !== undefined) out[k] = o[k] as number | boolean;
+    }
+    return out;
+  });
+
 /** POST /api/memecoins/close, POST /api/execution/close, WS CLOSE_POSITION. */
 export const OperatorCloseSchema = z
   .object({

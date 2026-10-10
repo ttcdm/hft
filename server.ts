@@ -36,6 +36,7 @@ import {
   AutoKillSchema,
   AutoResumeSchema,
   CalloutSnipeSchema,
+  AutoSnipeRulesSchema,
   OPERATOR_PROVENANCE,
   OperatorCloseSchema,
   OperatorExecuteTradeSchema,
@@ -1209,7 +1210,7 @@ app.get('/api/pumpfun/callouts/rules', requireOperatorAuth, (req, res) => {
   });
 });
 
-app.post('/api/pumpfun/callouts/rules', requireOperatorAuth, (req, res) => {
+app.post('/api/pumpfun/callouts/rules', requireOperatorAuth, validateTradeBody(AutoSnipeRulesSchema), (req, res) => {
   const updated = pumpFunService.updateAutoSnipeRules(req.body);
   res.json({
     status: 'OK',

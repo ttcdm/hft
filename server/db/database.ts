@@ -357,8 +357,10 @@ export class WorkstationDatabase {
   }
 
   /**
-   * Order ids of paper fills where at least one safety gate stayed UNKNOWN (C5). Those fills are not evidence
-   * of an edge, so closed-trade statistics (CapitalSizer, kill-switch expectancy) leave them out.
+   * Ids of paper positions whose result is not evidence of an edge, so closed-trade statistics (CapitalSizer, kill-switch expectancy) leave
+   * them out: (C5) a fill where at least one safety gate stayed UNKNOWN; (S9) a fill priced by the flat MODEL because the curve could not be
+   * read (the controller already flagged these as unverified on the decision row, but the evidence query did not); and a position whose
+   * EXIT was model-priced (PAPER_SELL_FILLED, keyed by the position id).
    */
   public getUnverifiedFillIds(): Set<string> {
     const ids = new Set<string>();
@@ -367,7 +369,14 @@ export class WorkstationDatabase {
       for (const r of rows) {
         try {
           const p = JSON.parse(r.payload_json);
-          if (p?.gates?.eligibility?.unverified?.length > 0 && p.orderId) ids.add(p.orderId);
+          if ((p?.gates?.eligibility?.unverified?.length > 0 || p?.gates?.pricing === 'MODEL') && p.orderId) ids.add(p.orderId);
+        } catch { /* skip */ }
+      }
+      const sells = this.db.prepare("SELECT payload_json FROM system_journal WHERE event_type = 'PAPER_SELL_FILLED'").all() as Array<{ payload_json: string }>;
+      for (const r of sells) {
+        try {
+          const p = JSON.parse(r.payload_json);
+          if (p?.pricing === 'MODEL' && p.positionId) ids.add(p.positionId);
         } catch { /* skip */ }
       }
     } catch { /* no journal yet */ }
@@ -513,7 +522,7 @@ export class WorkstationDatabase {
   /**
    * N18: the append-only audit tables (risk_decisions, decisions, system_journal) grew without bound. Rows older than the retention
    * window are deleted. Kept regardless of age because something still reads them: the halt journal (the latest row decides whether
-   * trading is halted after a restart) and PAPER_FILL_GATES (marks which old paper fills are unverified, for the closed-trade statistics).
+   * trading is halted after a restart) and PAPER_FILL_GATES / PAPER_SELL_FILLED (mark which old paper fills and exits are unverified or model-priced, for the closed-trade statistics).
    * Positions, orders and transactions are never pruned. Returns the number of rows deleted per table.
    */
   public pruneOldRows(retentionDays: number, now: number = Date.now()): { riskDecisions: number; decisions: number; journal: number } {
@@ -524,7 +533,7 @@ export class WorkstationDatabase {
       return {
         riskDecisions: run('DELETE FROM risk_decisions WHERE created_at < ?', cutoff),
         decisions: run('DELETE FROM decisions WHERE ts < ?', cutoff),
-        journal: run(`DELETE FROM system_journal WHERE created_at < ? AND event_type NOT IN ('TRADING_HALTED','TRADING_HALT_CLEARED','PAPER_FILL_GATES')`, cutoff),
+        journal: run(`DELETE FROM system_journal WHERE created_at < ? AND event_type NOT IN ('TRADING_HALTED','TRADING_HALT_CLEARED','PAPER_FILL_GATES','PAPER_SELL_FILLED')`, cutoff),
       };
     } catch (e: any) {
       Logger.error(`Retention prune failed: ${e?.message ?? e}`);

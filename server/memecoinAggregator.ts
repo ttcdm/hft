@@ -298,14 +298,16 @@ export class MemecoinAggregatorService extends EventEmitter {
     });
   }
 
-  public getConfig(): SniperBotConfig {
-    return this.config;
+  /** The config as it may leave this process (HTTP, WebSocket, events): the Telegram bot token is never included, only whether one is set. */
+  public getConfig(): SniperBotConfig & { telegramBotTokenSet: boolean } {
+    return { ...this.config, telegramBotToken: '', telegramBotTokenSet: Boolean(this.config.telegramBotToken) };
   }
 
-  public updateConfig(newConfig: Partial<SniperBotConfig>): SniperBotConfig {
+  public updateConfig(newConfig: Partial<SniperBotConfig>): SniperBotConfig & { telegramBotTokenSet: boolean } {
     this.config = { ...this.config, ...newConfig };
-    this.emit('config_updated', this.config);
-    return this.config;
+    const out = this.getConfig();
+    this.emit('config_updated', out);
+    return out;
   }
 
   public setConfluenceGating(enabled: boolean): void {

@@ -211,6 +211,14 @@ export const PUBLIC_API_ALLOWLIST: ReadonlyArray<{ method: string; path: string 
  * case-insensitively, so an auth check that compares case-sensitively (`/API/...`) is bypassed.
  */
 export function normalizeApiPath(raw: string): string {
+  // An absolute-form request target (`GET http://x/api/wallet/state`) is routed by its path, so reduce it to the path first.
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) {
+    try {
+      raw = new URL(raw).pathname;
+    } catch {
+      return '/api/__unparseable__'; // cannot be matched to a route; treat as an API path so the gate demands a token
+    }
+  }
   let p = raw.split('?')[0];
   try {
     p = decodeURIComponent(p);

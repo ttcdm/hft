@@ -537,13 +537,13 @@ app.get('/api/account/balance', requireOperatorAuth, async (req, res) => {
 });
 
 // 4. Automated Unit Testing Suite Runner (200 Quantitative HFT & Bonding Curve Test Cases)
-app.get('/api/unit-tests', (req, res) => {
+app.get('/api/unit-tests', requireOperatorAuth, (req, res) => {
   const suiteOutput = runComprehensiveTestSuite();
   res.json(suiteOutput);
 });
 
 // 5. AI Quant Diagnostics with High Thinking Mode (gemini-3.1-pro-preview) and Market Grounding (gemini-3.5-flash)
-app.post('/api/ai/diagnostics', async (req, res) => {
+app.post('/api/ai/diagnostics', requireOperatorAuth, async (req, res) => {
   const { mode = 'thinking', strategyConfig, telemetry, prompt } = req.body;
   const ai = getGenAI();
 
@@ -617,7 +617,7 @@ User Query: ${prompt || 'Perform full risk audit and latency sensitivity analysi
 });
 
 // 6. Raw Packet Logs Exporter (PCAP-JSON formatted)
-app.post('/api/export/packets', (req, res) => {
+app.post('/api/export/packets', requireOperatorAuth, (req, res) => {
   const { logs } = req.body;
   const rawData = {
     pcapHeader: {
@@ -640,7 +640,7 @@ app.post('/api/export/packets', (req, res) => {
 });
 
 // 7. High-Performance Autonomous Execution Engine Endpoints
-app.get('/api/engine/status', (req, res) => {
+app.get('/api/engine/status', requireOperatorAuth, (req, res) => {
   res.json(hftEngine.getTelemetry());
 });
 
@@ -676,7 +676,7 @@ app.post('/api/engine/config', requireOperatorAuth, (req, res) => {
   res.json({ status: 'OK', telemetry: hftEngine.getTelemetry() });
 });
 
-app.get('/api/engine/wal', (req, res) => {
+app.get('/api/engine/wal', requireOperatorAuth, (req, res) => {
   const limit = parseInt(req.query.limit as string) || 60;
   res.json({
     seqId: hftEngine.getWAL().getCurrentSeq(),
@@ -684,7 +684,7 @@ app.get('/api/engine/wal', (req, res) => {
   });
 });
 
-app.get('/api/engine/wal/export', (req, res) => {
+app.get('/api/engine/wal/export', requireOperatorAuth, (req, res) => {
   const journal = hftEngine.getWAL().exportJournal();
   res.setHeader('Content-Type', 'text/plain');
   res.setHeader('Content-Disposition', 'attachment; filename="apex_engine_journal.wal"');
@@ -696,12 +696,12 @@ app.post('/api/engine/risk/limits', requireOperatorAuth, (req, res) => {
   res.json({ status: 'OK', limits: hftEngine.getRiskEngine().getLimits() });
 });
 
-app.get('/api/engine/risk/limits', (req, res) => {
+app.get('/api/engine/risk/limits', requireOperatorAuth, (req, res) => {
   res.json(hftEngine.getRiskEngine().getLimits());
 });
 
 // 8. Standalone Rust Engine Source & $10 Micro-Capital Configuration
-app.get('/api/engine/rust/source', (req, res) => {
+app.get('/api/engine/rust/source', requireOperatorAuth, (req, res) => {
   try {
     const crateDir = path.join(process.cwd(), 'crates', 'apex_hft_engine');
 
@@ -774,7 +774,7 @@ app.post('/api/engine/mode/micro-10', requireOperatorAuth, (req, res) => {
 // ============================================================================
 // 12. SOCIAL SCANNER (TELEGRAM & X.COM) ALPHA INTELLIGENCE ENDPOINTS
 // ============================================================================
-app.get('/api/social/signals', (req, res) => {
+app.get('/api/social/signals', requireOperatorAuth, (req, res) => {
   res.json({
     status: 'OK',
     count: socialScanner.getSignals().length,
@@ -814,7 +814,7 @@ app.post('/api/social/signals/snipe', requireOperatorAuth, validateTradeBody(Sig
   });
 });
 
-app.get('/api/telegram/config', (req, res) => {
+app.get('/api/telegram/config', requireOperatorAuth, (req, res) => {
   res.json({
     status: 'OK',
     config: socialScanner.getTelegramConfigRedacted(),
@@ -853,7 +853,7 @@ app.post('/api/social/test-twitter', requireOperatorAuth, async (req, res) => {
 });
 
 // Full External Connectivity Diagnostics & Simulation Scope Audit
-app.get('/api/connectivity/diagnostics', async (req, res) => {
+app.get('/api/connectivity/diagnostics', requireOperatorAuth, async (req, res) => {
   const tStart = Date.now();
 
   // 1. Telegram
@@ -1077,7 +1077,7 @@ app.get('/api/connectivity/diagnostics', async (req, res) => {
 // ============================================================================
 // 13. MULTI-PLATFORM MEMECOIN AGGREGATOR & SNIPER ENGINE ENDPOINTS
 // ============================================================================
-app.get('/api/memecoins/pools', (req, res) => {
+app.get('/api/memecoins/pools', requireOperatorAuth, (req, res) => {
   const { platform, chain } = req.query;
   const pools = memecoinAggregator.getPools(platform as string, chain as string);
   res.json({
@@ -1087,7 +1087,7 @@ app.get('/api/memecoins/pools', (req, res) => {
   });
 });
 
-app.get('/api/memecoins/positions', (req, res) => {
+app.get('/api/memecoins/positions', requireOperatorAuth, (req, res) => {
   res.json({
     status: 'OK',
     positions: memecoinAggregator.getPositions(),
@@ -1117,7 +1117,7 @@ function redactSniperConfig<T extends { telegramBotToken?: string }>(c: T) {
   return { ...c, telegramBotToken: '', telegramBotTokenSet: Boolean(c.telegramBotToken) };
 }
 
-app.get('/api/memecoins/config', (req, res) => {
+app.get('/api/memecoins/config', requireOperatorAuth, (req, res) => {
   res.json({
     status: 'OK',
     config: redactSniperConfig(memecoinAggregator.getConfig()),
@@ -1138,7 +1138,7 @@ app.post('/api/memecoins/config', requireOperatorAuth, validateTradeBody(SniperC
 // ============================================================================
 // 13b. PUMP.FUN HOT CALLOUTS & CALLER LEADERBOARD (REAL-WORLD ENGINE)
 // ============================================================================
-app.get('/api/pumpfun/callouts', (req, res) => {
+app.get('/api/pumpfun/callouts', requireOperatorAuth, (req, res) => {
   const status = pumpFunService.getStatus();
   res.json({
     status: 'OK',
@@ -1152,7 +1152,7 @@ app.get('/api/pumpfun/callouts', (req, res) => {
   });
 });
 
-app.get('/api/pumpfun/leaderboard', (req, res) => {
+app.get('/api/pumpfun/leaderboard', requireOperatorAuth, (req, res) => {
   res.json({
     status: 'OK',
     leaderboard: pumpFunService.getLeaderboard(),
@@ -1184,7 +1184,7 @@ app.post('/api/pumpfun/callouts/toggle-autosnipe', requireOperatorAuth, validate
   });
 });
 
-app.get('/api/pumpfun/callouts/rules', (req, res) => {
+app.get('/api/pumpfun/callouts/rules', requireOperatorAuth, (req, res) => {
   res.json({
     status: 'OK',
     rules: pumpFunService.getAutoSnipeRules(),
@@ -1199,11 +1199,11 @@ app.post('/api/pumpfun/callouts/rules', requireOperatorAuth, (req, res) => {
   });
 });
 
-app.get('/api/pumpfun/status', (req, res) => {
+app.get('/api/pumpfun/status', requireOperatorAuth, (req, res) => {
   res.json(pumpFunService.getStatus());
 });
 
-app.post('/api/pumpfun/refresh', async (req, res) => {
+app.post('/api/pumpfun/refresh', requireOperatorAuth, async (req, res) => {
   // A manual refresh only reloads the feed; it must never evaluate auto-snipe triggers (A5).
   await pumpFunService.syncRealWorldData({ evaluateTriggers: false });
   res.json({
@@ -1217,7 +1217,7 @@ app.post('/api/pumpfun/refresh', async (req, res) => {
 // ============================================================================
 // 14. REALISM & CO-LOCATION MICROSTRUCTURE CONFIG ENDPOINTS
 // ============================================================================
-app.get('/api/realism/config', (req, res) => {
+app.get('/api/realism/config', requireOperatorAuth, (req, res) => {
   res.json({
     status: 'OK',
     config: realismEngine.getConfig(),
@@ -1237,7 +1237,7 @@ app.post('/api/realism/config', requireOperatorAuth, (req, res) => {
 // ============================================================================
 // 15. PLUG-AND-PLAY WALLET ONBOARDING & LIVE AUTONOMOUS TRADING ENDPOINTS
 // ============================================================================
-app.get('/api/wallet/state', (req, res) => {
+app.get('/api/wallet/state', requireOperatorAuth, (req, res) => {
   res.json({
     success: true,
     data: walletTrader.getState(),
@@ -1312,7 +1312,7 @@ app.post('/api/wallet/panic-liquidate', requireOperatorAuth, async (req, res) =>
   });
 });
 
-app.post('/api/wallet/sync-rpc', async (req, res) => {
+app.post('/api/wallet/sync-rpc', requireOperatorAuth, async (req, res) => {
   const solBalance = await walletTrader.syncRpcBalance();
   res.json({
     success: true,
@@ -1324,7 +1324,7 @@ app.post('/api/wallet/sync-rpc', async (req, res) => {
 // ============================================================================
 // 16. CANONICAL DIAGNOSTICS & SYSTEM ARCHITECTURE AUDIT (SECTION 64)
 // ============================================================================
-app.get('/api/diagnostics/system', (req, res) => {
+app.get('/api/diagnostics/system', requireOperatorAuth, (req, res) => {
   const diag = executionCoordinator.getDiagnostics();
   const signerStatus = localSigner.getStatus();
   const dbMetrics = workstationDb.getExecutionMetrics();
@@ -1360,7 +1360,7 @@ app.get('/api/diagnostics/system', (req, res) => {
   });
 });
 
-app.get('/api/execution/mode', (req, res) => {
+app.get('/api/execution/mode', requireOperatorAuth, (req, res) => {
   res.json({
     success: true,
     mode: executionCoordinator.getExecutionMode(),
@@ -1368,14 +1368,14 @@ app.get('/api/execution/mode', (req, res) => {
   });
 });
 
-app.get('/api/execution/can-arm', (req, res) => {
+app.get('/api/execution/can-arm', requireOperatorAuth, (req, res) => {
   res.json({
     success: true,
     ...executionCoordinator.canExecuteLive(),
   });
 });
 
-app.get('/api/execution/readiness', (req, res) => {
+app.get('/api/execution/readiness', requireOperatorAuth, (req, res) => {
   res.json({
     success: true,
     ...executionCoordinator.getLiveReadiness(),
@@ -1513,7 +1513,7 @@ app.post('/api/execution/reconcile', requireOperatorAuth, async (req, res) => {
   }
 });
 
-app.get('/api/signer/status', (req, res) => {
+app.get('/api/signer/status', requireOperatorAuth, (req, res) => {
   const status = localSigner.getStatus();
   const pubkey = status === 'READY' ? localSigner.getPublicKey().toBase58() : null;
   res.json({
@@ -1544,7 +1544,7 @@ app.post('/api/signer/generate', requireOperatorAuth, (req, res) => {
   }
 });
 
-app.get('/api/workstation/positions', (req, res) => {
+app.get('/api/workstation/positions', requireOperatorAuth, (req, res) => {
   const mode = (req.query.mode as any) || undefined;
   const status = (req.query.status as any) || undefined;
   const positions = executionCoordinator.getPositions(mode, status);
@@ -1555,7 +1555,7 @@ app.get('/api/workstation/positions', (req, res) => {
   });
 });
 
-app.get('/api/workstation/events', (req, res) => {
+app.get('/api/workstation/events', requireOperatorAuth, (req, res) => {
   const limit = Math.min(parseInt((req.query.limit as string) || '50', 10), 200);
   const events = workstationDb.getEvents(limit);
   res.json({
@@ -1569,6 +1569,14 @@ app.get('/api/workstation/events', (req, res) => {
 app.use(errorHandler);
 
 // Vite middleware & Static SPA serving
+// One bad request must not take down the server and the trade monitor. Log it loudly and keep serving; the operator sees it in the logs.
+process.on('unhandledRejection', (reason) => {
+  Logger.error(`[PROCESS] unhandledRejection (process kept alive): ${reason instanceof Error ? reason.stack || reason.message : String(reason)}`);
+});
+process.on('uncaughtException', (err) => {
+  Logger.error(`[PROCESS] uncaughtException (process kept alive): ${err?.stack || err?.message || String(err)}`);
+});
+
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
     const customLogger = createLogger();

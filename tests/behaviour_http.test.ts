@@ -1,3 +1,4 @@
+import net from 'node:net';
 import fs from 'node:fs';
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
 import { Keypair } from '@solana/web3.js';
@@ -247,4 +248,48 @@ describe('deny-by-default on the real server: no route is reachable without a to
       expect(leaks).toEqual([]); // 401, or 429 from the rate limiter: denied either way, never served
     } finally { await rpc.close(); }
   }, 180_000);
+});
+
+describe('R1/R2/R3s: the server survives hostile requests and the gate cannot be walked around', () => {
+  it('an absolute-form request target is still gated; a repeated query parameter is a 400, not a crash; the bot token is never on the wire', async () => {
+    const rpc = await startRpcStub(LOCALNET_STUB_GENESIS);
+    try {
+      const app = await startApp(dir(), { SOLANA_RPC_URL: rpc.url, ALLOWED_CLUSTER: 'localnet', LOCALNET_GENESIS_HASH: LOCALNET_STUB_GENESIS }); handles.push(app);
+      const port = new URL(app.base).port;
+
+      // raw request line `GET http://x/api/wallet/state` through Node's real HTTP parser (fetch cannot send this form)
+      const raw = (target: string, extraHeaders = '') => new Promise<number>((resolve, reject) => {
+        const s = net.connect(Number(port), '127.0.0.1', () => s.write(`GET ${target} HTTP/1.1\r\nHost: x\r\n${extraHeaders}Connection: close\r\n\r\n`));
+        let buf = '';
+        s.on('data', (d) => (buf += d));
+        s.on('close', () => resolve(Number(/^HTTP\/1\.1 (\d+)/.exec(buf)?.[1] ?? 0)));
+        s.on('error', reject);
+      });
+      for (const t of ['http://x/api/wallet/state', 'http://x/API/wallet/state', 'HTTP://x//api/wallet/state', 'http://x/api/workstation/positions?x=1']) {
+        expect(await raw(t), t).toBe(401);
+      }
+      expect(await raw('http://x/api/wallet/state', `Authorization: Bearer ${app.token}\r\n`)).toBe(200);
+
+      // the crash: ?symbol=a&symbol=b used to call .replace on an array inside an async handler and kill the process
+      for (const q of ['symbol=a&symbol=b', 'symbol[x]=1', 'symbol[]=1']) {
+        const r = await app.call('GET', `/api/market/ticker?${q}`);
+        expect(r.status, q).toBe(400);
+      }
+      expect((await app.call('GET', '/api/health')).status).toBe(200); // still alive
+
+      // the Telegram bot token is not in the config or the WebSocket snapshot
+      await app.call('POST', '/api/memecoins/config', { telegramBotToken: 'SECRET-TOKEN-123456:ABC', telegramChatId: '1' });
+      const cfg = await app.call('GET', '/api/memecoins/config');
+      expect(JSON.stringify(cfg.json)).not.toContain('SECRET-TOKEN');
+      const frames: string[] = [];
+      await new Promise<void>((resolve) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${port}/ws/engine`);
+        ws.onmessage = (m) => { frames.push(String(m.data)); };
+        ws.onopen = () => ws.send(JSON.stringify({ action: 'AUTHENTICATE', token: app.token }));
+        setTimeout(() => { ws.close(); resolve(); }, 2500);
+      });
+      expect(frames.join('\n')).toContain('MEMECOIN_SNAPSHOT');
+      expect(frames.join('\n')).not.toContain('SECRET-TOKEN');
+    } finally { await rpc.close(); }
+  }, 120_000);
 });

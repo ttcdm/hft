@@ -1,4 +1,5 @@
-import type { Express } from 'express';
+import type { Express, Request, Response } from 'express';
+import { requireOperatorAuth } from '../middleware/auth';
 
 /**
  * Market data proxy routes (B2). When the upstream source fails, these answer 503 with { source: 'UNAVAILABLE' } and
@@ -7,7 +8,17 @@ import type { Express } from 'express';
 const unavailable = (res: any, symbol: string, what: string) =>
   res.status(503).json({ source: 'UNAVAILABLE', symbol, error: `${what} unavailable from the upstream source`, timestamp: Date.now() });
 
-const safeSymbol = (q: unknown) => ((q as string) || 'BTCUSDT').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+const safeSymbol = (q: string) => (q || 'BTCUSDT').replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
+
+/** The `symbol` query parameter as a clean string, or null after answering 400 (an array or object, e.g. `?symbol=a&symbol=b`, used to crash the process). */
+function symbolOf(req: Request, res: Response): string | null {
+  const q: unknown = req.query.symbol;
+  if (q !== undefined && typeof q !== 'string') {
+    res.status(400).json({ success: false, error: 'symbol must be a single string' });
+    return null;
+  }
+  return safeSymbol((q as string | undefined) ?? '');
+}
 
 async function upstream(url: string): Promise<any | null> {
   const controller = new AbortController();
@@ -23,8 +34,9 @@ async function upstream(url: string): Promise<any | null> {
 }
 
 export function registerMarketRoutes(app: Express) {
-  app.get('/api/market/orderbook', async (req, res) => {
-    const symbol = safeSymbol(req.query.symbol);
+  app.get('/api/market/orderbook', requireOperatorAuth, async (req, res) => {
+    const symbol = symbolOf(req, res);
+    if (!symbol) return;
     const data = await upstream(`https://api.binance.com/api/v3/depth?symbol=${symbol}&limit=20`);
     if (!data) return unavailable(res, symbol, 'Order book');
     const bids = (data.bids || []).map((b: [string, string]) => [parseFloat(b[0]), parseFloat(b[1])]);
@@ -45,8 +57,9 @@ export function registerMarketRoutes(app: Express) {
     });
   });
 
-  app.get('/api/market/trades', async (req, res) => {
-    const symbol = safeSymbol(req.query.symbol);
+  app.get('/api/market/trades', requireOperatorAuth, async (req, res) => {
+    const symbol = symbolOf(req, res);
+    if (!symbol) return;
     const limit = Math.min(parseInt((req.query.limit as string) || '30', 10) || 30, 100);
     const trades = await upstream(`https://api.binance.com/api/v3/trades?symbol=${symbol}&limit=${limit}`);
     if (!Array.isArray(trades)) return unavailable(res, symbol, 'Trades');
@@ -63,8 +76,9 @@ export function registerMarketRoutes(app: Express) {
     res.json({ source: 'BINANCE_LIVE_TRADES', symbol, count: mapped.length, trades: mapped.reverse() });
   });
 
-  app.get('/api/market/ticker', async (req, res) => {
-    const symbol = safeSymbol(req.query.symbol);
+  app.get('/api/market/ticker', requireOperatorAuth, async (req, res) => {
+    const symbol = symbolOf(req, res);
+    if (!symbol) return;
     const data = await upstream(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`);
     if (!data) return unavailable(res, symbol, 'Ticker');
     res.json({

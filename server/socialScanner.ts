@@ -276,7 +276,7 @@ export class SocialAlphaScanner {
     const trimmed = commandText.trim();
     if (trimmed.startsWith('/start') || trimmed.startsWith('/help')) {
       return {
-        reply: `⚡ APEX QUANT TELEGRAM BOT ONLINE\nAvailable Commands:\n/snipe <CA> [amount_usd] - Instantly snipes token with Jito priority tip\n/signals - Lists top 3 high-confidence market maker signals\n/positions - View open memecoin positions and PnL\n/status - Check bot connection & execution telemetry\n/panic_sell - Liquidate all open positions immediately`,
+        reply: `⚡ APEX QUANT TELEGRAM BOT ONLINE\nAvailable Commands:\n/snipe <CA> [amount_usd] - Buys the token (paper or live, whichever mode is active)\n/signals - Lists top 3 high-confidence market maker signals\n/positions - View open memecoin positions and PnL\n/status - Check bot connection & execution telemetry\n/panic_sell - Liquidate all open positions immediately`,
       };
     }
 
@@ -320,23 +320,27 @@ export class SocialAlphaScanner {
       }
       let totalRealized = 0;
       const closedNames: string[] = [];
+      const failedNames: string[] = []; // Q23: a close that failed is reported, never counted as sold
       for (const p of positions) {
-        const res = await memecoinAggregator.closePosition(p.id, 100);
+        const res = await memecoinAggregator.closePosition(p.id, 100).catch((e: any) => ({ success: false as const, realizedPnl: 0, message: e?.message }));
         if (res.success) {
           totalRealized += res.realizedPnl || 0;
           closedNames.push(p.tokenTicker);
+        } else {
+          failedNames.push(`${p.tokenTicker}${(res as any).message ? ` (${(res as any).message})` : ''}`);
         }
       }
+      const head = failedNames.length === 0 ? '🚨 EMERGENCY DUMP COMPLETE' : `⚠️ EMERGENCY DUMP INCOMPLETE: ${failedNames.length} position(s) STILL OPEN`;
       return {
-        reply: `🚨 EMERGENCY DUMP EXECUTED:\nLiquidated ${closedNames.length} tokens: ${closedNames.join(', ')}\nTotal Realized PnL: ${totalRealized >= 0 ? '+' : ''}$${totalRealized.toFixed(2)}`,
-        actionTaken: 'PANIC_SELL_EXECUTED',
+        reply: `${head}:\nClosed ${closedNames.length}: ${closedNames.join(', ') || 'none'}${failedNames.length ? `\nStill open: ${failedNames.join(', ')}` : ''}\nRealized PnL of the closed: ${totalRealized >= 0 ? '+' : ''}$${totalRealized.toFixed(2)}`,
+        actionTaken: failedNames.length === 0 ? 'PANIC_SELL_EXECUTED' : 'PANIC_SELL_PARTIAL',
       };
     }
 
     if (trimmed.startsWith('/status')) {
       const positions = memecoinAggregator.getPositions();
       return {
-        reply: `🟢 APEX QUANT TELEGRAM BOT ENGINE STATUS:\n• Connection: ${this.telegramConfig.webhookActive ? 'LIVE WEBHOOK ACTIVE' : 'POLLING ACTIVE'}\n• Alert Chat: ${this.telegramConfig.chatId || '@apex_alpha_vip_snipers'}\n• Active Alpha Signals: ${this.signals.length}\n• Open Positions: ${positions.length}\n• MEV Tip Target: Jito Validator Tip Floor\n• Latency: ~28ms RTT`,
+        reply: `🟢 APEX QUANT TELEGRAM BOT ENGINE STATUS:\n• Connection: ${this.telegramConfig.webhookActive ? 'LIVE WEBHOOK ACTIVE' : 'POLLING ACTIVE'}\n• Alert Chat: ${this.telegramConfig.chatId || 'not set'}\n• Active Alpha Signals: ${this.signals.length}\n• Open Positions: ${positions.length}`,
       };
     }
 
@@ -367,7 +371,7 @@ export class SocialAlphaScanner {
       if (snipeResult.success) {
         const pos = snipeResult.position;
         return {
-          reply: `🚀 SNIPER ORDER EXECUTED via Telegram!\nToken: $${pos?.tokenTicker || 'TOKEN'}\nCA: ${ca}\nNotional: $${amount.toFixed(2)}\nExecution Price: $${(pos?.entryPriceUsd || 0).toFixed(6)}\nPriority Fee: 0.005 SOL (Jito MEV Bundle)\nTx Hash: ${snipeResult.txHash}\nStatus: CONFIRMED in Block Slot`,
+          reply: `🚀 SNIPER ORDER FILLED via Telegram:\nToken: $${pos?.tokenTicker || 'TOKEN'}\nCA: ${ca}\nNotional: $${amount.toFixed(2)}\nExecution Price: $${(pos?.entryPriceUsd || 0).toFixed(6)}\nTx: ${snipeResult.txHash || 'none (paper fill)'}`,
           actionTaken: 'SNIPED_FROM_TELEGRAM',
         };
       } else {

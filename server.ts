@@ -834,6 +834,11 @@ app.post('/api/telegram/config', requireOperatorAuth, (req, res) => {
 app.post('/api/telegram/webhook', requireOperatorAuth, async (req, res) => {
   const { message } = req.body;
   const text = message?.text || req.body?.text || '';
+  // Q23: /snipe and /buy are one-click trades, so they need the same live confirmation as the other trade routes
+  if (/^\s*\/(snipe|buy)\b/.test(text)) {
+    const unconfirmed = liveConfirmationRefusal(executionCoordinator.isLiveArmed(), allowedCluster(), req.body);
+    if (unconfirmed) return res.status(409).json({ ok: false, result: { reply: `❌ SNIPE REJECTED: ${unconfirmed}` } });
+  }
   const result = await socialScanner.processTelegramCommand(text);
 
   res.json({

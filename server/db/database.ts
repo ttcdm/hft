@@ -381,7 +381,8 @@ export class WorkstationDatabase {
     }
   }
 
-  public saveTransaction(tx: PersistedTransaction) {
+  /** Returns false when the write failed (it is logged); callers that must not lose the record check it. */
+  public saveTransaction(tx: PersistedTransaction): boolean {
     try {
       const stmt = this.db.prepare(`
         INSERT INTO transactions (
@@ -415,8 +416,10 @@ export class WorkstationDatabase {
         tx.executionMode,
         tx.error || null
       );
+      return true;
     } catch (err: any) {
       Logger.error(`Failed to save transaction ${tx.signature}: ${err.message}`);
+      return false;
     }
   }
 

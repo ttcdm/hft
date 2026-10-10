@@ -22,6 +22,8 @@ import { VALID_PUMP_MINT_1, DUMMY_FEE_RECIPIENT, createSimulatedBondingCurveStat
  * P4 (critique #4): a failing stop-loss must not bleed fees. Real coordinator and SQLite; the RPC, builder and reconciler are stubbed at their edges.
  * Wallet keys are freshly generated throwaway values.
  */
+const uid = () => Math.random().toString(36).slice(2);
+
 describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', () => {
   let coordinator: ExecutionCoordinator;
   let mockRpc: MockSolanaRpc;
@@ -257,5 +259,38 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
     } as any);
     expect(evaluate).toHaveBeenCalled();
     expect(evaluate.mock.calls[0][0].walletSpendableSol).toBeCloseTo(0.2, 6); // balance - in-flight (0), no reserve and no rent taken off yet
+  });
+
+  it('N11: a landed buy whose position the database refuses is still a success for the caller, stays open for recovery, and alerts', async () => {
+    for (const p of workstationDb.loadPositions(undefined, 'ACTIVE')) {
+      workstationDb.savePosition({ ...p, status: 'CLOSED', tokenQuantityRaw: '0', costBasisLamports: 0, currentValueSol: 0, currentPriceSol: p.entryPriceSol, realizedPnLSol: 0 } as any);
+    }
+    vi.spyOn(workstationDb, 'getDailyTotalPnLSol').mockReturnValue(0);
+    (riskEngine as any).lastTradeFailureTimestamp = 0;
+    (coordinator as any).realWalletBalanceSol = 1;
+    (coordinator as any).executionMode = 'LIVE';
+    (coordinator as any).isLiveTradingArmed = true;
+    vi.spyOn(workstationDb, 'hasUnresolvedLiveBuy').mockReturnValue(false); // the N2 case above leaves an unresolved buy of this mint
+    const sig = `n11_${uid()}`;
+    submit.mockResolvedValue({ success: true, signature: sig, transport: 'SOLANA_RPC', slot: 9, lifecycleState: 'CONFIRMED' });
+    vi.spyOn(TradeReconciler, 'reconcileBuyTransaction').mockResolvedValue({
+      success: true, reconciliationState: 'RECONCILED', actualSolSpentLamports: 5_000_000, actualTokensReceivedRaw: '1000000', tokenDecimals: 6,
+      tokensReceivedHuman: 1, actualNetworkFeeLamports: 5000, actualJitoTipLamports: 0, effectiveFillPriceSol: 0.005, allInFillPriceSol: 0.005, slot: 9,
+    } as any);
+    const recovery = vi.spyOn(coordinator as any, 'scheduleOrphanRecovery').mockImplementation(() => undefined);
+    const realSave = workstationDb.savePosition.bind(workstationDb);
+    vi.spyOn(workstationDb, 'savePosition').mockImplementation((pos: any) => {
+      if (pos.id === sig) throw new Error('SQLITE_FULL: database or disk is full');
+      return realSave(pos);
+    });
+    const res = await coordinator.executeTrade({
+      signalTimestamp: Date.now(), mint: VALID_PUMP_MINT_1.toBase58(), symbol: 'N11', name: 'N11', amountSol: 0.005,
+      source: 'AUTO_SNIPER', provenance: 'REAL_ONCHAIN', eligibilityReport: createPassingEligibilityReport(VALID_PUMP_MINT_1.toBase58()),
+    } as any);
+    expect(res.success, res.error).toBe(true);
+    expect(res.lifecycleState).toBe('CONFIRMED');
+    expect(coordinator.getOperatorAlerts().some((a) => a.code === 'POSITION_NOT_PERSISTED')).toBe(true);
+    expect(recovery).toHaveBeenCalled();
+    expect(workstationDb.loadTransactions().find((t) => t.signature === sig)?.reconciliationState).toBe('RECONCILIATION_REQUIRED');
   });
 });

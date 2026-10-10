@@ -160,6 +160,18 @@ describe('P3b: untracked wallet token balances', () => {
       expect(close.mock.calls.filter((c) => c[0] === p.id)).toEqual([]);
     });
 
+    it('R15: while the ladder is off the high-water mark and trailing stop do not ratchet', async () => {
+      const { p } = await setup();
+      const before = { hwm: posFor(new PublicKey(p.mint))!.highWaterMarkSol, trail: posFor(new PublicKey(p.mint))!.trailingStopSol };
+      reprice(p, 0.0030); // +200%
+      await coordinator.evaluateAndProcessExits();
+      reprice(p, 0.0020);
+      await coordinator.evaluateAndProcessExits();
+      const after = posFor(new PublicKey(p.mint))!;
+      expect(after.highWaterMarkSol).toBe(before.hwm);
+      expect(after.trailingStopSol).toBe(before.trail);
+    });
+
     it('AUTO_MANAGE_RECOVERED=true opts back into the full exit engine', async () => {
       vi.stubEnv('AUTO_MANAGE_RECOVERED', 'true');
       const { p, close } = await setup();

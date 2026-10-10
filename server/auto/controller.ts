@@ -450,7 +450,14 @@ export class AutoSnipeController extends EventEmitter {
         params.amountSolOverride = AUTO_DEVNET_ORDER_SOL;
       }
       const res = await memecoinAggregator.executeSnipe(params);
-      if (!res.success) return this.record(c, 'REJECTED', classifyRejection(res.message), res.message, { inputs: { confluenceScore: res.confluenceScore, dryRun: shadow } });
+      if (!res.success) {
+        // R6: a buy that was sent and may have landed (unconfirmed, or landed with an unreadable fill) spent real SOL the cap must count.
+        if (this.session && !shadow && /^(UNCONFIRMED|RECONCILIATION FAILED)/.test(res.message)) {
+          this.session.spentSol += AUTO_DEVNET_ORDER_SOL;
+          workstationDb.logDecision({ autoMode: this.mode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'budget', outcome: 'INFO', reason: `counted ${AUTO_DEVNET_ORDER_SOL} SOL against the session cap: the buy was sent and may have landed` });
+        }
+        return this.record(c, 'REJECTED', classifyRejection(res.message), res.message, { inputs: { confluenceScore: res.confluenceScore, dryRun: shadow } });
+      }
       if (shadow) return this.record(c, 'WOULD_BUY', 'fill', res.message, { amountSol: res.amountSol, inputs: { dryRun: true, confluenceScore: res.confluenceScore, gates: res.gates } });
       if (this.session) {
         this.session.buys += 1;

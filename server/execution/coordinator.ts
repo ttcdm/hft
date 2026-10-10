@@ -2447,7 +2447,6 @@ export class ExecutionCoordinator {
 
       // 8. Reconciled Successfully: Persist verified OPEN position
       riskEngine.recordTradeSuccess(req.mint);
-      await this.syncRealWalletBalance();
 
       const livePosition: NormalizedPosition = {
         id: subRes.signature,
@@ -2479,9 +2478,19 @@ export class ExecutionCoordinator {
         lastUpdatedTimestamp: Date.now(),
       };
 
-      workstationDb.savePosition(livePosition);
+      // N11: the tokens are in the wallet. If the database refuses the position the buy must not turn into a "chain error" with an
+      // unwatched balance: keep the transaction row open for recovery (it rebuilds the position from chain data) and tell the operator.
+      let positionPersisted = true;
+      try {
+        workstationDb.savePosition(livePosition);
+      } catch (err: any) {
+        positionPersisted = false;
+        Logger.error(`Position write failed after a landed buy ${subRes.signature}: ${err.message}`);
+        this.raiseOperatorAlert('POSITION_NOT_PERSISTED', `A buy of ${req.symbol || req.mint} landed (${subRes.signature.slice(0, 8)}) but the database refused the position (${String(err.message).slice(0, 80)}). Recovery will rebuild it from chain data; until then it has no stop-loss.`, subRes.signature);
+        this.scheduleOrphanRecovery();
+      }
 
-      workstationDb.saveTransaction({
+      const ledgerWritten = workstationDb.saveTransaction({
         signature: subRes.signature,
         bundleId: subRes.bundleId,
         orderId: clientOrderId,
@@ -2492,11 +2501,19 @@ export class ExecutionCoordinator {
         submissionTime: Date.now(),
         landingSlot: reconciliation.slot,
         confirmationTime: Date.now(),
-        reconciliationState: 'RECONCILED',
+        reconciliationState: positionPersisted ? 'RECONCILED' : 'RECONCILIATION_REQUIRED',
         networkFeeLamports: reconciliation.actualNetworkFeeLamports,
         jitoTipLamports: resolvedTip.tipLamports,
         executionMode: 'LIVE',
       });
+      if (!ledgerWritten) {
+        this.raiseOperatorAlert('LEDGER_WRITE_FAILED', `The transaction row for a landed buy (${subRes.signature.slice(0, 8)}) could not be written; the position ${positionPersisted ? 'was saved' : 'was NOT saved either'}.`, subRes.signature);
+      }
+      try {
+        await this.syncRealWalletBalance();
+      } catch (err: any) {
+        Logger.warn(`Wallet balance sync after a landed buy failed: ${err.message}`); // the buy is done; a stale balance self-corrects on the next sync
+      }
 
       return {
         success: true,
@@ -3084,13 +3101,14 @@ export class ExecutionCoordinator {
       // A RECOVERED position (a balance found in the wallet that this app never bought) has an entry price that is just the mark at
       // adoption, so take-profit, trailing and stale exits would sell whatever lands in the wallet on an invented schedule. Only the
       // hard stop applies, unless the operator opts in with AUTO_MANAGE_RECOVERED=true.
-      if (
-        decision.shouldExit &&
-        decision.reason !== 'STOP_LOSS' &&
-        pos.entryTxSignature?.startsWith('RECOVERED:') &&
-        process.env.AUTO_MANAGE_RECOVERED !== 'true'
-      ) {
+      const ladderSuppressed = isRecoveredPosition(pos) && process.env.AUTO_MANAGE_RECOVERED !== 'true';
+      if (decision.shouldExit && decision.reason !== 'STOP_LOSS' && ladderSuppressed) {
         decision = { ...decision, shouldExit: false, newExitStage: pos.exitStage ?? 0 };
+      }
+      if (ladderSuppressed) {
+        // R15: while the ladder is off, the high-water mark and trailing stop must not keep ratcheting up, or enabling
+        // AUTO_MANAGE_RECOVERED later would fire a trailing stop built from days of suppressed history at once.
+        decision = { ...decision, newHighWaterMarkSol: pos.highWaterMarkSol ?? decision.newHighWaterMarkSol, newTrailingStopSol: pos.trailingStopSol ?? decision.newTrailingStopSol };
       }
 
       // Persist high_water_mark_sol and trailing_stop_sol to SQLite (B13). The exit stage only advances after the

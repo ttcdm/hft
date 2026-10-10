@@ -201,6 +201,23 @@ describe('G1: auto-snipe controller', () => {
     workstationDb.savePosition({ ...workstationDb.loadPositions().find((p) => p.id === 'dv-open')!, status: 'CLOSED' } as any); // do not leak an open LIVE row into later tests
   });
 
+  it('R6: a buy that was sent and may have landed (unconfirmed / fill unreadable) counts against the DEVNET session cap, a plain rejection does not', async () => {
+    vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
+    vi.stubEnv('ALLOWED_CLUSTER', 'devnet');
+    vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('LIVE');
+    vi.spyOn(executionCoordinator, 'isLiveArmed').mockReturnValue(true);
+    await autoSnipeController.setMode('DEVNET_LIVE', { confirmationCode: DEVNET_CONFIRMATION_CODE });
+    const remaining = () => autoSnipeController.getStatus().session!.budgetsLeft.spendSol;
+    const start = remaining();
+    const snipe = vi.spyOn(memecoinAggregator, 'executeSnipe');
+    snipe.mockResolvedValueOnce({ success: false, message: 'RISK_REJECTED: nope', txHash: '' });
+    await autoSnipeController.submitCandidate(cand(newPool()));
+    expect(remaining()).toBeCloseTo(start, 6);
+    snipe.mockResolvedValueOnce({ success: false, message: 'UNCONFIRMED: did not confirm. The transaction was sent and may still land', txHash: '' });
+    await autoSnipeController.submitCandidate(cand(newPool()));
+    expect(remaining()).toBeCloseTo(start - AUTO_DEVNET_ORDER_SOL, 6);
+  });
+
   it('L2: every candidate re-checks the coordinator mode (PAPER auto with LIVE armed, DEVNET_LIVE with the coordinator in PAPER)', async () => {
     // PAPER auto was started while the coordinator was PAPER; afterwards someone arms LIVE.
     await setAutoMode('PAPER');

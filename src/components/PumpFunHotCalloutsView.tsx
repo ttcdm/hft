@@ -197,7 +197,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
       onAlertTrigger?.(
         'WARNING',
         'SNIPE REJECTED',
-        res?.result?.message || 'Failed pre-trade risk or curve check'
+        res?.result?.message || res?.error || 'Failed pre-trade risk or curve check'
       );
     }
     setSnipingCalloutId(null);

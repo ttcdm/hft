@@ -197,6 +197,15 @@ const INITIAL_SIGNALS: SocialSignal[] = [
   },
 ];
 
+/**
+ * True for any text the Telegram parser could treat as a buy command. Deliberately a PREFIX test on the trimmed text, the same one the
+ * parser starts from, so the webhook's live-confirmation guard cannot be dodged by "/snipe_x" or "/buyer" (S1c).
+ */
+export function isTelegramTradeCommand(text: string): boolean {
+  const t = (text ?? '').trim();
+  return t.startsWith('/snipe') || t.startsWith('/buy');
+}
+
 export class SocialAlphaScanner {
   private signals: SocialSignal[] = [];
   private telegramConfig: TelegramBotConfig = {
@@ -344,8 +353,11 @@ export class SocialAlphaScanner {
       };
     }
 
-    if (trimmed.startsWith('/snipe') || trimmed.startsWith('/buy')) {
+    if (isTelegramTradeCommand(trimmed)) {
       const parts = trimmed.split(/\s+/);
+      // S1c: only the exact commands trade. The route's live-confirmation guard uses the broader prefix test, so "/snipe_x" and "/buyer"
+      // are refused by the guard while LIVE is armed and are not trades here either.
+      if (!/^\/(snipe|buy)(@\w+)?$/.test(parts[0])) return { reply: `Unknown command ${parts[0].slice(0, 40)}. Type /help for the available operations.` };
       const ca = parts[1] || '';
       // S1: never fall back to a hardcoded token. A missing or malformed mint, or a bad amount, is rejected.
       let validMint: boolean;

@@ -198,8 +198,25 @@ describe('arming policy and readiness, through the real API', () => {
       expect(ok.status).toBe(200);
       expect((await app.call('GET', '/api/execution/mode')).json).toMatchObject({ mode: 'LIVE', isLiveArmed: true });
 
+      // S1: with LIVE armed every position-opening route refuses a request that does not carry confirmLive: true, before anything else runs
+      const mintB = Keypair.generate().publicKey.toBase58();
+      const unconfirmed = [
+        await app.call('POST', '/api/execution/trade', trade()),
+        await app.call('POST', '/api/memecoins/trade', { contractAddress: mintB, amountUsd: 5 }),
+        await app.call('POST', '/api/wallet/snipe', { mint: mintB, amountSol: 0.01 }),
+        await app.call('POST', '/api/pumpfun/callouts/snipe', { calloutId: 'x' }),
+        await app.call('POST', '/api/social/signals/snipe', { signalId: 'x' }),
+      ];
+      for (const r of unconfirmed) { expect(r.status).toBe(409); expect(JSON.stringify(r.json)).toMatch(/LIVE_CONFIRMATION_REQUIRED/); }
+      // the telegram guard covers the prefix the parser accepts, not just "/snipe " and "/buy "
+      for (const text of ['/snipe ' + mintB, '/buy ' + mintB, '/snipe_x ' + mintB, '/buyer ' + mintB, '  /snipe ' + mintB]) {
+        const t = await app.call('POST', '/api/telegram/webhook', { text });
+        expect(t.status, text).toBe(409);
+      }
+      expect(sends(rpc)).toBe(0);
+
       // LIVE with no readable curve (the RPC has no accounts), and a caller-suggested price: refused, nothing is signed or sent.
-      const live = await app.call('POST', '/api/execution/trade', trade());
+      const live = await app.call('POST', '/api/execution/trade', { ...trade(), confirmLive: true });
       expect(live.json.success).toBe(false);
       expect(live.json.error).toMatch(/MARKET_DATA_UNAVAILABLE: Could not fetch real Pump\.fun bonding curve/); // the caller's own currentPriceSol is not used in LIVE
       expect(sends(rpc)).toBe(0);

@@ -262,7 +262,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
       onAlertTrigger?.(
         'WARNING',
         `SNIPE REJECTED`,
-        res?.tradeResult?.message || 'Failed pre-trade risk check'
+        res?.tradeResult?.message || res?.error || 'Failed pre-trade risk check'
       );
     }
   };
@@ -307,6 +307,9 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   // Manual Snipe by CA
   const handleManualSnipe = async () => {
     if (!manualSnipeCa.trim()) return;
+    // S1: a manual snipe by address is a one-click trade too
+    const warning = liveClickWarning(tradingMode, `Sniping ${manualSnipeCa.trim().slice(0, 8)}… for $${(Number(manualSnipeAmount) || 5.0).toFixed(2)}`);
+    if (warning && !window.confirm(warning)) return;
     setManualSnipeLoading(true);
     hftAudio.playOrderFill();
     try {
@@ -315,7 +318,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
         amountUsd: Number(manualSnipeAmount) || 5.0,
         jitoTipSol: sniperConfig.jitoTipSol,
         slippagePct: sniperConfig.maxSlippagePct,
-      });
+      }, tradingMode.live);
 
       if (res?.result?.success) {
         onAlertTrigger?.('INFO', 'MANUAL SNIPE SUCCESSFUL', res.result.message);

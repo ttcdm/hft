@@ -23,6 +23,7 @@ import {
 } from 'lucide-react';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
 import { authFetch } from '../services/engineClient';
+import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
 import { positionPnlCell } from '../utils/positionPnl';
 
 interface PlugAndPlayTradingModalProps {
@@ -80,6 +81,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   const [positionSearchQuery, setPositionSearchQuery] = useState('');
   const [selectedExternalToken, setSelectedExternalToken] = useState<any>(null);
 
+  const tradingMode = useTradingMode();
   const [isLoading, setIsLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ text: string; type: 'info' | 'success' | 'error' } | null>(null);
 
@@ -213,6 +215,10 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
       return;
     }
 
+    // S1: this button sends a real transaction while LIVE is armed, so it asks first and tells the server it asked
+    const warning = liveClickWarning(tradingMode, `Sniping ${manualMint.trim().slice(0, 8)}… for ${Number(manualAmountSol)} SOL`);
+    if (warning && !window.confirm(warning)) return;
+
     try {
       setIsLoading(true);
       const res = await authFetch('/api/wallet/snipe', {
@@ -225,6 +231,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
           jitoTipSol: Number(jitoTipSol),
           callerHandle: '@manual_terminal',
           confluenceScore: 100,
+          ...(tradingMode.live ? { confirmLive: true } : {}),
         }),
       });
 

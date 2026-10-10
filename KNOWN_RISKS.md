@@ -104,3 +104,9 @@ These can be set (some from the UI) and are saved, but no code path reads them t
 | `ENABLE_SYNTHETIC_SOCIAL` | `server/solana/executionConfig.ts` | Read into the config object, never consulted. |
 
 Also: Jito bundles are used only on mainnet-beta, which this build does not use. On devnet and localnet the app sends ordinary transactions with a priority fee.
+
+## 7. What the live confirmation (`confirmLive`) is, and is not (S1)
+
+While LIVE is armed, every route and socket action that can open a position (`/api/execution/trade`, `/api/memecoins/trade`, `/api/wallet/snipe`, `/api/pumpfun/callouts/snipe`, `/api/social/signals/snipe`, the WebSocket `SNIPE_PUMP_CALLOUT` and `SNIPE_MEMECOIN` actions, and the Telegram `/snipe` and `/buy` commands) refuses a request that does not carry `confirmLive: true`. The UI sends it only after the operator accepts a dialog that names the cluster.
+
+It is a guard against an accidental or scripted one-click trade. It is **not** a security boundary: the flag is a value the client asserts, and anyone holding the operator token can send it. The operator token is the real authorisation. Closing a position and the kill switch are not behind it.

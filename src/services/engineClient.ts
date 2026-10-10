@@ -244,16 +244,16 @@ class EngineClient {
     return this.isConnected;
   }
 
-  public wsSnipePumpCallout(calloutId: string, amountUsd: number = 5.0, jitoTipSol: number = 0.005, slippagePct: number = 6.0) {
-    this.sendAction('SNIPE_PUMP_CALLOUT', { calloutId, amountUsd, jitoTipSol, slippagePct });
+  public wsSnipePumpCallout(calloutId: string, amountUsd: number = 5.0, jitoTipSol: number = 0.005, slippagePct: number = 6.0, confirmLive = false) {
+    this.sendAction('SNIPE_PUMP_CALLOUT', { calloutId, amountUsd, jitoTipSol, slippagePct, ...(confirmLive ? { confirmLive: true } : {}) });
   }
 
   public wsToggleCallerSubscription(userId: string) {
     this.sendAction('TOGGLE_CALLER_SNIPE', { userId });
   }
 
-  public wsSnipeMemecoin(params: { contractAddress: string; amountUsd: number; jitoTipSol?: number; slippagePct?: number }) {
-    this.sendAction('SNIPE_MEMECOIN', params);
+  public wsSnipeMemecoin(params: { contractAddress: string; amountUsd: number; jitoTipSol?: number; slippagePct?: number }, confirmLive = false) {
+    this.sendAction('SNIPE_MEMECOIN', { ...params, ...(confirmLive ? { confirmLive: true } : {}) });
   }
 
   public wsClosePosition(positionId: string, sellPct: number = 100) {
@@ -457,12 +457,12 @@ class EngineClient {
     jitoTipSol?: number;
     slippagePct?: number;
     signalId?: string;
-  }) {
+  }, confirmLive = false) {
     try {
       const res = await authFetch('/api/memecoins/trade', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(params),
+        body: JSON.stringify({ ...params, ...(confirmLive ? { confirmLive: true } : {}) }),
       });
       return await res.json();
     } catch (e) {

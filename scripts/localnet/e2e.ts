@@ -301,7 +301,7 @@ async function main() {
   if (!arm.body?.success) return finish();
 
   // ---- (a) BUY through the HTTP API ----
-  const buy = await call('POST', '/api/execution/trade', { mint: mint.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02 });
+  const buy = await call('POST', '/api/execution/trade', { mint: mint.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02, confirmLive: true });
   rec('(a) POST /api/execution/trade BUY', buy.status === 200 && buy.body?.success, JSON.stringify(buy.body).slice(0, 500));
   const chainBal = await ata();
   const pos1 = (await positions());
@@ -338,7 +338,7 @@ async function main() {
   const rival = await marketBuyTx(rivalFund, mintD, 1.5);
   await rpcCall(info.url, 'localnet_frontrunNext', [Buffer.from(rival.serialize()).toString('base64')]);
   const posBefore = ((await positions()) as any);
-  const revert = await call('POST', '/api/execution/trade', { mint: mintD.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02, slippageBps: 1 });
+  const revert = await call('POST', '/api/execution/trade', { mint: mintD.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02, slippageBps: 1, confirmLive: true });
   const posAfterList: any[] = Array.isArray(await positions()) ? ((await positions()) as any) : ((await positions()) as any)?.positions || [];
   const openLcl = posAfterList.filter((x) => x.mint === mintD.toBase58() && (x.status === 'ACTIVE' || x.status === 'PARTIALLY_CLOSED'));
   rec('(d) forced revert: app reports failure, no phantom position', revert.body?.success === false && openLcl.length === 0, `${revert.status} ${JSON.stringify(revert.body).slice(0, 330)}; open positions on mint: ${openLcl.length}`);
@@ -347,12 +347,12 @@ async function main() {
   rec('(d) wallet holds no tokens after the revert', ataAfterRevert === null || ataAfterRevert === 0n, `ATA ${ataAfterRevert}`);
 
   // The app pauses all execution for 15 s after a failure (EXECUTION_DISABLED: cooling down); that is itself behaviour worth seeing.
-  const cooling = await call('POST', '/api/execution/trade', { mint: mintE.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02 });
+  const cooling = await call('POST', '/api/execution/trade', { mint: mintE.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02, confirmLive: true });
   rec('(d) failure cooldown blocks the next trade', cooling.body?.success === false && /Cooling down/.test(JSON.stringify(cooling.body)), JSON.stringify(cooling.body).slice(0, 200));
   await sleep(16_000);
   // ---- (e) transient send failure: the app must not double-buy ----
   await rpcCall(info.url, 'localnet_failNextSends', [1]);
-  const flaky = await call('POST', '/api/execution/trade', { mint: mintE.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02 });
+  const flaky = await call('POST', '/api/execution/trade', { mint: mintE.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02, confirmLive: true });
   const flakyList: any[] = (await positions()) as any;
   const flat = Array.isArray(flakyList) ? flakyList : (flakyList as any)?.positions || [];
   const openFlaky = flat.filter((x: any) => x.mint === mintE.toBase58() && (x.status === 'ACTIVE' || x.status === 'PARTIALLY_CLOSED'));
@@ -362,7 +362,7 @@ async function main() {
   await sleep(16_000);
   // ---- (f) kill the app right after a buy lands on-chain, restart it on the same database ----
   await rpcCall(info.url, 'localnet_holdNextResponse', []);
-  const inFlight = fetch(`${base}/api/execution/trade`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ mint: mintF.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02 }) }).catch(() => null);
+  const inFlight = fetch(`${base}/api/execution/trade`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ mint: mintF.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02, confirmLive: true }) }).catch(() => null);
   let held: string[] = [];
   for (let i = 0; i < 60 && !held.length; i++) {
     await sleep(250);
@@ -399,7 +399,7 @@ async function main() {
 
   // ---- (g) Q18: the app dies right after a SELL lands on-chain, before it records the result ----
   await sleep(16_000);
-  const buyG = await call('POST', '/api/execution/trade', { mint: mintG.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02 });
+  const buyG = await call('POST', '/api/execution/trade', { mint: mintG.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02, confirmLive: true });
   rec('(g) buy for the sell-in-flight scenario', buyG.status === 200 && buyG.body?.success, JSON.stringify(buyG.body).slice(0, 200));
   if (buyG.body?.positionId) {
     await rpcCall(info.url, 'localnet_holdNextResponse', []);
@@ -437,7 +437,7 @@ async function main() {
   // PumpSwap program itself (the real binary) executes the app's sell.
   const armH = await call('POST', '/api/execution/arm', { arm: true, confirmationCode: 'CONFIRM_LIVE_TRADING_RISK' }); // a restart leaves the app in PAPER
   rec('(h) re-armed after the restart', armH.status === 200 && armH.body?.success, JSON.stringify(armH.body).slice(0, 120));
-  const buyH = await call('POST', '/api/execution/trade', { mint: mintH.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02 });
+  const buyH = await call('POST', '/api/execution/trade', { mint: mintH.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02, confirmLive: true });
   rec('(h) buy before migration', buyH.status === 200 && buyH.body?.success, JSON.stringify(buyH.body).slice(0, 160));
   if (buyH.body?.positionId) {
     const setAccount = (pk: PublicKey, lamports: number, data: Buffer, owner: PublicKey) =>
@@ -506,7 +506,7 @@ async function main() {
 
   // ---- kill switch over HTTP ----
   const ks = await call('POST', '/api/execution/kill-switch', { activate: true });
-  const blocked = await call('POST', '/api/execution/trade', { mint: mintE.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02 });
+  const blocked = await call('POST', '/api/execution/trade', { mint: mintE.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02, confirmLive: true });
   rec('kill switch blocks new buys', ks.status === 200 && blocked.body?.success === false, `${blocked.status} ${JSON.stringify(blocked.body).slice(0, 200)}`);
   await call('POST', '/api/execution/kill-switch', { activate: false });
 

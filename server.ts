@@ -11,7 +11,7 @@ import { createServer as createViteServer, createLogger } from 'vite';
 import { secretPathGuard, viteDevServerOptions } from './server/security/secretPaths';
 import { GoogleGenAI } from '@google/genai';
 import { hftEngine } from './server/engine/engine';
-import { socialScanner } from './server/socialScanner';
+import { socialScanner, isTelegramTradeCommand } from './server/socialScanner';
 import { memecoinAggregator } from './server/memecoinAggregator';
 import { realismEngine } from './server/realismEngine';
 import { pumpFunService } from './server/pumpfunService';
@@ -257,6 +257,8 @@ wss.on('connection', (ws: WebSocket, req: any) => {
       if (parsed.action === 'SNIPE_PUMP_CALLOUT') {
         const input = validateTradeInput(CalloutSnipeSchema, parsed);
         if (input.status === 'invalid') return rejectWsInput(input.issues);
+        const refused = liveGate(parsed); // S1
+        if (refused) return void ws.send(JSON.stringify({ type: 'CALLOUT_SNIPE_RESULT', data: { success: false, message: refused } }));
         const result = await pumpFunService.snipeCallout(
           input.data.calloutId,
           input.data.amountUsd,
@@ -279,6 +281,8 @@ wss.on('connection', (ws: WebSocket, req: any) => {
       if (parsed.action === 'SNIPE_MEMECOIN') {
         const input = validateTradeInput(OperatorSnipeSchema, parsed);
         if (input.status === 'invalid') return rejectWsInput(input.issues);
+        const refused = liveGate(parsed); // S1
+        if (refused) return void ws.send(JSON.stringify({ type: 'MEMECOIN_SNIPE_RESULT', data: { success: false, message: refused } }));
         const result = await memecoinAggregator.executeSnipe({ ...input.data, provenance: OPERATOR_PROVENANCE, signalTimestamp: Date.now() });
         ws.send(JSON.stringify({ type: 'MEMECOIN_SNIPE_RESULT', data: result }));
       }
@@ -783,6 +787,19 @@ app.get('/api/social/signals', requireOperatorAuth, (req, res) => {
   });
 });
 
+/**
+ * S1: while LIVE is armed, EVERY entry point that can open a position needs `confirmLive: true` (the UI sends it after the operator
+ * confirmed a dialog naming the cluster): the HTTP routes below, the two WebSocket snipe actions, and the Telegram /snipe and /buy
+ * commands. This is a guard against an accidental or scripted one-click trade, NOT a security boundary: the flag is a client
+ * assertion, and the operator token is what actually authorises the request.
+ */
+const liveGate = (body: unknown) => liveConfirmationRefusal(executionCoordinator.isLiveArmed(), allowedCluster(), body as { confirmLive?: unknown } | undefined);
+const requireLiveConfirmation: express.RequestHandler = (req, res, next) => {
+  const refusal = liveGate(req.body);
+  if (!refusal) return next();
+  res.status(409).json({ success: false, status: 'REJECTED', error: refusal, result: { success: false, message: refusal } });
+};
+
 app.post('/api/social/signals/snipe', requireOperatorAuth, validateTradeBody(SignalSnipeSchema), async (req, res) => {
   const { signalId } = req.body;
   const unconfirmed = liveConfirmationRefusal(executionCoordinator.isLiveArmed(), allowedCluster(), req.body); // Q10b
@@ -836,7 +853,7 @@ app.post('/api/telegram/webhook', requireOperatorAuth, async (req, res) => {
   const { message } = req.body;
   const text = message?.text || req.body?.text || '';
   // Q23: /snipe and /buy are one-click trades, so they need the same live confirmation as the other trade routes
-  if (/^\s*\/(snipe|buy)\b/.test(text)) {
+  if (isTelegramTradeCommand(text)) {
     const unconfirmed = liveConfirmationRefusal(executionCoordinator.isLiveArmed(), allowedCluster(), req.body);
     if (unconfirmed) return res.status(409).json({ ok: false, result: { reply: `❌ SNIPE REJECTED: ${unconfirmed}` } });
   }
@@ -1111,7 +1128,7 @@ app.get('/api/memecoins/positions', requireOperatorAuth, (req, res) => {
   });
 });
 
-app.post('/api/memecoins/trade', requireOperatorAuth, validateTradeBody(OperatorSnipeSchema), async (req, res) => {
+app.post('/api/memecoins/trade', requireOperatorAuth, requireLiveConfirmation, validateTradeBody(OperatorSnipeSchema), async (req, res) => {
   const result = await memecoinAggregator.executeSnipe({ ...req.body, provenance: OPERATOR_PROVENANCE, signalTimestamp: Date.now() });
 
   res.json({
@@ -1295,7 +1312,7 @@ app.post('/api/wallet/toggle-trading', requireOperatorAuth, validateTradeBody(Ar
   });
 });
 
-app.post('/api/wallet/snipe', requireOperatorAuth, validateBody(LiveSnipeOrderSchema), async (req, res) => {
+app.post('/api/wallet/snipe', requireOperatorAuth, requireLiveConfirmation, validateBody(LiveSnipeOrderSchema), async (req, res) => {
   // The operator's request is the signal; a client-supplied signalTimestamp is ignored so the age check cannot be dodged.
   const result = await walletTrader.executeLiveSnipe({ ...req.body, signalTimestamp: Date.now() });
   if (!result.success) {
@@ -1502,7 +1519,7 @@ app.post('/api/execution/kill-switch', requireOperatorAuth, (req, res) => {
   });
 });
 
-app.post('/api/execution/trade', requireOperatorAuth, validateTradeBody(OperatorExecuteTradeSchema), async (req, res) => {
+app.post('/api/execution/trade', requireOperatorAuth, requireLiveConfirmation, validateTradeBody(OperatorExecuteTradeSchema), async (req, res) => {
   try {
     // Provenance and source are set here. A client cannot choose them (the schema rejects them).
     const result = await executionCoordinator.executeTrade({

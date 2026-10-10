@@ -92,11 +92,12 @@ export class SolPriceService {
   /**
    * Boot wiring. External feeds on: keep the price fresh in the background. External feeds off (tests, loopback-only servers): no
    * background polling and no public host, but on a local validator one refresh still runs, because doRefresh() is the only reader of
-   * LOCALNET_SOL_PRICE_USD and without it the first LIVE buy answers SOL_PRICE_UNAVAILABLE. On devnet/mainnet nothing runs.
+   * LOCALNET_SOL_PRICE_USD and without it the first LIVE buy answers SOL_PRICE_UNAVAILABLE. On devnet/mainnet nothing runs, and on
+   * localnet nothing runs unless that fixed price is set: doRefresh() would otherwise fall through to Coinbase/CoinGecko/Binance.
    */
   public startForBoot(externalFeedsDisabled: boolean) {
     if (!externalFeedsDisabled) return this.startAutoRefresh();
-    if (allowedCluster() === 'localnet') void this.refresh();
+    if (allowedCluster() === 'localnet' && parse(process.env.LOCALNET_SOL_PRICE_USD) !== null) void this.refresh();
   }
 
   /** Reads from the public sources in order. Concurrent calls share one request. Never throws. */

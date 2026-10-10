@@ -21,6 +21,19 @@ describe('S26b: boot price when external feeds are disabled', () => {
     expect(auto).not.toHaveBeenCalled();
   });
 
+  it('localnet with feeds disabled but no fixed price: nothing runs and no public host is contacted', async () => {
+    vi.stubEnv('ALLOWED_CLUSTER', 'localnet');
+    vi.stubEnv('LOCALNET_SOL_PRICE_USD', '');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
+    const s = new SolPriceService();
+    const refresh = vi.spyOn(s, 'refresh');
+    s.startForBoot(true);
+    await new Promise((r) => setTimeout(r, 20));
+    expect(refresh).not.toHaveBeenCalled();
+    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(s.getPrice().usd).toBeNull();
+  });
+
   it('devnet with feeds disabled: nothing runs, no fetch, no price', async () => {
     vi.stubEnv('ALLOWED_CLUSTER', 'devnet');
     vi.stubEnv('LOCALNET_SOL_PRICE_USD', '150');

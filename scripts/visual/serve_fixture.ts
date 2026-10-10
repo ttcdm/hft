@@ -32,7 +32,7 @@ async function main() {
   for (const [symbol, name, price, curve, top10, creatorPct] of names) {
     const mint = Keypair.generate().publicKey.toBase58();
     const creator = Keypair.generate().publicKey.toBase58();
-    const ev = l.parseLogs({ err: null, signature: `vf-${symbol}`, logs: [PumpFeedListener.encodeCreateEventLog({ name, symbol, uri: '', mint, creator })] } as any, { slot: 9 })!;
+    const ev = l.parseLogs({ err: null, signature: `vf-${symbol}`, logs: PumpFeedListener.asPumpInvocation(PumpFeedListener.encodeCreateEventLog({ name, symbol, uri: '', mint, creator })) } as any, { slot: 9 })!;
     const pool: any = memecoinAggregator.ingestOnChainCreateEvent(ev);
     Object.assign(pool, { priceNative: price, bondingCurveProgress: curve, top10HoldersPct: top10, devHoldingPct: creatorPct, liquidityUsd: 15_000 });
     mints.push(mint);

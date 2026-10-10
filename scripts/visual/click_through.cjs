@@ -57,6 +57,17 @@ const audit = () => {
     for (const t of ['launches', 'watching', 'holding']) await step('tab-' + t, async () => { await p.getByTestId('tab-' + t).click({ timeout: 2000 }); await p.waitForTimeout(500); });
     // nav
     for (const id of ['btn-nav-telegram-tracker', 'btn-nav-plug-and-play', 'btn-nav-workstation']) await step(id, async () => { await p.locator('#' + id).click({ timeout: 3000 }); await p.waitForTimeout(1200); });
+    // Values, not just geometry: the Plug & Play positions table must show what the fixture holds (mode, symbol, PnL %).
+    // This is the check that would have caught the table reading fields that do not exist (every row "PAPER", "+0.0%").
+    await step('values-plug-and-play', async () => {
+      await p.locator('#btn-nav-plug-and-play').click({ timeout: 3000 }); await p.waitForTimeout(1500);
+      await p.getByText(/Open Positions/).first().click({ timeout: 3000 }); await p.waitForTimeout(800);
+      const text = await p.locator('body').innerText();
+      // The paper exit monitor acts on the seeded rows while the app runs: FIXD (+40%) trips take-profit, FIXE (-20%) trips stop-loss.
+      // The table must show those real outcomes (status + the live PnL of the row that is still open), not placeholders.
+      const expect = [['FIXD +40% partial', /FIXD[\s\S]{0,200}\+40(\.\d+)?%[\s\S]{0,120}PARTIALLY_CLOSED/], ['FIXE stopped out', /FIXE[\s\S]{0,200}CLOSED/], ['PAPER mode label', /PAPER/]];
+      for (const [name, re] of expect) report.push({ W, name: 'value:' + name, ok: re.test(text) });
+    });
     // direct header buttons then dropdown items
     const headerIds = ['btn-capital-tier-toggle', 'btn-auto-profit-ticker', 'btn-engine-console', 'btn-open-backtest', 'btn-unit-tests', 'btn-operator-auth', 'btn-deploy-algorithm', 'btn-audio-toggle'];
     const reload = async () => { await p.reload({ waitUntil: 'load' }); await p.waitForTimeout(3000); };
@@ -78,7 +89,7 @@ const audit = () => {
     report.push({ W, name: 'console', errs: [...new Set(errs)], bad: [...new Set(bad)] });
     await p.close();
   }
-  fs.writeFileSync('./screens-visual/report.json', JSON.stringify(report, null, 1));
+  fs.writeFileSync(`${OUT}/report.json`, JSON.stringify(report, null, 1));
   for (const r of report) console.log(r.W, r.name, r.error || r.note || '', (r.issues || []).length ? '\n   ' + r.issues.join('\n   ') : '', r.errs ? JSON.stringify(r.errs) + JSON.stringify(r.bad) : '');
   await b.close(); srv.kill();
 })().catch(e => { console.error('FAIL', e); srv.kill(); process.exit(1); });

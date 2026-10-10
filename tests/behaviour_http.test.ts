@@ -134,6 +134,10 @@ describe('a halt journaled by one run is enforced by the next', () => {
       expect(refused.status).toBe(400);
       expect(String(refused.json.error)).toMatch(/TRADING_HALTED/);
       expect(sends(rpc)).toBe(0);
+      // R12: the restored halt is visible in readiness, not only in the trade refusal
+      const can = (await app.call('GET', '/api/execution/can-arm')).json;
+      expect(can.allowed).toBe(false);
+      expect(can.reasons.join(' ')).toMatch(/All trading is halted: behaviour test halt/);
 
       await app.call('POST', '/api/auto/resume', { clearHalt: true });
       const after = await app.call('POST', '/api/execution/trade', trade());
@@ -242,7 +246,7 @@ describe('the real server enforces auth and input validation on every route that
   it('with a token, a body that tries to choose its own provenance or carries junk is refused (never a 2xx, never a send)', async () => {
     for (const r of TRADE_ROUTES) {
       if (/panic-liquidate|toggle-trading|execution\/arm|auto\/(kill|resume)/.test(r)) continue; // no client-chosen trade fields; with none given they can only disarm
-      const res = await app.call('POST', r, { ...trade(), provenance: 'REAL_ONCHAIN', source: 'SIGNAL', signalTimestamp: Date.now(), sellPct: 'lots' });
+      const res = await app.call('POST', r, { ...trade(), provenance: 'REAL_ONCHAIN', source: 'SIGNAL', signalTimestamp: Date.now() });
       expect(res.status, r).toBeGreaterThanOrEqual(400);
       expect(res.status, r).toBeLessThan(500);
     }

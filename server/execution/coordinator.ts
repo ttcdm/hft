@@ -775,6 +775,10 @@ export class ExecutionCoordinator {
     if (signerStatus === 'READY') {
       const walletPubkey = localSigner.getPublicKey();
       const activeLivePositions = workstationDb.loadPositions('LIVE', 'ACTIVE');
+      // S10: a SELL that step 4 could not settle (the RPC failed, or the signature is confirmed but its details are not readable yet) is
+      // still PENDING here. Its position shows an empty wallet precisely BECAUSE the sell landed, and closing it now would zero the cost
+      // basis; the retry would then find the position closed and drop the sell as "already applied", so its realized PnL is lost for good.
+      const unsettledSellMints = new Map(workstationDb.getPendingTransactions().filter((t) => t.direction === 'SELL').map((t) => [t.mint, t.signature]));
 
       for (const pos of activeLivePositions) {
         try {
@@ -792,7 +796,11 @@ export class ExecutionCoordinator {
             else throw e;
           }
 
-          if (onChainAmount <= 0n) {
+          if (onChainAmount <= 0n && unsettledSellMints.has(pos.mint)) {
+            mismatchesCount++;
+            issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) shows no tokens but its sell ${String(unsettledSellMints.get(pos.mint)).slice(0, 8)}... is not settled yet; left open so the fill and its PnL can be applied`);
+            this.scheduleReconcileRetry();
+          } else if (onChainAmount <= 0n) {
             // The tokens are gone (sold or moved outside this app). Left OPEN this position blocks arming until someone edits the DB,
             // while the exit loop keeps trying to sell an empty account. Close it with the reason on the record, and say so.
             pos.status = 'CLOSED';

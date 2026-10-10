@@ -138,9 +138,10 @@ export class AuthManager {
     }
 
     if (credentials.password) {
-      const inputBuffer = Buffer.from(credentials.password, 'utf8');
-      const expectedBuffer = Buffer.from(envPassword, 'utf8');
-      if (inputBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(inputBuffer, expectedBuffer)) {
+      // R9s: compare fixed-length HMACs, so neither the length nor the content of the password shows in the timing.
+      const key = crypto.randomBytes(32);
+      const digest = (v: string) => crypto.createHmac('sha256', key).update(v, 'utf8').digest();
+      if (crypto.timingSafeEqual(digest(credentials.password), digest(envPassword))) {
         const session = this.createSession('OPERATOR');
         return { success: true, token: session.token };
       }
@@ -202,6 +203,7 @@ export function requireOperatorAuth(req: Request, res: Response, next: NextFunct
 // A1: the only /api routes reachable without an operator token. Everything else is denied by default.
 export const PUBLIC_API_ALLOWLIST: ReadonlyArray<{ method: string; path: string }> = [
   { method: 'GET', path: '/api/health' },
+  { method: 'HEAD', path: '/api/health' }, // R5s: probes (wget --spider, curl -I) send HEAD; Express answers it from the GET route
   { method: 'POST', path: '/api/auth/login' },
   { method: 'OPTIONS', path: '*' },
 ];

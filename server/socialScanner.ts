@@ -226,7 +226,8 @@ export class SocialAlphaScanner {
   public updateTelegramConfig(cfg: Partial<TelegramBotConfig>): TelegramBotConfig {
     // S1: only known keys with the right types are accepted (no mass assignment from the request body).
     const next: Partial<TelegramBotConfig> = {};
-    if (typeof cfg?.botToken === 'string') next.botToken = cfg.botToken.trim();
+    // R4s: the UI never receives the stored token, so it posts '' on Save Config; an empty token means "unchanged", never "wipe".
+    if (typeof cfg?.botToken === 'string' && cfg.botToken.trim() !== '') next.botToken = cfg.botToken.trim();
     if (typeof cfg?.chatId === 'string') next.chatId = cfg.chatId.trim();
     if (typeof cfg?.webhookActive === 'boolean') next.webhookActive = cfg.webhookActive;
     if (typeof cfg?.autoForwardAlerts === 'boolean') next.autoForwardAlerts = cfg.autoForwardAlerts;

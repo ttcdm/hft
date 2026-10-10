@@ -340,3 +340,33 @@ describe('R1/R2/R3s: the server survives hostile requests and the gate cannot be
     } finally { await rpc.close(); }
   }, 120_000);
 });
+
+describe('R4s/R5s/R10s over the real server', () => {
+  it('Save Config with an empty token keeps the stored one; a HEAD health probe needs no token; an unknown /api path is a JSON 404, not index.html', async () => {
+    const rpc = await startRpcStub(LOCALNET_STUB_GENESIS);
+    try {
+      const app = await startApp(dir(), { SOLANA_RPC_URL: rpc.url, ALLOWED_CLUSTER: 'localnet', LOCALNET_GENESIS_HASH: LOCALNET_STUB_GENESIS }); handles.push(app);
+
+      // R4s: the UI cannot see the stored token, so Save Config posts ''. That must not wipe it.
+      await app.call('POST', '/api/telegram/config', { botToken: '123456:ABC-token-for-test', chatId: '1' });
+      expect((await app.call('GET', '/api/telegram/config')).json.config.botTokenSet).toBe(true);
+      const save = await app.call('POST', '/api/telegram/config', { botToken: '', chatId: '2' });
+      expect(save.json.config.botTokenSet).toBe(true);
+      expect(save.json.config.chatId).toBe('2'); // the other field did change
+      expect(JSON.stringify(save.json)).not.toContain('ABC-token');
+
+      // R5s: the container healthcheck / curl -I send HEAD
+      const head = await fetch(`${app.base}/api/health`, { method: 'HEAD' });
+      expect(head.status).toBe(200);
+      const headOther = await fetch(`${app.base}/api/wallet/state`, { method: 'HEAD' });
+      expect(headOther.status).toBe(401); // only /api/health is public for HEAD
+
+      // R10s: with a token, a path that is no route answers 404 JSON; without one it is still 401
+      const unknown = await fetch(`${app.base}/api/this-route-does-not-exist`, { headers: { Authorization: `Bearer ${app.token}` } });
+      expect(unknown.status).toBe(404);
+      expect(unknown.headers.get('content-type') ?? '').toMatch(/json/);
+      expect((await unknown.json()).success).toBe(false);
+      expect((await fetch(`${app.base}/api/this-route-does-not-exist`)).status).toBe(401);
+    } finally { await rpc.close(); }
+  });
+});

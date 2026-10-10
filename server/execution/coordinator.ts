@@ -90,7 +90,9 @@ const ORPHAN_MAX_AGE_MS = 15 * 60_000;
 /** A balance found in the wallet that this app never bought (cost basis unknown): watched with a hard stop, not a trade the app chose. */
 export const isRecoveredPosition = (p: { entryTxSignature?: string }): boolean => !!p.entryTxSignature?.startsWith('RECOVERED:');
 
-export const PROTECTIVE_EXIT_REASONS = /^(STOP_LOSS|TRAILING_STOP|EMERGENCY_PANIC_LIQUIDATION|MANUAL|Manual Close)$/;
+// Q11: the reasons the operator routes actually pass ('Manual user order' from POST /api/wallet/close, 'Aggregator Close' from the WS
+// CLOSE_POSITION / aggregator close route, 'Operator close' from POST /api/execution/close) count as manual closes, as the halt alert promises.
+export const PROTECTIVE_EXIT_REASONS = /^(STOP_LOSS|TRAILING_STOP|EMERGENCY_PANIC_LIQUIDATION|MANUAL|Manual Close|Manual user order|Aggregator Close|Operator close)$/;
 
 export class ExecutionCoordinator {
   private executionMode: ExecutionMode = 'PAPER';
@@ -2618,9 +2620,13 @@ export class ExecutionCoordinator {
     return this.exitFailures.get(positionId)?.count ?? 0;
   }
 
-  /** Errors that mean no send was attempted, so they neither cost fees nor count toward backoff. */
+  /**
+   * Errors that mean no send was attempted (or that an earlier send is still being waited for), so they neither cost fees nor count
+   * toward backoff or the EXIT_FAILING alert. Q12: waiting for a pending sell, an undeterminable venue, a missing signer and a zero
+   * quantity are not rejected sends; counting them walked the ladder to 4000 bps before the real resend.
+   */
   private static isNonAttemptExitError(error?: string): boolean {
-    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found)/.test(error) || ExecutionCoordinator.isQuoteFailure(error);
+    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found|SELL_PENDING_VERIFICATION|UNKNOWN_TRADING_VENUE|Signer is not configured|Calculated sell quantity is zero)/.test(error) || ExecutionCoordinator.isQuoteFailure(error);
   }
 
   /** R10: the sell could not even be quoted (fail-closed quote, fee config, market state). Nothing was sent, and widening slippage cannot help. */

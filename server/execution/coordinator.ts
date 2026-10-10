@@ -3106,7 +3106,9 @@ export class ExecutionCoordinator {
     try {
       const res = await this.connection.simulateTransaction(tx, { sigVerify: false, commitment: 'processed' });
       if (res?.value?.err) {
-        return { ok: false, error: JSON.stringify(res.value.err) };
+        // the program log tail says which program refused and why; the error code alone does not
+        const tail = (res.value.logs ?? []).filter((l) => !l.startsWith('Program data:')).slice(-6).join(' | ');
+        return { ok: false, error: `${JSON.stringify(res.value.err)}${tail ? ` [logs: ${tail}]` : ''}` };
       }
       return { ok: true };
     } catch (e: any) {

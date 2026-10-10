@@ -463,9 +463,17 @@ async function main() {
     await setAccount(quoteVault, 2_039_280 + Number(poolQuote), tokenAcct(NATIVE_MINT, poolPk, poolQuote, true), TOKEN_PROGRAM_ID);
     const lpData = Buffer.alloc(82); lpData[45] = 1;
     await setAccount(lpMint, 1_461_600, lpData, TOKEN_PROGRAM_ID);
+    // The program signs as the pool PDA with the bump stored in the pool account. 255 is only right for about half of all mints
+    // (this step failed on one run in two with 'Could not create program address'), so find the bump that gives the canonical address.
+    const poolSeeds = [Buffer.from('pool'), Buffer.from(new Uint16Array([0]).buffer), pumpPoolAuthorityPda(mintH).toBuffer(), mintH.toBuffer(), NATIVE_MINT.toBuffer()];
+    let poolBump = -1;
+    for (let b = 255; b >= 0 && poolBump < 0; b--) {
+      try { if (PublicKey.createProgramAddressSync([...poolSeeds, Buffer.from([b])], PUMP_AMM_PROGRAM_ID).equals(poolPk)) poolBump = b; } catch { /* off-curve required: next bump */ }
+    }
+    rec('(h) pool bump found', poolBump >= 0, `bump ${poolBump}`);
     const prog: any = (PUMP_AMM_SDK as any).offlineProgram;
     const poolData: Buffer = await prog.coder.accounts.encode('pool', {
-      poolBump: 255, index: 0, creator: pumpPoolAuthorityPda(mintH), baseMint: mintH, quoteMint: NATIVE_MINT, lpMint,
+      poolBump, index: 0, creator: pumpPoolAuthorityPda(mintH), baseMint: mintH, quoteMint: NATIVE_MINT, lpMint,
       poolBaseTokenAccount: baseVault, poolQuoteTokenAccount: quoteVault, lpSupply: new (await import('bn.js')).default(1_000_000),
       coinCreator: creator.publicKey, isMayhemMode: false, isCashbackCoin: false, virtualQuoteReserves: new (await import('bn.js')).default(0),
       creatorFeeBps: new (await import('bn.js')).default(0), canEditCreatorFee: false,
@@ -493,7 +501,7 @@ async function main() {
     const wsolLeft = wsolInfo ? AccountLayout.decode(wsolInfo.data).amount : 0n;
     const closedH = (((await positions()) as any)?.positions ?? []).find((x: any) => x.id === buyH.body.positionId);
     rec('(h) Q4: PumpSwap sell succeeds and the proceeds arrive as native SOL', sellH.body?.success === true && solAfter > solBefore && wsolLeft === 0n,
-      `close ${sellH.status} ${JSON.stringify(sellH.body).slice(0, 300)}; wallet SOL ${solBefore} -> ${solAfter}; WSOL left in the wallet ATA: ${wsolLeft}; position ${closedH ? closedH.status + ' realized ' + closedH.realizedPnLSol : 'n/a'}`);
+      `close ${sellH.status} ${JSON.stringify(sellH.body).slice(0, 1500)}; wallet SOL ${solBefore} -> ${solAfter}; WSOL left in the wallet ATA: ${wsolLeft}; position ${closedH ? closedH.status + ' realized ' + closedH.realizedPnLSol : 'n/a'}`);
   }
 
   // ---- kill switch over HTTP ----

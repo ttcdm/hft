@@ -174,6 +174,20 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
     expect(row.tokenQuantityRaw).toBe('500000000');
   });
 
+  it('N3: a partial sell whose wallet balance dropped by less than the sold amount is not adopted as a full sale; the rest stays tracked', async () => {
+    (TradeReconciler.reconcileSellTransaction as any).mockResolvedValue({ success: false, reconciliationState: 'RECONCILIATION_REQUIRED', error: 'fill unreadable' });
+    await coordinator.closePosition(posId, 50, 'TAKE_PROFIT_1'); // asked to sell 500,000,000 of 1,000,000,000
+    // The wallet only lost 200,000,000 (the sell was smaller than asked, or only part of it landed).
+    (coordinator as any).connection.getTokenAccountBalance = vi.fn(async () => ({ value: { amount: '800000000' } }));
+    const again = await coordinator.closePosition(posId, 50, 'TAKE_PROFIT_1');
+    expect(again.success).toBe(true);
+    expect(submit).toHaveBeenCalledTimes(1); // adopted from the wallet, not sold a second time
+    const row = workstationDb.loadPositions().find((p) => p.id === posId)!;
+    expect(row.status).toBe('PARTIALLY_CLOSED'); // not CLOSED
+    expect(row.tokenQuantityRaw).toBe('800000000'); // the wallet decides what is left, not the 500,000,000 that was asked for
+    expect(row.costBasisLamports).toBe(80_000_000); // basis scaled to what is still held
+  });
+
   describe('N20: the PENDING row is written before anything is sent', () => {
     const params = (sigByte: number, orderId: string) => ({
       tx: { signatures: [new Uint8Array(64).fill(sigByte)] } as any, orderId, correlationId: 'c-' + orderId, side: 'BUY' as const,

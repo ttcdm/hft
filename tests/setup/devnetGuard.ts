@@ -1,4 +1,5 @@
 import net from 'node:net';
+import fs from 'node:fs';
 import { beforeEach, afterEach, afterAll, vi } from 'vitest';
 import { executionCoordinator } from '../../server/execution/coordinator';
 import { PumpCurveService } from '../../server/solana/pumpCurve';
@@ -29,6 +30,8 @@ const realConnect = net.Socket.prototype.connect;
   }
   if (!isLoopback(host ?? '')) {
     (globalThis as any).__networkGuardHits.push(String(host) + ' @ ' + (new Error().stack || '').split('\n').filter((l) => l.includes('/server') && !l.includes('node_modules')).slice(0, 2).map((l) => l.trim().replace(/.*macgit\//, '')).join(' <- '));
+    // NETWORK_GUARD_LOG=<file>: one line per refused attempt, so a full run can be audited (deliberate probes by the guard's own test are marked).
+    if (process.env.NETWORK_GUARD_LOG) fs.appendFileSync(process.env.NETWORK_GUARD_LOG, `${(globalThis as any).__expectNetworkGuardHits ? 'EXPECTED' : 'UNEXPECTED'} ${String(host)} ${String((globalThis as any).__vitest_worker__?.filepath ?? '')}\n`);
     throw new Error(`TEST_NETWORK_GUARD: a test tried to connect to non-loopback host "${host}"`);
   }
   return (realConnect as any).apply(this, args);

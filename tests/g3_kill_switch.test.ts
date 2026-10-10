@@ -257,9 +257,11 @@ describe('G3: decision journal and kill switch on the real controller', () => {
     expect(autoSnipeController.getStatus().killReason).toMatch(/unexplained/);
     expect(executionCoordinator.getOperatorAlerts().some((a) => a.code === 'TRADING_HALTED' && !a.cleared)).toBe(true);
 
-    // while halted, exits are blocked too; a halt is cleared only on purpose
-    const exit = await executionCoordinator.closePosition('anything', 100, 'MANUAL');
+    // while halted, discretionary exits are blocked; protective ones (stop-loss, manual, panic) still run. A halt is cleared only on purpose
+    const exit = await executionCoordinator.closePosition('anything', 100, 'TAKE_PROFIT_1');
     expect(exit.error).toMatch(/TRADING_HALTED/);
+    const stop = await executionCoordinator.closePosition('anything', 100, 'STOP_LOSS');
+    expect(stop.error).not.toMatch(/TRADING_HALTED/);
     expect(autoSnipeController.resume({}).halted).toBe(true);
     expect(autoSnipeController.resume({ clearHalt: true })).toEqual({ halted: false, mode: 'OFF' });
   });

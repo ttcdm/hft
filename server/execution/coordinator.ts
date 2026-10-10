@@ -77,6 +77,9 @@ export interface ExecutionResponse {
   correlationId: string;
 }
 
+/** Exit reasons that run even while all trading is halted (see closePosition). */
+export const PROTECTIVE_EXIT_REASONS = /^(STOP_LOSS|TRAILING_STOP|EMERGENCY_PANIC_LIQUIDATION|MANUAL|Manual Close)$/;
+
 export class ExecutionCoordinator {
   private executionMode: ExecutionMode = 'PAPER';
   private isLiveTradingArmed: boolean = false;
@@ -139,6 +142,7 @@ export class ExecutionCoordinator {
       if (persisted) {
         this.haltReason = persisted;
         Logger.error(`[HALT] Trading is still halted from before the restart: ${persisted}`);
+        this.raiseOperatorAlert('TRADING_HALTED', `All trading is halted (restored after a restart): ${persisted}. Protective exits (stop-loss, trailing stop, manual close, panic) still run; clear it with POST /api/auto/resume {clearHalt:true}.`);
       }
     }
     this.initializeConnection();
@@ -170,7 +174,16 @@ export class ExecutionCoordinator {
         this.pumpFeedHealth = 'HEALTHY';
       }
 
-      // Check position mark freshness
+      // Check position mark freshness. The clock belongs to open LIVE positions: with none open there is nothing to be
+      // stale, so it resets (otherwise the feed read STALE 90 s after the last close and blocked arming until a restart),
+      // and a PAPER position that cannot be priced (e.g. a mainnet-only mint on devnet) never turns the feed red.
+      let liveOpen: boolean;
+      try {
+        liveOpen = workstationDb.loadPositions('LIVE', 'ACTIVE').length > 0;
+      } catch {
+        liveOpen = true; // cannot tell: keep the clock running rather than hide a dead feed
+      }
+      if (!liveOpen) this.lastPositionMarkTimestamp = 0;
       const markAge = this.lastPositionMarkTimestamp > 0 ? now - this.lastPositionMarkTimestamp : 0;
       if (markAge > 90000) {
         this.positionMarkHealth = 'STALE';
@@ -282,6 +295,10 @@ export class ExecutionCoordinator {
       reasons.push(
         `Position mark feed is ${this.positionMarkHealth} (${markAgeMs === Infinity ? 'never marked' : `${Math.round(markAgeMs / 1000)}s ago`})`
       );
+    }
+
+    if (this.haltReason) {
+      reasons.push(`All trading is halted: ${this.haltReason}`);
     }
 
     if (riskEngine.isKillSwitchActive()) {
@@ -2310,12 +2327,13 @@ export class ExecutionCoordinator {
   public haltAll(reason: string): void {
     if (this.haltReason) return;
     this.haltReason = reason;
-    workstationDb.logJournal('TRADING_HALTED', 'halt', this.executionMode, { reason });
+    // Only the process-wide coordinator persists a halt (it is the only one that restores it); a script or test coordinator must not halt the next real boot.
+    if (this.isDefaultSingleton) workstationDb.logJournal('TRADING_HALTED', 'halt', this.executionMode, { reason });
     this.raiseOperatorAlert('TRADING_HALTED', `All trading including exits is halted: ${reason}`);
   }
 
   public clearHalt(): void {
-    if (this.haltReason) workstationDb.logJournal('TRADING_HALT_CLEARED', 'halt', this.executionMode, {});
+    if (this.haltReason && this.isDefaultSingleton) workstationDb.logJournal('TRADING_HALT_CLEARED', 'halt', this.executionMode, {});
     this.haltReason = null;
     this.clearOperatorAlert('TRADING_HALTED');
   }
@@ -2368,7 +2386,9 @@ export class ExecutionCoordinator {
     sellPct: number = 100,
     reason: string = 'Manual Close'
   ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string }> {
-    if (this.haltReason) {
+    // A halt stops entries and discretionary exits. It never stops the exits that protect the wallet: stop-loss, trailing stop,
+    // an operator's manual close and panic liquidation (a halt that froze a losing position would be the opposite of its purpose).
+    if (this.haltReason && !PROTECTIVE_EXIT_REASONS.test(reason)) {
       return { success: false, pnlSol: 0, error: `TRADING_HALTED: ${this.haltReason}` };
     }
     const before = workstationDb.loadPositions().find((p) => p.id === positionId);
@@ -2737,6 +2757,11 @@ export class ExecutionCoordinator {
 
     const positions = workstationDb.loadPositions(undefined, 'ACTIVE');
     const now = Date.now();
+    // Nothing LIVE is open, so there is no mark to be stale (see the feed heartbeat): reset the clock here too.
+    if (!positions.some((p) => p.executionMode === 'LIVE')) {
+      this.lastPositionMarkTimestamp = 0;
+      this.positionMarkHealth = 'HEALTHY';
+    }
 
     for (const pos of positions) {
       // C4: staleness is measured from the last real mark only. lastUpdatedTimestamp is rewritten on every tick
@@ -2755,12 +2780,12 @@ export class ExecutionCoordinator {
             );
           }
           // A position nobody can price must age the mark feed from its entry, or an empty history would read as healthy.
-          if (this.lastPositionMarkTimestamp === 0) this.lastPositionMarkTimestamp = pos.entryTimestamp || now;
+          if (pos.executionMode === 'LIVE' && this.lastPositionMarkTimestamp === 0) this.lastPositionMarkTimestamp = pos.entryTimestamp || now;
           continue;
         }
         this.clearOperatorAlert('POSITION_MARK_UNAVAILABLE', pos.id);
-        this.recordPositionMarkEvent();
-      } else {
+        if (pos.executionMode === 'LIVE') this.recordPositionMarkEvent();
+      } else if (pos.executionMode === 'LIVE') {
         this.recordPositionMarkEvent(); // a real mark within the staleness window
       }
 

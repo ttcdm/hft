@@ -12,6 +12,12 @@ export const MAX_SLIPPAGE_BREACHES = 2;
 export const READINESS_RED_LIMIT_MS = 10_000;
 export const WALLET_AUDIT_BASE_TOLERANCE_SOL = 0.0005;
 export const WALLET_AUDIT_GROSS_TOLERANCE = 0.05;
+/**
+ * Each journaled fill may also move the wallet by the rent of the token account it opens or closes (a classic ATA is
+ * 0.00203928 SOL, Token-2022 with extensions a little more), which the fill's own amount and fees do not include. Without
+ * this allowance the first real buy read as an unexplained 0.002 SOL loss and halted all trading.
+ */
+export const WALLET_AUDIT_RENT_ALLOWANCE_SOL = 0.0025;
 
 export interface KillTrigger {
   code: string;
@@ -91,9 +97,9 @@ export function evaluateKillTriggers(ctx: KillContext): KillTrigger[] {
 export function auditWalletChange(
   prevSol: number,
   nowSol: number,
-  journal: { delta: number; gross: number }
+  journal: { delta: number; gross: number; count?: number }
 ): { explained: boolean; unexplainedSol: number; toleranceSol: number } {
-  const toleranceSol = WALLET_AUDIT_BASE_TOLERANCE_SOL + WALLET_AUDIT_GROSS_TOLERANCE * journal.gross;
+  const toleranceSol = WALLET_AUDIT_BASE_TOLERANCE_SOL + WALLET_AUDIT_GROSS_TOLERANCE * journal.gross + WALLET_AUDIT_RENT_ALLOWANCE_SOL * (journal.count ?? 0);
   const unexplainedSol = nowSol - prevSol - journal.delta;
   return { explained: Math.abs(unexplainedSol) <= toleranceSol, unexplainedSol, toleranceSol };
 }

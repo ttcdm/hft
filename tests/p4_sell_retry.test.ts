@@ -157,7 +157,7 @@ describe('P4: sell preflight, slippage ladder and retry backoff', () => {
 
   it('rejections that attempt nothing do not count as failures: halted, dust, missing position, paper', async () => {
     coordinator.haltAll('test halt');
-    await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+    await coordinator.closePosition(posId, 100, 'TAKE_PROFIT_1');
     coordinator.clearHalt();
     expect(coordinator.getExitFailureCount(posId)).toBe(0);
     await coordinator.closePosition('does-not-exist', 100, 'STOP_LOSS');

@@ -8,30 +8,35 @@ import { workstationDb } from '../server/db/database';
 describe('L9: mark-feed health is real, and a LIVE buy with nothing spendable is refused', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it('a position with a fresh mark records a position-mark event; an unpriceable one does not and ages from its entry', async () => {
-    const c = new ExecutionCoordinator(false);
-    const rec = vi.spyOn(c, 'recordPositionMarkEvent');
-    vi.spyOn(c as any, 'updatePositionMarkPrices').mockResolvedValue(undefined);
-    const pos: any = {
-      id: 'l9-fresh', mint: Keypair.generate().publicKey.toBase58(), symbol: 'L9', name: 'L9', tokenDecimals: 6, tokenQuantityRaw: '1000000',
-      entryPriceSol: 1e-6, currentPriceSol: 1e-6, currentValueSol: 1e-6, costBasisLamports: 1000, realizedPnLSol: 0, status: 'OPEN',
-      venue: 'PUMP_BONDING_CURVE', executionMode: 'PAPER', entryTxSignature: 'l9', entryTimestamp: Date.now(), lastMarkTimestamp: Date.now(),
-      recordUpdatedAt: Date.now(), updatedAt: Date.now(),
-    };
-    workstationDb.savePosition(pos);
-    await c.evaluateAndProcessExits();
-    expect(rec).toHaveBeenCalled();
+  const livePos = (id: string, mode: 'LIVE' | 'PAPER', ageMs: number): any => ({
+    id, mint: Keypair.generate().publicKey.toBase58(), symbol: 'L9', name: 'L9', tokenDecimals: 6, tokenQuantityRaw: '1000000',
+    entryPriceSol: 1e-6, currentPriceSol: 1e-6, currentValueSol: 1e-6, costBasisLamports: 1000, realizedPnLSol: 0, status: 'OPEN',
+    venue: 'PUMP_BONDING_CURVE', executionMode: mode, entryTxSignature: id, entryTimestamp: Date.now() - ageMs, lastMarkTimestamp: Date.now() - ageMs,
+    recordUpdatedAt: Date.now(), updatedAt: Date.now(),
+  });
 
-    rec.mockClear();
-    vi.spyOn(c as any, 'refreshStaleMark').mockResolvedValue(false);
-    workstationDb.savePosition({ ...pos, status: 'CLOSED' });
-    const old = Date.now() - 10 * 60_000;
-    workstationDb.savePosition({ ...pos, id: 'l9-unpriced', mint: Keypair.generate().publicKey.toBase58(), status: 'OPEN', entryTimestamp: old, lastMarkTimestamp: old });
-    (c as any).lastPositionMarkTimestamp = 0;
-    await c.evaluateAndProcessExits();
-    expect(rec).not.toHaveBeenCalled();
-    expect((c as any).lastPositionMarkTimestamp).toBe(workstationDb.loadPositions().find((p) => p.id === 'l9-unpriced')!.entryTimestamp);
-    c.cleanup();
+  it('the mark feed turns STALE for an unpriceable LIVE position and recovers once it is closed; a PAPER one never turns it red (R11, R4)', async () => {
+    {
+      const c = new ExecutionCoordinator(false);
+      vi.spyOn(c as any, 'updatePositionMarkPrices').mockResolvedValue(undefined); // no network
+      vi.spyOn(c as any, 'refreshStaleMark').mockResolvedValue(false); // nobody can price it
+      const markReason = () => c.canExecuteLive().reasons.filter((r) => /mark feed/i.test(r));
+
+      workstationDb.savePosition(livePos('l9-paper-unpriced', 'PAPER', 10 * 60_000));
+      await c.evaluateAndProcessExits();
+      expect(markReason(), 'a PAPER position must not turn the LIVE mark feed red').toEqual([]);
+
+      workstationDb.savePosition(livePos('l9-live-unpriced', 'LIVE', 10 * 60_000));
+      await c.evaluateAndProcessExits();
+      expect(markReason().join(' ')).toMatch(/Position mark feed is/);
+
+      // the position closes: nothing is left to be stale, so the feed must recover without a restart
+      workstationDb.savePosition({ ...livePos('l9-live-unpriced', 'LIVE', 10 * 60_000), status: 'CLOSED' });
+      workstationDb.savePosition({ ...livePos('l9-paper-unpriced', 'PAPER', 10 * 60_000), status: 'CLOSED' });
+      await c.evaluateAndProcessExits();
+      expect(markReason()).toEqual([]);
+      c.cleanup();
+    }
   });
 
   it('a LIVE snipe with zero spendable bankroll is rejected, not sent at the full requested size', async () => {

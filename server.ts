@@ -1020,21 +1020,29 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, async (req, res) =
     simulationScopeMatrix: [
       {
         subsystem: 'Pump.fun Token Discovery & Velocity',
-        nature: 'LIVE',
-        details:
-          'Fetches real new tokens and bonding curve progress via live HTTP GET requests to frontend-api-v3.pump.fun every 5s.',
+        nature: allowedCluster() === 'mainnet-beta' ? 'LIVE' : 'NOT_AVAILABLE_ON_THIS_CLUSTER',
+        details: allowedCluster() === 'mainnet-beta'
+          ? 'New launches and trades come from the program log stream (PumpFeedListener) on the configured RPC; the pump.fun HTTP API adds metadata.'
+          : `Cluster is ${allowedCluster()}: the pump.fun HTTP API only serves mainnet, so it yields no candidates here. Launches appear only if the pump program is deployed on this cluster and something creates tokens on it (the log stream reads the configured RPC).`,
       },
       {
         subsystem: 'DexScreener Boosted & Pool Metrics',
-        nature: 'LIVE',
-        details:
-          'Pulls live boosted tokens and 5-minute buy/sell ratios from api.dexscreener.com in real-time.',
+        nature: allowedCluster() === 'mainnet-beta' ? 'LIVE' : 'NOT_AVAILABLE_ON_THIS_CLUSTER',
+        details: allowedCluster() === 'mainnet-beta'
+          ? 'Boosted tokens and 5-minute buy/sell ratios from api.dexscreener.com.'
+          : 'DexScreener indexes mainnet only; it has no data for devnet or localnet tokens.',
       },
       {
         subsystem: 'Multi-Caller Confluence Engine',
         nature: 'LIVE_COMPUTATION',
         details:
-          'Evaluates intersection between live Pump.fun tokens and live DexScreener boosted coins in real-time to trigger INSTANT_SNIPE priority.',
+          'Scores a candidate from the signals it is given (score gate 70, maximum reachable 90 because the Social component is 0). It computes only from what the discovery sources above supply, so on devnet it scores watch-window candidates, not DexScreener boosts.',
+      },
+      {
+        subsystem: 'Auto mode (OFF / SHADOW / PAPER / DEVNET_LIVE)',
+        nature: 'PAPER_BY_DEFAULT',
+        details:
+          'Candidates come from the watch window (HOT/READY releases). PAPER fills and exits use the real curve maths, fees and tips, so a round trip at an unchanged curve loses about 3% plus tips; profit needs real price moves. PAPER has its own session budgets. Liquidity and distribution score components stay 0 until the pool has enough real SOL and 30 distinct buyers. DEVNET_LIVE is the only mode that signs transactions.',
       },
       {
         subsystem: 'Telegram Bot API Link',

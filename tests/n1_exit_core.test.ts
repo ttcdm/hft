@@ -197,6 +197,46 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
     expect(row.costBasisLamports).toBe(80_000_000); // basis scaled to what is still held
   });
 
+  describe('Q13: a 100% sell sells what the wallet holds', () => {
+    const rowOf = () => workstationDb.loadPositions().find((p) => p.id === posId)!;
+    const balance = (amount: string) => { (coordinator as any).connection.getTokenAccountBalance = vi.fn(async () => ({ value: { amount } })); };
+
+    it('the row says 1,000,000,000 but the wallet holds 600,000,000: the sell is for 600,000,000, the basis is scaled and the position closes', async () => {
+      balance('600000000');
+      const res = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(res.success, res.error).toBe(true);
+      expect(submit).toHaveBeenCalledTimes(1);
+      expect(String(quoteSpy.mock.calls[0][0].amountTokens ?? quoteSpy.mock.calls[0][0].tokenAmountRaw ?? '')).toBe('600000000');
+      expect(rowOf().status).toBe('CLOSED');
+      expect(coordinator.getOperatorAlerts().some((a) => a.code === 'POSITION_BALANCE_CLAMPED')).toBe(true);
+    });
+
+    it('an empty wallet closes the row without sending anything', async () => {
+      balance('0');
+      const res = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(res.success).toBe(true);
+      expect(submit).not.toHaveBeenCalled();
+      const row = rowOf();
+      expect(row.status).toBe('CLOSED');
+      expect(row.exitReason).toMatch(/^RECONCILED_ZERO_BALANCE/);
+      expect(coordinator.getOperatorAlerts().some((a) => a.code === 'POSITION_BALANCE_MISSING')).toBe(true);
+    });
+
+    it('an unreadable balance sells what the row says, as before', async () => {
+      (coordinator as any).connection.getTokenAccountBalance = vi.fn(async () => { throw new Error('429 too many requests'); });
+      const res = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(res.success, res.error).toBe(true);
+      expect(String(quoteSpy.mock.calls[0][0].amountTokens ?? quoteSpy.mock.calls[0][0].tokenAmountRaw ?? '')).toBe('1000000000');
+    });
+
+    it('a wallet holding more than the row (dust, an airdrop) does not change a 100% sell', async () => {
+      balance('1500000000');
+      const res = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(res.success, res.error).toBe(true);
+      expect(String(quoteSpy.mock.calls[0][0].amountTokens ?? quoteSpy.mock.calls[0][0].tokenAmountRaw ?? '')).toBe('1000000000');
+    });
+  });
+
   describe('N20: the PENDING row is written before anything is sent', () => {
     const params = (sigByte: number, orderId: string) => ({
       tx: { signatures: [new Uint8Array(64).fill(sigByte)] } as any, orderId, correlationId: 'c-' + orderId, side: 'BUY' as const,

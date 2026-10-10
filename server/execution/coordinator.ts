@@ -2755,8 +2755,8 @@ export class ExecutionCoordinator {
     const seller = localSigner.getPublicKey();
     const mintPubkey = new PublicKey(target.mint);
 
-      const totalTokensRaw = BigInt(target.tokenQuantityRaw);
-      const amountTokensToSell = (totalTokensRaw * BigInt(safeSellPct)) / 100n;
+      let totalTokensRaw = BigInt(target.tokenQuantityRaw);
+      let amountTokensToSell = (totalTokensRaw * BigInt(safeSellPct)) / 100n;
 
       if (amountTokensToSell <= 0n) {
         return { success: false, pnlSol: 0, error: 'Calculated sell quantity is zero' };
@@ -2798,6 +2798,38 @@ export class ExecutionCoordinator {
           return { success: false, pnlSol: 0, error: `SELL_PENDING_VERIFICATION: sell ${pendingSell.signature.slice(0, 8)} was sent and is not confirmed or expired yet; not selling again` };
         }
         this.pendingSells.delete(positionId);
+      }
+
+      // Q13: a 100% sell sells what the wallet holds. When the row says more than the wallet has (tokens moved outside the app, a partial
+      // that landed with no pending record), every attempt fails simulation and the stop-loss can never clear. Scale the row to the wallet
+      // (the N3 adoption arithmetic) and sell that; an empty wallet closes the row without a send.
+      if (safeSellPct >= 100) {
+        let held: bigint | null = null;
+        try {
+          const tp = target.baseTokenProgram ? new PublicKey(target.baseTokenProgram) : TOKEN_PROGRAM_ID;
+          const bal = await this.connection.getTokenAccountBalance(PumpCurveService.getAssociatedTokenAddress(mintPubkey, seller, tp), 'confirmed');
+          held = BigInt(bal?.value?.amount ?? '0');
+        } catch (e: any) {
+          held = /could not find account|Invalid param/i.test(String(e?.message)) ? 0n : null; // unreadable for another reason: sell what the row says
+        }
+        if (held !== null && held < totalTokensRaw) {
+          target.lastUpdatedTimestamp = Date.now();
+          if (held === 0n) {
+            target.status = 'CLOSED';
+            target.tokenQuantityRaw = '0';
+            target.costBasisLamports = 0;
+            target.exitReason = 'RECONCILED_ZERO_BALANCE: the wallet held no tokens when the sell was prepared';
+            workstationDb.savePosition(target);
+            this.raiseOperatorAlert('POSITION_BALANCE_MISSING', `${target.symbol || target.mint} was closed without a sell: the wallet held none of it. Realized PnL for it was not recorded.`, positionId);
+            return { success: true, pnlSol: 0, status: 'CLOSED' };
+          }
+          target.costBasisLamports = Math.round(target.costBasisLamports * Number(held) / Number(totalTokensRaw));
+          target.tokenQuantityRaw = held.toString();
+          workstationDb.savePosition(target);
+          this.raiseOperatorAlert('POSITION_BALANCE_CLAMPED', `${target.symbol || target.mint}: the position said ${totalTokensRaw} but the wallet holds ${held}; selling what the wallet holds.`, positionId);
+          totalTokensRaw = held;
+          amountTokensToSell = held;
+        }
       }
 
       // CloseAccount only succeeds on an empty token account. If the wallet holds more than this sell (dust, an airdrop) or the balance

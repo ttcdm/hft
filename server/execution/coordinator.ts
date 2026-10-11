@@ -27,6 +27,12 @@ export const EXIT_FAILURE_ALERT_AFTER = 4;
 export const MARK_STALE_MS = 15_000;
 /** C4: if a direct read still fails after this long, raise an operator alert. */
 export const MARK_ALERT_AFTER_MS = 60_000;
+export const MARK_RETRY_BASE_MS = 60_000;
+export const MARK_RETRY_MAX_MS = 10 * 60_000;
+/** At most this many PAPER positions get a direct stale-mark read in one exit pass; LIVE positions are never capped. */
+export const PAPER_STALE_REFRESH_PER_PASS = 5;
+/** PAPER positions with no price get their own alert up to this many per pass; the rest share one alert with a count. */
+export const PAPER_INDIVIDUAL_ALERTS = 5;
 import { EligibilityFilter } from '../signals/eligibilityFilter';
 import { localSigner } from '../solana/signer';
 import { txBuilder, SolanaTransactionBuilder, PumpBuyParams, PumpSellParams } from '../solana/transactionBuilder';
@@ -1171,8 +1177,10 @@ export class ExecutionCoordinator {
       }
     }
 
-    // 2. Query on-chain bonding curve marks for active positions
-    const mints = positions.map((p) => p.mint);
+    // 2. Query on-chain bonding curve marks for active positions. A mint that failed recently waits out its back-off.
+    for (const k of this.markRetry.keys()) if (!positions.some((p) => p.mint === k)) this.markRetry.delete(k); // closed positions leave the map
+    const askable = positions.filter((p) => !this.markBackedOff(p.mint, now));
+    const mints = askable.map((p) => p.mint);
     try {
       const hasLivePositions = positions.some((p) => p.executionMode === 'LIVE');
       const onChainMarks = await RealMarkPriceService.queryOnChainMarkPrices(
@@ -1184,11 +1192,13 @@ export class ExecutionCoordinator {
         this.recordRealMarketEvent('BONDING_CURVE_RPC');
       }
 
-      for (const pos of positions) {
+      for (const pos of askable) {
         const mark = onChainMarks[pos.mint];
         if (mark && mark.priceSol > 0) {
+          this.noteMarkSuccess(pos.mint);
           this.applyMarkPrice(pos, mark.priceSol, mark.source, mark.timestamp, mark.poolAddress);
         } else if (!priceMap || !priceMap[pos.mint]) {
+          this.noteMarkFailure(pos.mint, now);
           const rejected = PumpCurveService.getMintRejection(pos.mint);
           if (rejected) this.raiseOperatorAlert('MARK_MINT_REJECTED', `${pos.symbol || pos.mint.slice(0, 6)} cannot be marked: ${rejected}. The position keeps its last mark and goes stale.`, pos.id); // R19
           // Mark age increases honestly
@@ -3158,8 +3168,27 @@ export class ExecutionCoordinator {
     }
   }
 
+  /**
+   * A mint whose price could not be read is not asked again at once. Without this, 515 stale PAPER positions on mints that do not exist
+   * cost one RPC read each on every 3 s pass (and a log line each), which also drew 429s from the endpoint. The wait doubles from
+   * MARK_RETRY_BASE_MS to MARK_RETRY_MAX_MS and resets on a successful read.
+   */
+  private markRetry = new Map<string, { failures: number; nextAt: number }>();
+  private markBackedOff(mint: string, now = Date.now()): boolean {
+    const r = this.markRetry.get(mint);
+    return !!r && now < r.nextAt;
+  }
+  private noteMarkFailure(mint: string, now = Date.now()): void {
+    const failures = (this.markRetry.get(mint)?.failures ?? 0) + 1;
+    this.markRetry.set(mint, { failures, nextAt: now + Math.min(MARK_RETRY_MAX_MS, MARK_RETRY_BASE_MS * 2 ** (failures - 1)) });
+  }
+  private noteMarkSuccess(mint: string): void {
+    this.markRetry.delete(mint);
+  }
+
   /** C4: isolated per-position price read used when the shared mark feed has gone stale. */
   private async refreshStaleMark(pos: NormalizedPosition): Promise<boolean> {
+    if (this.markBackedOff(pos.mint)) return false; // asked recently and failed: no RPC read this time
     try {
       const marks = await RealMarkPriceService.queryOnChainMarkPrices(
         this.connection,
@@ -3170,12 +3199,15 @@ export class ExecutionCoordinator {
       if (!mark || !(mark.priceSol > 0)) {
         const rejected = PumpCurveService.getMintRejection(pos.mint);
         if (rejected) this.raiseOperatorAlert('MARK_MINT_REJECTED', `${pos.symbol || pos.mint.slice(0, 6)} cannot be marked: ${rejected}. The position keeps its last mark and goes stale.`, pos.id); // R19
+        this.noteMarkFailure(pos.mint);
         return false;
       }
+      this.noteMarkSuccess(pos.mint);
       this.applyMarkPrice(pos, mark.priceSol, mark.source, mark.timestamp, mark.poolAddress);
       return true;
     } catch (err: any) {
       Logger.debug(`Direct mark read failed for ${pos.mint}: ${err.message}`);
+      this.noteMarkFailure(pos.mint);
       return false;
     }
   }
@@ -3192,6 +3224,7 @@ export class ExecutionCoordinator {
     const existing = this.operatorAlerts.find((a) => a.code === code && a.positionId === positionId && !a.cleared);
     if (existing) {
       existing.lastSeenAt = now;
+      existing.message = message; // counts and ages in an aggregate alert stay current; no new log line
       return;
     }
     this.operatorAlerts.push({ code, message, positionId, raisedAt: now, lastSeenAt: now, cleared: false });
@@ -3240,16 +3273,23 @@ export class ExecutionCoordinator {
       this.positionMarkHealth = 'HEALTHY';
     }
 
+    let paperRefreshes = 0;
+    let paperAlertsThisPass = 0;
+    const paperNoMark: Array<{ pos: NormalizedPosition; ageMs: number }> = [];
     for (const pos of positions) {
       // C4: staleness is measured from the last real mark only. lastUpdatedTimestamp is rewritten on every tick
       // and would hide a dead feed, so it is never a fallback; a never-marked position ages from its entry.
       const markAge = now - (pos.lastMarkTimestamp || pos.entryTimestamp || now);
       if (markAge > MARK_STALE_MS) {
         // Before skipping, read this position's curve/pool directly. A fresh read lets the stop-loss run.
-        const refreshed = await this.refreshStaleMark(pos);
+        // PAPER positions cost no more than PAPER_STALE_REFRESH_PER_PASS direct reads per pass; LIVE positions always get theirs.
+        const skipRead = pos.executionMode !== 'LIVE' && ++paperRefreshes > PAPER_STALE_REFRESH_PER_PASS;
+        const refreshed = skipRead ? false : await this.refreshStaleMark(pos);
         if (!refreshed) {
           // Missing data is never "safe": exits cannot be priced, so say so loudly once the gap is long enough.
-          if (markAge > MARK_ALERT_AFTER_MS) {
+          if (markAge > MARK_ALERT_AFTER_MS && pos.executionMode !== 'LIVE' && ++paperAlertsThisPass > PAPER_INDIVIDUAL_ALERTS) {
+            paperNoMark.push({ pos, ageMs: markAge }); // past the first few: one alert with a count for the rest, below
+          } else if (markAge > MARK_ALERT_AFTER_MS) {
             this.raiseOperatorAlert(
               'POSITION_MARK_UNAVAILABLE',
               `No price for ${pos.symbol || pos.mint} for ${Math.round(markAge / 1000)}s and a direct curve/pool read failed. Stop-loss and take-profit cannot fire until a mark returns; consider closing manually.`,
@@ -3323,6 +3363,18 @@ export class ExecutionCoordinator {
           }
         }
       }
+    }
+
+    // One alert for every PAPER position with no price, with a count; a per-position alert for 500 stale paper rows filled the alert list
+    // (cap 50) and re-logged on every pass. LIVE positions keep their own alert above.
+    if (paperNoMark.length > 0) {
+      const oldest = Math.max(...paperNoMark.map((x) => x.ageMs));
+      this.raiseOperatorAlert(
+        'PAPER_MARKS_UNAVAILABLE',
+        `${paperNoMark.length} more PAPER position(s) have no price (oldest ${Math.round(oldest / 1000)}s). Their stop-loss and take-profit cannot fire until a mark returns. They are re-read at most every ${Math.round(MARK_RETRY_BASE_MS / 1000)}s.`
+      );
+    } else {
+      this.clearOperatorAlert('PAPER_MARKS_UNAVAILABLE');
     }
   }
 

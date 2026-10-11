@@ -18,10 +18,6 @@ describe('Q38/Q39: no invented numbers, no LIVE badge on synthetic data', () => 
     const demo = src.slice(0, src.indexOf('export class SocialAlphaScanner'));
     expect(demo).not.toMatch(/isLiveFeed: true/);
   });
-  it('a backtest with zero variance reports 0 for Sharpe/Sortino/Calmar, not 3.2/4.5/10', () => {
-    const src = fs.readFileSync('src/utils/backtestEngine.ts', 'utf8');
-    expect(src).not.toMatch(/: 3\.2;|: 4\.5;|: 10\.0;/);
-  });
   it('the Plug-and-Play card no longer states fixed 0.02/0.06 SOL caps', () => {
     expect(fs.readFileSync('src/components/PlugAndPlayTradingModal.tsx', 'utf8')).not.toMatch(/0\.02 SOL \(~\$2\.90|0\.06 SOL \(~\$8\.70/);
   });

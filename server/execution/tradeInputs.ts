@@ -49,6 +49,8 @@ const address = z.string().trim().regex(SOLANA_ADDRESS, 'must be a valid Base58 
 const id = z.string().trim().min(1).max(128);
 
 const amountUsd = z.coerce.number().positive().max(100_000).default(5.0);
+/** S181: an explicit size in SOL (the operator's saved snipe amount). When present it wins over amountUsd and is checked, never clamped. */
+const amountSol = z.coerce.number().positive().max(1_000).optional();
 /** Optional: absent means the executionConfig dynamic tip policy decides (C6). */
 const jitoTipSol = z.coerce.number().min(0).max(0.1).optional();
 const slippagePct = z.coerce.number().min(0.5).max(50).default(8.0);
@@ -59,6 +61,7 @@ export const OperatorSnipeSchema = z
   .object({
     contractAddress: address,
     amountUsd,
+    amountSol,
     platform: z.string().trim().max(32).optional(),
     jitoTipSol,
     slippagePct,
@@ -66,9 +69,10 @@ export const OperatorSnipeSchema = z
   })
   .loose()
   .superRefine(rejectForbiddenKeys)
-  .transform(({ contractAddress, amountUsd, platform, jitoTipSol, slippagePct, signalId }) => ({
+  .transform(({ contractAddress, amountUsd, amountSol, platform, jitoTipSol, slippagePct, signalId }) => ({
     contractAddress,
     amountUsd,
+    amountSol,
     platform,
     jitoTipSol,
     slippagePct,
@@ -81,6 +85,7 @@ export const SignalSnipeSchema = z
   .object({
     signalId: id,
     amountUsd,
+    amountSol,
     platform: z.string().trim().max(32).optional(),
     jitoTipSol,
     slippagePct,
@@ -88,9 +93,10 @@ export const SignalSnipeSchema = z
   })
   .loose()
   .superRefine(rejectForbiddenKeys)
-  .transform(({ signalId, amountUsd, platform, jitoTipSol, slippagePct, confirmLive }) => ({
+  .transform(({ signalId, amountUsd, amountSol, platform, jitoTipSol, slippagePct, confirmLive }) => ({
     signalId,
     amountUsd,
+    amountSol,
     platform,
     jitoTipSol,
     slippagePct,
@@ -102,13 +108,14 @@ export const CalloutSnipeSchema = z
   .object({
     calloutId: id,
     amountUsd,
+    amountSol,
     jitoTipSol,
     slippagePct: z.coerce.number().min(0.5).max(50).default(6.0),
     confirmLive: z.boolean().optional(),
   })
   .loose()
   .superRefine(rejectForbiddenKeys)
-  .transform(({ calloutId, amountUsd, jitoTipSol, slippagePct, confirmLive }) => ({ calloutId, amountUsd, jitoTipSol, slippagePct, confirmLive }));
+  .transform(({ calloutId, amountUsd, amountSol, jitoTipSol, slippagePct, confirmLive }) => ({ calloutId, amountUsd, amountSol, jitoTipSol, slippagePct, confirmLive }));
 
 /** POST /api/pumpfun/callouts/rules. Only these keys, inside these bounds, reach the rules object (Q25: it used to be a spread of the raw body). */
 export const AutoSnipeRulesSchema = z
@@ -180,6 +187,15 @@ export const ArmSchema = z.object({
 
 /** POST /api/auto/mode (G1). */
 export const KillSwitchSchema = z.object({ activate: strictBool });
+
+/** POST /api/auto/budget (S181): the session budget the operator may edit. The server's caps are applied in the controller. */
+export const AutoBudgetSchema = z.object({
+  maxBuys: z.coerce.number().int().min(1).max(50),
+  maxSpendSol: z.coerce.number().positive().max(1_000),
+});
+
+/** POST /api/auto/order-size (S183). */
+export const AutoOrderSizeSchema = z.object({ orderSol: z.coerce.number().positive().max(1_000) });
 
 export const AutoModeSchema = z.object({
   mode: z.enum(['OFF', 'SHADOW', 'PAPER', 'DEVNET_LIVE']),

@@ -77,6 +77,7 @@ describe('C4: exits keep working on stale marks', () => {
     const id = open(MINTS[2]).id;
     expect(executionCoordinator.getOperatorAlerts().some((a) => a.positionId === id)).toBe(true);
 
+    (executionCoordinator as any).markRetry.clear(); // the first failed read put this mint in back-off; a real mark returns later than that
     q.mockResolvedValue({ [MINTS[2]]: { priceSol: 0.00006, source: 'ON_CHAIN_BONDING_CURVE', timestamp: Date.now() } } as any);
     await executionCoordinator.evaluateAndProcessExits();
     expect(executionCoordinator.getOperatorAlerts().some((a) => a.positionId === id)).toBe(false);

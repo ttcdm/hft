@@ -29,7 +29,11 @@ export const DEV_DENY_DIRS = DENY_DIRS.filter((d) => d !== 'node_modules');
 function allowedPath(relPath: string, denyDirs: string[]): boolean {
   const parts = relPath.replace(/\\/g, '/').split('/').filter(Boolean);
   if (parts.length === 0) return false;
-  if (parts.slice(0, -1).some((d) => denyDirs.includes(d))) return false;
+  // A package's own dist/ or build/ folder (node_modules/vite/dist/client/...) is not the project's. When node_modules is servable (dev),
+  // the directory rules apply only to the part of the path before it; the file-name rules still apply to everything.
+  const nm = denyDirs.includes('node_modules') ? -1 : parts.indexOf('node_modules');
+  const dirParts = nm >= 0 ? parts.slice(0, nm) : parts.slice(0, -1);
+  if (dirParts.some((d) => denyDirs.includes(d))) return false;
   const base = parts[parts.length - 1];
   if (allowRes.some((r) => r.test(base))) return true;
   return !denyRes.some((r) => r.test(base));
@@ -54,17 +58,23 @@ export function dockerignoreLines(): string[] {
   ];
 }
 
+/** Build-output folders: denied at the PROJECT root only. `**\/dist/**` also matched node_modules/vite/dist/client, so /@vite/client was a 404 and the page stayed blank. */
+const ROOT_ONLY_DIRS = ['dist', 'coverage', 'target', 'build'];
+const escapeGlob = (s: string) => s.replace(/[\\^$*+?.()|{}[\]!]/g, '\\$&');
+
 /** Vite `server.fs.deny` globs from the same lists (replaces Vite's default list, so its own defaults are repeated). */
-export function viteFsDeny(): string[] {
+export function viteFsDeny(root: string = process.cwd()): string[] {
+  const rootPosix = escapeGlob(root.replace(/\\/g, '/').replace(/\/+$/, ''));
   return [
     '.env', '.env.*', '*.{crt,pem}',
-    ...DEV_DENY_DIRS.map((d) => `**/${d}/**`),
+    ...DEV_DENY_DIRS.filter((d) => !ROOT_ONLY_DIRS.includes(d)).map((d) => `**/${d}/**`),
+    ...ROOT_ONLY_DIRS.filter((d) => DEV_DENY_DIRS.includes(d)).map((d) => `${rootPosix}/${d}/**`),
     ...DENY_FILE_GLOBS.filter((g) => !ALLOW_FILE_GLOBS.includes(g)).map((g) => `**/${g}`),
   ];
 }
 
-export function viteDevServerOptions() {
-  return { middlewareMode: true as const, hmr: false as const, fs: { strict: true, deny: viteFsDeny() } };
+export function viteDevServerOptions(root: string = process.cwd()) {
+  return { middlewareMode: true as const, hmr: false as const, fs: { strict: true, deny: viteFsDeny(root) } };
 }
 
 /**

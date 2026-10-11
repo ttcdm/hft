@@ -7,11 +7,11 @@ import { MonteCarloAnalytics } from '../src/components/MonteCarloAnalytics';
 import { SYNTHETIC_BANNER_TEXT } from '../src/components/SyntheticBanner';
 
 describe('B4: synthetic results are labelled as synthetic', () => {
-  it('the Backtest view shows the banner and no longer claims to be historical', () => {
+  it('the Backtest view has no generator behind it: with no recording it says so and shows no result', () => {
     const html = renderToStaticMarkup(<BacktestModal isOpen={true} onClose={() => undefined} />);
-    expect(html).toContain(SYNTHETIC_BANNER_TEXT);
-    expect(html).not.toMatch(/Historical Backtest/i);
-    expect(html).not.toMatch(/July 11/);
+    expect(html).not.toContain(SYNTHETIC_BANNER_TEXT); // there is nothing synthetic left to label (S178)
+    expect(html).not.toMatch(/Historical Backtest|July 11/i);
+    expect(fs.existsSync('src/utils/backtestEngine.ts')).toBe(false);
   });
 
   it('the Monte Carlo view shows the banner', () => {

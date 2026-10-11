@@ -15,6 +15,11 @@ import { memecoinAggregator } from './server/memecoinAggregator';
 import { onChainPoolStats } from './server/market/poolStats';
 import { wireWatchPins } from './server/signals/watchPins';
 import { realismEngine } from './server/realismEngine';
+import { buildSystemChecks } from './server/system/systemChecks';
+import { LaunchRecorder } from './server/backtest/launchRecorder';
+import { replayLaunches } from './server/backtest/replay';
+import { computeLatency } from './server/system/latencyStats';
+import { buildDiagnosticsContext } from './server/system/aiContext';
 import { pumpFunService, pumpBootMode } from './server/pumpfunService';
 import { pumpFeedListener } from './server/solana/pumpFeedListener';
 import { autoSnipeController } from './server/auto/controller';
@@ -23,10 +28,10 @@ import { FunderLookup, wireFunderLookup } from './server/signals/funderLookup';
 import { buildBoard } from './server/board';
 import { PublicKey } from '@solana/web3.js';
 import { solPriceService } from './server/market/solPriceService';
+import { checkSnipeAmountSol, getSnipeLimits } from './server/execution/snipeAmount';
 import { PumpCurveService } from './server/solana/pumpCurve';
 import { buildCurveDepth } from './server/market/curveDepth';
 import { TradeTape } from './server/market/tradeTape';
-import { runComprehensiveTestSuite } from './server/unitTestCases';
 import { registerMarketRoutes } from './server/market/marketRoutes';
 import { walletTrader } from './server/walletTrader';
 import { resolveRpcUrl, allowedCluster } from './server/solana/clusterGuard';
@@ -34,6 +39,8 @@ import { liveConfirmationRefusal } from './server/execution/liveConfirmation';
 import {
   ArmSchema,
   AutoModeSchema,
+  AutoBudgetSchema,
+  AutoOrderSizeSchema,
   AutoKillSchema,
   AutoResumeSchema,
   CalloutSnipeSchema,
@@ -265,7 +272,8 @@ wss.on('connection', (ws: WebSocket, req: any) => {
           input.data.calloutId,
           input.data.amountUsd,
           input.data.jitoTipSol,
-          input.data.slippagePct
+          input.data.slippagePct,
+          input.data.amountSol
         );
         ws.send(JSON.stringify({ type: 'CALLOUT_SNIPE_RESULT', data: result }));
       }
@@ -285,7 +293,7 @@ wss.on('connection', (ws: WebSocket, req: any) => {
         if (input.status === 'invalid') return rejectWsInput(input.issues);
         const refused = liveGate(parsed); // S1
         if (refused) return void ws.send(JSON.stringify({ type: 'MEMECOIN_SNIPE_RESULT', data: { success: false, message: refused } }));
-        const result = await memecoinAggregator.executeSnipe({ ...input.data, provenance: OPERATOR_PROVENANCE, signalTimestamp: Date.now() });
+        const result = await memecoinAggregator.executeSnipe({ ...withOperatorAmount(input.data), provenance: OPERATOR_PROVENANCE, signalTimestamp: Date.now() });
         ws.send(JSON.stringify({ type: 'MEMECOIN_SNIPE_RESULT', data: result }));
       }
       if (parsed.action === 'CLOSE_POSITION') {
@@ -327,6 +335,9 @@ watchWindow.setScoreFn((mint) => {
   return pool ? memecoinAggregator.evaluateTokenConfluence(pool).score : null;
 });
 watchWindow.attach(pumpFeedListener);
+// S178: save what the window sees (launches it scores, their trades, the funder facts) so the auto rules can be replayed over real launches
+const launchRecorder = new LaunchRecorder(workstationDb, watchWindow, () => solPriceService.lastKnownPrice());
+launchRecorder.attach(pumpFeedListener);
 wireWatchPins(watchWindow, memecoinAggregator, onChainPoolStats); // S4: a watched mint keeps its pool and its trade stats until the verdict
 wireFunderLookup(watchWindow, new FunderLookup(() => executionCoordinator.getConnection())); // Q6b
 watchWindow.on('release', (r) => broadcastWs({ type: 'WATCH_RELEASE', data: r }));
@@ -502,78 +513,47 @@ registerMarketRoutes(app);
 
 // 3h. (removed, Q57) /api/account/balance was a Binance-testnet route with invented "institutional" balances and hardcoded BTC/ETH prices; nothing in src/ called it.
 
-// 4. Automated Unit Testing Suite Runner (200 Quantitative HFT & Bonding Curve Test Cases)
-app.get('/api/unit-tests', requireOperatorAuth, (req, res) => {
-  const suiteOutput = runComprehensiveTestSuite();
-  res.json(suiteOutput);
-});
+// 4. (removed) /api/unit-tests ran 700 arithmetic self-checks on toy numbers; System checks (/api/system/checks) reads live state instead.
 
-// 5. AI Quant Diagnostics with High Thinking Mode (gemini-3.1-pro-preview) and Market Grounding (gemini-3.5-flash)
+// 5. Quant AI Diagnostics: the model is given the server's own live state (system checks, auto journal stats, measured latency), built
+// here from the same sources the screens read. The client sends only the mode and the question; it cannot add figures.
 app.post('/api/ai/diagnostics', requireOperatorAuth, async (req, res) => {
-  const { mode = 'thinking', strategyConfig, telemetry, prompt } = req.body;
+  const { mode = 'thinking', prompt } = req.body ?? {};
   const ai = getGenAI();
 
   if (!ai) {
     return res.status(503).json({
-      error: 'GEMINI_API_KEY is not configured. Add it in AI Studio Settings to activate AI Quant Diagnostics.',
+      error: 'GEMINI_API_KEY is not configured. Set it in .env and restart to use Quant AI Diagnostics (nothing is sent anywhere without it).',
     });
   }
 
+  const context = buildDiagnosticsContext();
   try {
     if (mode === 'thinking') {
-      // User directive: MUST use gemini-3.1-pro-preview with thinkingLevel: 'HIGH', no maxOutputTokens
-      const systemInstruction = `You are the Principal Quantitative Strategist & Chief Risk Officer at Apex Quant HFT.
-Provide deep, rigorous mathematical analysis of high-frequency execution strategies, order flow imbalance, inventory risk, and network degradation profiles.
-Respond with:
-1. Executive Risk & Alpha Assessment
-2. Mathematical Formula Calibrations (Avellaneda-Stoikov gamma, kappa, volatility sigma)
-3. Congestion & Slippage Vulnerability Analysis
-4. Actionable Parameter Tuning Suggestions`;
-
-      const userMessage = `Analyze the current workstation configuration and strategy fleet:
-Strategy Fleet Context: ${JSON.stringify(strategyConfig || {}, null, 2)}
-Real-Time Telemetry: ${JSON.stringify(telemetry || {}, null, 2)}
-User Query: ${prompt || 'Perform full risk audit and latency sensitivity analysis.'}`;
-
+      const systemInstruction = `You review a Solana pump.fun auto-trading workstation (devnet / paper). Use ONLY the JSON state given; if a figure is missing or null say it is not measured, never estimate it.
+Answer with: 1. What the state shows (cite the check or counter), 2. What looks wrong or risky, 3. What to look at next. Be short and concrete. You cannot trade and nothing you say is executed.`;
+      const userMessage = `Live state:\n${JSON.stringify(context, null, 2)}\n\nQuestion: ${prompt || 'Review this state and point out anything that needs attention.'}`;
       const response = await ai.models.generateContent({
         model: 'gemini-3.1-pro-preview',
-        contents: [
-          { role: 'user', parts: [{ text: `${systemInstruction}\n\n${userMessage}` }] },
-        ],
-        config: {
-          thinkingConfig: {
-            thinkingLevel: 'HIGH' as any,
-          },
-        },
+        contents: [{ role: 'user', parts: [{ text: `${systemInstruction}\n\n${userMessage}` }] }],
+        config: { thinkingConfig: { thinkingLevel: 'HIGH' as any } },
       });
-
-      return res.json({
-        model: 'gemini-3.1-pro-preview',
-        thinkingEnabled: true,
-        analysis: response.text || 'Analysis completed.',
-      });
-    } else {
-      // User directive: MUST use gemini-3.5-flash with googleSearch tool for real-time market grounding
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.5-flash',
-        contents: prompt || 'What are the current macroeconomic volatility drivers impacting HFT market making spreads today?',
-        config: {
-          tools: [{ googleSearch: {} }],
-        },
-      });
-
-      return res.json({
-        model: 'gemini-3.5-flash',
-        grounded: true,
-        analysis: response.text || 'Market search completed.',
-        groundingMetadata: response.candidates?.[0]?.groundingMetadata,
-      });
+      return res.json({ model: 'gemini-3.1-pro-preview', thinkingEnabled: true, analysis: response.text || 'Analysis completed.', context });
     }
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.5-flash',
+      contents: prompt || 'What is the current state of pump.fun launch activity on Solana?',
+      config: { tools: [{ googleSearch: {} }] },
+    });
+    return res.json({
+      model: 'gemini-3.5-flash',
+      grounded: true,
+      analysis: response.text || 'Market search completed.',
+      groundingMetadata: response.candidates?.[0]?.groundingMetadata,
+    });
   } catch (err: any) {
     console.error('Gemini API Error:', err);
-    res.status(500).json({
-      error: err.message || 'Error processing AI Diagnostics',
-    });
+    res.status(500).json({ error: err.message || 'Error processing AI Diagnostics' });
   }
 });
 
@@ -768,12 +748,18 @@ app.post('/api/social/signals/snipe', requireOperatorAuth, validateTradeBody(Sig
   if (executionCoordinator.isLiveArmed() && existing.verified !== true) {
     return res.status(409).json({ error: 'UNVERIFIED_SIGNAL: refusing to snipe an unverified signal while LIVE is armed' });
   }
+  // S181: an explicit size is judged before the signal is marked, so a refused amount leaves the signal snipeable.
+  if (req.body.amountSol !== undefined) {
+    const check = checkSnipeAmountSol(req.body.amountSol);
+    if (!check.ok) return res.status(422).json({ success: false, status: 'REJECTED', error: check.reason });
+  }
   const sig = socialScanner.markSniped(signalId)!;
 
   // Trigger sniper trade on the aggregator
   const tradeResult = await memecoinAggregator.executeSnipe({
     contractAddress: sig.contractAddress,
     amountUsd: req.body.amountUsd,
+    operatorAmountSol: req.body.amountSol,
     platform: req.body.platform,
     jitoTipSol: req.body.jitoTipSol,
     slippagePct: req.body.slippagePct,
@@ -1087,7 +1073,7 @@ app.get('/api/memecoins/positions', requireOperatorAuth, (req, res) => {
 });
 
 app.post('/api/memecoins/trade', requireOperatorAuth, requireLiveConfirmation, validateTradeBody(OperatorSnipeSchema), async (req, res) => {
-  const result = await memecoinAggregator.executeSnipe({ ...req.body, provenance: OPERATOR_PROVENANCE, signalTimestamp: Date.now() });
+  const result = await memecoinAggregator.executeSnipe({ ...withOperatorAmount(req.body), provenance: OPERATOR_PROVENANCE, signalTimestamp: Date.now() });
 
   res.json({
     status: result.success ? 'OK' : 'REJECTED',
@@ -1152,11 +1138,11 @@ app.get('/api/pumpfun/leaderboard', requireOperatorAuth, (req, res) => {
 });
 
 app.post('/api/pumpfun/callouts/snipe', requireOperatorAuth, validateTradeBody(CalloutSnipeSchema), async (req, res) => {
-  const { calloutId, amountUsd, jitoTipSol, slippagePct } = req.body;
+  const { calloutId, amountUsd, amountSol, jitoTipSol, slippagePct } = req.body;
   const unconfirmed = liveConfirmationRefusal(executionCoordinator.isLiveArmed(), allowedCluster(), req.body); // Q10b
   if (unconfirmed) return res.status(409).json({ success: false, status: 'REJECTED', error: unconfirmed, result: { success: false, message: unconfirmed } });
 
-  const result = await pumpFunService.snipeCallout(calloutId, amountUsd, jitoTipSol, slippagePct);
+  const result = await pumpFunService.snipeCallout(calloutId, amountUsd, jitoTipSol, slippagePct, amountSol);
 
   res.json({
     status: result.success ? 'OK' : 'REJECTED',
@@ -1271,6 +1257,9 @@ app.post('/api/wallet/toggle-trading', requireOperatorAuth, validateTradeBody(Ar
 });
 
 app.post('/api/wallet/snipe', requireOperatorAuth, requireLiveConfirmation, validateBody(LiveSnipeOrderSchema), async (req, res) => {
+  // S181: same refusal-with-a-reason as the other snipe routes (minimum and MAX_POSITION_SIZE_SOL); nothing is clamped.
+  const amountCheck = checkSnipeAmountSol(req.body.amountSol);
+  if (!amountCheck.ok) return res.status(400).json({ success: false, error: amountCheck.reason });
   // The operator's request is the signal; a client-supplied signalTimestamp is ignored so the age check cannot be dodged.
   const result = await walletTrader.executeLiveSnipe({ ...req.body, signalTimestamp: Date.now() });
   if (!result.success) {
@@ -1366,6 +1355,37 @@ app.get('/api/diagnostics/system', requireOperatorAuth, (req, res) => {
   });
 });
 
+// System checks and measured latency: live reads, each from the component that owns the fact (see server/system/*).
+app.get('/api/system/checks', requireOperatorAuth, (req, res) => {
+  res.json({ success: true, ...buildSystemChecks() });
+});
+
+app.get('/api/system/latency', requireOperatorAuth, (req, res) => {
+  const txs = workstationDb.loadTransactions().sort((a, b) => b.submissionTime - a.submissionTime).slice(0, 5000);
+  const queued = workstationDb.loadDecisions({ stage: 'queue', outcome: 'QUEUED', limit: 5000 }).map((d) => ({ ts: d.ts, mint: d.mint }));
+  res.json({ success: true, measuredAt: Date.now(), ...computeLatency(txs, queued) });
+});
+
+// Backtest = replay of recorded launches through the auto trader's real rules. No recording, no result.
+app.get('/api/backtest/recording', requireOperatorAuth, (req, res) => {
+  res.json({ success: true, ...workstationDb.getLaunchRecordingStatus() });
+});
+
+let replayCache: { key: string; at: number; body: any } | null = null;
+app.get('/api/backtest/replay', requireOperatorAuth, (req, res) => {
+  const status = workstationDb.getLaunchRecordingStatus();
+  if (status.launches === 0) {
+    return res.json({ success: true, recorded: status, report: null, message: 'No launch has been recorded yet, so there is nothing to replay. The recorder saves every launch the watch window scores while the app runs against a pump.fun feed.' });
+  }
+  const key = `${status.events}:${status.newestTs}`;
+  if (replayCache && replayCache.key === key && Date.now() - replayCache.at < 30_000) return res.json(replayCache.body);
+  const { launches, funders } = workstationDb.loadLaunchRecording(300);
+  const report = replayLaunches(launches, funders, solPriceService.lastKnownPrice());
+  const body = { success: true, recorded: status, report, message: null };
+  replayCache = { key, at: Date.now(), body };
+  res.json(body);
+});
+
 app.get('/api/execution/mode', requireOperatorAuth, (req, res) => {
   res.json({
     success: true,
@@ -1386,6 +1406,25 @@ app.get('/api/execution/readiness', requireOperatorAuth, (req, res) => {
     success: true,
     ...executionCoordinator.getLiveReadiness(),
   });
+});
+
+/** S181: the schemas carry the client's size as amountSol; the aggregator takes it as operatorAmountSol. */
+function withOperatorAmount<T extends { amountSol?: number }>(body: T): T & { operatorAmountSol?: number } {
+  return { ...body, operatorAmountSol: body.amountSol };
+}
+
+app.get('/api/snipe/limits', requireOperatorAuth, (req, res) => {
+  res.json({ success: true, ...getSnipeLimits(solPriceService.lastKnownPrice()) });
+});
+
+app.post('/api/auto/budget', requireOperatorAuth, validateTradeBody(AutoBudgetSchema), (req, res) => {
+  const result = autoSnipeController.setBudget({ maxBuys: req.body.maxBuys, maxSpendSol: req.body.maxSpendSol });
+  res.status(result.ok ? 200 : 422).json({ success: result.ok, ...result, error: result.reason, status: autoSnipeController.getStatus() });
+});
+
+app.post('/api/auto/order-size', requireOperatorAuth, validateTradeBody(AutoOrderSizeSchema), (req, res) => {
+  const result = autoSnipeController.setOrderSol(req.body.orderSol);
+  res.status(result.ok ? 200 : 422).json({ success: result.ok, ...result, error: result.reason, status: autoSnipeController.getStatus() });
 });
 
 // G1: auto-snipe controller. Mode lives in memory only, so every restart comes back OFF.

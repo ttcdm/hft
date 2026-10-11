@@ -26,6 +26,8 @@ interface TokenInlineExternalLinksProps {
   website?: string;
   onOpenModal?: () => void;
   compact?: boolean;
+  /** S184: the mint came from mainnet data (a callout), so the mainnet-only sites list it whatever cluster this server is on. */
+  mainnetToken?: boolean;
 }
 
 export const TokenInlineExternalLinks: React.FC<TokenInlineExternalLinksProps> = ({
@@ -39,6 +41,7 @@ export const TokenInlineExternalLinks: React.FC<TokenInlineExternalLinksProps> =
   website,
   onOpenModal,
   compact = false,
+  mainnetToken = false,
 }) => {
   const [copied, setCopied] = useState(false);
   const mode = useTradingMode();
@@ -51,7 +54,7 @@ export const TokenInlineExternalLinks: React.FC<TokenInlineExternalLinksProps> =
     twitter,
     telegram,
     website,
-    cluster: mode.cluster,
+    cluster: mainnetToken ? 'mainnet-beta' : (mode.cluster ?? 'unknown'),
   });
 
   const handleCopy = (e: React.MouseEvent) => {
@@ -64,16 +67,25 @@ export const TokenInlineExternalLinks: React.FC<TokenInlineExternalLinksProps> =
 
   // Get primary external services
   const dexLink = links.find((l) => l.id === 'dexscreener');
-  const pumpLink = links.find((l) => l.id === 'pumpfun' && l.isAvailable);
-  const gmgnLink = links.find((l) => l.id === 'gmgn' && l.isAvailable);
-  const birdeyeLink = links.find((l) => l.id === 'birdeye' && l.isAvailable);
+  const pumpLink = links.find((l) => l.id === 'pumpfun' && l.isAvailable && !l.mainnetOnly);
+  const gmgnLink = links.find((l) => l.id === 'gmgn' && l.isAvailable && !l.mainnetOnly);
+  const birdeyeLink = links.find((l) => l.id === 'birdeye' && l.isAvailable && !l.mainnetOnly);
   const explorerLink = links.find((l) => l.id === 'solscan' && l.isAvailable);
-  const photonLink = links.find((l) => l.id === 'photon' && l.isAvailable);
+  const photonLink = links.find((l) => l.id === 'photon' && l.isAvailable && !l.mainnetOnly);
 
   return (
     <div className="flex flex-wrap items-center gap-1.5 pt-1">
       {/* DexScreener Link */}
-      {dexLink && (
+      {dexLink?.mainnetOnly && (
+        <span
+          data-testid="mainnet-only-note"
+          className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-mono text-slate-500 border border-slate-700/60 cursor-help"
+          title="DexScreener, RugCheck, pump.fun and the other chart sites only index mainnet. This server is not on a known mainnet cluster, so a link would open an empty page."
+        >
+          charts: mainnet only
+        </span>
+      )}
+      {dexLink && !dexLink.mainnetOnly && (
         <a
           href={dexLink.url}
           target="_blank"
@@ -211,6 +223,7 @@ interface TokenExternalLinksModalProps {
   isOpen: boolean;
   onClose: () => void;
   tokenData: {
+    mainnetToken?: boolean;
     mintOrCa: string;
     symbol: string;
     name?: string;
@@ -235,7 +248,7 @@ export const TokenExternalLinksModal: React.FC<TokenExternalLinksModalProps> = (
   if (!isOpen || !tokenData) return null;
 
   const links = getTokenExternalLinks({
-    cluster: mode.cluster,
+    cluster: tokenData.mainnetToken ? 'mainnet-beta' : (mode.cluster ?? 'unknown'),
     mintOrCa: tokenData.mintOrCa,
     symbol: tokenData.symbol,
     name: tokenData.name,
@@ -325,6 +338,14 @@ export const TokenExternalLinksModal: React.FC<TokenExternalLinksModalProps> = (
             {links
               .filter((l) => l.isAvailable)
               .map((link) => {
+                if (link.mainnetOnly) {
+                  return (
+                    <div key={link.id} data-testid="mainnet-only-link" className="p-3 rounded-xl bg-[#0D1322] border border-[#1E293B] opacity-60">
+                      <span className="font-bold text-sm text-slate-400">{link.name}</span>
+                      <p className="text-[10px] text-slate-500 leading-tight">Mainnet only: this server is not on a known mainnet cluster, so the page would be empty.</p>
+                    </div>
+                  );
+                }
                 return (
                   <a
                     key={link.id}

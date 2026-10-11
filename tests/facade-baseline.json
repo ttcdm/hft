@@ -129,7 +129,6 @@
 "tests/q34_known_risks.test.ts::enableSyntheticSocial is never read outside its definition",
 "tests/q34_known_risks.test.ts::isAutoSnipeEnvEnabled has no caller",
 "tests/q35_header_pill.test.ts::the header no longer reads the nonexistent fields or hardcodes a plus sign",
-"tests/q38_invented_numbers.test.ts::a backtest with zero variance reports 0 for Sharpe/Sortino/Calmar, not 3.2/4.5/10",
 "tests/q38_invented_numbers.test.ts::the AI diagnostics 503 carries no canned Sharpe or recommendation",
 "tests/q38_invented_numbers.test.ts::the Plug-and-Play card no longer states fixed 0.02/0.06 SOL caps",
 "tests/q38_invented_numbers.test.ts::the demo signal templates are not flagged as a live feed",
@@ -138,7 +137,6 @@
 "tests/q47_q49_harness.test.ts::smoke.ts points every network setting at a closed loopback port",
 "tests/q58_scope_matrix.test.ts::Pump.fun and DexScreener are LIVE only on mainnet-beta",
 "tests/q58_scope_matrix.test.ts::has an Auto mode row that states the round-trip cost and the score ceiling",
-"tests/r107_frontend_bits.test.tsx::shows RUNNING while tests have started but no summary has arrived",
 "tests/r1_cluster_guard.test.ts::no dotenv override:true in server code or scripts",
 "tests/r1_cluster_guard.test.ts::no mainnet RPC or block engine URL literal outside the cluster guard and the tip-floor gate",
 "tests/r1_cluster_guard.test.ts::the PAPER-mode mainnet fallback is gone and env:show is removed",
@@ -148,6 +146,7 @@
 "tests/r2_devnet_guard.test.ts::allows and logs a devnet URL attempt without connecting during the check",
 "tests/r2_devnet_guard.test.ts::throws on fetch to a mainnet or jito.wtf URL and logs the attempt",
 "tests/r2_devnet_guard.test.ts::throws on https.request / http.get to a blocked host",
+"tests/s177_quant_tools.test.tsx::the live-state routes exist and the toy routes are gone",
 "tests/s1_live_confirm.test.ts::the UI asks before, and sends confirmLive from, the two buttons that had no dialog; a 409 shows its real reason",
 "tests/s1_live_confirm.test.ts::the websocket snipe actions and the three HTTP routes call the same gate (source order: gate before the trade)",
 "tests/s1_social_integrations.test.ts::says plainly that setWebhook, polling and alert forwarding are not implemented",
@@ -162,8 +161,5 @@
 "tests/v1_ui_labels.test.ts::Plug & Play carries no static LIVE badge (the mode pill shows the real mode)",
 "tests/v1_ui_labels.test.ts::left-aligned headers do not also carry text-right (CSS order made the right one win)",
 "tests/v1_ui_labels.test.ts::no 30 / 120 / 85 / 142 fallbacks for tokens monitored and latency",
-"tests/v1_ui_labels.test.ts::the Deploy button does not claim a CME / NY4 engine",
-"tests/v1_ui_labels.test.ts::the assumed 1.15ms co-location latency is labelled ASSUMED in the menu",
-"tests/v1_ui_labels.test.ts::the self-check button and menu entry do not call toy math a live unit-test suite",
 "tests/v1_ui_labels.test.ts::the wide-only nav badge and the AUTH label are hidden below their breakpoints"
 ]

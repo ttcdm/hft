@@ -18,6 +18,8 @@ export interface TokenLinkItem {
   colorClass: string;
   badgeBgClass: string;
   isAvailable: boolean;
+  /** true when the site only indexes mainnet and the server is not on a known mainnet cluster: show a note instead of a link that goes nowhere */
+  mainnetOnly?: boolean;
 }
 
 export function sanitizeExternalUrl(url?: string | null): string | undefined {
@@ -74,6 +76,20 @@ export function sanitizeTelegramUrl(raw?: string | null): string | undefined {
 /** S20: only a known mainnet cluster may link to the mainnet-only sites. Unknown (the server has not answered yet) is NOT mainnet. */
 export function isMainnetCluster(cluster?: string | null): boolean {
   return cluster === 'mainnet-beta' || cluster === 'mainnet';
+}
+
+/**
+ * S184: whether the mainnet-only sites (pump.fun, DexScreener, GMGN) can list this token. They can when the server is on mainnet, OR when the
+ * token itself came from mainnet data (the pump.fun / DexScreener HTTP lists, a real social call): that mint exists on mainnet whatever
+ * cluster this server trades on. A token created on this devnet / localnet is not listed, so it keeps "no mainnet links".
+ */
+export function mainnetLinksAvailable(serverCluster: string | null | undefined, tokenIsMainnetData: boolean): boolean {
+  return tokenIsMainnetData || isMainnetCluster(serverCluster);
+}
+
+/** S184: provenance values whose mint comes from a mainnet source. */
+export function isMainnetDataProvenance(p: string | null | undefined): boolean {
+  return p === 'PUMP_HTTP_API' || p === 'REAL_SOCIAL';
 }
 
 /** S20: a Solscan account link that names the cluster, so a devnet / localnet wallet never opens as a mainnet page. */
@@ -253,6 +269,13 @@ export function getTokenExternalLinks(params: {
     },
   ];
 
+  // Q-links: dexscreener / rugcheck-style sites only index mainnet. When the caller names a cluster that is not mainnet (or the
+  // server has not answered: the inline view passes 'unknown'), the link is flagged so the view shows "mainnet only" and no anchor.
+  // An omitted cluster keeps the old behaviour (callers outside the UI).
+  if (cluster && !isMainnetCluster(cluster)) {
+    for (const it of items) if (MAINNET_ONLY_LINK_IDS.includes(it.id)) it.mainnetOnly = true;
+  }
+
   if (telegramClean) {
     items.push({
       id: 'telegram',
@@ -292,3 +315,40 @@ export function getTokenExternalLinks(params: {
 
   return items;
 }
+
+/** Sites that index mainnet only. On devnet / localnet / an unknown cluster a link to one opens an empty page. */
+export const MAINNET_ONLY_LINK_IDS: ReadonlyArray<TokenLinkItem['id']> = ['dexscreener', 'pumpfun', 'gmgn', 'birdeye', 'photon', 'bullx', 'axiom'];
+
+/** Price change for a cell: no float residue ("9.99e-8%"), no exponent, a sign only when there is a move. */
+export function formatPctChange(v: number | null | undefined): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return '—';
+  const r = Math.round(v * 100) / 100;
+  if (r === 0) return '0.00%';
+  return `${r > 0 ? '+' : ''}${r.toFixed(2)}%`;
+}
+
+/** Pump.fun callouts come from the mainnet pump.fun API; those mints do not exist on devnet, so a callout can only be sniped on mainnet. */
+export function calloutSnipeBlock(cluster?: string | null): string | null {
+  if (isMainnetCluster(cluster)) return null;
+  return 'Mainnet token (pump.fun mainnet API data): not snipeable on ' + (cluster ? cluster : 'an unknown cluster');
+}
+
+/** Mcap for a callout: a number, or "unknown". */
+export function formatCalloutMcap(v: number | null | undefined): string {
+  return v === null || v === undefined || !Number.isFinite(v) || v <= 0 ? 'unknown' : `$${Math.round(v).toLocaleString()}`;
+}
+
+/** S179: what the callout snipe button says. It is a normal snipe; Jito is only a transport the server may or may not have configured. */
+export function calloutSnipeLabel(amountLabel: string): string {
+  return `SNIPE (${amountLabel})`;
+}
+
+/** S179: the line under the snipe button. The tip is paid only when the server has a Jito block engine configured (never on devnet / localnet). */
+export function calloutSendNote(tipSol: number): string {
+  return `Sent over the normal RPC path. Jito tip ${tipSol} SOL only if the server has Jito configured (devnet: never).`;
+}
+
+/** S179: the per-caller marker is a screen flag. Nothing buys because of it. */
+export const CALLER_MARK_LABEL = (on: boolean): string => (on ? 'CALLER MARKED' : 'MARK CALLER');
+export const CALLER_MARK_TITLE = (on: boolean): string =>
+  on ? 'Unmark this caller (a screen marker only; nothing buys because of it)' : 'Mark this caller (a screen marker only; nothing buys because of it)';

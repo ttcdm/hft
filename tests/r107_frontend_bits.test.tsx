@@ -9,8 +9,8 @@ import { engineClient } from '../src/services/engineClient';
 describe('R32: the kill-switch tooltip says what the kill switch does', () => {
   it('no longer promises to freeze all loops and open orders', () => {
     const html = renderToStaticMarkup(
-      <Header kpis={{} as any} isHalted={false} onToggleKillSwitch={() => undefined} onOpenDeployModal={() => undefined} onOpenAiDiagnostics={() => undefined}
-        onOpenUnitTests={() => undefined} onOpenGatewayModal={() => undefined} onOpenEngineConsole={() => undefined} activeFeed="CME_AURORA" onSelectFeed={() => undefined}
+      <Header kpis={{} as any} isHalted={false} onToggleKillSwitch={() => undefined} onOpenAiDiagnostics={() => undefined}
+        onOpenSystemChecks={() => undefined} onOpenGatewayModal={() => undefined} onOpenAutoPipeline={() => undefined} activeFeed="CME_AURORA" onSelectFeed={() => undefined}
         capitalTier="MICRO_10" onToggleCapitalTier={() => undefined} />
     );
     expect(html).not.toMatch(/freeze all trading loops/i);
@@ -57,14 +57,5 @@ describe('R34: the WAL download is not revoked before the browser has it, and a 
     vi.stubGlobal('fetch', vi.fn(async () => new Response('no', { status: 500 })));
     const r = await engineClient.downloadWalJournal();
     expect(r).toEqual({ ok: false, error: 'HTTP 500' });
-  });
-});
-
-describe('R37: the client unit-test status is not "passed" before a summary exists', () => {
-  it('shows RUNNING while tests have started but no summary has arrived', () => {
-    // no DOM test environment: source check of the status expression (labelled)
-    const src = fs.readFileSync('src/components/UnitTestModal.tsx', 'utf8');
-    expect(src).not.toMatch(/progress\.current > 0 \? 'ALL_TESTS_PASSED'/);
-    expect(src).toMatch(/progress\.current > 0 \? 'RUNNING'/);
   });
 });

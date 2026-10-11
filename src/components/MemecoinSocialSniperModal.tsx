@@ -1,7 +1,11 @@
 import { signalFeedBadge } from '../utils/signalBadge';
+import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { probeBadge, probeLatency, hostOfService } from '../utils/probeBadge';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
-import { isMainnetCluster, sanitizeExternalUrl, sanitizeTelegramUrl } from '../utils/tokenLinks';
+import { buildPoolSnipeRequest } from '../utils/poolSnipe';
+import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
+import { SnipeAmountControl } from './SnipeAmountControl';
+import { mainnetLinksAvailable, isMainnetDataProvenance, sanitizeExternalUrl, sanitizeTelegramUrl, formatPctChange } from '../utils/tokenLinks';
 import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
 import React, { useState, useEffect } from 'react';
 import {
@@ -95,7 +99,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const [selectedExternalToken, setSelectedExternalToken] = useState<any>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [manualSnipeCa, setManualSnipeCa] = useState('');
-  const [manualSnipeAmount, setManualSnipeAmount] = useState(capitalTier === 'MICRO_10' ? '5.0' : '25.0');
+  const snipeAmount = useSnipeAmount(); // S181: one saved size for every snipe button here
   const [manualSnipeLoading, setManualSnipeLoading] = useState(false);
 
   // Telegram interactive terminal
@@ -241,9 +245,10 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
   // Snipe a specific signal
   const handleSnipeSignal = async (sig: SocialSignal) => {
-    const amount = capitalTier === 'MICRO_10' ? 5.0 : 25.0;
+    if (!snipeAmount.parsed.ok) { onAlertTrigger?.('WARNING', 'SNIPE NOT SENT', snipeAmount.parsed.reason); return; }
+    const amount = snipeAmount.parsed.sol;
     // Q10b: while LIVE is armed this click sends a real transaction; say so and ask first
-    const warning = liveClickWarning(tradingMode, `Sniping ${sig.tokenTicker} for $${amount.toFixed(2)}`);
+    const warning = liveClickWarning(tradingMode, `Sniping ${sig.tokenTicker} for ${formatSol(amount)}`);
     if (warning && !window.confirm(warning)) return;
     hftAudio.playOrderFill();
     const res = await engineClient.snipeSocialSignal(sig.id, amount, sniperConfig.jitoTipSol, sniperConfig.maxSlippagePct, tradingMode.live);
@@ -252,7 +257,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
       onAlertTrigger?.(
         'INFO',
         `SNIPED ${sig.tokenTicker}`,
-        `${/^PAPER/i.test(String(res.tradeResult.txHash ?? '')) ? 'Paper fill' : 'Sent'} for $${amount.toFixed(2)} on ${sig.chain}${res.tradeResult.txHash ? ` (${String(res.tradeResult.txHash).slice(0, 14)}...)` : ''}. CA: ${sig.contractAddress.slice(0, 10)}...`
+        `${/^PAPER/i.test(String(res.tradeResult.txHash ?? '')) ? 'Paper fill' : 'Sent'} for ${formatSol(amount)} on ${sig.chain}${res.tradeResult.txHash ? ` (${String(res.tradeResult.txHash).slice(0, 14)}...)` : ''}. CA: ${sig.contractAddress.slice(0, 10)}...`
       );
       // Update signal status locally
       setSignals((prev) =>
@@ -265,6 +270,28 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
         `SNIPE REJECTED`,
         res?.tradeResult?.message || res?.error || 'Failed pre-trade risk check'
       );
+    }
+  };
+
+  // Snipe a pool row by its mint. The row never had a server-side signal, so it must not go through /api/social/signals/snipe
+  // (that route looks the signal id up and answers "Signal not found" for an id the server never issued).
+  const handleSnipePool = async (pool: MemecoinPool) => {
+    if (!snipeAmount.parsed.ok) { onAlertTrigger?.('WARNING', 'SNIPE NOT SENT', snipeAmount.parsed.reason); return; }
+    const amount = snipeAmount.parsed.sol;
+    const warning = liveClickWarning(tradingMode, `Sniping $${pool.symbol} for ${formatSol(amount)}`);
+    if (warning && !window.confirm(warning)) return;
+    hftAudio.playOrderFill();
+    const res = await engineClient.executeMemecoinSnipe(buildPoolSnipeRequest(pool, amount, sniperConfig), tradingMode.live);
+    const r = res?.result ?? res?.tradeResult;
+    if (r?.success) {
+      onAlertTrigger?.(
+        'INFO',
+        `SNIPED $${pool.symbol}`,
+        `${/^PAPER/i.test(String(r.txHash ?? '')) ? 'Paper fill' : 'Sent'} for ${formatSol(amount)} on ${pool.chain}${r.txHash ? ` (${String(r.txHash).slice(0, 14)}...)` : ''}. CA: ${pool.contractAddress.slice(0, 10)}...`
+      );
+      refreshData();
+    } else {
+      onAlertTrigger?.('WARNING', 'SNIPE REJECTED', r?.message || res?.error || 'Failed pre-trade risk check');
     }
   };
 
@@ -309,14 +336,15 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const handleManualSnipe = async () => {
     if (!manualSnipeCa.trim()) return;
     // S1: a manual snipe by address is a one-click trade too
-    const warning = liveClickWarning(tradingMode, `Sniping ${manualSnipeCa.trim().slice(0, 8)}… for $${(Number(manualSnipeAmount) || 5.0).toFixed(2)}`);
+    if (!snipeAmount.parsed.ok) { onAlertTrigger?.('WARNING', 'SNIPE NOT SENT', snipeAmount.parsed.reason); return; }
+    const warning = liveClickWarning(tradingMode, `Sniping ${manualSnipeCa.trim().slice(0, 8)}… for ${formatSol(snipeAmount.parsed.sol)}`);
     if (warning && !window.confirm(warning)) return;
     setManualSnipeLoading(true);
     hftAudio.playOrderFill();
     try {
       const res = await engineClient.executeMemecoinSnipe({
         contractAddress: manualSnipeCa.trim(),
-        amountUsd: Number(manualSnipeAmount) || 5.0,
+        amountSol: snipeAmount.parsed.sol,
         jitoTipSol: sniperConfig.jitoTipSol,
         slippagePct: sniperConfig.maxSlippagePct,
       }, tradingMode.live);
@@ -333,6 +361,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     }
   };
 
+  useEscapeToClose(isOpen, onClose);
   if (!isOpen) return null;
 
   // Filtered pools
@@ -376,6 +405,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
           </div>
 
           <div className="flex items-center space-x-2">
+            <SnipeAmountControl compact />
+
             {/* Capital Tier Pill */}
             <div className="px-2.5 py-1 rounded-lg bg-amber-950/60 border border-amber-500/40 text-amber-300 text-xs font-mono flex items-center space-x-1.5">
               <Coins className="w-3.5 h-3.5" />
@@ -660,7 +691,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
                           {/* Live Platform Feed Links */}
                           <div className="flex flex-wrap items-center gap-1.5">
-                            {isMainnetCluster(tradingMode.cluster) ? (
+                            {mainnetLinksAvailable(tradingMode.cluster, isMainnetDataProvenance(sig.provenance)) ? (
                               <>
                             {/* Pump.fun Link */}
                             <a
@@ -764,7 +795,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                               className="px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs shadow-md shadow-emerald-950/40 flex items-center space-x-1.5 transition active:scale-95"
                             >
                               <Zap className="w-3.5 h-3.5" />
-                              <span>Snipe with {capitalTier === 'MICRO_10' ? '$5 Micro' : '$25'} ({tradingMode.label})</span>
+                              <span>Snipe {snipeAmount.parsed.ok ? formatSol(snipeAmount.parsed.sol) : '(set amount)'} ({tradingMode.label})</span>
                             </button>
                           )}
                         </div>
@@ -846,7 +877,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                   <span className="text-slate-400 text-xs font-normal">({pool.name})</span>
                                 </div>
                                 <div className="text-[10px] text-slate-400 flex items-center space-x-1">
-                                  <span>{pool.contractAddress.slice(0, 6)}...{pool.contractAddress.slice(-4)}</span>
+                                  <span data-testid="pool-mint" title={pool.contractAddress} className="font-mono text-slate-300">{pool.contractAddress.slice(0, 8)}...{pool.contractAddress.slice(-6)}</span>
                                   <button onClick={() => copyToClipboard(pool.contractAddress)}>
                                     {copiedCa === pool.contractAddress ? (
                                       <Check className="w-2.5 h-2.5 text-emerald-400" />
@@ -861,9 +892,11 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                   name={pool.name}
                                   chain={pool.chain}
                                   platform={pool.platform}
+                                  mainnetToken={pool.id.startsWith('pool-callout-')}
                                   compact={true}
                                   onOpenModal={() =>
                                     setSelectedExternalToken({
+                                      mainnetToken: pool.id.startsWith('pool-callout-'),
                                       mintOrCa: pool.contractAddress,
                                       symbol: pool.symbol,
                                       name: pool.name,
@@ -892,7 +925,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                             </div>
                             <div className={`text-[11px] font-bold flex items-center space-x-0.5 ${isPositive ? 'text-emerald-400' : 'text-rose-400'}`}>
                               {isPositive ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
-                              <span>{isPositive ? '+' : ''}{pool.priceChange5mPct}% (5m)</span>
+                              <span>{formatPctChange(pool.priceChange5mPct)} (5m)</span>
                             </div>
                           </td>
 
@@ -958,33 +991,12 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                           <td className="p-3 text-right">
                             <button
                               onClick={() => {
-                                handleSnipeSignal({
-                                  id: `sig-agg-${pool.id}`,
-                                  provenance: pool.id.startsWith('pool-onchain') ? 'REAL_ONCHAIN' : 'SYNTHETIC_TEST',
-                                  source: 'TELEGRAM',
-                                  authorHandle: pool.platform,
-                                  authorDisplayName: pool.name,
-                                  authorTier: 'MARKET_MAKER_BOT',
-                                  verified: false,
-                                  timestamp: Date.now(),
-                                  timeStr: 'Now',
-                                  rawText: `Manual snipe of ${pool.symbol} from the ${pool.platform} pool list (operator-initiated, no signal scoring)`,
-                                  tokenTicker: `$${pool.symbol}`,
-                                  tokenName: pool.name,
-                                  contractAddress: pool.contractAddress,
-                                  chain: pool.chain,
-                                  signalPattern: 'STEALTH_ACCUMULATION',
-                                  confidenceScore: null,
-                                  sentimentScore: null,
-                                  actionSuggested: 'REVIEW',
-                                  status: 'NEW',
-                                  metrics: {},
-                                });
+                                handleSnipePool(pool);
                               }}
                               className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow transition active:scale-95 flex items-center space-x-1 ml-auto"
                             >
                               <Zap className="w-3 h-3" />
-                              <span>Snipe ${capitalTier === 'MICRO_10' ? '5.00' : '25.00'}</span>
+                              <span>Snipe {snipeAmount.parsed.ok ? formatSol(snipeAmount.parsed.sol) : '(set amount)'}</span>
                             </button>
                           </td>
                         </tr>
@@ -1112,14 +1124,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                   />
                 </div>
 
-                <div className="w-28">
-                  <label className="block text-slate-400 text-xs font-mono mb-1">Amount ($)</label>
-                  <input
-                    type="number"
-                    value={manualSnipeAmount}
-                    onChange={(e) => setManualSnipeAmount(e.target.value)}
-                    className="w-full bg-[#141B2D] border border-[#1E293B] rounded-lg px-3 py-2 text-xs text-white font-mono outline-none focus:border-cyan-400"
-                  />
+                <div>
+                  <SnipeAmountControl compact />
                 </div>
 
                 <button

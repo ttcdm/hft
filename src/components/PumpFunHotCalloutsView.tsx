@@ -1,3 +1,6 @@
+import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
+import { SnipeAmountControl } from './SnipeAmountControl';
+import { CONFLUENCE_RULE_LABEL, CONFLUENCE_RULE_NOTE } from '../utils/calloutRuleText';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
 import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
 import React, { useState, useEffect } from 'react';
@@ -25,6 +28,7 @@ import {
   Settings,
   Globe,
   Bot,
+  Star,
 } from 'lucide-react';
 import {
   PumpFunHotCallout,
@@ -38,6 +42,13 @@ import {
   sanitizeTwitterUrl,
   sanitizeTelegramUrl,
   isMainnetCluster,
+  calloutSnipeBlock,
+  mainnetLinksAvailable,
+  calloutSnipeLabel,
+  calloutSendNote,
+  CALLER_MARK_LABEL,
+  CALLER_MARK_TITLE,
+  formatCalloutMcap,
   solscanAccountUrl,
 } from '../utils/tokenLinks';
 
@@ -53,6 +64,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   onRefreshParent,
 }) => {
   const tradingMode = useTradingMode();
+  const snipeAmount = useSnipeAmount();
   const [subTab, setSubTab] = useState<'CALLOUTS' | 'LEADERBOARD' | 'RULES'>('CALLOUTS');
   const [callouts, setCallouts] = useState<PumpFunHotCallout[]>([]);
   const [leaderboard, setLeaderboard] = useState<PumpFunCaller[]>([]);
@@ -171,16 +183,21 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   };
 
   const handleSnipeCallout = async (callout: PumpFunHotCallout) => {
-    const defaultAmount = capitalTier === 'MICRO_10' ? 5.0 : 25.0;
+    // S181: the size is the operator's saved snipe amount; an out-of-bounds value is refused here and again by the server
+    if (!snipeAmount.parsed.ok) {
+      onAlertTrigger?.('WARNING', 'SNIPE NOT SENT', snipeAmount.parsed.reason);
+      return;
+    }
+    const amountSol = snipeAmount.parsed.sol;
     // Q10b: while LIVE is armed this click sends a real transaction; say so and ask first
-    const warning = liveClickWarning(tradingMode, `Sniping $${callout.token.symbol} for $${defaultAmount.toFixed(2)}`);
+    const warning = liveClickWarning(tradingMode, `Sniping $${callout.token.symbol} for ${formatSol(amountSol)}`);
     if (warning && !window.confirm(warning)) return;
     setSnipingCalloutId(callout.id);
     hftAudio.playOrderFill();
 
     const res = await engineClient.snipePumpFunCallout(
       callout.id,
-      defaultAmount,
+      amountSol,
       rules.jitoPriorityTipSol,
       6.0,
       tradingMode.live
@@ -190,7 +207,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
       onAlertTrigger?.(
         'INFO',
         `⚡ HOT CALLOUT SNIPED: $${callout.token.symbol}`,
-        `${tradingMode.live ? 'Sent' : 'PAPER fill of'} $${defaultAmount.toFixed(2)} on Pump.fun (${tradingMode.label}). Caller: @${callout.caller.userId} (Avg: ${callout.caller.avgMultiple}x)`
+        `${tradingMode.live ? 'Sent' : 'PAPER fill of'} ${formatSol(amountSol)} on Pump.fun (${tradingMode.label}). Caller: @${callout.caller.userId} (Avg: ${callout.caller.avgMultiple}x)`
       );
       setCallouts((prev) =>
         prev.map((c) => (c.id === callout.id ? { ...c, status: 'SNIPED' } : c))
@@ -222,8 +239,8 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
       );
       onAlertTrigger?.(
         'INFO',
-        `CALLER SUBSCRIPTION UPDATED`,
-        `Auto-snipe for @${userId} is now ${res.caller.isAutoSnipeSubscribed ? 'ENABLED' : 'DISABLED'}`
+        `CALLER MARK UPDATED`,
+        `@${userId} is now ${res.caller.isAutoSnipeSubscribed ? 'marked' : 'unmarked'} (screen marker only)`
       );
     }
   };
@@ -351,29 +368,38 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
 
         {subTab === 'CALLOUTS' && (
           <div className="text-[11px] font-mono text-slate-400 hidden sm:block">
-            Showing <span className="text-white font-bold">{filteredCallouts.length}</span> verified hot calls
+            Showing <span className="text-white font-bold">{filteredCallouts.length}</span> hot calls
           </div>
         )}
       </div>
+      {calloutSnipeBlock(tradingMode.cluster) !== null && (
+        <div data-testid="callouts-mainnet-banner" className="mx-1 mb-2 px-3 py-2 rounded-lg border border-amber-500/30 bg-amber-500/10 text-[11px] font-mono text-amber-300">
+          These callouts are pump.fun MAINNET data. This server is on {tradingMode.cluster || 'an unknown cluster'}, where these tokens do not exist, so they cannot be sniped here.
+        </div>
+      )}
 
       {/* ========================================================================= */}
       {/* 1. HOT CALLOUTS STREAM VIEW */}
       {/* ========================================================================= */}
       {subTab === 'CALLOUTS' && (
         <div className="space-y-3">
+          <div className="p-3 rounded-xl bg-[#0F172A] border border-cyan-500/20">
+            <SnipeAmountControl />
+          </div>
+
           {/* Quick Auto-Sniper Status Bar */}
           <div className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-xl bg-gradient-to-r from-[#0F172A] to-[#1E1B4B] border border-cyan-500/30 shadow-lg">
             <div className="flex items-center space-x-2.5">
               <Bot className="w-5 h-5 text-cyan-400 animate-pulse" />
               <div>
                 <div className="text-xs font-mono font-bold text-white flex items-center space-x-2">
-                  <span>AUTONOMOUS CALLOUT SNIPER</span>
+                  <span>PUMP.FUN CALLOUTS</span>
                   <span className="text-[10px] px-1.5 py-0.2 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
-                    JITO MEV BUNDLES
+                    CALLOUTS
                   </span>
                 </div>
                 <div className="text-[11px] text-slate-400">
-                  The per-caller auto-snipe toggle only marks a caller on this screen; nothing buys because of it. Auto trading is controlled in the Auto panel.
+                  Marking a caller only flags them on this screen; nothing buys because of it. Auto trading is controlled in the Auto panel.
                 </div>
               </div>
             </div>
@@ -387,7 +413,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 className="px-3 py-1.5 rounded-lg text-xs font-mono font-bold bg-cyan-600/30 hover:bg-cyan-600/50 text-cyan-300 border border-cyan-500/50 transition flex items-center space-x-1.5"
               >
                 <Award className="w-3.5 h-3.5 text-amber-400" />
-                <span>Manage Subscriptions ({leaderboard.filter(c => c.isAutoSnipeSubscribed).length} Active)</span>
+                <span>Marked callers ({leaderboard.filter(c => c.isAutoSnipeSubscribed).length})</span>
               </button>
             </div>
           </div>
@@ -619,7 +645,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                             </button>
 
                             {/* External Links */}
-                            {isMainnetCluster(tradingMode.cluster) ? (
+                            {mainnetLinksAvailable(tradingMode.cluster, true /* S184: callouts come from the mainnet pump.fun list */) ? (
                               <>
                             <a
                               href={`https://pump.fun/coin/${c.token.mint}`}
@@ -648,6 +674,15 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                               title="GMGN Smart Money & Dev Holdings"
                             >
                               <span className="text-emerald-400 font-bold">GMGN</span>
+                            </a>
+                            <a
+                              href={`https://solscan.io/token/${c.token.mint}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-slate-400 hover:text-slate-200 p-0.5 text-[9px] font-mono flex items-center gap-0.5"
+                              title="Solscan (mainnet token page)"
+                            >
+                              <span className="text-slate-300 font-bold">SCAN</span>
                             </a>
                               </>
                             ) : (
@@ -764,21 +799,22 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                       {/* CALLOUT PRICING & MULTIPLES (Cols 8-10) */}
                       <div className="lg:col-span-3 grid grid-cols-2 gap-2 text-xs font-mono">
                         <div className="p-2 rounded bg-[#090D16] border border-[#1E293B]">
-                          <div className="text-[10px] text-slate-500 uppercase">Callout Mcap</div>
-                          <div className="font-bold text-slate-300">
-                            ${Math.round(c.token.marketCapAtCalloutUsd).toLocaleString()}
+                          <div className="text-[10px] text-slate-500 uppercase" title="Market cap the first time this server saw the token as a callout. It is not the launch market cap.">Mcap when first seen</div>
+                          <div className="font-bold text-slate-300" data-testid="callout-mcap">
+                            {formatCalloutMcap(c.token.marketCapAtCalloutUsd)}
                           </div>
                         </div>
 
                         <div className="p-2 rounded bg-[#090D16] border border-[#1E293B]">
-                          <div className="text-[10px] text-slate-500 uppercase">Multiple Reached</div>
-                          <div className="font-extrabold text-emerald-400 flex items-center space-x-0.5">
-                            <ArrowUpRight className="w-3 h-3" />
-                            <span>{c.token.currentMultiple.toFixed(2)}x</span>
-                            <span className="text-[10px] text-slate-400 ml-1">
-                              (ATH: {c.token.peakMultiple.toFixed(2)}x)
-                            </span>
-                          </div>
+                          <div className="text-[10px] text-slate-500 uppercase">Multiple since first seen</div>
+                          {c.token.currentMultiple === null ? (
+                            <div className="font-bold text-slate-500" data-testid="callout-multiple">unknown</div>
+                          ) : (
+                            <div className="font-extrabold text-emerald-400 flex items-center space-x-0.5" data-testid="callout-multiple">
+                              <ArrowUpRight className="w-3 h-3" />
+                              <span>{c.token.currentMultiple.toFixed(2)}x</span>
+                            </div>
+                          )}
                         </div>
                       </div>
 
@@ -786,7 +822,8 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                       <div className="lg:col-span-2 flex flex-col space-y-1.5">
                         <button
                           onClick={() => handleSnipeCallout(c)}
-                          disabled={snipingCalloutId === c.id || c.status === 'SNIPED'}
+                          disabled={snipingCalloutId === c.id || c.status === 'SNIPED' || calloutSnipeBlock(tradingMode.cluster) !== null}
+                          title={calloutSnipeBlock(tradingMode.cluster) ?? undefined}
                           className={`w-full py-2 px-3 rounded-lg font-mono font-bold text-xs transition flex items-center justify-center space-x-1.5 shadow-md ${
                             c.status === 'SNIPED'
                               ? 'bg-emerald-950/80 border border-emerald-500/50 text-emerald-300 cursor-default'
@@ -801,15 +838,23 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                               ? 'SNIPED ✓'
                               : snipingCalloutId === c.id
                               ? 'BUNDLING...'
-                              : `1-CLICK JITO ($${capitalTier === 'MICRO_10' ? '5' : '25'})`}
+                              : calloutSnipeBlock(tradingMode.cluster) !== null
+                              ? 'MAINNET ONLY'
+                              : calloutSnipeLabel(snipeAmount.parsed.ok ? formatSol(snipeAmount.parsed.sol) : 'set amount')}
                           </span>
                         </button>
 
-                        <div className="text-center text-[10px] font-mono text-slate-500">
-                          Jito MEV {rules.jitoPriorityTipSol} SOL Tip
-                        </div>
+                        {calloutSnipeBlock(tradingMode.cluster) !== null ? (
+                          <div data-testid="callout-mainnet-note" className="text-center text-[10px] font-mono text-amber-400/80">
+                            Mainnet data: this token does not exist on {tradingMode.cluster || 'this cluster'}
+                          </div>
+                        ) : (
+                          <div className="text-center text-[10px] font-mono text-slate-500">
+                            {calloutSendNote(rules.jitoPriorityTipSol)}
+                          </div>
+                        )}
 
-                        {/* Caller Auto-Snipe Toggle */}
+                        {/* Caller marker (a screen flag, not a trading switch) */}
                         <button
                           onClick={() => handleToggleAutoSnipe(c.caller.userId)}
                           className={`w-full py-1 px-2 rounded text-[10px] font-mono font-bold transition flex items-center justify-center space-x-1 border ${
@@ -817,10 +862,10 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                               ? 'bg-rose-500/20 text-rose-300 border-rose-500/50 shadow-sm'
                               : 'bg-[#141B2D] text-slate-400 border-[#1E293B] hover:text-white hover:border-slate-600'
                           }`}
-                          title={c.caller.isAutoSnipeSubscribed ? 'Click to unmark this caller (a screen marker only; nothing buys because of it)' : 'Click to mark this caller (a screen marker only; nothing buys because of it)'}
+                          title={CALLER_MARK_TITLE(c.caller.isAutoSnipeSubscribed)}
                         >
-                          <Bot className="w-3 h-3 text-cyan-400" />
-                          <span>{c.caller.isAutoSnipeSubscribed ? 'AUTO-SNIPE: ON' : 'AUTO-SNIPE: OFF'}</span>
+                          <Star className={`w-3 h-3 ${c.caller.isAutoSnipeSubscribed ? 'text-amber-300 fill-amber-300' : 'text-cyan-400'}`} />
+                          <span>{CALLER_MARK_LABEL(c.caller.isAutoSnipeSubscribed)}</span>
                         </button>
                       </div>
                     </div>
@@ -860,7 +905,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
             </div>
 
             <div className="text-[11px] text-slate-400">
-              Toggle <span className="text-rose-400 font-bold">Auto-Snipe</span> to snipe whenever that specific caller drops a callout (a real transaction only when LIVE is armed)
+              <span className="text-rose-400 font-bold">Mark</span> a caller to flag them on this screen. Marking does not buy anything; auto trading is controlled in the Auto panel.
             </div>
           </div>
 
@@ -875,7 +920,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                   <th className="py-2.5 px-3">Time to Peak</th>
                   <th className="py-2.5 px-3">Total Calls</th>
                   <th className="py-2.5 px-3">Top Hall-of-Fame Calls</th>
-                  <th className="py-2.5 px-3 text-right">Auto-Snipe</th>
+                  <th className="py-2.5 px-3 text-right">Marked</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#1E293B]">
@@ -966,7 +1011,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                             : 'bg-[#141B2D] text-slate-400 border-[#1E293B] hover:text-white hover:border-slate-700'
                         }`}
                       >
-                        {caller.isAutoSnipeSubscribed ? 'AUTO-SNIPE ON' : 'OFF'}
+                        {caller.isAutoSnipeSubscribed ? 'MARKED' : 'MARK'}
                       </button>
                     </td>
                   </tr>
@@ -1090,7 +1135,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
             <div className="p-3 rounded-lg bg-[#090D16] border border-[#1E293B] space-y-2">
               <div className="flex items-center justify-between">
                 <label className="text-slate-300 font-bold">
-                  Auto-Snipe on 2x+ Confluence
+                  {CONFLUENCE_RULE_LABEL}
                 </label>
                 <input
                   type="checkbox"
@@ -1102,7 +1147,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 />
               </div>
               <span className="text-[10px] text-slate-500 block">
-                Overrides individual caller thresholds if 2 or more verified callers call the same coin within 3 minutes.
+                {CONFLUENCE_RULE_NOTE}
               </span>
             </div>
 
@@ -1262,8 +1307,8 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 }`}
               >
                 {selectedCallerModal.isAutoSnipeSubscribed
-                  ? 'Auto-Snipe Subscribed (Click to Disable)'
-                  : 'Subscribe to Auto-Snipe this Caller'}
+                  ? 'Caller marked (click to unmark)'
+                  : 'Mark this caller (screen marker only)'}
               </button>
             </div>
           </div>

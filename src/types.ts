@@ -1,32 +1,5 @@
-export type StrategyArchetype =
-  | 'MARKET_MAKING'
-  | 'STATISTICAL_ARBITRAGE'
-  | 'ORDER_BOOK_IMBALANCE'
-  | 'LATENCY_ARBITRAGE'
-  | 'MOMENTUM_SCALPING';
-
-export type AssetClass = 'CRYPTO' | 'EQUITIES' | 'FX' | 'COMMODITIES';
-
 export type OrderSide = 'BUY' | 'SELL';
 export type OrderStatus = 'FILLED' | 'PARTIALLY_FILLED' | 'CANCELLED' | 'REJECTED';
-
-export interface TradingBot {
-  id: string;
-  name: string;
-  archetype: StrategyArchetype;
-  assetClass: AssetClass;
-  symbol: string;
-  isRunning: boolean;
-  winRate: number;
-  pnl: number;
-  tradesCount: number;
-  opsPerSec: number;
-  maxDailyLoss: number;
-  slippageLimitBps: number;
-  leverage: number;
-  gamma?: number; // Risk aversion
-  kappa?: number; // Order intensity
-}
 
 export interface OrderBookEntry {
   price: number;
@@ -449,13 +422,13 @@ export interface PumpFunHotCallout {
     bondingCurveAddress: string;
     associatedBondingCurve?: string;
     creator: string;
-    calloutPriceUsd: number;
+    calloutPriceUsd: number | null; // null = unknown (no price when first seen)
     currentPriceUsd: number;
-    marketCapAtCalloutUsd: number;
+    marketCapAtCalloutUsd: number | null; // market cap when this server first saw the callout; null = unknown
     currentMarketCapUsd: number;
     athPriceSol: number;
-    peakMultiple: number;
-    currentMultiple: number;
+    peakMultiple: number | null;
+    currentMultiple: number | null; // null = unknown, never a made-up 1.00x
     complete: boolean; // Raydium / PumpSwap migration status
     raydiumPool?: string;
     // null = not provided by the feed (never an invented value)

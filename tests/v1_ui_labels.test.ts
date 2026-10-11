@@ -9,20 +9,8 @@ const read = (f: string) => fs.readFileSync(f, 'utf8');
 
 describe('V1/V2: labels match what the control really is', () => {
   const header = read('src/components/Header.tsx');
-  it('the self-check button and menu entry do not call toy math a live unit-test suite', () => {
-    expect(header).not.toMatch(/700 Tests|700 Unit Tests|700 High-Stakes/);
-    expect(header).toMatch(/700 Self-Checks/);
-    expect(header).toMatch(/TOY MATH/);
-  });
   it('Plug & Play carries no static LIVE badge (the mode pill shows the real mode)', () => {
     expect(header).not.toMatch(/LIVE ⚡/);
-  });
-  it('the assumed 1.15ms co-location latency is labelled ASSUMED in the menu', () => {
-    expect(header).not.toMatch(/>1\.15ms</);
-    expect(header).toMatch(/ASSUMED/);
-  });
-  it('the Deploy button does not claim a CME / NY4 engine', () => {
-    expect(read('src/components/DeployBotModal.tsx')).not.toMatch(/CME \/ NY4/);
   });
 });
 

@@ -94,7 +94,7 @@ const audit = () => {
     });
     await p.reload({ waitUntil: 'load' }); await p.waitForTimeout(3000);
     // direct header buttons then dropdown items
-    const headerIds = ['btn-capital-tier-toggle', 'btn-auto-profit-ticker', 'btn-engine-console', 'btn-open-backtest', 'btn-unit-tests', 'btn-operator-auth', 'btn-deploy-algorithm', 'btn-audio-toggle'];
+    const headerIds = ['btn-capital-tier-toggle', 'btn-auto-profit-ticker', 'btn-engine-console', 'btn-open-backtest', 'btn-unit-tests', 'btn-operator-auth', 'btn-audio-toggle'];
     const reload = async () => { await p.reload({ waitUntil: 'load' }); await p.waitForTimeout(3000); };
     for (const id of headerIds) {
       const el = p.locator('#' + id);

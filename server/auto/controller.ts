@@ -4,6 +4,7 @@ import { executionCoordinator, isRecoveredPosition } from '../execution/coordina
 import { memecoinAggregator } from '../memecoinAggregator';
 import { solPriceService } from '../market/solPriceService';
 import { executionConfig } from '../solana/executionConfig';
+import { checkSnipeAmountSol, SNIPE_AMOUNT_MIN_SOL } from '../execution/snipeAmount';
 import { allowedCluster, assertClusterAllowed } from '../solana/clusterGuard';
 import { Logger } from '../middleware/enterprise';
 import type { SignalProvenance } from '../core/types';
@@ -97,6 +98,8 @@ export interface AutoSession {
 }
 
 export interface AutoStatus {
+  /** false when AUTO_SNIPE_ENABLED is not "true": every mode but OFF is refused. The panel tells the operator how to enable it. */
+  envEnabled: boolean;
   mode: AutoMode;
   killed: boolean;
   killReason: string | null;
@@ -107,6 +110,11 @@ export interface AutoStatus {
   slippageBreaches: number;
   session: (AutoSession & { sessionPnlSol: number; budgetsLeft: { buys: number; spendSol: number; lossSol: number; msLeft: number } }) | null;
   budgets: SessionBudgets;
+  /** S181: the largest session spend the operator may set (3 x MAX_POSITION_SIZE_SOL), and the smallest (one order). */
+  budgetLimits: { maxSpendSol: number; minSpendSol: number; maxBuys: number };
+  /** S183: size of one auto order (SOL) and the bounds the server accepts for it. */
+  orderSol: number;
+  orderLimits: { minSol: number; maxSol: number };
 }
 
 const MAX_DECISIONS = 500;
@@ -196,6 +204,59 @@ export class AutoSnipeController extends EventEmitter {
       .reduce((acc, p) => acc + (p.realizedPnLSol ?? 0) + (p.status === 'CLOSED' ? 0 : p.unrealizedPnLSol ?? 0), 0);
   }
 
+  /** S181: operator-edited session budget. In memory only, like the mode: a restart returns the defaults. */
+  private budgetOverride: { maxBuys: number; maxSpendSol: number } | null = null;
+
+  /** The most a session may spend: the risk engine's own aggregate exposure limit (3 x MAX_POSITION_SIZE_SOL). */
+  public static maxSessionSpendSol(): number {
+    return executionConfig.getConfig().maxPositionSizeSol * 3;
+  }
+
+  /**
+   * S181: change the session budget. Refused (never clamped) when the spend is below one order or above the server's cap.
+   * It applies to the running session at once and to every later one.
+   */
+  public setBudget(b: { maxBuys: number; maxSpendSol: number }): { ok: boolean; reason?: string } {
+    const cap = AutoSnipeController.maxSessionSpendSol();
+    if (!Number.isInteger(b.maxBuys) || b.maxBuys < 1 || b.maxBuys > 50) return { ok: false, reason: 'REJECTED: max buys must be a whole number from 1 to 50.' };
+    const order = this.orderSol();
+    if (!Number.isFinite(b.maxSpendSol) || b.maxSpendSol < order) {
+      return { ok: false, reason: `REJECTED: the session spend limit must cover at least one order (${order} SOL).` };
+    }
+    if (b.maxSpendSol > cap + 1e-9) {
+      return { ok: false, reason: `REJECTED: ${b.maxSpendSol} SOL is above the ${Number(cap.toFixed(6))} SOL session cap (3 x MAX_POSITION_SIZE_SOL). Lower it, or raise MAX_POSITION_SIZE_SOL in .env and restart.` };
+    }
+    this.budgetOverride = { maxBuys: b.maxBuys, maxSpendSol: b.maxSpendSol };
+    if (this.session) this.session.budgets = { ...this.session.budgets, ...this.budgetOverride };
+    workstationDb.logDecision({ autoMode: this.mode, mint: '-', stage: 'budget', outcome: 'INFO', reason: `operator set the session budget: ${b.maxBuys} buys, ${b.maxSpendSol} SOL` });
+    return { ok: true };
+  }
+
+  /** S183: operator-set size of one auto order in SOL. In memory only, like the mode. Null: the built-in default. */
+  private orderSolOverride: number | null = null;
+
+  /** The size of one auto order: the operator's, else the fixed 0.005 SOL. */
+  public orderSol(): number {
+    return this.orderSolOverride ?? AUTO_DEVNET_ORDER_SOL;
+  }
+
+  /**
+   * S183: change the size of one auto order. The same refusal rules as the manual snipe amount (not a number, under the minimum, over
+   * MAX_POSITION_SIZE_SOL), plus: it must fit inside the session spend limit. Refused, never clamped. It applies from the next order.
+   * Once set it sizes every auto buy that is sent or simulated (PAPER and DEVNET_LIVE), so paper results match what live would do.
+   */
+  public setOrderSol(sol: number): { ok: boolean; reason?: string } {
+    const check = checkSnipeAmountSol(sol);
+    if (!check.ok) return { ok: false, reason: check.reason };
+    const spendLimit = (this.session?.budgets ?? this.getStatus().budgets).maxSpendSol;
+    if (sol > spendLimit + 1e-9) {
+      return { ok: false, reason: `REJECTED: AUTO_ORDER_ABOVE_SESSION_LIMIT: ${sol} SOL is above the ${Number(spendLimit.toFixed(6))} SOL session spend limit; raise the session budget first.` };
+    }
+    this.orderSolOverride = sol;
+    workstationDb.logDecision({ autoMode: this.mode, mint: '-', stage: 'budget', outcome: 'INFO', reason: `operator set the auto order size: ${sol} SOL` });
+    return { ok: true };
+  }
+
   public getStatus(): AutoStatus {
     this.enforceBudgets();
     let session: AutoStatus['session'] = null;
@@ -213,9 +274,13 @@ export class AutoSnipeController extends EventEmitter {
       };
     }
     return {
+      envEnabled: process.env.AUTO_SNIPE_ENABLED === 'true',
       mode: this.mode, killed: this.killed, killReason: this.killReason, downgradeReason: this.downgradeReason,
       triggers: [...this.triggers], haltReason: executionCoordinator.getHaltReason(), slippageBreaches: this.slippageBreaches,
-      session, budgets: session?.budgets ?? SESSION_BUDGETS,
+      session, budgets: session?.budgets ?? (this.budgetOverride ? { ...SESSION_BUDGETS, ...this.budgetOverride } : SESSION_BUDGETS),
+      budgetLimits: { maxSpendSol: AutoSnipeController.maxSessionSpendSol(), minSpendSol: this.orderSol(), maxBuys: 50 },
+      orderSol: this.orderSol(),
+      orderLimits: { minSol: SNIPE_AMOUNT_MIN_SOL, maxSol: executionConfig.getConfig().maxPositionSizeSol },
     };
   }
 
@@ -299,9 +364,11 @@ export class AutoSnipeController extends EventEmitter {
       // S12: only DEVNET_LIVE sizes from the real wallet; PAPER trades a simulated bankroll, so its budgets must not depend on what the wallet holds.
       const paperBankroll = executionConfig.getConfig().paperBankrollSol;
       const bankroll = next === 'DEVNET_LIVE' ? (executionCoordinator.getRealWalletBalanceSol() ?? paperBankroll) : paperBankroll;
-      const budgets: SessionBudgets = next === 'PAPER'
+      const base: SessionBudgets = next === 'PAPER'
         ? { maxBuys: PAPER_SESSION_BUDGETS.maxBuys, maxSpendSol: PAPER_SESSION_BUDGETS.maxSpendBankrollMultiple * bankroll, maxLossFraction: PAPER_SESSION_BUDGETS.maxLossFraction, maxDurationMs: PAPER_SESSION_BUDGETS.maxDurationMs }
         : { ...SESSION_BUDGETS };
+      // S181: the operator's saved budget (buys and spend) replaces the defaults; loss and time limits stay fixed.
+      const budgets: SessionBudgets = this.budgetOverride ? { ...base, ...this.budgetOverride } : base;
       this.session = { startedAt: Date.now(), startingBankrollSol: bankroll, buys: 0, spentSol: 0, positionIds: [], budgets };
     } else {
       this.session = null;
@@ -363,7 +430,7 @@ export class AutoSnipeController extends EventEmitter {
       readinessRed: [...this.redSince.entries()].map(([name, since]) => ({ name, redForMs: now - since })),
       walletSol: executionCoordinator.getRealWalletBalanceSol(),
       reserveSol: 0.015,
-      maxTradeSol: AUTO_DEVNET_ORDER_SOL,
+      maxTradeSol: this.orderSol(),
     };
     const hits = evaluateKillTriggers(ctx);
     if (hits.length === 0) return [];
@@ -551,7 +618,7 @@ export class AutoSnipeController extends EventEmitter {
     // and then noticed on the next candidate.
     // DEVNET_LIVE only: the cap is a real-SOL cap (0.02), a paper $5 order (~0.033 SOL) would never fit it.
     if (this.session && mode === 'DEVNET_LIVE') {
-      const plannedSol = AUTO_DEVNET_ORDER_SOL;
+      const plannedSol = this.orderSol();
       if (this.session.spentSol + plannedSol > this.session.budgets.maxSpendSol) {
         return this.record(c, 'REJECTED', 'budget', `would exceed the session spend limit (${this.session.spentSol.toFixed(4)} + ${plannedSol.toFixed(4)} > ${this.session.budgets.maxSpendSol} SOL)`);
       }
@@ -585,16 +652,19 @@ export class AutoSnipeController extends EventEmitter {
         noSyntheticPool: true, // S16
       };
       if (shadow) params.dryRun = true;
+      const startOrderSol = this.orderSol();
       if (startMode === 'DEVNET_LIVE') {
         if (solUsd === null) return this.record(c, 'REJECTED', 'size', 'SOL_PRICE_UNAVAILABLE', { mode: startMode });
-        params.amountSolOverride = AUTO_DEVNET_ORDER_SOL;
+        params.amountSolOverride = startOrderSol;
+      } else if (this.orderSolOverride !== null) {
+        params.amountSolOverride = this.orderSolOverride; // S183: PAPER and SHADOW use the operator's size too
       }
       const res = await memecoinAggregator.executeSnipe(params);
       if (!res.success) {
         // R6: a buy that was sent and may have landed (unconfirmed, or landed with an unreadable fill) spent real SOL the cap must count.
         if (startSession && !shadow && /^(UNCONFIRMED|RECONCILIATION FAILED)/.test(res.message)) {
-          startSession.spentSol += AUTO_DEVNET_ORDER_SOL;
-          workstationDb.logDecision({ autoMode: startMode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'budget', outcome: 'INFO', reason: `counted ${AUTO_DEVNET_ORDER_SOL} SOL against the session cap: the buy was sent and may have landed` });
+          startSession.spentSol += startOrderSol;
+          workstationDb.logDecision({ autoMode: startMode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'budget', outcome: 'INFO', reason: `counted ${startOrderSol} SOL against the session cap: the buy was sent and may have landed` });
         }
         return this.record(c, 'REJECTED', classifyRejection(res.message), res.message, { mode: startMode, inputs: { confluenceScore: res.confluenceScore, dryRun: shadow } });
       }

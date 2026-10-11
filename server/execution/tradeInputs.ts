@@ -194,6 +194,9 @@ export const AutoBudgetSchema = z.object({
   maxSpendSol: z.coerce.number().positive().max(1_000),
 });
 
+/** POST /api/auto/order-size (S183). */
+export const AutoOrderSizeSchema = z.object({ orderSol: z.coerce.number().positive().max(1_000) });
+
 export const AutoModeSchema = z.object({
   mode: z.enum(['OFF', 'SHADOW', 'PAPER', 'DEVNET_LIVE']),
   confirmationCode: z.string().max(64).optional(),

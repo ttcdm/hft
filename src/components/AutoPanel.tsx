@@ -13,6 +13,9 @@ export interface AutoStatusData {
   budgets: { maxBuys: number; maxSpendSol: number; maxLossFraction: number; maxDurationMs: number };
   /** S181: bounds the server accepts for the session budget. Absent on an older server. */
   budgetLimits?: { maxSpendSol: number; minSpendSol: number; maxBuys: number };
+  /** S183: size of one auto order in SOL and the bounds the server accepts. Absent on an older server. */
+  orderSol?: number;
+  orderLimits?: { minSol: number; maxSol: number };
   stats: { seen: number; rejectedByStage: Record<string, number>; wouldBuy: number; bought: number; open: number; closed: number; netPnlSol: number; feesPaidSol: number; winRate: number | null };
 }
 
@@ -54,8 +57,31 @@ export function AutoBudgetEditor({ budgets, limits, onSave, busy }: { budgets: A
   );
 }
 
-export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, code, onCode, busy, error }: {
-  status: AutoStatusData | null; onMode?: (m: AutoMode) => void; onKill?: () => void; onResume?: () => void; onBudget?: (maxBuys: number, maxSpendSol: number) => void;
+/** S183: edit the size of one auto order (SOL). Same bounds as the manual snipe amount; the server refuses anything else with its reason. */
+export function AutoOrderSizeEditor({ orderSol, limits, spendLimitSol, onSave, busy }: { orderSol: number; limits?: AutoStatusData['orderLimits']; spendLimitSol?: number; onSave?: (sol: number) => void; busy?: boolean }) {
+  const [text, setText] = useState(String(Number(orderSol.toFixed(6))));
+  const n = text.trim() === '' ? NaN : Number(text);
+  let problem: string | null = null;
+  if (!Number.isFinite(n) || n <= 0) problem = 'Enter an order size in SOL above 0.';
+  else if (limits && n < limits.minSol) problem = `Below the ${limits.minSol} SOL minimum: the network fee and token account rent would eat the order.`;
+  else if (limits && n > limits.maxSol + 1e-9) problem = `Above the ${limits.maxSol} SOL maximum position size (MAX_POSITION_SIZE_SOL).`;
+  else if (spendLimitSol !== undefined && n > spendLimitSol + 1e-9) problem = `Above the ${Number(spendLimitSol.toFixed(6))} SOL session spend limit; raise the session budget first.`;
+  return (
+    <div className="mb-2 font-mono" data-testid="auto-order-editor">
+      <div className="text-slate-500 mb-0.5">Order size (each auto buy)</div>
+      <div className="flex items-center gap-1.5">
+        <input data-testid="order-sol" type="number" step="0.001" min={limits?.minSol} max={limits?.maxSol} value={text} onChange={(e) => setText(e.target.value)} className="w-20 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
+        <span className="text-slate-500">SOL</span>
+        <button data-testid="order-save" disabled={busy || problem !== null} onClick={() => onSave?.(n)} className="ml-auto px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white disabled:opacity-40">Save</button>
+      </div>
+      {problem && <p className="text-rose-400 mt-0.5" data-testid="order-problem">{problem}</p>}
+      {limits && <p className="text-slate-600 mt-0.5">{limits.minSol} to {limits.maxSol} SOL. Applies to PAPER and DEVNET_LIVE buys from the next order; kept until the server restarts.</p>}
+    </div>
+  );
+}
+
+export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOrderSize, code, onCode, busy, error }: {
+  status: AutoStatusData | null; onMode?: (m: AutoMode) => void; onKill?: () => void; onResume?: () => void; onBudget?: (maxBuys: number, maxSpendSol: number) => void; onOrderSize?: (sol: number) => void;
   code?: string; onCode?: (c: string) => void; busy?: boolean; error?: string | null;
 }) {
   if (!status) return <section className="rounded-lg border border-slate-800 bg-[#0B0F17] p-3 text-xs text-slate-500" data-testid="auto-panel">Auto-snipe: sign in as operator to read the controller.</section>;
@@ -84,6 +110,9 @@ export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, code
       {status.haltReason && <p className="text-red-400 mb-2" data-testid="halt-reason">ALL TRADING HALTED: {status.haltReason} <button onClick={onResume} className="underline ml-1">clear halt</button></p>}
       {status.killReason && <p className="text-amber-400 mb-1">Killed: {status.killReason}</p>}
       {status.downgradeReason && <p className="text-amber-400 mb-1" data-testid="downgrade-reason">Dropped to SHADOW: {status.downgradeReason}</p>}
+      {status.orderSol !== undefined && (
+        <React.Fragment key={`order-${status.orderSol}`}><AutoOrderSizeEditor orderSol={status.orderSol} limits={status.orderLimits} spendLimitSol={status.budgets.maxSpendSol} onSave={onOrderSize} busy={busy} /></React.Fragment>
+      )}
       <React.Fragment key={`${status.budgets.maxBuys}-${status.budgets.maxSpendSol}`}><AutoBudgetEditor budgets={status.budgets} limits={status.budgetLimits} onSave={onBudget} busy={busy} /></React.Fragment>
       <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 mb-2 font-mono">
         <span className="text-slate-500">Buys left</span><span className="text-right">{b ? `${b.buys} / ${status.budgets.maxBuys}` : '—'}</span>
@@ -159,6 +188,7 @@ export function AutoPanel() {
         void post('/api/auto/kill', { exitAll: true, reason: 'operator kill from panel' });
       }}
       onResume={() => post('/api/auto/resume', { clearHalt: true })}
-      onBudget={(maxBuys, maxSpendSol) => post('/api/auto/budget', { maxBuys, maxSpendSol })} />
+      onBudget={(maxBuys, maxSpendSol) => post('/api/auto/budget', { maxBuys, maxSpendSol })}
+      onOrderSize={(orderSol) => post('/api/auto/order-size', { orderSol })} />
   );
 }

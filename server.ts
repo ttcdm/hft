@@ -40,6 +40,7 @@ import {
   ArmSchema,
   AutoModeSchema,
   AutoBudgetSchema,
+  AutoOrderSizeSchema,
   AutoKillSchema,
   AutoResumeSchema,
   CalloutSnipeSchema,
@@ -1418,6 +1419,11 @@ app.get('/api/snipe/limits', requireOperatorAuth, (req, res) => {
 
 app.post('/api/auto/budget', requireOperatorAuth, validateTradeBody(AutoBudgetSchema), (req, res) => {
   const result = autoSnipeController.setBudget({ maxBuys: req.body.maxBuys, maxSpendSol: req.body.maxSpendSol });
+  res.status(result.ok ? 200 : 422).json({ success: result.ok, ...result, error: result.reason, status: autoSnipeController.getStatus() });
+});
+
+app.post('/api/auto/order-size', requireOperatorAuth, validateTradeBody(AutoOrderSizeSchema), (req, res) => {
+  const result = autoSnipeController.setOrderSol(req.body.orderSol);
   res.status(result.ok ? 200 : 422).json({ success: result.ok, ...result, error: result.reason, status: autoSnipeController.getStatus() });
 });
 

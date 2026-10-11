@@ -1,3 +1,4 @@
+import { CONFLUENCE_RULE_LABEL, CONFLUENCE_RULE_NOTE } from '../utils/calloutRuleText';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
 import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
 import React, { useState, useEffect } from 'react';
@@ -1112,7 +1113,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
             <div className="p-3 rounded-lg bg-[#090D16] border border-[#1E293B] space-y-2">
               <div className="flex items-center justify-between">
                 <label className="text-slate-300 font-bold">
-                  Auto-Snipe on 2x+ Confluence
+                  {CONFLUENCE_RULE_LABEL}
                 </label>
                 <input
                   type="checkbox"
@@ -1124,7 +1125,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 />
               </div>
               <span className="text-[10px] text-slate-500 block">
-                Overrides individual caller thresholds if 2 or more verified callers call the same coin within 3 minutes.
+                {CONFLUENCE_RULE_NOTE}
               </span>
             </div>
 

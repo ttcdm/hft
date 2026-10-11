@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import { isReadOnly } from '../solana/readOnly';
 import { workstationDb } from '../db/database';
 import { executionCoordinator, isRecoveredPosition } from '../execution/coordinator';
 import { memecoinAggregator } from '../memecoinAggregator';
@@ -341,6 +342,7 @@ export class AutoSnipeController extends EventEmitter {
       return { ok: false, mode: this.mode, error: 'PAPER auto mode needs the execution coordinator in PAPER' };
     }
     if (next === 'DEVNET_LIVE') {
+      if (isReadOnly()) return { ok: false, mode: this.mode, error: 'DEVNET_LIVE is refused: APEX_READ_ONLY=true allows OFF, SHADOW and PAPER only.' };
       if (allowedCluster() === 'mainnet-beta') return { ok: false, mode: this.mode, error: 'DEVNET_LIVE is refused: ALLOWED_CLUSTER is mainnet-beta (devnet or localnet only). There is no mainnet auto mode.' };
       if (coordMode !== 'LIVE') return { ok: false, mode: this.mode, error: 'DEVNET_LIVE needs the coordinator armed LIVE (on devnet)' };
       if (opts.confirmationCode !== DEVNET_CONFIRMATION_CODE) return { ok: false, mode: this.mode, error: 'DEVNET_LIVE needs the confirmation code' };

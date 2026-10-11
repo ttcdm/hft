@@ -3,6 +3,7 @@ import bs58 from 'bs58';
 import { Logger } from '../middleware/enterprise';
 import { jitoTipFloorAllowed, resolveJitoUrl } from './clusterGuard';
 import { executionConfig } from './executionConfig';
+import { assertNotReadOnly } from './readOnly';
 
 export type BundleLifecycleState =
   | 'SUBMITTED_TO_JITO'
@@ -56,6 +57,7 @@ export class SolanaRpcTransport implements ExecutionTransport {
   constructor(private connection: Connection) {}
 
   public async submit(tx: VersionedTransaction): Promise<SubmitResult> {
+    assertNotReadOnly('sending a transaction over RPC'); // S185: before anything is serialized or sent
     const t0 = performance.now();
     try {
       const raw = tx.serialize();
@@ -405,6 +407,7 @@ export class JitoTransport implements ExecutionTransport {
   }
 
   public async submit(tx: VersionedTransaction): Promise<SubmitResult> {
+    assertNotReadOnly('submitting a Jito bundle'); // S185: before anything is encoded or sent
     const t0 = performance.now();
     if (!this.isEnabled()) {
       this.lastHealthStatus = 'NOT_CONFIGURED';

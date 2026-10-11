@@ -1,4 +1,5 @@
 import '../loadEnv'; // must stay the first import
+import { isReadOnly, assertNotReadOnly } from '../solana/readOnly';
 import bs58 from 'bs58';
 import { solPriceService } from '../market/solPriceService';
 import { Connection, PublicKey, SystemProgram, VersionedTransaction } from '@solana/web3.js';
@@ -314,6 +315,10 @@ export class ExecutionCoordinator {
   public getLiveReadiness(): LiveReadiness {
     const reasons: string[] = [];
     const now = Date.now();
+
+    if (isReadOnly()) {
+      reasons.push('READ_ONLY: APEX_READ_ONLY=true. This server watches and paper trades only; it has no signer and cannot execute live');
+    }
 
     if (process.env.ALLOW_LIVE_REAL_MONEY_TRADING !== 'true') {
       reasons.push('Live real-money trading is disabled by environment policy (ALLOW_LIVE_REAL_MONEY_TRADING !== "true")');
@@ -1134,6 +1139,12 @@ export class ExecutionCoordinator {
   }
 
   public armLiveTrading(arm: boolean, confirmationCode?: string): { success: boolean; message: string; reasons?: string[] } {
+    if (isReadOnly()) {
+      // S185: read-only never arms, and never claims to have changed mode; disarming has nothing to undo.
+      this.isLiveTradingArmed = false;
+      this.executionMode = 'PAPER';
+      return { success: false, message: 'READ_ONLY: APEX_READ_ONLY=true. This server watches and paper trades only; live trading cannot be armed.', reasons: ['APEX_READ_ONLY=true'] };
+    }
     if (arm) {
       if (confirmationCode !== 'CONFIRM_LIVE_TRADING_RISK') {
         return { success: false, message: 'Invalid confirmation code. Live trading arming rejected.' };
@@ -1418,6 +1429,7 @@ export class ExecutionCoordinator {
     unconfirmed?: boolean;
   }> {
     const { tx, orderId, correlationId, side, mint, mintPubkey, owner, tokenProgram, preSnapshot, jitoTipLamports } = params;
+    assertNotReadOnly(`sending a ${side} order`); // S185: the one place every signed buy and sell is submitted from
     const cfg = executionConfig.getConfig();
 
     // Cluster guard: every signed buy and sell passes through here. Refuse before anything is sent
@@ -1957,6 +1969,11 @@ export class ExecutionCoordinator {
 
     if (this.haltReason) {
       return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: this.executionMode, error: `TRADING_HALTED: ${this.haltReason}`, correlationId };
+    }
+
+    // S185: read-only mode has no LIVE; a trade that somehow arrives in LIVE is refused before any gate runs.
+    if (isReadOnly() && this.executionMode === 'LIVE') {
+      return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: this.executionMode, error: 'READ_ONLY: APEX_READ_ONLY=true; a LIVE trade is refused', correlationId };
     }
 
     if (req.executionMode && req.executionMode !== this.executionMode) {

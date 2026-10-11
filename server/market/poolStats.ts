@@ -1,4 +1,5 @@
 import type { PumpTradeEvent } from '../solana/pumpFeedListener';
+import { poolStatsMaxMints } from '../signals/capacity';
 
 /** A bonding curve graduates at about 85 SOL of real reserves (the same constant the aggregator uses for curve progress). */
 export const CURVE_GRADUATION_SOL = 85;
@@ -6,7 +7,6 @@ export const CURVE_GRADUATION_SOL = 85;
 export const CURVE_INITIAL_REAL_TOKENS = 793_100_000_000_000n;
 export const POOL_STATS_WINDOW_MS = 5 * 60_000;
 const MAX_TRADES_KEPT = 2_000;
-const MAX_MINTS_KEPT = 300;
 /** S14: wallets tracked per mint. Above this (plus slack) zero balances go first, then the smallest holders. */
 const MAX_HOLDERS_KEPT = 5_000;
 const HOLDER_TRIM_SLACK = 500;
@@ -58,6 +58,8 @@ export const tradePriceSol = (t: Pick<PumpTradeEvent, 'virtualTokenReserves' | '
  */
 export class OnChainPoolStats {
   private mints = new Map<string, PoolState>();
+  /** S185: mints dropped to make room. A dropped mint loses its measured figures, so a busy feed must show this number, not hide it. */
+  private evicted = 0;
   private isPinned: (mint: string) => boolean = () => false;
 
   /** S4: a mint the watch window is still scoring is never evicted to make room (at feed rate 300 newer mints arrive well inside its 120 s). */
@@ -67,10 +69,10 @@ export class OnChainPoolStats {
 
   public track(mint: string, opts: { insiders: Array<string | undefined>; supplyRaw?: bigint; createPriceSol?: number; realTokenReserves?: bigint }): void {
     if (this.mints.has(mint)) return;
-    if (this.mints.size >= MAX_MINTS_KEPT) {
+    if (this.mints.size >= poolStatsMaxMints()) {
       // Oldest first, skipping pinned mints. The window holds at most 60, so an unpinned victim always exists below 300.
       for (const k of this.mints.keys()) {
-        if (!this.isPinned(k)) { this.mints.delete(k); break; }
+        if (!this.isPinned(k)) { this.mints.delete(k); this.evicted++; break; }
       }
     }
     this.mints.set(mint, {
@@ -83,6 +85,14 @@ export class OnChainPoolStats {
       initialRealTokenReserves: opts.realTokenReserves ?? null,
       trades: [], balances: new Map(), outOfCurve: 0n, seen: new Set(), tradeCount: 0,
     });
+  }
+
+  public getEvictedCount(): number {
+    return this.evicted;
+  }
+
+  public getTrackedCount(): number {
+    return this.mints.size;
   }
 
   public isTracking(mint: string): boolean {

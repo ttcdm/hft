@@ -108,6 +108,8 @@ const DEMO_POOL_IDS: ReadonlySet<string> = new Set(INITIAL_POOLS.map((p) => p.id
 
 export class MemecoinAggregatorService extends EventEmitter {
   private pools: MemecoinPool[] = [];
+  /** S185: pools dropped from the board to keep it at 200 (never one the watch window still scores). */
+  private poolsTrimmed = 0;
   // C3: the SOL/USD price comes from the single SolPriceService. 0 here means "no price known"; every code path that
   // converts USD to SOL is guarded in executeSnipe (LIVE needs a fresh price, PAPER needs a last known one).
   private get solPriceUsd(): number {
@@ -304,7 +306,9 @@ export class MemecoinAggregatorService extends EventEmitter {
     if (this.pools.length > 200) {
       // S4: newest 200, plus any pool the watch window is still scoring. Dropping that one made scoreOf return null (no HOT, a READY
       // without a score) and stopped applyTradeToPool for it, at any feed rate that creates 200 mints inside the 120 s window.
+      const before = this.pools.length;
       this.pools = this.pools.filter((p, i) => i < 200 || this.isPoolPinned(p.contractAddress));
+      this.poolsTrimmed += before - this.pools.length; // S185: counted, shown in System checks
     }
 
     onChainPoolStats.track(cleanCa, {
@@ -360,6 +364,10 @@ export class MemecoinAggregatorService extends EventEmitter {
       return true;
     });
     if (unique.length !== this.pools.length) this.pools = unique;
+  }
+
+  public getPoolsTrimmedCount(): number {
+    return this.poolsTrimmed;
   }
 
   public getPools(platform?: string, chain?: string): MemecoinPool[] {

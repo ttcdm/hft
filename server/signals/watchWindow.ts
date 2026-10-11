@@ -1,4 +1,5 @@
 import { EventEmitter } from 'events';
+import { watchMaxCandidates } from './capacity';
 import type { PumpTradeEvent } from '../solana/pumpFeedListener';
 
 /**
@@ -133,7 +134,7 @@ export class WatchWindow extends EventEmitter {
     super();
     this.publicFunders = new Set(opts.publicFunders ?? publicFundersFromEnv());
     this.opts = {
-      maxCandidates: opts.maxCandidates ?? WATCH_MAX_CANDIDATES,
+      maxCandidates: opts.maxCandidates ?? watchMaxCandidates(),
       minMs: opts.minMs ?? WATCH_MIN_MS,
       maxMs: opts.maxMs ?? WATCH_MAX_MS,
       funderOf: opts.funderOf,

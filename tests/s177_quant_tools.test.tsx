@@ -25,7 +25,7 @@ describe('S177: System checks render the server\'s live answer', () => {
   it('every check the brief names is present, with a status and a measured value, rendered from the wire JSON', () => {
     const data = wire(buildSystemChecks());
     const html = renderToStaticMarkup(<SystemChecksView data={data} />);
-    for (const id of ['cluster', 'signer', 'rpc', 'reconciliation', 'halt', 'killswitch', 'feed', 'marks', 'database']) {
+    for (const id of ['cluster', 'signer', 'rpc', 'reconciliation', 'halt', 'killswitch', 'feed', 'capacity', 'marks', 'database']) {
       expect(html, id).toContain(`data-testid="check-${id}"`);
     }
     expect(html).toContain(`cluster <strong class="text-slate-200">${data.cluster}</strong>`);

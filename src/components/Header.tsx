@@ -25,6 +25,7 @@ import { hftAudio } from '../utils/audio';
 import { authFetch } from '../services/engineClient';
 import { AutoHeaderBadge, useAutoStatus } from './AutoPanel';
 import { usePolled } from '../utils/usePolled';
+import { ReadOnlyPill } from './TradingModeBanner';
 
 /** Facts, not adjectives: how many of the live checks are not OK. */
 export function checksBadgeFor(checks: Array<{ status: string }> | null): { text: string; tone: string } {
@@ -162,6 +163,7 @@ export const Header: React.FC<HeaderProps> = ({
 
             {/* H3: the auto-snipe mode replaces the exchange selector */}
             <AutoHeaderBadge />
+            <ReadOnlyPill />
           </div>
 
           <div className="hidden lg:flex items-center space-x-2 text-[10px] text-slate-400 font-mono mt-0.5">

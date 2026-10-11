@@ -16,6 +16,7 @@ import { onChainPoolStats } from './server/market/poolStats';
 import { wireWatchPins } from './server/signals/watchPins';
 import { realismEngine } from './server/realismEngine';
 import { buildSystemChecks } from './server/system/systemChecks';
+import { isReadOnly, assertReadOnlyStartup } from './server/solana/readOnly';
 import { LaunchRecorder } from './server/backtest/launchRecorder';
 import { replayLaunches } from './server/backtest/replay';
 import { computeLatency } from './server/system/latencyStats';
@@ -1028,13 +1029,16 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, async (req, res) =
         nature: executionCoordinator.isLiveArmed() ? 'LIVE_ARMED' : 'PAPER_BY_DEFAULT',
         details: executionCoordinator.isLiveArmed()
           ? 'LIVE is ARMED: snipes are signed with the configured wallet and submitted to the configured cluster RPC. Real funds on that cluster are at risk.'
-          : 'LIVE is not armed: snipes are paper-traded in memory against the curve quote. No transaction is signed or sent.',
+          : isReadOnly()
+            ? 'READ-ONLY: this server has no signer and cannot arm LIVE. Snipes are paper-traded against the real curve quote; no transaction is signed or sent.'
+            : 'LIVE is not armed: snipes are paper-traded in memory against the curve quote. No transaction is signed or sent.',
       },
       {
         subsystem: 'Jito MEV Bundles & Priority Tips',
         nature: executionCoordinator.isLiveArmed() ? 'LIVE_CLUSTER_DEPENDENT' : 'PAPER_ONLY',
-        details:
-          'Priority tips follow the executionConfig tip policy. Bundles go to Jito only on mainnet-beta (never enabled by default); on devnet or localnet the transaction goes to the cluster RPC with a priority fee and no bundle. In paper mode nothing is sent.',
+        details: isReadOnly()
+          ? 'Read-only mode: nothing is signed or sent, so no tip is ever paid. Paper fills still model the priority tip from the tip policy (on mainnet it follows the public Jito tip floor) so their cost is what a real send would pay.'
+          : 'Priority tips follow the executionConfig tip policy. Bundles go to Jito only on mainnet-beta (never enabled by default); on devnet or localnet the transaction goes to the cluster RPC with a priority fee and no bundle. In paper mode nothing is sent.',
       },
       {
         subsystem: 'Caller Persona Historical Track Records',
@@ -1334,6 +1338,7 @@ app.get('/api/diagnostics/system', requireOperatorAuth, (req, res) => {
       signerStatus,
       rpcEndpoint: endpointOrigin(diag.rpcEndpoint || resolveRpcUrl()), // Q54: the endpoint in use (it changes on a switch), host only
       allowedCluster: allowedCluster(),
+      readOnly: isReadOnly(), // S185: the banner reads this
       rpcLatencyMs: diag.rpcLatencyMs,
       databaseFile: 'apex_workstation.db',
       dbDriver: 'node:sqlite (WAL mode enabled)',
@@ -1497,6 +1502,10 @@ autoSnipeController.on('mode', (d) => broadcastWs({ type: 'AUTO_MODE', data: { .
 
 app.post('/api/execution/arm', requireOperatorAuth, validateTradeBody(ArmSchema), (req, res) => {
   const { arm, confirmationCode } = req.body;
+  // S185: read-only mode answers every arm request, arm or disarm, with 409 and does nothing.
+  if (isReadOnly()) {
+    return res.status(409).json({ success: false, error: 'READ_ONLY', message: 'READ_ONLY: APEX_READ_ONLY=true. This server watches and paper trades only; live trading cannot be armed.' });
+  }
   const result = executionCoordinator.armLiveTrading(Boolean(arm), confirmationCode);
   if (!result.success) {
     return res.status(403).json(result);
@@ -1638,6 +1647,7 @@ process.on('uncaughtException', (err) => {
 });
 
 async function startServer() {
+  assertReadOnlyStartup(); // S185: refuses to start next to a signing key in read-only mode
   if (process.env.NODE_ENV !== 'production') {
     const customLogger = createLogger();
     const originalError = customLogger.error.bind(customLogger);

@@ -12,6 +12,6 @@ describe('Q40/Q43/Q44/Q45 source checks', () => {
     expect(read('src/components/PlugAndPlayTradingModal.tsx')).not.toContain('handleEmergencyKillSwitch');
     expect(read('index.html')).not.toContain('event.preventDefault()');
     expect(JSON.parse(read('tsconfig.json')).compilerOptions.strictNullChecks).toBe(true);
-    expect(read('src/components/UnitTestModal.tsx')).not.toContain('200 Tests');
+    expect(fs.existsSync('src/components/UnitTestModal.tsx')).toBe(false); // the toy self-check suite and its '200 Tests' wording were removed (S177)
   });
 });

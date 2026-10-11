@@ -7,10 +7,11 @@ import { Header } from './components/Header';
 import { AlertSystem } from './components/AlertSystem';
 import { DeployBotModal } from './components/DeployBotModal';
 import { AiDiagnosticsModal } from './components/AiDiagnosticsModal';
-import { UnitTestModal } from './components/UnitTestModal';
+import { SystemChecksModal } from './components/SystemChecksModal';
+import { ExecutionLatencyModal } from './components/ExecutionLatencyModal';
+import { AutoPipelineModal } from './components/AutoPipelineModal';
 import { EngineConsoleModal } from './components/EngineConsoleModal';
 import { MemecoinSocialSniperModal } from './components/MemecoinSocialSniperModal';
-import { MicrostructureRealismModal } from './components/MicrostructureRealismModal';
 import { BacktestModal } from './components/BacktestModal';
 import { PlugAndPlayTradingModal } from './components/PlugAndPlayTradingModal';
 import { AuthModal } from './components/AuthModal';
@@ -175,10 +176,11 @@ export default function App() {
   // Modals
   const [isDeployModalOpen, setIsDeployModalOpen] = useState(false);
   const [isAiDiagnosticsOpen, setIsAiDiagnosticsOpen] = useState(false);
-  const [isUnitTestsOpen, setIsUnitTestsOpen] = useState(false);
+  const [isSystemChecksOpen, setIsSystemChecksOpen] = useState(false);
+  const [isAutoPipelineOpen, setIsAutoPipelineOpen] = useState(false);
   const [isEngineConsoleOpen, setIsEngineConsoleOpen] = useState(false);
   const [isMemecoinSniperOpen, setIsMemecoinSniperOpen] = useState(false);
-  const [isRealismModalOpen, setIsRealismModalOpen] = useState(false);
+  const [isLatencyOpen, setIsLatencyOpen] = useState(false);
   const [isBacktestModalOpen, setIsBacktestModalOpen] = useState(false);
   const [isPlugAndPlayOpen, setIsPlugAndPlayOpen] = useState(false);
   const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
@@ -384,13 +386,13 @@ export default function App() {
         onToggleKillSwitch={toggleKillSwitch}
         onOpenDeployModal={() => setIsDeployModalOpen(true)}
         onOpenAiDiagnostics={() => setIsAiDiagnosticsOpen(true)}
-        onOpenUnitTests={() => setIsUnitTestsOpen(true)}
-        onOpenEngineConsole={() => setIsEngineConsoleOpen(true)}
+        onOpenSystemChecks={() => setIsSystemChecksOpen(true)}
+        onOpenAutoPipeline={() => setIsAutoPipelineOpen(true)}
         onOpenMemecoinSniper={() => {
           setIsPlugAndPlayOpen(false);
           setIsMemecoinSniperOpen(true);
         }}
-        onOpenRealismModal={() => setIsRealismModalOpen(true)}
+        onOpenLatency={() => setIsLatencyOpen(true)}
         onOpenBacktestModal={() => setIsBacktestModalOpen(true)}
         onOpenPlugAndPlayTrading={() => {
           setIsMemecoinSniperOpen(false);
@@ -444,14 +446,14 @@ export default function App() {
       <AiDiagnosticsModal
         isOpen={isAiDiagnosticsOpen}
         onClose={() => setIsAiDiagnosticsOpen(false)}
-        bots={bots}
-        kpis={kpis}
-        stressConfig={stressConfig}
       />
 
-      <UnitTestModal
-        isOpen={isUnitTestsOpen}
-        onClose={() => setIsUnitTestsOpen(false)}
+      <SystemChecksModal isOpen={isSystemChecksOpen} onClose={() => setIsSystemChecksOpen(false)} />
+      <ExecutionLatencyModal isOpen={isLatencyOpen} onClose={() => setIsLatencyOpen(false)} />
+      <AutoPipelineModal
+        isOpen={isAutoPipelineOpen}
+        onClose={() => setIsAutoPipelineOpen(false)}
+        onOpenHftConsole={() => setIsEngineConsoleOpen(true)}
       />
 
       <EngineConsoleModal
@@ -465,12 +467,6 @@ export default function App() {
         isOpen={isMemecoinSniperOpen}
         onClose={() => setIsMemecoinSniperOpen(false)}
         capitalTier={capitalTier}
-        onAlertTrigger={triggerAlert}
-      />
-
-      <MicrostructureRealismModal
-        isOpen={isRealismModalOpen}
-        onClose={() => setIsRealismModalOpen(false)}
         onAlertTrigger={triggerAlert}
       />
 

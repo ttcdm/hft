@@ -292,6 +292,24 @@ export class ExecutionCoordinator {
     return this.connection;
   }
 
+  /** What the cluster check last said: the allowed cluster, why the RPC is not trusted (null when it is), and whether a check has passed. */
+  public getClusterStatus(): { allowed: string; problem: string | null; rpcHealth: 'HEALTHY' | 'DEGRADED' | 'DISCONNECTED' } {
+    return { allowed: allowedCluster(), problem: this.clusterProblem, rpcHealth: this.rpcHealth };
+  }
+
+  /** The last startup reconciliation result (null before the first one finishes). */
+  public getReconciliationStatus() {
+    return this.lastStartupReconciliation ? { ...this.lastStartupReconciliation } : null;
+  }
+
+  /** Age in ms of the last pump event and the last position mark; null when none was ever seen. */
+  public getFeedAges(now: number = Date.now()): { pumpFeedAgeMs: number | null; positionMarkAgeMs: number | null } {
+    return {
+      pumpFeedAgeMs: this.lastPumpFeedTimestamp > 0 ? now - this.lastPumpFeedTimestamp : null,
+      positionMarkAgeMs: this.lastPositionMarkTimestamp > 0 ? now - this.lastPositionMarkTimestamp : null,
+    };
+  }
+
   // Explicit LiveReadiness object with independent health tracking across all critical subsystems (R0.12)
   public getLiveReadiness(): LiveReadiness {
     const reasons: string[] = [];

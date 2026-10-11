@@ -15,6 +15,9 @@ import { memecoinAggregator } from './server/memecoinAggregator';
 import { onChainPoolStats } from './server/market/poolStats';
 import { wireWatchPins } from './server/signals/watchPins';
 import { realismEngine } from './server/realismEngine';
+import { buildSystemChecks } from './server/system/systemChecks';
+import { computeLatency } from './server/system/latencyStats';
+import { buildDiagnosticsContext } from './server/system/aiContext';
 import { pumpFunService, pumpBootMode } from './server/pumpfunService';
 import { pumpFeedListener } from './server/solana/pumpFeedListener';
 import { autoSnipeController } from './server/auto/controller';
@@ -26,7 +29,6 @@ import { solPriceService } from './server/market/solPriceService';
 import { PumpCurveService } from './server/solana/pumpCurve';
 import { buildCurveDepth } from './server/market/curveDepth';
 import { TradeTape } from './server/market/tradeTape';
-import { runComprehensiveTestSuite } from './server/unitTestCases';
 import { registerMarketRoutes } from './server/market/marketRoutes';
 import { walletTrader } from './server/walletTrader';
 import { resolveRpcUrl, allowedCluster } from './server/solana/clusterGuard';
@@ -502,78 +504,47 @@ registerMarketRoutes(app);
 
 // 3h. (removed, Q57) /api/account/balance was a Binance-testnet route with invented "institutional" balances and hardcoded BTC/ETH prices; nothing in src/ called it.
 
-// 4. Automated Unit Testing Suite Runner (200 Quantitative HFT & Bonding Curve Test Cases)
-app.get('/api/unit-tests', requireOperatorAuth, (req, res) => {
-  const suiteOutput = runComprehensiveTestSuite();
-  res.json(suiteOutput);
-});
+// 4. (removed) /api/unit-tests ran 700 arithmetic self-checks on toy numbers; System checks (/api/system/checks) reads live state instead.
 
-// 5. AI Quant Diagnostics with High Thinking Mode (gemini-3.1-pro-preview) and Market Grounding (gemini-3.5-flash)
+// 5. Quant AI Diagnostics: the model is given the server's own live state (system checks, auto journal stats, measured latency), built
+// here from the same sources the screens read. The client sends only the mode and the question; it cannot add figures.
 app.post('/api/ai/diagnostics', requireOperatorAuth, async (req, res) => {
-  const { mode = 'thinking', strategyConfig, telemetry, prompt } = req.body;
+  const { mode = 'thinking', prompt } = req.body ?? {};
   const ai = getGenAI();
 
   if (!ai) {
     return res.status(503).json({
-      error: 'GEMINI_API_KEY is not configured. Add it in AI Studio Settings to activate AI Quant Diagnostics.',
+      error: 'GEMINI_API_KEY is not configured. Set it in .env and restart to use Quant AI Diagnostics (nothing is sent anywhere without it).',
     });
   }
 
+  const context = buildDiagnosticsContext();
   try {
     if (mode === 'thinking') {
-      // User directive: MUST use gemini-3.1-pro-preview with thinkingLevel: 'HIGH', no maxOutputTokens
-      const systemInstruction = `You are the Principal Quantitative Strategist & Chief Risk Officer at Apex Quant HFT.
-Provide deep, rigorous mathematical analysis of high-frequency execution strategies, order flow imbalance, inventory risk, and network degradation profiles.
-Respond with:
-1. Executive Risk & Alpha Assessment
-2. Mathematical Formula Calibrations (Avellaneda-Stoikov gamma, kappa, volatility sigma)
-3. Congestion & Slippage Vulnerability Analysis
-4. Actionable Parameter Tuning Suggestions`;
-
-      const userMessage = `Analyze the current workstation configuration and strategy fleet:
-Strategy Fleet Context: ${JSON.stringify(strategyConfig || {}, null, 2)}
-Real-Time Telemetry: ${JSON.stringify(telemetry || {}, null, 2)}
-User Query: ${prompt || 'Perform full risk audit and latency sensitivity analysis.'}`;
-
+      const systemInstruction = `You review a Solana pump.fun auto-trading workstation (devnet / paper). Use ONLY the JSON state given; if a figure is missing or null say it is not measured, never estimate it.
+Answer with: 1. What the state shows (cite the check or counter), 2. What looks wrong or risky, 3. What to look at next. Be short and concrete. You cannot trade and nothing you say is executed.`;
+      const userMessage = `Live state:\n${JSON.stringify(context, null, 2)}\n\nQuestion: ${prompt || 'Review this state and point out anything that needs attention.'}`;
       const response = await ai.models.generateContent({
         model: 'gemini-3.1-pro-preview',
-        contents: [
-          { role: 'user', parts: [{ text: `${systemInstruction}\n\n${userMessage}` }] },
-        ],
-        config: {
-          thinkingConfig: {
-            thinkingLevel: 'HIGH' as any,
-          },
-        },
+        contents: [{ role: 'user', parts: [{ text: `${systemInstruction}\n\n${userMessage}` }] }],
+        config: { thinkingConfig: { thinkingLevel: 'HIGH' as any } },
       });
-
-      return res.json({
-        model: 'gemini-3.1-pro-preview',
-        thinkingEnabled: true,
-        analysis: response.text || 'Analysis completed.',
-      });
-    } else {
-      // User directive: MUST use gemini-3.5-flash with googleSearch tool for real-time market grounding
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.5-flash',
-        contents: prompt || 'What are the current macroeconomic volatility drivers impacting HFT market making spreads today?',
-        config: {
-          tools: [{ googleSearch: {} }],
-        },
-      });
-
-      return res.json({
-        model: 'gemini-3.5-flash',
-        grounded: true,
-        analysis: response.text || 'Market search completed.',
-        groundingMetadata: response.candidates?.[0]?.groundingMetadata,
-      });
+      return res.json({ model: 'gemini-3.1-pro-preview', thinkingEnabled: true, analysis: response.text || 'Analysis completed.', context });
     }
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.5-flash',
+      contents: prompt || 'What is the current state of pump.fun launch activity on Solana?',
+      config: { tools: [{ googleSearch: {} }] },
+    });
+    return res.json({
+      model: 'gemini-3.5-flash',
+      grounded: true,
+      analysis: response.text || 'Market search completed.',
+      groundingMetadata: response.candidates?.[0]?.groundingMetadata,
+    });
   } catch (err: any) {
     console.error('Gemini API Error:', err);
-    res.status(500).json({
-      error: err.message || 'Error processing AI Diagnostics',
-    });
+    res.status(500).json({ error: err.message || 'Error processing AI Diagnostics' });
   }
 });
 
@@ -1364,6 +1335,17 @@ app.get('/api/diagnostics/system', requireOperatorAuth, (req, res) => {
     },
     executionMetrics: dbMetrics,
   });
+});
+
+// System checks and measured latency: live reads, each from the component that owns the fact (see server/system/*).
+app.get('/api/system/checks', requireOperatorAuth, (req, res) => {
+  res.json({ success: true, ...buildSystemChecks() });
+});
+
+app.get('/api/system/latency', requireOperatorAuth, (req, res) => {
+  const txs = workstationDb.loadTransactions().sort((a, b) => b.submissionTime - a.submissionTime).slice(0, 5000);
+  const queued = workstationDb.loadDecisions({ stage: 'queue', outcome: 'QUEUED', limit: 5000 }).map((d) => ({ ts: d.ts, mint: d.mint }));
+  res.json({ success: true, measuredAt: Date.now(), ...computeLatency(txs, queued) });
 });
 
 app.get('/api/execution/mode', requireOperatorAuth, (req, res) => {

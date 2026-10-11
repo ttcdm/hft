@@ -550,29 +550,6 @@ class EngineClient {
   }
 
   // ---------------- MICROSTRUCTURE REALISM ----------------
-  public async getRealismConfig() {
-    try {
-      const res = await authFetch('/api/realism/config');
-      if (res.ok) return await res.json();
-    } catch (e) {
-      console.error(e);
-    }
-    return null;
-  }
-
-  public async updateRealismConfig(cfg: any) {
-    try {
-      const res = await authFetch('/api/realism/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(cfg),
-      });
-      return await res.json();
-    } catch (e) {
-      console.error(e);
-    }
-  }
-
   // ---------------- PUMP.FUN HOT CALLOUTS & LEADERBOARD ----------------
   public async getPumpFunCallouts() {
     try {

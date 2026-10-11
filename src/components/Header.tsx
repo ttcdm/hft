@@ -24,7 +24,15 @@ import {
 import { PerformanceKPIs } from '../types';
 import { hftAudio } from '../utils/audio';
 import { authFetch } from '../services/engineClient';
-import { AutoHeaderBadge } from './AutoPanel';
+import { AutoHeaderBadge, useAutoStatus } from './AutoPanel';
+import { usePolled } from '../utils/usePolled';
+
+/** Facts, not adjectives: how many of the live checks are not OK. */
+export function checksBadgeFor(checks: Array<{ status: string }> | null): { text: string; tone: string } {
+  if (!checks) return { text: 'no data', tone: 'bg-slate-700/60 text-slate-200' };
+  const bad = checks.filter((c) => c.status !== 'OK').length;
+  return bad === 0 ? { text: `${checks.length}/${checks.length} OK`, tone: 'bg-emerald-500/20 text-emerald-300' } : { text: `${bad} not OK`, tone: 'bg-amber-500/20 text-amber-300' };
+}
 
 interface HeaderProps {
   kpis: PerformanceKPIs;
@@ -32,10 +40,10 @@ interface HeaderProps {
   onToggleKillSwitch: () => void;
   onOpenDeployModal: () => void;
   onOpenAiDiagnostics: () => void;
-  onOpenUnitTests: () => void;
-  onOpenEngineConsole: () => void;
+  onOpenSystemChecks: () => void;
+  onOpenAutoPipeline: () => void;
   onOpenMemecoinSniper?: () => void;
-  onOpenRealismModal?: () => void;
+  onOpenLatency?: () => void;
   onOpenBacktestModal?: () => void;
   onOpenPlugAndPlayTrading?: () => void;
   onOpenAuthModal?: () => void;
@@ -56,10 +64,10 @@ export const Header: React.FC<HeaderProps> = ({
   onToggleKillSwitch,
   onOpenDeployModal,
   onOpenAiDiagnostics,
-  onOpenUnitTests,
-  onOpenEngineConsole,
+  onOpenSystemChecks,
+  onOpenAutoPipeline,
   onOpenMemecoinSniper,
-  onOpenRealismModal,
+  onOpenLatency,
   onOpenBacktestModal,
   onOpenPlugAndPlayTrading,
   onOpenAuthModal,
@@ -75,6 +83,9 @@ export const Header: React.FC<HeaderProps> = ({
   const [audioEnabled, setAudioEnabled] = useState(true);
   const [timeString, setTimeString] = useState('');
   const [isToolsOpen, setIsToolsOpen] = useState(false);
+  const autoStatus = useAutoStatus();
+  const checks = usePolled<{ checks: Array<{ status: string }> }>('/api/system/checks', 15000, isOperatorAuthenticated !== false);
+  const checksBadge = checksBadgeFor(checks.data?.checks ?? null);
   const toolsMenuRef = useRef<HTMLDivElement | null>(null);
 
   // Live Auto-Profit Ticker State (fetched from walletTrader) - Clean initial state (B22)
@@ -255,19 +266,19 @@ export const Header: React.FC<HeaderProps> = ({
         <div className="hidden min-[1700px]:flex items-center space-x-1.5">
           <button
             id="btn-engine-console"
-            onClick={onOpenEngineConsole}
-            title="Core High-Frequency Execution Engine (WAL & DMA)"
+            onClick={onOpenAutoPipeline}
+            title="Auto trader pipeline: mode, candidates watched, rejections by stage"
             className="px-2 py-1 rounded-lg bg-[#10192A] hover:bg-[#1A263D] border border-cyan-500/40 text-[11px] font-mono text-cyan-300 hover:text-white transition flex items-center space-x-1"
           >
             <Cpu className="w-3 h-3 text-cyan-400" />
-            <span>Engine</span>
+            <span>Pipeline</span>
           </button>
 
           {onOpenBacktestModal && (
             <button
               id="btn-open-backtest"
               onClick={onOpenBacktestModal}
-              title="60-Day Historical Backtest with Bonding Curves & MEV"
+              title="Backtest"
               className="px-2 py-1 rounded-lg bg-emerald-950/70 hover:bg-emerald-900/70 border border-emerald-500/40 text-[11px] font-mono text-emerald-300 hover:text-white transition flex items-center space-x-1"
             >
               <TrendingUp className="w-3 h-3 text-emerald-400" />
@@ -277,12 +288,12 @@ export const Header: React.FC<HeaderProps> = ({
 
           <button
             id="btn-unit-tests"
-            onClick={onOpenUnitTests}
-            title="700 self-contained illustrative checks on toy numbers (not the repo test suite)"
+            onClick={onOpenSystemChecks}
+            title="Live system checks: cluster, signer, RPC, reconciliation, halt, feeds, marks, database"
             className="px-2 py-1 rounded-lg bg-[#141B2D] hover:bg-[#1E293B] border border-emerald-500/30 text-[11px] font-mono text-emerald-300 hover:text-white transition flex items-center space-x-1"
           >
             <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-            <span>700 Checks</span>
+            <span>System checks</span>
           </button>
         </div>
 
@@ -300,95 +311,62 @@ export const Header: React.FC<HeaderProps> = ({
           </button>
 
           {isToolsOpen && (
-            <div className="absolute right-0 mt-2 w-56 bg-[#0E1526] border border-[#1E293B] rounded-xl shadow-2xl py-1 z-50 font-mono text-xs text-slate-200 divide-y divide-[#1E293B]">
+            <div className="absolute right-0 mt-2 w-64 bg-[#0E1526] border border-[#1E293B] rounded-xl shadow-2xl py-1 z-50 font-mono text-xs text-slate-200 divide-y divide-[#1E293B]" data-testid="quant-tools-menu">
               <div className="py-1">
                 <button
-                  onClick={() => {
-                    onOpenEngineConsole();
-                    setIsToolsOpen(false);
-                  }}
+                  onClick={() => { onOpenAutoPipeline(); setIsToolsOpen(false); }}
                   className="w-full text-left px-3 py-2 hover:bg-[#1A263D] flex items-center justify-between text-cyan-300"
                 >
-                  <span className="flex items-center space-x-2">
-                    <Cpu className="w-3.5 h-3.5" />
-                    <span>Core Engine</span>
-                  </span>
-                  <span className="text-[9px] px-1 rounded bg-emerald-500/20 text-emerald-300">ASYNC</span>
+                  <span className="flex items-center space-x-2"><Cpu className="w-3.5 h-3.5" /><span>Auto pipeline</span></span>
+                  <span className="text-[9px] px-1 rounded bg-slate-700/60 text-slate-200" data-testid="badge-pipeline">{autoStatus ? `mode ${autoStatus.mode}` : 'no data'}</span>
                 </button>
 
                 {onOpenBacktestModal && (
                   <button
-                    onClick={() => {
-                      onOpenBacktestModal();
-                      setIsToolsOpen(false);
-                    }}
+                    onClick={() => { onOpenBacktestModal(); setIsToolsOpen(false); }}
                     className="w-full text-left px-3 py-2 hover:bg-[#1A263D] flex items-center justify-between text-emerald-300"
                   >
-                    <span className="flex items-center space-x-2">
-                      <TrendingUp className="w-3.5 h-3.5" />
-                      <span>60D Backtest</span>
-                    </span>
-                    <span className="text-[9px] px-1 rounded bg-emerald-500/20 text-emerald-300">2 MO</span>
+                    <span className="flex items-center space-x-2"><TrendingUp className="w-3.5 h-3.5" /><span>Backtest</span></span>
+                    <span className="text-[9px] px-1 rounded bg-amber-500/20 text-amber-300" data-testid="badge-backtest">seeded random</span>
                   </button>
                 )}
               </div>
 
               <div className="py-1">
                 <button
-                  onClick={() => {
-                    onOpenUnitTests();
-                    setIsToolsOpen(false);
-                  }}
+                  onClick={() => { onOpenSystemChecks(); setIsToolsOpen(false); }}
                   className="w-full text-left px-3 py-2 hover:bg-[#1A263D] flex items-center justify-between text-slate-300 hover:text-white"
                 >
-                  <span className="flex items-center space-x-2">
-                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
-                    <span>700 Self-Checks</span>
-                  </span>
-                  <span className="text-[9px] px-1 rounded bg-amber-500/20 text-amber-300">TOY MATH</span>
+                  <span className="flex items-center space-x-2"><CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" /><span>System checks</span></span>
+                  <span className={`text-[9px] px-1 rounded ${checksBadge.tone}`} data-testid="badge-checks">{checksBadge.text}</span>
                 </button>
 
                 <button
-                  onClick={() => {
-                    onOpenAiDiagnostics();
-                    setIsToolsOpen(false);
-                  }}
-                  className="w-full text-left px-3 py-2 hover:bg-[#1A263D] flex items-center space-x-2 text-cyan-300 hover:text-white"
+                  onClick={() => { onOpenAiDiagnostics(); setIsToolsOpen(false); }}
+                  className="w-full text-left px-3 py-2 hover:bg-[#1A263D] flex items-center justify-between text-cyan-300 hover:text-white"
                 >
-                  <Sparkles className="w-3.5 h-3.5 text-cyan-400" />
-                  <span>Quant AI Diagnostics</span>
+                  <span className="flex items-center space-x-2"><Sparkles className="w-3.5 h-3.5 text-cyan-400" /><span>Quant AI Diagnostics</span></span>
+                  <span className="text-[9px] px-1 rounded bg-slate-700/60 text-slate-200">sends live state</span>
                 </button>
 
-                {onOpenRealismModal && (
+                {onOpenLatency && (
                   <button
-                    onClick={() => {
-                      onOpenRealismModal();
-                      setIsToolsOpen(false);
-                    }}
+                    onClick={() => { onOpenLatency(); setIsToolsOpen(false); }}
                     className="w-full text-left px-3 py-2 hover:bg-[#1A263D] flex items-center justify-between text-slate-300 hover:text-white"
                   >
-                    <span className="flex items-center space-x-2">
-                      <Globe className="w-3.5 h-3.5 text-slate-400" />
-                      <span>Co-Loc Realism</span>
-                    </span>
-                    <span className="text-[9px] text-amber-300">ASSUMED</span>
+                    <span className="flex items-center space-x-2"><Globe className="w-3.5 h-3.5 text-slate-400" /><span>Execution latency</span></span>
+                    <span className="text-[9px] px-1 rounded bg-slate-700/60 text-slate-200">from journal</span>
                   </button>
                 )}
 
                 {onOpenAuthModal && (
                   <button
-                    onClick={() => {
-                      onOpenAuthModal();
-                      setIsToolsOpen(false);
-                    }}
+                    onClick={() => { onOpenAuthModal(); setIsToolsOpen(false); }}
                     className="w-full text-left px-3 py-2 hover:bg-[#1A263D] flex items-center justify-between text-cyan-300 hover:text-white"
                   >
-                    <span className="flex items-center space-x-2">
-                      <Lock className="w-3.5 h-3.5 text-cyan-400" />
-                      <span>Operator Auth</span>
-                    </span>
+                    <span className="flex items-center space-x-2"><Lock className="w-3.5 h-3.5 text-cyan-400" /><span>Operator Auth</span></span>
                     <span className={`text-[9px] px-1 rounded ${isOperatorAuthenticated ? 'bg-emerald-500/20 text-emerald-300' : 'bg-amber-500/20 text-amber-300'}`}>
-                      {isOperatorAuthenticated ? 'ACTIVE' : 'REQUIRED'}
+                      {isOperatorAuthenticated ? 'token set' : 'no token'}
                     </span>
                   </button>
                 )}

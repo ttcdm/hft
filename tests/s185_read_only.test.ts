@@ -1,5 +1,8 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { VersionedTransaction, Connection } from '@solana/web3.js';
+import { VersionedTransaction, Connection, Keypair } from '@solana/web3.js';
 import { isReadOnly, assertNotReadOnly, readOnlyStartupProblems, assertReadOnlyStartup, ReadOnlyError } from '../server/solana/readOnly';
 import { LocalKeypairSigner } from '../server/solana/signer';
 import { SolanaRpcTransport, JitoTransport } from '../server/solana/transports';
@@ -11,6 +14,8 @@ import { readOnlyBannerText } from '../src/utils/tradingMode';
 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
+const empty = fs.mkdtempSync(path.join(os.tmpdir(), 's185-empty-'));
+
 describe('S185 the flag and the startup refusal', () => {
   it('is off unless APEX_READ_ONLY is exactly "true"', () => {
     expect(isReadOnly({})).toBe(false);
@@ -21,9 +26,19 @@ describe('S185 the flag and the startup refusal', () => {
   });
   it('lists every signing key and the real-money switch as a reason not to start, and nothing when the flag is off', () => {
     expect(readOnlyStartupProblems({ OPERATOR_PRIVATE_KEY: 'k' } as any)).toEqual([]);
-    const p = readOnlyStartupProblems({ APEX_READ_ONLY: 'true', OPERATOR_PRIVATE_KEY: 'k', SIGNER_KEYPAIR_PATH: '/x', SOLANA_PRIVATE_KEY: 'z', ALLOW_LIVE_REAL_MONEY_TRADING: 'true' } as any);
+    const p = readOnlyStartupProblems({ APEX_READ_ONLY: 'true', OPERATOR_PRIVATE_KEY: 'k', SIGNER_KEYPAIR_PATH: '/x', SOLANA_PRIVATE_KEY: 'z', ALLOW_LIVE_REAL_MONEY_TRADING: 'true' } as any, empty);
     expect(p).toHaveLength(4);
-    expect(readOnlyStartupProblems({ APEX_READ_ONLY: 'true', OPERATOR_PRIVATE_KEY: '  ' } as any)).toEqual([]);
+    expect(readOnlyStartupProblems({ APEX_READ_ONLY: 'true' } as any, empty)).toEqual([]);
+    expect(readOnlyStartupProblems({ APEX_READ_ONLY: 'true', OPERATOR_PRIVATE_KEY: '  ' } as any, empty)).toEqual([]);
+  });
+  it('S186: a default .apex_trading_keypair.json next to the server is also a reason not to start', () => {
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), 's186-key-'));
+    fs.writeFileSync(path.join(d, '.apex_trading_keypair.json'), '[1]');
+    const p = readOnlyStartupProblems({ APEX_READ_ONLY: 'true' } as any, d);
+    expect(p).toHaveLength(1);
+    expect(p[0]).toMatch(/\.apex_trading_keypair\.json exists/);
+    expect(readOnlyStartupProblems({} as any, d)).toEqual([]); // flag off: untouched
+    fs.rmSync(d, { recursive: true, force: true });
   });
   it('exits non-zero with the problems printed', () => {
     const err = vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -44,6 +59,24 @@ describe('S185 nothing can sign or send', () => {
     expect(s.getStatus()).toBe('NOT_CONFIGURED');
     await expect(s.signMessage(new Uint8Array([1]))).rejects.toThrow(/READ_ONLY/);
     await expect(s.signTransaction({} as VersionedTransaction)).rejects.toThrow(/READ_ONLY/);
+  });
+  it('S186: generating or importing a key is refused in every form, and no key file is written', () => {
+    vi.stubEnv('APEX_READ_ONLY', 'true');
+    const d = fs.mkdtempSync(path.join(os.tmpdir(), 's186-gen-'));
+    const target = path.join(d, 'key.json');
+    vi.stubEnv('SIGNER_KEYPAIR_PATH', '');
+    const s = new LocalKeypairSigner();
+    (s as any).keypairPath = target;
+    const secret = JSON.stringify(Array.from(Keypair.generate().secretKey));
+    expect(() => s.generateDedicatedTradingKeypair(true)).toThrow(/READ_ONLY/);
+    expect(() => s.generateNewKeypair(true)).toThrow(/READ_ONLY/);
+    expect(() => s.importKeypair(secret, true)).toThrow(/READ_ONLY/);
+    expect(() => s.importSecretKey(secret, true)).toThrow(/READ_ONLY/);
+    expect(fs.existsSync(target)).toBe(false);
+    expect(s.getStatus()).toBe('NOT_CONFIGURED');
+    vi.unstubAllEnvs();
+    expect(() => new LocalKeypairSigner()).not.toThrow(); // flag off: generating still works
+    fs.rmSync(d, { recursive: true, force: true });
   });
   it('both network transports throw before they touch the connection or fetch', async () => {
     vi.stubEnv('APEX_READ_ONLY', 'true');

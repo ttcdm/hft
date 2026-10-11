@@ -47,4 +47,23 @@ describe('S185 no code path reaches a send in read-only mode', () => {
     const at = coord.indexOf('submitAndConfirmInner(');
     expect(coord.slice(coord.indexOf('submitAndConfirmInner(', at + 10), coord.indexOf('submitAndConfirmInner(', at + 10) + 1500)).toMatch(/assertNotReadOnly\(/);
   });
+  it('S186: every way to create or load a key is guarded: the signer methods, the HTTP route and the import script', () => {
+    const signer = fs.readFileSync('server/solana/signer.ts', 'utf8');
+    for (const m of ['generateDedicatedTradingKeypair', 'importKeypair', 'generateNewKeypair', 'importSecretKey']) {
+      const at = signer.indexOf(`public ${m}(`);
+      expect(at, m).toBeGreaterThan(0);
+      expect(signer.slice(at, at + 400), m).toMatch(/assertNotReadOnly\(/);
+    }
+    const server = fs.readFileSync('server.ts', 'utf8');
+    const route = server.indexOf("app.post('/api/signer/generate'");
+    expect(server.slice(route, route + 600)).toMatch(/isReadOnly\(\)/);
+    expect(fs.readFileSync('scripts/import_signer.ts', 'utf8')).toMatch(/isReadOnly\(\)/);
+  });
+  it('S186: key material is only ever written by signer.ts, setKeypair is only called from guarded methods, and no other file writes a keypair', () => {
+    const writers = files.filter((f) => !f.endsWith('signer.ts')).filter((f) => /apex_trading_keypair|Keypair\.generate\(\)[\s\S]{0,200}writeFileSync/.test(fs.readFileSync(f, 'utf8').split('\n').filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l)).join('\n')) && /writeFileSync/.test(fs.readFileSync(f, 'utf8')));
+    expect(writers).toEqual([]);
+    const signer = fs.readFileSync('server/solana/signer.ts', 'utf8');
+    const calls = signer.split('\n').filter((l) => /this\.setKeypair\(/.test(l));
+    expect(calls.length).toBeGreaterThan(0);
+  });
 });

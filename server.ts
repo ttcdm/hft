@@ -1586,6 +1586,10 @@ app.get('/api/signer/status', requireOperatorAuth, (req, res) => {
 // Local wallet generation helper (imports must be done via CLI: npm run signer:import)
 app.post('/api/signer/generate', requireOperatorAuth, (req, res) => {
   try {
+    // S186: a read-only server never holds a key, so it cannot create one either
+    if (isReadOnly()) {
+      return res.status(409).json({ success: false, error: 'READ_ONLY', message: 'READ_ONLY: APEX_READ_ONLY=true: this server holds no signing key and cannot generate or import one.' });
+    }
     if (req.body?.forceOverwrite) {
       return res.status(403).json({
         success: false,

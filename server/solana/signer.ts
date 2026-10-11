@@ -104,6 +104,7 @@ export class LocalKeypairSigner implements TransactionSigner {
   // Generates a dedicated local low-balance trading keypair file with restricted permissions (0600)
   // Protected against accidental overwriting of existing keypairs with funds
   public generateDedicatedTradingKeypair(forceOverwrite = false): { publicKey: string; path: string } {
+    assertNotReadOnly('generating a signing key'); // S186
     const targetPath = this.keypairPath || path.join(process.cwd(), '.apex_trading_keypair.json');
 
     // Q5: a key that is already loaded (from OPERATOR_PRIVATE_KEY, SIGNER_KEYPAIR_PATH or the default file) is never swapped at runtime:
@@ -134,6 +135,7 @@ export class LocalKeypairSigner implements TransactionSigner {
   }
 
   public importKeypair(secretKeyInput: string, forceOverwrite = false): { publicKey: string; path: string } {
+    assertNotReadOnly('importing a signing key'); // S186
     const targetPath = this.keypairPath || path.join(process.cwd(), '.apex_trading_keypair.json');
 
     if (fs.existsSync(targetPath) && !forceOverwrite) {
@@ -160,10 +162,12 @@ export class LocalKeypairSigner implements TransactionSigner {
   }
 
   public generateNewKeypair(forceOverwrite = false): string {
+    assertNotReadOnly('generating a signing key'); // S186
     return this.generateDedicatedTradingKeypair(forceOverwrite).publicKey;
   }
 
   public importSecretKey(secretKeyInput: string, forceOverwrite = false): string {
+    assertNotReadOnly('importing a signing key'); // S186
     return this.importKeypair(secretKeyInput, forceOverwrite).publicKey;
   }
 

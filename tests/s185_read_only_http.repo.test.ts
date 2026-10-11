@@ -33,6 +33,14 @@ describe('S185 read-only server over HTTP', () => {
     expect(byId.signer.value).toMatch(/read-only by design/);
     expect(byId.capacity.value).toMatch(/of 250/);
   });
+  it('S186: /api/signer/generate is 409 and writes no key file', async () => {
+    const r = await app.call('POST', '/api/signer/generate', {});
+    expect(r.status).toBe(409);
+    expect(r.json.error).toBe('READ_ONLY');
+    expect(fs.existsSync(path.join(dir, '.apex_trading_keypair.json'))).toBe(false);
+    const sg = (await app.call('GET', '/api/system/checks')).json.checks.find((c: any) => c.id === 'signer');
+    expect(sg.value).toMatch(/read-only by design/);
+  });
   it('auto refuses DEVNET_LIVE and allows PAPER, and nothing was sent', async () => {
     const live = await app.call('POST', '/api/auto/mode', { mode: 'DEVNET_LIVE', confirmationCode: 'CONFIRM_AUTO_DEVNET' });
     expect(live.status).toBeGreaterThanOrEqual(400);
@@ -57,6 +65,17 @@ describe('S185 the server refuses to start next to a key', () => {
     const r = boot({ SIGNER_KEYPAIR_PATH: '', OPERATOR_PRIVATE_KEY: '[1,2,3]' });
     expect(r.status).toBe(1);
     expect(r.stderr).toMatch(/REFUSING TO START[\s\S]*OPERATOR_PRIVATE_KEY is set/);
+  }, 100_000);
+  it('S186: exits 1 when the default .apex_trading_keypair.json sits in the working directory', () => {
+    const d = scratchDir('s186-boot-');
+    try {
+      fs.writeFileSync(path.join(d, '.apex_trading_keypair.json'), '[1,2,3]');
+      const r = spawnSync(process.execPath, ['--import', tsxEsm, path.resolve('server.ts')], {
+        cwd: d, encoding: 'utf8', timeout: 90_000, env: { ...baseEnv(d, { APP_PORT: '0', APEX_READ_ONLY: 'true', SIGNER_KEYPAIR_PATH: '' }) },
+      });
+      expect(r.status).toBe(1);
+      expect(r.stderr).toMatch(/\.apex_trading_keypair\.json exists/);
+    } finally { fs.rmSync(d, { recursive: true, force: true }); }
   }, 100_000);
   it('exits 1 and names SIGNER_KEYPAIR_PATH', () => {
     const r = boot({}); // baseEnv sets a throwaway SIGNER_KEYPAIR_PATH

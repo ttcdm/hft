@@ -143,12 +143,14 @@ export class WatchWindow extends EventEmitter {
 
   /** Record a wallet's funder (the sender of its earliest incoming transfer). */
   public setFunder(wallet: string, funder: string): void {
+    this.emit('funder', { wallet, funder });
     this.funders.set(wallet, funder);
     if (this.funders.size > MAX_FUNDERS_KEPT) this.funders.delete(this.funders.keys().next().value as string);
   }
 
   /** Q6b: record that a wallet's funder was looked up and there is none to cluster it with. */
   public setNoFunder(wallet: string): void {
+    this.emit('funder', { wallet, funder: null });
     this.noFunder.add(wallet);
     if (this.noFunder.size > MAX_FUNDERS_KEPT) this.noFunder.delete(this.noFunder.values().next().value as string);
   }

@@ -47,7 +47,8 @@ interface PoolState {
   tradeCount: number;
 }
 
-const priceOf = (t: PumpTradeEvent): number | null =>
+/** SOL per token implied by a trade's virtual reserves (6-decimal tokens). */
+export const tradePriceSol = (t: Pick<PumpTradeEvent, 'virtualTokenReserves' | 'virtualSolReserves'>): number | null =>
   t.virtualTokenReserves > 0n ? Number(t.virtualSolReserves) / Number(t.virtualTokenReserves) / 1000 : null;
 
 /**
@@ -97,7 +98,7 @@ export class OnChainPoolStats {
     s.seen.add(key);
     if (s.seen.size > MAX_TRADES_KEPT) s.seen.delete(s.seen.values().next().value as string);
 
-    const price = priceOf(t);
+    const price = tradePriceSol(t);
     if (price !== null) {
       s.priceSol = price;
       if (s.anchorPriceSol === null) s.anchorPriceSol = price;

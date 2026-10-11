@@ -181,6 +181,16 @@ export class WorkstationDatabase {
         unverified INTEGER NOT NULL DEFAULT 0
       );
 
+      -- S178: what the watch window saw, so the auto trader's rules can be replayed over real launches. One row per create event, trade,
+      -- or funder fact for a mint the watch window was scoring. kind: CREATE | TRADE | FUNDER (mint is '' for a funder fact).
+      CREATE TABLE IF NOT EXISTS launch_recording (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts INTEGER NOT NULL,
+        mint TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        payload_json TEXT NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS system_journal (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         event_type TEXT NOT NULL,
@@ -238,6 +248,8 @@ export class WorkstationDatabase {
       CREATE INDEX IF NOT EXISTS idx_tx_order ON transactions(order_id);
       CREATE INDEX IF NOT EXISTS idx_tx_mint ON transactions(mint);
       CREATE INDEX IF NOT EXISTS idx_risk_decisions_created ON risk_decisions(created_at);
+      CREATE INDEX IF NOT EXISTS idx_launch_rec_mint ON launch_recording(mint, ts);
+      CREATE INDEX IF NOT EXISTS idx_launch_rec_ts ON launch_recording(ts);
     `);
     Logger.info(`SQLite persistence initialized at ${this.dbPath}`);
   }
@@ -538,6 +550,55 @@ export class WorkstationDatabase {
     } catch (e: any) {
       Logger.error(`Retention prune failed: ${e?.message ?? e}`);
       return { riskDecisions: 0, decisions: 0, journal: 0 };
+    }
+  }
+
+  /** S178: append one recorded event. Never throws: a recording failure must not touch trading. */
+  public recordLaunchEvent(ts: number, mint: string, kind: 'CREATE' | 'TRADE' | 'FUNDER', payload: Record<string, unknown>): boolean {
+    try {
+      this.db.prepare('INSERT INTO launch_recording (ts, mint, kind, payload_json) VALUES (?, ?, ?, ?)').run(ts, mint, kind, JSON.stringify(payload));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Recorded events of the `limit` most recently created launches, oldest event first, plus every funder fact. */
+  public loadLaunchRecording(limit = 500): { launches: Array<{ mint: string; events: Array<{ ts: number; kind: 'CREATE' | 'TRADE'; payload: any }> }>; funders: Array<{ ts: number; wallet: string; funder: string | null }> } {
+    try {
+      const mints = (this.db.prepare(`SELECT mint FROM launch_recording WHERE kind = 'CREATE' ORDER BY ts DESC LIMIT ?`).all(limit) as any[]).map((r) => r.mint as string).reverse();
+      const launches = mints.map((mint) => ({
+        mint,
+        events: (this.db.prepare(`SELECT ts, kind, payload_json FROM launch_recording WHERE mint = ? AND kind IN ('CREATE','TRADE') ORDER BY ts ASC, id ASC`).all(mint) as any[])
+          .map((r) => ({ ts: r.ts as number, kind: r.kind as 'CREATE' | 'TRADE', payload: JSON.parse(r.payload_json) })),
+      }));
+      const funders = (this.db.prepare(`SELECT ts, payload_json FROM launch_recording WHERE kind = 'FUNDER' ORDER BY ts ASC, id ASC`).all() as any[])
+        .map((r) => ({ ts: r.ts as number, ...JSON.parse(r.payload_json) }));
+      return { launches, funders };
+    } catch {
+      return { launches: [], funders: [] };
+    }
+  }
+
+  public getLaunchRecordingStatus(): { launches: number; events: number; oldestTs: number | null; newestTs: number | null } {
+    try {
+      const r = this.db.prepare(`SELECT COUNT(*) AS n, MIN(ts) AS lo, MAX(ts) AS hi FROM launch_recording`).get() as any;
+      const l = this.db.prepare(`SELECT COUNT(*) AS n FROM launch_recording WHERE kind = 'CREATE'`).get() as any;
+      return { launches: Number(l.n), events: Number(r.n), oldestTs: r.lo ?? null, newestTs: r.hi ?? null };
+    } catch {
+      return { launches: 0, events: 0, oldestTs: null, newestTs: null };
+    }
+  }
+
+  /** Keep the recording bounded: rows older than `retentionDays`, then the oldest rows beyond `maxRows`. Returns rows deleted. */
+  public pruneLaunchRecording(retentionDays: number, maxRows: number, now: number = Date.now()): number {
+    try {
+      let n = Number((this.db.prepare('DELETE FROM launch_recording WHERE ts < ?').run(now - retentionDays * 86_400_000) as any).changes ?? 0);
+      const total = Number((this.db.prepare('SELECT COUNT(*) AS n FROM launch_recording').get() as any).n);
+      if (total > maxRows) n += Number((this.db.prepare('DELETE FROM launch_recording WHERE id IN (SELECT id FROM launch_recording ORDER BY id ASC LIMIT ?)').run(total - maxRows) as any).changes ?? 0);
+      return n;
+    } catch {
+      return 0;
     }
   }
 

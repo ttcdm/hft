@@ -129,7 +129,6 @@
 "tests/q34_known_risks.test.ts::enableSyntheticSocial is never read outside its definition",
 "tests/q34_known_risks.test.ts::isAutoSnipeEnvEnabled has no caller",
 "tests/q35_header_pill.test.ts::the header no longer reads the nonexistent fields or hardcodes a plus sign",
-"tests/q38_invented_numbers.test.ts::a backtest with zero variance reports 0 for Sharpe/Sortino/Calmar, not 3.2/4.5/10",
 "tests/q38_invented_numbers.test.ts::the AI diagnostics 503 carries no canned Sharpe or recommendation",
 "tests/q38_invented_numbers.test.ts::the Plug-and-Play card no longer states fixed 0.02/0.06 SOL caps",
 "tests/q38_invented_numbers.test.ts::the demo signal templates are not flagged as a live feed",

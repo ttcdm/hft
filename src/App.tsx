@@ -473,7 +473,6 @@ export default function App() {
       <BacktestModal
         isOpen={isBacktestModalOpen}
         onClose={() => setIsBacktestModalOpen(false)}
-        currentCapitalTier={capitalTier}
       />
 
       <PlugAndPlayTradingModal

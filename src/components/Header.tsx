@@ -86,6 +86,7 @@ export const Header: React.FC<HeaderProps> = ({
   const autoStatus = useAutoStatus();
   const checks = usePolled<{ checks: Array<{ status: string }> }>('/api/system/checks', 15000, isOperatorAuthenticated !== false);
   const checksBadge = checksBadgeFor(checks.data?.checks ?? null);
+  const recording = usePolled<{ launches: number }>('/api/backtest/recording', 60000, isOperatorAuthenticated !== false).data;
   const toolsMenuRef = useRef<HTMLDivElement | null>(null);
 
   // Live Auto-Profit Ticker State (fetched from walletTrader) - Clean initial state (B22)
@@ -278,7 +279,7 @@ export const Header: React.FC<HeaderProps> = ({
             <button
               id="btn-open-backtest"
               onClick={onOpenBacktestModal}
-              title="Backtest"
+              title="Replay of recorded launches through the auto trader's rules"
               className="px-2 py-1 rounded-lg bg-emerald-950/70 hover:bg-emerald-900/70 border border-emerald-500/40 text-[11px] font-mono text-emerald-300 hover:text-white transition flex items-center space-x-1"
             >
               <TrendingUp className="w-3 h-3 text-emerald-400" />
@@ -327,7 +328,7 @@ export const Header: React.FC<HeaderProps> = ({
                     className="w-full text-left px-3 py-2 hover:bg-[#1A263D] flex items-center justify-between text-emerald-300"
                   >
                     <span className="flex items-center space-x-2"><TrendingUp className="w-3.5 h-3.5" /><span>Backtest</span></span>
-                    <span className="text-[9px] px-1 rounded bg-amber-500/20 text-amber-300" data-testid="badge-backtest">seeded random</span>
+                    <span className="text-[9px] px-1 rounded bg-slate-700/60 text-slate-200" data-testid="badge-backtest">{recording ? `${recording.launches} launches recorded` : 'no data'}</span>
                   </button>
                 )}
               </div>

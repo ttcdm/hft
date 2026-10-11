@@ -16,6 +16,8 @@ import { onChainPoolStats } from './server/market/poolStats';
 import { wireWatchPins } from './server/signals/watchPins';
 import { realismEngine } from './server/realismEngine';
 import { buildSystemChecks } from './server/system/systemChecks';
+import { LaunchRecorder } from './server/backtest/launchRecorder';
+import { replayLaunches } from './server/backtest/replay';
 import { computeLatency } from './server/system/latencyStats';
 import { buildDiagnosticsContext } from './server/system/aiContext';
 import { pumpFunService, pumpBootMode } from './server/pumpfunService';
@@ -329,6 +331,9 @@ watchWindow.setScoreFn((mint) => {
   return pool ? memecoinAggregator.evaluateTokenConfluence(pool).score : null;
 });
 watchWindow.attach(pumpFeedListener);
+// S178: save what the window sees (launches it scores, their trades, the funder facts) so the auto rules can be replayed over real launches
+const launchRecorder = new LaunchRecorder(workstationDb, watchWindow, () => solPriceService.lastKnownPrice());
+launchRecorder.attach(pumpFeedListener);
 wireWatchPins(watchWindow, memecoinAggregator, onChainPoolStats); // S4: a watched mint keeps its pool and its trade stats until the verdict
 wireFunderLookup(watchWindow, new FunderLookup(() => executionCoordinator.getConnection())); // Q6b
 watchWindow.on('release', (r) => broadcastWs({ type: 'WATCH_RELEASE', data: r }));
@@ -1346,6 +1351,26 @@ app.get('/api/system/latency', requireOperatorAuth, (req, res) => {
   const txs = workstationDb.loadTransactions().sort((a, b) => b.submissionTime - a.submissionTime).slice(0, 5000);
   const queued = workstationDb.loadDecisions({ stage: 'queue', outcome: 'QUEUED', limit: 5000 }).map((d) => ({ ts: d.ts, mint: d.mint }));
   res.json({ success: true, measuredAt: Date.now(), ...computeLatency(txs, queued) });
+});
+
+// Backtest = replay of recorded launches through the auto trader's real rules. No recording, no result.
+app.get('/api/backtest/recording', requireOperatorAuth, (req, res) => {
+  res.json({ success: true, ...workstationDb.getLaunchRecordingStatus() });
+});
+
+let replayCache: { key: string; at: number; body: any } | null = null;
+app.get('/api/backtest/replay', requireOperatorAuth, (req, res) => {
+  const status = workstationDb.getLaunchRecordingStatus();
+  if (status.launches === 0) {
+    return res.json({ success: true, recorded: status, report: null, message: 'No launch has been recorded yet, so there is nothing to replay. The recorder saves every launch the watch window scores while the app runs against a pump.fun feed.' });
+  }
+  const key = `${status.events}:${status.newestTs}`;
+  if (replayCache && replayCache.key === key && Date.now() - replayCache.at < 30_000) return res.json(replayCache.body);
+  const { launches, funders } = workstationDb.loadLaunchRecording(300);
+  const report = replayLaunches(launches, funders, solPriceService.lastKnownPrice());
+  const body = { success: true, recorded: status, report, message: null };
+  replayCache = { key, at: Date.now(), body };
+  res.json(body);
 });
 
 app.get('/api/execution/mode', requireOperatorAuth, (req, res) => {

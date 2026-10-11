@@ -26,6 +26,8 @@ interface TokenInlineExternalLinksProps {
   website?: string;
   onOpenModal?: () => void;
   compact?: boolean;
+  /** S184: the mint came from mainnet data (a callout), so the mainnet-only sites list it whatever cluster this server is on. */
+  mainnetToken?: boolean;
 }
 
 export const TokenInlineExternalLinks: React.FC<TokenInlineExternalLinksProps> = ({
@@ -39,6 +41,7 @@ export const TokenInlineExternalLinks: React.FC<TokenInlineExternalLinksProps> =
   website,
   onOpenModal,
   compact = false,
+  mainnetToken = false,
 }) => {
   const [copied, setCopied] = useState(false);
   const mode = useTradingMode();
@@ -51,7 +54,7 @@ export const TokenInlineExternalLinks: React.FC<TokenInlineExternalLinksProps> =
     twitter,
     telegram,
     website,
-    cluster: mode.cluster ?? 'unknown',
+    cluster: mainnetToken ? 'mainnet-beta' : (mode.cluster ?? 'unknown'),
   });
 
   const handleCopy = (e: React.MouseEvent) => {
@@ -220,6 +223,7 @@ interface TokenExternalLinksModalProps {
   isOpen: boolean;
   onClose: () => void;
   tokenData: {
+    mainnetToken?: boolean;
     mintOrCa: string;
     symbol: string;
     name?: string;
@@ -244,7 +248,7 @@ export const TokenExternalLinksModal: React.FC<TokenExternalLinksModalProps> = (
   if (!isOpen || !tokenData) return null;
 
   const links = getTokenExternalLinks({
-    cluster: mode.cluster ?? 'unknown',
+    cluster: tokenData.mainnetToken ? 'mainnet-beta' : (mode.cluster ?? 'unknown'),
     mintOrCa: tokenData.mintOrCa,
     symbol: tokenData.symbol,
     name: tokenData.name,

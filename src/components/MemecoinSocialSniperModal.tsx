@@ -5,7 +5,7 @@ import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
 import { buildPoolSnipeRequest } from '../utils/poolSnipe';
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { SnipeAmountControl } from './SnipeAmountControl';
-import { isMainnetCluster, sanitizeExternalUrl, sanitizeTelegramUrl, formatPctChange } from '../utils/tokenLinks';
+import { mainnetLinksAvailable, isMainnetDataProvenance, sanitizeExternalUrl, sanitizeTelegramUrl, formatPctChange } from '../utils/tokenLinks';
 import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
 import React, { useState, useEffect } from 'react';
 import {
@@ -691,7 +691,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
                           {/* Live Platform Feed Links */}
                           <div className="flex flex-wrap items-center gap-1.5">
-                            {isMainnetCluster(tradingMode.cluster) ? (
+                            {mainnetLinksAvailable(tradingMode.cluster, isMainnetDataProvenance(sig.provenance)) ? (
                               <>
                             {/* Pump.fun Link */}
                             <a
@@ -892,9 +892,11 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                   name={pool.name}
                                   chain={pool.chain}
                                   platform={pool.platform}
+                                  mainnetToken={pool.id.startsWith('pool-callout-')}
                                   compact={true}
                                   onOpenModal={() =>
                                     setSelectedExternalToken({
+                                      mainnetToken: pool.id.startsWith('pool-callout-'),
                                       mintOrCa: pool.contractAddress,
                                       symbol: pool.symbol,
                                       name: pool.name,

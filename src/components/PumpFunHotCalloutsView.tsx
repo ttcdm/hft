@@ -43,6 +43,7 @@ import {
   sanitizeTelegramUrl,
   isMainnetCluster,
   calloutSnipeBlock,
+  mainnetLinksAvailable,
   calloutSnipeLabel,
   calloutSendNote,
   CALLER_MARK_LABEL,
@@ -644,7 +645,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                             </button>
 
                             {/* External Links */}
-                            {isMainnetCluster(tradingMode.cluster) ? (
+                            {mainnetLinksAvailable(tradingMode.cluster, true /* S184: callouts come from the mainnet pump.fun list */) ? (
                               <>
                             <a
                               href={`https://pump.fun/coin/${c.token.mint}`}
@@ -673,6 +674,15 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                               title="GMGN Smart Money & Dev Holdings"
                             >
                               <span className="text-emerald-400 font-bold">GMGN</span>
+                            </a>
+                            <a
+                              href={`https://solscan.io/token/${c.token.mint}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-slate-400 hover:text-slate-200 p-0.5 text-[9px] font-mono flex items-center gap-0.5"
+                              title="Solscan (mainnet token page)"
+                            >
+                              <span className="text-slate-300 font-bold">SCAN</span>
                             </a>
                               </>
                             ) : (

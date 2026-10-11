@@ -18,7 +18,7 @@ describe('S19/S20 UI truth', () => {
   it('components have no unconditional mainnet hrefs or unconditional LIVE badges', () => {
     for (const f of ['src/components/MemecoinSocialSniperModal.tsx', 'src/components/PumpFunHotCalloutsView.tsx']) {
       const s = read(f);
-      expect(s).toContain('isMainnetCluster(tradingMode.cluster)');
+      expect(s).toContain('mainnetLinksAvailable(tradingMode.cluster');
       expect(s).not.toMatch(/href=\{`https:\/\/solscan\.io\/account/);
       expect(s).not.toContain('LIVE INGESTION');
       expect(s).not.toContain('LIVE API v3');

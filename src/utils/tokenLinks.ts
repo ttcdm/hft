@@ -78,6 +78,20 @@ export function isMainnetCluster(cluster?: string | null): boolean {
   return cluster === 'mainnet-beta' || cluster === 'mainnet';
 }
 
+/**
+ * S184: whether the mainnet-only sites (pump.fun, DexScreener, GMGN) can list this token. They can when the server is on mainnet, OR when the
+ * token itself came from mainnet data (the pump.fun / DexScreener HTTP lists, a real social call): that mint exists on mainnet whatever
+ * cluster this server trades on. A token created on this devnet / localnet is not listed, so it keeps "no mainnet links".
+ */
+export function mainnetLinksAvailable(serverCluster: string | null | undefined, tokenIsMainnetData: boolean): boolean {
+  return tokenIsMainnetData || isMainnetCluster(serverCluster);
+}
+
+/** S184: provenance values whose mint comes from a mainnet source. */
+export function isMainnetDataProvenance(p: string | null | undefined): boolean {
+  return p === 'PUMP_HTTP_API' || p === 'REAL_SOCIAL';
+}
+
 /** S20: a Solscan account link that names the cluster, so a devnet / localnet wallet never opens as a mainnet page. */
 export function solscanAccountUrl(address: string, cluster?: string | null): string | null {
   if (cluster === 'devnet') return `https://solscan.io/account/${address}?cluster=devnet`;

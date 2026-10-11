@@ -97,6 +97,8 @@ export interface AutoSession {
 }
 
 export interface AutoStatus {
+  /** false when AUTO_SNIPE_ENABLED is not "true": every mode but OFF is refused. The panel tells the operator how to enable it. */
+  envEnabled: boolean;
   mode: AutoMode;
   killed: boolean;
   killReason: string | null;
@@ -213,6 +215,7 @@ export class AutoSnipeController extends EventEmitter {
       };
     }
     return {
+      envEnabled: process.env.AUTO_SNIPE_ENABLED === 'true',
       mode: this.mode, killed: this.killed, killReason: this.killReason, downgradeReason: this.downgradeReason,
       triggers: [...this.triggers], haltReason: executionCoordinator.getHaltReason(), slippageBreaches: this.slippageBreaches,
       session, budgets: session?.budgets ?? SESSION_BUDGETS,

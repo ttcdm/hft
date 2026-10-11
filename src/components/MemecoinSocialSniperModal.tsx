@@ -1,7 +1,8 @@
 import { signalFeedBadge } from '../utils/signalBadge';
 import { probeBadge, probeLatency, hostOfService } from '../utils/probeBadge';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
-import { isMainnetCluster, sanitizeExternalUrl, sanitizeTelegramUrl } from '../utils/tokenLinks';
+import { buildPoolSnipeRequest } from '../utils/poolSnipe';
+import { isMainnetCluster, sanitizeExternalUrl, sanitizeTelegramUrl, formatPctChange } from '../utils/tokenLinks';
 import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
 import React, { useState, useEffect } from 'react';
 import {
@@ -265,6 +266,27 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
         `SNIPE REJECTED`,
         res?.tradeResult?.message || res?.error || 'Failed pre-trade risk check'
       );
+    }
+  };
+
+  // Snipe a pool row by its mint. The row never had a server-side signal, so it must not go through /api/social/signals/snipe
+  // (that route looks the signal id up and answers "Signal not found" for an id the server never issued).
+  const handleSnipePool = async (pool: MemecoinPool) => {
+    const amount = capitalTier === 'MICRO_10' ? 5.0 : 25.0;
+    const warning = liveClickWarning(tradingMode, `Sniping $${pool.symbol} for $${amount.toFixed(2)}`);
+    if (warning && !window.confirm(warning)) return;
+    hftAudio.playOrderFill();
+    const res = await engineClient.executeMemecoinSnipe(buildPoolSnipeRequest(pool, amount, sniperConfig), tradingMode.live);
+    const r = res?.result ?? res?.tradeResult;
+    if (r?.success) {
+      onAlertTrigger?.(
+        'INFO',
+        `SNIPED $${pool.symbol}`,
+        `${/^PAPER/i.test(String(r.txHash ?? '')) ? 'Paper fill' : 'Sent'} for $${amount.toFixed(2)} on ${pool.chain}${r.txHash ? ` (${String(r.txHash).slice(0, 14)}...)` : ''}. CA: ${pool.contractAddress.slice(0, 10)}...`
+      );
+      refreshData();
+    } else {
+      onAlertTrigger?.('WARNING', 'SNIPE REJECTED', r?.message || res?.error || 'Failed pre-trade risk check');
     }
   };
 
@@ -846,7 +868,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                   <span className="text-slate-400 text-xs font-normal">({pool.name})</span>
                                 </div>
                                 <div className="text-[10px] text-slate-400 flex items-center space-x-1">
-                                  <span>{pool.contractAddress.slice(0, 6)}...{pool.contractAddress.slice(-4)}</span>
+                                  <span data-testid="pool-mint" title={pool.contractAddress} className="font-mono text-slate-300">{pool.contractAddress.slice(0, 8)}...{pool.contractAddress.slice(-6)}</span>
                                   <button onClick={() => copyToClipboard(pool.contractAddress)}>
                                     {copiedCa === pool.contractAddress ? (
                                       <Check className="w-2.5 h-2.5 text-emerald-400" />
@@ -892,7 +914,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                             </div>
                             <div className={`text-[11px] font-bold flex items-center space-x-0.5 ${isPositive ? 'text-emerald-400' : 'text-rose-400'}`}>
                               {isPositive ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
-                              <span>{isPositive ? '+' : ''}{pool.priceChange5mPct}% (5m)</span>
+                              <span>{formatPctChange(pool.priceChange5mPct)} (5m)</span>
                             </div>
                           </td>
 
@@ -958,28 +980,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                           <td className="p-3 text-right">
                             <button
                               onClick={() => {
-                                handleSnipeSignal({
-                                  id: `sig-agg-${pool.id}`,
-                                  provenance: pool.id.startsWith('pool-onchain') ? 'REAL_ONCHAIN' : 'SYNTHETIC_TEST',
-                                  source: 'TELEGRAM',
-                                  authorHandle: pool.platform,
-                                  authorDisplayName: pool.name,
-                                  authorTier: 'MARKET_MAKER_BOT',
-                                  verified: false,
-                                  timestamp: Date.now(),
-                                  timeStr: 'Now',
-                                  rawText: `Manual snipe of ${pool.symbol} from the ${pool.platform} pool list (operator-initiated, no signal scoring)`,
-                                  tokenTicker: `$${pool.symbol}`,
-                                  tokenName: pool.name,
-                                  contractAddress: pool.contractAddress,
-                                  chain: pool.chain,
-                                  signalPattern: 'STEALTH_ACCUMULATION',
-                                  confidenceScore: null,
-                                  sentimentScore: null,
-                                  actionSuggested: 'REVIEW',
-                                  status: 'NEW',
-                                  metrics: {},
-                                });
+                                handleSnipePool(pool);
                               }}
                               className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow transition active:scale-95 flex items-center space-x-1 ml-auto"
                             >

@@ -2,6 +2,8 @@ import type { PumpTradeEvent } from '../solana/pumpFeedListener';
 
 /** A bonding curve graduates at about 85 SOL of real reserves (the same constant the aggregator uses for curve progress). */
 export const CURVE_GRADUATION_SOL = 85;
+/** What a fresh pump.fun curve holds: 793.1M tokens at 6 decimals. Progress is the share of these that has been sold. */
+export const CURVE_INITIAL_REAL_TOKENS = 793_100_000_000_000n;
 export const POOL_STATS_WINDOW_MS = 5 * 60_000;
 const MAX_TRADES_KEPT = 2_000;
 const MAX_MINTS_KEPT = 300;
@@ -13,7 +15,7 @@ export interface MeasuredPoolStats {
   /** SOL per token from the last trade's virtual reserves. */
   priceSol: number;
   realSolReserves: number;
-  /** Real SOL in the curve over the graduation size, 0..100. */
+  /** Share of the curve's tokens already sold (what pump.fun shows), 0..100. Falls back to real SOL over the graduation size when the token reserve is unknown. */
   curveProgressPct: number;
   /** Last price against the oldest price inside the 5 minute window (or the create price for a younger token). */
   priceChange5mPct: number;
@@ -152,7 +154,7 @@ export class OnChainPoolStats {
     return {
       priceSol: s.priceSol,
       realSolReserves: s.realSolReserves,
-      curveProgressPct: Math.min(100, (s.realSolReserves / CURVE_GRADUATION_SOL) * 100),
+      curveProgressPct: curveProgressOf(s),
       priceChange5mPct,
       buys5m: recent.filter((t) => t.isBuy).length,
       sells5m: recent.filter((t) => !t.isBuy).length,
@@ -166,6 +168,16 @@ export class OnChainPoolStats {
   public clear(): void {
     this.mints.clear();
   }
+}
+
+/** Q-curve: pump.fun's bar is tokens sold, not SOL raised (the curve is constant-product, so SOL lags tokens: at half the tokens sold only a quarter of the SOL is in). */
+function curveProgressOf(s: { realSolReserves: number; realTokenReserves: bigint | null }): number {
+  if (s.realTokenReserves !== null) {
+    const initial = CURVE_INITIAL_REAL_TOKENS; // not the first value seen: a watch that starts mid-curve would see a smaller "initial"
+    const sold = Number(initial - s.realTokenReserves) / Number(initial);
+    return Math.max(0, Math.min(100, sold * 100));
+  }
+  return Math.min(100, (s.realSolReserves / CURVE_GRADUATION_SOL) * 100);
 }
 
 export const onChainPoolStats = new OnChainPoolStats();

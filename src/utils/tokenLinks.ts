@@ -18,6 +18,8 @@ export interface TokenLinkItem {
   colorClass: string;
   badgeBgClass: string;
   isAvailable: boolean;
+  /** true when the site only indexes mainnet and the server is not on a known mainnet cluster: show a note instead of a link that goes nowhere */
+  mainnetOnly?: boolean;
 }
 
 export function sanitizeExternalUrl(url?: string | null): string | undefined {
@@ -253,6 +255,13 @@ export function getTokenExternalLinks(params: {
     },
   ];
 
+  // Q-links: dexscreener / rugcheck-style sites only index mainnet. When the caller names a cluster that is not mainnet (or the
+  // server has not answered: the inline view passes 'unknown'), the link is flagged so the view shows "mainnet only" and no anchor.
+  // An omitted cluster keeps the old behaviour (callers outside the UI).
+  if (cluster && !isMainnetCluster(cluster)) {
+    for (const it of items) if (MAINNET_ONLY_LINK_IDS.includes(it.id)) it.mainnetOnly = true;
+  }
+
   if (telegramClean) {
     items.push({
       id: 'telegram',
@@ -291,4 +300,26 @@ export function getTokenExternalLinks(params: {
   }
 
   return items;
+}
+
+/** Sites that index mainnet only. On devnet / localnet / an unknown cluster a link to one opens an empty page. */
+export const MAINNET_ONLY_LINK_IDS: ReadonlyArray<TokenLinkItem['id']> = ['dexscreener', 'pumpfun', 'gmgn', 'birdeye', 'photon', 'bullx', 'axiom'];
+
+/** Price change for a cell: no float residue ("9.99e-8%"), no exponent, a sign only when there is a move. */
+export function formatPctChange(v: number | null | undefined): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return '—';
+  const r = Math.round(v * 100) / 100;
+  if (r === 0) return '0.00%';
+  return `${r > 0 ? '+' : ''}${r.toFixed(2)}%`;
+}
+
+/** Pump.fun callouts come from the mainnet pump.fun API; those mints do not exist on devnet, so a callout can only be sniped on mainnet. */
+export function calloutSnipeBlock(cluster?: string | null): string | null {
+  if (isMainnetCluster(cluster)) return null;
+  return 'Mainnet token (pump.fun mainnet API data): not snipeable on ' + (cluster ? cluster : 'an unknown cluster');
+}
+
+/** Mcap for a callout: a number, or "unknown". */
+export function formatCalloutMcap(v: number | null | undefined): string {
+  return v === null || v === undefined || !Number.isFinite(v) || v <= 0 ? 'unknown' : `$${Math.round(v).toLocaleString()}`;
 }

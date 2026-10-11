@@ -38,6 +38,8 @@ import {
   sanitizeTwitterUrl,
   sanitizeTelegramUrl,
   isMainnetCluster,
+  calloutSnipeBlock,
+  formatCalloutMcap,
   solscanAccountUrl,
 } from '../utils/tokenLinks';
 
@@ -351,10 +353,15 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
 
         {subTab === 'CALLOUTS' && (
           <div className="text-[11px] font-mono text-slate-400 hidden sm:block">
-            Showing <span className="text-white font-bold">{filteredCallouts.length}</span> verified hot calls
+            Showing <span className="text-white font-bold">{filteredCallouts.length}</span> hot calls
           </div>
         )}
       </div>
+      {calloutSnipeBlock(tradingMode.cluster) !== null && (
+        <div data-testid="callouts-mainnet-banner" className="mx-1 mb-2 px-3 py-2 rounded-lg border border-amber-500/30 bg-amber-500/10 text-[11px] font-mono text-amber-300">
+          These callouts are pump.fun MAINNET data. This server is on {tradingMode.cluster || 'an unknown cluster'}, where these tokens do not exist, so they cannot be sniped here.
+        </div>
+      )}
 
       {/* ========================================================================= */}
       {/* 1. HOT CALLOUTS STREAM VIEW */}
@@ -764,21 +771,22 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                       {/* CALLOUT PRICING & MULTIPLES (Cols 8-10) */}
                       <div className="lg:col-span-3 grid grid-cols-2 gap-2 text-xs font-mono">
                         <div className="p-2 rounded bg-[#090D16] border border-[#1E293B]">
-                          <div className="text-[10px] text-slate-500 uppercase">Callout Mcap</div>
-                          <div className="font-bold text-slate-300">
-                            ${Math.round(c.token.marketCapAtCalloutUsd).toLocaleString()}
+                          <div className="text-[10px] text-slate-500 uppercase" title="Market cap the first time this server saw the token as a callout. It is not the launch market cap.">Mcap when first seen</div>
+                          <div className="font-bold text-slate-300" data-testid="callout-mcap">
+                            {formatCalloutMcap(c.token.marketCapAtCalloutUsd)}
                           </div>
                         </div>
 
                         <div className="p-2 rounded bg-[#090D16] border border-[#1E293B]">
-                          <div className="text-[10px] text-slate-500 uppercase">Multiple Reached</div>
-                          <div className="font-extrabold text-emerald-400 flex items-center space-x-0.5">
-                            <ArrowUpRight className="w-3 h-3" />
-                            <span>{c.token.currentMultiple.toFixed(2)}x</span>
-                            <span className="text-[10px] text-slate-400 ml-1">
-                              (ATH: {c.token.peakMultiple.toFixed(2)}x)
-                            </span>
-                          </div>
+                          <div className="text-[10px] text-slate-500 uppercase">Multiple since first seen</div>
+                          {c.token.currentMultiple === null ? (
+                            <div className="font-bold text-slate-500" data-testid="callout-multiple">unknown</div>
+                          ) : (
+                            <div className="font-extrabold text-emerald-400 flex items-center space-x-0.5" data-testid="callout-multiple">
+                              <ArrowUpRight className="w-3 h-3" />
+                              <span>{c.token.currentMultiple.toFixed(2)}x</span>
+                            </div>
+                          )}
                         </div>
                       </div>
 
@@ -786,7 +794,8 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                       <div className="lg:col-span-2 flex flex-col space-y-1.5">
                         <button
                           onClick={() => handleSnipeCallout(c)}
-                          disabled={snipingCalloutId === c.id || c.status === 'SNIPED'}
+                          disabled={snipingCalloutId === c.id || c.status === 'SNIPED' || calloutSnipeBlock(tradingMode.cluster) !== null}
+                          title={calloutSnipeBlock(tradingMode.cluster) ?? undefined}
                           className={`w-full py-2 px-3 rounded-lg font-mono font-bold text-xs transition flex items-center justify-center space-x-1.5 shadow-md ${
                             c.status === 'SNIPED'
                               ? 'bg-emerald-950/80 border border-emerald-500/50 text-emerald-300 cursor-default'
@@ -801,13 +810,21 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                               ? 'SNIPED ✓'
                               : snipingCalloutId === c.id
                               ? 'BUNDLING...'
+                              : calloutSnipeBlock(tradingMode.cluster) !== null
+                              ? 'MAINNET ONLY'
                               : `1-CLICK JITO ($${capitalTier === 'MICRO_10' ? '5' : '25'})`}
                           </span>
                         </button>
 
-                        <div className="text-center text-[10px] font-mono text-slate-500">
-                          Jito MEV {rules.jitoPriorityTipSol} SOL Tip
-                        </div>
+                        {calloutSnipeBlock(tradingMode.cluster) !== null ? (
+                          <div data-testid="callout-mainnet-note" className="text-center text-[10px] font-mono text-amber-400/80">
+                            Mainnet data: this token does not exist on {tradingMode.cluster || 'this cluster'}
+                          </div>
+                        ) : (
+                          <div className="text-center text-[10px] font-mono text-slate-500">
+                            Jito MEV {rules.jitoPriorityTipSol} SOL Tip
+                          </div>
+                        )}
 
                         {/* Caller Auto-Snipe Toggle */}
                         <button

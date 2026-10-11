@@ -449,13 +449,13 @@ export interface PumpFunHotCallout {
     bondingCurveAddress: string;
     associatedBondingCurve?: string;
     creator: string;
-    calloutPriceUsd: number;
+    calloutPriceUsd: number | null; // null = unknown (no price when first seen)
     currentPriceUsd: number;
-    marketCapAtCalloutUsd: number;
+    marketCapAtCalloutUsd: number | null; // market cap when this server first saw the callout; null = unknown
     currentMarketCapUsd: number;
     athPriceSol: number;
-    peakMultiple: number;
-    currentMultiple: number;
+    peakMultiple: number | null;
+    currentMultiple: number | null; // null = unknown, never a made-up 1.00x
     complete: boolean; // Raydium / PumpSwap migration status
     raydiumPool?: string;
     // null = not provided by the feed (never an invented value)

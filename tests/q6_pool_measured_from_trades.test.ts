@@ -54,7 +54,8 @@ describe('Q6: a WS-created pool is filled in from its trades', () => {
     expect(pool.buys5m).toBe(40);
     expect(pool.sells5m).toBe(0);
     expect(pool.liquidityUsd).toBeCloseTo(44 * 150 * 2, 6);
-    expect(pool.bondingCurveProgress).toBeCloseTo((44 / 85) * 100, 1);
+    // curve progress is the share of curve tokens sold (the trades report 780M of 793.1M left), not SOL over 85
+    expect(pool.bondingCurveProgress).toBeCloseTo((1 - 780 / 793.1) * 100, 1);
     expect(pool.priceChange5mPct).toBeGreaterThan(30);
     expect(pool.top10HoldersPct).toBeGreaterThan(0);
     expect(pool.top10HoldersPct).toBeLessThan(30); // 40 equal wallets: the top ten hold a quarter

@@ -148,9 +148,63 @@ export class MemecoinAggregatorService extends EventEmitter {
     pumpFeedListener.on('trade_event', (t: PumpTradeEvent) => this.applyTradeToPool(t));
 
     this.startAutonomousSniperLoop();
+    this.startAuthorityLoop();
   }
 
   private autoSniperTimer: NodeJS.Timeout | null = null;
+  private authorityTimer: NodeJS.Timeout | null = null;
+  private authorityRetryAt = new Map<string, number>();
+  private authorityBackoffUntil = 0;
+  private authorityInflight = false;
+
+  /**
+   * A pool made from a create event has no mint / freeze authority yet (it shows "unknown"). Read both from the chain this server is on,
+   * for up to 100 mints in ONE getMultipleAccounts call: the SPL mint layout has the mint authority option at byte 0 and the freeze
+   * authority option at byte 46 (0 = no authority, i.e. revoked). A mint the cluster does not have (a mainnet mint shown on devnet)
+   * stays unknown and is asked again at most once a minute. Returns how many pools were verified.
+   */
+  public async verifyPoolAuthorities(now = Date.now()): Promise<number> {
+    if (this.authorityInflight || now < this.authorityBackoffUntil) return 0;
+    const due = this.pools
+      .filter((p) => p.authoritiesVerified === false && (this.authorityRetryAt.get(p.contractAddress) ?? 0) <= now)
+      .slice(0, 100);
+    if (due.length === 0) return 0;
+    this.authorityInflight = true;
+    let verified = 0;
+    try {
+      const keys: PublicKey[] = [];
+      const pools: MemecoinPool[] = [];
+      for (const p of due) {
+        try { keys.push(new PublicKey(p.contractAddress)); pools.push(p); } catch { this.authorityRetryAt.set(p.contractAddress, now + 3_600_000); }
+      }
+      if (keys.length === 0) return 0;
+      const infos = await executionCoordinator.getConnection().getMultipleAccountsInfo(keys, 'confirmed');
+      pools.forEach((p, i) => {
+        const data = infos[i]?.data;
+        if (!data || data.length < 82) {
+          this.authorityRetryAt.set(p.contractAddress, now + 60_000);
+          return;
+        }
+        p.isMintRevoked = data.readUInt32LE(0) === 0;
+        p.isFreezeRevoked = data.readUInt32LE(46) === 0;
+        p.authoritiesVerified = true;
+        this.authorityRetryAt.delete(p.contractAddress);
+        verified++;
+      });
+      if (this.authorityRetryAt.size > 2_000) this.authorityRetryAt.clear();
+    } catch {
+      this.authorityBackoffUntil = now + 30_000; // an RPC failure (a 429) must not become a retry storm
+    } finally {
+      this.authorityInflight = false;
+    }
+    return verified;
+  }
+
+  private startAuthorityLoop() {
+    if (this.authorityTimer) return;
+    this.authorityTimer = setInterval(() => void this.verifyPoolAuthorities(), 5000);
+    this.authorityTimer.unref?.();
+  }
 
   private startAutonomousSniperLoop() {
     if (this.autoSniperTimer) return;
@@ -281,7 +335,7 @@ export class MemecoinAggregatorService extends EventEmitter {
     pool.marketCapUsd = m.priceSol * 1_000_000_000 * solUsd;
     pool.liquidityUsd = m.realSolReserves * solUsd * 2;
     pool.bondingCurveProgress = Number(m.curveProgressPct.toFixed(1));
-    pool.priceChange5mPct = m.priceChange5mPct;
+    pool.priceChange5mPct = Number(m.priceChange5mPct.toFixed(2)); // a float residue like 9.99e-8 is not a price move
     pool.buys5m = m.buys5m;
     pool.sells5m = m.sells5m;
     pool.volume5mUsd = m.volume5mSol * solUsd;
@@ -295,7 +349,20 @@ export class MemecoinAggregatorService extends EventEmitter {
     }
   }
 
+  /** One pool per mint. Two entries for the same mint can only come from a race between the feed and a snipe that built a pool; keep the first. */
+  private dedupePools(): void {
+    const seen = new Set<string>();
+    const unique = this.pools.filter((p) => {
+      const k = p.contractAddress.trim().toLowerCase();
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+    if (unique.length !== this.pools.length) this.pools = unique;
+  }
+
   public getPools(platform?: string, chain?: string): MemecoinPool[] {
+    this.dedupePools();
     let result = this.pools;
     if (platform) {
       result = result.filter((p) => p.platform.toLowerCase() === platform.toLowerCase());
@@ -542,7 +609,9 @@ export class MemecoinAggregatorService extends EventEmitter {
           mint: mintPubkey,
           executionMode: currentMode,
         });
-        if (state && !state.complete) {
+        // the feed may have created this mint's pool while the curve was being read; use it instead of adding a second entry
+        pool = this.pools.find((p) => p.contractAddress.toLowerCase() === cleanCa.toLowerCase());
+        if (!pool && state && !state.complete) {
           executionCoordinator.recordPumpFeedEvent('ON_CHAIN_CURVE', cleanCa);
           const priceNative =
             Number(state.virtualSolReserves) /
@@ -619,7 +688,7 @@ export class MemecoinAggregatorService extends EventEmitter {
             contractAddress: cleanCa,
             priceUsd,
             priceNative,
-            marketCapUsd: t.marketCapAtCalloutUsd || 45000,
+            marketCapUsd: t.currentMarketCapUsd || 0, // the feed's current figure, not a launch-time stand-in
             liquidityUsd: 15000,
             bondingCurveProgress: t.bondingCurveProgress || 50,
             isMigrated: t.complete,

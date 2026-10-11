@@ -5,6 +5,8 @@ import { fmt } from './TokenBoard';
 /** H3: the auto-snipe controller panel. Every number is read from GET /api/auto/status (controller state + decision journal). */
 export type AutoMode = 'OFF' | 'SHADOW' | 'PAPER' | 'DEVNET_LIVE';
 export interface AutoStatusData {
+  /** false: the server was started without AUTO_SNIPE_ENABLED=true, so every mode except OFF is refused (HTTP 409). Absent on an older server. */
+  envEnabled?: boolean;
   mode: AutoMode; killed: boolean; killReason: string | null; downgradeReason: string | null; haltReason: string | null;
   triggers: Array<{ code: string; message: string }>; slippageBreaches: number;
   session: null | { buys: number; spentSol: number; sessionPnlSol: number; budgetsLeft: { buys: number; spendSol: number; lossSol: number; msLeft: number } };
@@ -39,6 +41,11 @@ export function AutoPanelView({ status, onMode, onKill, onResume, code, onCode, 
         <h3 className="text-[11px] uppercase tracking-wider text-slate-400 font-bold">Auto-snipe</h3>
         <AutoModeBadge mode={status.mode} halted={!!status.haltReason} />
       </div>
+      {status.envEnabled === false && (
+        <p className="text-amber-300 mb-2 font-mono" data-testid="auto-env-hint">
+          Auto trading is switched off at the server. To enable it, set <strong>AUTO_SNIPE_ENABLED=true</strong> in <strong>.env</strong> and restart the server (<code>npm start</code>). Until then SHADOW, PAPER and DEVNET_LIVE are refused.
+        </p>
+      )}
       <div className="flex gap-1 mb-2">
         {(['OFF', 'SHADOW', 'PAPER', 'DEVNET_LIVE'] as AutoMode[]).map((m) => (
           <button key={m} disabled={busy || status.mode === m} onClick={() => onMode?.(m)} data-testid={`mode-${m}`}

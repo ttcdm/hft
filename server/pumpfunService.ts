@@ -335,6 +335,7 @@ export function pumpBootMode(env: NodeJS.ProcessEnv = process.env): 'FULL' | 'WS
 export class PumpFunService extends EventEmitter {
   private callers: PumpFunCaller[] = isDemoMode() ? [...INITIAL_CALLERS] : [];
   private hotCallouts: PumpFunHotCallout[] = [];
+  private firstSeenMcap = new Map<string, { mcapUsd: number; priceUsd: number }>();
   private lastSyncTimestamp: number = 0;
   private lastSyncLatencyMs: number = 0;
   private liveSource: string = 'frontend-api-v3.pump.fun + DexScreener v1';
@@ -597,22 +598,29 @@ export class PumpFunService extends EventEmitter {
       const elapsedSeconds = Math.floor(elapsedMs / 1000);
       const calloutTimestamp = tokenTradeTime > 0 ? tokenTradeTime : now - elapsedMs;
 
-      // Base launch valuation floor on Pump.fun is ~30 SOL virtual reserve ($5,000 USD)
-      const baseLaunchMarketCapUsd = 5000;
-      const currentMultiple = Number(Math.max(1.0, currentMarketCapUsd / baseLaunchMarketCapUsd).toFixed(2));
-      const calloutPriceUsd = baseLaunchMarketCapUsd / 1_000_000_000;
-      const marketCapAtCalloutUsd = baseLaunchMarketCapUsd;
+      // Callout market cap = the market cap the first time THIS server saw the token as a callout (a measured number). It used to be a
+      // fixed $5,000 "launch floor", which made every multiple an invention. With no market cap in the feed it is unknown: no multiple.
+      const mintKey = mint.toLowerCase();
+      if (!this.firstSeenMcap.has(mintKey) && currentMarketCapUsd > 0) {
+        this.firstSeenMcap.set(mintKey, { mcapUsd: currentMarketCapUsd, priceUsd: currentPriceUsd });
+        if (this.firstSeenMcap.size > 2_000) this.firstSeenMcap.delete(this.firstSeenMcap.keys().next().value as string);
+      }
+      const firstSeen = this.firstSeenMcap.get(mintKey) ?? null;
+      const marketCapAtCalloutUsd: number | null = firstSeen ? firstSeen.mcapUsd : null;
+      const calloutPriceUsd: number | null = firstSeen && firstSeen.priceUsd > 0 ? firstSeen.priceUsd : null;
+      const currentMultiple: number | null =
+        firstSeen && currentMarketCapUsd > 0 ? Number((currentMarketCapUsd / firstSeen.mcapUsd).toFixed(2)) : null;
 
       // Determine Production HFT Execution Action
       let hftAction: CalloutHftAction = 'MOMENTUM_ENTRY';
-      if (confluenceCount >= 2 && currentMultiple <= 2.5 && elapsedSeconds <= 180) {
+      if (confluenceCount >= 2 && currentMultiple !== null && currentMultiple <= 2.5 && elapsedSeconds <= 180) {
         // Multi-Caller Confluence on Pump.fun + DexScreener Boosted elevates to INSTANT_SNIPE
         hftAction = 'INSTANT_SNIPE';
       } else if (curveProgress >= 80 && !c.complete) {
         hftAction = 'PRE_GRADUATION_WATCH';
-      } else if (currentMultiple >= 3.8 || elapsedSeconds > 480) {
+      } else if ((currentMultiple !== null && currentMultiple >= 3.8) || elapsedSeconds > 480) {
         hftAction = 'DUMP_RISK';
-      } else if (currentMultiple > 1.8) {
+      } else if (currentMultiple !== null && currentMultiple > 1.8) {
         hftAction = 'LATE_STAGE_HOLD';
       }
 
@@ -623,6 +631,8 @@ export class PumpFunService extends EventEmitter {
       let calloutNote: string;
       if (confluenceCount >= 2) {
         calloutNote = `🚨 MULTI-CALLER CONFLUENCE (Pump.fun Velocity + DexScreener Boosted): Called by @${caller.userId}${otherCallers.length > 0 ? ' & ' + otherCallers.join(', ') : ''}. Curve: ${curveProgress}% | 5m Vol: ${pair?.volume?.m5 != null ? '$' + Number(pair.volume.m5).toLocaleString() : 'n/a'}. Elevated to INSTANT_SNIPE.`;
+      } else if (c.complete) {
+        calloutNote = `🎓 MIGRATED: the feed reports this curve as complete (graduated to the AMM).`;
       } else if (curveProgress >= 80) {
         calloutNote = `⚡ GRADUATION IMMINENT: Bonding curve is ${curveProgress}% filled. PumpSwap AMM migration happens when the curve's tokens are sold out.`;
       } else if (isBoosted) {
@@ -751,7 +761,7 @@ export class PumpFunService extends EventEmitter {
         callout.confluenceCount >= 2 &&
         isConfluenceScorePassed;
 
-      const withinPriceLimit = callout.token.currentMultiple <= rules.maxEntryMultiple;
+      const withinPriceLimit = callout.token.currentMultiple !== null && callout.token.currentMultiple <= rules.maxEntryMultiple; // an unknown multiple is not "within the limit"
       const withinTimeLimit = (Date.now() - callout.calloutTimestamp) / 1000 <= rules.maxElapsedSeconds;
 
       // Trigger on (caller stats) OR strong confluence (>= 70), within price and time limits.

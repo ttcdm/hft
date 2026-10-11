@@ -325,8 +325,8 @@ export function formatCalloutMcap(v: number | null | undefined): string {
 }
 
 /** S179: what the callout snipe button says. It is a normal snipe; Jito is only a transport the server may or may not have configured. */
-export function calloutSnipeLabel(amountUsd: number): string {
-  return `SNIPE ($${amountUsd})`;
+export function calloutSnipeLabel(amountLabel: string): string {
+  return `SNIPE (${amountLabel})`;
 }
 
 /** S179: the line under the snipe button. The tip is paid only when the server has a Jito block engine configured (never on devnet / localnet). */

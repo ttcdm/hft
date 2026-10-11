@@ -17,13 +17,13 @@ afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); memecoinAggregator.s
 describe('S176 #1: a pool row snipes by its mint, not through a signal id the server never issued', () => {
   it('the request the row builds passes the trade schema and reaches executeTrade for that mint; the old signal route could not find the id', async () => {
     const { mint, pool } = newPumpPool('NONE');
-    const body = buildPoolSnipeRequest(pool, 5, { jitoTipSol: 0.005, maxSlippagePct: 6 });
+    const body = buildPoolSnipeRequest(pool, 0.01, { jitoTipSol: 0.005, maxSlippagePct: 6 });
     const parsed = OperatorSnipeSchema.safeParse(body);
     expect(parsed.success).toBe(true);
     memecoinAggregator.setConfluenceGating(false);
     vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('PAPER');
     const trade = vi.spyOn(executionCoordinator, 'executeTrade').mockResolvedValue({ success: true, positionId: 'p1', txHash: 'PAPER-1' } as any);
-    const res = await memecoinAggregator.executeSnipe({ ...(parsed as any).data, provenance: 'REAL_ONCHAIN', signalTimestamp: Date.now() });
+    const res = await memecoinAggregator.executeSnipe({ ...(parsed as any).data, operatorAmountSol: (parsed as any).data.amountSol, provenance: 'REAL_ONCHAIN', signalTimestamp: Date.now() });
     expect(res.message ?? '').not.toMatch(/Signal not found/);
     expect(trade.mock.calls[0]?.[0].mint).toBe(mint);
     // the id the old button invented is not in the server's list, which is why every click answered 404

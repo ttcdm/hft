@@ -416,12 +416,12 @@ class EngineClient {
     return { status: 'ERROR', signals: [] };
   }
 
-  public async snipeSocialSignal(signalId: string, amountUsd: number = 5.0, jitoTipSol: number = 0.005, slippagePct: number = 8.0, confirmLive = false) {
+  public async snipeSocialSignal(signalId: string, amountSol: number, jitoTipSol: number = 0.005, slippagePct: number = 8.0, confirmLive = false) {
     try {
       const res = await authFetch('/api/social/signals/snipe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ signalId, amountUsd, jitoTipSol, slippagePct, ...(confirmLive ? { confirmLive: true } : {}) }),
+        body: JSON.stringify({ signalId, amountSol, jitoTipSol, slippagePct, ...(confirmLive ? { confirmLive: true } : {}) }),
       });
       return await res.json();
     } catch (e) {
@@ -493,7 +493,8 @@ class EngineClient {
 
   public async executeMemecoinSnipe(params: {
     contractAddress: string;
-    amountUsd: number;
+    /** S181: the operator's chosen size in SOL. The server refuses it with a reason when it is out of bounds. */
+    amountSol: number;
     platform?: string;
     jitoTipSol?: number;
     slippagePct?: number;
@@ -571,12 +572,12 @@ class EngineClient {
     return null;
   }
 
-  public async snipePumpFunCallout(calloutId: string, amountUsd?: number, jitoTipSol?: number, slippagePct?: number, confirmLive = false) {
+  public async snipePumpFunCallout(calloutId: string, amountSol: number, jitoTipSol?: number, slippagePct?: number, confirmLive = false) {
     try {
       const res = await authFetch('/api/pumpfun/callouts/snipe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ calloutId, amountUsd, jitoTipSol, slippagePct, ...(confirmLive ? { confirmLive: true } : {}) }),
+        body: JSON.stringify({ calloutId, amountSol, jitoTipSol, slippagePct, ...(confirmLive ? { confirmLive: true } : {}) }),
       });
       return await res.json();
     } catch (e) {

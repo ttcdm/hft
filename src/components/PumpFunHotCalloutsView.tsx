@@ -1,3 +1,5 @@
+import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
+import { SnipeAmountControl } from './SnipeAmountControl';
 import { CONFLUENCE_RULE_LABEL, CONFLUENCE_RULE_NOTE } from '../utils/calloutRuleText';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
 import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
@@ -61,6 +63,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   onRefreshParent,
 }) => {
   const tradingMode = useTradingMode();
+  const snipeAmount = useSnipeAmount();
   const [subTab, setSubTab] = useState<'CALLOUTS' | 'LEADERBOARD' | 'RULES'>('CALLOUTS');
   const [callouts, setCallouts] = useState<PumpFunHotCallout[]>([]);
   const [leaderboard, setLeaderboard] = useState<PumpFunCaller[]>([]);
@@ -179,16 +182,21 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   };
 
   const handleSnipeCallout = async (callout: PumpFunHotCallout) => {
-    const defaultAmount = capitalTier === 'MICRO_10' ? 5.0 : 25.0;
+    // S181: the size is the operator's saved snipe amount; an out-of-bounds value is refused here and again by the server
+    if (!snipeAmount.parsed.ok) {
+      onAlertTrigger?.('WARNING', 'SNIPE NOT SENT', snipeAmount.parsed.reason);
+      return;
+    }
+    const amountSol = snipeAmount.parsed.sol;
     // Q10b: while LIVE is armed this click sends a real transaction; say so and ask first
-    const warning = liveClickWarning(tradingMode, `Sniping $${callout.token.symbol} for $${defaultAmount.toFixed(2)}`);
+    const warning = liveClickWarning(tradingMode, `Sniping $${callout.token.symbol} for ${formatSol(amountSol)}`);
     if (warning && !window.confirm(warning)) return;
     setSnipingCalloutId(callout.id);
     hftAudio.playOrderFill();
 
     const res = await engineClient.snipePumpFunCallout(
       callout.id,
-      defaultAmount,
+      amountSol,
       rules.jitoPriorityTipSol,
       6.0,
       tradingMode.live
@@ -198,7 +206,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
       onAlertTrigger?.(
         'INFO',
         `⚡ HOT CALLOUT SNIPED: $${callout.token.symbol}`,
-        `${tradingMode.live ? 'Sent' : 'PAPER fill of'} $${defaultAmount.toFixed(2)} on Pump.fun (${tradingMode.label}). Caller: @${callout.caller.userId} (Avg: ${callout.caller.avgMultiple}x)`
+        `${tradingMode.live ? 'Sent' : 'PAPER fill of'} ${formatSol(amountSol)} on Pump.fun (${tradingMode.label}). Caller: @${callout.caller.userId} (Avg: ${callout.caller.avgMultiple}x)`
       );
       setCallouts((prev) =>
         prev.map((c) => (c.id === callout.id ? { ...c, status: 'SNIPED' } : c))
@@ -374,6 +382,10 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
       {/* ========================================================================= */}
       {subTab === 'CALLOUTS' && (
         <div className="space-y-3">
+          <div className="p-3 rounded-xl bg-[#0F172A] border border-cyan-500/20">
+            <SnipeAmountControl />
+          </div>
+
           {/* Quick Auto-Sniper Status Bar */}
           <div className="flex flex-wrap items-center justify-between gap-3 p-3 rounded-xl bg-gradient-to-r from-[#0F172A] to-[#1E1B4B] border border-cyan-500/30 shadow-lg">
             <div className="flex items-center space-x-2.5">
@@ -818,7 +830,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                               ? 'BUNDLING...'
                               : calloutSnipeBlock(tradingMode.cluster) !== null
                               ? 'MAINNET ONLY'
-                              : calloutSnipeLabel(capitalTier === 'MICRO_10' ? 5 : 25)}
+                              : calloutSnipeLabel(snipeAmount.parsed.ok ? formatSol(snipeAmount.parsed.sol) : 'set amount')}
                           </span>
                         </button>
 

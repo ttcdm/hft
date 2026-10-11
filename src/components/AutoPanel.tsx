@@ -11,6 +11,8 @@ export interface AutoStatusData {
   triggers: Array<{ code: string; message: string }>; slippageBreaches: number;
   session: null | { buys: number; spentSol: number; sessionPnlSol: number; budgetsLeft: { buys: number; spendSol: number; lossSol: number; msLeft: number } };
   budgets: { maxBuys: number; maxSpendSol: number; maxLossFraction: number; maxDurationMs: number };
+  /** S181: bounds the server accepts for the session budget. Absent on an older server. */
+  budgetLimits?: { maxSpendSol: number; minSpendSol: number; maxBuys: number };
   stats: { seen: number; rejectedByStage: Record<string, number>; wouldBuy: number; bought: number; open: number; closed: number; netPnlSol: number; feesPaidSol: number; winRate: number | null };
 }
 
@@ -27,8 +29,33 @@ export function AutoModeBadge({ mode, halted }: { mode: AutoMode | null; halted?
   );
 }
 
-export function AutoPanelView({ status, onMode, onKill, onResume, code, onCode, busy, error }: {
-  status: AutoStatusData | null; onMode?: (m: AutoMode) => void; onKill?: () => void; onResume?: () => void;
+/** S181: edit the session budget (buys and spend, in SOL). The server refuses an out-of-bounds value with its reason; nothing is clamped. */
+export function AutoBudgetEditor({ budgets, limits, onSave, busy }: { budgets: AutoStatusData['budgets']; limits?: AutoStatusData['budgetLimits']; onSave?: (maxBuys: number, maxSpendSol: number) => void; busy?: boolean }) {
+  const [buys, setBuys] = useState(String(budgets.maxBuys));
+  const [spend, setSpend] = useState(String(Number(budgets.maxSpendSol.toFixed(6))));
+  const nBuys = Number(buys), nSpend = Number(spend);
+  let problem: string | null = null;
+  if (!Number.isInteger(nBuys) || nBuys < 1 || nBuys > (limits?.maxBuys ?? 50)) problem = `Max buys must be a whole number from 1 to ${limits?.maxBuys ?? 50}.`;
+  else if (!Number.isFinite(nSpend) || (limits && nSpend < limits.minSpendSol)) problem = `Max spend must cover at least one order (${limits?.minSpendSol} SOL).`;
+  else if (limits && nSpend > limits.maxSpendSol + 1e-9) problem = `Max spend is above the server cap of ${Number(limits.maxSpendSol.toFixed(6))} SOL (3 x MAX_POSITION_SIZE_SOL).`;
+  return (
+    <div className="mb-2 font-mono" data-testid="auto-budget-editor">
+      <div className="text-slate-500 mb-0.5">Session budget</div>
+      <div className="flex items-center gap-1.5">
+        <input data-testid="budget-buys" type="number" step="1" min="1" max={limits?.maxBuys ?? 50} value={buys} onChange={(e) => setBuys(e.target.value)} className="w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
+        <span className="text-slate-500">buys,</span>
+        <input data-testid="budget-spend" type="number" step="0.005" min={limits?.minSpendSol} max={limits?.maxSpendSol} value={spend} onChange={(e) => setSpend(e.target.value)} className="w-20 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
+        <span className="text-slate-500">SOL incl. fees</span>
+        <button data-testid="budget-save" disabled={busy || problem !== null} onClick={() => onSave?.(nBuys, nSpend)} className="ml-auto px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white disabled:opacity-40">Save</button>
+      </div>
+      {problem && <p className="text-rose-400 mt-0.5" data-testid="budget-problem">{problem}</p>}
+      {limits && <p className="text-slate-600 mt-0.5">Up to {Number(limits.maxSpendSol.toFixed(6))} SOL. Kept until the server restarts.</p>}
+    </div>
+  );
+}
+
+export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, code, onCode, busy, error }: {
+  status: AutoStatusData | null; onMode?: (m: AutoMode) => void; onKill?: () => void; onResume?: () => void; onBudget?: (maxBuys: number, maxSpendSol: number) => void;
   code?: string; onCode?: (c: string) => void; busy?: boolean; error?: string | null;
 }) {
   if (!status) return <section className="rounded-lg border border-slate-800 bg-[#0B0F17] p-3 text-xs text-slate-500" data-testid="auto-panel">Auto-snipe: sign in as operator to read the controller.</section>;
@@ -57,6 +84,7 @@ export function AutoPanelView({ status, onMode, onKill, onResume, code, onCode, 
       {status.haltReason && <p className="text-red-400 mb-2" data-testid="halt-reason">ALL TRADING HALTED: {status.haltReason} <button onClick={onResume} className="underline ml-1">clear halt</button></p>}
       {status.killReason && <p className="text-amber-400 mb-1">Killed: {status.killReason}</p>}
       {status.downgradeReason && <p className="text-amber-400 mb-1" data-testid="downgrade-reason">Dropped to SHADOW: {status.downgradeReason}</p>}
+      <React.Fragment key={`${status.budgets.maxBuys}-${status.budgets.maxSpendSol}`}><AutoBudgetEditor budgets={status.budgets} limits={status.budgetLimits} onSave={onBudget} busy={busy} /></React.Fragment>
       <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 mb-2 font-mono">
         <span className="text-slate-500">Buys left</span><span className="text-right">{b ? `${b.buys} / ${status.budgets.maxBuys}` : '—'}</span>
         <span className="text-slate-500">Spend left</span><span className="text-right">{b ? `${fmt(b.spendSol, 4)} SOL` : '—'}</span>
@@ -130,6 +158,7 @@ export function AutoPanel() {
         if (typeof window !== 'undefined' && !window.confirm('KILL AUTO: switch auto to OFF and sell every position it bought. Continue?')) return;
         void post('/api/auto/kill', { exitAll: true, reason: 'operator kill from panel' });
       }}
-      onResume={() => post('/api/auto/resume', { clearHalt: true })} />
+      onResume={() => post('/api/auto/resume', { clearHalt: true })}
+      onBudget={(maxBuys, maxSpendSol) => post('/api/auto/budget', { maxBuys, maxSpendSol })} />
   );
 }

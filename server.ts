@@ -28,6 +28,7 @@ import { FunderLookup, wireFunderLookup } from './server/signals/funderLookup';
 import { buildBoard } from './server/board';
 import { PublicKey } from '@solana/web3.js';
 import { solPriceService } from './server/market/solPriceService';
+import { checkSnipeAmountSol, getSnipeLimits } from './server/execution/snipeAmount';
 import { PumpCurveService } from './server/solana/pumpCurve';
 import { buildCurveDepth } from './server/market/curveDepth';
 import { TradeTape } from './server/market/tradeTape';
@@ -38,6 +39,7 @@ import { liveConfirmationRefusal } from './server/execution/liveConfirmation';
 import {
   ArmSchema,
   AutoModeSchema,
+  AutoBudgetSchema,
   AutoKillSchema,
   AutoResumeSchema,
   CalloutSnipeSchema,
@@ -269,7 +271,8 @@ wss.on('connection', (ws: WebSocket, req: any) => {
           input.data.calloutId,
           input.data.amountUsd,
           input.data.jitoTipSol,
-          input.data.slippagePct
+          input.data.slippagePct,
+          input.data.amountSol
         );
         ws.send(JSON.stringify({ type: 'CALLOUT_SNIPE_RESULT', data: result }));
       }
@@ -289,7 +292,7 @@ wss.on('connection', (ws: WebSocket, req: any) => {
         if (input.status === 'invalid') return rejectWsInput(input.issues);
         const refused = liveGate(parsed); // S1
         if (refused) return void ws.send(JSON.stringify({ type: 'MEMECOIN_SNIPE_RESULT', data: { success: false, message: refused } }));
-        const result = await memecoinAggregator.executeSnipe({ ...input.data, provenance: OPERATOR_PROVENANCE, signalTimestamp: Date.now() });
+        const result = await memecoinAggregator.executeSnipe({ ...withOperatorAmount(input.data), provenance: OPERATOR_PROVENANCE, signalTimestamp: Date.now() });
         ws.send(JSON.stringify({ type: 'MEMECOIN_SNIPE_RESULT', data: result }));
       }
       if (parsed.action === 'CLOSE_POSITION') {
@@ -744,12 +747,18 @@ app.post('/api/social/signals/snipe', requireOperatorAuth, validateTradeBody(Sig
   if (executionCoordinator.isLiveArmed() && existing.verified !== true) {
     return res.status(409).json({ error: 'UNVERIFIED_SIGNAL: refusing to snipe an unverified signal while LIVE is armed' });
   }
+  // S181: an explicit size is judged before the signal is marked, so a refused amount leaves the signal snipeable.
+  if (req.body.amountSol !== undefined) {
+    const check = checkSnipeAmountSol(req.body.amountSol);
+    if (!check.ok) return res.status(422).json({ success: false, status: 'REJECTED', error: check.reason });
+  }
   const sig = socialScanner.markSniped(signalId)!;
 
   // Trigger sniper trade on the aggregator
   const tradeResult = await memecoinAggregator.executeSnipe({
     contractAddress: sig.contractAddress,
     amountUsd: req.body.amountUsd,
+    operatorAmountSol: req.body.amountSol,
     platform: req.body.platform,
     jitoTipSol: req.body.jitoTipSol,
     slippagePct: req.body.slippagePct,
@@ -1063,7 +1072,7 @@ app.get('/api/memecoins/positions', requireOperatorAuth, (req, res) => {
 });
 
 app.post('/api/memecoins/trade', requireOperatorAuth, requireLiveConfirmation, validateTradeBody(OperatorSnipeSchema), async (req, res) => {
-  const result = await memecoinAggregator.executeSnipe({ ...req.body, provenance: OPERATOR_PROVENANCE, signalTimestamp: Date.now() });
+  const result = await memecoinAggregator.executeSnipe({ ...withOperatorAmount(req.body), provenance: OPERATOR_PROVENANCE, signalTimestamp: Date.now() });
 
   res.json({
     status: result.success ? 'OK' : 'REJECTED',
@@ -1128,11 +1137,11 @@ app.get('/api/pumpfun/leaderboard', requireOperatorAuth, (req, res) => {
 });
 
 app.post('/api/pumpfun/callouts/snipe', requireOperatorAuth, validateTradeBody(CalloutSnipeSchema), async (req, res) => {
-  const { calloutId, amountUsd, jitoTipSol, slippagePct } = req.body;
+  const { calloutId, amountUsd, amountSol, jitoTipSol, slippagePct } = req.body;
   const unconfirmed = liveConfirmationRefusal(executionCoordinator.isLiveArmed(), allowedCluster(), req.body); // Q10b
   if (unconfirmed) return res.status(409).json({ success: false, status: 'REJECTED', error: unconfirmed, result: { success: false, message: unconfirmed } });
 
-  const result = await pumpFunService.snipeCallout(calloutId, amountUsd, jitoTipSol, slippagePct);
+  const result = await pumpFunService.snipeCallout(calloutId, amountUsd, jitoTipSol, slippagePct, amountSol);
 
   res.json({
     status: result.success ? 'OK' : 'REJECTED',
@@ -1247,6 +1256,9 @@ app.post('/api/wallet/toggle-trading', requireOperatorAuth, validateTradeBody(Ar
 });
 
 app.post('/api/wallet/snipe', requireOperatorAuth, requireLiveConfirmation, validateBody(LiveSnipeOrderSchema), async (req, res) => {
+  // S181: same refusal-with-a-reason as the other snipe routes (minimum and MAX_POSITION_SIZE_SOL); nothing is clamped.
+  const amountCheck = checkSnipeAmountSol(req.body.amountSol);
+  if (!amountCheck.ok) return res.status(400).json({ success: false, error: amountCheck.reason });
   // The operator's request is the signal; a client-supplied signalTimestamp is ignored so the age check cannot be dodged.
   const result = await walletTrader.executeLiveSnipe({ ...req.body, signalTimestamp: Date.now() });
   if (!result.success) {
@@ -1393,6 +1405,20 @@ app.get('/api/execution/readiness', requireOperatorAuth, (req, res) => {
     success: true,
     ...executionCoordinator.getLiveReadiness(),
   });
+});
+
+/** S181: the schemas carry the client's size as amountSol; the aggregator takes it as operatorAmountSol. */
+function withOperatorAmount<T extends { amountSol?: number }>(body: T): T & { operatorAmountSol?: number } {
+  return { ...body, operatorAmountSol: body.amountSol };
+}
+
+app.get('/api/snipe/limits', requireOperatorAuth, (req, res) => {
+  res.json({ success: true, ...getSnipeLimits(solPriceService.lastKnownPrice()) });
+});
+
+app.post('/api/auto/budget', requireOperatorAuth, validateTradeBody(AutoBudgetSchema), (req, res) => {
+  const result = autoSnipeController.setBudget({ maxBuys: req.body.maxBuys, maxSpendSol: req.body.maxSpendSol });
+  res.status(result.ok ? 200 : 422).json({ success: result.ok, ...result, error: result.reason, status: autoSnipeController.getStatus() });
 });
 
 // G1: auto-snipe controller. Mode lives in memory only, so every restart comes back OFF.

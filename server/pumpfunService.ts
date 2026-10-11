@@ -19,6 +19,7 @@ import {
 } from './signals/confluenceEngine';
 import { ConfluenceBreakdown, SignalProvenance } from './core/types';
 import { autoSnipeController } from './auto/controller';
+import { checkSnipeAmountSol } from './execution/snipeAmount';
 
 interface AutoSnipeRules {
   minCallerWinRate2x: number;
@@ -871,8 +872,14 @@ export class PumpFunService extends EventEmitter {
     calloutId: string,
     amountUsd: number = 5.0,
     jitoTipSol?: number,
-    maxSlippagePct: number = 6.0
+    maxSlippagePct: number = 6.0,
+    operatorAmountSol?: number
   ): Promise<{ success: boolean; message: string; txHash?: string }> {
+    // S181: an explicit size is judged before anything is marked, so a refused amount leaves the callout snipeable.
+    if (operatorAmountSol !== undefined) {
+      const check = checkSnipeAmountSol(operatorAmountSol);
+      if (!check.ok) return { success: false, message: check.reason };
+    }
     const target = calloutId.trim().toLowerCase();
     const callout = this.hotCallouts.find(
       (c) =>
@@ -888,6 +895,7 @@ export class PumpFunService extends EventEmitter {
     const tradeRes = await memecoinAggregator.executeSnipe({
       contractAddress: callout.token.mint,
       amountUsd,
+      operatorAmountSol,
       platform: 'PUMP_FUN',
       jitoTipSol,
       slippagePct: maxSlippagePct,

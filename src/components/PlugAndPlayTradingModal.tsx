@@ -1,5 +1,7 @@
 import { ARMED_MESSAGE, PANIC_CONFIRM_TEXT, panicOutcome } from '../utils/tradingCopy';
 import React, { useState, useEffect } from 'react';
+import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
+import { SnipeAmountControl } from './SnipeAmountControl';
 import {
   Wallet,
   Play,
@@ -77,7 +79,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
 
   // Manual Snipe Input
   const [manualMint, setManualMint] = useState('');
-  const [manualAmountSol, setManualAmountSol] = useState(0.015);
+  const snipeAmount = useSnipeAmount(); // S181: the one saved snipe size
   const [positionSearchQuery, setPositionSearchQuery] = useState('');
   const [selectedExternalToken, setSelectedExternalToken] = useState<any>(null);
 
@@ -197,8 +199,13 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
       return;
     }
 
+    if (!snipeAmount.parsed.ok) {
+      setStatusMessage({ text: snipeAmount.parsed.reason, type: 'error' });
+      return;
+    }
+    const amountSol = snipeAmount.parsed.sol;
     // S1: this button sends a real transaction while LIVE is armed, so it asks first and tells the server it asked
-    const warning = liveClickWarning(tradingMode, `Sniping ${manualMint.trim().slice(0, 8)}… for ${Number(manualAmountSol)} SOL`);
+    const warning = liveClickWarning(tradingMode, `Sniping ${manualMint.trim().slice(0, 8)}… for ${formatSol(amountSol)}`);
     if (warning && !window.confirm(warning)) return;
 
     try {
@@ -208,7 +215,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           mint: manualMint.trim(),
-          amountSol: Number(manualAmountSol),
+          amountSol,
           slippagePct: Number(slippageBps) / 100,
           jitoTipSol: Number(jitoTipSol),
           callerHandle: '@manual_terminal',
@@ -498,14 +505,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                     className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white font-mono focus:border-amber-500 focus:outline-none"
                   />
                   <div className="flex gap-2">
-                    <input
-                      type="number"
-                      step="0.005"
-                      max={riskControls?.maxPositionSol || 0.02}
-                      value={manualAmountSol}
-                      onChange={(e) => setManualAmountSol(parseFloat(e.target.value) || 0.01)}
-                      className="w-24 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 text-xs text-white font-mono"
-                    />
+                    <SnipeAmountControl compact />
                     <button
                       type="button"
                       onClick={handleManualSnipe}

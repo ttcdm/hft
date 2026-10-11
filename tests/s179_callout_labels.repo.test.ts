@@ -38,8 +38,8 @@ describe('S179 callout button labels', () => {
   });
 
   it('the snipe button is a plain SNIPE, and its note says what the send path is', () => {
-    expect(calloutSnipeLabel(5)).toBe('SNIPE ($5)');
-    expect(calloutSnipeLabel(25)).toBe('SNIPE ($25)');
+    expect(calloutSnipeLabel('0.01 SOL')).toBe('SNIPE (0.01 SOL)');
+    expect(calloutSnipeLabel('0.005 SOL')).toBe('SNIPE (0.005 SOL)');
     const note = calloutSendNote(0.00018);
     expect(note).toContain('normal RPC path');
     expect(note).toContain('only if the server has Jito configured');

@@ -12,6 +12,7 @@ import { SignalProvenance, ConfluenceBreakdown, ExecutionMode } from './core/typ
 import { CapitalSizer } from './capital/capitalSizer';
 import { ConfluenceEngine, isConfluencePassed, MIN_CONFLUENCE_SCORE } from './signals/confluenceEngine';
 import { curveVelocityEvaluator } from './signals/curveVelocityEvaluator';
+import { checkSnipeAmountSol } from './execution/snipeAmount';
 
 const INITIAL_POOLS: MemecoinPool[] = [
   {
@@ -484,6 +485,8 @@ export class MemecoinAggregatorService extends EventEmitter {
   public async executeSnipe(params: {
     contractAddress: string;
     amountUsd: number;
+    /** S181: the operator's chosen size in SOL. Checked (refused with a reason, never clamped) and used as is. */
+    operatorAmountSol?: number;
     platform?: string;
     jitoTipSol?: number;
     slippagePct?: number;
@@ -518,6 +521,10 @@ export class MemecoinAggregatorService extends EventEmitter {
     gates?: Record<string, unknown>;
   }> {
     const cleanCa = params.contractAddress.trim();
+
+    // S181: an operator-chosen size is judged first, so a refused amount never costs an RPC read or touches any state.
+    const operatorCheck = params.operatorAmountSol !== undefined ? checkSnipeAmountSol(params.operatorAmountSol) : null;
+    if (operatorCheck && !operatorCheck.ok) return { success: false, message: operatorCheck.reason, txHash: '' };
 
     // Sizing via CapitalSizer (B12): determine spendable bankroll and 10% ceiling
     const executionMode = executionCoordinator.getExecutionMode();
@@ -570,7 +577,11 @@ export class MemecoinAggregatorService extends EventEmitter {
     let amountSol: number;
     let amountUsd: number;
 
-    if (params.amountUsd && params.amountUsd > 0) {
+    if (operatorCheck && operatorCheck.ok) {
+      amountSol = operatorCheck.amountSol;
+      amountUsd = amountSol * this.solPriceUsd;
+      // No 10% clamp here: the coordinator refuses an order above its bankroll ceiling with its own reason.
+    } else if (params.amountUsd && params.amountUsd > 0) {
       amountUsd = params.amountUsd;
       amountSol = amountUsd / this.solPriceUsd;
 

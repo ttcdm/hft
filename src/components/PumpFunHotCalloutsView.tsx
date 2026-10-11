@@ -25,6 +25,7 @@ import {
   Settings,
   Globe,
   Bot,
+  Star,
 } from 'lucide-react';
 import {
   PumpFunHotCallout,
@@ -39,6 +40,10 @@ import {
   sanitizeTelegramUrl,
   isMainnetCluster,
   calloutSnipeBlock,
+  calloutSnipeLabel,
+  calloutSendNote,
+  CALLER_MARK_LABEL,
+  CALLER_MARK_TITLE,
   formatCalloutMcap,
   solscanAccountUrl,
 } from '../utils/tokenLinks';
@@ -224,8 +229,8 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
       );
       onAlertTrigger?.(
         'INFO',
-        `CALLER SUBSCRIPTION UPDATED`,
-        `Auto-snipe for @${userId} is now ${res.caller.isAutoSnipeSubscribed ? 'ENABLED' : 'DISABLED'}`
+        `CALLER MARK UPDATED`,
+        `@${userId} is now ${res.caller.isAutoSnipeSubscribed ? 'marked' : 'unmarked'} (screen marker only)`
       );
     }
   };
@@ -374,13 +379,13 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <Bot className="w-5 h-5 text-cyan-400 animate-pulse" />
               <div>
                 <div className="text-xs font-mono font-bold text-white flex items-center space-x-2">
-                  <span>AUTONOMOUS CALLOUT SNIPER</span>
+                  <span>PUMP.FUN CALLOUTS</span>
                   <span className="text-[10px] px-1.5 py-0.2 rounded bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
-                    JITO MEV BUNDLES
+                    CALLOUTS
                   </span>
                 </div>
                 <div className="text-[11px] text-slate-400">
-                  The per-caller auto-snipe toggle only marks a caller on this screen; nothing buys because of it. Auto trading is controlled in the Auto panel.
+                  Marking a caller only flags them on this screen; nothing buys because of it. Auto trading is controlled in the Auto panel.
                 </div>
               </div>
             </div>
@@ -394,7 +399,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 className="px-3 py-1.5 rounded-lg text-xs font-mono font-bold bg-cyan-600/30 hover:bg-cyan-600/50 text-cyan-300 border border-cyan-500/50 transition flex items-center space-x-1.5"
               >
                 <Award className="w-3.5 h-3.5 text-amber-400" />
-                <span>Manage Subscriptions ({leaderboard.filter(c => c.isAutoSnipeSubscribed).length} Active)</span>
+                <span>Marked callers ({leaderboard.filter(c => c.isAutoSnipeSubscribed).length})</span>
               </button>
             </div>
           </div>
@@ -812,7 +817,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                               ? 'BUNDLING...'
                               : calloutSnipeBlock(tradingMode.cluster) !== null
                               ? 'MAINNET ONLY'
-                              : `1-CLICK JITO ($${capitalTier === 'MICRO_10' ? '5' : '25'})`}
+                              : calloutSnipeLabel(capitalTier === 'MICRO_10' ? 5 : 25)}
                           </span>
                         </button>
 
@@ -822,11 +827,11 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                           </div>
                         ) : (
                           <div className="text-center text-[10px] font-mono text-slate-500">
-                            Jito MEV {rules.jitoPriorityTipSol} SOL Tip
+                            {calloutSendNote(rules.jitoPriorityTipSol)}
                           </div>
                         )}
 
-                        {/* Caller Auto-Snipe Toggle */}
+                        {/* Caller marker (a screen flag, not a trading switch) */}
                         <button
                           onClick={() => handleToggleAutoSnipe(c.caller.userId)}
                           className={`w-full py-1 px-2 rounded text-[10px] font-mono font-bold transition flex items-center justify-center space-x-1 border ${
@@ -834,10 +839,10 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                               ? 'bg-rose-500/20 text-rose-300 border-rose-500/50 shadow-sm'
                               : 'bg-[#141B2D] text-slate-400 border-[#1E293B] hover:text-white hover:border-slate-600'
                           }`}
-                          title={c.caller.isAutoSnipeSubscribed ? 'Click to unmark this caller (a screen marker only; nothing buys because of it)' : 'Click to mark this caller (a screen marker only; nothing buys because of it)'}
+                          title={CALLER_MARK_TITLE(c.caller.isAutoSnipeSubscribed)}
                         >
-                          <Bot className="w-3 h-3 text-cyan-400" />
-                          <span>{c.caller.isAutoSnipeSubscribed ? 'AUTO-SNIPE: ON' : 'AUTO-SNIPE: OFF'}</span>
+                          <Star className={`w-3 h-3 ${c.caller.isAutoSnipeSubscribed ? 'text-amber-300 fill-amber-300' : 'text-cyan-400'}`} />
+                          <span>{CALLER_MARK_LABEL(c.caller.isAutoSnipeSubscribed)}</span>
                         </button>
                       </div>
                     </div>
@@ -877,7 +882,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
             </div>
 
             <div className="text-[11px] text-slate-400">
-              Toggle <span className="text-rose-400 font-bold">Auto-Snipe</span> to snipe whenever that specific caller drops a callout (a real transaction only when LIVE is armed)
+              <span className="text-rose-400 font-bold">Mark</span> a caller to flag them on this screen. Marking does not buy anything; auto trading is controlled in the Auto panel.
             </div>
           </div>
 
@@ -892,7 +897,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                   <th className="py-2.5 px-3">Time to Peak</th>
                   <th className="py-2.5 px-3">Total Calls</th>
                   <th className="py-2.5 px-3">Top Hall-of-Fame Calls</th>
-                  <th className="py-2.5 px-3 text-right">Auto-Snipe</th>
+                  <th className="py-2.5 px-3 text-right">Marked</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#1E293B]">
@@ -983,7 +988,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                             : 'bg-[#141B2D] text-slate-400 border-[#1E293B] hover:text-white hover:border-slate-700'
                         }`}
                       >
-                        {caller.isAutoSnipeSubscribed ? 'AUTO-SNIPE ON' : 'OFF'}
+                        {caller.isAutoSnipeSubscribed ? 'MARKED' : 'MARK'}
                       </button>
                     </td>
                   </tr>
@@ -1279,8 +1284,8 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 }`}
               >
                 {selectedCallerModal.isAutoSnipeSubscribed
-                  ? 'Auto-Snipe Subscribed (Click to Disable)'
-                  : 'Subscribe to Auto-Snipe this Caller'}
+                  ? 'Caller marked (click to unmark)'
+                  : 'Mark this caller (screen marker only)'}
               </button>
             </div>
           </div>

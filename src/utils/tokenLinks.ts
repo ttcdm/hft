@@ -323,3 +323,18 @@ export function calloutSnipeBlock(cluster?: string | null): string | null {
 export function formatCalloutMcap(v: number | null | undefined): string {
   return v === null || v === undefined || !Number.isFinite(v) || v <= 0 ? 'unknown' : `$${Math.round(v).toLocaleString()}`;
 }
+
+/** S179: what the callout snipe button says. It is a normal snipe; Jito is only a transport the server may or may not have configured. */
+export function calloutSnipeLabel(amountUsd: number): string {
+  return `SNIPE ($${amountUsd})`;
+}
+
+/** S179: the line under the snipe button. The tip is paid only when the server has a Jito block engine configured (never on devnet / localnet). */
+export function calloutSendNote(tipSol: number): string {
+  return `Sent over the normal RPC path. Jito tip ${tipSol} SOL only if the server has Jito configured (devnet: never).`;
+}
+
+/** S179: the per-caller marker is a screen flag. Nothing buys because of it. */
+export const CALLER_MARK_LABEL = (on: boolean): string => (on ? 'CALLER MARKED' : 'MARK CALLER');
+export const CALLER_MARK_TITLE = (on: boolean): string =>
+  on ? 'Unmark this caller (a screen marker only; nothing buys because of it)' : 'Mark this caller (a screen marker only; nothing buys because of it)';

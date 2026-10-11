@@ -1,4 +1,5 @@
 import React from 'react';
+import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { X, Timer } from 'lucide-react';
 import { usePolled } from '../utils/usePolled';
 
@@ -46,6 +47,7 @@ export function ExecutionLatencyView({ data, error }: { data: LatencyData | null
 
 export const ExecutionLatencyModal: React.FC<{ isOpen: boolean; onClose: () => void }> = ({ isOpen, onClose }) => {
   const { data, error } = usePolled<LatencyData>('/api/system/latency', 10000, isOpen);
+  useEscapeToClose(isOpen, onClose);
   if (!isOpen) return null;
   return (
     <div className="fixed inset-0 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 z-50 font-mono">

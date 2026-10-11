@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { Sparkles, Brain, Search, Send, X, ShieldAlert, Cpu } from 'lucide-react';
 import { authFetch } from '../services/engineClient';
 
@@ -20,6 +21,7 @@ export const AiDiagnosticsModal: React.FC<AiDiagnosticsModalProps> = ({ isOpen, 
   const [result, setResult] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
 
+  useEscapeToClose(isOpen, onClose);
   if (!isOpen) return null;
 
   const handleRunAnalysis = async () => {

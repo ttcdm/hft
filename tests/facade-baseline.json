@@ -161,6 +161,5 @@
 "tests/v1_ui_labels.test.ts::Plug & Play carries no static LIVE badge (the mode pill shows the real mode)",
 "tests/v1_ui_labels.test.ts::left-aligned headers do not also carry text-right (CSS order made the right one win)",
 "tests/v1_ui_labels.test.ts::no 30 / 120 / 85 / 142 fallbacks for tokens monitored and latency",
-"tests/v1_ui_labels.test.ts::the Deploy button does not claim a CME / NY4 engine",
 "tests/v1_ui_labels.test.ts::the wide-only nav badge and the AUTH label are hidden below their breakpoints"
 ]

@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { KeyRound, Lock, ShieldCheck, AlertCircle, Eye, EyeOff, X, Terminal, CheckCircle2 } from 'lucide-react';
 import { setOperatorSessionToken } from '../services/engineClient';
 
@@ -34,6 +35,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
     }
   }, [isOpen]);
 
+  useEscapeToClose(isOpen, onClose);
   if (!isOpen) return null;
 
   const handleValidateAndSubmit = async (e: React.FormEvent) => {

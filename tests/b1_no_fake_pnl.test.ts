@@ -1,20 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import { INITIAL_BOTS, makeEmptyKpis } from '../src/App';
+import { makeEmptyKpis } from '../src/App';
 
 describe('B1: the UI does not fabricate PnL', () => {
-  it('seeds every bot with zero performance and not running', () => {
-    expect(INITIAL_BOTS.length).toBeGreaterThan(0);
-    for (const bot of INITIAL_BOTS) {
-      expect(bot.pnl, `${bot.id} pnl`).toBe(0);
-      expect(bot.winRate, `${bot.id} winRate`).toBe(0);
-      expect(bot.tradesCount, `${bot.id} tradesCount`).toBe(0);
-      expect(bot.opsPerSec, `${bot.id} opsPerSec`).toBe(0);
-      expect(bot.isRunning, `${bot.id} isRunning`).toBe(false);
-    }
-  });
-
   it('starts KPIs at zero apart from the starting equity', () => {
     const kpis = makeEmptyKpis(10);
     const { totalEquity, peakEquity, ...rest } = kpis;

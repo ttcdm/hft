@@ -1,32 +1,5 @@
-export type StrategyArchetype =
-  | 'MARKET_MAKING'
-  | 'STATISTICAL_ARBITRAGE'
-  | 'ORDER_BOOK_IMBALANCE'
-  | 'LATENCY_ARBITRAGE'
-  | 'MOMENTUM_SCALPING';
-
-export type AssetClass = 'CRYPTO' | 'EQUITIES' | 'FX' | 'COMMODITIES';
-
 export type OrderSide = 'BUY' | 'SELL';
 export type OrderStatus = 'FILLED' | 'PARTIALLY_FILLED' | 'CANCELLED' | 'REJECTED';
-
-export interface TradingBot {
-  id: string;
-  name: string;
-  archetype: StrategyArchetype;
-  assetClass: AssetClass;
-  symbol: string;
-  isRunning: boolean;
-  winRate: number;
-  pnl: number;
-  tradesCount: number;
-  opsPerSec: number;
-  maxDailyLoss: number;
-  slippageLimitBps: number;
-  leverage: number;
-  gamma?: number; // Risk aversion
-  kappa?: number; // Order intensity
-}
 
 export interface OrderBookEntry {
   price: number;

@@ -1,4 +1,5 @@
 import React from 'react';
+import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { X, Cpu } from 'lucide-react';
 import { usePolled } from '../utils/usePolled';
 import type { AutoStatusData } from './AutoPanel';
@@ -55,6 +56,7 @@ export function AutoPipelineView({ auto, watch, error, onOpenHftConsole }: { aut
 export const AutoPipelineModal: React.FC<{ isOpen: boolean; onClose: () => void; onOpenHftConsole?: () => void }> = ({ isOpen, onClose, onOpenHftConsole }) => {
   const a = usePolled<AutoStatusData>('/api/auto/status', 4000, isOpen);
   const w = usePolled<WatchSnapshotData>('/api/watch', 4000, isOpen);
+  useEscapeToClose(isOpen, onClose);
   if (!isOpen) return null;
   return (
     <div className="fixed inset-0 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 z-50 font-mono">

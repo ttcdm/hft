@@ -1,4 +1,5 @@
 import { ARMED_MESSAGE, PANIC_CONFIRM_TEXT, panicOutcome } from '../utils/tradingCopy';
+import { useEscapeToClose } from '../utils/useEscapeToClose';
 import React, { useState, useEffect } from 'react';
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { SnipeAmountControl } from './SnipeAmountControl';
@@ -273,6 +274,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
     }
   };
 
+  useEscapeToClose(isOpen, onClose);
   if (!isOpen) return null;
 
   return (

@@ -52,7 +52,7 @@ describe('H3: auto-snipe panel', () => {
     expect(renderToStaticMarkup(<AutoModeBadge mode="SHADOW" />)).toContain('AUTO: SHADOW');
     expect(renderToStaticMarkup(<AutoModeBadge mode={null} />)).toContain('AUTO: —');
     const html = renderToStaticMarkup(
-      <Header kpis={{} as any} isHalted={false} onToggleKillSwitch={() => undefined} onOpenDeployModal={() => undefined} onOpenAiDiagnostics={() => undefined}
+      <Header kpis={{} as any} isHalted={false} onToggleKillSwitch={() => undefined} onOpenAiDiagnostics={() => undefined}
         onOpenUnitTests={() => undefined} onOpenGatewayModal={() => undefined} onOpenEngineConsole={() => undefined} activeFeed="CME_AURORA" onSelectFeed={() => undefined}
         capitalTier="MICRO_10" onToggleCapitalTier={() => undefined} />
     );

@@ -1,4 +1,5 @@
 import { signalFeedBadge } from '../utils/signalBadge';
+import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { probeBadge, probeLatency, hostOfService } from '../utils/probeBadge';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
 import { buildPoolSnipeRequest } from '../utils/poolSnipe';
@@ -360,6 +361,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     }
   };
 
+  useEscapeToClose(isOpen, onClose);
   if (!isOpen) return null;
 
   // Filtered pools

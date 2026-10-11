@@ -1,4 +1,5 @@
 import React from 'react';
+import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { X, TrendingUp } from 'lucide-react';
 import { usePolled } from '../utils/usePolled';
 
@@ -86,6 +87,7 @@ interface BacktestModalProps { isOpen: boolean; onClose: () => void }
 
 export const BacktestModal: React.FC<BacktestModalProps> = ({ isOpen, onClose }) => {
   const { data, error } = usePolled<ReplayResponse>('/api/backtest/replay', 30000, isOpen);
+  useEscapeToClose(isOpen, onClose);
   if (!isOpen) return null;
   return (
     <div className="fixed inset-0 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 z-50 font-mono">

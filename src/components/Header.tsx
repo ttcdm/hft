@@ -4,7 +4,6 @@ import {
   Activity,
   AlertOctagon,
   Cpu,
-  PlusCircle,
   Volume2,
   VolumeX,
   Sparkles,
@@ -38,7 +37,6 @@ interface HeaderProps {
   kpis: PerformanceKPIs;
   isHalted: boolean;
   onToggleKillSwitch: () => void;
-  onOpenDeployModal: () => void;
   onOpenAiDiagnostics: () => void;
   onOpenSystemChecks: () => void;
   onOpenAutoPipeline: () => void;
@@ -62,7 +60,6 @@ export const Header: React.FC<HeaderProps> = ({
   kpis,
   isHalted,
   onToggleKillSwitch,
-  onOpenDeployModal,
   onOpenAiDiagnostics,
   onOpenSystemChecks,
   onOpenAutoPipeline,
@@ -396,22 +393,6 @@ export const Header: React.FC<HeaderProps> = ({
             <span className="hidden min-[1440px]:inline">{isOperatorAuthenticated ? 'AUTH' : 'LOG IN'}</span>
           </button>
         )}
-
-        {/* Deploy Strategy Button */}
-        <button
-          id="btn-deploy-algorithm"
-          onClick={onOpenDeployModal}
-          disabled={isHalted}
-          className={`px-2.5 sm:px-3 py-1 rounded-lg text-xs font-semibold font-mono transition flex items-center space-x-1 shadow-sm ${
-            isHalted
-              ? 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700'
-              : 'bg-gradient-to-r from-blue-600 to-cyan-600 hover:from-blue-500 hover:to-cyan-500 text-white border border-cyan-400/30 shadow-cyan-500/20'
-          }`}
-          title="Deploy a new Algorithmic High-Frequency Strategy"
-        >
-          <PlusCircle className="w-3.5 h-3.5" />
-          <span className="hidden sm:inline">Deploy</span>
-        </button>
 
         {/* Sound toggle */}
         <button

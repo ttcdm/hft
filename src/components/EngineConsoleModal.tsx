@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { useEscapeToClose } from '../utils/useEscapeToClose';
 import {
   Activity,
   Zap,
@@ -125,6 +126,7 @@ export const EngineConsoleModal: React.FC<EngineConsoleModalProps> = ({
     }
   }, [walEntries, autoScrollWal]);
 
+  useEscapeToClose(isOpen, onClose);
   if (!isOpen) return null;
 
   const isRunning = telemetry?.status === 'RUNNING';

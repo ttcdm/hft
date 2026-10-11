@@ -1,4 +1,5 @@
 import React from 'react';
+import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { X, RefreshCw } from 'lucide-react';
 import { usePolled } from '../utils/usePolled';
 
@@ -39,6 +40,7 @@ export function SystemChecksView({ data, error }: { data: SystemChecksData | nul
 
 export const SystemChecksModal: React.FC<{ isOpen: boolean; onClose: () => void }> = ({ isOpen, onClose }) => {
   const { data, error } = usePolled<SystemChecksData>('/api/system/checks', 5000, isOpen);
+  useEscapeToClose(isOpen, onClose);
   if (!isOpen) return null;
   return (
     <div className="fixed inset-0 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 z-50 font-mono">

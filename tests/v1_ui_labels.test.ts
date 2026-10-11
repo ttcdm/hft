@@ -12,9 +12,6 @@ describe('V1/V2: labels match what the control really is', () => {
   it('Plug & Play carries no static LIVE badge (the mode pill shows the real mode)', () => {
     expect(header).not.toMatch(/LIVE ⚡/);
   });
-  it('the Deploy button does not claim a CME / NY4 engine', () => {
-    expect(read('src/components/DeployBotModal.tsx')).not.toMatch(/CME \/ NY4/);
-  });
 });
 
 describe('V1: header fits at 1280px (kill switch must never be pushed off screen)', () => {

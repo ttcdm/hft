@@ -45,7 +45,7 @@ import { workstationDb } from '../db/database';
 import { getRandomJitoTipAccount, TOKEN_2022_PROGRAM_ID } from '../solana/programs';
 import { executionConfig } from '../solana/executionConfig';
 import { Logger, endpointOrigin } from '../middleware/enterprise';
-import { allowedCluster, assertClusterAllowed, assertSendClusterAllowed, resolveRpcUrl } from '../solana/clusterGuard';
+import { allowedCluster, assertClusterAllowed, assertClusterAllowedCached, assertSendClusterAllowed, rememberGenesisCheck, resolveRpcUrl } from '../solana/clusterGuard';
 import { PumpCurveService, TradeQuote, PumpMarketState, fetchTokenHolderDistribution } from '../solana/pumpCurve';
 import { TradeReconciler, RealMarkPriceService, PreTradeSnapshot } from './reconciliation';
 export type { PreTradeSnapshot };
@@ -280,6 +280,7 @@ export class ExecutionCoordinator {
   private async verifyCluster(): Promise<boolean> {
     try {
       await assertClusterAllowed(this.connection);
+      rememberGenesisCheck(this.connection); // S208: readiness warms the send-path cache
       this.clusterProblem = null;
       return true;
     } catch (err: any) {
@@ -470,6 +471,7 @@ export class ExecutionCoordinator {
         confirmTransactionInitialTimeout: 30000,
       });
       await assertClusterAllowed(newConn);
+      rememberGenesisCheck(newConn);
       const t0 = performance.now();
       await newConn.getSlot('processed');
       const latency = Math.round(performance.now() - t0);
@@ -1443,7 +1445,7 @@ export class ExecutionCoordinator {
     // unless the RPC reports the allowed cluster's genesis hash (devnet unless Mike set ALLOWED_CLUSTER).
     try {
       assertSendClusterAllowed(); // mainnet is never a send target, even when the RPC reports its genesis
-      await assertClusterAllowed(this.connection);
+      await assertClusterAllowedCached(this.connection); // S208: a pass is remembered per Connection for 60 s
     } catch (err: any) {
       Logger.error(`[R1] ${side} for order ${orderId} blocked: ${err.message}`);
       workstationDb.logJournal('CLUSTER_GUARD_BLOCK', correlationId, 'LIVE', { orderId, side, mint, error: err.message });

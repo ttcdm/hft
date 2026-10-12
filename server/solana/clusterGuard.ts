@@ -143,3 +143,37 @@ export async function assertClusterAllowed(
   }
   return { cluster, genesisHash };
 }
+
+/** S208: how long a passed genesis check is trusted for the same Connection object. */
+export const GENESIS_CHECK_TTL_MS = 60_000;
+
+type GenesisCheck = { cluster: AllowedCluster; expected: string; at: number };
+const passedGenesisChecks = new WeakMap<object, GenesisCheck>();
+
+/** Record that `connection` just passed `assertClusterAllowed`, so the next sends can skip the genesis RPC call for GENESIS_CHECK_TTL_MS. */
+export function rememberGenesisCheck(connection: object, env: NodeJS.ProcessEnv = process.env, now = Date.now()): void {
+  passedGenesisChecks.set(connection, { cluster: allowedCluster(env), expected: expectedGenesisHash(env), at: now });
+}
+
+/**
+ * `assertClusterAllowed` for the send path, without a genesis RPC call on every order. A pass is remembered per Connection object for
+ * GENESIS_CHECK_TTL_MS. A new Connection (RPC change or failover), a changed ALLOWED_CLUSTER or an expired entry checks again, and a failure is never
+ * remembered. The localnet loopback check is cheap and always runs. The mainnet-beta refusal is `assertSendClusterAllowed`, which stays uncached.
+ */
+export async function assertClusterAllowedCached(
+  connection: Pick<Connection, 'getGenesisHash'> & { rpcEndpoint?: string },
+  env: NodeJS.ProcessEnv = process.env,
+  now = Date.now()
+): Promise<{ cluster: AllowedCluster; genesisHash: string }> {
+  const cluster = allowedCluster(env);
+  const hit = passedGenesisChecks.get(connection);
+  if (hit && hit.cluster === cluster && hit.expected === expectedGenesisHash(env) && now - hit.at < GENESIS_CHECK_TTL_MS) {
+    if (cluster === 'localnet' && (!connection.rpcEndpoint || !isLoopbackUrl(connection.rpcEndpoint))) {
+      throw new ClusterGuardError('localnet requires a loopback RPC endpoint; refusing to send');
+    }
+    return { cluster, genesisHash: hit.expected };
+  }
+  const res = await assertClusterAllowed(connection, env);
+  rememberGenesisCheck(connection, env, now);
+  return res;
+}

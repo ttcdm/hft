@@ -36,10 +36,6 @@ MICRO_10_USD=1 SYMBOL=btcusdt ./target/release/apex_hft_engine
 MICRO_10_USD=0 SYMBOL=btcusdt ./target/release/apex_hft_engine
 ```
 
-## Latency Benchmarks (unverified)
+## Latency
 
-The three figures below were written in an earlier version of this file. This project has never measured them; treat them as a claim, not a result.
-
-- **Tick-to-Trade Decision Latency**: ~1.1µs - 2.4µs
-- **Pre-Trade Risk Gateway Evaluation**: ~45 nanoseconds
-- **L2 Order Book Level Update**: ~120 nanoseconds
+No latency figure is given here. Earlier versions of this file quoted microsecond and nanosecond numbers; this project never measured them, so they were removed.

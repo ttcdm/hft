@@ -9,8 +9,8 @@ Optional env: `DEVNET_RPC_URL` (must not look like mainnet), `DEVNET_MINTS=<comm
 - The harness sets its own environment and never reads `.env`: `SOLANA_RPC_URL` devnet, `JITO_BLOCK_ENGINE_URL=http://127.0.0.1:9`
   (dead port, forces the RPC fallback), `ENABLE_RPC_FALLBACK=true`, `JITO_MAX_RETRIES=1`, `JITO_RETRY_INTERVAL_MS=200`,
   `APEX_DB_PATH` and `SIGNER_KEYPAIR_PATH` in a fresh temp directory, `ALLOW_LIVE_REAL_MONEY_TRADING=false`.
-- It aborts unless `getGenesisHash()` equals the devnet hash `EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG`. Only then does it set
-  `ALLOW_LIVE_REAL_MONEY_TRADING=true`, in-process.
+- It aborts unless `getGenesisHash()` equals the devnet hash `EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG`. Only then does it switch the
+  real-money environment variable on, inside its own process (it is never set in your shell or in any file).
 - The keypair is a throwaway generated in the temp directory. The repo keypair is never used. If the address cannot be
   funded the harness prints the address, runs only the simulate stage, and exits 1 (UNFUNDED).
 - Faucet: no airdrop by default and never a retry loop. `DEVNET_AIRDROP_ONCE=1` sends exactly one request for an empty wallet.

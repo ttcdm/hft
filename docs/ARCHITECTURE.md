@@ -1,6 +1,6 @@
 # Architecture
 
-A short map of the code and three diagrams of the parts that decide whether SOL moves. It describes what the code does at commit 1a80181 plus the docs patches, not what it was meant to do. **Devnet and localnet only**: nothing here is a route to mainnet or real-money trading.
+A short map of the code and three diagrams of the parts that decide whether SOL moves. It describes what the code does at commit 1a80181 plus patches 199 to 205, not what it was meant to do. **Devnet and localnet only**: nothing here is a route to mainnet or real-money trading.
 
 `tests/architecture_docs.test.ts` checks that every path named below exists and that every function named in a diagram node is still defined in the file shown under it. It cannot check that an arrow still points the right way, so read a diagram against the code when you change the flow it shows.
 
@@ -37,7 +37,7 @@ A short map of the code and three diagrams of the parts that decide whether SOL 
 
 ## 1. Trade lifecycle
 
-From a launch on the feed (or a manual click) to a closed position. The auto path is the left column. Manual snipe routes, hot callouts, social signals and the Telegram command join at `executeSnipe`. Two operator routes (`POST /api/execution/trade` and `POST /api/wallet/snipe`) skip `executeSnipe` and call `executeTrade` directly, so they skip the pool-level checks and the confluence gate in the `executeSnipe` box (`executeTrade` still runs its own on-chain eligibility check, section 3). Every box is a real function; the file is on the second line.
+From a launch on the feed (or a manual click) to a closed position. The auto path is the left column. Auto candidates from the pump feed watch window, auto-snipe callouts (`server/pumpfunService.ts`) and aggregator signals (`server/memecoinAggregator.ts`) all go to `submitCandidate`. Manual snipe routes, the hot-callout snipe button, social signals and the Telegram command join at `executeSnipe` without passing the auto gates. Two operator routes (`POST /api/execution/trade` and `POST /api/wallet/snipe`) skip `executeSnipe` and call `executeTrade` directly, so they skip the pool-level checks and the confluence gate in the `executeSnipe` box (`executeTrade` still runs its own on-chain eligibility check, section 3). Boxes name a function or a route (the file is on the second line); `tests/architecture_docs.test.ts` checks that each named function exists in its file, not that the arrows are right.
 
 ```mermaid
 flowchart TD
@@ -67,7 +67,8 @@ flowchart TD
   pos --> exits["evaluateAndProcessExits<br/>coordinator.ts"]
   exits --> rule["evaluate<br/>exitEngine.ts"]
   rule -->|"stop, trailing stop, take-profit, stale, or manual close"| close["closePosition<br/>coordinator.ts"]
-  close --> sell["reconcileSellTransaction<br/>reconciliation.ts"]
+  close -->|"LIVE position"| sell["reconcileSellTransaction<br/>reconciliation.ts"]
+  close -->|"PAPER position"| psell["executePaperSell<br/>paperEngine.ts"]
 ```
 
 Things worth knowing when you read it:
@@ -76,11 +77,11 @@ Things worth knowing when you read it:
 - The manual routes do not go through the auto controller or its watch window. `POST /api/memecoins/trade`, the callout snipe, the social snipe and the WebSocket snipe run the `executeSnipe` checks; `POST /api/execution/trade` and `POST /api/wallet/snipe` run only `executeTrade`'s own checks (section 3). Those include the on-chain eligibility filter (freeze authority, creator and top-10 share) in both PAPER and LIVE, but there is no confluence gate and no `executeSnipe` pool check on those two; they use no pools, so the placeholder-pool question does not arise.
 - A `HOT` release has already cleared the confluence threshold inside the window; a `READY` release is checked against it again before the buy. One threshold serves both (`server/signals/confluenceThreshold.ts`).
 - In PAPER the fill is priced from the real curve when it can be read; otherwise a flat model is used and the position is marked unverified.
-- `executeSnipe` can build a "pool" for a mint it has no market data for. The auto controller passes `noSyntheticPool`, so auto never trades against one; manual PAPER snipes still can. Those placeholder pools carry fixed liquidity and price figures; they are marked `unverified` or given `SYNTHETIC_TEST` provenance, and LIVE refuses that provenance.
+- `executeSnipe` can build a "pool" for a mint it has no market data for. The auto controller passes `noSyntheticPool`, which refuses the demo pools and `pool-simulated-*` ones; manual PAPER snipes can still use those. A `pool-callout-*` placeholder (built from a hot callout when the curve could not be read, never in LIVE) is not on that refusal list, so a PAPER or SHADOW candidate from a callout can reach one. Those placeholder pools carry fixed liquidity and price figures; they are marked `unverified` or given `SYNTHETIC_TEST` provenance, and LIVE refuses that provenance.
 
 ## 2. Auto mode states
 
-Modes live in memory only, so every start is OFF. An operator moves a mode up. The server moves it down (to SHADOW or OFF), and puts a PAPER session back after a readiness-only downgrade.
+Modes live in memory only, so every start is OFF. An operator can call `setMode` to any target its checks allow, in either direction (the diagram draws the usual upward arrows only). The server moves a mode down (to SHADOW or OFF) and puts a PAPER session back after a readiness-only downgrade.
 
 ```mermaid
 stateDiagram-v2
@@ -99,8 +100,9 @@ stateDiagram-v2
   SHADOW --> OFF: kill
   DEVNET_LIVE --> OFF: kill, or auditWallet finds an unexplained balance change
   note right of SHADOW
-    All gates run and the decision is journalled as WOULD_BUY.
-    Nothing is sent. Exits keep running.
+    The auto gates and the executeSnipe checks run, then the PAPER
+    gates through previewBuy (never the LIVE-only checks); the decision
+    is journalled as WOULD_BUY. Nothing is sent. Exits keep running.
   end note
   note right of DEVNET_LIVE
     One open position, devnet or localnet only.
@@ -108,7 +110,7 @@ stateDiagram-v2
   end note
 ```
 
-Budget limits (buys, spend, loss, time) are checked when a candidate arrives and when the status is read, so a quiet session whose time limit has passed drops to SHADOW when someone next looks or the next candidate comes. The operator can also call `setMode` directly to any target its checks allow (the arrows above show the conditions, not who may fire them). The operator kill switch (`POST /api/execution/kill-switch`) disarms the coordinator but does not touch the auto mode: auto then stays labelled `DEVNET_LIVE` and rejects every candidate with a mode error until an operator changes it. An unexplained wallet balance change also calls `haltAll`. That halt stops every buy, is written to the database so it survives a restart, and is cleared only by `POST /api/auto/resume` with `clearHalt`. Protective exits still run while halted. Read-only mode allows OFF, SHADOW and PAPER only.
+Budget limits (buys, spend, loss, time) are checked when a candidate arrives and when the status is read, so a quiet session whose time limit has passed drops to SHADOW when someone next looks or the next candidate comes. The operator can also call `setMode` directly to any target its checks allow (the arrows above show the conditions, not who may fire them). The operator kill switch (`POST /api/execution/kill-switch`) disarms the coordinator but does not touch the auto mode: auto then stays labelled `DEVNET_LIVE` and rejects every candidate with a mode error until an operator changes it. A kill trigger that drops `DEVNET_LIVE` to SHADOW leaves the coordinator armed LIVE: auto stops buying, but the manual routes can still send, and an operator has to disarm. An unexplained wallet balance change also calls `haltAll`. That halt stops every buy, is written to the database so it survives a restart, and is cleared only by `POST /api/auto/resume` with `clearHalt`. While halted, only stop-loss, trailing-stop, emergency and manual closes run; take-profit and stale-position exits are refused until the halt is cleared (`PROTECTIVE_EXIT_REASONS` in `server/execution/coordinator.ts`). Read-only mode allows OFF, SHADOW and PAPER only.
 
 ## 3. What a live send must pass
 
@@ -118,11 +120,11 @@ LIVE means a signed transaction on devnet or localnet. Everything on the left mu
 flowchart TD
   subgraph arm["To arm: armLiveTrading"]
     a0["not read-only"] --> a1["confirmation code<br/>CONFIRM_LIVE_TRADING_RISK"]
-    a1 --> a2["ALLOW_LIVE_REAL_MONEY_TRADING is true"]
+    a1 --> a2["the real-money environment switch is on"]
     a2 --> a2b["ALLOWED_CLUSTER is not mainnet-beta"]
     a2b --> a3["getLiveReadiness<br/>coordinator.ts"]
   end
-  a3 -.-> a3g["signer READY, balance above the 0.015 SOL reserve, database writable,<br/>startup reconciliation EXECUTION_READY, RPC HEALTHY,<br/>no halt, kill switch off, circuit breaker closed, Jito ready or not configured"]
+  a3 -.-> a3g["signer READY, balance above the 0.015 SOL reserve, database writable,<br/>startup reconciliation EXECUTION_READY, RPC HEALTHY,<br/>position mark feed healthy, no halt, kill switch off, circuit breaker closed, Jito ready or not configured"]
   a3 --> t0
   subgraph trade["For each trade: executeTrade"]
     t0["not halted, LIVE not refused by read-only,<br/>mode matches if the caller named one"] --> t1["provenance is a real source<br/>and signal timestamp is present"]

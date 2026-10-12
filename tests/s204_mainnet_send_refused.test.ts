@@ -5,6 +5,11 @@ import { CLUSTER_GENESIS_HASH, ClusterGuardError, assertSendClusterAllowed } fro
 import { PumpCurveService } from '../server/solana/pumpCurve';
 import { localSigner } from '../server/solana/signer';
 import { workstationDb } from '../server/db/database';
+import { PumpSwapVenueService } from '../server/solana/pumpSwapService';
+import { txBuilder } from '../server/solana/transactionBuilder';
+import { TradeReconciler } from '../server/execution/reconciliation';
+import { MockSolanaRpc } from './e2e/helpers/mockRpc';
+import { VALID_PUMP_MINT_1, DUMMY_FEE_RECIPIENT, createSimulatedBondingCurveState } from './e2e/helpers/simulatedStates';
 
 /**
  * S204: Mike decided that nothing in this build may arm LIVE, sign or send on mainnet, even with ALLOWED_CLUSTER=mainnet-beta and an RPC that
@@ -102,6 +107,51 @@ describe('S204 a mainnet setting never reaches a send', () => {
       expect(await (c as any).verifyCluster()).toBe(true);
     } finally {
       c.cleanup();
+    }
+  });
+});
+
+describe('S204 the exit path: closePosition on a LIVE position', () => {
+  it('a stop-loss sell is refused on a mainnet setting and nothing is broadcast, even with a mainnet genesis from the RPC', async () => {
+    vi.stubEnv('ALLOWED_CLUSTER', 'mainnet-beta');
+    const kp = Keypair.generate();
+    const mockRpc = new MockSolanaRpc();
+    vi.spyOn(localSigner, 'getStatus').mockReturnValue('READY');
+    vi.spyOn(localSigner, 'getPublicKey').mockReturnValue(kp.publicKey);
+    vi.spyOn(localSigner, 'signTransaction').mockImplementation(async (tx: any) => tx);
+    PumpCurveService.cachedGlobal = { feeRecipient: DUMMY_FEE_RECIPIENT.toBase58() } as any;
+    PumpCurveService.cachedFeeConfig = { feeBps: 100 } as any;
+    const c = new ExecutionCoordinator(mockRpc.createConnection());
+    const conn = (c as any).connection;
+    conn.simulateTransaction = vi.fn(async () => ({ context: { slot: 1 }, value: { err: null, logs: [], unitsConsumed: 1 } }));
+    vi.spyOn(conn, 'getGenesisHash').mockResolvedValue(MAINNET);
+    const send = vi.spyOn(conn, 'sendRawTransaction');
+    vi.spyOn(c.getJitoTransport(), 'getTipFloorLamports').mockResolvedValue(null as any); // the public tip-floor service is a network call; none in tests
+    vi.spyOn(PumpSwapVenueService, 'resolveVenue').mockResolvedValue({ venue: 'PUMP_BONDING_CURVE' } as any);
+    vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockResolvedValue(createSimulatedBondingCurveState());
+    vi.spyOn(PumpCurveService, 'calculateSellQuote').mockReturnValue({ expectedJitoTipLamports: 0, minOutputLamports: 1 } as any);
+    vi.spyOn(txBuilder, 'buildSellTransaction').mockResolvedValue({} as any);
+    vi.spyOn(TradeReconciler, 'capturePreTradeSnapshot').mockResolvedValue({ walletSolLamports: 1e9, tokenBalanceRaw: '1000000000', tokenDecimals: 6, timestamp: Date.now() });
+    vi.spyOn(c, 'canExecuteLive').mockReturnValue({ allowed: true, reasons: [], readiness: { ready: true } as any } as any);
+    const id = `s204_${Math.random().toString(36).slice(2)}`;
+    workstationDb.savePosition({
+      id, mint: VALID_PUMP_MINT_1.toBase58(), symbol: 'S204', name: 'S204 Coin', tokenDecimals: 6,
+      tokenQuantityRaw: '1000000000', entryPriceSol: 0.0001, currentPriceSol: 0.00005, currentValueSol: 0.05,
+      costBasisLamports: 100_000_000, realizedPnLSol: 0, status: 'OPEN', venue: 'PUMP_BONDING_CURVE',
+      executionMode: 'LIVE', entryTxSignature: `sig_${id}`, entryTimestamp: Date.now(), lastMarkTimestamp: Date.now(),
+      recordUpdatedAt: Date.now(), updatedAt: Date.now(),
+    } as any);
+    try {
+      const journal = vi.spyOn(workstationDb, 'logJournal');
+      const res = await c.closePosition(id, 100, 'STOP_LOSS');
+      expect(res.success).toBe(false);
+      expect(send).not.toHaveBeenCalled();
+      expect(journal).toHaveBeenCalledWith('CLUSTER_GUARD_BLOCK', expect.any(String), 'LIVE', expect.objectContaining({ side: 'SELL', error: expect.stringMatching(/mainnet-beta/) }));
+    } finally {
+      c.cleanup();
+      PumpCurveService.cachedGlobal = null;
+      PumpCurveService.cachedFeeConfig = null;
+      mockRpc.clear();
     }
   });
 });

@@ -10,7 +10,8 @@ import { pumpFeedListener, PumpCreateEvent, PumpTradeEvent } from './solana/pump
 import { onChainPoolStats } from './market/poolStats';
 import { SignalProvenance, ConfluenceBreakdown, ExecutionMode } from './core/types';
 import { CapitalSizer } from './capital/capitalSizer';
-import { ConfluenceEngine, isConfluencePassed, MIN_CONFLUENCE_SCORE } from './signals/confluenceEngine';
+import { ConfluenceEngine, isConfluencePassed } from './signals/confluenceEngine';
+import { getConfluenceThreshold } from './signals/confluenceThreshold';
 import { curveVelocityEvaluator } from './signals/curveVelocityEvaluator';
 import { checkSnipeAmountSol } from './execution/snipeAmount';
 
@@ -796,9 +797,9 @@ export class MemecoinAggregatorService extends EventEmitter {
       };
     }
 
-    // Alpha Pipeline Integration (B14): Enforce confluence composite score >= 70 when gating is enabled
+    // Alpha Pipeline Integration (B14): Enforce the confluence composite score (threshold in force, default 70) when gating is enabled
     const shouldEnforceConfluence = params.enforceConfluence === true || this.isConfluenceGatingEnabled;
-    const minConfluence = params.minConfluenceScore ?? MIN_CONFLUENCE_SCORE;
+    const minConfluence = params.minConfluenceScore ?? getConfluenceThreshold();
     const confluenceEval = this.evaluateTokenConfluence(pool);
 
     if (shouldEnforceConfluence && confluenceEval.score < minConfluence) {

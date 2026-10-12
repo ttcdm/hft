@@ -1,7 +1,8 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { X, TrendingUp } from 'lucide-react';
 import { usePolled } from '../utils/usePolled';
+import { parseThreshold, thresholdWarning } from '../utils/confluenceThreshold';
 
 export interface ReplayedLaunchRow {
   mint: string; symbol: string; trades: number; verdict: string; verdictReason: string; releasedAfterMs: number | null; score: number | null;
@@ -21,6 +22,27 @@ export interface ReplayResponse {
 
 const sol = (v: number | null) => (v === null ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(5)} SOL`);
 const dur = (ms: number | null) => (ms === null ? '—' : ms < 60_000 ? `${Math.round(ms / 1000)} s` : `${(ms / 60_000).toFixed(1)} min`);
+
+/**
+ * S187: the what-if box. Replays the recorded launches at another confluence threshold; the shortcut buttons run 70, 50 and 40.
+ * Nothing here changes the live threshold (that is the Auto panel); this only changes what the replay below uses.
+ */
+export function ReplayThresholdBox({ value, onChange, inForce }: { value: string; onChange: (v: string) => void; inForce?: number }) {
+  const p = parseThreshold(value);
+  const warn = p.ok ? thresholdWarning(p.value) : null;
+  return (
+    <div className="mb-3 p-2 rounded border border-[#1E293B] bg-[#090D16]" data-testid="replay-threshold">
+      <div className="text-slate-400 mb-1">What if the confluence buy threshold were… {inForce !== undefined && <span className="text-slate-600">(live: {inForce})</span>}</div>
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <input data-testid="replay-threshold-slider" type="range" min={0} max={100} step={1} value={p.ok ? p.value : 0} onChange={(e) => onChange(e.target.value)} className="flex-1 min-w-[8rem]" aria-label="Replay threshold" />
+        <input data-testid="replay-threshold-box" type="number" min={0} max={100} step={1} value={value} onChange={(e) => onChange(e.target.value)} className="w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
+        {[70, 50, 40].map((n) => <button key={n} data-testid={`replay-threshold-${n}`} onClick={() => onChange(String(n))} className="px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white">{n}</button>)}
+      </div>
+      {!p.ok && <p className="text-rose-400 mt-1" data-testid="replay-threshold-problem">{p.reason}</p>}
+      {warn && <p className="text-amber-300 mt-1" data-testid="replay-threshold-warning">{warn}</p>}
+    </div>
+  );
+}
 
 /**
  * Backtest = a replay of recorded launches through the auto trader's own rules. With nothing recorded it says so and shows no result:
@@ -86,7 +108,17 @@ export function ReplayBacktestView({ data, error }: { data: ReplayResponse | nul
 interface BacktestModalProps { isOpen: boolean; onClose: () => void }
 
 export const BacktestModal: React.FC<BacktestModalProps> = ({ isOpen, onClose }) => {
-  const { data, error } = usePolled<ReplayResponse>('/api/backtest/replay', 30000, isOpen);
+  const [thresholdText, setThresholdText] = useState('');
+  // untouched: the threshold in force (no query). A valid number: replay at that value. An invalid one keeps the last good replay.
+  const [applied, setApplied] = useState<number | null>(null);
+  const onThreshold = (v: string) => {
+    setThresholdText(v);
+    const p = parseThreshold(v);
+    if (p.ok) setApplied(p.value);
+  };
+  const path = applied === null ? '/api/backtest/replay' : `/api/backtest/replay?minScore=${applied}`;
+  const { data, error } = usePolled<ReplayResponse>(path, 30000, isOpen);
+  const live = usePolled<{ confluence?: { value: number } }>('/api/auto/status', 10000, isOpen).data?.confluence?.value;
   useEscapeToClose(isOpen, onClose);
   if (!isOpen) return null;
   return (
@@ -97,6 +129,7 @@ export const BacktestModal: React.FC<BacktestModalProps> = ({ isOpen, onClose })
           <button onClick={onClose} className="text-slate-400 hover:text-white" aria-label="Close"><X className="w-4 h-4" /></button>
         </div>
         <p className="text-[10px] text-slate-500 mb-3">Runs the auto trader's own watch window, confluence gate and exit engine over launches this app recorded. Past launches only: it says nothing about the next one.</p>
+        <ReplayThresholdBox value={thresholdText === '' ? String(live ?? 70) : thresholdText} onChange={onThreshold} inForce={live} />
         <ReplayBacktestView data={data} error={error} />
       </div>
     </div>

@@ -1,6 +1,7 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import { authFetch } from '../services/engineClient';
 import { fmt } from './TokenBoard';
+import { parseThreshold, thresholdWarning } from '../utils/confluenceThreshold';
 
 /** H3: the auto-snipe controller panel. Every number is read from GET /api/auto/status (controller state + decision journal). */
 export type AutoMode = 'OFF' | 'SHADOW' | 'PAPER' | 'DEVNET_LIVE';
@@ -16,6 +17,8 @@ export interface AutoStatusData {
   /** S183: size of one auto order in SOL and the bounds the server accepts. Absent on an older server. */
   orderSol?: number;
   orderLimits?: { minSol: number; maxSol: number };
+  /** S187: the confluence buy threshold in force. Absent on an older server. */
+  confluence?: { value: number; defaultValue: number; source: 'operator' | 'env' | 'default'; warnBelow: number; warning: string | null };
   stats: { seen: number; rejectedByStage: Record<string, number>; wouldBuy: number; bought: number; open: number; closed: number; netPnlSol: number; feesPaidSol: number; winRate: number | null };
 }
 
@@ -80,8 +83,33 @@ export function AutoOrderSizeEditor({ orderSol, limits, spendLimitSol, onSave, b
   );
 }
 
-export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOrderSize, code, onCode, busy, error }: {
-  status: AutoStatusData | null; onMode?: (m: AutoMode) => void; onKill?: () => void; onResume?: () => void; onBudget?: (maxBuys: number, maxSpendSol: number) => void; onOrderSize?: (sol: number) => void;
+/**
+ * S187: the confluence buy threshold (0 to 100, default 70): a slider and a number box that move together. It sets the watch window's HOT gate
+ * and the execution gate (manual snipes too) as one value, so they cannot diverge. Below 50 the panel warns plainly.
+ */
+export function ConfluenceThresholdEditor({ confluence, onSave, busy }: { confluence: NonNullable<AutoStatusData['confluence']>; onSave?: (value: number) => void; busy?: boolean }) {
+  const [text, setText] = useState(String(confluence.value));
+  const parsed = parseThreshold(text);
+  const shown = parsed.ok ? parsed.value : confluence.value;
+  const warning = thresholdWarning(shown);
+  const dirty = parsed.ok && parsed.value !== confluence.value;
+  return (
+    <div className="mb-2 font-mono" data-testid="confluence-editor">
+      <div className="text-slate-500 mb-0.5">Confluence buy threshold <span className="text-slate-300" data-testid="confluence-current">in force: {confluence.value}</span> <span className="text-slate-600">(of 100)</span></div>
+      <div className="flex items-center gap-1.5">
+        <input data-testid="confluence-slider" type="range" min={0} max={100} step={1} value={shown} onChange={(e) => setText(e.target.value)} className="flex-1" aria-label="Confluence buy threshold" />
+        <input data-testid="confluence-box" type="number" step="1" min={0} max={100} value={text} onChange={(e) => setText(e.target.value)} className="w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
+        <button data-testid="confluence-save" disabled={busy || !parsed.ok || !dirty} onClick={() => parsed.ok && onSave?.(parsed.value)} className="px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white disabled:opacity-40">Save</button>
+      </div>
+      {!parsed.ok && <p className="text-rose-400 mt-0.5" data-testid="confluence-problem">{parsed.reason}</p>}
+      {warning && <p className="text-amber-300 mt-0.5" data-testid="confluence-warning">{warning}</p>}
+      <p className="text-slate-600 mt-0.5">One value for the watch window and the buy gate (manual snipes too). {confluence.source === 'operator' ? `Default is ${confluence.defaultValue}.` : confluence.source === 'env' ? `Set by CONFLUENCE_MIN_SCORE (${confluence.defaultValue}).` : 'Default.'} Kept until the server restarts.</p>
+    </div>
+  );
+}
+
+export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOrderSize, onThreshold, code, onCode, busy, error }: {
+  status: AutoStatusData | null; onMode?: (m: AutoMode) => void; onKill?: () => void; onResume?: () => void; onBudget?: (maxBuys: number, maxSpendSol: number) => void; onOrderSize?: (sol: number) => void; onThreshold?: (value: number) => void;
   code?: string; onCode?: (c: string) => void; busy?: boolean; error?: string | null;
 }) {
   if (!status) return <section className="rounded-lg border border-slate-800 bg-[#0B0F17] p-3 text-xs text-slate-500" data-testid="auto-panel">Auto-snipe: sign in as operator to read the controller.</section>;
@@ -110,6 +138,9 @@ export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOr
       {status.haltReason && <p className="text-red-400 mb-2" data-testid="halt-reason">ALL TRADING HALTED: {status.haltReason} <button onClick={onResume} className="underline ml-1">clear halt</button></p>}
       {status.killReason && <p className="text-amber-400 mb-1">Killed: {status.killReason}</p>}
       {status.downgradeReason && <p className="text-amber-400 mb-1" data-testid="downgrade-reason">Dropped to SHADOW: {status.downgradeReason}</p>}
+      {status.confluence && (
+        <React.Fragment key={`confluence-${status.confluence.value}`}><ConfluenceThresholdEditor confluence={status.confluence} onSave={onThreshold} busy={busy} /></React.Fragment>
+      )}
       {status.orderSol !== undefined && (
         <React.Fragment key={`order-${status.orderSol}`}><AutoOrderSizeEditor orderSol={status.orderSol} limits={status.orderLimits} spendLimitSol={status.budgets.maxSpendSol} onSave={onOrderSize} busy={busy} /></React.Fragment>
       )}
@@ -189,6 +220,7 @@ export function AutoPanel() {
       }}
       onResume={() => post('/api/auto/resume', { clearHalt: true })}
       onBudget={(maxBuys, maxSpendSol) => post('/api/auto/budget', { maxBuys, maxSpendSol })}
-      onOrderSize={(orderSol) => post('/api/auto/order-size', { orderSol })} />
+      onOrderSize={(orderSol) => post('/api/auto/order-size', { orderSol })}
+      onThreshold={(threshold) => post('/api/auto/threshold', { threshold })} />
   );
 }

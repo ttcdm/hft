@@ -19,6 +19,7 @@ import { buildSystemChecks } from './server/system/systemChecks';
 import { isReadOnly, assertReadOnlyStartup } from './server/solana/readOnly';
 import { LaunchRecorder } from './server/backtest/launchRecorder';
 import { replayLaunches } from './server/backtest/replay';
+import { checkConfluenceThreshold, getConfluenceThreshold, envConfluenceProblem } from './server/signals/confluenceThreshold';
 import { computeLatency } from './server/system/latencyStats';
 import { buildDiagnosticsContext } from './server/system/aiContext';
 import { pumpFunService, pumpBootMode } from './server/pumpfunService';
@@ -42,6 +43,7 @@ import {
   AutoModeSchema,
   AutoBudgetSchema,
   AutoOrderSizeSchema,
+  AutoThresholdSchema,
   AutoKillSchema,
   AutoResumeSchema,
   CalloutSnipeSchema,
@@ -1378,14 +1380,21 @@ app.get('/api/backtest/recording', requireOperatorAuth, (req, res) => {
 
 let replayCache: { key: string; at: number; body: any } | null = null;
 app.get('/api/backtest/replay', requireOperatorAuth, (req, res) => {
+  // S187: ?minScore=N replays at another confluence threshold (the what-if box); without it, the threshold in force
+  let minScore: number | undefined;
+  if (req.query.minScore !== undefined) {
+    const c = checkConfluenceThreshold(req.query.minScore);
+    if (!c.ok) return res.status(422).json({ success: false, error: c.reason });
+    minScore = c.value;
+  }
   const status = workstationDb.getLaunchRecordingStatus();
   if (status.launches === 0) {
     return res.json({ success: true, recorded: status, report: null, message: 'No launch has been recorded yet, so there is nothing to replay. The recorder saves every launch the watch window scores while the app runs against a pump.fun feed.' });
   }
-  const key = `${status.events}:${status.newestTs}`;
+  const key = `${status.events}:${status.newestTs}:${minScore ?? getConfluenceThreshold()}`;
   if (replayCache && replayCache.key === key && Date.now() - replayCache.at < 30_000) return res.json(replayCache.body);
   const { launches, funders } = workstationDb.loadLaunchRecording(300);
-  const report = replayLaunches(launches, funders, solPriceService.lastKnownPrice());
+  const report = replayLaunches(launches, funders, solPriceService.lastKnownPrice(), minScore === undefined ? {} : { minScore });
   const body = { success: true, recorded: status, report, message: null };
   replayCache = { key, at: Date.now(), body };
   res.json(body);
@@ -1429,6 +1438,12 @@ app.post('/api/auto/budget', requireOperatorAuth, validateTradeBody(AutoBudgetSc
 
 app.post('/api/auto/order-size', requireOperatorAuth, validateTradeBody(AutoOrderSizeSchema), (req, res) => {
   const result = autoSnipeController.setOrderSol(req.body.orderSol);
+  res.status(result.ok ? 200 : 422).json({ success: result.ok, ...result, error: result.reason, status: autoSnipeController.getStatus() });
+});
+
+/** S187: the one confluence buy threshold (watch window HOT gate and execution gate, manual snipes included). Works in read-only mode: it changes what is bought, never whether anything can be sent. */
+app.post('/api/auto/threshold', requireOperatorAuth, validateTradeBody(AutoThresholdSchema), (req, res) => {
+  const result = autoSnipeController.setConfluenceThreshold(req.body.threshold);
   res.status(result.ok ? 200 : 422).json({ success: result.ok, ...result, error: result.reason, status: autoSnipeController.getStatus() });
 });
 
@@ -1652,6 +1667,7 @@ process.on('uncaughtException', (err) => {
 
 async function startServer() {
   assertReadOnlyStartup(); // S185: refuses to start next to a signing key in read-only mode
+  { const p = envConfluenceProblem(); if (p) console.warn(`[APEX QUANT HFT] ${p}`); } // S187
   if (process.env.NODE_ENV !== 'production') {
     const customLogger = createLogger();
     const originalError = customLogger.error.bind(customLogger);

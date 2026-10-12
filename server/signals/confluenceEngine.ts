@@ -1,4 +1,5 @@
 import { ConfluenceBreakdown } from '../core/types';
+import { CONFLUENCE_DEFAULT_THRESHOLD, getConfluenceThreshold } from './confluenceThreshold';
 import {
   CurveVelocityMetrics,
   CurveVelocityEvaluator,
@@ -10,13 +11,14 @@ import {
   creatorRiskScorer,
 } from './creatorRiskScorer';
 
-export const MIN_CONFLUENCE_SCORE = 70;
+/** The built-in default. The threshold in force is getConfluenceThreshold() (S187: operator-editable, env CONFLUENCE_MIN_SCORE). */
+export const MIN_CONFLUENCE_SCORE = CONFLUENCE_DEFAULT_THRESHOLD;
 
 /**
- * Checks whether the composite confluence score meets the production trading threshold (>= 70).
+ * Checks whether the composite confluence score meets the buy threshold in force (default 70; `min` overrides it for a what-if replay).
  */
-export function isConfluencePassed(score: number): boolean {
-  return typeof score === 'number' && !isNaN(score) && score >= MIN_CONFLUENCE_SCORE;
+export function isConfluencePassed(score: number, min: number = getConfluenceThreshold()): boolean {
+  return typeof score === 'number' && !isNaN(score) && score >= min;
 }
 
 /** A metric is "known" only when it is a finite number. null/undefined/NaN mean missing and earn no points (B3). */
@@ -49,7 +51,9 @@ export interface ConfluenceFactorsInput {
 }
 
 export class ConfluenceEngine {
-  public static readonly MIN_PASSING_SCORE = MIN_CONFLUENCE_SCORE;
+  public static get MIN_PASSING_SCORE(): number {
+    return getConfluenceThreshold();
+  }
 
   public static isConfluencePassed(score: number): boolean {
     return isConfluencePassed(score);

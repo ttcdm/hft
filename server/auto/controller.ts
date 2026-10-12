@@ -12,7 +12,8 @@ import type { SignalProvenance } from '../core/types';
 import { computeJournalStats, type JournalStats } from './journalStats';
 import { evaluateKillTriggers, auditWalletChange, type KillTrigger } from './killSwitch';
 import { riskEngine } from '../risk/riskEngine';
-import { watchWindow, HOT_MIN_SCORE, type WatchResult } from '../signals/watchWindow';
+import { watchWindow, type WatchResult } from '../signals/watchWindow';
+import { getConfluenceThreshold, setConfluenceThreshold, confluenceThresholdInfo, type ConfluenceThresholdInfo } from '../signals/confluenceThreshold';
 
 /**
  * G1: the only owner of auto trading.
@@ -116,6 +117,8 @@ export interface AutoStatus {
   /** S183: size of one auto order (SOL) and the bounds the server accepts for it. */
   orderSol: number;
   orderLimits: { minSol: number; maxSol: number };
+  /** S187: the confluence buy threshold in force (HOT gate and execution gate together). */
+  confluence: ConfluenceThresholdInfo;
 }
 
 const MAX_DECISIONS = 500;
@@ -258,6 +261,14 @@ export class AutoSnipeController extends EventEmitter {
     return { ok: true };
   }
 
+  /** S187: set the one confluence buy threshold (watch window HOT gate and the execution gate, manual snipes included). Journaled. */
+  public setConfluenceThreshold(raw: unknown): { ok: boolean; reason?: string; value?: number } {
+    const r = setConfluenceThreshold(raw);
+    if (!r.ok) return { ok: false, reason: r.reason };
+    workstationDb.logDecision({ autoMode: this.mode, mint: '-', stage: 'score', outcome: 'INFO', reason: `operator set the confluence buy threshold: ${r.previous} -> ${r.value} (watch window HOT gate and execution gate together)` });
+    return { ok: true, value: r.value };
+  }
+
   public getStatus(): AutoStatus {
     this.enforceBudgets();
     let session: AutoStatus['session'] = null;
@@ -282,6 +293,7 @@ export class AutoSnipeController extends EventEmitter {
       budgetLimits: { maxSpendSol: AutoSnipeController.maxSessionSpendSol(), minSpendSol: this.orderSol(), maxBuys: 50 },
       orderSol: this.orderSol(),
       orderLimits: { minSol: SNIPE_AMOUNT_MIN_SOL, maxSol: executionConfig.getConfig().maxPositionSizeSol },
+      confluence: confluenceThresholdInfo(),
     };
   }
 
@@ -646,7 +658,7 @@ export class AutoSnipeController extends EventEmitter {
         signalId: c.signalId,
         provenance: c.provenance,
         enforceConfluence: verdict.state === 'READY' ? true : c.enforceConfluence,
-        minConfluenceScore: verdict.state === 'READY' ? HOT_MIN_SCORE : undefined,
+        minConfluenceScore: verdict.state === 'READY' ? getConfluenceThreshold() : undefined,
         // The signal behind an auto buy is the watch window's release; LIVE refuses a trade without one.
         signalTimestamp: verdict.releasedAt,
         // R5: the mode checked above; the coordinator refuses the trade if LIVE was armed or disarmed during the awaits in executeSnipe.

@@ -197,3 +197,23 @@ describe('S178: exits come from the real ExitEngine over the recorded prices', (
     expect(rep.assumptions.entryDelayMs).toBeGreaterThan(0);
   });
 });
+
+describe('S187: the what-if threshold changes which replayed launches are bought', () => {
+  it('the same recording replayed at 0 and at 100 differs only through the confluence gate, and says which threshold refused it', () => {
+    const db = freshDb();
+    const buyers = Array.from({ length: 30 }, wallet);
+    record(buyers.map((b, i) => ({ at: 1000 + i * 1000, user: b, isBuy: true, sol: 0.7 })), db, buyers.map((w) => [w, null] as [string, null]));
+    const { launches, funders } = db.loadLaunchRecording();
+    const open = replayLaunch(launches[0], funders, 150, { minScore: 0, entryDelayMs: 0 });
+    const strict = replayLaunch(launches[0], funders, 150, { minScore: 100, entryDelayMs: 0 });
+    expect(open.verdict).not.toBe('DEAD');
+    // a score of 100 is not reached by hand-built trades, so nothing is bought at 100 and the reason names the threshold
+    expect(strict.score === null || strict.score < 100).toBe(true);
+    expect(strict.entered).toBe(false);
+    if (strict.verdict === 'READY') expect(strict.noEntryReason).toMatch(/< 100\)/);
+    // at 0 the gate cannot be the reason for staying out
+    expect(open.noEntryReason ?? '').not.toMatch(/confluence gate/);
+    const rep = replayLaunches(launches, funders, 150, { minScore: 40 });
+    expect(rep.assumptions.minScore).toBe(40);
+  });
+});

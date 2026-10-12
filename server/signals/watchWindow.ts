@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events';
 import { watchMaxCandidates } from './capacity';
+import { CONFLUENCE_DEFAULT_THRESHOLD, getConfluenceThreshold } from './confluenceThreshold';
 import type { PumpTradeEvent } from '../solana/pumpFeedListener';
 
 /**
@@ -32,7 +33,8 @@ export function publicFundersFromEnv(env: NodeJS.ProcessEnv = process.env): Set<
   return new Set((env.APEX_PUBLIC_FUNDERS ?? '').split(',').map((a) => a.trim()).filter(Boolean));
 }
 export const HOT_MIN_SIGNALS = 3;
-export const HOT_MIN_SCORE = 70;
+/** The built-in default; the gate itself reads the one shared threshold (S187), so HOT and the execution gate never diverge. */
+export const HOT_MIN_SCORE = CONFLUENCE_DEFAULT_THRESHOLD;
 const CREATOR_CLUSTER = 'cluster:creator';
 const MAX_FUNDERS_KEPT = 20_000;
 
@@ -110,16 +112,18 @@ export interface WatchWindowOptions {
   maxMs?: number;
   /** Funder of a wallet (first incoming transfer), or null when unknown. Fixtures in tests; no network lookup is built in. */
   funderOf?: (wallet: string) => string | null | undefined;
-  /** Confluence score for a mint, or null when it cannot be scored. HOT needs a score of at least 70. */
+  /** Confluence score for a mint, or null when it cannot be scored. HOT needs a score of at least the threshold in force (default 70). */
   scoreOf?: (mint: string) => number | null | undefined;
   /** S4d: funders whose wallets are not clustered together (see publicFundersFromEnv). Default: the environment's list. */
   publicFunders?: Iterable<string>;
+  /** S187: a fixed HOT score for this window (what-if replay). Default: the shared threshold in force, read at each evaluation. */
+  minScore?: number;
 }
 
 export class WatchWindow extends EventEmitter {
   private active = new Map<string, Candidate>();
   private released = new Map<string, WatchResult>();
-  private opts: Required<Pick<WatchWindowOptions, 'maxCandidates' | 'minMs' | 'maxMs'>> & Pick<WatchWindowOptions, 'funderOf' | 'scoreOf'>;
+  private opts: Required<Pick<WatchWindowOptions, 'maxCandidates' | 'minMs' | 'maxMs'>> & Pick<WatchWindowOptions, 'funderOf' | 'scoreOf' | 'minScore'>;
   private funders = new Map<string, string>();
   private publicFunders: Set<string>;
   /** Wallets whose funder was looked up and does not exist / is out of reach: they count as known, in a cluster of their own. */
@@ -137,6 +141,7 @@ export class WatchWindow extends EventEmitter {
       maxCandidates: opts.maxCandidates ?? watchMaxCandidates(),
       minMs: opts.minMs ?? WATCH_MIN_MS,
       maxMs: opts.maxMs ?? WATCH_MAX_MS,
+      minScore: opts.minScore,
       funderOf: opts.funderOf,
       scoreOf: opts.scoreOf,
     };
@@ -300,6 +305,11 @@ export class WatchWindow extends EventEmitter {
     return null;
   }
 
+  /** The score a HOT release needs: a what-if replay's own value, else the shared threshold in force. */
+  private minScore(): number {
+    return this.opts.minScore ?? getConfluenceThreshold();
+  }
+
   /** Judge one candidate at `now`; releases it when a verdict is due. */
   public evaluate(mint: string, now = Date.now()): WatchResult | null {
     const done = this.released.get(mint);
@@ -320,11 +330,12 @@ export class WatchWindow extends EventEmitter {
       return this.release(c, 'DEAD', `NET_OUTFLOW: cumulative net inflow ${m.cumulativeNetInflowSol.toFixed(4)} SOL is negative`, now);
     }
     const score = this.opts.scoreOf?.(mint) ?? null;
-    if (m.passingSignals >= HOT_MIN_SIGNALS && score !== null && score >= HOT_MIN_SCORE) {
-      return this.release(c, 'HOT', `${m.passingSignals} strong signals and score ${score}`, now, score);
+    const min = this.minScore();
+    if (m.passingSignals >= HOT_MIN_SIGNALS && score !== null && score >= min) {
+      return this.release(c, 'HOT', `${m.passingSignals} strong signals and score ${score} (threshold ${min})`, now, score);
     }
     if (m.elapsedMs >= this.opts.maxMs) {
-      return this.release(c, 'READY', `window elapsed with ${m.passingSignals} strong signal(s)${score === null ? ', no score' : `, score ${score}`}`, now, score);
+      return this.release(c, 'READY', `window elapsed with ${m.passingSignals} strong signal(s)${score === null ? ', no score' : `, score ${score}`} (threshold ${min})`, now, score);
     }
     return hold(`watching: ${m.passingSignals}/${HOT_MIN_SIGNALS} strong signals`);
   }

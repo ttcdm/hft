@@ -1,4 +1,5 @@
-import { WatchWindow, HOT_MIN_SCORE, type WatchState } from '../signals/watchWindow';
+import { WatchWindow, type WatchState } from '../signals/watchWindow';
+import { getConfluenceThreshold } from '../signals/confluenceThreshold';
 import { ConfluenceEngine, isConfluencePassed } from '../signals/confluenceEngine';
 import { CurveVelocityEvaluator } from '../signals/curveVelocityEvaluator';
 import { OnChainPoolStats, tradePriceSol } from '../market/poolStats';
@@ -7,7 +8,7 @@ import type { PumpTradeEvent } from '../solana/pumpFeedListener';
 
 /**
  * Replays the auto trader's own rules over recorded launches: the real WatchWindow (verdict at the same 20 s / 120 s timing), the real
- * ConfluenceEngine (score >= 70 for a READY release), and the real ExitEngine (stop, trailing stop, take-profit ladder, stale exit).
+ * ConfluenceEngine (score at or above the buy threshold for a READY release; default 70, replayable at any value), and the real ExitEngine (stop, trailing stop, take-profit ladder, stale exit).
  * Entry and exit prices are the recorded trades' prices; costs are the pump.fun fee on each side plus the network fee and tip.
  *
  * NOT replayed (the data to do it was not recorded, so the result is optimistic by that much): the eligibility filter (authorities,
@@ -23,7 +24,8 @@ export const REPLAY_DEFAULTS = {
   /** How often the window is ticked while replaying (the live loop ticks every 2 s). */
   tickMs: 2_000,
 };
-export type ReplayOptions = Partial<typeof REPLAY_DEFAULTS>;
+/** `minScore`: the confluence buy threshold to replay at (S187 what-if). Default: the threshold in force. */
+export type ReplayOptions = Partial<typeof REPLAY_DEFAULTS> & { minScore?: number };
 
 export interface RecordedEvent { ts: number; kind: 'CREATE' | 'TRADE'; payload: any }
 export interface RecordedLaunch { mint: string; events: RecordedEvent[] }
@@ -72,6 +74,7 @@ export function tradeFromJson(p: any): PumpTradeEvent {
 
 export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solUsdFallback: number | null, optsIn: ReplayOptions = {}): ReplayedLaunch {
   const o = { ...REPLAY_DEFAULTS, ...optsIn };
+  const minScore = optsIn.minScore ?? getConfluenceThreshold();
   const create = launch.events.find((e) => e.kind === 'CREATE');
   const trades = launch.events.filter((e) => e.kind === 'TRADE');
   const base: ReplayedLaunch = {
@@ -109,7 +112,7 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
     });
     return b.compositeScore;
   };
-  const ww = new WatchWindow({ scoreOf: () => scoreAt(clock), publicFunders: [] });
+  const ww = new WatchWindow({ scoreOf: () => scoreAt(clock), publicFunders: [], minScore });
   ww.watch(launch.mint, create.payload.creator ?? null, startTs, [create.payload.user]);
 
   // funder facts the window had learned by the end of the launch, applied at their recorded time (earlier ones at the start)
@@ -160,8 +163,8 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
 
   const result: ReplayedLaunch = { ...base, verdict: released.state, verdictReason: released.reason, releasedAfterMs: releasedAt - startTs, score: released.score ?? null };
   if (released.state === 'DEAD') return { ...result, noEntryReason: `watch verdict DEAD: ${released.reason}` };
-  if (released.state === 'READY' && !(released.score !== null && released.score !== undefined && isConfluencePassed(released.score))) {
-    return { ...result, noEntryReason: `READY below the confluence gate (score ${released.score ?? 'n/a'} < ${HOT_MIN_SCORE})` };
+  if (released.state === 'READY' && !(released.score !== null && released.score !== undefined && isConfluencePassed(released.score, minScore))) {
+    return { ...result, noEntryReason: `READY below the confluence gate (score ${released.score ?? 'n/a'} < ${minScore})` };
   }
 
   // entry: the first recorded trade at or after release + delay
@@ -205,7 +208,8 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
 }
 
 export function replayLaunches(launches: RecordedLaunch[], funders: FunderFact[], solUsdFallback: number | null, opts: ReplayOptions = {}): ReplayReport {
-  const rows = launches.map((l) => replayLaunch(l, funders, solUsdFallback, opts));
+  const minScore = opts.minScore ?? getConfluenceThreshold();
+  const rows = launches.map((l) => replayLaunch(l, funders, solUsdFallback, { ...opts, minScore }));
   const closed = rows.filter((r) => r.outcome === 'CLOSED');
   const wins = closed.filter((r) => (r.netPnlSol ?? 0) > 0).length;
   const released: Record<string, number> = {};
@@ -217,7 +221,7 @@ export function replayLaunches(launches: RecordedLaunch[], funders: FunderFact[]
   return {
     rules: [
       'Watch window verdict (real WatchWindow: 20 s minimum, 120 s maximum, HOT / READY / DEAD)',
-      `READY needs a confluence score of at least ${HOT_MIN_SCORE} (real ConfluenceEngine over the replayed pool stats)`,
+      `READY needs a confluence score of at least ${minScore} (real ConfluenceEngine over the replayed pool stats)`,
       'Exits: real ExitEngine (hard stop -20%, trailing stop, take-profit ladder: sell 33% of the holding at +30%, then 33% of what is left at +60%, stale exit at 30 min)',
     ],
     notReplayed: [
@@ -226,7 +230,7 @@ export function replayLaunches(launches: RecordedLaunch[], funders: FunderFact[]
       'Slippage and price impact beyond the recorded trade price',
       'Creator wallet history (the live score may add points a replay cannot)',
     ],
-    assumptions: { ...REPLAY_DEFAULTS, ...opts },
+    assumptions: { ...REPLAY_DEFAULTS, ...opts, minScore },
     summary: {
       launches: rows.length, released, entries: rows.filter((r) => r.entered).length, closed: closed.length, openAtEnd: rows.filter((r) => r.outcome === 'OPEN_AT_END').length,
       wins, losses: closed.length - wins, winRate: closed.length ? wins / closed.length : null,

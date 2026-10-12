@@ -449,7 +449,7 @@ export class AutoSnipeController extends EventEmitter {
 
   /**
    * Evaluate the kill-switch triggers. A hit drops PAPER / DEVNET_LIVE to SHADOW: buys stop, candidates are still
-   * journaled as "would buy", and exits keep running. Only an operator setting the mode again brings buys back.
+   * journaled as "would buy", and exits keep running. A DEVNET_LIVE hit also disarms the coordinator (S207). Only an operator setting the mode again brings buys back.
    */
   public async checkTriggers(now = Date.now()): Promise<KillTrigger[]> {
     if (this.mode === 'SHADOW' && this.autoRestore) { this.tryAutoRestore(now); return []; }
@@ -486,6 +486,8 @@ export class AutoSnipeController extends EventEmitter {
     // S189: nothing real is at risk in PAPER, so a downgrade caused ONLY by a flapping readiness check comes back by itself once readiness has
     // been green for a while. DEVNET_LIVE stays sticky (an operator sets it again), and so does any other trigger.
     this.autoRestore = from === 'PAPER' && hits.every((h) => h.code === 'READINESS_RED') ? { greenSince: null } : null;
+    // S207: a tripped DEVNET_LIVE session also disarms the coordinator, so nothing can keep sending on a LIVE arming left over from before the trip.
+    if (from === 'DEVNET_LIVE') executionCoordinator.armLiveTrading(false);
     workstationDb.logDecision({ autoMode: from, mint: '-', stage: 'risk', outcome: 'KILL_TRIGGER', reason, inputs: { triggers: hits } });
     Logger.warn(`[AUTO] ${reason}. Dropped ${from} -> SHADOW; exits keep running.`);
     this.emit('mode', { mode: this.mode, reason });

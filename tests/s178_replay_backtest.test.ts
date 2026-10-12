@@ -217,3 +217,42 @@ describe('S187: the what-if threshold changes which replayed launches are bought
     expect(rep.assumptions.minScore).toBe(40);
   });
 });
+
+describe('S190: the replay measures time to peak from the release over recorded launches', () => {
+  it('a launch with a later, higher price is bucketed by when that price came; the reference is the price the window left it at', () => {
+    const db = freshDb();
+    const buyers = Array.from({ length: 30 }, wallet);
+    const { mint } = record(buyers.map((b, i) => ({ at: 1000 + i * 1000, user: b, isBuy: true, sol: 0.7 })), db, buyers.map((w) => [w, null] as [string, null]));
+    const { launches, funders } = db.loadLaunchRecording();
+    const base = replayLaunch(launches[0], funders, 150, { minScore: 0 });
+    expect(base.releasedAfterMs).not.toBeNull();
+    const releasedAt = t0 + (base.releasedAfterMs as number);
+    const last = launches[0].events.filter((e) => e.kind === 'TRADE').slice(-1)[0];
+    // a much later trade at a 4x price: copy the last real trade with its price scaled via the reserves
+    const hi = { ...last.payload, signature: 'late', virtualSolReserves: String(BigInt(last.payload.virtualSolReserves) * 2n), virtualTokenReserves: String(BigInt(last.payload.virtualTokenReserves) / 2n) };
+    const withLate = { ...launches[0], events: [...launches[0].events, { ts: releasedAt + 75 * 60_000, kind: 'TRADE' as const, payload: hi }] };
+    const r = replayLaunch(withLate, funders, 150, { minScore: 0 });
+    expect(r.peak).toBeTruthy();
+    expect(r.peak?.timeToPeakMs).toBe(75 * 60_000);
+    expect(r.peak?.peakMultiple).toBeGreaterThan(3.9);
+    expect(r.peak?.observedMs).toBe(75 * 60_000);
+    const rep = replayLaunches([withLate], funders, 150, { minScore: 0 });
+    const b = Object.fromEntries(rep.peakAnalysis.buckets.map((x) => [x.label, x]));
+    expect(b['60 to 180 min'].launches).toBe(1);
+    expect(b['60 to 180 min'].peakAtLeast2x).toBe(1);
+    expect(rep.peakAnalysis.late.peakAfter60MinAtLeast2x).toBe(1);
+    expect(mint).toBe(withLate.mint);
+  });
+  it('a launch with nothing recorded after the release has no peak', () => {
+    const db = freshDb();
+    const buyers = Array.from({ length: 4 }, wallet);
+    record([
+      { at: 1000, user: buyers[0], isBuy: true, sol: 0.3 }, { at: 5000, user: buyers[1], isBuy: true, sol: 0.2 },
+      { at: 10_000, user: buyers[0], isBuy: false, sol: 0.28 }, { at: 15_000, user: buyers[1], isBuy: false, sol: 0.19 }, { at: 25_000, user: buyers[2], isBuy: false, sol: 0.05 },
+    ], db);
+    const { launches, funders } = db.loadLaunchRecording();
+    const r = replayLaunch(launches[0], funders, 150);
+    expect(r.verdict).toBe('DEAD');
+    expect(r.peak == null || r.peak.timeToPeakMs >= 0).toBe(true);
+  });
+});

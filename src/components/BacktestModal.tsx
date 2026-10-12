@@ -13,6 +13,33 @@ export interface ReplayReportData {
   rules: string[]; notReplayed: string[]; assumptions: Record<string, number>;
   summary: { launches: number; released: Record<string, number>; entries: number; closed: number; openAtEnd: number; wins: number; losses: number; winRate: number | null; netPnlSol: number | null; avgHoldMs: number | null; exitReasons: Record<string, number> };
   launches: ReplayedLaunchRow[];
+  /** S190. Absent on an older server. */
+  peakAnalysis?: PeakAnalysisData;
+}
+export interface PeakAnalysisData {
+  basis: string; launches: number;
+  coverage: { atLeast30Min: number; atLeast60Min: number; atLeast180Min: number };
+  buckets: Array<{ label: string; launches: number; medianPeakMultiple: number | null; peakAtLeast2x: number; peakAtLeast5x: number }>;
+  late: { peakAfter30MinAtLeast2x: number; ofLaunchesWithAtLeast60MinData: number; peakAfter60MinAtLeast2x: number; ofLaunchesWithAtLeast180MinData: number };
+  caveats: string[];
+}
+
+/** S190: when does the best price come? Measured on the recorded launches, no strategy behind it. */
+export function PeakAnalysisView({ a }: { a: PeakAnalysisData }) {
+  const x = (v: number | null) => (v === null ? '—' : `${v.toFixed(2)}x`);
+  return (
+    <div className="mb-3 p-2 rounded border border-[#1E293B] bg-[#090D16]" data-testid="peak-analysis">
+      <h4 className="text-[11px] font-bold text-slate-300 mb-1">When does the peak come? (time from the 2-minute release to the highest recorded price)</h4>
+      <p className="text-slate-500 mb-1">{a.launches} launch(es) with a release and later trades. Data reaches 30+ min after the release for {a.coverage.atLeast30Min}, 60+ min for {a.coverage.atLeast60Min}, 180+ min for {a.coverage.atLeast180Min}.</p>
+      <table className="w-full text-left mb-1" data-testid="peak-buckets">
+        <thead><tr className="text-slate-500 text-[10px]"><th className="py-1">peak came</th><th>launches</th><th>median peak vs release</th><th>peak 2x+</th><th>peak 5x+</th></tr></thead>
+        <tbody>{a.buckets.map((b) => <tr key={b.label} className="border-t border-[#1E293B]"><td className="py-1">{b.label}</td><td>{b.launches}</td><td>{x(b.medianPeakMultiple)}</td><td>{b.peakAtLeast2x}</td><td>{b.peakAtLeast5x}</td></tr>)}</tbody>
+      </table>
+      <p className="text-slate-300" data-testid="peak-late">Late spikes: {a.late.peakAfter30MinAtLeast2x} launch(es) peaked 2x+ more than 30 min after the release (of {a.late.ofLaunchesWithAtLeast60MinData} with 60+ min of data); {a.late.peakAfter60MinAtLeast2x} more than 60 min after (of {a.late.ofLaunchesWithAtLeast180MinData} with 180+ min of data).</p>
+      {a.coverage.atLeast60Min === 0 && <p className="text-amber-300/90 mt-1" data-testid="peak-no-coverage">No launch has 60+ minutes of recorded data yet, so late spikes cannot be seen. The recorder keeps up to the configured window per launch; data recorded with the old 30-minute window cannot show them.</p>}
+      <ul className="list-disc pl-4 text-slate-500 mt-1">{a.caveats.map((c) => <li key={c}>{c}</li>)}</ul>
+    </div>
+  );
 }
 export interface ReplayResponse {
   recorded: { launches: number; events: number; oldestTs: number | null; newestTs: number | null };
@@ -76,6 +103,7 @@ export function ReplayBacktestView({ data, error }: { data: ReplayResponse | nul
             {data.replayCap !== undefined && data.replayedLaunches !== undefined && data.recorded.launches > data.replayedLaunches && (
               <p className="text-amber-300/90 mb-3" data-testid="replay-capped">Replaying the newest {data.replayedLaunches} of {data.recorded.launches} recorded launches (the replay is capped at {data.replayCap}); the older ones are kept but not replayed.</p>
             )}
+            {r.peakAnalysis && <PeakAnalysisView a={r.peakAnalysis} />}
             <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 mb-3" data-testid="replay-summary">
               <span className="text-slate-500">Verdicts</span><span className="text-right">{Object.entries(s.released).map(([k, v]) => `${k} ${v}`).join(' · ') || '—'}</span>
               <span className="text-slate-500">Entered</span><span className="text-right">{s.entries}</span>

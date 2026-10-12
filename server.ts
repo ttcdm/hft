@@ -18,6 +18,7 @@ import { realismEngine } from './server/realismEngine';
 import { buildSystemChecks } from './server/system/systemChecks';
 import { isReadOnly, assertReadOnlyStartup } from './server/solana/readOnly';
 import { LaunchRecorder } from './server/backtest/launchRecorder';
+import { recorderConfigProblems } from './server/backtest/recorderConfig';
 import { replayLaunchesAsync } from './server/backtest/replay';
 import { checkConfluenceThreshold, getConfluenceThreshold, envConfluenceProblem } from './server/signals/confluenceThreshold';
 import { computeLatency } from './server/system/latencyStats';
@@ -339,6 +340,7 @@ watchWindow.setScoreFn((mint) => {
 });
 watchWindow.attach(pumpFeedListener);
 // S178: save what the window sees (launches it scores, their trades, the funder facts) so the auto rules can be replayed over real launches
+for (const p of recorderConfigProblems()) console.warn(`[APEX QUANT HFT] ${p}`); // S190
 const launchRecorder = new LaunchRecorder(workstationDb, watchWindow, () => solPriceService.lastKnownPrice());
 launchRecorder.attach(pumpFeedListener);
 wireWatchPins(watchWindow, memecoinAggregator, onChainPoolStats); // S4: a watched mint keeps its pool and its trade stats until the verdict

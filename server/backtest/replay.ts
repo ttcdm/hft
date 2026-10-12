@@ -50,6 +50,29 @@ export interface ReplayedLaunch {
   /** net SOL after fees for the closed part; for OPEN_AT_END the value at the last recorded price is in `openValueSol`, not here */
   netPnlSol: number | null;
   openValueSol: number | null;
+  /** S190: after the watch window's release, the highest recorded trade price against the price the window left it at. Null: no released launch / no later trade. */
+  peak?: { refPriceSol: number; peakPriceSol: number; peakMultiple: number; timeToPeakMs: number; observedMs: number } | null;
+}
+
+/** S190: the release-to-peak buckets, in minutes. A peak at exactly a boundary belongs to the later bucket. */
+export const PEAK_BUCKETS_MIN: Array<{ label: string; fromMin: number; toMin: number }> = [
+  { label: '< 5 min', fromMin: 0, toMin: 5 },
+  { label: '5 to 30 min', fromMin: 5, toMin: 30 },
+  { label: '30 to 60 min', fromMin: 30, toMin: 60 },
+  { label: '60 to 180 min', fromMin: 60, toMin: 180 },
+  { label: 'over 180 min', fromMin: 180, toMin: Infinity },
+];
+
+export interface PeakAnalysis {
+  basis: string;
+  /** launches with a release and at least one later recorded trade price */
+  launches: number;
+  /** launches whose recorded data reaches at least this long past the release: a late spike can only be seen where the recording is long enough */
+  coverage: { atLeast30Min: number; atLeast60Min: number; atLeast180Min: number };
+  buckets: Array<{ label: string; launches: number; medianPeakMultiple: number | null; peakAtLeast2x: number; peakAtLeast5x: number }>;
+  /** the question behind it: how often does the best price come late, and is it a real move */
+  late: { peakAfter30MinAtLeast2x: number; ofLaunchesWithAtLeast60MinData: number; peakAfter60MinAtLeast2x: number; ofLaunchesWithAtLeast180MinData: number };
+  caveats: string[];
 }
 
 export interface ReplayReport {
@@ -61,6 +84,8 @@ export interface ReplayReport {
     wins: number; losses: number; winRate: number | null; netPnlSol: number | null; avgHoldMs: number | null; exitReasons: Record<string, number>;
   };
   launches: ReplayedLaunch[];
+  /** S190 */
+  peakAnalysis: PeakAnalysis;
 }
 
 const big = (v: unknown): bigint => BigInt(String(v ?? '0'));
@@ -69,6 +94,56 @@ export function tradeFromJson(p: any): PumpTradeEvent {
     signature: p.signature, slot: Number(p.slot), mint: p.mint, solAmountLamports: big(p.solAmountLamports), tokenAmount: big(p.tokenAmount), isBuy: !!p.isBuy,
     user: p.user, timestampSec: Number(p.timestampSec), virtualSolReserves: big(p.virtualSolReserves), virtualTokenReserves: big(p.virtualTokenReserves),
     realSolReserves: big(p.realSolReserves), realTokenReserves: big(p.realTokenReserves),
+  };
+}
+
+/** S190: the price the window left the launch at (last trade at or before the release) and the highest trade price after it. */
+function peakAfter(trades: RecordedEvent[], releasedAt: number): NonNullable<ReplayedLaunch['peak']> | null {
+  let ref: number | null = null;
+  let peak = -Infinity, peakAt = 0, lastAt = releasedAt;
+  for (const ev of trades) {
+    const p = tradePriceSol(tradeFromJson(ev.payload));
+    if (p === null || !(p > 0)) continue;
+    if (ev.ts <= releasedAt) { ref = p; continue; }
+    if (ref === null) ref = p; // no trade before the release: the first one after it is the reference
+    lastAt = ev.ts;
+    if (p > peak) { peak = p; peakAt = ev.ts; }
+  }
+  if (ref === null || !(peak > 0) || lastAt <= releasedAt) return null;
+  return { refPriceSol: ref, peakPriceSol: peak, peakMultiple: peak / ref, timeToPeakMs: peakAt - releasedAt, observedMs: lastAt - releasedAt };
+}
+
+function median(v: number[]): number | null {
+  if (v.length === 0) return null;
+  const s = [...v].sort((a, b) => a - b);
+  const m = s.length >> 1;
+  return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+}
+
+export function analysePeaks(rows: ReplayedLaunch[]): PeakAnalysis {
+  const peaks = rows.map((r) => r.peak).filter((p): p is NonNullable<ReplayedLaunch['peak']> => !!p);
+  const min = (ms: number) => ms / 60_000;
+  const buckets = PEAK_BUCKETS_MIN.map((b) => {
+    const inB = peaks.filter((p) => min(p.timeToPeakMs) >= b.fromMin && min(p.timeToPeakMs) < b.toMin);
+    return { label: b.label, launches: inB.length, medianPeakMultiple: median(inB.map((p) => p.peakMultiple)), peakAtLeast2x: inB.filter((p) => p.peakMultiple >= 2).length, peakAtLeast5x: inB.filter((p) => p.peakMultiple >= 5).length };
+  });
+  const cover = (m: number) => peaks.filter((p) => min(p.observedMs) >= m).length;
+  return {
+    basis: 'Reference price: the last recorded trade at or before the watch window release (about 2 minutes after launch at most). Peak: the highest recorded trade price after it, and when.',
+    launches: peaks.length,
+    coverage: { atLeast30Min: cover(30), atLeast60Min: cover(60), atLeast180Min: cover(180) },
+    buckets,
+    late: {
+      peakAfter30MinAtLeast2x: peaks.filter((p) => min(p.timeToPeakMs) >= 30 && p.peakMultiple >= 2).length,
+      ofLaunchesWithAtLeast60MinData: cover(60),
+      peakAfter60MinAtLeast2x: peaks.filter((p) => min(p.timeToPeakMs) >= 60 && p.peakMultiple >= 2).length,
+      ofLaunchesWithAtLeast180MinData: cover(180),
+    },
+    caveats: [
+      'Descriptive only: it shows how often the best price came late, not that anyone could have bought and sold it.',
+      'A launch can only show a peak inside the time it was recorded for (see the coverage counts); recordings made with the old 30-minute window cannot show a late spike at all.',
+      'The peak is the single highest trade print, which one thin trade can set; slippage, liquidity and exits are not applied.',
+    ],
   };
 }
 
@@ -161,7 +236,7 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
   }
   if (!released) return { ...base, verdict: 'NO_TRADES', verdictReason: 'no verdict inside the recording', noEntryReason: 'still watching when the recording ended' };
 
-  const result: ReplayedLaunch = { ...base, verdict: released.state, verdictReason: released.reason, releasedAfterMs: releasedAt - startTs, score: released.score ?? null };
+  const result: ReplayedLaunch = { ...base, verdict: released.state, verdictReason: released.reason, releasedAfterMs: releasedAt - startTs, score: released.score ?? null, peak: peakAfter(trades, releasedAt) };
   if (released.state === 'DEAD') return { ...result, noEntryReason: `watch verdict DEAD: ${released.reason}` };
   if (released.state === 'READY' && !(released.score !== null && released.score !== undefined && isConfluencePassed(released.score, minScore))) {
     return { ...result, noEntryReason: `READY below the confluence gate (score ${released.score ?? 'n/a'} < ${minScore})` };
@@ -262,5 +337,6 @@ function buildReplayReport(rows: ReplayedLaunch[], opts: ReplayOptions, minScore
       exitReasons,
     },
     launches: rows,
+    peakAnalysis: analysePeaks(rows),
   };
 }

@@ -2995,6 +2995,17 @@ export class ExecutionCoordinator {
         }
       }
 
+      // S207: a LIVE sell on a mainnet setting is refused before anything is built, signed or simulated (submit still checks too), so no never-sent row is left behind.
+      if (target.executionMode === 'LIVE') {
+        try {
+          assertSendClusterAllowed();
+        } catch (err: any) {
+          Logger.error(`[R1] SELL for position ${positionId} blocked before signing: ${err.message}`);
+          workstationDb.logJournal('CLUSTER_GUARD_BLOCK', `exit-${positionId.slice(0, 8)}`, 'LIVE', { side: 'SELL', mint: target.mint, error: err.message });
+          return { success: false, pnlSol: 0, error: err.message };
+        }
+      }
+
       const { PumpSwapVenueService } = await import('../solana/pumpSwapService');
       const posMode: ExecutionMode = target.executionMode === 'LIVE' ? 'LIVE' : 'PAPER';
       const venueInfo = await PumpSwapVenueService.resolveVenue(this.connection, mintPubkey, posMode);

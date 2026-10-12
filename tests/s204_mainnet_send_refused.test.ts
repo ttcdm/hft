@@ -118,7 +118,7 @@ describe('S204 the exit path: closePosition on a LIVE position', () => {
     const mockRpc = new MockSolanaRpc();
     vi.spyOn(localSigner, 'getStatus').mockReturnValue('READY');
     vi.spyOn(localSigner, 'getPublicKey').mockReturnValue(kp.publicKey);
-    vi.spyOn(localSigner, 'signTransaction').mockImplementation(async (tx: any) => tx);
+    const signSpy = vi.spyOn(localSigner, 'signTransaction').mockImplementation(async (tx: any) => tx);
     PumpCurveService.cachedGlobal = { feeRecipient: DUMMY_FEE_RECIPIENT.toBase58() } as any;
     PumpCurveService.cachedFeeConfig = { feeBps: 100 } as any;
     const c = new ExecutionCoordinator(mockRpc.createConnection());
@@ -143,9 +143,13 @@ describe('S204 the exit path: closePosition on a LIVE position', () => {
     } as any);
     try {
       const journal = vi.spyOn(workstationDb, 'logJournal');
+      const saveTx = vi.spyOn(workstationDb, 'saveTransaction');
       const res = await c.closePosition(id, 100, 'STOP_LOSS');
       expect(res.success).toBe(false);
       expect(send).not.toHaveBeenCalled();
+      expect(signSpy).not.toHaveBeenCalled(); // S207: refused before signing
+      expect(conn.simulateTransaction).not.toHaveBeenCalled(); // and before simulating
+      expect(saveTx).not.toHaveBeenCalled(); // no PENDING or REVERTED transaction row
       expect(journal).toHaveBeenCalledWith('CLUSTER_GUARD_BLOCK', expect.any(String), 'LIVE', expect.objectContaining({ side: 'SELL', error: expect.stringMatching(/mainnet-beta/) }));
     } finally {
       c.cleanup();

@@ -1,4 +1,4 @@
-import type { Connection } from '@solana/web3.js';
+import { Connection } from '@solana/web3.js';
 
 /**
  * Cluster guard. Nothing in this repo may sign or send a transaction unless the
@@ -176,4 +176,50 @@ export async function assertClusterAllowedCached(
   const res = await assertClusterAllowed(connection, env);
   rememberGenesisCheck(connection, env, now);
   return res;
+}
+
+/** S210: opt-in second opinion on the cluster. Off unless APEX_VERIFY_BLOCKHASH=true. */
+export function blockhashCheckEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.APEX_VERIFY_BLOCKHASH === 'true';
+}
+
+export type BlockhashVerdict =
+  | { ok: true; skipped?: string }
+  | { ok: false; reason: string; /** true when the reference RPC answered "not valid"; false when it could not be asked */ definite: boolean };
+
+export interface BlockhashCheckDeps {
+  isValid?: (blockhash: string) => Promise<boolean>;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+let referenceConnection: Connection | null = null;
+async function referenceIsValid(blockhash: string): Promise<boolean> {
+  referenceConnection ??= new Connection(DEFAULT_RPC_URL, 'processed');
+  return (await referenceConnection.isBlockhashValid(blockhash, { commitment: 'processed' })).value;
+}
+
+/**
+ * Asks an INDEPENDENT RPC (the public devnet endpoint, not the configured one) whether the order's blockhash exists on devnet. An RPC that
+ * claims devnet but is really mainnet hands out blockhashes devnet has never seen, so this catches it where the genesis check cannot. A "no"
+ * is retried once after 500 ms, because the public node can lag a few slots behind the configured one.
+ * Skipped when the flag is off, on localnet (its blockhashes are local) and on mainnet-beta (sends are refused before this point).
+ */
+export async function verifyBlockhashIndependently(
+  blockhash: string,
+  env: NodeJS.ProcessEnv = process.env,
+  deps: BlockhashCheckDeps = {}
+): Promise<BlockhashVerdict> {
+  if (!blockhashCheckEnabled(env)) return { ok: true, skipped: 'APEX_VERIFY_BLOCKHASH is not true' };
+  const cluster = allowedCluster(env);
+  if (cluster !== 'devnet') return { ok: true, skipped: `not checked on ${cluster}` };
+  const isValid = deps.isValid ?? referenceIsValid;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  try {
+    if (await isValid(blockhash)) return { ok: true };
+    await sleep(500);
+    if (await isValid(blockhash)) return { ok: true };
+    return { ok: false, definite: true, reason: `blockhash ${blockhash} is not known to the independent devnet RPC; the configured RPC may not be on devnet` };
+  } catch (err: any) {
+    return { ok: false, definite: false, reason: `could not ask the independent devnet RPC about the blockhash (${err?.message ?? 'unknown error'})` };
+  }
 }

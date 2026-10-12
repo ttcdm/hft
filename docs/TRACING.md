@@ -22,6 +22,7 @@ Optional OpenTelemetry tracing for the server. It shows every step of a candidat
 | `gate.eligibility` | the on-chain eligibility verdict |
 | `risk.evaluateOrder` | the risk engine |
 | `tx.build`, `tx.sign` | building and signing the transaction |
+| `guard.blockhash` | the optional independent blockhash check (`APEX_VERIFY_BLOCKHASH`) |
 | `guard.sendCluster`, `guard.genesis` | the mainnet refusal and the genesis-hash check before a send |
 | `tx.submit`, `tx.confirm` | the transport (Jito or RPC) and confirmation, with `apex.transport` |
 | `tx.reconcile` | reading the fill back from the chain |

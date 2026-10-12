@@ -46,7 +46,7 @@ import { getRandomJitoTipAccount, TOKEN_2022_PROGRAM_ID } from '../solana/progra
 import { executionConfig } from '../solana/executionConfig';
 import { Logger, endpointOrigin } from '../middleware/enterprise';
 import { traced } from '../observability/tracing';
-import { allowedCluster, assertClusterAllowed, assertClusterAllowedCached, assertSendClusterAllowed, rememberGenesisCheck, resolveRpcUrl } from '../solana/clusterGuard';
+import { allowedCluster, assertClusterAllowed, assertClusterAllowedCached, assertSendClusterAllowed, blockhashCheckEnabled, rememberGenesisCheck, resolveRpcUrl, verifyBlockhashIndependently } from '../solana/clusterGuard';
 import { PumpCurveService, TradeQuote, PumpMarketState, fetchTokenHolderDistribution } from '../solana/pumpCurve';
 import { TradeReconciler, RealMarkPriceService, PreTradeSnapshot } from './reconciliation';
 export type { PreTradeSnapshot };
@@ -289,6 +289,19 @@ export class ExecutionCoordinator {
       this.rpcHealth = 'DISCONNECTED';
       return false;
     }
+  }
+
+  /** S210: null when the order may be signed, else why not. See `verifyBlockhashIndependently`. A buy needs a clean pass; a sell is refused only on a definite "no". */
+  private async blockhashProblem(tx: VersionedTransaction, side: 'BUY' | 'SELL'): Promise<string | null> {
+    if (!blockhashCheckEnabled()) return null;
+    const verdict = await traced('guard.blockhash', () => verifyBlockhashIndependently(tx.message.recentBlockhash), { 'apex.side': side });
+    if (verdict.ok) return null;
+    if (side === 'SELL' && !verdict.definite) {
+      Logger.warn(`[S210] SELL not blocked: ${verdict.reason}`);
+      return null;
+    }
+    Logger.error(`[S210] ${side} blocked: ${verdict.reason}`);
+    return verdict.reason;
   }
 
   public getConnection(): Connection {
@@ -2443,6 +2456,12 @@ export class ExecutionCoordinator {
 
       // 5. Build, sign, and submit real Solana transaction
       const v0Tx = await traced('tx.build', () => txBuilder.buildBuyTransaction(this.connection, buyParams), { 'apex.side': 'BUY' });
+      // S210 (opt-in, APEX_VERIFY_BLOCKHASH=true): a second, independent devnet RPC must know this order's blockhash. A buy that cannot be checked is refused.
+      const bhBuy = await this.blockhashProblem(v0Tx, 'BUY');
+      if (bhBuy) {
+        workstationDb.logJournal('CLUSTER_GUARD_BLOCK', correlationId, 'LIVE', { side: 'BUY', mint: req.mint, error: bhBuy });
+        return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'LIVE', error: `CLUSTER_GUARD: ${bhBuy}; nothing was signed or sent.`, correlationId };
+      }
       await traced('tx.sign', () => localSigner.signTransaction(v0Tx), { 'apex.side': 'BUY' });
 
       // Q17: risk approval was several awaits ago (curve read, holder lookup, tip floor, blockhash, snapshot, sign). Disarm, a halt or the
@@ -3132,6 +3151,13 @@ export class ExecutionCoordinator {
         tokenProgramToUse
       );
 
+      // S210: same check for a sell, but only a definite "unknown blockhash" refuses it; if the independent RPC cannot be reached the sell goes ahead,
+      // because a stop-loss must not be blocked by a flaky public endpoint.
+      const bhSell = await this.blockhashProblem(v0Tx, 'SELL');
+      if (bhSell) {
+        workstationDb.logJournal('CLUSTER_GUARD_BLOCK', `exit-${positionId.slice(0, 8)}`, 'LIVE', { side: 'SELL', mint: target.mint, error: bhSell });
+        return { success: false, pnlSol: 0, error: `CLUSTER_GUARD: ${bhSell}; nothing was signed or sent.` };
+      }
       await traced('tx.sign', () => localSigner.signTransaction(v0Tx), { 'apex.side': 'SELL' });
 
       // A sell that would revert (slippage breached, bad account) costs fees every time it lands. Simulate first and only send one that passes.

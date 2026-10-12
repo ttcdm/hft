@@ -4,8 +4,10 @@ import type { Connection } from '@solana/web3.js';
  * Cluster guard. Nothing in this repo may sign or send a transaction unless the
  * RPC endpoint reports the genesis hash of the cluster Mike has explicitly
  * allowed. The default (and only cluster used by tests and the devnet harness)
- * is devnet. Mainnet needs ALLOWED_CLUSTER=mainnet-beta, which nobody sets
- * in this repo.
+ * is devnet. ALLOWED_CLUSTER=mainnet-beta is still accepted so a read-only
+ * server can watch mainnet (see readOnly.ts), but `assertSendClusterAllowed`
+ * refuses every arm, signed trade and send while it is set: this build never
+ * sends on mainnet, whatever the RPC reports.
  */
 
 export type AllowedCluster = 'devnet' | 'mainnet-beta' | 'localnet';
@@ -100,6 +102,17 @@ export function resolveJitoUrl(explicit?: string | null, env: NodeJS.ProcessEnv 
 /** The public Jito tip-floor service is mainnet-only, so it is only reachable when mainnet is allowed. */
 export function jitoTipFloorAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
   return allowedCluster(env) === 'mainnet-beta';
+}
+
+/**
+ * Throws when ALLOWED_CLUSTER is mainnet-beta. Called wherever the app could arm LIVE, sign or send, so that a mainnet setting can only
+ * ever be used for watching and paper trading. `assertClusterAllowed` is not changed: readiness uses it to check the RPC, and a read-only
+ * server watching mainnet must keep passing that check.
+ */
+export function assertSendClusterAllowed(env: NodeJS.ProcessEnv = process.env): void {
+  if (allowedCluster(env) === 'mainnet-beta') {
+    throw new ClusterGuardError('ALLOWED_CLUSTER=mainnet-beta: this build never arms LIVE, signs or sends on mainnet (devnet and localnet only); refusing');
+  }
 }
 
 /**

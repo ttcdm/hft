@@ -119,13 +119,14 @@ flowchart TD
   subgraph arm["To arm: armLiveTrading"]
     a0["not read-only"] --> a1["confirmation code<br/>CONFIRM_LIVE_TRADING_RISK"]
     a1 --> a2["ALLOW_LIVE_REAL_MONEY_TRADING is true"]
-    a2 --> a3["getLiveReadiness<br/>coordinator.ts"]
+    a2 --> a2b["ALLOWED_CLUSTER is not mainnet-beta"]
+    a2b --> a3["getLiveReadiness<br/>coordinator.ts"]
   end
   a3 -.-> a3g["signer READY, balance above the 0.015 SOL reserve, database writable,<br/>startup reconciliation EXECUTION_READY, RPC HEALTHY,<br/>no halt, kill switch off, circuit breaker closed, Jito ready or not configured"]
   a3 --> t0
   subgraph trade["For each trade: executeTrade"]
     t0["not halted, LIVE not refused by read-only,<br/>mode matches if the caller named one"] --> t1["provenance is a real source<br/>and signal timestamp is present"]
-    t1 --> t2["still armed and signer READY"]
+    t1 --> t2["still armed, signer READY,<br/>ALLOWED_CLUSTER not mainnet-beta"]
     t2 --> t3["real bonding curve read, not migrated"]
     t3 --> t4["EligibilityFilter passes"]
     t4 --> t5["one open LIVE position per mint"]
@@ -137,14 +138,14 @@ flowchart TD
     t10 --> t11["after the awaits: still armed, not halted, kill switch off"]
   end
   t11 --> s0["assertNotReadOnly<br/>readOnly.ts"]
-  s0 --> s1["assertClusterAllowed<br/>clusterGuard.ts"]
+  s0 --> s1["assertSendClusterAllowed, then assertClusterAllowed<br/>clusterGuard.ts"]
   s1 --> s2(["transaction signed and sent"])
   m["manual one-click route: confirmLive true<br/>liveConfirmationRefusal"] -.-> t0
 ```
 
 The provenance and signal-timestamp checks apply to LIVE only; PAPER runs its own gate (`evaluatePaperBuy`) instead of everything after the provenance row. The "mode matches" check does nothing for the two direct manual routes, which name no mode; the auto controller does name one.
 
-`assertClusterAllowed` compares the RPC's genesis hash with the allowed cluster's and refuses if it cannot read it, so a mainnet RPC cannot send even if every earlier check passed. The code still parses a `mainnet-beta` value of `ALLOWED_CLUSTER`, but DEVNET_LIVE refuses it and this project does not use it. `confirmLive` is a guard against an accidental click, not a security boundary: the operator token is the authorisation ([`KNOWN_RISKS.md`](../KNOWN_RISKS.md) section 7).
+`assertClusterAllowed` compares the RPC's genesis hash with the allowed cluster's and refuses if it cannot read it, so a mainnet RPC cannot send even if every earlier check passed. The code still accepts a `mainnet-beta` value of `ALLOWED_CLUSTER`, but only so a read-only server can watch mainnet: while it is set, `armLiveTrading`, the LIVE branch of `executeTrade` and the send path (`assertSendClusterAllowed`) all refuse, and DEVNET_LIVE refuses it too. `confirmLive` is a guard against an accidental click, not a security boundary: the operator token is the authorisation ([`KNOWN_RISKS.md`](../KNOWN_RISKS.md) section 7).
 
 ## Code that looks functional and is not
 

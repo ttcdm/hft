@@ -10,7 +10,7 @@ Values are read as strings. Booleans mean the exact text `true` unless the row s
 
 | Variable | Default | Read in | Devnet-safe value and notes |
 |---|---|---|---|
-| `ALLOWED_CLUSTER` | `devnet` | `server/pumpfunService.ts`, `server/solana/clusterGuard.ts` | `devnet`, or `localnet` with `LOCALNET_GENESIS_HASH`. Any value except `localnet` and `mainnet-beta` means devnet. Do not set `mainnet-beta`: this project is devnet only. |
+| `ALLOWED_CLUSTER` | `devnet` | `server/pumpfunService.ts`, `server/solana/clusterGuard.ts` | `devnet`, or `localnet` with `LOCALNET_GENESIS_HASH`. Any value except `localnet` and `mainnet-beta` means devnet. `mainnet-beta` is accepted only so a read-only server can watch mainnet: while it is set, arming LIVE, every trade and every send are refused. Do not set it for trading: this project is devnet only. |
 | `SOLANA_RPC_URL` | `https://api.devnet.solana.com` | `server/solana/clusterGuard.ts` | A devnet URL or a loopback URL. A URL that names mainnet is replaced by the devnet default. Never commit one with an API key in it. |
 | `ALLOW_LIVE_REAL_MONEY_TRADING` | off (anything but `true`) | `server/execution/coordinator.ts`, `server/solana/readOnly.ts` | Leave `false`. Only the devnet harness sets it, in-process, after checking the genesis hash. Read-only mode refuses to start with it on. |
 | `APEX_READ_ONLY` | off | `server/solana/readOnly.ts` | `true` for watch-only mode. Startup refuses if any signing key is configured. |

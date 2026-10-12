@@ -45,7 +45,7 @@ import { workstationDb } from '../db/database';
 import { getRandomJitoTipAccount, TOKEN_2022_PROGRAM_ID } from '../solana/programs';
 import { executionConfig } from '../solana/executionConfig';
 import { Logger, endpointOrigin } from '../middleware/enterprise';
-import { allowedCluster, assertClusterAllowed, resolveRpcUrl } from '../solana/clusterGuard';
+import { allowedCluster, assertClusterAllowed, assertSendClusterAllowed, resolveRpcUrl } from '../solana/clusterGuard';
 import { PumpCurveService, TradeQuote, PumpMarketState, fetchTokenHolderDistribution } from '../solana/pumpCurve';
 import { TradeReconciler, RealMarkPriceService, PreTradeSnapshot } from './reconciliation';
 export type { PreTradeSnapshot };
@@ -1156,6 +1156,13 @@ export class ExecutionCoordinator {
           reasons: ['ALLOW_LIVE_REAL_MONEY_TRADING !== "true"'],
         };
       }
+      if (allowedCluster() === 'mainnet-beta') {
+        return {
+          success: false,
+          message: 'MAINNET_PROHIBITED: ALLOWED_CLUSTER=mainnet-beta. This build never arms LIVE on mainnet (devnet and localnet only); watching and paper trading still work.',
+          reasons: ['ALLOWED_CLUSTER=mainnet-beta'],
+        };
+      }
       const check = this.canExecuteLive();
       if (!check.allowed) {
         return {
@@ -1435,6 +1442,7 @@ export class ExecutionCoordinator {
     // Cluster guard: every signed buy and sell passes through here. Refuse before anything is sent
     // unless the RPC reports the allowed cluster's genesis hash (devnet unless Mike set ALLOWED_CLUSTER).
     try {
+      assertSendClusterAllowed(); // mainnet is never a send target, even when the RPC reports its genesis
       await assertClusterAllowed(this.connection);
     } catch (err: any) {
       Logger.error(`[R1] ${side} for order ${orderId} blocked: ${err.message}`);
@@ -2113,6 +2121,11 @@ export class ExecutionCoordinator {
         error: 'Live trading is not armed or signer is unavailable',
         correlationId,
       };
+    }
+    try {
+      assertSendClusterAllowed();
+    } catch (err: any) {
+      return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'LIVE', error: err.message, correlationId };
     }
 
     let mintPubkey: PublicKey;

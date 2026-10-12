@@ -16,6 +16,7 @@ import crypto from 'crypto';
 import net from 'net';
 import { spawn, ChildProcess } from 'child_process';
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
+import { waitForNewHeld } from './heldWait';
 import { AccountLayout, NATIVE_MINT, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from '@solana/spl-token';
 import { PUMP_AMM_SDK, PUMP_AMM_PROGRAM_ID, canonicalPumpPoolPda, GLOBAL_CONFIG_PDA, pumpPoolAuthorityPda, coinCreatorVaultAuthorityPda } from '@pump-fun/pump-swap-sdk';
 
@@ -407,14 +408,11 @@ async function main() {
   const buyG = await call('POST', '/api/execution/trade', { mint: mintG.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02, confirmLive: true });
   rec('(g) buy for the sell-in-flight scenario', buyG.status === 200 && buyG.body?.success, JSON.stringify(buyG.body).slice(0, 200));
   if (buyG.body?.positionId) {
+    const heldBefore = ((await rpcCall(info.url, 'localnet_stats', [])).held as string[]).length; // the (f) buy's signature is still in the list
     await rpcCall(info.url, 'localnet_holdNextResponse', []);
     const sellInFlight = fetch(`${base}/api/execution/close`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ positionId: buyG.body.positionId, sellPct: 100, reason: 'localnet Q18' }) }).catch(() => null);
-    let heldSell: string[] = [];
-    for (let i = 0; i < 60 && !heldSell.length; i++) {
-      await sleep(250);
-      heldSell = (await rpcCall(info.url, 'localnet_stats', [])).held;
-    }
-    rec('(g) sell landed on-chain with its response withheld', heldSell.length >= 1, `signature ${heldSell[heldSell.length - 1] ?? 'none'}`);
+    const heldSellSig = await waitForNewHeld(async () => (await rpcCall(info.url, 'localnet_stats', [])).held, heldBefore);
+    rec('(g) sell landed on-chain with its response withheld', heldSellSig !== null, `signature ${heldSellSig ?? 'none'}`);
     proc.kill('SIGKILL');
     await sellInFlight;
     await sleep(500);

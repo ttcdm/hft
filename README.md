@@ -55,15 +55,24 @@ npm run dev
 **Prerequisites:** Docker and Docker Compose installed.
 
 ```bash
+# Compose refuses to start without an operator token (16+ characters). Put it in your shell or in .env next to docker-compose.yml.
+export OPERATOR_AUTH_TOKEN=$(openssl rand -hex 32)
+
 # Build and launch container in background
 docker compose up -d --build
 
 # View real-time logs
 docker compose logs -f
 
-# Stop the container
+# Stop the container (the data volume is kept)
 docker compose down
 ```
+
+What to expect from the container:
+- The dashboard is at <http://127.0.0.1:3000>, published on the host's loopback only.
+- It is devnet-only and starts in PAPER with no signer: compose passes a fixed list of variables (see `docker-compose.yml`) and does not load `.env` as a whole, so `OPERATOR_PRIVATE_KEY`, `SIGNER_KEYPAIR_PATH` and other `.env` settings outside that list do not reach it. A key generated or imported in the UI is saved in the volume.
+- The database (and any such key) lives in the named volume `apex-data`, mounted at `/app/data`. It survives `docker compose down` and rebuilds; `docker compose down -v` deletes it.
+- The image only runs the app. Tests and the localnet scripts (`npm run localnet:e2e` and friends) need `solana-test-validator` and the dev dependencies, so run them on the host.
 
 ---
 

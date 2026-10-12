@@ -171,6 +171,7 @@
 "tests/seed_guard.test.ts::the CLI cannot be told a different genesis or cluster, and spends only with --execute",
 "tests/seed_recovery.test.ts::CI runs the localnet seeding proof, which includes the forced-429 sweep",
 "tests/seed_recovery.test.ts::CI runs the separate-funder audit proof (with its app-wallet control) after the seed proof",
+"tests/s214_docker_setup.test.ts::every file the postinstall script runs is copied into the builder before npm ci",
 "tests/t11_env_clean.test.ts::no live-trading, auto-snipe, demo or notification setting is inherited",
 "tests/v1_ui_labels.test.ts::Plug & Play carries no static LIVE badge (the mode pill shows the real mode)",
 "tests/v1_ui_labels.test.ts::left-aligned headers do not also carry text-right (CSS order made the right one win)",

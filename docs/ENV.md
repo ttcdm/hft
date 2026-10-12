@@ -97,6 +97,8 @@ Values are read as strings. Booleans mean the exact text `true` unless the row s
 
 `docker-compose.yml` passes a few variables through that the server does not read (`MEMECOIN_SNIPER_ENABLED`, `BINANCE_API_KEY`, `BINANCE_API_SECRET`), and it defaults `DEFAULT_JITO_TIP_SOL` to `0.005` where the code's default is `0.00018` (Jito is off on devnet, so the tip is forced to 0 and this default is unused). These are flagged, not changed here; a docs-only pass does not edit deployment config.
 
+In the image, `APEX_DB_PATH` is `/app/data/apex_workstation.db` and `SIGNER_KEYPAIR_PATH` is `/app/data/.apex_trading_keypair.json` (set in the `Dockerfile`); compose mounts the named volume `apex-data` at `/app/data`. Compose does not pass `OPERATOR_PRIVATE_KEY`, `SOLANA_PRIVATE_KEY` or `SIGNER_KEYPAIR_PATH` and has no `env_file`, so the container starts with no signer (PAPER).
+
 ## Script-only variables
 
 Read by files under `scripts/`, not by the server. The harness READMEs (`scripts/DEVNET_E2E_README.md`, `scripts/localnet/README.md`) say how each script is run.

@@ -32,6 +32,11 @@ Optional env:
 
 - Boot-time services: the harness does not run `server.ts`, so it starts what a LIVE buy needs from there. The SOL/USD price service is started and its first reading awaited (public Coinbase / CoinGecko / Binance hosts; no price is ever made up; if none can be read the run stops at "SOL/USD price"). The coordinator's own constructor starts the RPC heartbeat, startup reconciliation, the exit monitor and the mark feed. `MIN_LIQUIDITY_USD=0` is set because devnet pump curves hold cents (honoured off mainnet only). The top-10 and creator holding limits are fixed, so a mint that fails them is refused: pick another with `DEVNET_MINTS`.
 
+## Tracing and output
+- `APEX_TRACING=true` works here: the harness starts tracing before it makes any connection, as `server.ts` does (the local-only OTLP rule still applies; see the tracing notes in the README).
+- With `APEX_VERIFY_BLOCKHASH=true` the log shows `[S210] independent blockhash check passed for the BUY` when the check ran.
+- Everything printed goes through a redactor, and the devnet guard prints a private RPC host as `<rpc>`. When the crash-after-submit child does not reach the send, step (f) says how it ended and shows its last lines instead of a raw dump.
+
 ## Which mint it trades
 The app's eligibility filter refuses a creator holding over 5% or a top-10 share over 20%, and devnet test mints often fail that. So the harness probes mints (the listed ones, then the pump program's recent activity, at most 25) until one clears both limits, and uses it. It builds the eligibility report itself from fresh holder data just before the buy, with the app's own `EligibilityFilter`, so a rate-limited lookup inside the coordinator cannot refuse a mint it already screened.
 If none clears, it falls back to the readable mint with the lowest creator share and **waives only the creator and top-10 checks, in the harness's report, logging `WAIVER` lines with the real values**. The app's filter is not changed. A share it could not read is never waived, and neither is any other failed check. The mint is saved in the scratch directory so the crash and recover processes use the same one.

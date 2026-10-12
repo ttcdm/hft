@@ -469,6 +469,7 @@ export class WorkstationDatabase {
           reconciliation_state, network_fee_lamports, jito_tip_lamports, execution_mode, error
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(signature) DO UPDATE SET
+          submission_transport = excluded.submission_transport,
           bundle_id = excluded.bundle_id,
           landing_slot = excluded.landing_slot,
           confirmation_time = excluded.confirmation_time,

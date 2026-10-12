@@ -104,7 +104,7 @@ describe('S226: the devnet harness picks a mint the app accepts, and only waives
   it('never prints an RPC URL: scrubUrls, the guard log, and no harness line logs the URL variable', () => {
     expect(scrubUrls('failed https://dev.quiknode.pro/abc123secret/?k=v and wss://h.example/key done')).toBe('failed <url> and <url> done');
     const guard = path.resolve(process.cwd(), 'scripts/devnet_guard.cjs');
-    const r = spawnSync(process.execPath, ['--require', guard, '-e', "fetch('http://127.0.0.1:9/abc123secret?token=zzz').catch(()=>{})"], { encoding: 'utf8', timeout: 20_000 });
+    const r = spawnSync(process.execPath, ['--require', guard, '-e', "fetch('http://127.0.0.1:9/abc123secret?token=zzz').catch(()=>{})"], { encoding: 'utf8', timeout: 20_000, env: { ...process.env, DEVNET_RPC_URL: '', SOLANA_RPC_URL: '', SOLANA_WS_URL: '' } });
     expect(r.stderr).toContain('http://127.0.0.1:9');
     expect(r.stderr).not.toContain('abc123secret');
     expect(r.stderr).not.toContain('zzz');

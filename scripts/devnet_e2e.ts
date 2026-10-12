@@ -11,6 +11,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { spawnSync } from 'child_process';
+import { redact, childReport } from './redact';
 
 const DEVNET_GENESIS = 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG';
 const DEFAULT_MINTS = [
@@ -26,6 +27,8 @@ const keyPath = path.join(scratch, 'throwaway-keypair.json');
 
 // ---- sanitized environment: must be set before any server module is imported ----
 process.env.SOLANA_RPC_URL = process.env.DEVNET_RPC_URL || 'https://api.devnet.solana.com';
+// Everything printed goes through safe(): a private DEVNET_RPC_URL carries its key in the path and names its endpoint in the host.
+const safe = (t: unknown) => redact(String(t), [process.env.DEVNET_RPC_URL]);
 // No block engine: devnet's real configuration. A dead Jito URL makes readiness report Jito OFFLINE and arming refuses, so the RPC transport is used directly.
 delete process.env.JITO_BLOCK_ENGINE_URL;
 process.env.ENABLE_RPC_FALLBACK = 'true';
@@ -47,6 +50,7 @@ if (/mainnet|jito\.wtf/i.test(process.env.SOLANA_RPC_URL)) {
 
 const results: { step: string; ok: boolean; detail: string }[] = [];
 const rec = (step: string, ok: boolean, detail: string) => {
+  detail = safe(detail);
   results.push({ step, ok, detail });
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${step}: ${detail}`);
 };
@@ -54,6 +58,9 @@ const solscan = (sig: string) => `https://solscan.io/tx/${sig}?cluster=devnet`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
+  // S227: tracing starts here when APEX_TRACING=true, as server.ts does at boot, after the environment above is set and before any connection is made.
+  const { tracingReady } = await import('../server/observability/init');
+  await tracingReady;
   const web3 = await import('@solana/web3.js');
   const { Keypair, Connection, LAMPORTS_PER_SOL, PublicKey, VersionedTransaction } = web3;
 
@@ -81,7 +88,7 @@ async function main() {
       const sig = await conn.requestAirdrop(kp.publicKey, 1 * LAMPORTS_PER_SOL);
       await conn.confirmTransaction(sig, 'confirmed');
     } catch (e: any) {
-      console.log(`single airdrop request failed (not retried): ${String(e.message).slice(0, 120)}`);
+      console.log(`single airdrop request failed (not retried): ${safe(e.message).slice(0, 120)}`);
     }
     bal = await conn.getBalance(kp.publicKey);
   }
@@ -111,7 +118,7 @@ async function main() {
     try {
       st = await PumpCurveService.fetchPumpMarketState({ connection: conn, mint: new PublicKey(m), executionMode: 'LIVE' });
     } catch (e: any) {
-      return { mint: m, usable: false, creatorPct: null, top10Pct: null, note: M.scrubUrls(String(e.message)).slice(0, 80) };
+      return { mint: m, usable: false, creatorPct: null, top10Pct: null, note: safe(e.message).slice(0, 80) };
     }
     if (!st || st.complete) return { mint: m, usable: false, creatorPct: null, top10Pct: null, note: 'migrated or unreadable' };
     states.set(m, st);
@@ -119,7 +126,7 @@ async function main() {
       const d = await fetchTokenHolderDistribution(conn, new PublicKey(m), st.creator, st.bondingCurve);
       return { mint: m, usable: true, creatorPct: d.devHoldingPct, top10Pct: d.top10HoldersPct };
     } catch (e: any) {
-      return { mint: m, usable: true, creatorPct: null, top10Pct: null, note: M.scrubUrls(String(e.message)).slice(0, 80) };
+      return { mint: m, usable: true, creatorPct: null, top10Pct: null, note: safe(e.message).slice(0, 80) };
     }
   };
   const allowWaiver = process.env.DEVNET_NO_WAIVER !== '1';
@@ -259,7 +266,7 @@ async function main() {
         }
       }
     } catch (e: any) {
-      console.log(`INFO  could not build the eligibility report (${M.scrubUrls(String(e.message)).slice(0, 100)}); the coordinator will check by itself`);
+      console.log(`INFO  could not build the eligibility report (${safe(e.message).slice(0, 100)}); the coordinator will check by itself`);
       report = undefined;
     }
     return liveBuyRequest(mint!, BUY_SOL, Date.now(), report);
@@ -343,10 +350,10 @@ async function main() {
   // (f) crash after submit, then recover in a fresh process on the same scratch DB
   const env = { ...process.env, APEX_E2E_SCRATCH: scratch };
   const self = process.argv[1];
-  const run = (p: string) => spawnSync(process.execPath, ['--require', path.resolve('scripts/devnet_guard.cjs'), '--import', 'tsx', self, `--phase=${p}`], { env, encoding: 'utf8', timeout: 120_000 });
+  const run = (p: string) => spawnSync(process.execPath, ['--require', path.resolve('scripts/devnet_guard.cjs'), '--import', 'tsx', self, `--phase=${p}`], { env, encoding: 'utf8', timeout: 240_000 });
   const crash = run('crash');
   const crashed = /CRASH_AFTER_SUBMIT (\S+)/.exec(crash.stdout || '');
-  rec('(f) process killed after submit', !!crashed, crashed ? solscan(crashed[1]) : (crash.stdout + crash.stderr).slice(-300));
+  rec('(f) process killed after submit', !!crashed, crashed ? solscan(crashed[1]) : `the child never reached the send: ${childReport(crash, [process.env.DEVNET_RPC_URL])}`);
   const rec2 = run('recover');
   process.stdout.write(rec2.stdout || '');
   rec('(f) recover process exit', rec2.status === 0, `exit ${rec2.status}`);
@@ -362,6 +369,6 @@ function finish() {
 }
 
 main().catch((e) => {
-  console.error('harness error:', e?.stack || e);
+  console.error('harness error:', safe(e?.stack || e));
   process.exit(1);
 });

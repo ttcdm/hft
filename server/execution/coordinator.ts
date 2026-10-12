@@ -295,7 +295,11 @@ export class ExecutionCoordinator {
   private async blockhashProblem(tx: VersionedTransaction, side: 'BUY' | 'SELL'): Promise<string | null> {
     if (!blockhashCheckEnabled()) return null;
     const verdict = await traced('guard.blockhash', () => verifyBlockhashIndependently(tx.message.recentBlockhash), { 'apex.side': side });
-    if (verdict.ok) return null;
+    if (verdict.ok) {
+      // S227: say so when the check really ran, so a run that has it on shows it; a skipped check (flag off, localnet) is silent.
+      if (!('skipped' in verdict && verdict.skipped)) Logger.info(`[S210] independent blockhash check passed for the ${side}`);
+      return null;
+    }
     if (side === 'SELL' && !verdict.definite) {
       Logger.warn(`[S210] SELL not blocked: ${verdict.reason}`);
       return null;
@@ -1392,6 +1396,10 @@ export class ExecutionCoordinator {
   public async submitAndConfirmWithRetry(
     params: Parameters<ExecutionCoordinator['submitAndConfirmInner']>[0]
   ): ReturnType<ExecutionCoordinator['submitAndConfirmInner']> {
+    // S227: an order that is already recorded as landed is answered before anything is written. The PENDING row below is for a signature about
+    // to be sent; written first, a skipped resubmission left a row for a transaction that was never sent.
+    const already = this.alreadyLandedResult(params.orderId);
+    if (already) return already;
     const preSignature = this.signatureOf(params.tx);
     if (preSignature) {
       workstationDb.saveTransaction({
@@ -1400,7 +1408,8 @@ export class ExecutionCoordinator {
         correlationId: params.correlationId,
         mint: params.mint,
         direction: params.side,
-        submissionTransport: 'JITO',
+        // S227: with no block engine configured nothing goes through Jito, so the row says SOLANA_RPC from the start.
+        submissionTransport: this.jitoTransport.isEnabled() ? 'JITO' : 'SOLANA_RPC',
         submissionTime: Date.now(),
         reconciliationState: 'PENDING',
         networkFeeLamports: 5000,
@@ -1417,6 +1426,21 @@ export class ExecutionCoordinator {
       }
     }
     return res;
+  }
+
+  /** R0.6: the result for an order the database already holds as landed (RECONCILED), or null. Writes nothing. */
+  private alreadyLandedResult(orderId: string): { success: true; signature: string; transport: 'JITO' | 'SOLANA_RPC'; slot?: number; lifecycleState: 'CONFIRMED' } | null {
+    if (!orderId) return null;
+    const resolved = workstationDb.loadTransactions(orderId).find((t) => t.reconciliationState === 'RECONCILED');
+    if (!resolved) return null;
+    Logger.warn(`[R0.6] Order ${orderId} already landed or recorded in database; skipping resubmission`);
+    return {
+      success: true,
+      signature: resolved.signature,
+      transport: resolved.submissionTransport === 'SOLANA_RPC' ? 'SOLANA_RPC' : 'JITO',
+      slot: resolved.landingSlot,
+      lifecycleState: 'CONFIRMED',
+    };
   }
 
   private signatureOf(tx: any): string | null {
@@ -1492,20 +1516,8 @@ export class ExecutionCoordinator {
     const confirmTimeoutMs = Math.max(1000, cfg.bundleConfirmTimeoutMs);
 
     // 0. Pre-execution check: Has this order already executed or landed?
-    if (orderId) {
-      const txs = workstationDb.loadTransactions(orderId);
-      const resolved = txs.find((t) => t.reconciliationState === 'RECONCILED');
-      if (resolved) {
-        Logger.warn(`[R0.6] Order ${orderId} already landed or recorded in database; skipping resubmission`);
-        return {
-          success: true,
-          signature: resolved.signature,
-          transport: resolved.submissionTransport === 'SOLANA_RPC' ? 'SOLANA_RPC' : 'JITO',
-          slot: resolved.landingSlot,
-          lifecycleState: 'CONFIRMED',
-        };
-      }
-    }
+    const already = this.alreadyLandedResult(orderId);
+    if (already) return already;
 
     let lastSignature = '';
     let lastBundleId: string | undefined;
@@ -1617,7 +1629,8 @@ export class ExecutionCoordinator {
         };
       }
 
-      Logger.warn(`[R0.6] Jito attempts exhausted for order ${orderId}. Evaluating direct RPC fallback...`);
+      if (jitoEnabled) Logger.warn(`[R0.6] Jito attempts exhausted for order ${orderId}. Evaluating direct RPC fallback...`);
+      else Logger.info(`[S227] No Jito block engine is configured; order ${orderId} goes through the RPC transport`);
       // Crucial pre-check before fallback to prevent double fill:
       if (lastSignature || lastBundleId) {
         const preFallbackCheck = await this.checkIfTransactionLanded(lastSignature, lastBundleId, owner, mintPubkey, tokenProgram, preSnapshot, side, orderId);
@@ -1646,11 +1659,13 @@ export class ExecutionCoordinator {
         };
       }
 
-      workstationDb.logJournal('FALLBACK_RPC_ATTEMPT', correlationId, 'LIVE', {
-        orderId,
-        previousJitoSignature: lastSignature,
-        previousJitoBundleId: lastBundleId,
-      });
+      if (jitoEnabled) {
+        workstationDb.logJournal('FALLBACK_RPC_ATTEMPT', correlationId, 'LIVE', {
+          orderId,
+          previousJitoSignature: lastSignature,
+          previousJitoBundleId: lastBundleId,
+        });
+      }
 
       const rpcSubmit = await traced('tx.submit', () => this.rpcTransport.submit(tx), { 'apex.transport': 'SOLANA_RPC', 'apex.side': side });
       if (!rpcSubmit.success || !rpcSubmit.signature) {

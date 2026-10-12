@@ -46,10 +46,7 @@ export function mintFromProgramDataLog(line: string): string | null {
   return null;
 }
 
-/** Removes anything URL-shaped from text before it is printed: a private RPC URL carries its key in the path. */
-export function scrubUrls(text: string): string {
-  return String(text).replace(/\b[a-z][a-z0-9+.-]*:\/\/[^\s'")]+/gi, '<url>');
-}
+export { scrubUrls } from './redact';
 
 /** Distinct mints from the pump program's most recent transactions, newest first. Never throws: an RPC error ends the scan with what was found. */
 export async function recentCreateMints(

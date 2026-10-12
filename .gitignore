@@ -6,10 +6,6 @@ dist/
 build/
 coverage/
 
-# ─── Rust / Cargo ────────────────────────────────────────────────────────────
-target/
-Cargo.lock
-
 # ─── Environment & secrets ───────────────────────────────────────────────────
 .env
 .env.local

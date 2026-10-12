@@ -1,6 +1,4 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import fs from 'fs';
-import path from 'path';
 import crypto from 'crypto';
 import { PublicKey } from '@solana/web3.js';
 import {
@@ -15,7 +13,7 @@ import { walletTrader } from '../server/walletTrader';
 import { isLiveApprovedProvenance } from '../server/core/types';
 import { localSigner } from '../server/solana/signer';
 
-describe('Phase 2 Remediation Suite (B02, B08, B09, B21, B23)', () => {
+describe('Phase 2 Remediation Suite (B02, B08, B09, B23)', () => {
   const origEnv = { ...process.env };
 
   beforeEach(() => {
@@ -302,21 +300,8 @@ describe('Phase 2 Remediation Suite (B02, B08, B09, B21, B23)', () => {
   });
 
   // =========================================================================
-  // Task 4: B21, B23 Spurious Services, Price Resilience & Documentation
+  // Task 4: B23 Price Resilience & Documentation
   // =========================================================================
-  describe('B21: Rust Engine Documentation Boundary', () => {
-    it('crates/apex_hft_engine/README.md clarifies that apex_hft_engine is a standalone CEX benchmark and DEX execution is driven by TypeScript', () => {
-      const readmePath = path.join(process.cwd(), 'crates/apex_hft_engine/README.md');
-      const readmeContent = fs.readFileSync(readmePath, 'utf8');
-
-      expect(readmeContent).toContain('ARCHITECTURAL BOUNDARY & ROLE NOTICE (B21)');
-      expect(readmeContent).toContain('standalone');
-      expect(readmeContent).toContain('reference benchmark');
-      expect(readmeContent).toContain('TypeScript');
-      expect(readmeContent).toContain('server/');
-    });
-  });
-
   describe('B23: Fallback Pricing Resilience (SolPriceService, C3)', () => {
     // S26: unit tests run with the external feeds off; this block exercises the production price path.
     beforeEach(() => { vi.stubEnv('APEX_DISABLE_EXTERNAL_FEEDS', ''); });

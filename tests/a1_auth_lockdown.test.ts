@@ -58,6 +58,8 @@ describe('A1: operator auth lockdown', () => {
       expect(routes.length).toBeGreaterThan(50);
       expect(routes).toContainEqual({ method: 'GET', path: '/api/auth/session' });
       expect(routes).toContainEqual({ method: 'POST', path: '/api/pumpfun/refresh' });
+      // S211/S212: the BTC simulator routes and the Rust source route are gone
+      expect(routes.filter((r) => r.path.startsWith('/api/engine/'))).toEqual([]);
     });
 
     it('rejects every non-allowlisted /api route without a token and admits it with a valid one', async () => {

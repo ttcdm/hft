@@ -1,5 +1,4 @@
 [
-"tests/a1_auth_lockdown.test.ts::finds the real /api routes declared in server.ts",
 "tests/a2_secret_hygiene.test.ts::keeps long hex secrets out of tracked docs and sources",
 "tests/a3_trade_entry_points.test.ts::WebSocket PANIC_LIQUIDATE is in the authenticated mutating set",
 "tests/a3_trade_entry_points.test.ts::WebSocket action %s validates its input",
@@ -80,7 +79,6 @@
 "tests/e2e/tier2/boundaries21_25.test.ts::B23.2: SQL injection strings in mint or symbol are safely parameterized in database",
 "tests/e2e/tier2/boundaries21_25.test.ts::B24.1: tsconfig enforces target, moduleResolution, and skipLibCheck",
 "tests/e2e/tier2/boundaries21_25.test.ts::B24.2: package.json specifies pinned dependencies without loose wildcard versions",
-"tests/e2e/tier2/boundaries21_25.test.ts::B24.3: Cargo workspace defines native Rust release optimization settings",
 "tests/e2e/tier2/boundaries21_25.test.ts::B24.4: SQLite database schema includes required performance and integrity indexes",
 "tests/e2e/tier2/boundaries21_25.test.ts::B25.1: .gitignore enforces exclusion of sensitive runtime artifacts and logs",
 "tests/e2e/tier2/boundaries21_25.test.ts::B25.2: repository sample configuration does not expose unmasked Solana private keys",
@@ -133,7 +131,6 @@
 "tests/phase1_remediation.test.ts::README.md states Node.js >= 22.5.0 is required for native node:sqlite",
 "tests/phase1_remediation.test.ts::package.json declares Node >= 22.5.0 and npm >= 10.0.0 in engines",
 "tests/phase1_remediation.test.ts::server.ts uses process.env.PORT and process.env.BIND_HOST",
-"tests/phase2_remediation.test.ts::crates/apex_hft_engine/README.md clarifies that apex_hft_engine is a standalone CEX benchmark and DEX execution is driven by TypeScript",
 "tests/phase3_remediation.test.ts::B06.3: createCloseAccountInstruction correctly binds ATA, destination, and owner",
 "tests/phase3_remediation.test.ts::B24: UI PumpFunHotCalloutsView sets default Jito tip to 0.00018 SOL",
 "tests/phase3_stress_challenge.test.ts::B24: UI PumpFunHotCalloutsView is clean of old 0.005 SOL tips across all references",

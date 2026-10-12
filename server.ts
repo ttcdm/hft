@@ -561,36 +561,6 @@ app.post('/api/export/packets', requireOperatorAuth, (req, res) => {
   res.send(JSON.stringify(rawData, null, 2));
 });
 
-// 8. Standalone Rust Engine Source
-app.get('/api/engine/rust/source', requireOperatorAuth, (req, res) => {
-  try {
-    const crateDir = path.join(process.cwd(), 'crates', 'apex_hft_engine');
-
-    const files: Record<string, string> = {};
-    const readSafe = (subPath: string) => {
-      try {
-        return fs.readFileSync(path.join(crateDir, subPath), 'utf8');
-      } catch {
-        return '';
-      }
-    };
-
-    files['Cargo.toml'] = readSafe('Cargo.toml');
-    files['README.md'] = readSafe('README.md');
-    files['src/main.rs'] = readSafe('src/main.rs');
-    files['src/lib.rs'] = readSafe('src/lib.rs');
-    files['src/order_book.rs'] = readSafe('src/order_book.rs');
-    files['src/ring_buffer.rs'] = readSafe('src/ring_buffer.rs');
-    files['src/risk.rs'] = readSafe('src/risk.rs');
-    files['src/avellaneda_stoikov.rs'] = readSafe('src/avellaneda_stoikov.rs');
-    files['src/wal.rs'] = readSafe('src/wal.rs');
-
-    res.json({ status: 'OK', crateName: 'apex_hft_engine', files });
-  } catch (err: any) {
-    res.status(500).json({ status: 'ERROR', message: err.message });
-  }
-});
-
 // ============================================================================
 // 12. SOCIAL SCANNER (TELEGRAM & X.COM) ALPHA INTELLIGENCE ENDPOINTS
 // ============================================================================

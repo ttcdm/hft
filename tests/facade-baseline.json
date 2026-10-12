@@ -168,6 +168,8 @@
 "tests/s1_social_integrations.test.ts::says plainly that setWebhook, polling and alert forwarding are not implemented",
 "tests/s1_social_integrations.test.ts::the Telegram webhook, config and test routes require operator auth",
 "tests/s1_social_integrations.test.ts::the snipe route refuses unverified signals while LIVE is armed (route-level; static check, no HTTP harness)",
+"tests/s224_devnet_harness_boot.test.ts::every boot-time service a LIVE buy needs is started by the harness, because it does not run server.ts",
+"tests/s224_devnet_harness_boot.test.ts::the harness keeps the devnet liquidity minimum off the mint list and sets no hardcoded price",
 "tests/s7_harness_env.test.ts::liveServer baseEnv points the RPC at a closed loopback port on the local cluster, and an explicit value still wins",
 "tests/seed_guard.test.ts::the CLI cannot be told a different genesis or cluster, and spends only with --execute",
 "tests/seed_recovery.test.ts::CI runs the localnet seeding proof, which includes the forced-429 sweep",

@@ -27,6 +27,8 @@ Optional env: `DEVNET_RPC_URL` (must not look like mainnet), `DEVNET_MINTS=<comm
 ## Notes
 - The LIVE buy request is built by `liveBuyRequest` in `scripts/devnet_funding.ts` (typed as `ExecuteTradeRequest`, with `signalTimestamp` set when the request is made; LIVE refuses a trade without one).
 
+- Boot-time services: the harness does not run `server.ts`, so it starts what a LIVE buy needs from there. The SOL/USD price service is started and its first reading awaited (public Coinbase / CoinGecko / Binance hosts; no price is ever made up; if none can be read the run stops at "SOL/USD price"). The coordinator's own constructor starts the RPC heartbeat, startup reconciliation, the exit monitor and the mark feed. `MIN_LIQUIDITY_USD=0` is set because devnet pump curves hold cents (honoured off mainnet only). The top-10 and creator holding limits are fixed, so a mint that fails them is refused: pick another with `DEVNET_MINTS`.
+
 ## Status
 Written and type-checked, NOT run against devnet: the overnight sandbox proxy returns 403 for api.devnet.solana.com. Running it
 offline fails closed at the genesis check (verified). Expect to adjust stage details on the first real run: the exact

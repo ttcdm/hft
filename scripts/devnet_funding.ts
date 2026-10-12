@@ -28,6 +28,26 @@ export function planFunding(balSol: number, address: string): FundingPlan {
   };
 }
 
+/** The SOL/USD price source the harness needs before a LIVE buy (only the price, so a test can pass a fake). */
+export interface PriceSource {
+  refresh(): Promise<unknown>;
+  getPrice(): { usd: number | null; stale: boolean };
+}
+
+/**
+ * server.ts starts the SOL/USD price service at boot; a script that imports the coordinator directly does not, and a LIVE buy then answers
+ * SOL_PRICE_UNAVAILABLE. Reads a real price (never a made-up one), trying a few times; returns what it found.
+ */
+export async function awaitSolPrice(svc: PriceSource, attempts = 4, pauseMs = 1500): Promise<{ ok: boolean; usd: number | null }> {
+  for (let i = 0; i < attempts; i++) {
+    await svc.refresh();
+    const r = svc.getPrice();
+    if (r.usd !== null && !r.stale) return { ok: true, usd: r.usd };
+    if (i < attempts - 1) await new Promise((res) => setTimeout(res, pauseMs));
+  }
+  return { ok: false, usd: null };
+}
+
 /**
  * The executeTrade request the harness sends for its LIVE buy. Typed, so a field the coordinator renames fails tsc here instead of on the
  * next devnet run. `signalTimestamp` is taken when the request is made: LIVE refuses a trade with no signal time (MISSING_SIGNAL_TIMESTAMP),

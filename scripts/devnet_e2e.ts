@@ -29,6 +29,8 @@ process.env.SOLANA_RPC_URL = process.env.DEVNET_RPC_URL || 'https://api.devnet.s
 // No block engine: devnet's real configuration. A dead Jito URL makes readiness report Jito OFFLINE and arming refuses, so the RPC transport is used directly.
 delete process.env.JITO_BLOCK_ENGINE_URL;
 process.env.ENABLE_RPC_FALLBACK = 'true';
+// Devnet pump curves hold a few cents of SOL; the mainnet liquidity minimum would make every test mint ineligible. Honoured off mainnet only.
+process.env.MIN_LIQUIDITY_USD = '0';
 process.env.JITO_MAX_RETRIES = '1';
 process.env.JITO_RETRY_INTERVAL_MS = '200';
 process.env.APEX_DB_PATH = path.join(scratch, 'e2e.db');
@@ -85,7 +87,7 @@ async function main() {
   }
   // Sizes scale down to the balance: the 10% spendable ceiling means a buy of about 8% of the balance.
   const balSol = bal / LAMPORTS_PER_SOL;
-  const { planFunding, liveBuyRequest } = await import('./devnet_funding');
+  const { planFunding, liveBuyRequest, awaitSolPrice } = await import('./devnet_funding');
   const plan = planFunding(balSol, kp.publicKey.toBase58());
   const BUY_SOL = plan.buySol;
   const funded = plan.funded;
@@ -146,6 +148,15 @@ async function main() {
   const { workstationDb } = await import('../server/db/database');
   const { localSigner } = await import('../server/solana/signer');
   const coordinator = new ExecutionCoordinator(true);
+  // server.ts starts the SOL/USD price service at boot (a LIVE buy needs a fresh price for the liquidity gate); this script does not run server.ts.
+  const { solPriceService } = await import('../server/market/solPriceService');
+  solPriceService.startAutoRefresh();
+  const price = await awaitSolPrice(solPriceService);
+  if (!price.ok) {
+    rec('SOL/USD price', false, 'no price could be read from Coinbase, CoinGecko or Binance (all public; none is a mainnet or Jito host). No price is made up. Check the network and re-run.');
+    return finish();
+  }
+  console.log(`INFO  SOL/USD ${price.usd} (read by the price service)`);
   if (phase === 'crash') {
     // Kill the process the instant the RPC returns a signature, before confirmation is recorded.
     const orig = Connection.prototype.sendRawTransaction;

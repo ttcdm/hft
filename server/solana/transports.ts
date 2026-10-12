@@ -7,17 +7,17 @@
  * URL is then used. With no URL every send goes through `SolanaRpcTransport`. The RPC transport sends with `skipPreflight: true`: nothing is simulated
  * first, so a transaction that would fail is found out on chain, not before it.
  *
- * What it must never do: send in read-only mode (both `submit` methods call `assertNotReadOnly` first), call the public Jito tip-floor
- * service unless mainnet was allowed (`jitoTipFloorAllowed`), or be used as a way around the cluster guard. These classes do not check
- * the cluster themselves; `ExecutionCoordinator.submitAndConfirmInner` runs `assertClusterAllowed` before it calls them, so they must
- * only be reached through it.
+ * What it must never do: send in read-only mode (both `submit` methods call `assertNotReadOnly` first, then `assertSendClusterAllowed`, which refuses whenever `ALLOWED_CLUSTER=mainnet-beta`), call the public Jito tip-floor
+ * service unless mainnet was allowed (`jitoTipFloorAllowed`), or be used as a way around the cluster guard. These classes refuse a mainnet
+ * setting themselves but do not check the RPC's genesis hash; `ExecutionCoordinator.submitAndConfirmInner` runs `assertClusterAllowed` before it
+ * calls them, so they must only be reached through it.
  *
  * Called by: `server/execution/coordinator.ts` only.
  */
 import { Connection, VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { Logger } from '../middleware/enterprise';
-import { jitoTipFloorAllowed, resolveJitoUrl } from './clusterGuard';
+import { assertSendClusterAllowed, jitoTipFloorAllowed, resolveJitoUrl } from './clusterGuard';
 import { executionConfig } from './executionConfig';
 import { assertNotReadOnly } from './readOnly';
 
@@ -84,6 +84,7 @@ export class SolanaRpcTransport implements ExecutionTransport {
   /** Sends one signed transaction with `sendRawTransaction`, `skipPreflight: true`. Throws `READ_ONLY` before touching the network in read-only mode. */
   public async submit(tx: VersionedTransaction): Promise<SubmitResult> {
     assertNotReadOnly('sending a transaction over RPC'); // S185: before anything is serialized or sent
+    assertSendClusterAllowed(); // S206: the lowest choke point; a mainnet setting never reaches the network from here
     const t0 = performance.now();
     try {
       const raw = tx.serialize();
@@ -440,6 +441,7 @@ export class JitoTransport implements ExecutionTransport {
   /** Sends the transaction as a one-transaction bundle. Fails at once with `JITO_DISABLED` when no block engine is configured. */
   public async submit(tx: VersionedTransaction): Promise<SubmitResult> {
     assertNotReadOnly('submitting a Jito bundle'); // S185: before anything is encoded or sent
+    assertSendClusterAllowed(); // S206: same as the RPC transport
     const t0 = performance.now();
     if (!this.isEnabled()) {
       this.lastHealthStatus = 'NOT_CONFIGURED';

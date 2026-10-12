@@ -1,16 +1,20 @@
 import '../hermeticEnv';
 import fs from 'fs';
 import readline from 'readline';
-import { replayLaunch, REPLAY_DEFAULTS, tradeFromJson } from '../../server/backtest/replay';
+import { replayLaunch, REPLAY_DEFAULTS, tradeFromJson, type RecordedLaunch } from '../../server/backtest/replay';
 import { ExitEngine } from '../../server/exits/exitEngine';
 import { tradePriceSol } from '../../server/market/poolStats';
 import { toRecordedLaunch, type CorpusLaunch } from './replay';
+import { openRecorded, resolveSplit, type RecordedSource } from './recorded';
 
 /**
  * S197b: exit-rule variants over the entries the real watch window + confluence gate produce at thresholds 70 / 60 / 50.
  * Entries come from replayLaunch (so the release and entry fill are the real replay's); the exit loop below is replay.ts's own loop with the
  * ExitEngine constants overridden per variant (stop loss, first take-profit, stale timeout) and a per-side haircut on the P&L.
- *   npx tsx scripts/hfcorpus/exit_variants.ts launches.jsonl [--out result.json] [--sol-usd 150]
+ *   npx tsx scripts/hfcorpus/exit_variants.ts launches.jsonl [--out result.json] [--sol-usd 150] [--split-ts <unix ms>]
+ *   npx tsx scripts/hfcorpus/exit_variants.ts --recorded <paper.db | snapshot.jsonl> [--out result.json] [--sol-usd <default: the recorded median>] [--split-ts <unix ms>]
+ * S228: --recorded reads the app's own launch recordings (see recorded.ts) instead of the corpus; the recorded funder facts are passed to the replay.
+ * The train/test cut is --split-ts; without it the corpus keeps 2026-07-05 UTC and recorded data cuts at the 75th percentile of create times.
  * Validation built in: with no haircut and the stock constants the loop must reproduce replayLaunch's own net P&L for every launch.
  */
 type Variant = { stop: number; tp1: number; staleMin: number };
@@ -20,10 +24,12 @@ const setVariant = (v: Variant) => { E.HARD_STOP_LOSS_PCT = -v.stop; E.TP1_TRIGG
 
 interface SimOut { net: number | null; open: number | null; exits: string[]; holdMs: number }
 
-function simulate(c: CorpusLaunch, releasedAfterMs: number, v: Variant, sellFeePct: number, sideHaircut: number): SimOut {
+/** One launch as the study needs it: the replay's input and its start time (the corpus create time, or the recorded CREATE row's). */
+interface Item { rec: RecordedLaunch; t0: number }
+
+function simulate(c: Item, releasedAfterMs: number, v: Variant, sellFeePct: number, sideHaircut: number): SimOut {
   setVariant(v);
-  const rec = toRecordedLaunch(c, null);
-  const trades = rec.events.filter((e) => e.kind === 'TRADE');
+  const trades = c.rec.events.filter((e) => e.kind === 'TRADE');
   const entryAt = c.t0 + releasedAfterMs + REPLAY_DEFAULTS.entryDelayMs;
   const after = trades.filter((e) => e.ts >= entryAt);
   const entryPrice = tradePriceSol(tradeFromJson(after[0].payload)) as number;
@@ -51,24 +57,38 @@ function simulate(c: CorpusLaunch, releasedAfterMs: number, v: Variant, sellFeeP
 
 async function main() {
   const args = process.argv.slice(2);
-  const file = args[0];
   const opt = (k: string, d: string) => { const i = args.indexOf('--' + k); return i >= 0 ? args[i + 1] : d; };
-  const solUsd = Number(opt('sol-usd', '150'));
+  const recordedPath = opt('recorded', '');
+  const file = args[0];
+  if (!recordedPath && (!file || file.startsWith('--'))) throw new Error('usage: exit_variants.ts launches.jsonl | --recorded <paper.db|snapshot.jsonl> [--out f] [--sol-usd n] [--split-ts ms]');
+  const source: RecordedSource | null = recordedPath ? await openRecorded(recordedPath) : null;
+  const solUsdArg = opt('sol-usd', '');
+  const solUsd = solUsdArg !== '' ? Number(solUsdArg) : (source?.medianSolUsd() ?? 150);
   const outPath = opt('out', '/tmp/exit_variants.json');
   const THRESH = [70, 60, 50];
-  const entered = new Map<number, Array<{ c: CorpusLaunch; releasedAfterMs: number; base: number | null }>>(THRESH.map((t) => [t, []]));
-  const rl = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
+  const entered = new Map<number, Array<{ c: Item; releasedAfterMs: number; base: number | null }>>(THRESH.map((t) => [t, []]));
   let n = 0;
-  for await (const line of rl) {
-    if (!line) continue;
-    const c: CorpusLaunch = JSON.parse(line);
-    const rec = toRecordedLaunch(c, solUsd);
+  const consider = (item: Item, funders: ReturnType<RecordedSource['funders']>) => {
     for (const th of THRESH) {
       setVariant(STOCK);
-      const r = replayLaunch(rec, [], solUsd, { minScore: th });
-      if (r.entered && r.releasedAfterMs !== null) entered.get(th)!.push({ c, releasedAfterMs: r.releasedAfterMs, base: r.outcome === 'CLOSED' ? r.netPnlSol : null });
+      const r = replayLaunch(item.rec, funders, solUsd, { minScore: th });
+      if (r.entered && r.releasedAfterMs !== null) entered.get(th)!.push({ c: item, releasedAfterMs: r.releasedAfterMs, base: r.outcome === 'CLOSED' ? r.netPnlSol : null });
     }
-    if (++n % 50000 === 0) console.error(n);
+    if (++n % 50000 === 0 || (source && n % 2000 === 0)) console.error(n);
+  };
+  if (source) {
+    const funders = source.funders();
+    for (const rec of source.launches()) {
+      const create = rec.events.find((e) => e.kind === 'CREATE');
+      if (create) consider({ rec, t0: create.ts }, funders);
+    }
+  } else {
+    const rl = readline.createInterface({ input: fs.createReadStream(file), crlfDelay: Infinity });
+    for await (const line of rl) {
+      if (!line) continue;
+      const c: CorpusLaunch = JSON.parse(line);
+      consider({ rec: toRecordedLaunch(c, solUsd), t0: c.t0 }, []);
+    }
   }
   console.error('entries', THRESH.map((t) => `${t}:${entered.get(t)!.length}`).join(' '));
 
@@ -89,8 +109,12 @@ async function main() {
   ];
   const rows: any[] = [];
   // S197d: the last 10 days (launches from 2026-07-05 UTC on) are held out: pick variants on 'train', confirm on 'test'
-  const CUT = Date.UTC(2026, 6, 5);
-  const SPLITS: Array<[string, (t0: number) => boolean]> = [['all', () => true], ['train (to Jul 4)', (t0) => t0 < CUT], ['test (Jul 5 on)', (t0) => t0 >= CUT]];
+  const split = resolveSplit(opt('split-ts', ''), source, Date.UTC(2026, 6, 5));
+  const CUT = split.cut;
+  const iso = new Date(CUT).toISOString().slice(0, 16) + 'Z';
+  const SPLITS: Array<[string, (t0: number) => boolean]> = split.isDefaultCorpus
+    ? [['all', () => true], ['train (to Jul 4)', (t0) => t0 < CUT], ['test (Jul 5 on)', (t0) => t0 >= CUT]]
+    : [['all', () => true], [`train (before ${iso})`, (t0) => t0 < CUT], [`test (from ${iso})`, (t0) => t0 >= CUT]];
   for (const [split, inSplit] of SPLITS) for (const th of THRESH) for (const h of haircuts) for (const v of variants) {
     let net = 0, open = 0, wins = 0, closed = 0, openN = 0; const reasons: Record<string, number> = {};
     const list = entered.get(th)!.filter((e) => inSplit(e.c.t0));
@@ -102,6 +126,8 @@ async function main() {
     const entries = list.length;
     rows.push({ split, threshold: th, haircut: h.name, ...v, entries, closed, openAtEnd: openN, winRate: closed ? wins / closed : null, realizedSol: net, openMarkSol: open, totalSol: net + open, perEntrySol: entries ? (net + open) / entries : null, reasons });
   }
-  fs.writeFileSync(outPath, JSON.stringify({ entriesByThreshold: Object.fromEntries(THRESH.map((t) => [t, entered.get(t)!.length])), validation: { checked, differ: bad }, rows }, null, 1));
+  const funderFacts = source?.funders().length ?? 0;
+  source?.close();
+  fs.writeFileSync(outPath, JSON.stringify({ input: source ? { recorded: recordedPath, kind: source.kind, launches: n, funderFacts, solUsd } : { corpus: file, launches: n, solUsd }, split: { cutMs: CUT, cutIso: iso, note: split.note }, entriesByThreshold: Object.fromEntries(THRESH.map((t) => [t, entered.get(t)!.length])), validation: { checked, differ: bad }, rows }, null, 1));
 }
 main().catch((e) => { console.error(e); process.exit(1); });

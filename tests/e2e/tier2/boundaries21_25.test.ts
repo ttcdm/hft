@@ -494,7 +494,7 @@ describe('Tier 2: Boundary & Corner Cases (Features 21 - 25)', () => {
     });
 
     it('B25.5: master project architecture documents interface contracts and error standards', () => {
-      const projectPath = path.resolve(process.cwd(), 'PROJECT.md');
+      const projectPath = path.resolve(process.cwd(), 'docs/archive/PROJECT.md');
       const projectDoc = fs.readFileSync(projectPath, 'utf8');
 
       expect(projectDoc).toContain('Interface Contracts');

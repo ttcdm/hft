@@ -30,7 +30,7 @@ describe('B4: synthetic results are labelled as synthetic', () => {
   });
 
   it('STRATEGY_EVALUATION.md marks the PF 2.36 / +0.000677 SOL claims unverified', () => {
-    const md = fs.readFileSync('STRATEGY_EVALUATION.md', 'utf8');
+    const md = fs.readFileSync('docs/archive/STRATEGY_EVALUATION.md', 'utf8');
     expect(md).toMatch(/UNVERIFIED/);
     for (const claim of ['2.36', '0.000677']) {
       const lines = md.split('\n').filter((l) => l.includes(claim));

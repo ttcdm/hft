@@ -15,7 +15,7 @@ from the lockfile (not the hand-written stubs). No `.env`, no network to Solana 
 | # | Test | Class | Cause | Action |
 |---|---|---|---|---|
 | 1-3 | `adversarialGen2SecurityConcurrencyM1` 5.2, 5.3, 5.6 | broken test | `new ExecutionCoordinator()` probes `Connection.getSlot` on construction. The tests only mocked transaction lookups, so with a real SDK the probe hit the network, RPC health stayed `DISCONNECTED` and `startupReconciliation()` returned `OFFLINE`. The old stub always answered slot 1000, which hid this. | Fixed in D1: the Probe 5 `beforeEach` spies on `Connection.prototype.getSlot` and `getBalance`. |
-| 4 | `tier1/features21_25` F25.5 | broken test | Read `.agents/ORIGINAL_REQUEST.md`. `.agents/` is git-ignored, so the file does not exist in a clean checkout. The tracked copy is `ORIGINAL_REQUEST.md` in the repo root. | Fixed in D1: test reads the root file. |
+| 4 | `tier1/features21_25` F25.5 | broken test | Read `.agents/ORIGINAL_REQUEST.md`. `.agents/` is git-ignored, so the file does not exist in a clean checkout. The tracked copy is `docs/archive/ORIGINAL_REQUEST.md`. | Fixed in D1: test reads the root file. |
 | 5 | `tier2/boundaries16_20` B16.4 | contract conflict (needs Mike) | Asserts the Jito tip economic cap is 25% of notional. `executionConfig.ts` has 15%. A6 reverted the working-tree 25% edit, so code and committed tests disagree. | Not changed. Mike decides 15% or 25%, then the code or the three tests change. |
 | 6 | `tier5/jitoMevBundlesAndRpcFallback` JMB-2 | contract conflict (needs Mike) | Same 25% vs 15% cap. | Not changed. |
 | 7 | `phase3_stress_challenge` B07/B24 urgency multipliers | contract conflict (needs Mike) | Same 25% vs 15% cap (comment says "25% = 2.5M"). | Not changed. |

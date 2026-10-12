@@ -377,7 +377,6 @@ class EngineClient {
     }
   }
 
-  // ---------------- MICROSTRUCTURE REALISM ----------------
   // ---------------- PUMP.FUN HOT CALLOUTS & LEADERBOARD ----------------
   public async getPumpFunCallouts() {
     try {

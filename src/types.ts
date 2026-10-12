@@ -37,17 +37,6 @@ export interface ExecutedTrade {
   rejectionReason?: string;
 }
 
-export type JitterProfileType = 'GAUSSIAN' | 'PARETO_BURST' | 'MICROWAVE_FADE' | 'CIRCUIT_BREAKER';
-
-export interface NetworkStressConfig {
-  isStressActive: boolean;
-  profile: JitterProfileType;
-  baseLatencyMs: number;
-  jitterMs: number;
-  packetLossPct: number;
-  exchangeDisconnect: boolean;
-}
-
 export interface PerformanceKPIs {
   dailyPnL: number;
   unrealizedPnL: number;
@@ -295,27 +284,6 @@ export interface SniperBotConfig {
   telegramBotToken: string;
   telegramChatId: string;
   telegramWebhookActive: boolean;
-}
-
-// ---------------- REALISM & MICROSTRUCTURE CONFIG ----------------
-export type CoLocationRegion =
-  | 'AWS_TOKYO_AP_NORTHEAST_1'
-  | 'TOKYO_RETAIL_FIBER'
-  | 'AWS_OREGON_US_WEST_2'
-  | 'AWS_FRANKFURT_EU_CENTRAL_1';
-
-export type ExchangeFeeTier = 'VIP_0' | 'VIP_1' | 'VIP_4' | 'VIP_9_NEGATIVE_MAKER';
-
-export interface MicrostructureRealismConfig {
-  region: CoLocationRegion;
-  networkLatencyMs: number;
-  queuePositionModeling: boolean;
-  toxicFlowAdverseSelection: boolean;
-  feeTier: ExchangeFeeTier;
-  makerFeeBps: number;
-  takerFeeBps: number;
-  slippageModelEnabled: boolean;
-  jitoMevProtection: boolean;
 }
 
 // ---------------- PUMP.FUN HOT CALLOUTS & CALLER LEADERBOARD ----------------

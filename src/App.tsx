@@ -1,6 +1,6 @@
 import { TradingModeBanner } from './components/TradingModeBanner';
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { NetworkStressConfig, PerformanceKPIs, AlertEvent } from './types';
+import { PerformanceKPIs, AlertEvent } from './types';
 import { hftAudio } from './utils/audio';
 
 import { Header } from './components/Header';
@@ -45,28 +45,8 @@ export default function App() {
   const [selectedMint, setSelectedMint] = useState<string | null>(null);
   const [activeFeed, setActiveFeed] = useState('CME_AURORA');
 
-  // Strategy Fleet
-
-  // Network Stress Config
-  const [stressConfig] = useState<NetworkStressConfig>({
-    isStressActive: false,
-    profile: 'GAUSSIAN',
-    baseLatencyMs: 0.65,
-    jitterMs: 1.8,
-    packetLossPct: 0.0,
-    exchangeDisconnect: false,
-  });
-
-
   // KPIs & Risk Matrix (Initialized for $10 Micro Account)
   const [kpis] = useState<PerformanceKPIs>(makeEmptyKpis(10));
-
-
-  // Stable references for stream callbacks to ensure persistent connection without reconnect churn
-  const stressConfigRef = useRef(stressConfig);
-  stressConfigRef.current = stressConfig;
-  const isHaltedRef = useRef(isHalted);
-  isHaltedRef.current = isHalted;
 
   // Alerts
   const [alerts, setAlerts] = useState<AlertEvent[]>([]);

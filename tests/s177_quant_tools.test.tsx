@@ -167,6 +167,8 @@ describe('S177: routes and removals', () => {
     expect(src).toContain("'/api/system/checks'");
     expect(src).toContain("'/api/system/latency'");
     expect(src).not.toContain("'/api/unit-tests'");
-    for (const f of ['src/components/UnitTestModal.tsx', 'src/components/MicrostructureRealismModal.tsx', 'server/unitTestCases.ts']) expect(fs.existsSync(f), f).toBe(false);
+    expect(src).not.toContain("'/api/realism/config'"); // S213: the route had no caller once its modal was gone
+    for (const f of ['src/components/UnitTestModal.tsx', 'src/components/MicrostructureRealismModal.tsx', 'server/unitTestCases.ts',
+      'server/realismEngine.ts', 'src/utils/unitTests.ts', 'src/components/MonteCarloAnalytics.tsx']) expect(fs.existsSync(f), f).toBe(false);
   });
 });

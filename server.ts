@@ -14,7 +14,6 @@ import { socialScanner, isTelegramTradeCommand } from './server/socialScanner';
 import { memecoinAggregator } from './server/memecoinAggregator';
 import { onChainPoolStats } from './server/market/poolStats';
 import { wireWatchPins } from './server/signals/watchPins';
-import { realismEngine } from './server/realismEngine';
 import { buildSystemChecks } from './server/system/systemChecks';
 import { isReadOnly, assertReadOnlyStartup } from './server/solana/readOnly';
 import { LaunchRecorder } from './server/backtest/launchRecorder';
@@ -1045,26 +1044,6 @@ app.post('/api/pumpfun/refresh', requireOperatorAuth, async (req, res) => {
   });
 });
 
-
-// ============================================================================
-// 14. REALISM & CO-LOCATION MICROSTRUCTURE CONFIG ENDPOINTS
-// ============================================================================
-app.get('/api/realism/config', requireOperatorAuth, (req, res) => {
-  res.json({
-    status: 'OK',
-    config: realismEngine.getConfig(),
-    regions: realismEngine.getRegionDetails(),
-    feeSchedules: realismEngine.getFeeSchedule(),
-  });
-});
-
-app.post('/api/realism/config', requireOperatorAuth, (req, res) => {
-  const updated = realismEngine.updateConfig(req.body);
-  res.json({
-    status: 'OK',
-    config: updated,
-  });
-});
 
 // ============================================================================
 // 15. PLUG-AND-PLAY WALLET ONBOARDING & LIVE AUTONOMOUS TRADING ENDPOINTS

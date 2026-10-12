@@ -28,7 +28,6 @@ A short map of the code and three diagrams of the parts that decide whether SOL 
 | `server/pumpfunService.ts` | Hot callouts, callers and the Pump.fun feed wiring. | `server/pumpfunService.ts` |
 | `server/socialScanner.ts` | Social signals and the Telegram command parser. | `server/socialScanner.ts` |
 | `server/board.ts`, `server/walletTrader.ts` | The home-board read model and the wallet state and panic liquidation used by the UI. | `server/board.ts` |
-| `server/realismEngine.ts` | A co-location and exchange-fee profile left from the old BTC simulation. Nothing on the Pump.fun trade path imports it; only `/api/realism/config` reads it. | `server/realismEngine.ts` |
 | `src/` | The React operator UI (Vite). It holds no keys and sends orders only through the API. | `src/App.tsx` |
 | `scripts/` | Smoke test, devnet and localnet harnesses, signer import, release packaging. `scripts/localnet/` is the in-process LiteSVM validator. | `scripts/smoke.ts` |
 | `tests/` | The suite (`vitest run`). What the tests do and do not prove: [`TEST_FIDELITY.md`](TEST_FIDELITY.md). | `vitest.config.ts` |

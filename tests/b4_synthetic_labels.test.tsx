@@ -3,20 +3,13 @@ import fs from 'fs';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { BacktestModal } from '../src/components/BacktestModal';
-import { MonteCarloAnalytics } from '../src/components/MonteCarloAnalytics';
-import { SYNTHETIC_BANNER_TEXT } from '../src/components/SyntheticBanner';
 
 describe('B4: synthetic results are labelled as synthetic', () => {
   it('the Backtest view has no generator behind it: with no recording it says so and shows no result', () => {
     const html = renderToStaticMarkup(<BacktestModal isOpen={true} onClose={() => undefined} />);
-    expect(html).not.toContain(SYNTHETIC_BANNER_TEXT); // there is nothing synthetic left to label (S178)
+    expect(html).not.toMatch(/synthetic price paths/i); // there is nothing synthetic left to label (S178)
     expect(html).not.toMatch(/Historical Backtest|July 11/i);
     expect(fs.existsSync('src/utils/backtestEngine.ts')).toBe(false);
-  });
-
-  it('the Monte Carlo view shows the banner', () => {
-    const html = renderToStaticMarkup(<MonteCarloAnalytics currentPrice={150} />);
-    expect(html).toContain(SYNTHETIC_BANNER_TEXT);
   });
 
   it('the benchmark output is renamed and carries a header note saying its inputs are hand-written', () => {

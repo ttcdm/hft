@@ -1,3 +1,16 @@
+/**
+ * The "Memecoin and Social Sniper" screen: social signals, memecoin pools, open sniper positions, the sniper configuration and the Telegram
+ * settings, with the Pump.fun hot callouts as an embedded tab (`PumpFunHotCalloutsView`).
+ *
+ * API it calls (all through `engineClient`, with the operator token): `GET /api/social/signals`, `POST /api/social/signals/snipe`,
+ * `GET /api/memecoins/pools`, `GET /api/memecoins/positions`, `POST /api/memecoins/trade`, `POST /api/memecoins/close`,
+ * `GET` and `POST /api/memecoins/config`, `/api/telegram/config`, `/api/telegram/test-connection`, `/api/telegram/webhook`, and
+ * `GET /api/connectivity/diagnostics`. Live updates arrive over the `/ws/engine` WebSocket (pool snapshots, sniper trades).
+ *
+ * It holds no keys and decides nothing about risk: every buy goes to the server, which applies the gates described in
+ * `docs/ARCHITECTURE.md`. While LIVE is armed the server refuses a snipe that does not carry `confirmLive`, and this screen only sends it
+ * after the operator accepts the warning. Some switches here are stored but change nothing (KNOWN_RISKS.md section 6).
+ */
 import { signalFeedBadge } from '../utils/signalBadge';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { probeBadge, probeLatency, hostOfService } from '../utils/probeBadge';

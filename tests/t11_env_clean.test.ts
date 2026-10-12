@@ -1,5 +1,4 @@
 import { describe, it, expect } from 'vitest';
-import os from 'node:os';
 
 // T11/T12: the vitest config pins the environment, so a shell that exports live-trading or notification settings cannot leak in.
 describe('T11/T12: tests start from a clean, non-live environment', () => {
@@ -9,9 +8,5 @@ describe('T11/T12: tests start from a clean, non-live environment', () => {
     }
     expect(process.env.APEX_ENV_FILE).toBe('');
   });
-  it('the engine WAL goes to the temp dir, not the checkout', async () => {
-    const { EngineWAL } = await import('../server/engine/wal') as any;
-    const wal = new EngineWAL();
-    expect(String((wal as any).logFilePath).startsWith(os.tmpdir())).toBe(true);
-  });
+
 });

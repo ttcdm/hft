@@ -1,8 +1,26 @@
+/**
+ * The token eligibility gate. Pure: it takes what is known about one token (authorities, creator and top-10 holder shares, Token-2022
+ * extensions, liquidity in USD, whether it has migrated) and returns a report with one result per rule. It reads no chain and no
+ * network; the caller gathers the data.
+ *
+ * Rules, in order: freeze authority revoked, mint authority revoked, creator share under `MAX_CREATOR_HOLDING_PCT`, top-10 share under
+ * `MAX_TOP10_HOLDERS_PCT`, Token-2022 policy, liquidity above `minLiquidityUsd()` (`MIN_LIQUIDITY_USD`, honoured off mainnet only), and
+ * not graduated. Each rule is PASS, FAIL or UNKNOWN.
+ *
+ * What it must never do: pass an UNKNOWN in LIVE. `evaluate(token, 'LIVE')` fails every rule whose status is UNKNOWN; only PAPER lets an
+ * UNKNOWN through, and the report then records it so the fill can be marked unverified. A change here that makes UNKNOWN pass in LIVE is a
+ * safety regression.
+ *
+ * Called by: `ExecutionCoordinator` (`evaluatePaperBuy` and the LIVE path of `executeTrade`). The watch window and the auto
+ * controller do not call it; they rely on the coordinator's verdict.
+ */
 import { MAX_TOP10_HOLDERS_PCT, MAX_CREATOR_HOLDING_PCT, minLiquidityUsd } from '../solana/executionConfig';
 import { TokenEligibilityReport, EligibilityCheckResult, TriState, ExecutionMode } from '../core/types';
 
+/** What a token account says about an authority: still held, given up, or not read. */
 export type AuthorityStatus = 'ACTIVE' | 'REVOKED' | 'UNKNOWN';
 
+/** The facts one evaluation needs. Most fields are optional and tri-state on purpose: absent or null means "not verified", which is UNKNOWN, never a pass. */
 export interface TokenRawData {
   mint: string;
   symbol: string;
@@ -25,6 +43,7 @@ export interface TokenRawData {
   isMigrated?: boolean;
 }
 
+/** Folds the specific authority field and the boolean/status fallback into PASS (revoked), FAIL (active) or UNKNOWN. The specific field wins when both are present. */
 function resolveAuthorityStatus(
   specificAuth: AuthorityStatus | TriState | null | undefined,
   booleanOrStatus: boolean | AuthorityStatus | TriState | null | undefined
@@ -42,7 +61,13 @@ function resolveAuthorityStatus(
   return 'UNKNOWN';
 }
 
+/** Namespace for the single static rule evaluator. */
 export class EligibilityFilter {
+  /**
+   * Runs every rule and returns the report. `isEligible` is true only when no rule failed. The second argument is the execution mode (or a legacy
+   * boolean where true means strict). Strict is `'LIVE'` or `true`: PAPER passes `true` when `PAPER_STRICT_GATES` is on, and then rejects UNKNOWN like LIVE.
+ * Anything else is lenient PAPER.
+   */
   public static evaluate(token: TokenRawData, isLiveModeOrExecutionMode: ExecutionMode | boolean = false): TokenEligibilityReport {
     const isLiveMode = isLiveModeOrExecutionMode === 'LIVE' || isLiveModeOrExecutionMode === true;
     const checks: EligibilityCheckResult[] = [];

@@ -1,5 +1,7 @@
 import { EventEmitter } from 'events';
+import { isReadOnly } from '../solana/readOnly';
 import { workstationDb } from '../db/database';
+import { traced } from '../observability/tracing';
 import { executionCoordinator, isRecoveredPosition } from '../execution/coordinator';
 import { memecoinAggregator } from '../memecoinAggregator';
 import { solPriceService } from '../market/solPriceService';
@@ -11,7 +13,8 @@ import type { SignalProvenance } from '../core/types';
 import { computeJournalStats, type JournalStats } from './journalStats';
 import { evaluateKillTriggers, auditWalletChange, type KillTrigger } from './killSwitch';
 import { riskEngine } from '../risk/riskEngine';
-import { watchWindow, HOT_MIN_SCORE, type WatchResult } from '../signals/watchWindow';
+import { watchWindow, type WatchResult } from '../signals/watchWindow';
+import { getConfluenceThreshold, setConfluenceThreshold, confluenceThresholdInfo, type ConfluenceThresholdInfo } from '../signals/confluenceThreshold';
 
 /**
  * G1: the only owner of auto trading.
@@ -111,10 +114,14 @@ export interface AutoStatus {
   session: (AutoSession & { sessionPnlSol: number; budgetsLeft: { buys: number; spendSol: number; lossSol: number; msLeft: number } }) | null;
   budgets: SessionBudgets;
   /** S181: the largest session spend the operator may set (3 x MAX_POSITION_SIZE_SOL), and the smallest (one order). */
-  budgetLimits: { maxSpendSol: number; minSpendSol: number; maxBuys: number };
+  budgetLimits: { maxSpendSol: number; minSpendSol: number; maxBuys: number; capKind: 'PAPER' | 'REAL'; capNote: string };
   /** S183: size of one auto order (SOL) and the bounds the server accepts for it. */
   orderSol: number;
   orderLimits: { minSol: number; maxSol: number };
+  /** S187: the confluence buy threshold in force (HOT gate and execution gate together). */
+  confluence: ConfluenceThresholdInfo;
+  /** S189: set while a PAPER session waits in SHADOW for readiness to stay green; it then comes back by itself. */
+  autoRestore: { greenForMs: number; needMs: number } | null;
 }
 
 const MAX_DECISIONS = 500;
@@ -124,6 +131,8 @@ export const DROP_REPEAT_MS = 10 * 60_000;
 export const PENDING_RELEASE_MAX = 10;
 export const PENDING_RELEASE_MAX_AGE_MS = 20_000;
 const MONITOR_INTERVAL_MS = 5_000;
+/** S189: how long readiness must stay green before a PAPER session downgraded by READINESS_RED is put back. */
+export const READINESS_RESTORE_GREEN_MS = 60_000;
 
 /** Map a rejection message to the pipeline stage that produced it. */
 export function classifyRejection(message: string): string {
@@ -207,9 +216,24 @@ export class AutoSnipeController extends EventEmitter {
   /** S181: operator-edited session budget. In memory only, like the mode: a restart returns the defaults. */
   private budgetOverride: { maxBuys: number; maxSpendSol: number } | null = null;
 
-  /** The most a session may spend: the risk engine's own aggregate exposure limit (3 x MAX_POSITION_SIZE_SOL). */
+  /** The most a REAL-SOL session may spend: the risk engine's own aggregate exposure limit (3 x MAX_POSITION_SIZE_SOL). */
   public static maxSessionSpendSol(): number {
     return executionConfig.getConfig().maxPositionSizeSol * 3;
+  }
+
+  /** S189: the most a PAPER session may spend: the ceiling the server itself starts a PAPER session with (10 x the paper bankroll). Paper spends nothing. */
+  public static maxPaperSessionSpendSol(): number {
+    return PAPER_SESSION_BUDGETS.maxSpendBankrollMultiple * executionConfig.getConfig().paperBankrollSol;
+  }
+
+  /** S189: which kind of session the budget editor is talking to. A running (or SHADOW-downgraded) PAPER session is PAPER; anything else gets the real-SOL cap. */
+  private sessionKind: 'PAPER' | 'DEVNET_LIVE' | null = null;
+  private spendCap(): { cap: number; kind: 'PAPER' | 'REAL'; note: string } {
+    if (this.session && this.sessionKind === 'PAPER') {
+      const cap = AutoSnipeController.maxPaperSessionSpendSol();
+      return { cap, kind: 'PAPER', note: '10 x the paper bankroll, the PAPER session ceiling' };
+    }
+    return { cap: AutoSnipeController.maxSessionSpendSol(), kind: 'REAL', note: '3 x MAX_POSITION_SIZE_SOL' };
   }
 
   /**
@@ -217,14 +241,14 @@ export class AutoSnipeController extends EventEmitter {
    * It applies to the running session at once and to every later one.
    */
   public setBudget(b: { maxBuys: number; maxSpendSol: number }): { ok: boolean; reason?: string } {
-    const cap = AutoSnipeController.maxSessionSpendSol();
+    const { cap, note } = this.spendCap();
     if (!Number.isInteger(b.maxBuys) || b.maxBuys < 1 || b.maxBuys > 50) return { ok: false, reason: 'REJECTED: max buys must be a whole number from 1 to 50.' };
     const order = this.orderSol();
     if (!Number.isFinite(b.maxSpendSol) || b.maxSpendSol < order) {
       return { ok: false, reason: `REJECTED: the session spend limit must cover at least one order (${order} SOL).` };
     }
     if (b.maxSpendSol > cap + 1e-9) {
-      return { ok: false, reason: `REJECTED: ${b.maxSpendSol} SOL is above the ${Number(cap.toFixed(6))} SOL session cap (3 x MAX_POSITION_SIZE_SOL). Lower it, or raise MAX_POSITION_SIZE_SOL in .env and restart.` };
+      return { ok: false, reason: `REJECTED: ${b.maxSpendSol} SOL is above the ${Number(cap.toFixed(6))} SOL session cap (${note}).${note.startsWith('10 x') ? ' Lower it.' : ' Lower it, or raise MAX_POSITION_SIZE_SOL in .env and restart.'}` };
     }
     this.budgetOverride = { maxBuys: b.maxBuys, maxSpendSol: b.maxSpendSol };
     if (this.session) this.session.budgets = { ...this.session.budgets, ...this.budgetOverride };
@@ -257,6 +281,14 @@ export class AutoSnipeController extends EventEmitter {
     return { ok: true };
   }
 
+  /** S187: set the one confluence buy threshold (watch window HOT gate and the execution gate, manual snipes included). Journaled. */
+  public setConfluenceThreshold(raw: unknown): { ok: boolean; reason?: string; value?: number } {
+    const r = setConfluenceThreshold(raw);
+    if (!r.ok) return { ok: false, reason: r.reason };
+    workstationDb.logDecision({ autoMode: this.mode, mint: '-', stage: 'score', outcome: 'INFO', reason: `operator set the confluence buy threshold: ${r.previous} -> ${r.value} (watch window HOT gate and execution gate together)` });
+    return { ok: true, value: r.value };
+  }
+
   public getStatus(): AutoStatus {
     this.enforceBudgets();
     let session: AutoStatus['session'] = null;
@@ -278,9 +310,11 @@ export class AutoSnipeController extends EventEmitter {
       mode: this.mode, killed: this.killed, killReason: this.killReason, downgradeReason: this.downgradeReason,
       triggers: [...this.triggers], haltReason: executionCoordinator.getHaltReason(), slippageBreaches: this.slippageBreaches,
       session, budgets: session?.budgets ?? (this.budgetOverride ? { ...SESSION_BUDGETS, ...this.budgetOverride } : SESSION_BUDGETS),
-      budgetLimits: { maxSpendSol: AutoSnipeController.maxSessionSpendSol(), minSpendSol: this.orderSol(), maxBuys: 50 },
+      budgetLimits: { maxSpendSol: this.spendCap().cap, minSpendSol: this.orderSol(), maxBuys: 50, capKind: this.spendCap().kind, capNote: this.spendCap().note },
       orderSol: this.orderSol(),
       orderLimits: { minSol: SNIPE_AMOUNT_MIN_SOL, maxSol: executionConfig.getConfig().maxPositionSizeSol },
+      confluence: confluenceThresholdInfo(),
+      autoRestore: this.autoRestore ? { greenForMs: this.autoRestore.greenSince === null ? 0 : Date.now() - this.autoRestore.greenSince, needMs: READINESS_RESTORE_GREEN_MS } : null,
     };
   }
 
@@ -322,6 +356,7 @@ export class AutoSnipeController extends EventEmitter {
 
   public async setMode(next: AutoMode, opts: { confirmationCode?: string } = {}): Promise<{ ok: boolean; mode: AutoMode; error?: string }> {
     if (!['OFF', 'SHADOW', 'PAPER', 'DEVNET_LIVE'].includes(next)) return { ok: false, mode: this.mode, error: `unknown mode ${next}` };
+    this.autoRestore = null; // S189: an operator choice replaces any pending automatic restore
     if (next === 'OFF') {
       this.mode = 'OFF';
       // Q29: OFF stops new candidates at once; the session is dropped only after a buy in flight has booked itself in it
@@ -341,8 +376,14 @@ export class AutoSnipeController extends EventEmitter {
       return { ok: false, mode: this.mode, error: 'PAPER auto mode needs the execution coordinator in PAPER' };
     }
     if (next === 'DEVNET_LIVE') {
+      if (isReadOnly()) return { ok: false, mode: this.mode, error: 'DEVNET_LIVE is refused: APEX_READ_ONLY=true allows OFF, SHADOW and PAPER only.' };
       if (allowedCluster() === 'mainnet-beta') return { ok: false, mode: this.mode, error: 'DEVNET_LIVE is refused: ALLOWED_CLUSTER is mainnet-beta (devnet or localnet only). There is no mainnet auto mode.' };
       if (coordMode !== 'LIVE') return { ok: false, mode: this.mode, error: 'DEVNET_LIVE needs the coordinator armed LIVE (on devnet)' };
+      // S189: a spend limit saved for PAPER (up to 10 x the paper bankroll) must never carry into real SOL
+      const realCap = AutoSnipeController.maxSessionSpendSol();
+      if (this.budgetOverride && this.budgetOverride.maxSpendSol > realCap + 1e-9) {
+        return { ok: false, mode: this.mode, error: `DEVNET_LIVE is refused: the saved session spend limit (${this.budgetOverride.maxSpendSol} SOL) is above the ${Number(realCap.toFixed(6))} SOL real-SOL cap. Lower it first (it was allowed because PAPER spends nothing).` };
+      }
       if (opts.confirmationCode !== DEVNET_CONFIRMATION_CODE) return { ok: false, mode: this.mode, error: 'DEVNET_LIVE needs the confirmation code' };
       try {
         await assertClusterAllowed(executionCoordinator.getConnection());
@@ -370,6 +411,7 @@ export class AutoSnipeController extends EventEmitter {
       // S181: the operator's saved budget (buys and spend) replaces the defaults; loss and time limits stay fixed.
       const budgets: SessionBudgets = this.budgetOverride ? { ...base, ...this.budgetOverride } : base;
       this.session = { startedAt: Date.now(), startingBankrollSol: bankroll, buys: 0, spentSol: 0, positionIds: [], budgets };
+      this.sessionKind = next;
     } else {
       this.session = null;
     }
@@ -380,6 +422,7 @@ export class AutoSnipeController extends EventEmitter {
   /** Kill switch for auto trading: back to OFF now, optionally selling everything the session opened. Exits keep running otherwise. */
   public async kill(opts: { exitAll?: boolean; reason?: string } = {}): Promise<{ mode: AutoMode; closed: number }> {
     this.mode = 'OFF';
+    this.autoRestore = null;
     this.killed = true;
     this.killReason = opts.reason || 'operator kill';
     // Q29: a buy already past the gates finishes (its position exists once it does); wait for it so its position is in the owned set below
@@ -407,9 +450,10 @@ export class AutoSnipeController extends EventEmitter {
 
   /**
    * Evaluate the kill-switch triggers. A hit drops PAPER / DEVNET_LIVE to SHADOW: buys stop, candidates are still
-   * journaled as "would buy", and exits keep running. Only an operator setting the mode again brings buys back.
+   * journaled as "would buy", and exits keep running. A DEVNET_LIVE hit also disarms the coordinator (S207). Only an operator setting the mode again brings buys back.
    */
   public async checkTriggers(now = Date.now()): Promise<KillTrigger[]> {
+    if (this.mode === 'SHADOW' && this.autoRestore) { this.tryAutoRestore(now); return []; }
     if (this.mode !== 'PAPER' && this.mode !== 'DEVNET_LIVE') return [];
     const live = this.mode === 'DEVNET_LIVE';
     const execMode = live ? 'LIVE' : 'PAPER';
@@ -440,10 +484,39 @@ export class AutoSnipeController extends EventEmitter {
     this.triggers = hits;
     this.mode = 'SHADOW';
     this.downgradeReason = reason;
+    // S189: nothing real is at risk in PAPER, so a downgrade caused ONLY by a flapping readiness check comes back by itself once readiness has
+    // been green for a while. DEVNET_LIVE stays sticky (an operator sets it again), and so does any other trigger.
+    this.autoRestore = from === 'PAPER' && hits.every((h) => h.code === 'READINESS_RED') ? { greenSince: null } : null;
+    // S207: a tripped DEVNET_LIVE session also disarms the coordinator, so nothing can keep sending on a LIVE arming left over from before the trip.
+    if (from === 'DEVNET_LIVE') executionCoordinator.armLiveTrading(false);
     workstationDb.logDecision({ autoMode: from, mint: '-', stage: 'risk', outcome: 'KILL_TRIGGER', reason, inputs: { triggers: hits } });
     Logger.warn(`[AUTO] ${reason}. Dropped ${from} -> SHADOW; exits keep running.`);
     this.emit('mode', { mode: this.mode, reason });
     return hits;
+  }
+
+  /** S189: set only while a PAPER session sits in SHADOW because of READINESS_RED; greenSince is when readiness last turned (and stayed) all green. */
+  private autoRestore: { greenSince: number | null } | null = null;
+
+  private tryAutoRestore(now: number): boolean {
+    const st = this.autoRestore;
+    if (!st || this.mode !== 'SHADOW' || this.killed || !this.session || this.sessionKind !== 'PAPER') { this.autoRestore = null; return false; }
+    if (executionCoordinator.getExecutionMode() !== 'PAPER') { this.autoRestore = null; return false; } // never restore into a different execution mode
+    const c = executionCoordinator.getLiveReadiness().components;
+    const green = c.rpc.healthy && c.markFeed.healthy && c.db.healthy;
+    if (!green) { st.greenSince = null; return false; }
+    if (st.greenSince === null) { st.greenSince = now; return false; }
+    if (now - st.greenSince < READINESS_RESTORE_GREEN_MS) return false;
+    const reason = `PAPER restored: readiness has been green for ${Math.round((now - st.greenSince) / 1000)}s after: ${this.downgradeReason}`;
+    this.mode = 'PAPER';
+    this.downgradeReason = null;
+    this.triggers = [];
+    this.redSince.clear();
+    this.autoRestore = null;
+    workstationDb.logDecision({ autoMode: 'PAPER', mint: '-', stage: 'risk', outcome: 'INFO', reason });
+    Logger.warn(`[AUTO] ${reason}`);
+    this.emit('mode', { mode: this.mode, reason });
+    return true;
   }
 
   /**
@@ -564,7 +637,12 @@ export class AutoSnipeController extends EventEmitter {
   /**
    * The single door into auto trading. Returns the decision it journaled.
    */
-  public async submitCandidate(c: AutoCandidate): Promise<AutoDecision> {
+  /** S209: the root span of an auto candidate's trace; everything below it (watch verdict, gates, risk, build, sign, submit, confirm, reconcile) nests inside. */
+  public submitCandidate(c: AutoCandidate): Promise<AutoDecision> {
+    return traced('auto.candidate', () => this.submitCandidateUntraced(c), { 'apex.source': c.source, 'apex.mode': this.mode });
+  }
+
+  private async submitCandidateUntraced(c: AutoCandidate): Promise<AutoDecision> {
     const key = c.mint.toLowerCase();
     // Q27: the 5s candidate loops resubmit the same mints forever. A drop that depends only on the watch verdict (never watched, still
     // watching, dead) cannot change until the verdict does, so a repeat inside DROP_REPEAT_MS gets the earlier decision and no new rows
@@ -586,8 +664,8 @@ export class AutoSnipeController extends EventEmitter {
     if (open.some((p) => p.mint.toLowerCase() === key)) return this.record(c, 'DROPPED', 'auto', 'POSITION_ALREADY_OPEN');
 
     // G2b: only watch-window releases get this far. HOT goes straight to the execution stages; READY must also clear
-    // the confluence score (>= 70) here; DEAD, still-watching and never-watched candidates are dropped.
-    const verdict = watchWindow.getVerdict(c.mint);
+    // the confluence score (the threshold in force, default 70) here; DEAD, still-watching and never-watched candidates are dropped.
+    const verdict = traced('watch.release', () => watchWindow.getVerdict(c.mint));
     if (!verdict || verdict.state === 'WATCHING' || verdict.state === 'DEAD') {
       const reason = !verdict ? 'NOT_IN_WATCH_WINDOW' : verdict.state === 'WATCHING' ? 'WATCH_PENDING: still in the watch window' : `WATCH_DEAD: ${verdict.reason}`;
       const dropped = this.record(c, 'DROPPED', 'watch', reason);
@@ -644,7 +722,7 @@ export class AutoSnipeController extends EventEmitter {
         signalId: c.signalId,
         provenance: c.provenance,
         enforceConfluence: verdict.state === 'READY' ? true : c.enforceConfluence,
-        minConfluenceScore: verdict.state === 'READY' ? HOT_MIN_SCORE : undefined,
+        minConfluenceScore: verdict.state === 'READY' ? getConfluenceThreshold() : undefined,
         // The signal behind an auto buy is the watch window's release; LIVE refuses a trade without one.
         signalTimestamp: verdict.releasedAt,
         // R5: the mode checked above; the coordinator refuses the trade if LIVE was armed or disarmed during the awaits in executeSnipe.
@@ -659,7 +737,7 @@ export class AutoSnipeController extends EventEmitter {
       } else if (this.orderSolOverride !== null) {
         params.amountSolOverride = this.orderSolOverride; // S183: PAPER and SHADOW use the operator's size too
       }
-      const res = await memecoinAggregator.executeSnipe(params);
+      const res = await traced('snipe.execute', () => memecoinAggregator.executeSnipe(params), { 'apex.dryRun': shadow });
       if (!res.success) {
         // R6: a buy that was sent and may have landed (unconfirmed, or landed with an unreadable fill) spent real SOL the cap must count.
         if (startSession && !shadow && /^(UNCONFIRMED|RECONCILIATION FAILED)/.test(res.message)) {

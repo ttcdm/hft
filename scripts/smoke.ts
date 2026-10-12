@@ -103,7 +103,6 @@ async function main(): Promise<void> {
     APEX_ENV_FILE: '',
     APEX_DB_PATH: path.join(scratchDir, 'smoke.db'),
     SIGNER_KEYPAIR_PATH: path.join(scratchDir, 'no-keypair.json'),
-    APEX_WAL_PATH: path.join(scratchDir, 'engine.wal'), // never the checkout's apex_engine.wal
     // Q47: without these the app probed api.devnet.solana.com on every CI run. A closed loopback port keeps the run offline.
     ALLOWED_CLUSTER: 'localnet',
     LOCALNET_GENESIS_HASH: '11111111111111111111111111111111',

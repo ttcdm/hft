@@ -197,6 +197,9 @@ export const AutoBudgetSchema = z.object({
 /** POST /api/auto/order-size (S183). */
 export const AutoOrderSizeSchema = z.object({ orderSol: z.coerce.number().positive().max(1_000) });
 
+/** POST /api/auto/threshold (S187). The range and whole-number rule are judged in confluenceThreshold.ts, so the reason is the same everywhere. */
+export const AutoThresholdSchema = z.object({ threshold: z.union([z.number(), z.string().max(12)]) });
+
 export const AutoModeSchema = z.object({
   mode: z.enum(['OFF', 'SHADOW', 'PAPER', 'DEVNET_LIVE']),
   confirmationCode: z.string().max(64).optional(),

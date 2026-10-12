@@ -1,4 +1,5 @@
 import { Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
+import { isReadOnly, assertNotReadOnly } from './readOnly';
 import fs from 'fs';
 import path from 'path';
 import bs58 from 'bs58';
@@ -29,6 +30,12 @@ export class LocalKeypairSigner implements TransactionSigner {
   }
 
   private initializeSigner() {
+    // S185: read-only mode loads no key at all: not from the environment, not from a file. The status stays NOT_CONFIGURED.
+    if (isReadOnly()) {
+      this.keypairPath = '';
+      this.status = 'NOT_CONFIGURED';
+      return;
+    }
     // Q5: the file this signer would write to is known up front, also when the key itself came from the environment.
     this.keypairPath = process.env.SIGNER_KEYPAIR_PATH || path.join(process.cwd(), '.apex_trading_keypair.json');
     const envPrivateKey = process.env.OPERATOR_PRIVATE_KEY || process.env.SOLANA_PRIVATE_KEY;
@@ -97,6 +104,7 @@ export class LocalKeypairSigner implements TransactionSigner {
   // Generates a dedicated local low-balance trading keypair file with restricted permissions (0600)
   // Protected against accidental overwriting of existing keypairs with funds
   public generateDedicatedTradingKeypair(forceOverwrite = false): { publicKey: string; path: string } {
+    assertNotReadOnly('generating a signing key'); // S186
     const targetPath = this.keypairPath || path.join(process.cwd(), '.apex_trading_keypair.json');
 
     // Q5: a key that is already loaded (from OPERATOR_PRIVATE_KEY, SIGNER_KEYPAIR_PATH or the default file) is never swapped at runtime:
@@ -127,6 +135,7 @@ export class LocalKeypairSigner implements TransactionSigner {
   }
 
   public importKeypair(secretKeyInput: string, forceOverwrite = false): { publicKey: string; path: string } {
+    assertNotReadOnly('importing a signing key'); // S186
     const targetPath = this.keypairPath || path.join(process.cwd(), '.apex_trading_keypair.json');
 
     if (fs.existsSync(targetPath) && !forceOverwrite) {
@@ -153,10 +162,12 @@ export class LocalKeypairSigner implements TransactionSigner {
   }
 
   public generateNewKeypair(forceOverwrite = false): string {
+    assertNotReadOnly('generating a signing key'); // S186
     return this.generateDedicatedTradingKeypair(forceOverwrite).publicKey;
   }
 
   public importSecretKey(secretKeyInput: string, forceOverwrite = false): string {
+    assertNotReadOnly('importing a signing key'); // S186
     return this.importKeypair(secretKeyInput, forceOverwrite).publicKey;
   }
 
@@ -176,6 +187,7 @@ export class LocalKeypairSigner implements TransactionSigner {
   }
 
   public async signTransaction(transaction: VersionedTransaction): Promise<VersionedTransaction> {
+    assertNotReadOnly('signing a transaction');
     if (!this.keypair || this.status !== 'READY') {
       throw new Error('Local signer is not ready to sign transactions');
     }
@@ -184,6 +196,7 @@ export class LocalKeypairSigner implements TransactionSigner {
   }
 
   public async signMessage(message: Uint8Array): Promise<Uint8Array> {
+    assertNotReadOnly('signing a message');
     if (!this.keypair || this.status !== 'READY' || !this.nodePrivateKey) {
       throw new Error('Local signer is not ready to sign messages');
     }

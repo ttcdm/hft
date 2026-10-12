@@ -16,6 +16,7 @@ import crypto from 'crypto';
 import net from 'net';
 import { spawn, ChildProcess } from 'child_process';
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey } from '@solana/web3.js';
+import { waitForNewHeld } from './heldWait';
 import { AccountLayout, NATIVE_MINT, TOKEN_2022_PROGRAM_ID, TOKEN_PROGRAM_ID, getAssociatedTokenAddressSync } from '@solana/spl-token';
 import { PUMP_AMM_SDK, PUMP_AMM_PROGRAM_ID, canonicalPumpPoolPda, GLOBAL_CONFIG_PDA, pumpPoolAuthorityPda, coinCreatorVaultAuthorityPda } from '@pump-fun/pump-swap-sdk';
 
@@ -27,10 +28,6 @@ const rec = (step: string, ok: boolean, detail: string) => {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${step}: ${detail}`);
 };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-// S7: neither the driver nor the server it spawns may append to the checkout's apex_engine.wal.
-const checkoutWal = path.join(ROOT, 'apex_engine.wal');
-const walSize = (): number | null => (fs.existsSync(checkoutWal) ? fs.statSync(checkoutWal).size : null);
-const walBefore = walSize();
 
 /** Startup reconciliation (including the wallet token scan) finishes in the background; arming before it is refused by design. */
 async function waitCanArm(call: (m: 'GET' | 'POST', p: string, b?: unknown) => Promise<any>, timeoutMs = 60_000) {
@@ -119,7 +116,6 @@ async function main() {
   process.env.APEX_ENV_FILE = '';
   process.env.SOLANA_RPC_URL = info.url;
   process.env.APEX_DB_PATH = path.join(scratch, 'driver.db');
-  process.env.APEX_WAL_PATH = path.join(scratch, 'engine.wal');
   const { PUMP_SDK } = await import('@pump-fun/pump-sdk');
   const { PumpCurveService } = await import('../../server/solana/pumpCurve');
   const { txBuilder } = await import('../../server/solana/transactionBuilder');
@@ -255,7 +251,6 @@ async function main() {
       SOLANA_RPC_URL: info.url,
       ENABLE_RPC_FALLBACK: 'true',
       APEX_DB_PATH: path.join(scratch, 'app.db'),
-      APEX_WAL_PATH: path.join(scratch, 'app.wal'), // S7: without this the server wrote cwd/apex_engine.wal in the checkout
       SIGNER_KEYPAIR_PATH: keyPath,
       // Set only after the driver asserted (above) that the RPC reports the local validator's genesis hash.
       LOCALNET_SOL_PRICE_USD: '150', // labelled LOCALNET_FIXED in the price service; a local validator has no market
@@ -407,14 +402,11 @@ async function main() {
   const buyG = await call('POST', '/api/execution/trade', { mint: mintG.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02, confirmLive: true });
   rec('(g) buy for the sell-in-flight scenario', buyG.status === 200 && buyG.body?.success, JSON.stringify(buyG.body).slice(0, 200));
   if (buyG.body?.positionId) {
+    const heldBefore = ((await rpcCall(info.url, 'localnet_stats', [])).held as string[]).length; // the (f) buy's signature is still in the list
     await rpcCall(info.url, 'localnet_holdNextResponse', []);
     const sellInFlight = fetch(`${base}/api/execution/close`, { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` }, body: JSON.stringify({ positionId: buyG.body.positionId, sellPct: 100, reason: 'localnet Q18' }) }).catch(() => null);
-    let heldSell: string[] = [];
-    for (let i = 0; i < 60 && !heldSell.length; i++) {
-      await sleep(250);
-      heldSell = (await rpcCall(info.url, 'localnet_stats', [])).held;
-    }
-    rec('(g) sell landed on-chain with its response withheld', heldSell.length >= 1, `signature ${heldSell[heldSell.length - 1] ?? 'none'}`);
+    const heldSellSig = await waitForNewHeld(async () => (await rpcCall(info.url, 'localnet_stats', [])).held, heldBefore);
+    rec('(g) sell landed on-chain with its response withheld', heldSellSig !== null, `signature ${heldSellSig ?? 'none'}`);
     proc.kill('SIGKILL');
     await sellInFlight;
     await sleep(500);
@@ -538,7 +530,6 @@ async function cleanup() {
 main()
   .catch((e) => rec('harness error', false, String(e?.stack || e).slice(0, 800)))
   .finally(async () => {
-    rec('the checkout apex_engine.wal was not written by this run', walSize() === walBefore, `${walBefore ?? 'absent'} -> ${walSize() ?? 'absent'} bytes`);
     const bad = results.filter((r) => !r.ok);
     console.log(`\n${results.length - bad.length}/${results.length} steps passed (scratch ${scratch})`);
     if (bad.length || process.env.LOCALNET_VERBOSE) {

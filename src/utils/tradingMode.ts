@@ -6,6 +6,8 @@ export interface SystemAuditLite {
   mode?: string;
   isLiveArmed?: boolean;
   allowedCluster?: string;
+  /** S185: APEX_READ_ONLY=true on the server */
+  readOnly?: boolean;
   rpcEndpoint?: string;
 }
 
@@ -17,6 +19,8 @@ export interface TradingModeInfo {
   live: boolean;
   label: 'PAPER' | 'LIVE ARMED' | 'LIVE (NOT ARMED)' | 'MODE UNKNOWN';
   cluster: string | null;
+  /** S185: the server cannot sign or send; the banner says so on every screen */
+  readOnly: boolean;
   rpcHost: string | null;
   ageMs: number | null;
 }
@@ -34,14 +38,14 @@ const hostOf = (url?: string): string | null => {
  */
 export function describeTradingMode(audit: SystemAuditLite | null | undefined, fetchedAt: number | null, now = Date.now()): TradingModeInfo {
   if (!audit || fetchedAt === null) {
-    return { known: false, stale: false, live: false, label: 'MODE UNKNOWN', cluster: null, rpcHost: null, ageMs: null };
+    return { known: false, stale: false, live: false, label: 'MODE UNKNOWN', cluster: null, readOnly: false, rpcHost: null, ageMs: null };
   }
   const ageMs = Math.max(0, now - fetchedAt);
   const stale = ageMs > MODE_STALE_MS;
   const armed = audit.isLiveArmed === true;
   const mode = String(audit.mode ?? '').toUpperCase();
   const label: TradingModeInfo['label'] = stale ? 'MODE UNKNOWN' : armed ? 'LIVE ARMED' : mode === 'LIVE' ? 'LIVE (NOT ARMED)' : 'PAPER';
-  return { known: !stale, stale, live: armed && !stale, label, cluster: audit.allowedCluster ?? null, rpcHost: hostOf(audit.rpcEndpoint), ageMs };
+  return { known: !stale, stale, live: armed && !stale, label, cluster: audit.allowedCluster ?? null, readOnly: audit.readOnly === true, rpcHost: hostOf(audit.rpcEndpoint), ageMs };
 }
 
 // One poller shared by every component that shows the mode.
@@ -88,4 +92,11 @@ export function useTradingMode(): TradingModeInfo {
 export function liveClickWarning(m: TradingModeInfo, what: string): string | null {
   if (!m.live) return null;
   return `LIVE is armed${m.cluster ? ` on ${m.cluster}` : ''}. ${what} will send a REAL transaction from the signer wallet. Continue?`;
+}
+
+/** S185: the banner text for a read-only server ("MAINNET · READ-ONLY · PAPER"), or null. Names the cluster it really runs on. */
+export function readOnlyBannerText(m: Pick<TradingModeInfo, 'readOnly' | 'cluster'>): string | null {
+  if (!m.readOnly) return null;
+  const c = m.cluster === 'mainnet-beta' || m.cluster === 'mainnet' ? 'MAINNET' : (m.cluster ?? 'UNKNOWN CLUSTER').toUpperCase();
+  return `${c} · READ-ONLY · PAPER`;
 }

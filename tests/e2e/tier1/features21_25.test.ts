@@ -336,9 +336,9 @@ describe('Tier 1: Feature Coverage (Features 21 - 25)', () => {
   });
 
   // =========================================================================
-  // Feature 24: Build, Typecheck, Lint & Rust Gates
+  // Feature 24: Build, Typecheck & Lint Gates
   // =========================================================================
-  describe('Feature 24: Build, Typecheck, Lint & Rust Gates', () => {
+  describe('Feature 24: Build, Typecheck & Lint Gates', () => {
     it('F24.4: execution coordinator and risk engine export typed contract interfaces', () => {
       const coordinator = new ExecutionCoordinator();
       expect(typeof coordinator.executeTrade).toBe('function');

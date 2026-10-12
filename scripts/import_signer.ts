@@ -3,6 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { parseSecretKey } from '../server/solana/parseSecretKey';
 import { Keypair } from '@solana/web3.js';
+import { isReadOnly } from '../server/solana/readOnly';
 
 function printUsage() {
   console.log('Usage: npm run signer:import -- <path-to-keypair.json> [--force]');
@@ -11,6 +12,10 @@ function printUsage() {
 }
 
 async function main() {
+  if (isReadOnly()) {
+    console.error('[ERROR] READ_ONLY: APEX_READ_ONLY=true. A read-only server must not have a signing key; unset the flag to import one.');
+    process.exit(1);
+  }
   const args = process.argv.slice(2);
   const inputPath = args.find((a) => !a.startsWith('--'));
   const force = args.includes('--force') || args.includes('-f');

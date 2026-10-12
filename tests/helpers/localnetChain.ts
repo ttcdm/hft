@@ -175,7 +175,6 @@ export async function startLocalnetApp(o: AppOptions): Promise<LocalnetApp> {
     JITO_BLOCK_ENGINE_URL: '', // Jito is off on localnet regardless; keep it explicit
     ENABLE_RPC_FALLBACK: 'true',
     APEX_DB_PATH: dbPath,
-    APEX_WAL_PATH: path.join(o.dir, 'app.wal'),
     SIGNER_KEYPAIR_PATH: o.signerKeyPath,
     LOCALNET_SOL_PRICE_USD: '150', // labelled LOCALNET_FIXED by the price service; a local validator has no market
     ALLOW_LIVE_REAL_MONEY_TRADING: 'true',

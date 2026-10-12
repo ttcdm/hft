@@ -1,11 +1,13 @@
-import type { Connection } from '@solana/web3.js';
+import { Connection } from '@solana/web3.js';
 
 /**
  * Cluster guard. Nothing in this repo may sign or send a transaction unless the
  * RPC endpoint reports the genesis hash of the cluster Mike has explicitly
  * allowed. The default (and only cluster used by tests and the devnet harness)
- * is devnet. Mainnet needs ALLOWED_CLUSTER=mainnet-beta, which nobody sets
- * in this repo.
+ * is devnet. ALLOWED_CLUSTER=mainnet-beta is still accepted so a read-only
+ * server can watch mainnet (see readOnly.ts), but `assertSendClusterAllowed`
+ * refuses every arm, signed trade and send while it is set: this build never
+ * sends on mainnet, whatever the RPC reports.
  */
 
 export type AllowedCluster = 'devnet' | 'mainnet-beta' | 'localnet';
@@ -103,6 +105,17 @@ export function jitoTipFloorAllowed(env: NodeJS.ProcessEnv = process.env): boole
 }
 
 /**
+ * Throws when ALLOWED_CLUSTER is mainnet-beta. Called wherever the app could arm LIVE, sign or send, so that a mainnet setting can only
+ * ever be used for watching and paper trading. `assertClusterAllowed` is not changed: readiness uses it to check the RPC, and a read-only
+ * server watching mainnet must keep passing that check.
+ */
+export function assertSendClusterAllowed(env: NodeJS.ProcessEnv = process.env): void {
+  if (allowedCluster(env) === 'mainnet-beta') {
+    throw new ClusterGuardError('ALLOWED_CLUSTER=mainnet-beta: this build never arms LIVE, signs or sends on mainnet (devnet and localnet only); refusing');
+  }
+}
+
+/**
  * Throws unless the connection's genesis hash matches the allowed cluster.
  * Called before every signed buy and sell. Any RPC error fails closed.
  */
@@ -129,4 +142,84 @@ export async function assertClusterAllowed(
     );
   }
   return { cluster, genesisHash };
+}
+
+/** S208: how long a passed genesis check is trusted for the same Connection object. */
+export const GENESIS_CHECK_TTL_MS = 60_000;
+
+type GenesisCheck = { cluster: AllowedCluster; expected: string; at: number };
+const passedGenesisChecks = new WeakMap<object, GenesisCheck>();
+
+/** Record that `connection` just passed `assertClusterAllowed`, so the next sends can skip the genesis RPC call for GENESIS_CHECK_TTL_MS. */
+export function rememberGenesisCheck(connection: object, env: NodeJS.ProcessEnv = process.env, now = Date.now()): void {
+  passedGenesisChecks.set(connection, { cluster: allowedCluster(env), expected: expectedGenesisHash(env), at: now });
+}
+
+/**
+ * `assertClusterAllowed` for the send path, without a genesis RPC call on every order. A pass is remembered per Connection object for
+ * GENESIS_CHECK_TTL_MS. A new Connection (RPC change or failover), a changed ALLOWED_CLUSTER or an expired entry checks again, and a failure is never
+ * remembered. The localnet loopback check is cheap and always runs. The mainnet-beta refusal is `assertSendClusterAllowed`, which stays uncached.
+ */
+export async function assertClusterAllowedCached(
+  connection: Pick<Connection, 'getGenesisHash'> & { rpcEndpoint?: string },
+  env: NodeJS.ProcessEnv = process.env,
+  now = Date.now()
+): Promise<{ cluster: AllowedCluster; genesisHash: string }> {
+  const cluster = allowedCluster(env);
+  const hit = passedGenesisChecks.get(connection);
+  if (hit && hit.cluster === cluster && hit.expected === expectedGenesisHash(env) && now - hit.at < GENESIS_CHECK_TTL_MS) {
+    if (cluster === 'localnet' && (!connection.rpcEndpoint || !isLoopbackUrl(connection.rpcEndpoint))) {
+      throw new ClusterGuardError('localnet requires a loopback RPC endpoint; refusing to send');
+    }
+    return { cluster, genesisHash: hit.expected };
+  }
+  const res = await assertClusterAllowed(connection, env);
+  rememberGenesisCheck(connection, env, now);
+  return res;
+}
+
+/** S210: opt-in second opinion on the cluster. Off unless APEX_VERIFY_BLOCKHASH=true. */
+export function blockhashCheckEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.APEX_VERIFY_BLOCKHASH === 'true';
+}
+
+export type BlockhashVerdict =
+  | { ok: true; skipped?: string }
+  | { ok: false; reason: string; /** true when the reference RPC answered "not valid"; false when it could not be asked */ definite: boolean };
+
+export interface BlockhashCheckDeps {
+  isValid?: (blockhash: string) => Promise<boolean>;
+  sleep?: (ms: number) => Promise<void>;
+}
+
+let referenceConnection: Connection | null = null;
+async function referenceIsValid(blockhash: string): Promise<boolean> {
+  referenceConnection ??= new Connection(DEFAULT_RPC_URL, 'processed');
+  return (await referenceConnection.isBlockhashValid(blockhash, { commitment: 'processed' })).value;
+}
+
+/**
+ * Asks an INDEPENDENT RPC (the public devnet endpoint, not the configured one) whether the order's blockhash exists on devnet. An RPC that
+ * claims devnet but is really mainnet hands out blockhashes devnet has never seen, so this catches it where the genesis check cannot. A "no"
+ * is retried once after 500 ms, because the public node can lag a few slots behind the configured one.
+ * Skipped when the flag is off, on localnet (its blockhashes are local) and on mainnet-beta (sends are refused before this point).
+ */
+export async function verifyBlockhashIndependently(
+  blockhash: string,
+  env: NodeJS.ProcessEnv = process.env,
+  deps: BlockhashCheckDeps = {}
+): Promise<BlockhashVerdict> {
+  if (!blockhashCheckEnabled(env)) return { ok: true, skipped: 'APEX_VERIFY_BLOCKHASH is not true' };
+  const cluster = allowedCluster(env);
+  if (cluster !== 'devnet') return { ok: true, skipped: `not checked on ${cluster}` };
+  const isValid = deps.isValid ?? referenceIsValid;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  try {
+    if (await isValid(blockhash)) return { ok: true };
+    await sleep(500);
+    if (await isValid(blockhash)) return { ok: true };
+    return { ok: false, definite: true, reason: `blockhash ${blockhash} is not known to the independent devnet RPC; the configured RPC may not be on devnet` };
+  } catch (err: any) {
+    return { ok: false, definite: false, reason: `could not ask the independent devnet RPC about the blockhash (${err?.message ?? 'unknown error'})` };
+  }
 }

@@ -34,14 +34,6 @@ describe('Tier 1: Repository file checks (Features 22, 24, 25)', () => {
       expect(tsconfig.compilerOptions.paths).toBeDefined();
     });
 
-    it('F24.3: rust workspace Cargo.toml defines valid crates or native acceleration components', () => {
-      const cargoPath = path.resolve(process.cwd(), 'Cargo.toml');
-      expect(fs.existsSync(cargoPath)).toBe(true);
-      const cargoContent = fs.readFileSync(cargoPath, 'utf8');
-      expect(cargoContent).toContain('[workspace]');
-      expect(cargoContent).toContain('apex_hft_engine');
-    });
-
     it('F25.1: sensitive secrets and environment files are guarded against accidental packaging', () => {
       const gitignorePath = path.resolve(process.cwd(), '.gitignore');
       expect(fs.existsSync(gitignorePath)).toBe(true);
@@ -59,8 +51,8 @@ describe('Tier 1: Repository file checks (Features 22, 24, 25)', () => {
     });
 
     it('F25.5: project architecture and request contracts document all 25 features and milestone gates', () => {
-      const projectMdPath = path.resolve(process.cwd(), 'PROJECT.md');
-      const originalRequestPath = path.resolve(process.cwd(), 'ORIGINAL_REQUEST.md');
+      const projectMdPath = path.resolve(process.cwd(), 'docs/archive/PROJECT.md');
+      const originalRequestPath = path.resolve(process.cwd(), 'docs/archive/ORIGINAL_REQUEST.md');
 
       expect(fs.existsSync(projectMdPath)).toBe(true);
       expect(fs.existsSync(originalRequestPath)).toBe(true);

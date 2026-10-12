@@ -1,6 +1,7 @@
 import { MemecoinPool, SniperPosition, SniperBotConfig } from '../src/types';
 import { EventEmitter } from 'events';
 import { PublicKey } from '@solana/web3.js';
+import { traced } from './observability/tracing';
 import { PumpCurveService } from './solana/pumpCurve';
 import { executionCoordinator } from './execution/coordinator';
 import { solPriceService } from './market/solPriceService';
@@ -10,7 +11,8 @@ import { pumpFeedListener, PumpCreateEvent, PumpTradeEvent } from './solana/pump
 import { onChainPoolStats } from './market/poolStats';
 import { SignalProvenance, ConfluenceBreakdown, ExecutionMode } from './core/types';
 import { CapitalSizer } from './capital/capitalSizer';
-import { ConfluenceEngine, isConfluencePassed, MIN_CONFLUENCE_SCORE } from './signals/confluenceEngine';
+import { ConfluenceEngine, isConfluencePassed } from './signals/confluenceEngine';
+import { getConfluenceThreshold } from './signals/confluenceThreshold';
 import { curveVelocityEvaluator } from './signals/curveVelocityEvaluator';
 import { checkSnipeAmountSol } from './execution/snipeAmount';
 
@@ -108,6 +110,8 @@ const DEMO_POOL_IDS: ReadonlySet<string> = new Set(INITIAL_POOLS.map((p) => p.id
 
 export class MemecoinAggregatorService extends EventEmitter {
   private pools: MemecoinPool[] = [];
+  /** S185: pools dropped from the board to keep it at 200 (never one the watch window still scores). */
+  private poolsTrimmed = 0;
   // C3: the SOL/USD price comes from the single SolPriceService. 0 here means "no price known"; every code path that
   // converts USD to SOL is guarded in executeSnipe (LIVE needs a fresh price, PAPER needs a last known one).
   private get solPriceUsd(): number {
@@ -304,7 +308,9 @@ export class MemecoinAggregatorService extends EventEmitter {
     if (this.pools.length > 200) {
       // S4: newest 200, plus any pool the watch window is still scoring. Dropping that one made scoreOf return null (no HOT, a READY
       // without a score) and stopped applyTradeToPool for it, at any feed rate that creates 200 mints inside the 120 s window.
+      const before = this.pools.length;
       this.pools = this.pools.filter((p, i) => i < 200 || this.isPoolPinned(p.contractAddress));
+      this.poolsTrimmed += before - this.pools.length; // S185: counted, shown in System checks
     }
 
     onChainPoolStats.track(cleanCa, {
@@ -360,6 +366,10 @@ export class MemecoinAggregatorService extends EventEmitter {
       return true;
     });
     if (unique.length !== this.pools.length) this.pools = unique;
+  }
+
+  public getPoolsTrimmedCount(): number {
+    return this.poolsTrimmed;
   }
 
   public getPools(platform?: string, chain?: string): MemecoinPool[] {
@@ -788,10 +798,10 @@ export class MemecoinAggregatorService extends EventEmitter {
       };
     }
 
-    // Alpha Pipeline Integration (B14): Enforce confluence composite score >= 70 when gating is enabled
+    // Alpha Pipeline Integration (B14): Enforce the confluence composite score (threshold in force, default 70) when gating is enabled
     const shouldEnforceConfluence = params.enforceConfluence === true || this.isConfluenceGatingEnabled;
-    const minConfluence = params.minConfluenceScore ?? MIN_CONFLUENCE_SCORE;
-    const confluenceEval = this.evaluateTokenConfluence(pool);
+    const minConfluence = params.minConfluenceScore ?? getConfluenceThreshold();
+    const confluenceEval = traced('gate.confluence', () => this.evaluateTokenConfluence(pool));
 
     if (shouldEnforceConfluence && confluenceEval.score < minConfluence) {
       return {

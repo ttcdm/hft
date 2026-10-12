@@ -34,3 +34,9 @@ All agents operating in this repository must strictly adhere to the following ar
 ## 6. Test Suite Completeness & Lockfile Integrity
 - **Never narrow test script scopes to bypass failures.** The root `npm test` script must execute all test files across `tests/` (`vitest run`). Never filter the test runner in `package.json` to a subset of files to create the illusion of a passing build.
 - **Maintain hermetic package locking.** `package-lock.json` must always be committed and synchronized with `package.json`. Agents must never delete or omit the lockfile.
+
+## 7. Documentation Moves With the Code
+- **A change that adds an environment variable, an API route or an operator-visible feature updates the docs in the same commit.** An environment variable goes in `docs/ENV.md` (and `.env.example` if an operator sets it); a feature or route goes in `README.md`. `tests/env_docs.test.ts` fails when `docs/ENV.md` and the code disagree, so the environment part is enforced; the rest is for review.
+- **A change to the order of gates a trade passes updates `docs/ARCHITECTURE.md`** (the three diagrams). `tests/architecture_docs.test.ts` catches a renamed function or file, not a changed flow, so read the diagram against the change.
+- **Docs are devnet only.** No document outside `docs/archive/` may suggest a mainnet RPC or Jito URL, a block-explorer link without `?cluster=devnet`, or turning on real-money trading (`tests/docs_safety.test.ts`).
+- **Describe what the code does, not what it was meant to do.** If a setting or function looks live and does nothing, say so (see `KNOWN_RISKS.md` section 6) instead of describing it as working. Do not delete it in a docs change.

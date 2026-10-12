@@ -49,7 +49,7 @@ async function main() {
   });
   const conn = new Connection(info.url, 'confirmed');
   process.env.ALLOWED_CLUSTER = 'localnet'; process.env.LOCALNET_GENESIS_HASH = info.genesisHash; process.env.APEX_ENV_FILE = '';
-  process.env.SOLANA_RPC_URL = info.url; process.env.APEX_DB_PATH = path.join(scratch, 'seed.db'); process.env.APEX_WAL_PATH = path.join(scratch, 'seed.wal');
+  process.env.SOLANA_RPC_URL = info.url; process.env.APEX_DB_PATH = path.join(scratch, 'seed.db');
   const { runSeed, HARD_CAP_SOL, SeedGuardError, SeedRunError, sweepFromFile } = await import('../devnet_seed');
 
   const funder = Keypair.generate();

@@ -590,6 +590,15 @@ export class WorkstationDatabase {
     }
   }
 
+  /** S190: rows written in the last `windowMs` (uses the ts index). The recorder's measured rate, for System checks. */
+  public getLaunchRecordingRows(sinceTs: number): number {
+    try {
+      return Number((this.db.prepare('SELECT COUNT(*) AS n FROM launch_recording WHERE ts >= ?').get(sinceTs) as any).n);
+    } catch {
+      return 0;
+    }
+  }
+
   /** Keep the recording bounded: rows older than `retentionDays`, then the oldest rows beyond `maxRows`. Returns rows deleted. */
   public pruneLaunchRecording(retentionDays: number, maxRows: number, now: number = Date.now()): number {
     try {

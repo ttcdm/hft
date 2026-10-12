@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { SnipeAmountView } from '../src/components/SnipeAmountControl';
-import { AutoPanelView, AutoBudgetEditor, type AutoStatusData } from '../src/components/AutoPanel';
+import { AutoPanelView, AutoBudgetEditor, budgetProblem, type AutoStatusData } from '../src/components/AutoPanel';
 import {
   parseSnipeAmount, formatSol, formatUsdEquivalent, usdEquivalent, readSavedAmount, SNIPE_AMOUNT_STORAGE_KEY, FALLBACK_LIMITS, type SnipeLimits,
 } from '../src/utils/snipeAmount';
@@ -74,12 +74,13 @@ describe('S181 Auto session budget editor', () => {
     expect(html).not.toContain('budget-problem');
   });
   it('a budget above the cap or below one order shows the reason and cannot be saved', () => {
+    // the rules, for a value the operator typed (S188: the server's own unedited value is a note, not an error; see s188 tests)
+    expect(budgetProblem(5, 0.5, base.budgetLimits)).toContain('above the server cap of 0.06 SOL');
+    expect(budgetProblem(5, 0.001, base.budgetLimits)).toContain('at least one order (0.005 SOL)');
+    expect(budgetProblem(0, 0.02, base.budgetLimits)).toContain('whole number from 1 to 50');
+    expect(budgetProblem(5, 0.02, base.budgetLimits)).toBeNull();
+    // and an unedited server value that breaks them still cannot be "saved" back
     const over = renderToStaticMarkup(React.createElement(AutoBudgetEditor, { budgets: { ...base.budgets, maxSpendSol: 0.5 }, limits: base.budgetLimits }));
-    expect(over).toContain('above the server cap of 0.06 SOL');
     expect(over).toMatch(/data-testid="budget-save"[^>]*disabled/);
-    const tiny = renderToStaticMarkup(React.createElement(AutoBudgetEditor, { budgets: { ...base.budgets, maxSpendSol: 0.001 }, limits: base.budgetLimits }));
-    expect(tiny).toContain('at least one order (0.005 SOL)');
-    const zero = renderToStaticMarkup(React.createElement(AutoBudgetEditor, { budgets: { ...base.budgets, maxBuys: 0 }, limits: base.budgetLimits }));
-    expect(zero).toContain('whole number from 1 to 50');
   });
 });

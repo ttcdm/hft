@@ -25,7 +25,7 @@ describe('S177 over HTTP', () => {
   it('/api/system/checks reads the cluster check from the RPC: matching genesis is OK, a mainnet answer is FAIL', async () => {
     const ok = (await goodApp.call('GET', '/api/system/checks')).json;
     expect(ok.success).toBe(true);
-    expect(ok.checks.map((c: any) => c.id)).toEqual(['cluster', 'signer', 'rpc', 'reconciliation', 'halt', 'killswitch', 'feed', 'marks', 'database']);
+    expect(ok.checks.map((c: any) => c.id)).toEqual(['cluster', 'signer', 'rpc', 'reconciliation', 'halt', 'killswitch', 'feed', 'capacity', 'recorder', 'marks', 'database']);
     const cluster = (j: any) => j.checks.find((c: any) => c.id === 'cluster');
     await new Promise((r) => setTimeout(r, 1500));
     expect(cluster((await goodApp.call('GET', '/api/system/checks')).json).status).toBe('OK');

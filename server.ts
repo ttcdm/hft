@@ -1,4 +1,5 @@
 import './server/loadEnv'; // must stay the FIRST import: singletons built at import time read process.env
+import { tracingReady } from './server/observability/init'; // S209: starts OpenTelemetry tracing when APEX_TRACING=true; does nothing otherwise
 import './suppress-warnings.cjs';
 import express from 'express';
 import cors from 'cors';
@@ -9,15 +10,16 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer, createLogger } from 'vite';
 import { secretPathGuard, viteDevServerOptions } from './server/security/secretPaths';
 import { GoogleGenAI } from '@google/genai';
-import { hftEngine } from './server/engine/engine';
 import { socialScanner, isTelegramTradeCommand } from './server/socialScanner';
 import { memecoinAggregator } from './server/memecoinAggregator';
 import { onChainPoolStats } from './server/market/poolStats';
 import { wireWatchPins } from './server/signals/watchPins';
-import { realismEngine } from './server/realismEngine';
 import { buildSystemChecks } from './server/system/systemChecks';
+import { isReadOnly, assertReadOnlyStartup } from './server/solana/readOnly';
 import { LaunchRecorder } from './server/backtest/launchRecorder';
-import { replayLaunches } from './server/backtest/replay';
+import { recorderConfigProblems } from './server/backtest/recorderConfig';
+import { replayLaunchesAsync } from './server/backtest/replay';
+import { checkConfluenceThreshold, getConfluenceThreshold, envConfluenceProblem } from './server/signals/confluenceThreshold';
 import { computeLatency } from './server/system/latencyStats';
 import { buildDiagnosticsContext } from './server/system/aiContext';
 import { pumpFunService, pumpBootMode } from './server/pumpfunService';
@@ -41,6 +43,7 @@ import {
   AutoModeSchema,
   AutoBudgetSchema,
   AutoOrderSizeSchema,
+  AutoThresholdSchema,
   AutoKillSchema,
   AutoResumeSchema,
   CalloutSnipeSchema,
@@ -186,7 +189,6 @@ wss.on('connection', (ws: WebSocket, req: any) => {
           ws.send(JSON.stringify({ type: 'AUTHENTICATED', authenticated: true, timestamp: Date.now() }));
           ws.send(JSON.stringify({ type: 'AUTH_SUCCESS', authenticated: true }));
           // Emit telemetry and snapshots exclusively after successful authentication
-          ws.send(JSON.stringify({ type: 'TELEMETRY', data: hftEngine.getTelemetry() }));
           ws.send(
             JSON.stringify({
               type: 'PUMP_HOT_CALLOUTS',
@@ -207,7 +209,6 @@ wss.on('connection', (ws: WebSocket, req: any) => {
               },
             })
           );
-          ws.send(JSON.stringify({ type: 'WAL_SNAPSHOT', data: hftEngine.getWAL().getRecent(40) }));
           ws.send(JSON.stringify({ type: 'WALLET_STATE_UPDATED', data: walletTrader.getState() }));
           ws.send(
             JSON.stringify({
@@ -225,12 +226,6 @@ wss.on('connection', (ws: WebSocket, req: any) => {
 
       // Mutating WebSocket commands require operator session authorization
       const MUTATING_WS_ACTIONS = new Set([
-        'START',
-        'STOP',
-        'KILL',
-        'RESET',
-        'SET_SYMBOL',
-        'SET_CONFIG',
         'SNIPE_PUMP_CALLOUT',
         'TOGGLE_CALLER_SNIPE',
         'SNIPE_MEMECOIN',
@@ -251,13 +246,6 @@ wss.on('connection', (ws: WebSocket, req: any) => {
           return;
         }
       }
-
-      if (parsed.action === 'START') hftEngine.startEngine();
-      if (parsed.action === 'STOP') hftEngine.stopEngine();
-      if (parsed.action === 'KILL') hftEngine.killSwitch();
-      if (parsed.action === 'RESET') hftEngine.resetState();
-      if (parsed.action === 'SET_SYMBOL' && parsed.symbol) hftEngine.setSymbol(parsed.symbol);
-      if (parsed.action === 'SET_CONFIG' && parsed.config) hftEngine.updateConfig(parsed.config);
 
       // Real-time sniper actions via WebSocket routed through authoritative coordinator
       const rejectWsInput = (issues: Array<{ path: string; message: string }>) =>
@@ -310,15 +298,6 @@ wss.on('connection', (ws: WebSocket, req: any) => {
   });
 });
 
-// Broadcast engine updates over WebSocket
-hftEngine.onTelemetry((tel) => {
-  broadcastWs({ type: 'TELEMETRY', data: tel });
-});
-
-hftEngine.onTrade((trade) => {
-  broadcastWs({ type: 'TRADE_FILL', data: trade });
-});
-
 // Broadcast real-time Pump.fun Hot Callouts updates
 pumpFunService.on('callouts_updated', (data) => {
   broadcastWs({ type: 'PUMP_HOT_CALLOUTS', data });
@@ -336,6 +315,7 @@ watchWindow.setScoreFn((mint) => {
 });
 watchWindow.attach(pumpFeedListener);
 // S178: save what the window sees (launches it scores, their trades, the funder facts) so the auto rules can be replayed over real launches
+for (const p of recorderConfigProblems()) console.warn(`[APEX QUANT HFT] ${p}`); // S190
 const launchRecorder = new LaunchRecorder(workstationDb, watchWindow, () => solPriceService.lastKnownPrice());
 launchRecorder.attach(pumpFeedListener);
 wireWatchPins(watchWindow, memecoinAggregator, onChainPoolStats); // S4: a watched mint keeps its pool and its trade stats until the verdict
@@ -578,138 +558,6 @@ app.post('/api/export/packets', requireOperatorAuth, (req, res) => {
   res.setHeader('Content-Type', 'application/json');
   res.setHeader('Content-Disposition', 'attachment; filename="apex_hft_packet_stream.json"');
   res.send(JSON.stringify(rawData, null, 2));
-});
-
-// 7. High-Performance Autonomous Execution Engine Endpoints
-app.get('/api/engine/status', requireOperatorAuth, (req, res) => {
-  res.json(hftEngine.getTelemetry());
-});
-
-app.post('/api/engine/start', requireOperatorAuth, (req, res) => {
-  hftEngine.startEngine();
-  res.json({ status: 'OK', telemetry: hftEngine.getTelemetry() });
-});
-
-app.post('/api/engine/stop', requireOperatorAuth, (req, res) => {
-  hftEngine.stopEngine();
-  res.json({ status: 'OK', telemetry: hftEngine.getTelemetry() });
-});
-
-app.post('/api/engine/reset', requireOperatorAuth, (req, res) => {
-  hftEngine.resetState();
-  res.json({ status: 'OK', telemetry: hftEngine.getTelemetry() });
-});
-
-app.post('/api/engine/kill', requireOperatorAuth, (req, res) => {
-  hftEngine.killSwitch();
-  res.json({ status: 'OK', telemetry: hftEngine.getTelemetry() });
-});
-
-app.post('/api/engine/symbol', requireOperatorAuth, (req, res) => {
-  if (req.body.symbol) {
-    hftEngine.setSymbol(req.body.symbol);
-  }
-  res.json({ status: 'OK', telemetry: hftEngine.getTelemetry() });
-});
-
-app.post('/api/engine/config', requireOperatorAuth, (req, res) => {
-  hftEngine.updateConfig(req.body);
-  res.json({ status: 'OK', telemetry: hftEngine.getTelemetry() });
-});
-
-app.get('/api/engine/wal', requireOperatorAuth, (req, res) => {
-  const limit = parseInt(req.query.limit as string) || 60;
-  res.json({
-    seqId: hftEngine.getWAL().getCurrentSeq(),
-    entries: hftEngine.getWAL().getRecent(limit),
-  });
-});
-
-app.get('/api/engine/wal/export', requireOperatorAuth, (req, res) => {
-  const journal = hftEngine.getWAL().exportJournal();
-  res.setHeader('Content-Type', 'text/plain');
-  res.setHeader('Content-Disposition', 'attachment; filename="apex_engine_journal.wal"');
-  res.send(journal);
-});
-
-app.post('/api/engine/risk/limits', requireOperatorAuth, (req, res) => {
-  hftEngine.getRiskEngine().updateLimits(req.body);
-  res.json({ status: 'OK', limits: hftEngine.getRiskEngine().getLimits() });
-});
-
-app.get('/api/engine/risk/limits', requireOperatorAuth, (req, res) => {
-  res.json(hftEngine.getRiskEngine().getLimits());
-});
-
-// 8. Standalone Rust Engine Source & $10 Micro-Capital Configuration
-app.get('/api/engine/rust/source', requireOperatorAuth, (req, res) => {
-  try {
-    const crateDir = path.join(process.cwd(), 'crates', 'apex_hft_engine');
-
-    const files: Record<string, string> = {};
-    const readSafe = (subPath: string) => {
-      try {
-        return fs.readFileSync(path.join(crateDir, subPath), 'utf8');
-      } catch {
-        return '';
-      }
-    };
-
-    files['Cargo.toml'] = readSafe('Cargo.toml');
-    files['README.md'] = readSafe('README.md');
-    files['src/main.rs'] = readSafe('src/main.rs');
-    files['src/lib.rs'] = readSafe('src/lib.rs');
-    files['src/order_book.rs'] = readSafe('src/order_book.rs');
-    files['src/ring_buffer.rs'] = readSafe('src/ring_buffer.rs');
-    files['src/risk.rs'] = readSafe('src/risk.rs');
-    files['src/avellaneda_stoikov.rs'] = readSafe('src/avellaneda_stoikov.rs');
-    files['src/wal.rs'] = readSafe('src/wal.rs');
-
-    res.json({ status: 'OK', crateName: 'apex_hft_engine', files });
-  } catch (err: any) {
-    res.status(500).json({ status: 'ERROR', message: err.message });
-  }
-});
-
-app.post('/api/engine/mode/micro-10', requireOperatorAuth, (req, res) => {
-  const { enabled } = req.body;
-  if (enabled) {
-    // Apply $10 micro-capital constraints
-    hftEngine.updateConfig({
-      baseQuoteSize: 0.0001, // ~6.80 USD on BTC, satisfying Binance's 5 USDT minimum notional
-      targetSpreadBps: 4.0,  // Wider spread to offset retail taker/maker fees
-      gamma: 0.35,           // Higher risk aversion
-      inventoryLimitQty: 0.0002,
-    });
-    hftEngine.getRiskEngine().updateLimits({
-      minOrderNotionalUsd: 5.0,  // Exchange minimum notional
-      maxOrderNotionalUsd: 10.0, // Hard ceiling for $10 account
-      maxSingleOrderQty: 0.0002,
-      maxDailyLossUsd: 2.0,      // Max 20% drawdown on $10
-      fatFingerPriceBandPct: 1.5,
-    });
-  } else {
-    // Institutional defaults
-    hftEngine.updateConfig({
-      baseQuoteSize: 0.05,
-      targetSpreadBps: 2.0,
-      gamma: 0.1,
-      inventoryLimitQty: 5.0,
-    });
-    hftEngine.getRiskEngine().updateLimits({
-      minOrderNotionalUsd: 5.0,
-      maxOrderNotionalUsd: 50000.0,
-      maxSingleOrderQty: 5.0,
-      maxDailyLossUsd: 5000.0,
-      fatFingerPriceBandPct: 2.5,
-    });
-  }
-  res.json({
-    status: 'OK',
-    isMicro10: enabled,
-    telemetry: hftEngine.getTelemetry(),
-    limits: hftEngine.getRiskEngine().getLimits(),
-  });
 });
 
 // ============================================================================
@@ -1028,13 +876,16 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, async (req, res) =
         nature: executionCoordinator.isLiveArmed() ? 'LIVE_ARMED' : 'PAPER_BY_DEFAULT',
         details: executionCoordinator.isLiveArmed()
           ? 'LIVE is ARMED: snipes are signed with the configured wallet and submitted to the configured cluster RPC. Real funds on that cluster are at risk.'
-          : 'LIVE is not armed: snipes are paper-traded in memory against the curve quote. No transaction is signed or sent.',
+          : isReadOnly()
+            ? 'READ-ONLY: this server has no signer and cannot arm LIVE. Snipes are paper-traded against the real curve quote; no transaction is signed or sent.'
+            : 'LIVE is not armed: snipes are paper-traded in memory against the curve quote. No transaction is signed or sent.',
       },
       {
         subsystem: 'Jito MEV Bundles & Priority Tips',
         nature: executionCoordinator.isLiveArmed() ? 'LIVE_CLUSTER_DEPENDENT' : 'PAPER_ONLY',
-        details:
-          'Priority tips follow the executionConfig tip policy. Bundles go to Jito only on mainnet-beta (never enabled by default); on devnet or localnet the transaction goes to the cluster RPC with a priority fee and no bundle. In paper mode nothing is sent.',
+        details: isReadOnly()
+          ? 'Read-only mode: nothing is signed or sent, so no tip is ever paid. Paper fills still model the priority tip from the tip policy (on mainnet it follows the public Jito tip floor) so their cost is what a real send would pay.'
+          : 'Priority tips follow the executionConfig tip policy. Bundles go to Jito only on mainnet-beta (never enabled by default); on devnet or localnet the transaction goes to the cluster RPC with a priority fee and no bundle. In paper mode nothing is sent.',
       },
       {
         subsystem: 'Caller Persona Historical Track Records',
@@ -1195,26 +1046,6 @@ app.post('/api/pumpfun/refresh', requireOperatorAuth, async (req, res) => {
 
 
 // ============================================================================
-// 14. REALISM & CO-LOCATION MICROSTRUCTURE CONFIG ENDPOINTS
-// ============================================================================
-app.get('/api/realism/config', requireOperatorAuth, (req, res) => {
-  res.json({
-    status: 'OK',
-    config: realismEngine.getConfig(),
-    regions: realismEngine.getRegionDetails(),
-    feeSchedules: realismEngine.getFeeSchedule(),
-  });
-});
-
-app.post('/api/realism/config', requireOperatorAuth, (req, res) => {
-  const updated = realismEngine.updateConfig(req.body);
-  res.json({
-    status: 'OK',
-    config: updated,
-  });
-});
-
-// ============================================================================
 // 15. PLUG-AND-PLAY WALLET ONBOARDING & LIVE AUTONOMOUS TRADING ENDPOINTS
 // ============================================================================
 app.get('/api/wallet/state', requireOperatorAuth, (req, res) => {
@@ -1334,12 +1165,12 @@ app.get('/api/diagnostics/system', requireOperatorAuth, (req, res) => {
       signerStatus,
       rpcEndpoint: endpointOrigin(diag.rpcEndpoint || resolveRpcUrl()), // Q54: the endpoint in use (it changes on a switch), host only
       allowedCluster: allowedCluster(),
+      readOnly: isReadOnly(), // S185: the banner reads this
       rpcLatencyMs: diag.rpcLatencyMs,
       databaseFile: 'apex_workstation.db',
       dbDriver: 'node:sqlite (WAL mode enabled)',
       keypairStorage: 'Local filesystem (mode 0600) at .apex_trading_keypair.json',
       browserPrivateKeySecurity: 'Private keys are NEVER accepted via HTTP/WebSocket requests.',
-      hftPaperIsolation: 'CME/Binance/Coinbase L2 HFT engine runs strictly in-memory simulation; completely isolated from real-money Solana wallet.',
     },
     riskControls: {
       tier: 'MICRO_10',
@@ -1371,19 +1202,46 @@ app.get('/api/backtest/recording', requireOperatorAuth, (req, res) => {
   res.json({ success: true, ...workstationDb.getLaunchRecordingStatus() });
 });
 
+/** The most launches one replay covers (newest first). 3,250 launches replay in about 7 s of CPU, now time-sliced so the live loop keeps running. APEX_REPLAY_MAX_LAUNCHES (100 to 50000) overrides. */
+function replayLaunchCap(env: NodeJS.ProcessEnv = process.env): number {
+  const n = Number((env.APEX_REPLAY_MAX_LAUNCHES ?? '').trim());
+  return Number.isInteger(n) && n >= 100 && n <= 50_000 ? n : 5_000;
+}
 let replayCache: { key: string; at: number; body: any } | null = null;
-app.get('/api/backtest/replay', requireOperatorAuth, (req, res) => {
+const replayInFlight = new Map<string, Promise<any>>();
+app.get('/api/backtest/replay', requireOperatorAuth, async (req, res) => {
+  // S187: ?minScore=N replays at another confluence threshold (the what-if box); without it, the threshold in force
+  let minScore: number | undefined;
+  if (req.query.minScore !== undefined) {
+    const c = checkConfluenceThreshold(req.query.minScore);
+    if (!c.ok) return res.status(422).json({ success: false, error: c.reason });
+    minScore = c.value;
+  }
   const status = workstationDb.getLaunchRecordingStatus();
   if (status.launches === 0) {
     return res.json({ success: true, recorded: status, report: null, message: 'No launch has been recorded yet, so there is nothing to replay. The recorder saves every launch the watch window scores while the app runs against a pump.fun feed.' });
   }
-  const key = `${status.events}:${status.newestTs}`;
+  const cap = replayLaunchCap();
+  const key = `${status.events}:${status.newestTs}:${minScore ?? getConfluenceThreshold()}:${cap}`;
   if (replayCache && replayCache.key === key && Date.now() - replayCache.at < 30_000) return res.json(replayCache.body);
-  const { launches, funders } = workstationDb.loadLaunchRecording(300);
-  const report = replayLaunches(launches, funders, solPriceService.lastKnownPrice());
-  const body = { success: true, recorded: status, report, message: null };
-  replayCache = { key, at: Date.now(), body };
-  res.json(body);
+  try {
+    // S189: one replay per key at a time (the screen polls), time-sliced so a long replay never stalls the live feed or the auto controller
+    let running = replayInFlight.get(key);
+    if (!running) {
+      running = (async () => {
+        const { launches, funders } = workstationDb.loadLaunchRecording(cap);
+        const report = await replayLaunchesAsync(launches, funders, solPriceService.lastKnownPrice(), minScore === undefined ? {} : { minScore });
+        // S188: the replay covers the newest `cap` launches; the response says so, so a count below the recorder's is explained
+        const body = { success: true, recorded: status, report, message: null, replayedLaunches: launches.length, replayCap: cap };
+        replayCache = { key, at: Date.now(), body };
+        return body;
+      })().finally(() => replayInFlight.delete(key));
+      replayInFlight.set(key, running);
+    }
+    res.json(await running);
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: `Replay failed: ${e?.message || e}` });
+  }
 });
 
 app.get('/api/execution/mode', requireOperatorAuth, (req, res) => {
@@ -1424,6 +1282,12 @@ app.post('/api/auto/budget', requireOperatorAuth, validateTradeBody(AutoBudgetSc
 
 app.post('/api/auto/order-size', requireOperatorAuth, validateTradeBody(AutoOrderSizeSchema), (req, res) => {
   const result = autoSnipeController.setOrderSol(req.body.orderSol);
+  res.status(result.ok ? 200 : 422).json({ success: result.ok, ...result, error: result.reason, status: autoSnipeController.getStatus() });
+});
+
+/** S187: the one confluence buy threshold (watch window HOT gate and execution gate, manual snipes included). Works in read-only mode: it changes what is bought, never whether anything can be sent. */
+app.post('/api/auto/threshold', requireOperatorAuth, validateTradeBody(AutoThresholdSchema), (req, res) => {
+  const result = autoSnipeController.setConfluenceThreshold(req.body.threshold);
   res.status(result.ok ? 200 : 422).json({ success: result.ok, ...result, error: result.reason, status: autoSnipeController.getStatus() });
 });
 
@@ -1497,6 +1361,10 @@ autoSnipeController.on('mode', (d) => broadcastWs({ type: 'AUTO_MODE', data: { .
 
 app.post('/api/execution/arm', requireOperatorAuth, validateTradeBody(ArmSchema), (req, res) => {
   const { arm, confirmationCode } = req.body;
+  // S185: read-only mode answers every arm request, arm or disarm, with 409 and does nothing.
+  if (isReadOnly()) {
+    return res.status(409).json({ success: false, error: 'READ_ONLY', message: 'READ_ONLY: APEX_READ_ONLY=true. This server watches and paper trades only; live trading cannot be armed.' });
+  }
   const result = executionCoordinator.armLiveTrading(Boolean(arm), confirmationCode);
   if (!result.success) {
     return res.status(403).json(result);
@@ -1577,6 +1445,10 @@ app.get('/api/signer/status', requireOperatorAuth, (req, res) => {
 // Local wallet generation helper (imports must be done via CLI: npm run signer:import)
 app.post('/api/signer/generate', requireOperatorAuth, (req, res) => {
   try {
+    // S186: a read-only server never holds a key, so it cannot create one either
+    if (isReadOnly()) {
+      return res.status(409).json({ success: false, error: 'READ_ONLY', message: 'READ_ONLY: APEX_READ_ONLY=true: this server holds no signing key and cannot generate or import one.' });
+    }
     if (req.body?.forceOverwrite) {
       return res.status(403).json({
         success: false,
@@ -1638,6 +1510,9 @@ process.on('uncaughtException', (err) => {
 });
 
 async function startServer() {
+  await tracingReady; // S209: instrumentation must be in place before any outbound connection is made
+  assertReadOnlyStartup(); // S185: refuses to start next to a signing key in read-only mode
+  { const p = envConfluenceProblem(); if (p) console.warn(`[APEX QUANT HFT] ${p}`); } // S187
   if (process.env.NODE_ENV !== 'production') {
     const customLogger = createLogger();
     const originalError = customLogger.error.bind(customLogger);

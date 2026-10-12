@@ -400,9 +400,9 @@ describe('Tier 2: Boundary & Corner Cases (Features 21 - 25)', () => {
   });
 
   // =========================================================================
-  // Feature 24 Boundaries: Build, Typecheck, Lint & Rust Gates
+  // Feature 24 Boundaries: Build, Typecheck & Lint Gates
   // =========================================================================
-  describe('Feature 24 Boundaries: Build, Typecheck, Lint & Rust Gates', () => {
+  describe('Feature 24 Boundaries: Build, Typecheck & Lint Gates', () => {
     it('B24.1: tsconfig enforces target, moduleResolution, and skipLibCheck', () => {
       const tsconfigPath = path.resolve(process.cwd(), 'tsconfig.json');
       const tsconfig = JSON.parse(fs.readFileSync(tsconfigPath, 'utf8'));
@@ -421,15 +421,6 @@ describe('Tier 2: Boundary & Corner Cases (Features 21 - 25)', () => {
       const deps = pkg.dependencies || {};
       expect(deps['@pump-fun/pump-sdk']).toBe('1.37.0');
       expect(deps['@pump-fun/pump-swap-sdk']).toBe('1.20.0');
-    });
-
-    it('B24.3: Cargo workspace defines native Rust release optimization settings', () => {
-      const cargoPath = path.resolve(process.cwd(), 'Cargo.toml');
-      const cargoContent = fs.readFileSync(cargoPath, 'utf8');
-
-      expect(cargoContent).toContain('[profile.release]');
-      expect(cargoContent).toContain('opt-level = 3');
-      expect(cargoContent).toContain('lto = "fat"');
     });
 
     it('B24.4: SQLite database schema includes required performance and integrity indexes', () => {
@@ -494,7 +485,7 @@ describe('Tier 2: Boundary & Corner Cases (Features 21 - 25)', () => {
     });
 
     it('B25.5: master project architecture documents interface contracts and error standards', () => {
-      const projectPath = path.resolve(process.cwd(), 'PROJECT.md');
+      const projectPath = path.resolve(process.cwd(), 'docs/archive/PROJECT.md');
       const projectDoc = fs.readFileSync(projectPath, 'utf8');
 
       expect(projectDoc).toContain('Interface Contracts');

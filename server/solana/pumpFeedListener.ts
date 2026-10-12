@@ -64,6 +64,9 @@ export interface PumpFeedListenerTelemetry {
   status: 'ACTIVE' | 'CONNECTING' | 'RECONNECTING' | 'DISCONNECTED' | 'ERROR';
   subscriptionId: number | null;
   eventsReceived: number;
+  /** S185: logs whose handler threw (counted, then skipped), and the slowest handler seen. A feed that cannot keep up shows here. */
+  handlerErrors: number;
+  slowestHandlerMs: number;
   eventsParsed: number;
   tradesParsed: number;
   lastEventTimestamp: number;
@@ -82,6 +85,8 @@ export class PumpFeedListener extends EventEmitter {
   private subscriptionId: number | null = null;
   private status: 'ACTIVE' | 'CONNECTING' | 'RECONNECTING' | 'DISCONNECTED' | 'ERROR' = 'DISCONNECTED';
   private eventsReceived: number = 0;
+  private handlerErrors: number = 0;
+  private slowestHandlerMs: number = 0;
   private eventsParsed: number = 0;
   private tradesParsed: number = 0;
   private lastEventTimestamp: number = 0;
@@ -446,6 +451,7 @@ export class PumpFeedListener extends EventEmitter {
         PUMP_FUN_PROGRAM_ID,
         (logs: Logs, ctx: Context) => {
           this.eventsReceived++;
+          const handlerStart = performance.now();
           try {
             const trades = this.parseTradeLogs(logs, ctx);
             const event = this.parseLogs(logs, ctx);
@@ -475,7 +481,10 @@ export class PumpFeedListener extends EventEmitter {
             // create already exists to receive them. Before, they were emitted first and no subscriber was watching yet.
             for (const trade of trades) this.ingestTradeEvent(trade);
           } catch (err: any) {
+            this.handlerErrors++;
             Logger.warn(`PumpFeedListener error processing log: ${err.message}`);
+          } finally {
+            this.slowestHandlerMs = Math.max(this.slowestHandlerMs, Math.round(performance.now() - handlerStart));
           }
         },
         'processed'
@@ -538,6 +547,8 @@ export class PumpFeedListener extends EventEmitter {
       status: this.status,
       subscriptionId: this.subscriptionId,
       eventsReceived: this.eventsReceived,
+      handlerErrors: this.handlerErrors,
+      slowestHandlerMs: this.slowestHandlerMs,
       eventsParsed: this.eventsParsed,
       tradesParsed: this.tradesParsed,
       lastEventTimestamp: this.lastEventTimestamp,

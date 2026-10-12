@@ -58,6 +58,8 @@ describe('A1: operator auth lockdown', () => {
       expect(routes.length).toBeGreaterThan(50);
       expect(routes).toContainEqual({ method: 'GET', path: '/api/auth/session' });
       expect(routes).toContainEqual({ method: 'POST', path: '/api/pumpfun/refresh' });
+      // S211/S212: the BTC simulator routes and the Rust source route are gone
+      expect(routes.filter((r) => r.path.startsWith('/api/engine/'))).toEqual([]);
     });
 
     it('rejects every non-allowlisted /api route without a token and admits it with a valid one', async () => {
@@ -107,7 +109,7 @@ describe('A1: operator auth lockdown', () => {
     it('never accepts an operator token passed in the query string', async () => {
       const token = authManager.getPrimaryToken();
       await withGatedApp(async (base) => {
-        const res = await fetch(`${base}/api/engine/status?token=${token}&sessionToken=${token}`);
+        const res = await fetch(`${base}/api/execution/readiness?token=${token}&sessionToken=${token}`);
         expect(res.status).toBe(401);
       });
     });
@@ -117,7 +119,7 @@ describe('A1: operator auth lockdown', () => {
       const session = mgr.createSession('OPERATOR');
       expect(authManager.validateToken(session.token)).toBe(false);
       await withGatedApp(async (base) => {
-        const res = await fetch(`${base}/api/engine/status`, {
+        const res = await fetch(`${base}/api/execution/readiness`, {
           headers: { Authorization: `Bearer ${session.token}` },
         });
         expect(res.status).toBe(401);

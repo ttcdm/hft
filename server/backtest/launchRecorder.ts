@@ -2,13 +2,21 @@ import { EventEmitter } from 'events';
 import type { PumpCreateEvent, PumpTradeEvent } from '../solana/pumpFeedListener';
 import type { WatchWindow } from '../signals/watchWindow';
 import type { WorkstationDatabase } from '../db/database';
+import { Logger } from '../middleware/enterprise';
+import { recorderConfig, setRecorderRuntime, RECORD_DEFAULT_MINT_MINUTES, RECORD_TRADES_PER_30_MIN, RECORD_DEFAULT_RETENTION_DAYS, RECORD_DEFAULT_MAX_ROWS, type RecorderConfig, type RecorderRuntime } from './recorderConfig';
 
-/** How long, and how much, of one launch is recorded. The auto trader's exits run for up to 30 minutes, so that is how long trades are kept. */
-export const RECORD_MINT_MS = 30 * 60_000;
-export const RECORD_MAX_TRADES_PER_MINT = 2_000;
-export const RECORD_RETENTION_DAYS = 14;
-export const RECORD_MAX_ROWS = 300_000;
+/**
+ * How long, and how much, of one launch is recorded: see recorderConfig.ts (env-configurable; 30 minutes on a normal server, 180 read-only).
+ * The old constants stay as the normal defaults.
+ */
+export const RECORD_MINT_MS = RECORD_DEFAULT_MINT_MINUTES * 60_000;
+export const RECORD_MAX_TRADES_PER_MINT = RECORD_TRADES_PER_30_MIN;
+export const RECORD_RETENTION_DAYS = RECORD_DEFAULT_RETENTION_DAYS;
+export const RECORD_MAX_ROWS = RECORD_DEFAULT_MAX_ROWS;
 const PENDING_CREATES_MAX = 500;
+/** Launches whose trade count is tracked. Entries older than the window are dropped first; only then the oldest, so a long window never loses a live launch. */
+const RECORDED_TRACK_SOFT = 5_000;
+const RECORDED_TRACK_HARD = 50_000;
 
 type Db = Pick<WorkstationDatabase, 'recordLaunchEvent' | 'pruneLaunchRecording'>;
 
@@ -27,8 +35,14 @@ export class LaunchRecorder {
   private recorded = new Map<string, { createdAt: number; trades: number }>();
   private attachedTo: Array<{ off: () => void }> = [];
   private lastPrune = 0;
+  private runtime: RecorderRuntime;
 
-  constructor(private db: Db, private window: Pick<WatchWindow, 'isWatching'> & EventEmitter, private solUsd: () => number | null = () => null, private now: () => number = Date.now) {}
+  constructor(private db: Db, private window: Pick<WatchWindow, 'isWatching'> & EventEmitter, private solUsd: () => number | null = () => null, private now: () => number = Date.now, private config: RecorderConfig = recorderConfig()) {
+    this.runtime = { config: this.config, prunedRows: 0, prunings: 0, firstPruneAt: null, lastPruneAt: null, lastPruneRows: 0 };
+    setRecorderRuntime(this.runtime);
+  }
+
+  public getRuntime(): RecorderRuntime { return this.runtime; }
 
   public attach(feed: EventEmitter): void {
     const onCreate = (e: PumpCreateEvent) => this.onCreate(e);
@@ -61,9 +75,9 @@ export class LaunchRecorder {
       this.pending.delete(t.mint);
       rec = { createdAt: p.ts, trades: 0 };
       this.recorded.set(t.mint, rec);
-      if (this.recorded.size > 2_000) this.recorded.delete(this.recorded.keys().next().value as string);
+      this.trimTracked(at);
     }
-    if (at - rec.createdAt > RECORD_MINT_MS || rec.trades >= RECORD_MAX_TRADES_PER_MINT) return;
+    if (at - rec.createdAt > this.config.mintMs || rec.trades >= this.config.maxTradesPerMint) return;
     rec.trades++;
     this.db.recordLaunchEvent(at, t.mint, 'TRADE', eventToJson(t));
     this.maybePrune(at);
@@ -73,9 +87,23 @@ export class LaunchRecorder {
     this.db.recordLaunchEvent(this.now(), '', 'FUNDER', { wallet: f.wallet, funder: f.funder });
   }
 
+  private trimTracked(now: number): void {
+    if (this.recorded.size <= RECORDED_TRACK_SOFT) return;
+    for (const [mint, r] of this.recorded) if (now - r.createdAt > this.config.mintMs) this.recorded.delete(mint);
+    while (this.recorded.size > RECORDED_TRACK_HARD) this.recorded.delete(this.recorded.keys().next().value as string);
+  }
+
   private maybePrune(now: number): void {
     if (now - this.lastPrune < 3_600_000) return;
     this.lastPrune = now;
-    this.db.pruneLaunchRecording(RECORD_RETENTION_DAYS, RECORD_MAX_ROWS, now);
+    const deleted = this.db.pruneLaunchRecording(this.config.retentionDays, this.config.maxRows, now);
+    if (deleted > 0) {
+      const rt = this.runtime;
+      const first = rt.firstPruneAt === null;
+      rt.prunedRows += deleted; rt.prunings++; rt.lastPruneRows = deleted; rt.lastPruneAt = now; rt.firstPruneAt ??= now;
+      // Pruning removes the OLDEST recorded launches, so say so loudly the first time and quietly after
+      const msg = `[RECORDER] pruned ${deleted} recorded row(s) (limits: ${this.config.maxRows} rows, ${this.config.retentionDays} days). The oldest launches are being dropped${first ? '; raise APEX_RECORD_MAX_ROWS / APEX_RECORD_RETENTION_DAYS if you want to keep them (about 330 bytes a row on disk)' : ''}.`;
+      if (first) Logger.warn(msg); else Logger.info(msg);
+    }
   }
 }

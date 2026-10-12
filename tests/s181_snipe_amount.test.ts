@@ -83,7 +83,7 @@ describe('S181 the Auto session budget is editable within the server cap', () =>
     expect(cap).toBeCloseTo(executionConfig.getConfig().maxPositionSizeSol * 3, 9);
     expect(c.setBudget({ maxBuys: 3, maxSpendSol: 0.03 })).toEqual({ ok: true });
     expect(c.getStatus().budgets).toMatchObject({ maxBuys: 3, maxSpendSol: 0.03 });
-    expect(c.getStatus().budgetLimits).toEqual({ maxSpendSol: cap, minSpendSol: AUTO_DEVNET_ORDER_SOL, maxBuys: 50 });
+    expect(c.getStatus().budgetLimits).toEqual({ maxSpendSol: cap, minSpendSol: AUTO_DEVNET_ORDER_SOL, maxBuys: 50, capKind: 'REAL', capNote: '3 x MAX_POSITION_SIZE_SOL' });
     // the loss and time limits are not editable
     expect(c.getStatus().budgets.maxLossFraction).toBe(SESSION_BUDGETS.maxLossFraction);
   });

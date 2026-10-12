@@ -1,3 +1,18 @@
+/**
+ * Builds the unsigned transactions for Pump.fun bonding-curve buys and sells: compute budget, an idempotent token-account create,
+ * the official Pump V2 instruction (via @pump-fun/pump-sdk), the optional Jito tip transfer and, on a full exit, the token-account close.
+ * It returns a VersionedTransaction and nothing else.
+ *
+ * What it must never do: sign, send, read the signer, or decide whether a trade is allowed. Signing and sending belong to
+ * `ExecutionCoordinator` (`submitAndConfirmWithRetry`, which also runs the cluster guard and refuses in read-only mode). Risk,
+ * eligibility and sizing are decided before this file is called. It does not guess a creator or fee recipient: a missing one is a
+ * thrown error, not a default. The token program is the exception: when a caller does not pass `tokenProgram` the classic SPL Token program
+ * is used (`params.tokenProgram || TOKEN_PROGRAM_ID`), so a Token-2022 mint built without it would use the wrong program. The coordinator
+ * always passes the one it read with the bonding-curve state (buys) or recorded on the position (sells).
+ *
+ * Called by: `server/execution/coordinator.ts` (`buildBuyTransaction`, `buildSellTransaction`, `buildCustomVersionedTransaction`
+ * through the `txBuilder` singleton, plus `createComputeBudgetInstructions`). Migrated PumpSwap pools are built in `pumpSwapService.ts`.
+ */
 import {
   PublicKey,
   TransactionInstruction,
@@ -20,6 +35,7 @@ import {
   COMPUTE_BUDGET_PROGRAM_ID,
 } from './programs';
 
+/** Inputs of one Pump V2 buy. `maxSolCostLamports` is the slippage ceiling the program enforces, not the amount the caller wants to spend. `creator`, `feeRecipient` and `buybackFeeRecipient` are required in practice: the V2 builders throw without them. */
 export interface PumpBuyParams {
   buyer: PublicKey;
   mint: PublicKey;
@@ -40,6 +56,7 @@ export interface PumpBuyParams {
   jitoTipAccount?: PublicKey;
 }
 
+/** Inputs of one Pump V2 sell. `minSolOutputLamports` is the slippage floor the program enforces. `closeAta` asks for the token account to be closed after the sell (rent reclaim); `buildSellTransaction` also takes it as an argument, which wins. */
 export interface PumpSellParams {
   seller: PublicKey;
   mint: PublicKey;
@@ -61,10 +78,12 @@ export interface PumpSellParams {
   closeAta?: boolean;
 }
 
+/** Instruction and transaction builders. Static methods are pure; the instance only caches a blockhash (and trade builds always bypass that cache, see `getRecentBlockhash`). */
 export class SolanaTransactionBuilder {
   private cachedBlockhash: { blockhash: string; lastValidBlockHeight: number; timestamp: number } | null = null;
   private readonly BLOCKHASH_MAX_AGE_MS = 25000; // 25s for fast Solana slot time
 
+  /** Derives an associated token account address for any token program. Production code uses `PumpCurveService.getAssociatedTokenAddress` instead; only tests call this one. */
   public static getAssociatedTokenAddress(
     mint: PublicKey,
     owner: PublicKey,
@@ -77,6 +96,7 @@ export class SolanaTransactionBuilder {
     return address;
   }
 
+  /** Bonding-curve PDA of a mint on the Pump.fun program. Production code uses `PumpCurveService.getBondingCurveAddress`; only tests call this one. */
   public static getBondingCurveAddress(mint: PublicKey): [PublicKey, number] {
     return PublicKey.findProgramAddressSync(
       [Buffer.from('bonding-curve'), mint.toBuffer()],
@@ -84,6 +104,7 @@ export class SolanaTransactionBuilder {
     );
   }
 
+  /** Latest `confirmed` blockhash, cached for 25 s unless `forceFresh`. Every trade build passes `forceFresh = true`, so the cache is not used on the trade path. */
   public async getRecentBlockhash(connection: Connection, forceFresh = false): Promise<string> {
     const now = Date.now();
     if (!forceFresh && this.cachedBlockhash && now - this.cachedBlockhash.timestamp < this.BLOCKHASH_MAX_AGE_MS) {
@@ -95,6 +116,7 @@ export class SolanaTransactionBuilder {
     return blockhash;
   }
 
+  /** Associated-token-account CreateIdempotent: succeeds whether or not the account exists, so a repeat buy never fails on it. The payer funds the rent on first creation. */
   public static createAtaIdempotentInstruction(
     payer: PublicKey,
     associatedToken: PublicKey,
@@ -117,6 +139,7 @@ export class SolanaTransactionBuilder {
     });
   }
 
+  /** Compute Unit Limit and (when `microLamports` is above 0) Compute Unit Price instructions, hand-encoded. */
   public static createComputeBudgetInstructions(
     units: number = 200000,
     microLamports: number = 50000
@@ -149,6 +172,7 @@ export class SolanaTransactionBuilder {
   }
 
   private static pumpSdkInstance: any = null;
+  /** The shared `PumpSdk` used to encode V2 instructions. */
   public static getPumpSdk(): any {
     if (!SolanaTransactionBuilder.pumpSdkInstance) {
       SolanaTransactionBuilder.pumpSdkInstance = new PumpSdk();
@@ -156,6 +180,10 @@ export class SolanaTransactionBuilder {
     return SolanaTransactionBuilder.pumpSdkInstance;
   }
 
+  /**
+   * Pump V2 buy instruction. Throws, and so rejects the trade, when the creator, the fee recipient or the buyback fee recipient is missing or
+   * the default key, when those two recipients are the same account, or when the SDK returns other than 27 accounts (a changed program layout).
+   */
   // Official Pump.fun V2 Buy instruction via @pump-fun/pump-sdk (27 accounts, discriminator: b817ee6167c5d33d)
   public static async createPumpBuyV2Instruction(params: PumpBuyParams): Promise<TransactionInstruction> {
     if (!params.creator || params.creator.equals(PublicKey.default)) {
@@ -199,6 +227,7 @@ export class SolanaTransactionBuilder {
     return ix;
   }
 
+  /** Pump V2 sell instruction. Same refusals as the buy, with 26 accounts expected. */
   // Official Pump.fun V2 Sell instruction via @pump-fun/pump-sdk (26 accounts, discriminator: 5df6823ce7e940b2)
   public static async createPumpSellV2Instruction(params: PumpSellParams): Promise<TransactionInstruction> {
     if (!params.creator || params.creator.equals(PublicKey.default)) {
@@ -243,6 +272,10 @@ export class SolanaTransactionBuilder {
     return ix;
   }
 
+  /**
+   * Legacy 12-account buy with a hard-coded discriminator and fee recipient. Nothing in `server/`, `scripts/` or `tests/` calls it, and it is
+   * not what the app sends (that is `createPumpBuyV2Instruction`). Flagged as dead, not removed: do not use it for a real send.
+   */
   // Anchor instruction discriminator for Pump.fun legacy "global:buy" (kept for backward compatibility reference)
   public static createPumpBuyInstruction(params: PumpBuyParams): TransactionInstruction {
     const data = Buffer.alloc(8 + 8 + 8);
@@ -275,6 +308,7 @@ export class SolanaTransactionBuilder {
     });
   }
 
+  /** Legacy 12-account sell, as above: no caller anywhere, not what the app sends (`createPumpSellV2Instruction` is). Flagged as dead, not removed. */
   // Anchor instruction discriminator for Pump.fun "global:sell" = [0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad]
   public static createPumpSellInstruction(params: PumpSellParams): TransactionInstruction {
     const data = Buffer.alloc(8 + 8 + 8);
@@ -307,6 +341,10 @@ export class SolanaTransactionBuilder {
     });
   }
 
+  /**
+   * Compute budget, token-account create, Pump V2 buy and the optional tip transfer, compiled to a v0 message with the buyer as fee payer.
+   * Returns it unsigned. Defaults: 250,000 compute units and 50,000 micro-lamports of priority fee when the caller gives none.
+   */
   public async buildBuyTransaction(
     connection: Connection,
     params: PumpBuyParams
@@ -359,6 +397,10 @@ export class SolanaTransactionBuilder {
     return new VersionedTransaction(messageV0);
   }
 
+  /**
+   * Compute budget, Pump V2 sell, then (on a full exit) closing the token account to reclaim its rent, then the optional tip transfer. Unsigned.
+   * The `closeAta` argument wins over `params.closeAta` when given.
+   */
   public async buildSellTransaction(
     connection: Connection,
     params: PumpSellParams,
@@ -413,6 +455,7 @@ export class SolanaTransactionBuilder {
     return new VersionedTransaction(messageV0);
   }
 
+  /** Wraps caller-built instructions (for example a wrapped-SOL cleanup or a token-account close) in a v0 message with a fresh blockhash. Unsigned. */
   public async buildCustomVersionedTransaction(
     connection: Connection,
     payer: PublicKey,
@@ -429,4 +472,5 @@ export class SolanaTransactionBuilder {
   }
 }
 
+/** The process-wide builder the coordinator uses. */
 export const txBuilder = new SolanaTransactionBuilder();

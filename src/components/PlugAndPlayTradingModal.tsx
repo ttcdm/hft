@@ -1,3 +1,14 @@
+/**
+ * The wallet and execution panel: arm and disarm LIVE, the PAPER and LIVE banner, generate a signer, snipe, close a position and panic
+ * liquidate.
+ *
+ * API it calls with `fetch` and the operator token: `POST /api/execution/arm`, `GET /api/diagnostics/system`, `GET /api/workstation/positions`,
+ * `GET /api/workstation/events`, `POST /api/signer/generate`, `POST /api/wallet/snipe`, `POST /api/wallet/close-position` and
+ * `POST /api/wallet/panic-liquidate`.
+ *
+ * It must not hold or show key material, and it must not arm LIVE by itself: arming needs the operator to type the confirmation code, and
+ * the server decides whether the prerequisites hold (`getLiveReadiness`). In read-only mode the server refuses to arm and to generate a key.
+ */
 import { ARMED_MESSAGE, PANIC_CONFIRM_TEXT, panicOutcome } from '../utils/tradingCopy';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import React, { useState, useEffect } from 'react';
@@ -48,7 +59,6 @@ interface SystemAudit {
   dbDriver: string;
   keypairStorage: string;
   browserPrivateKeySecurity: string;
-  hftPaperIsolation: string;
 }
 
 interface RiskControls {
@@ -477,7 +487,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                   </div>
                   <div className="p-2.5 rounded-lg bg-slate-900/60 border border-slate-800 space-y-1">
                     <strong className="text-white block">3. Isolated Paper Engine:</strong>
-                    The BTC/ETH engine console is a simulation and does not touch the Solana wallet. Paper snipes are modeled fills against the curve quote.
+                    Paper snipes are modeled fills against the curve quote; they never touch the Solana wallet.
                   </div>
                   <div className="p-2.5 rounded-lg bg-slate-900/60 border border-slate-800 space-y-1">
                     <strong className="text-white block">4. Deterministic SQLite Storage:</strong>

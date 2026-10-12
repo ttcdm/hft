@@ -1,9 +1,30 @@
+/**
+ * The two ways a signed transaction leaves the process: plain Solana RPC (`SolanaRpcTransport`) and a Jito block engine (`JitoTransport`).
+ * Each can submit, retry and confirm, and reports a lifecycle state and timing. `JitoTransport` also reports health and a tip floor.
+ *
+ * Jito is off unless a block engine URL is configured, and on devnet and localnet none should be: `resolveJitoUrl` returns an empty string for
+ * a mainnet URL unless mainnet is allowed, and for any URL on localnet, but it keeps any other URL on devnet (tests use a mock), and that
+ * URL is then used. With no URL every send goes through `SolanaRpcTransport`. The RPC transport sends with `skipPreflight: true`: nothing is simulated
+ * first, so a transaction that would fail is found out on chain, not before it.
+ *
+ * What it must never do: send in read-only mode (both `submit` methods call `assertNotReadOnly` first, then `assertSendClusterAllowed`, which refuses whenever `ALLOWED_CLUSTER=mainnet-beta`), call the public Jito tip-floor
+ * service unless mainnet was allowed (`jitoTipFloorAllowed`), or be used as a way around the cluster guard. These classes refuse a mainnet
+ * setting themselves but do not check the RPC's genesis hash; `ExecutionCoordinator.submitAndConfirmInner` runs `assertClusterAllowed` before it
+ * calls them, so they must only be reached through it.
+ *
+ * Called by: `server/execution/coordinator.ts` only.
+ */
 import { Connection, VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { Logger } from '../middleware/enterprise';
-import { jitoTipFloorAllowed, resolveJitoUrl } from './clusterGuard';
+import { assertSendClusterAllowed, jitoTipFloorAllowed, resolveJitoUrl } from './clusterGuard';
 import { executionConfig } from './executionConfig';
+import { assertNotReadOnly } from './readOnly';
 
+/**
+ * Where a submission stands. `SUBMITTED_TO_JITO` and `BUNDLE_PENDING` only occur on the Jito path. `BUNDLE_LANDED`, `TX_RECONCILED` and
+ * `EXPIRED_BLOCKHASH` are declared but nothing assigns them (checked by searching `server/`).
+ */
 export type BundleLifecycleState =
   | 'SUBMITTED_TO_JITO'
   | 'BUNDLE_PENDING'
@@ -15,6 +36,7 @@ export type BundleLifecycleState =
   | 'TIMED_OUT'
   | 'EXPIRED_BLOCKHASH';
 
+/** What one submit attempt returned: the signature (empty on failure), which transport, timing and, on failure, the reason. */
 export interface SubmitResult {
   signature: string;
   bundleId?: string;
@@ -25,6 +47,7 @@ export interface SubmitResult {
   error?: string;
 }
 
+/** What waiting for a signature found: confirmed, failed on chain, or timed out. */
 export interface ConfirmationResult {
   signature: string;
   confirmed: boolean;
@@ -35,11 +58,13 @@ export interface ConfirmationResult {
   error?: string;
 }
 
+/** What the coordinator needs from a transport. */
 export interface ExecutionTransport {
   submit(tx: VersionedTransaction): Promise<SubmitResult>;
   confirm(signature: string, maxWaitMs?: number, bundleId?: string): Promise<ConfirmationResult>;
 }
 
+/** Jito health as shown in readiness. `NOT_CONFIGURED` is the normal state on devnet and localnet and does not block arming. */
 export interface JitoHealthTelemetry {
   health: 'HEALTHY' | 'DEGRADED' | 'OFFLINE' | 'NOT_CONFIGURED';
   lastResponseMsAgo: number | null;
@@ -49,13 +74,17 @@ export interface JitoHealthTelemetry {
   lastError: string | null;
 }
 
+/** Sends over plain RPC (`sendRawTransaction`, no preflight, 2 node-side retries) and confirms by polling signature statuses. The only transport used on devnet and localnet. */
 export class SolanaRpcTransport implements ExecutionTransport {
   private lastRequestTimestamp: number | null = null;
   private lastLatencyMs: number | null = null;
 
   constructor(private connection: Connection) {}
 
+  /** Sends one signed transaction with `sendRawTransaction`, `skipPreflight: true`. Throws `READ_ONLY` before touching the network in read-only mode. */
   public async submit(tx: VersionedTransaction): Promise<SubmitResult> {
+    assertNotReadOnly('sending a transaction over RPC'); // S185: before anything is serialized or sent
+    assertSendClusterAllowed(); // S206: the lowest choke point; a mainnet setting never reaches the network from here
     const t0 = performance.now();
     try {
       const raw = tx.serialize();
@@ -91,6 +120,7 @@ export class SolanaRpcTransport implements ExecutionTransport {
     }
   }
 
+  /** Retries `submit` (default 2 retries, 200 ms apart). Returns the last result and the number of attempts. */
   public async submitWithRetry(
     tx: VersionedTransaction,
     customMaxRetries = 2,
@@ -120,6 +150,7 @@ export class SolanaRpcTransport implements ExecutionTransport {
     return { ...lastResult, attempts };
   }
 
+  /** Polls signature status (including history) until confirmed, failed on chain or `maxWaitMs` (default 25 s). */
   public async confirm(signature: string, maxWaitMs = 25000): Promise<ConfirmationResult> {
     const t0 = performance.now();
     const startTime = Date.now();
@@ -184,6 +215,7 @@ export class SolanaRpcTransport implements ExecutionTransport {
   }
 }
 
+/** Sends bundles to a block engine. Disabled (`isEnabled()` false) unless a non-mainnet URL is configured, and `submit` then fails with `JITO_DISABLED` rather than falling through. */
 export class JitoTransport implements ExecutionTransport {
   private blockEngineUrl: string;
   private lastSubmitTimestamp: number | null = null;
@@ -217,6 +249,7 @@ export class JitoTransport implements ExecutionTransport {
     this.lastHealthStatus = 'NOT_CONFIGURED';
   }
 
+  /** Median landed tip in lamports from the public tip-floor service, cached 15 s. Mainnet-only: with mainnet not allowed it never makes the call and returns the cached value or null. */
   public async getTipFloorLamports(): Promise<number | null> {
     const now = Date.now();
     if (this.cachedTipFloor && now - this.cachedTipFloor.timestamp < 15000) {
@@ -268,6 +301,7 @@ export class JitoTransport implements ExecutionTransport {
    * and requires a non-empty array back. HEALTHY only on that answer; an HTTP error or unexpected body is
    * DEGRADED; a network error or timeout is OFFLINE. The tip-floor lookup no longer decides health.
    */
+  /** Health probe against the block engine; sets the health status readiness reads. Returns unhealthy without a network call when Jito is not configured. */
   public async probe(): Promise<{ healthy: boolean; tipFloorLamports: number | null; latencyMs: number }> {
     const t0 = performance.now();
     if (!this.isEnabled()) {
@@ -404,7 +438,10 @@ export class JitoTransport implements ExecutionTransport {
     return null;
   }
 
+  /** Sends the transaction as a one-transaction bundle. Fails at once with `JITO_DISABLED` when no block engine is configured. */
   public async submit(tx: VersionedTransaction): Promise<SubmitResult> {
+    assertNotReadOnly('submitting a Jito bundle'); // S185: before anything is encoded or sent
+    assertSendClusterAllowed(); // S206: same as the RPC transport
     const t0 = performance.now();
     if (!this.isEnabled()) {
       this.lastHealthStatus = 'NOT_CONFIGURED';
@@ -507,6 +544,7 @@ export class JitoTransport implements ExecutionTransport {
   }
 
   // Bounded idempotent retry for bundle submission honoring jitoMaxRetries (R0.6)
+  /** Retries `submit` up to `jitoMaxRetries` times (default 2) with `jitoRetryIntervalMs` between tries, both from `executionConfig`. Returns the last result and the attempt count. */
   public async submitWithRetry(
     tx: VersionedTransaction,
     customMaxRetries?: number,
@@ -552,6 +590,7 @@ export class JitoTransport implements ExecutionTransport {
     return { ...lastResult, attempts };
   }
 
+  /** Polls bundle status (when a bundle id is given) and signature status until confirmed, failed or `maxWaitMs`. */
   public async confirm(
     signature: string,
     maxWaitMs = 25000,

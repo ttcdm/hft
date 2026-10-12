@@ -4,7 +4,13 @@ import { pumpFeedListener } from '../solana/pumpFeedListener';
 import { workstationDb } from '../db/database';
 import { riskEngine } from '../risk/riskEngine';
 import { endpointOrigin } from '../middleware/enterprise';
-import { resolveRpcUrl } from '../solana/clusterGuard';
+import { resolveRpcUrl, allowedCluster } from '../solana/clusterGuard';
+import { isReadOnly } from '../solana/readOnly';
+import { watchWindow } from '../signals/watchWindow';
+import { onChainPoolStats } from '../market/poolStats';
+import { memecoinAggregator } from '../memecoinAggregator';
+import { minLiquidityUsd } from '../solana/executionConfig';
+import { getRecorderRuntime } from '../backtest/recorderConfig';
 
 export type CheckStatus = 'OK' | 'WARN' | 'FAIL' | 'UNKNOWN';
 export interface SystemCheck {
@@ -40,7 +46,17 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
     ? { id: 'cluster', label: 'Cluster / genesis', status: 'UNKNOWN', value: `${cluster.allowed}: not checked`, detail: 'The RPC is not reachable, so the genesis hash could not be read.' }
     : { id: 'cluster', label: 'Cluster / genesis', status: 'OK', value: `${cluster.allowed}: genesis hash matches`, detail: `RPC ${endpointOrigin(diag.rpcEndpoint || resolveRpcUrl())} reports the genesis hash configured for ${cluster.allowed}.` });
 
-  checks.push({
+  if (isReadOnly()) {
+    const cl = allowedCluster();
+    checks.push({
+      id: 'readonly', label: 'Read-only mode', status: diag.signerStatus === 'NOT_CONFIGURED' && !diag.liveTradingActive ? 'OK' : 'FAIL',
+      value: `${cl === 'mainnet-beta' ? 'MAINNET' : cl.toUpperCase()} · READ-ONLY · PAPER`,
+      detail: `APEX_READ_ONLY=true: no signer is loaded, no transaction can be signed or sent, arming LIVE is refused, auto allows OFF, SHADOW and PAPER only. Paper fills use the real curve maths and the real eligibility floor (liquidity at least $${minLiquidityUsd()}${cl === 'mainnet-beta' ? '; MIN_LIQUIDITY_USD is ignored on mainnet' : ''}).`,
+    });
+  }
+  checks.push(isReadOnly()
+    ? { id: 'signer', label: 'Signer', status: diag.signerStatus === 'NOT_CONFIGURED' ? 'OK' : 'FAIL', value: 'none (read-only by design)', detail: diag.signerStatus === 'NOT_CONFIGURED' ? 'Read-only mode loads no key. PAPER only.' : `Read-only mode is on but the signer says ${diag.signerStatus}: this must never happen.` }
+    : {
     id: 'signer', label: 'Signer', status: diag.signerStatus === 'READY' ? 'OK' : 'WARN', value: diag.signerStatus,
     detail: diag.signerStatus === 'READY' ? `wallet ${diag.activeWalletAddress.slice(0, 6)}...${diag.activeWalletAddress.slice(-4)}` : 'No usable keypair: PAPER only, no real transaction can be signed.',
   });
@@ -72,6 +88,18 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
     value: `${feed.status}, last event ${sec(feedAge)} ago`, detail: `${feed.eventsReceived} logs received, ${feed.eventsParsed} creates and ${feed.tradesParsed} trades parsed. A quiet devnet is normal; on mainnet this is a warning.`,
   });
 
+  const cap = watchWindow.getSnapshot(now).capacity;
+  const evicted = onChainPoolStats.getEvictedCount();
+  const trimmed = memecoinAggregator.getPoolsTrimmedCount();
+  const dropped = cap.refusedFull + evicted + trimmed + feed.handlerErrors;
+  checks.push({
+    id: 'capacity', label: 'Feed capacity (dropped candidates)', status: dropped > 0 ? 'WARN' : 'OK',
+    value: `watching ${cap.active} of ${cap.max}; dropped ${dropped}`,
+    detail: `Launches refused because the watch window was full: ${cap.refusedFull}${cap.lastRefusedMint ? ` (last ${cap.lastRefusedMint.slice(0, 8)}...)` : ''}. Measured-stat tables evicted: ${evicted}. Board pools trimmed: ${trimmed}. Feed log handler errors: ${feed.handlerErrors} (slowest handler ${feed.slowestHandlerMs} ms). Raise APEX_WATCH_MAX_CANDIDATES if the first number grows. Logs the RPC provider itself drops are not visible here.`,
+  });
+
+  checks.push(recorderCheck(now));
+
   const alerts = diag.operatorAlerts ?? [];
   const markAlerts = alerts.filter((a) => a.code === 'POSITION_MARK_UNAVAILABLE' || a.code === 'PAPER_MARKS_UNAVAILABLE');
   checks.push({
@@ -85,4 +113,27 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
   });
 
   return { checkedAt: now, cluster: cluster.allowed, mode: `${diag.executionMode}${diag.liveTradingActive ? ' (LIVE armed)' : ''}`, checks };
+}
+
+/** S190: the launch recorder against its limits. Rate and days-left are measured from the last hour of writes, not assumed. */
+let rateCache: { at: number; rows: number } | null = null;
+export function recorderCheck(now: number): SystemCheck {
+  const rt = getRecorderRuntime();
+  if (!rt) return { id: 'recorder', label: 'Launch recorder', status: 'UNKNOWN', value: 'not started', detail: 'The launch recorder has not been created in this process, so there is nothing to read.' };
+  const st = workstationDb.getLaunchRecordingStatus();
+  if (!rateCache || now - rateCache.at > 30_000) rateCache = { at: now, rows: workstationDb.getLaunchRecordingRows(now - 3_600_000) };
+  const perHour = rateCache.rows;
+  const room = rt.config.maxRows - st.events;
+  const hoursLeft = perHour > 0 ? Math.max(0, room) / perHour : null;
+  const days = (h: number) => (h / 24).toFixed(1);
+  const spanDays = st.oldestTs !== null && st.newestTs !== null ? (st.newestTs - st.oldestTs) / 86_400_000 : 0;
+  const pruned = rt.prunedRows > 0;
+  const nearFull = st.events >= rt.config.maxRows * 0.8;
+  const limits = `window ${Math.round(rt.config.mintMs / 60_000)} min per launch, up to ${rt.config.maxTradesPerMint} trades each; keeps ${rt.config.maxRows} rows (about ${(rt.config.maxRows * 333 / 1e9).toFixed(1)} GB) and ${rt.config.retentionDays} days`;
+  return {
+    id: 'recorder', label: 'Launch recorder (backtest data)',
+    status: pruned || nearFull ? 'WARN' : 'OK',
+    value: `${st.launches} launches, ${st.events} of ${rt.config.maxRows} rows${pruned ? `, PRUNING (${rt.prunedRows} dropped)` : ''}`,
+    detail: `${limits}. Last hour: ${perHour} rows${hoursLeft === null ? '' : `, so about ${days(hoursLeft)} days until the row limit at this rate`}. Recorded span so far: ${spanDays.toFixed(1)} days. ${pruned ? `Pruning started ${new Date(rt.firstPruneAt as number).toISOString()}: the OLDEST launches are being dropped; raise APEX_RECORD_MAX_ROWS or APEX_RECORD_RETENTION_DAYS to keep them.` : nearFull ? 'Over 80% of the row limit: the oldest launches will start to be dropped soon. Raise APEX_RECORD_MAX_ROWS to keep them.' : 'Nothing has been pruned.'}`,
+  };
 }

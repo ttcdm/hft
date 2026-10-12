@@ -80,7 +80,7 @@ Things worth knowing when you read it:
 
 ## 2. Auto mode states
 
-Modes live in memory only, so every start is OFF. An operator can call `setMode` to any target its checks allow, in either direction (the diagram draws the usual upward arrows only). The server moves a mode down (to SHADOW or OFF) and puts a PAPER session back after a readiness-only downgrade.
+The mode is saved in the database (`app_settings`) and `restorePersisted` brings it back at startup, up to PAPER: a saved `DEVNET_LIVE` comes back as SHADOW and needs a fresh arm and confirmation code, and without `AUTO_SNIPE_ENABLED=true` auto stays OFF. A first start is OFF. The confluence threshold is saved and restored the same way. An operator can call `setMode` to any target its checks allow, in either direction (the diagram draws the usual upward arrows only). The server moves a mode down (to SHADOW or OFF) and puts a PAPER session back after a readiness-only downgrade.
 
 ```mermaid
 stateDiagram-v2

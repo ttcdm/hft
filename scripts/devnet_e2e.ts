@@ -3,8 +3,7 @@
  *
  *   npm run devnet:e2e            # runs under scripts/devnet_guard.cjs
  *
- * Safety: devnet only, throwaway keypair generated here, scratch DB, Jito pointed at a dead local port so the
- * RPC fallback is exercised. ALLOW_LIVE_REAL_MONEY_TRADING is set true in-process ONLY after the cluster's genesis hash
+ * Safety: devnet only, throwaway keypair generated here, scratch DB, no Jito block engine (the RPC transport sends, as on devnet normally). ALLOW_LIVE_REAL_MONEY_TRADING is set true in-process ONLY after the cluster's genesis hash
  * equals the devnet hash. It never reads .env, the repo keypair, or any real RPC URL.
  */
 import './hermeticEnv'; // no .env is ever loaded by this script
@@ -27,7 +26,8 @@ const keyPath = path.join(scratch, 'throwaway-keypair.json');
 
 // ---- sanitized environment: must be set before any server module is imported ----
 process.env.SOLANA_RPC_URL = process.env.DEVNET_RPC_URL || 'https://api.devnet.solana.com';
-process.env.JITO_BLOCK_ENGINE_URL = 'http://127.0.0.1:9';
+// No block engine: devnet's real configuration. A dead Jito URL makes readiness report Jito OFFLINE and arming refuses, so the RPC transport is used directly.
+delete process.env.JITO_BLOCK_ENGINE_URL;
 process.env.ENABLE_RPC_FALLBACK = 'true';
 process.env.JITO_MAX_RETRIES = '1';
 process.env.JITO_RETRY_INTERVAL_MS = '200';
@@ -85,9 +85,12 @@ async function main() {
   }
   // Sizes scale down to the balance: the 10% spendable ceiling means a buy of about 8% of the balance.
   const balSol = bal / LAMPORTS_PER_SOL;
-  const BUY_SOL = Math.min(0.01, Number((balSol * 0.08).toFixed(5)));
-  const funded = balSol >= 0.03;
-  rec('funding', funded, `${balSol} SOL at ${kp.publicKey.toBase58()}; buy size ${BUY_SOL} SOL${funded ? '' : ' (too low to trade: fund this devnet address and re-run; only the simulate stage runs)'}`);
+  const { planFunding } = await import('./devnet_funding');
+  const plan = planFunding(balSol, kp.publicKey.toBase58());
+  const BUY_SOL = plan.buySol;
+  const funded = plan.funded;
+  rec('funding', funded, plan.message);
+  if (plan.unfunded) return finish(); // nothing to simulate or send with an empty wallet; the message above says what to do
 
   const { PumpCurveService } = await import('../server/solana/pumpCurve');
   const { txBuilder } = await import('../server/solana/transactionBuilder');
@@ -120,8 +123,8 @@ async function main() {
     // ---- stage 1: simulate (sigVerify false, replaceRecentBlockhash true) ----
     try {
       const quote = PumpCurveService.calculateBuyQuote({
-        state, solAmountSol: BUY_SOL, slippageBps: 800, jitoTipSol: 0, priorityFeeLamports: 0, executionMode: 'LIVE',
-      } as any);
+        state, amountSol: BUY_SOL, slippageBps: 800, jitoTipSol: 0, priorityFeeLamports: 0, executionMode: 'LIVE',
+      });
       const ata = PumpCurveService.getAssociatedTokenAddress(mintPk, kp.publicKey, state.tokenProgram);
       const buyTx = await txBuilder.buildBuyTransaction(conn, {
         buyer: kp.publicKey, mint: mintPk, bondingCurve: state.bondingCurve, associatedBondingCurve: state.associatedBondingCurve,
@@ -185,7 +188,7 @@ async function main() {
     return finish();
   }
 
-  // (a) BUY via Jito failure -> RPC fallback
+  // (a) BUY through the RPC transport
   const buy = await coordinator.executeTrade({
     mint, symbol: 'E2E', name: 'E2E', amountSol: BUY_SOL, source: 'MANUAL', provenance: 'MANUAL_OPERATOR', executionMode: 'LIVE',
   } as any);
@@ -212,7 +215,7 @@ async function main() {
   // (d) forced revert: max cost of 1 lamport cannot be satisfied
   try {
     const ata = PumpCurveService.getAssociatedTokenAddress(mintPk, kp.publicKey, state.tokenProgram);
-    const q = PumpCurveService.calculateBuyQuote({ state, solAmountSol: BUY_SOL, slippageBps: 800, jitoTipSol: 0, priorityFeeLamports: 0, executionMode: 'LIVE' } as any);
+    const q = PumpCurveService.calculateBuyQuote({ state, amountSol: BUY_SOL, slippageBps: 800, jitoTipSol: 0, priorityFeeLamports: 0, executionMode: 'LIVE' });
     const bad = await txBuilder.buildBuyTransaction(conn, {
       buyer: kp.publicKey, mint: mintPk, bondingCurve: state.bondingCurve, associatedBondingCurve: state.associatedBondingCurve,
       associatedUser: ata, creator: state.creator, feeRecipient: state.feeRecipient, buybackFeeRecipient: state.buybackFeeRecipient,

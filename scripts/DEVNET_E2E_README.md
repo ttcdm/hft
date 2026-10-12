@@ -6,8 +6,8 @@ Optional env: `DEVNET_RPC_URL` (must not look like mainnet), `DEVNET_MINTS=<comm
 ## Safety
 - Devnet only. The preload `scripts/devnet_guard.cjs` wraps fetch and http/https request/get, logs every attempt to stderr
   and throws on anything matching /mainnet|jito\.wtf/i.
-- The harness sets its own environment and never reads `.env`: `SOLANA_RPC_URL` devnet, `JITO_BLOCK_ENGINE_URL=http://127.0.0.1:9`
-  (dead port, forces the RPC fallback), `ENABLE_RPC_FALLBACK=true`, `JITO_MAX_RETRIES=1`, `JITO_RETRY_INTERVAL_MS=200`,
+- The harness sets its own environment and never reads `.env`: `SOLANA_RPC_URL` devnet, no `JITO_BLOCK_ENGINE_URL`
+  (as on devnet normally, so the RPC transport sends; a dead Jito URL makes readiness report Jito OFFLINE and arming refuses), `ENABLE_RPC_FALLBACK=true`, `JITO_MAX_RETRIES=1`, `JITO_RETRY_INTERVAL_MS=200`,
   `APEX_DB_PATH` and `SIGNER_KEYPAIR_PATH` in a fresh temp directory, `ALLOW_LIVE_REAL_MONEY_TRADING=false`.
 - It aborts unless `getGenesisHash()` equals the devnet hash `EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG`. Only then does it switch the
   real-money environment variable on, inside its own process (it is never set in your shell or in any file).
@@ -18,7 +18,7 @@ Optional env: `DEVNET_RPC_URL` (must not look like mainnet), `DEVNET_MINTS=<comm
 
 ## Stages
 1. Simulate BUY with `sigVerify:false, replaceRecentBlockhash:true` (PumpCurveService LIVE state, calculateBuyQuote, txBuilder).
-2. (a) BUY (scaled, see above) through the real ExecutionCoordinator: Jito fails, RPC fallback, CONFIRMED, db tokenQuantityRaw == on-chain ATA balance.
+2. (a) BUY (scaled, see above) through the real ExecutionCoordinator: sent through the RPC transport, CONFIRMED, db tokenQuantityRaw == on-chain ATA balance.
 3. (b) close 50%. (c) close 100% (ATA closed, about 0.00203928 SOL rent back). Every signature is checked with getTransaction and printed as a Solscan `?cluster=devnet` link.
 4. (d) forced revert: a buy with maxSolCost of 1 lamport, sent with skipPreflight, must land with an error.
 5. (e) a second submit with an already recorded orderId must add no transaction row.

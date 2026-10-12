@@ -14,14 +14,14 @@ import { computeJournalStats, type JournalStats } from './journalStats';
 import { evaluateKillTriggers, auditWalletChange, type KillTrigger } from './killSwitch';
 import { riskEngine } from '../risk/riskEngine';
 import { watchWindow, type WatchResult } from '../signals/watchWindow';
-import { getConfluenceThreshold, setConfluenceThreshold, confluenceThresholdInfo, type ConfluenceThresholdInfo } from '../signals/confluenceThreshold';
+import { checkConfluenceThreshold, getConfluenceThreshold, setConfluenceThreshold, confluenceThresholdInfo, type ConfluenceThresholdInfo } from '../signals/confluenceThreshold';
 
 /**
  * G1: the only owner of auto trading.
  *
  * Both candidate sources (pumpfunService callouts, the memecoinAggregator sniper loop) hand candidates to
- * `submitCandidate`; neither may call execution directly. The mode is held in memory only, so a restart always
- * comes back OFF. There is no mainnet mode. Open positions stay under the exit engine in every mode.
+ * `submitCandidate`; neither may call execution directly. The mode is saved, and a restart brings it back up to PAPER
+ * (a saved DEVNET_LIVE comes back as SHADOW and needs a fresh arm). There is no mainnet mode. Open positions stay under the exit engine in every mode.
  *
  *   OFF         drop every candidate (manual trades still work)
  *   SHADOW      run every gate and journal "would buy"; nothing is sent or filled
@@ -131,6 +131,9 @@ export const DROP_REPEAT_MS = 10 * 60_000;
 export const PENDING_RELEASE_MAX = 10;
 export const PENDING_RELEASE_MAX_AGE_MS = 20_000;
 const MONITOR_INTERVAL_MS = 5_000;
+/** S222: keys in `app_settings`. */
+const SETTING_THRESHOLD = 'auto.confluenceThreshold';
+const SETTING_MODE = 'auto.mode';
 /** S189: how long readiness must stay green before a PAPER session downgraded by READINESS_RED is put back. */
 export const READINESS_RESTORE_GREEN_MS = 60_000;
 
@@ -145,7 +148,12 @@ export function classifyRejection(message: string): string {
 }
 
 export class AutoSnipeController extends EventEmitter {
-  private mode: AutoMode = 'OFF'; // never restored from disk: a restart is always OFF
+  constructor() {
+    super();
+    this.on('mode', () => this.persistMode());
+  }
+
+  private mode: AutoMode = 'OFF'; // S222: restored from the last run at startup by `restorePersisted`, never above PAPER
   private killed = false;
   private killReason: string | null = null;
   private downgradeReason: string | null = null;
@@ -286,8 +294,45 @@ export class AutoSnipeController extends EventEmitter {
     const r = setConfluenceThreshold(raw);
     if (!r.ok) return { ok: false, reason: r.reason };
     workstationDb.logDecision({ autoMode: this.mode, mint: '-', stage: 'score', outcome: 'INFO', reason: `operator set the confluence buy threshold: ${r.previous} -> ${r.value} (watch window HOT gate and execution gate together)` });
+    workstationDb.setSetting(SETTING_THRESHOLD, r.value); // S222: kept across restarts
     return { ok: true, value: r.value };
   }
+
+  /**
+   * S222: bring back what the operator had set before a restart. The confluence threshold always. The mode only up to PAPER: a saved
+   * DEVNET_LIVE comes back as SHADOW (nothing is sent) and needs a fresh arm and confirmation code, so a restart never resumes live
+   * sending by itself. A mode that cannot be restored (AUTO_SNIPE_ENABLED not true, coordinator not in PAPER) leaves auto OFF.
+   * Call once at startup, before `startMonitor`.
+   */
+  public async restorePersisted(): Promise<{ threshold: number | null; mode: AutoMode; note: string | null }> {
+    let threshold: number | null = null;
+    const savedThreshold = workstationDb.getSetting<unknown>(SETTING_THRESHOLD);
+    if (savedThreshold !== null) {
+      const c = checkConfluenceThreshold(savedThreshold);
+      if (c.ok) { setConfluenceThreshold(c.value); threshold = c.value; } else Logger.warn(`[AUTO] saved confluence threshold ignored: ${c.reason}`);
+    }
+    let note: string | null = null;
+    const saved = workstationDb.getSetting<unknown>(SETTING_MODE);
+    if (saved === 'PAPER' || saved === 'SHADOW' || saved === 'DEVNET_LIVE') {
+      const target: AutoMode = saved === 'DEVNET_LIVE' ? 'SHADOW' : saved;
+      const res = await this.setMode(target);
+      if (res.ok) {
+        note = saved === 'DEVNET_LIVE'
+          ? 'restart: the last run was in DEVNET_LIVE; auto came back as SHADOW (nothing is sent). Arm LIVE and set DEVNET_LIVE again to trade.'
+          : `restart: auto mode ${target} restored from the last run`;
+        if (saved === 'DEVNET_LIVE') this.downgradeReason = note;
+        workstationDb.logDecision({ autoMode: this.mode, mint: '-', stage: 'auto', outcome: 'INFO', reason: note });
+      } else {
+        note = `restart: could not restore auto mode ${target} (${res.error}); auto stays OFF`;
+        Logger.warn(`[AUTO] ${note}`);
+      }
+    }
+    if (note) Logger.info(`[AUTO] ${note}`);
+    return { threshold, mode: this.mode, note };
+  }
+
+  /** S222: every mode change is saved, so `restorePersisted` can bring it back. */
+  private persistMode = (): void => { workstationDb.setSetting(SETTING_MODE, this.mode); };
 
   public getStatus(): AutoStatus {
     this.enforceBudgets();

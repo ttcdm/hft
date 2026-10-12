@@ -1,0 +1,27 @@
+/**
+ * How much the devnet harness can do with the balance it found. Pure, so a test can check it.
+ * The buy is about 8% of the balance (the 10% spendable ceiling), capped at 0.01 SOL; under 0.03 SOL the harness does not trade.
+ */
+export interface FundingPlan {
+  buySol: number;
+  funded: boolean;
+  /** exactly zero: the faucet request failed or was not made */
+  unfunded: boolean;
+  message: string;
+}
+
+export function planFunding(balSol: number, address: string): FundingPlan {
+  const safe = Number.isFinite(balSol) && balSol > 0 ? balSol : 0;
+  const buySol = Math.min(0.01, Number((safe * 0.08).toFixed(5)));
+  if (safe === 0) {
+    return {
+      buySol: 0, funded: false, unfunded: true,
+      message: `wallet unfunded: 0 SOL at ${address}. The faucet request failed or was not made (DEVNET_AIRDROP_ONCE=1 sends one). Send devnet SOL to this address (for example from https://faucet.solana.com) and re-run. Nothing was simulated or sent.`,
+    };
+  }
+  const funded = safe >= 0.03;
+  return {
+    buySol, funded, unfunded: false,
+    message: `${safe} SOL at ${address}; buy size ${buySol} SOL${funded ? '' : ' (too low to trade: fund this devnet address and re-run; only the simulate stage runs)'}`,
+  };
+}

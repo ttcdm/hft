@@ -864,8 +864,9 @@ export class PumpCurveService {
       throw new Error(`UNSUPPORTED_QUOTE_MINT: Quote mint ${state.quoteMint.toBase58()} is not native SOL.`);
     }
 
-    if (solAmountSol <= 0) {
-      throw new Error(`Order size must be greater than zero SOL.`);
+    // S222: `undefined <= 0` is false, so a caller passing the wrong field name used to reach BigInt(NaN) with a confusing error
+    if (!Number.isFinite(solAmountSol) || solAmountSol <= 0) {
+      throw new Error(`Order size must be a number greater than zero SOL (got ${String(solAmountSol)}); the field is amountSol.`);
     }
 
     const solInputLamports = BigInt(Math.round(solAmountSol * 1e9));

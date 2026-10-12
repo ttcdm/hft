@@ -191,6 +191,12 @@ export class WorkstationDatabase {
         payload_json TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS system_journal (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         event_type TEXT NOT NULL,
@@ -252,6 +258,29 @@ export class WorkstationDatabase {
       CREATE INDEX IF NOT EXISTS idx_launch_rec_ts ON launch_recording(ts);
     `);
     Logger.info(`SQLite persistence initialized at ${this.dbPath}`);
+  }
+
+  /** S222: a small operator setting that survives a restart (the confluence threshold and the auto mode). null when unset or unreadable. */
+  public getSetting<T = unknown>(key: string): T | null {
+    try {
+      const row = this.db.prepare(`SELECT value_json FROM app_settings WHERE key = ?`).get(key) as { value_json: string } | undefined;
+      return row ? (JSON.parse(row.value_json) as T) : null;
+    } catch (err: any) {
+      Logger.warn(`Setting ${key} could not be read: ${err.message}`);
+      return null;
+    }
+  }
+
+  /** Returns false when the value could not be saved (logged); the in-memory setting still applies until restart. */
+  public setSetting(key: string, value: unknown): boolean {
+    try {
+      this.db.prepare(`INSERT INTO app_settings (key, value_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`)
+        .run(key, JSON.stringify(value), Date.now());
+      return true;
+    } catch (err: any) {
+      Logger.warn(`Setting ${key} could not be saved: ${err.message}`);
+      return false;
+    }
   }
 
   public getDbPath(): string {

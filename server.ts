@@ -1263,7 +1263,7 @@ app.post('/api/auto/threshold', requireOperatorAuth, validateTradeBody(AutoThres
   res.status(result.ok ? 200 : 422).json({ success: result.ok, ...result, error: result.reason, status: autoSnipeController.getStatus() });
 });
 
-// G1: auto-snipe controller. Mode lives in memory only, so every restart comes back OFF.
+// G1: auto-snipe controller. The mode is saved; a restart brings it back up to PAPER (a saved DEVNET_LIVE returns as SHADOW).
 app.get('/api/auto/status', requireOperatorAuth, (req, res) => {
   res.json({ success: true, ...autoSnipeController.getStatus(), stats: autoSnipeController.getJournalStats(), decisions: autoSnipeController.getDecisions(100) });
 });
@@ -1530,6 +1530,7 @@ async function startServer() {
   };
   prune();
   setInterval(prune, 86_400_000).unref();
+  await autoSnipeController.restorePersisted(); // S222: the confluence threshold, and the auto mode up to PAPER, come back after a restart
   autoSnipeController.startMonitor(); // G3: kill-switch triggers and wallet audit (inert while the mode is OFF)
   server.listen(PORT, BIND_HOST, () => {
     console.log(`[APEX QUANT HFT] Autonomous Execution Engine running on ${BIND_HOST}:${PORT}`);

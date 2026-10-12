@@ -75,11 +75,11 @@ Copy `.env.example` to `.env`:
 cp .env.example .env
 ```
 
-Key environment variables (see `.env.example` for the rest; the old `ENV_CONFIG.md` was wrong and now sits in `docs/archive/`):
+Key environment variables. [`docs/ENV.md`](docs/ENV.md) lists every variable the server reads, with defaults and devnet-safe values (a test keeps it in step with the code); `.env.example` is the starting file:
 - `PORT=3000`, `BIND_HOST` / `ALLOW_PUBLIC_BIND`: port and bind address (loopback by default)
 - `OPERATOR_AUTH_TOKEN`: operator API token (min 16 characters; `openssl rand -hex 32`). If unset, a volatile token is generated and printed at startup. Never commit it. `OPERATOR_PASSWORD` optionally enables password login.
 - `ALLOWED_CLUSTER`: `devnet` (default) or `localnet` (with `LOCALNET_GENESIS_HASH`). Mainnet is refused.
-- `SOLANA_RPC_URL`: `https://api.devnet.solana.com` or a loopback URL for a local validator. `SOLANA_WS_URL` / `SOLANA_WS_RPC_URL` for the websocket.
+- `SOLANA_RPC_URL`: `https://api.devnet.solana.com` or a loopback URL for a local validator. The websocket address is derived from it; `SOLANA_WS_URL` is not read by the server.
 - `ALLOW_LIVE_REAL_MONEY_TRADING`: leave `false`; only the devnet harness sets it, in-process, after checking the genesis hash.
 - `SIGNER_KEYPAIR_PATH`: keypair file (default `.apex_trading_keypair.json`, mode 0600). Use only a throwaway devnet key. `OPERATOR_PRIVATE_KEY` / `SOLANA_PRIVATE_KEY` override it and are better left unset.
 - `JITO_BLOCK_ENGINE_URL`: leave unset on devnet/localnet (there is no devnet block engine; devnet and localnet send plain transactions). `DEFAULT_JITO_TIP_SOL` is the tip floor (default `0.00018`; capped at 15% of trade notional).

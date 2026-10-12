@@ -1,0 +1,82 @@
+import '../hermeticEnv';
+import fs from 'fs';
+import readline from 'readline';
+import { ExitEngine } from '../../server/exits/exitEngine';
+import type { CorpusLaunch } from './replay';
+
+/**
+ * S197c: prices the rule "buy at the 30-minute mark if the curve is at least X% done and the coin has not graduated".
+ *   npx tsx scripts/hfcorpus/late_rule.ts launches.jsonl grad.csv [--curve 40] [--checkpoint 30] [--side 2] [--out result.json]
+ * Fill: the first recorded trade at or after launch + checkpoint + 1.5 s. Curve progress: the last trade before the checkpoint (share of the
+ * curve's 793.1M tokens sold). Two exit sets: STOCK (the real ExitEngine as shipped) and TRAIL (take-profits off, hard stop and trailing stop
+ * kept, forced exit at the first trade 6 h after entry). `side` is the all-in cost per side in percent (buy keeps 1 - side, each sale pays 1 - side).
+ * Positions still open when the recording ends (48 h tracking window, or the corpus end) are marked at the last recorded price. A control group
+ * (curve below the cut-off) is priced the same way. train = launches before 2026-07-05 UTC, test = from then on.
+ */
+const E = ExitEngine as unknown as Record<string, number>;
+const STOCK = { HARD_STOP_LOSS_PCT: E.HARD_STOP_LOSS_PCT, TP1_TRIGGER_PCT: E.TP1_TRIGGER_PCT, TP2_TRIGGER_PCT: E.TP2_TRIGGER_PCT, STALE_POSITION_HOLD_MS: E.STALE_POSITION_HOLD_MS };
+const useStock = () => Object.assign(E, STOCK);
+const useTrail = () => Object.assign(E, STOCK, { TP1_TRIGGER_PCT: 1e9, TP2_TRIGGER_PCT: 1e9, STALE_POSITION_HOLD_MS: 1e15 });
+const CUT = Date.UTC(2026, 6, 5);
+const ORDER = 0.005, FIXED = 2 * (0.000005 + 0.0001), ENTRY_DELAY = 1500, MAX_HOLD_MS = 6 * 3_600_000;
+const price = (r: CorpusLaunch['trades'][number]) => r[5] / r[6] / 1000;
+
+interface Out { net: number; open: boolean }
+function simulate(c: CorpusLaunch, i0: number, mode: 'STOCK' | 'TRAIL', side: number): Out {
+  (mode === 'STOCK' ? useStock : useTrail)();
+  const h = side / 100, t = c.trades;
+  const ep = price(t[i0]), ets = t[i0][0];
+  let remaining = 1, proceeds = 0, hwm = ep, trail = 0, stage = 0, last = ep;
+  for (let i = i0 + 1; i < t.length; i++) {
+    const px = price(t[i]); last = px;
+    const forced = mode === 'TRAIL' && t[i][0] - ets >= MAX_HOLD_MS;
+    const d = ExitEngine.evaluate({ entryPriceSol: ep, currentPriceSol: px, highWaterMarkSol: hwm, trailingStopSol: trail, exitStage: stage, entryTimestamp: ets, currentTimestamp: t[i][0] });
+    hwm = d.newHighWaterMarkSol; trail = d.newTrailingStopSol;
+    if (!d.shouldExit && !forced) continue;
+    const pct = forced && !d.shouldExit ? 100 : d.sellPercentage;
+    const f = remaining * Math.min(100, Math.max(1, pct)) / 100;
+    proceeds += f * ORDER * (1 - h) * (px / ep) * (1 - h);
+    remaining -= f; stage = d.newExitStage;
+    if (remaining <= 1e-9 || pct >= 100) { remaining = 0; break; }
+  }
+  if (remaining > 1e-9) { proceeds += remaining * ORDER * (1 - h) * (last / ep) * (1 - h); return { net: proceeds - ORDER - FIXED, open: true }; }
+  return { net: proceeds - ORDER - FIXED, open: false };
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const opt = (k: string, d: string) => { const i = args.indexOf('--' + k); return i >= 0 ? args[i + 1] : d; };
+  const curveMin = Number(opt('curve', '40')), cpMin = Number(opt('checkpoint', '30')), side = Number(opt('side', '2')), outPath = opt('out', '');
+  const grad = new Map<string, number>();
+  for (const l of fs.readFileSync(args[1], 'utf8').split('\n').slice(1)) { const [m, g] = l.split(','); if (m) grad.set(m, Number(g)); }
+  type Acc = { entries: number; wins: number; openAtEnd: number; net: number };
+  const acc: Record<string, Acc> = {};
+  const add = (key: string, o: Out) => { const a = (acc[key] ??= { entries: 0, wins: 0, openAtEnd: 0, net: 0 }); a.entries++; a.net += o.net; if (o.net > 0) a.wins++; if (o.open) a.openAtEnd++; };
+  const counts = { launches: 0, tradedBeforeCp: 0, graduatedBeforeEntry: 0, noTradeAfterCp: 0 };
+  for await (const line of readline.createInterface({ input: fs.createReadStream(args[0]), crlfDelay: Infinity })) {
+    if (!line) continue;
+    const c: CorpusLaunch = JSON.parse(line);
+    counts.launches++;
+    const cp = c.t0 + cpMin * 60_000;
+    const iAfter = c.trades.findIndex((r) => r[0] >= cp + ENTRY_DELAY);
+    const iBefore = (iAfter < 0 ? c.trades.length : iAfter) - 1;
+    let lastBefore: CorpusLaunch['trades'][number] | undefined;
+    for (const r of c.trades) { if (r[0] < cp) lastBefore = r; else break; }
+    if (!lastBefore) continue;
+    counts.tradedBeforeCp++;
+    if (iAfter < 0) { counts.noTradeAfterCp++; continue; }
+    const g = grad.get(c.mint);
+    if (g !== undefined && g <= c.trades[iAfter][0]) { counts.graduatedBeforeEntry++; continue; }
+    void iBefore;
+    const curve = (793_100_000_000_000 - (lastBefore[6] - 279_900_000_000_000)) / 793_100_000_000_000 * 100;
+    const grp = curve >= curveMin ? 'RULE' : 'CONTROL';
+    const part = c.t0 < CUT ? 'train' : 'test';
+    for (const mode of ['STOCK', 'TRAIL'] as const) add(`${grp}|${mode}|${part}`, simulate(c, iAfter, mode, side));
+  }
+  useStock();
+  const rows = Object.entries(acc).map(([k, a]) => { const [group, exits, part] = k.split('|'); return { group, exits, part, entries: a.entries, winRate: a.wins / a.entries, openAtEnd: a.openAtEnd, perEntrySol: a.net / a.entries, totalSol: a.net }; });
+  const res = { curveMin, checkpointMin: cpMin, sidePct: side, orderSol: ORDER, counts, rows };
+  if (outPath) fs.writeFileSync(outPath, JSON.stringify(res, null, 1));
+  console.log(JSON.stringify(res, null, 1));
+}
+main().catch((e) => { console.error(e); process.exit(1); });

@@ -18,6 +18,9 @@ export interface ReplayResponse {
   recorded: { launches: number; events: number; oldestTs: number | null; newestTs: number | null };
   report: ReplayReportData | null;
   message: string | null;
+  /** S188: how many launches this replay covers and the most it will cover. Absent on an older server. */
+  replayedLaunches?: number;
+  replayCap?: number;
 }
 
 const sol = (v: number | null) => (v === null ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(5)} SOL`);
@@ -67,6 +70,9 @@ export function ReplayBacktestView({ data, error }: { data: ReplayResponse | nul
             <p className="text-slate-400 mb-3" data-testid="replay-recorded">
               {data.recorded.launches} launch(es), {data.recorded.events} recorded events, from {data.recorded.oldestTs ? new Date(data.recorded.oldestTs).toLocaleString() : '—'} to {data.recorded.newestTs ? new Date(data.recorded.newestTs).toLocaleString() : '—'}.
             </p>
+            {data.replayCap !== undefined && data.replayedLaunches !== undefined && data.recorded.launches > data.replayedLaunches && (
+              <p className="text-amber-300/90 mb-3" data-testid="replay-capped">Replaying the newest {data.replayedLaunches} of {data.recorded.launches} recorded launches (the replay is capped at {data.replayCap}); the older ones are kept but not replayed.</p>
+            )}
             <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 mb-3" data-testid="replay-summary">
               <span className="text-slate-500">Verdicts</span><span className="text-right">{Object.entries(s.released).map(([k, v]) => `${k} ${v}`).join(' · ') || '—'}</span>
               <span className="text-slate-500">Entered</span><span className="text-right">{s.entries}</span>

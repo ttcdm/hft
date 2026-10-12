@@ -35,15 +35,25 @@ export function AutoModeBadge({ mode, halted }: { mode: AutoMode | null; halted?
   );
 }
 
+/** The reason a budget is not acceptable to the server, or null. Mirrors AutoSnipeController.setBudget. */
+export function budgetProblem(nBuys: number, nSpend: number, limits?: AutoStatusData['budgetLimits']): string | null {
+  if (!Number.isInteger(nBuys) || nBuys < 1 || nBuys > (limits?.maxBuys ?? 50)) return `Max buys must be a whole number from 1 to ${limits?.maxBuys ?? 50}.`;
+  if (!Number.isFinite(nSpend) || (limits && nSpend < limits.minSpendSol)) return `Max spend must cover at least one order (${limits?.minSpendSol} SOL).`;
+  if (limits && nSpend > limits.maxSpendSol + 1e-9) return `Max spend is above the server cap of ${Number(limits.maxSpendSol.toFixed(6))} SOL (3 x MAX_POSITION_SIZE_SOL).`;
+  return null;
+}
+
 /** S181: edit the session budget (buys and spend, in SOL). The server refuses an out-of-bounds value with its reason; nothing is clamped. */
 export function AutoBudgetEditor({ budgets, limits, onSave, busy }: { budgets: AutoStatusData['budgets']; limits?: AutoStatusData['budgetLimits']; onSave?: (maxBuys: number, maxSpendSol: number) => void; busy?: boolean }) {
   const [buys, setBuys] = useState(String(budgets.maxBuys));
   const [spend, setSpend] = useState(String(Number(budgets.maxSpendSol.toFixed(6))));
   const nBuys = Number(buys), nSpend = Number(spend);
-  let problem: string | null = null;
-  if (!Number.isInteger(nBuys) || nBuys < 1 || nBuys > (limits?.maxBuys ?? 50)) problem = `Max buys must be a whole number from 1 to ${limits?.maxBuys ?? 50}.`;
-  else if (!Number.isFinite(nSpend) || (limits && nSpend < limits.minSpendSol)) problem = `Max spend must cover at least one order (${limits?.minSpendSol} SOL).`;
-  else if (limits && nSpend > limits.maxSpendSol + 1e-9) problem = `Max spend is above the server cap of ${Number(limits.maxSpendSol.toFixed(6))} SOL (3 x MAX_POSITION_SIZE_SOL).`;
+  const found = budgetProblem(nBuys, nSpend, limits);
+  // S188: what the server is running with is shown as it is. A PAPER session defaults to 50 buys and 10 x the paper bankroll (0.7 SOL), which is
+  // above the cap on a budget the operator SAVES (3 x MAX_POSITION_SIZE_SOL); flagging the server's own value red read as stale or broken input.
+  const unedited = nBuys === budgets.maxBuys && Math.abs(nSpend - Number(budgets.maxSpendSol.toFixed(6))) < 1e-9;
+  const problem = unedited ? null : found;
+  const runningNote = unedited && found ? `This is what the running session uses (a PAPER session starts with up to 50 buys and 10 x the paper bankroll). ${found} That limit only applies when you save a budget.` : null;
   return (
     <div className="mb-2 font-mono" data-testid="auto-budget-editor">
       <div className="text-slate-500 mb-0.5">Session budget</div>
@@ -52,9 +62,10 @@ export function AutoBudgetEditor({ budgets, limits, onSave, busy }: { budgets: A
         <span className="text-slate-500">buys,</span>
         <input data-testid="budget-spend" type="number" step="0.005" min={limits?.minSpendSol} max={limits?.maxSpendSol} value={spend} onChange={(e) => setSpend(e.target.value)} className="w-20 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
         <span className="text-slate-500">SOL incl. fees</span>
-        <button data-testid="budget-save" disabled={busy || problem !== null} onClick={() => onSave?.(nBuys, nSpend)} className="ml-auto px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white disabled:opacity-40">Save</button>
+        <button data-testid="budget-save" disabled={busy || found !== null || unedited} onClick={() => onSave?.(nBuys, nSpend)} className="ml-auto px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white disabled:opacity-40">Save</button>
       </div>
       {problem && <p className="text-rose-400 mt-0.5" data-testid="budget-problem">{problem}</p>}
+      {runningNote && <p className="text-amber-300/90 mt-0.5" data-testid="budget-running-note">{runningNote}</p>}
       {limits && <p className="text-slate-600 mt-0.5">Up to {Number(limits.maxSpendSol.toFixed(6))} SOL. Kept until the server restarts.</p>}
     </div>
   );

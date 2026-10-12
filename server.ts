@@ -1378,6 +1378,8 @@ app.get('/api/backtest/recording', requireOperatorAuth, (req, res) => {
   res.json({ success: true, ...workstationDb.getLaunchRecordingStatus() });
 });
 
+/** The replay is CPU work done synchronously per launch, so it covers the newest launches only. */
+const REPLAY_LAUNCH_CAP = 300;
 let replayCache: { key: string; at: number; body: any } | null = null;
 app.get('/api/backtest/replay', requireOperatorAuth, (req, res) => {
   // S187: ?minScore=N replays at another confluence threshold (the what-if box); without it, the threshold in force
@@ -1393,9 +1395,10 @@ app.get('/api/backtest/replay', requireOperatorAuth, (req, res) => {
   }
   const key = `${status.events}:${status.newestTs}:${minScore ?? getConfluenceThreshold()}`;
   if (replayCache && replayCache.key === key && Date.now() - replayCache.at < 30_000) return res.json(replayCache.body);
-  const { launches, funders } = workstationDb.loadLaunchRecording(300);
+  const { launches, funders } = workstationDb.loadLaunchRecording(REPLAY_LAUNCH_CAP);
   const report = replayLaunches(launches, funders, solPriceService.lastKnownPrice(), minScore === undefined ? {} : { minScore });
-  const body = { success: true, recorded: status, report, message: null };
+  // S188: the replay covers the newest REPLAY_LAUNCH_CAP launches; the response says so, so a count below the recorder's is explained
+  const body = { success: true, recorded: status, report, message: null, replayedLaunches: launches.length, replayCap: REPLAY_LAUNCH_CAP };
   replayCache = { key, at: Date.now(), body };
   res.json(body);
 });

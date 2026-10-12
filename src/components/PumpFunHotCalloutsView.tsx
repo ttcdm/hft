@@ -2,10 +2,10 @@
  * The Pump.fun hot callouts board: callouts, callers and the callout rules, with a snipe button per callout.
  *
  * API it calls (through `engineClient`): `GET /api/pumpfun/callouts`, `POST /api/pumpfun/callouts/snipe`,
- * `POST /api/pumpfun/callouts/toggle-autosnipe`, `GET` and `POST /api/pumpfun/callouts/rules`, `POST /api/pumpfun/refresh`. New callouts and
+ * `GET` and `POST /api/pumpfun/callouts/rules`, `POST /api/pumpfun/refresh`. New callouts and
  * "sniped" notices arrive over the `/ws/engine` WebSocket.
  *
- * The caller button is a screen marker only: nothing reads it when deciding to buy (KNOWN_RISKS.md section 6). The callout rules are not: while the
+ * The callout rules are live: while the
  * Auto controller is not OFF, `pumpfunService.evaluateAutoSnipeTriggers` reads them and submits matching callouts to the controller as candidates
  * (the controller still applies its own gates and mode; in SHADOW nothing is sent). The snipe button is a real one-click buy through the server's
  * gates, and in LIVE it needs `confirmLive`. Explorer and market links are always offered on this screen, because the callouts come from the mainnet
@@ -41,7 +41,6 @@ import {
   Settings,
   Globe,
   Bot,
-  Star,
 } from 'lucide-react';
 import {
   PumpFunHotCallout,
@@ -59,8 +58,6 @@ import {
   mainnetLinksAvailable,
   calloutSnipeLabel,
   calloutSendNote,
-  CALLER_MARK_LABEL,
-  CALLER_MARK_TITLE,
   formatCalloutMcap,
   solscanAccountUrl,
 } from '../utils/tokenLinks';
@@ -236,28 +233,6 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
     setSnipingCalloutId(null);
   };
 
-  const handleToggleAutoSnipe = async (userId: string) => {
-    hftAudio.playClick();
-    const res = await engineClient.togglePumpFunAutoSnipe(userId);
-    if (res?.status === 'OK' && res?.caller) {
-      setLeaderboard((prev) =>
-        prev.map((c) => (c.userId === userId ? res.caller : c))
-      );
-      setCallouts((prev) =>
-        prev.map((c) =>
-          c.caller.userId === userId
-            ? { ...c, caller: { ...c.caller, isAutoSnipeSubscribed: res.caller.isAutoSnipeSubscribed } }
-            : c
-        )
-      );
-      onAlertTrigger?.(
-        'INFO',
-        `CALLER MARK UPDATED`,
-        `@${userId} is now ${res.caller.isAutoSnipeSubscribed ? 'marked' : 'unmarked'} (screen marker only)`
-      );
-    }
-  };
-
   const handleSaveRules = async () => {
     hftAudio.playClick();
     const res = await engineClient.updatePumpFunRules(rules);
@@ -426,7 +401,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 className="px-3 py-1.5 rounded-lg text-xs font-mono font-bold bg-cyan-600/30 hover:bg-cyan-600/50 text-cyan-300 border border-cyan-500/50 transition flex items-center space-x-1.5"
               >
                 <Award className="w-3.5 h-3.5 text-amber-400" />
-                <span>Marked callers ({leaderboard.filter(c => c.isAutoSnipeSubscribed).length})</span>
+                <span>Caller leaderboard</span>
               </button>
             </div>
           </div>
@@ -866,20 +841,6 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                             {calloutSendNote(rules.jitoPriorityTipSol)}
                           </div>
                         )}
-
-                        {/* Caller marker (a screen flag, not a trading switch) */}
-                        <button
-                          onClick={() => handleToggleAutoSnipe(c.caller.userId)}
-                          className={`w-full py-1 px-2 rounded text-[10px] font-mono font-bold transition flex items-center justify-center space-x-1 border ${
-                            c.caller.isAutoSnipeSubscribed
-                              ? 'bg-rose-500/20 text-rose-300 border-rose-500/50 shadow-sm'
-                              : 'bg-[#141B2D] text-slate-400 border-[#1E293B] hover:text-white hover:border-slate-600'
-                          }`}
-                          title={CALLER_MARK_TITLE(c.caller.isAutoSnipeSubscribed)}
-                        >
-                          <Star className={`w-3 h-3 ${c.caller.isAutoSnipeSubscribed ? 'text-amber-300 fill-amber-300' : 'text-cyan-400'}`} />
-                          <span>{CALLER_MARK_LABEL(c.caller.isAutoSnipeSubscribed)}</span>
-                        </button>
                       </div>
                     </div>
 
@@ -933,7 +894,6 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                   <th className="py-2.5 px-3">Time to Peak</th>
                   <th className="py-2.5 px-3">Total Calls</th>
                   <th className="py-2.5 px-3">Top Hall-of-Fame Calls</th>
-                  <th className="py-2.5 px-3 text-right">Marked</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#1E293B]">
@@ -1012,20 +972,6 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                           </span>
                         ))}
                       </div>
-                    </td>
-
-                    {/* Auto-Snipe Switch */}
-                    <td className="py-3 px-3 text-right">
-                      <button
-                        onClick={() => handleToggleAutoSnipe(caller.userId)}
-                        className={`px-3 py-1 rounded-lg text-xs font-mono font-bold transition border ${
-                          caller.isAutoSnipeSubscribed
-                            ? 'bg-rose-600 text-white border-rose-400 shadow-sm shadow-rose-500/30'
-                            : 'bg-[#141B2D] text-slate-400 border-[#1E293B] hover:text-white hover:border-slate-700'
-                        }`}
-                      >
-                        {caller.isAutoSnipeSubscribed ? 'MARKED' : 'MARK'}
-                      </button>
                     </td>
                   </tr>
                 ))}
@@ -1302,27 +1248,6 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <p className="text-slate-400 text-[10px] leading-relaxed">
                 Tokens called by this profile are monitored on live DexScreener boosted queues. {tradingMode.live ? `LIVE is armed${tradingMode.cluster ? ` on ${tradingMode.cluster}` : ''}: a snipe from this profile sends a real transaction after you confirm it.` : tradingMode.known ? 'Mode is PAPER: a snipe from this profile is a simulated fill priced from the bonding curve.' : 'The server has not reported its mode, so this screen does not say whether a snipe is paper or live.'}
               </p>
-            </div>
-
-            <div className="pt-2 flex items-center justify-between">
-              <button
-                onClick={() => {
-                  handleToggleAutoSnipe(selectedCallerModal.userId);
-                  setSelectedCallerModal({
-                    ...selectedCallerModal,
-                    isAutoSnipeSubscribed: !selectedCallerModal.isAutoSnipeSubscribed,
-                  });
-                }}
-                className={`w-full py-2 rounded-lg font-mono font-bold text-xs transition border ${
-                  selectedCallerModal.isAutoSnipeSubscribed
-                    ? 'bg-rose-600 text-white border-rose-500'
-                    : 'bg-[#141B2D] text-slate-300 border-[#1E293B] hover:text-white'
-                }`}
-              >
-                {selectedCallerModal.isAutoSnipeSubscribed
-                  ? 'Caller marked (click to unmark)'
-                  : 'Mark this caller (screen marker only)'}
-              </button>
             </div>
           </div>
         </div>

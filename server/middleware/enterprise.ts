@@ -213,22 +213,12 @@ export function isSafeExternalUrl(val: string): boolean {
 }
 
 export const WalletConfigSchema = z.object({
-  walletAddress: z
-    .string()
-    .min(32, 'Solana wallet address must be at least 32 characters')
-    .max(44, 'Solana wallet address cannot exceed 44 characters')
-    .regex(SOLANA_ADDRESS_REGEX, 'Invalid Base58 Solana public key address'),
   rpcEndpoint: z
     .string()
     .url('RPC Endpoint must be a valid HTTP or HTTPS URL')
     .refine(isSafeExternalUrl, 'RPC Endpoint cannot point to private metadata services or use embedded credentials')
     // Absent leaves the current endpoint alone. (A default here silently re-pointed the RPC at the public devnet URL on every
     // config save, which also fails the cluster check when running against a local validator.)
-    .optional(),
-  wsRpcEndpoint: z
-    .string()
-    .url('WebSocket RPC must be a valid WS or WSS URL')
-    .refine(isSafeExternalUrl, 'WebSocket RPC cannot point to private metadata services')
     .optional(),
   // '' means Jito is disabled (the fail-closed default). There is no mainnet default.
   jitoBlockEngineUrl: z
@@ -238,15 +228,10 @@ export const WalletConfigSchema = z.object({
       'Jito Block Engine must be empty (disabled) or a valid URL that does not point to private metadata services'
     )
     .default(''),
-  jitoTipAccount: z
-    .string()
-    .regex(SOLANA_ADDRESS_REGEX, 'Invalid Jito tip account public key')
-    .default('96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5'),
   jitoTipSol: z.number().min(0.0001).max(0.2).optional(), // absent leaves the stored value alone (C6)
   slippageToleranceBps: z.number().min(10).max(5000).default(600), // 6.0% default for meme volatility
   capitalTier: z.enum(['MICRO_10', 'INSTITUTIONAL', 'CUSTOM']).default('MICRO_10'),
   allocatedSol: z.number().min(0.01).max(5000).default(0.07), // ~0.07 SOL = ~$10
-  autoStartTrading: z.boolean().default(false), // STRICT SAFETY: Always false by default
   enabledStrategies: z.object({
     pumpFunSniper: z.boolean().default(true),
     marketMaking: z.boolean().default(false),
@@ -258,7 +243,6 @@ export const WalletConfigSchema = z.object({
     maxPositionSizeSol: z.number().min(0.005).max(50).default(0.02),
     stopLossPct: z.number().min(5).max(90).default(20),
     takeProfitMultiple: z.number().min(1.2).max(50).default(1.5),
-    requireConfluenceScore: z.number().min(0).max(100).default(70),
   }),
 });
 
@@ -276,8 +260,6 @@ export const LiveSnipeOrderSchema = z.object({
 export const ClosePositionSchema = z.object({
   positionId: z.string().min(1, 'positionId is required'),
   sellPct: z.number().min(1).max(100).default(100),
-  // PLACEHOLDER: parsed but never read by the close-position handler; no default so nothing implies a tip is sent.
-  priorityTipSol: z.number().min(0.0001).max(0.1).optional(),
 });
 
 // Middleware factory for Zod validation

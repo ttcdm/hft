@@ -209,10 +209,6 @@ class EngineClient {
     this.sendAction('SNIPE_PUMP_CALLOUT', { calloutId, amountUsd, jitoTipSol, slippagePct, ...(confirmLive ? { confirmLive: true } : {}) });
   }
 
-  public wsToggleCallerSubscription(userId: string) {
-    this.sendAction('TOGGLE_CALLER_SNIPE', { userId });
-  }
-
   public wsSnipeMemecoin(params: { contractAddress: string; amountUsd: number; jitoTipSol?: number; slippagePct?: number }, confirmLive = false) {
     this.sendAction('SNIPE_MEMECOIN', { ...params, ...(confirmLive ? { confirmLive: true } : {}) });
   }
@@ -409,19 +405,6 @@ class EngineClient {
     } catch (e) {
       console.error(e);
       return { status: 'ERROR', result: { success: false, message: 'Network error executing snipe' } };
-    }
-  }
-
-  public async togglePumpFunAutoSnipe(userId: string) {
-    try {
-      const res = await authFetch('/api/pumpfun/callouts/toggle-autosnipe', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ userId }),
-      });
-      return await res.json();
-    } catch (e) {
-      console.error(e);
     }
   }
 

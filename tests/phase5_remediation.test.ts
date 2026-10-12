@@ -601,7 +601,6 @@ describe('Phase 5 Master Remediation Suite: Alpha Pipeline Integration (B14)', (
           followersCount: 10000,
           totalVolumeDrivenUsd: 1_000_000,
           reputationTier: 'LEGENDARY_WHALE',
-          isAutoSnipeSubscribed: true,
           topCallouts: [],
         },
         token: {
@@ -667,7 +666,6 @@ describe('Phase 5 Master Remediation Suite: Alpha Pipeline Integration (B14)', (
           followersCount: 100,
           totalVolumeDrivenUsd: 5000,
           reputationTier: 'EMERGING_CALLER' as const,
-          isAutoSnipeSubscribed: false, // NOT subscribed -> must rely on confluence
           topCallouts: [],
         },
         token: {

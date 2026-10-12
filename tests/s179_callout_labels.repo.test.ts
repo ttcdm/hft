@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import fs from 'fs';
 import path from 'path';
-import { calloutSnipeLabel, calloutSendNote, CALLER_MARK_LABEL, CALLER_MARK_TITLE, calloutSnipeBlock } from '../src/utils/tokenLinks';
+import { calloutSnipeLabel, calloutSendNote, calloutSnipeBlock } from '../src/utils/tokenLinks';
 
 const read = (f: string) => fs.readFileSync(f, 'utf8');
 const walk = (d: string, out: string[] = []): string[] => {
@@ -14,27 +14,19 @@ const walk = (d: string, out: string[] = []): string[] => {
 };
 
 describe('S179 callout button labels', () => {
-  it('the caller button says it marks, never "auto-snipe"', () => {
-    expect(CALLER_MARK_LABEL(false)).toBe('MARK CALLER');
-    expect(CALLER_MARK_LABEL(true)).toBe('CALLER MARKED');
-    expect(CALLER_MARK_TITLE(false)).toContain('nothing buys');
+  it('the callout board has no caller marker (S215) and never says "auto-snipe"', () => {
+    expect(calloutSnipeLabel('0.01 SOL')).toBe('SNIPE (0.01 SOL)');
     const src = read('src/components/PumpFunHotCalloutsView.tsx');
     expect(src).not.toMatch(/AUTO-SNIPE: (ON|OFF)/);
     expect(src).not.toContain('AUTO-SNIPE ON');
     expect(src).not.toContain('Subscribe to Auto-Snipe');
     expect(src).not.toContain('AUTONOMOUS CALLOUT SNIPER');
-    expect(src).toContain('CALLER_MARK_LABEL(c.caller.isAutoSnipeSubscribed)');
+    expect(src).not.toMatch(/MARK CALLER|Mark this caller|toggle-autosnipe/);
   });
 
-  it('nothing but the marker itself reads isAutoSnipeSubscribed (the flag drives no trade)', () => {
-    const readers = [...walk('server'), ...walk('src'), 'server.ts']
-      .filter((f) => /isAutoSnipeSubscribed/.test(read(f)))
-      .map((f) => f.replace(/\\/g, '/'))
-      .sort();
-    expect(readers).toEqual(['server.ts', 'server/pumpfunService.ts', 'src/components/PumpFunHotCalloutsView.tsx', 'src/types.ts']);
-    // server.ts only echoes it in the leaderboard payload; in the service the flag appears only as seed data and in the toggle
-    const svc = read('server/pumpfunService.ts').split('\n').filter((l) => l.includes('isAutoSnipeSubscribed'));
-    expect(svc.every((l) => /isAutoSnipeSubscribed: (true|false),$|caller\.isAutoSnipeSubscribed = !caller\.isAutoSnipeSubscribed;/.test(l.trim()))).toBe(true);
+  it('nothing stores or reads isAutoSnipeSubscribed any more (S215 removed the marker)', () => {
+    const readers = [...walk('server'), ...walk('src'), 'server.ts'].filter((f) => /isAutoSnipeSubscribed|toggleCallerAutoSnipe|TOGGLE_CALLER_SNIPE/.test(read(f)));
+    expect(readers).toEqual([]);
   });
 
   it('the snipe button is a plain SNIPE, and its note says what the send path is', () => {

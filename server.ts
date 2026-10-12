@@ -55,7 +55,6 @@ import {
   SignalSnipeSchema,
   KillSwitchSchema,
   SniperConfigPatchSchema,
-  ToggleCallerSchema,
   validateTradeBody,
   validateTradeInput,
 } from './server/execution/tradeInputs';
@@ -227,7 +226,6 @@ wss.on('connection', (ws: WebSocket, req: any) => {
       // Mutating WebSocket commands require operator session authorization
       const MUTATING_WS_ACTIONS = new Set([
         'SNIPE_PUMP_CALLOUT',
-        'TOGGLE_CALLER_SNIPE',
         'SNIPE_MEMECOIN',
         'CLOSE_POSITION',
         'PANIC_LIQUIDATE',
@@ -264,17 +262,6 @@ wss.on('connection', (ws: WebSocket, req: any) => {
           input.data.amountSol
         );
         ws.send(JSON.stringify({ type: 'CALLOUT_SNIPE_RESULT', data: result }));
-      }
-      if (parsed.action === 'TOGGLE_CALLER_SNIPE') {
-        const input = validateTradeInput(ToggleCallerSchema, parsed);
-        if (input.status === 'invalid') return rejectWsInput(input.issues);
-        const updated = pumpFunService.toggleCallerAutoSnipe(input.data.userId);
-        if (updated) {
-          broadcastWs({
-            type: 'CALLER_SUBSCRIPTION_UPDATED',
-            data: updated,
-          });
-        }
       }
       if (parsed.action === 'SNIPE_MEMECOIN') {
         const input = validateTradeInput(OperatorSnipeSchema, parsed);
@@ -813,7 +800,6 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, async (req, res) =
         avgMultiple: `${p.avgMultiple}x`,
         avgTimeToPeak: `${Math.round(p.avgTimeToPeakMs / 60000)}m`,
         followers: p.followersCount,
-        isAutoSnipeSubscribed: p.isAutoSnipeSubscribed,
       })),
       activeCalloutsCount: hotCallouts.length,
       multiCallerConfluenceCount: confluenceCallouts.length,
@@ -858,7 +844,7 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, async (req, res) =
         subsystem: 'Telegram Bot API Link',
         nature: 'PARTIAL',
         details:
-          'The command handler (/snipe, /signals, /positions, /status, /panic_sell) runs when something posts to the operator-authenticated /api/telegram/webhook. NOT implemented: setWebhook registration with Telegram, getUpdates polling, and alert forwarding (autoForwardAlerts is stored but never used). Outbound connectivity can be tested with a bot token; nothing is sent automatically.',
+          'The command handler (/snipe, /signals, /positions, /status, /panic_sell) runs when something posts to the operator-authenticated /api/telegram/webhook. NOT implemented: setWebhook registration with Telegram, getUpdates polling, and alert forwarding. Outbound connectivity can be tested with a bot token; nothing is sent automatically.',
       },
       {
         subsystem: 'X.com / Twitter Feed & Social Ingestion',
@@ -998,20 +984,6 @@ app.post('/api/pumpfun/callouts/snipe', requireOperatorAuth, validateTradeBody(C
   res.json({
     status: result.success ? 'OK' : 'REJECTED',
     result,
-  });
-});
-
-app.post('/api/pumpfun/callouts/toggle-autosnipe', requireOperatorAuth, validateTradeBody(ToggleCallerSchema), (req, res) => {
-  const { userId } = req.body;
-
-  const caller = pumpFunService.toggleCallerAutoSnipe(userId);
-  if (!caller) {
-    return res.status(404).json({ error: 'Caller not found' });
-  }
-
-  res.json({
-    status: 'OK',
-    caller,
   });
 });
 

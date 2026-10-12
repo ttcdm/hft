@@ -38,7 +38,6 @@ Values are read as strings. Booleans mean the exact text `true` unless the row s
 | `PAPER_BANKROLL_SOL` | `0.07` | `server/solana/executionConfig.ts` | Paper bankroll. A PAPER auto session may spend up to 10 times this. |
 | `PAPER_STRICT_GATES` | off | `server/solana/executionConfig.ts` | `1` or `true`: paper rejects unverified safety checks like LIVE. |
 | `DEMO_MODE` | off | `server/memecoinAggregator.ts`, `server/pumpfunService.ts` +2 | `true` loads fake callers and synthetic social data. Demo only. |
-| `ENABLE_SYNTHETIC_SOCIAL` | off | `server/solana/executionConfig.ts` | Read into the config object and never consulted (see KNOWN_RISKS section 6). Leave unset. |
 | `ENABLE_RPC_FALLBACK` | off | `server/solana/executionConfig.ts` | `true` falls back to plain RPC when a Jito bundle fails. On devnet RPC is already the only transport. |
 | `RPC_FALLBACK_TIMEOUT_MS` | `15000` | `server/solana/executionConfig.ts` | Timeout of the RPC fallback. |
 | `BUNDLE_CONFIRM_TIMEOUT_MS` | `15000` | `server/solana/executionConfig.ts` | How long to wait for a bundle to confirm. |

@@ -693,7 +693,6 @@ describe('Adversarial Stress & Empirical Challenge Suite: Alpha Pipeline Integra
           followersCount: 10000,
           totalVolumeDrivenUsd: 1_000_000,
           reputationTier: 'LEGENDARY_WHALE',
-          isAutoSnipeSubscribed: false,
           topCallouts: [],
         },
         token: {
@@ -758,7 +757,6 @@ describe('Adversarial Stress & Empirical Challenge Suite: Alpha Pipeline Integra
           followersCount: 10000,
           totalVolumeDrivenUsd: 1_000_000,
           reputationTier: 'LEGENDARY_WHALE',
-          isAutoSnipeSubscribed: false,
           topCallouts: [],
         },
         token: {

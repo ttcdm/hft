@@ -650,7 +650,6 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
           followersCount: 50,
           totalVolumeDrivenUsd: 1000,
           reputationTier: 'EMERGING_CALLER',
-          isAutoSnipeSubscribed: false, // NOT subscribed -> must qualify via confluence
           topCallouts: [],
         },
         token: {

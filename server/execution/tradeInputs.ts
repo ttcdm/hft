@@ -216,21 +216,17 @@ export const AutoResumeSchema = z.object({
   clearHalt: z.boolean().optional(),
 });
 
-/** WS TOGGLE_CALLER_SNIPE, POST /api/pumpfun/callouts/toggle-autosnipe. */
-export const ToggleCallerSchema = z.object({ userId: id }).loose().transform(({ userId }) => ({ userId }));
 
 /** POST /api/memecoins/config: a whitelist of the sniper bot settings. Everything else is dropped. */
 const SniperConfigFields = z
   .object({
     isAutoSnipeEnabled: z.boolean(),
-    minConfidenceScore: z.coerce.number().min(0).max(100),
     defaultSnipeAmountUsd: z.coerce.number().positive().max(100_000),
     maxSlippagePct: z.coerce.number().min(0.5).max(50),
     jitoTipSol: z.coerce.number().min(0).max(0.1),
     takeProfitPct: z.coerce.number().min(0).max(100_000),
     stopLossPct: z.coerce.number().min(0).max(100),
     trailingStopEnabled: z.boolean(),
-    requireMintRevoked: z.boolean(),
     requireFreezeRevoked: z.boolean(),
     maxDevHoldingPct: z.coerce.number().min(0).max(100),
     telegramBotToken: z.string().max(256),

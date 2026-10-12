@@ -21,7 +21,6 @@ function makeCaller(overrides: Partial<PumpFunCaller>): PumpFunCaller {
     totalVolumeDrivenUsd: 1_000_000,
     reputationTier: 'HIGH_MOMENTUM',
     topCallouts: [],
-    isAutoSnipeSubscribed: false,
     ...overrides,
   };
 }
@@ -95,24 +94,7 @@ describe('A5: fake callers cannot drive auto-snipe', () => {
     await setAutoMode('PAPER'); // the controller is armed; the env flag is one of its inputs and is now turned off
     vi.stubEnv('AUTO_SNIPE_ENABLED', '');
     const snipeSpy = vi.spyOn(memecoinAggregator, 'executeSnipe');
-    const callout = makeCallout(makeCaller({ isAutoSnipeSubscribed: true }), 'A5MintDisabled1111111111111111111111111111');
-    vi.spyOn(pumpFunService, 'getHotCallouts').mockReturnValue([callout]);
-
-    await (pumpFunService as any).evaluateAutoSnipeTriggers();
-
-    expect(snipeSpy).not.toHaveBeenCalled();
-    expect(callout.status).toBe('ACTIVE');
-  });
-
-  it('does not treat a caller subscription as a standalone trigger', async () => {
-    await setAutoMode('PAPER');
-    const snipeSpy = vi.spyOn(memecoinAggregator, 'executeSnipe');
-    const weakSubscribed = makeCaller({
-      isAutoSnipeSubscribed: true,
-      winRate2x: 5,
-      avgMultiple: 1,
-    });
-    const callout = makeCallout(weakSubscribed, 'A5MintSubscribed111111111111111111111111111', 1);
+    const callout = makeCallout(makeCaller({}), 'A5MintDisabled1111111111111111111111111111');
     vi.spyOn(pumpFunService, 'getHotCallouts').mockReturnValue([callout]);
 
     await (pumpFunService as any).evaluateAutoSnipeTriggers();

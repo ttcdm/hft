@@ -31,9 +31,6 @@ export interface TelegramConnectionTestResult {
 export interface TelegramBotConfig {
   botToken: string;
   chatId: string;
-  webhookActive: boolean;
-  autoForwardAlerts: boolean;
-  snipeThresholdScore: number;
 }
 
 const INITIAL_SIGNALS: SocialSignal[] = [
@@ -211,9 +208,6 @@ export class SocialAlphaScanner {
   private telegramConfig: TelegramBotConfig = {
     botToken: process.env.TELEGRAM_BOT_TOKEN || '',
     chatId: process.env.TELEGRAM_CHAT_ID || '',
-    webhookActive: false, // Q34: no webhook is registered with Telegram; the /status reply must not say LIVE WEBHOOK
-    autoForwardAlerts: true,
-    snipeThresholdScore: 85,
   };
 
   constructor() {
@@ -238,11 +232,6 @@ export class SocialAlphaScanner {
     // R4s: the UI never receives the stored token, so it posts '' on Save Config; an empty token means "unchanged", never "wipe".
     if (typeof cfg?.botToken === 'string' && cfg.botToken.trim() !== '') next.botToken = cfg.botToken.trim();
     if (typeof cfg?.chatId === 'string') next.chatId = cfg.chatId.trim();
-    if (typeof cfg?.webhookActive === 'boolean') next.webhookActive = cfg.webhookActive;
-    if (typeof cfg?.autoForwardAlerts === 'boolean') next.autoForwardAlerts = cfg.autoForwardAlerts;
-    if (typeof cfg?.snipeThresholdScore === 'number' && Number.isFinite(cfg.snipeThresholdScore)) {
-      next.snipeThresholdScore = Math.min(100, Math.max(0, cfg.snipeThresholdScore));
-    }
     this.telegramConfig = { ...this.telegramConfig, ...next };
     return this.telegramConfig;
   }
@@ -356,7 +345,7 @@ export class SocialAlphaScanner {
     if (trimmed.startsWith('/status')) {
       const positions = memecoinAggregator.getPositions();
       return {
-        reply: `🟢 APEX QUANT TELEGRAM BOT ENGINE STATUS:\n• Connection: ${this.telegramConfig.webhookActive ? 'LIVE WEBHOOK ACTIVE' : 'POLLING ACTIVE'}\n• Alert Chat: ${this.telegramConfig.chatId || 'not set'}\n• Active Alpha Signals: ${this.signals.length}\n• Open Positions: ${positions.length}`,
+        reply: `🟢 APEX QUANT TELEGRAM BOT ENGINE STATUS:\n• Connection: commands via /api/telegram/webhook (no webhook registered with Telegram)\n• Alert Chat: ${this.telegramConfig.chatId || 'not set'}\n• Active Alpha Signals: ${this.signals.length}\n• Open Positions: ${positions.length}`,
       };
     }
 

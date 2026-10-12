@@ -88,14 +88,12 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const [positions, setPositions] = useState<SniperPosition[]>([]);
   const [sniperConfig, setSniperConfig] = useState<SniperBotConfig>({
     isAutoSnipeEnabled: false,
-    minConfidenceScore: 85,
     defaultSnipeAmountUsd: capitalTier === 'MICRO_10' ? 5.0 : 50.0,
     maxSlippagePct: 8.0,
     jitoTipSol: 0.005,
     takeProfitPct: 50.0,
     stopLossPct: 20.0,
     trailingStopEnabled: true,
-    requireMintRevoked: true,
     requireFreezeRevoked: true,
     maxDevHoldingPct: 5.0,
     telegramBotToken: '',
@@ -603,9 +601,6 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                     X.com KOLs & Smart Money
                   </span>
                 </div>
-                <div className="text-xs text-slate-400 font-mono">
-                  Autonomous Snipe Threshold: <strong className="text-emerald-400">&gt;={sniperConfig.minConfidenceScore}% Confidence</strong>
-                </div>
               </div>
 
               {/* Signals Feed */}
@@ -1060,22 +1055,6 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
                 {/* Configuration Inputs */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono">
-                  <div>
-                    <label className="block text-slate-400 text-[10px] mb-1">
-                      Min Confidence Score
-                    </label>
-                    <input
-                      type="number"
-                      min="50"
-                      max="100"
-                      value={sniperConfig.minConfidenceScore}
-                      onChange={(e) =>
-                        setSniperConfig({ ...sniperConfig, minConfidenceScore: Number(e.target.value) })
-                      }
-                      className="w-full bg-[#141B2D] border border-[#1E293B] rounded p-2 text-white font-mono outline-none focus:border-cyan-400"
-                    />
-                  </div>
-
                   <div>
                     <label className="block text-slate-400 text-[10px] mb-1">
                       Snipe Amount (USD)

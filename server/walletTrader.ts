@@ -12,7 +12,6 @@ import { solPriceService } from './market/solPriceService';
 export interface WalletTraderConfig {
   walletAddress: string;
   rpcEndpoint: string;
-  wsRpcEndpoint?: string;
   jitoBlockEngineUrl: string;
   jitoTipAccount: string;
   jitoTipSol: number;
@@ -31,7 +30,6 @@ export interface WalletTraderConfig {
     maxPositionSizeSol: number;
     stopLossPct: number;
     takeProfitMultiple: number;
-    requireConfluenceScore: number;
   };
 }
 
@@ -98,7 +96,6 @@ class PlugAndPlayWalletTrader extends EventEmitter {
         maxPositionSizeSol: execCfg.maxPositionSizeSol,
         stopLossPct: 20,
         takeProfitMultiple: 1.5,
-        requireConfluenceScore: 70,
       },
     };
     this.initWalletAddress();

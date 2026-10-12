@@ -13,7 +13,6 @@ import {
   OperatorSnipeSchema,
   SignalSnipeSchema,
   SniperConfigPatchSchema,
-  ToggleCallerSchema,
   validateTradeBody,
   validateTradeInput,
 } from '../server/execution/tradeInputs';
@@ -109,11 +108,10 @@ describe('A3: trade entry point validation', () => {
       expect(ok.seen).toMatchObject({ positionId: 'p', sellPct: 100 });
     });
 
-    it('callout, signal, caller toggle and arm schemas validate their ids', async () => {
+    it('callout, signal and arm schemas validate their ids', async () => {
       expect((await post(CalloutSnipeSchema, {})).status).toBe(400);
       expect((await post(CalloutSnipeSchema, { calloutId: 'c1' })).status).toBe(200);
       expect((await post(SignalSnipeSchema, { amountUsd: 5 })).status).toBe(400);
-      expect((await post(ToggleCallerSchema, { userId: '' })).status).toBe(400);
       expect((await post(ArmSchema, { confirmationCode: 'x'.repeat(65) })).status).toBe(400);
       expect((await post(ArmSchema, { arm: true, confirmationCode: 'ok' })).status).toBe(200);
     });
@@ -143,9 +141,9 @@ describe('A3: trade entry point validation', () => {
   describe('every client-reachable trade entry point is covered (static walk of server.ts)', () => {
     const source = fs.readFileSync(path.resolve(process.cwd(), 'server.ts'), 'utf8');
     const blocks = source.split(/^(?=app\.(?:get|post|put|delete|patch)\()/m).filter((b) => b.startsWith('app.'));
-    const TRADE_CALLS = /executeSnipe|closePosition|executeTrade|snipeCallout|armLiveTrading|panicLiquidateAll|toggleCallerAutoSnipe|memecoinAggregator\.updateConfig|walletTrader\.executeLiveSnipe/;
+    const TRADE_CALLS = /executeSnipe|closePosition|executeTrade|snipeCallout|armLiveTrading|panicLiquidateAll|memecoinAggregator\.updateConfig|walletTrader\.executeLiveSnipe/;
 
-    it.each(['SNIPE_PUMP_CALLOUT', 'TOGGLE_CALLER_SNIPE', 'SNIPE_MEMECOIN', 'CLOSE_POSITION'])('WebSocket action %s validates its input', (action) => {
+    it.each(['SNIPE_PUMP_CALLOUT', 'SNIPE_MEMECOIN', 'CLOSE_POSITION'])('WebSocket action %s validates its input', (action) => {
       const start = source.indexOf(`parsed.action === '${action}'`);
       expect(start).toBeGreaterThan(-1);
       const snippet = source.slice(start, start + 400);

@@ -49,7 +49,6 @@ const INITIAL_CALLERS: PumpFunCaller[] = [
     followersCount: 38400,
     totalVolumeDrivenUsd: 14850000,
     reputationTier: 'LEGENDARY_WHALE',
-    isAutoSnipeSubscribed: true,
     topCallouts: [
       {
         calloutId: 'top-01',
@@ -104,7 +103,6 @@ const INITIAL_CALLERS: PumpFunCaller[] = [
     followersCount: 72100,
     totalVolumeDrivenUsd: 28900000,
     reputationTier: 'VERIFIED_ALPHA',
-    isAutoSnipeSubscribed: true,
     topCallouts: [
       {
         calloutId: 'top-04',
@@ -147,7 +145,6 @@ const INITIAL_CALLERS: PumpFunCaller[] = [
     followersCount: 41200,
     totalVolumeDrivenUsd: 19400000,
     reputationTier: 'LEGENDARY_WHALE',
-    isAutoSnipeSubscribed: true,
     topCallouts: [
       {
         calloutId: 'top-06',
@@ -178,7 +175,6 @@ const INITIAL_CALLERS: PumpFunCaller[] = [
     followersCount: 26300,
     totalVolumeDrivenUsd: 9800000,
     reputationTier: 'HIGH_MOMENTUM',
-    isAutoSnipeSubscribed: false,
     topCallouts: [],
   },
   {
@@ -196,7 +192,6 @@ const INITIAL_CALLERS: PumpFunCaller[] = [
     followersCount: 18900,
     totalVolumeDrivenUsd: 6200000,
     reputationTier: 'VERIFIED_ALPHA',
-    isAutoSnipeSubscribed: false,
     topCallouts: [],
   },
 ];
@@ -293,7 +288,6 @@ const UNATTRIBUTED_CALLER: PumpFunCaller = {
   totalVolumeDrivenUsd: 0,
   reputationTier: 'EMERGING_CALLER',
   topCallouts: [],
-  isAutoSnipeSubscribed: false,
 };
 
 const DEMO_CALLER_IDS: ReadonlySet<string> = new Set(INITIAL_CALLERS.map((c) => c.userId));
@@ -301,14 +295,6 @@ const DEMO_CALLER_IDS: ReadonlySet<string> = new Set(INITIAL_CALLERS.map((c) => 
 /** Fake hardcoded callers are only loaded when DEMO_MODE=true (A5). */
 function isDemoMode(): boolean {
   return process.env.DEMO_MODE === 'true';
-}
-
-/**
- * Auto-snipe is off unless explicitly enabled via AUTO_SNIPE_ENABLED=true (A5).
- * PLACEHOLDER: no caller left after G1; the auto-snipe controller reads the env itself. Kept, not removed, until the removal audit (H4).
- */
-export function isAutoSnipeEnvEnabled(): boolean {
-  return process.env.AUTO_SNIPE_ENABLED === 'true';
 }
 
 /**
@@ -843,15 +829,6 @@ export class PumpFunService extends EventEmitter {
   public updateAutoSnipeRules(rules: Partial<AutoSnipeRules>): AutoSnipeRules {
     this.autoSnipeRules = { ...this.autoSnipeRules, ...rules };
     return this.autoSnipeRules;
-  }
-
-  public toggleCallerAutoSnipe(userId: string): PumpFunCaller | null {
-    const caller = this.callers.find((c) => c.userId === userId);
-    if (caller) {
-      caller.isAutoSnipeSubscribed = !caller.isAutoSnipeSubscribed;
-      return caller;
-    }
-    return null;
   }
 
   public getStatus() {

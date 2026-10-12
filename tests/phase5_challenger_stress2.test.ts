@@ -364,7 +364,6 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
         followersCount: 500,
         totalVolumeDrivenUsd: 20_000,
         reputationTier: 'EMERGING_CALLER',
-        isAutoSnipeSubscribed: false, // NOT subscribed -> MUST rely solely on confluence
         topCallouts: [],
       },
       token: {

@@ -281,7 +281,7 @@ describe('S1: Telegram / social integrations', () => {
       expect(s.getTelegramConfig().botToken).toBe('123456:SECRET-TOKEN');
       expect((s.getTelegramConfig() as any).rogue).toBeUndefined();
       expect(s.getTelegramConfig().chatId).not.toBe(42);
-      expect(s.getTelegramConfig().snipeThresholdScore).toBe(100);
+      expect((s.getTelegramConfig() as any).snipeThresholdScore).toBeUndefined(); // S215: no longer a setting
     });
 
     it('the config routes answer from the redacted view and the auth gate denies them without a token', async () => {

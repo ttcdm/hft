@@ -680,7 +680,6 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
           followersCount: 50,
           totalVolumeDrivenUsd: 1000,
           reputationTier: 'EMERGING_CALLER',
-          isAutoSnipeSubscribed: false, // NOT subscribed
           topCallouts: [],
         },
         token: {
@@ -749,7 +748,6 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
           followersCount: 5000,
           totalVolumeDrivenUsd: 500_000,
           reputationTier: 'LEGENDARY_WHALE',
-          isAutoSnipeSubscribed: false, // NOT subscribed -> tests confluence path directly!
           topCallouts: [],
         },
         token: {

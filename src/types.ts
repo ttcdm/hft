@@ -271,14 +271,12 @@ export interface SniperPosition {
 
 export interface SniperBotConfig {
   isAutoSnipeEnabled: boolean;
-  minConfidenceScore: number;
   defaultSnipeAmountUsd: number;
   maxSlippagePct: number;
   jitoTipSol?: number; // optional operator override; absent = dynamic policy (C6)
   takeProfitPct: number;
   stopLossPct: number;
   trailingStopEnabled: boolean;
-  requireMintRevoked: boolean;
   requireFreezeRevoked: boolean;
   maxDevHoldingPct: number;
   telegramBotToken: string;
@@ -322,7 +320,6 @@ export interface PumpFunCaller {
   totalVolumeDrivenUsd: number;
   reputationTier: CallerReputationTier;
   topCallouts: TopCalloutRecord[];
-  isAutoSnipeSubscribed: boolean;
 }
 
 export type CalloutHftAction =

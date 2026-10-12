@@ -120,13 +120,11 @@ export class MemecoinAggregatorService extends EventEmitter {
   private simulationTimer: NodeJS.Timeout | null = null;
   private config: SniperBotConfig = {
     isAutoSnipeEnabled: false,
-    minConfidenceScore: 80,
     defaultSnipeAmountUsd: 5.0,
     maxSlippagePct: 6.0,
     takeProfitPct: 45.0,
     stopLossPct: 20.0,
     trailingStopEnabled: true,
-    requireMintRevoked: true,
     requireFreezeRevoked: true,
     maxDevHoldingPct: 5.0,
     telegramBotToken: '',

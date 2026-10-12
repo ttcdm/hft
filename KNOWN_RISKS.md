@@ -92,25 +92,13 @@ This document outlines structural, economic, and operational risks of running th
 
 ## 6. Settings that are stored but change nothing (checked against the code, Q34)
 
-These can be set (some from the UI) and are saved, but no code path reads them to decide anything. Do not rely on them.
+S215 removed the settings this section used to list (`snipeThresholdScore`, `autoForwardAlerts`, `webhookActive`, `isAutoSnipeEnvEnabled`, the per-caller auto-snipe marker, `requireMintRevoked`, `ENABLE_SYNTHETIC_SOCIAL`, `minConfidenceScore`, `requireConfluenceScore`, the unused wallet-config fields and `priorityTipSol`). None of them was read. The auto-snipe score gate is the confluence threshold: default 70, starting from `CONFLUENCE_MIN_SCORE`, editable at runtime (`POST /api/auto/threshold`, S187).
 
 | Setting | Where it lives | What it actually does |
 |---|---|---|
-| `snipeThresholdScore` (Telegram config) | `server/socialScanner.ts` | Stored and returned only. The auto-snipe score gate is the confluence threshold: default 70, starting from `CONFLUENCE_MIN_SCORE`, editable at runtime (`POST /api/auto/threshold`, S187). |
-| `autoForwardAlerts` (Telegram config) | `server/socialScanner.ts` | Stored only. Nothing forwards alerts to Telegram. |
-| `webhookActive` (Telegram config) | `server/socialScanner.ts` | Changes the word in the `/status` reply. No webhook is registered with Telegram. |
-| `isAutoSnipeEnvEnabled()` | `server/pumpfunService.ts` | Defined, never called. |
-| `isAutoSnipeSubscribed` / `toggleCallerAutoSnipe` | `server/pumpfunService.ts` | Flips a flag shown in the UI. No code buys because of it. |
-| `requireMintRevoked` | `server/memecoinAggregator.ts` config | Accepted and stored. The mint-authority rule is enforced by the eligibility gate, not by this field. |
-| `ENABLE_SYNTHETIC_SOCIAL` | `server/solana/executionConfig.ts` | Read into the config object, never consulted. |
+| Two "auto snipe" switches | env `AUTO_SNIPE_ENABLED` (`server/auto/controller.ts`) and `isAutoSnipeEnabled` in `server/memecoinAggregator.ts` (the sniper screen's ARMED/DISARMED button) | Both are read. The env flag and the Auto panel's mode decide whether auto trades at all. The aggregator flag, when on, makes its 5-second loop submit hot callouts to the controller as candidates (only while the controller is not OFF). |
 
-| `minConfidenceScore` | `server/memecoinAggregator.ts` config | Accepted and stored, never read. |
-| `requireConfluenceScore` (wallet config `riskLimits`, default 70) | `server/walletTrader.ts`, `server/middleware/enterprise.ts` | Accepted by the schema and kept in the config object. No code compares a score with it. The real gate is the confluence threshold (`CONFLUENCE_MIN_SCORE`, `POST /api/auto/threshold`). |
-| Two "auto snipe" switches | env `AUTO_SNIPE_ENABLED` (`server/auto/controller.ts`) and the UI/config flag in `server/memecoinAggregator.ts` | Only the env flag and the Auto panel's mode decide whether auto trades. The other flag is stored only. |
-| `walletAddress`, `jitoTipAccount`, `wsRpcEndpoint`, `autoStartTrading` (wallet config body) | `server/execution/schemas`/`walletTrader.updateConfig` | Accepted by the schema, never applied by `updateConfig`. |
-| `priorityTipSol` on close-position | `ClosePositionSchema` | Labelled placeholder; ignored. |
-
-Also: the per-caller auto-snipe toggle in the Hot Callouts screen is a screen marker only, and says so on screen; nothing reads it. The callout auto-snipe rules next to it are not markers: while the Auto controller is not OFF, `server/pumpfunService.ts` (`evaluateAutoSnipeTriggers`) reads them and submits matching callouts to the controller as candidates, and the controller applies its own gates (in SHADOW nothing is sent). Jito bundles are used only on mainnet-beta, which this build does not use. On devnet and localnet the app sends ordinary transactions with a priority fee.
+Also: the callout auto-snipe rules on the Hot Callouts screen are live: while the Auto controller is not OFF, `server/pumpfunService.ts` (`evaluateAutoSnipeTriggers`) reads them and submits matching callouts to the controller as candidates, and the controller applies its own gates (in SHADOW nothing is sent). Jito bundles are used only on mainnet-beta, which this build does not use. On devnet and localnet the app sends ordinary transactions with a priority fee.
 
 ## 7. What the live confirmation (`confirmLive`) is, and is not (S1)
 

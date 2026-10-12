@@ -48,7 +48,7 @@ describe('A2: secret hygiene', () => {
 
   it('keeps long hex secrets out of tracked docs and sources', () => {
     const root = process.cwd();
-    const files = ['ENV_CONFIG.md', 'README.md', '.env.example'];
+    const files = ['README.md', 'KNOWN_RISKS.md', '.env.example'];
     for (const f of files) {
       const text = fs.readFileSync(path.join(root, f), 'utf8');
       expect(text, `${f} contains a 64-char hex string`).not.toMatch(/[0-9a-f]{64}/i);

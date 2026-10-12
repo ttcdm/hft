@@ -1,24 +1,23 @@
 # Apex Quant HFT Workstation — Known Risks & Operational Guidelines
 
-This document outlines structural, economic, and operational risks inherent to automated high-frequency trading on Solana, together with required operational countermeasures.
+This document outlines structural, economic, and operational risks of running this automated Pump.fun trader, together with the countermeasures the code applies or the operator must apply. The build is **devnet and localnet only**: the cluster guard refuses mainnet, so mainnet-specific advice (private mainnet RPC providers, Jito block engines, tip auctions) does not apply here. It is not a latency-sensitive HFT system.
 
 ---
 
 ## 1. Environmental & Network Risks
 
-### 1.1 Public RPC Rate Limits & Slot Lag
-* **Risk Description:** Free public Solana RPC nodes (such as `api.mainnet-beta.solana.com`) employ strict IP-level rate-limiting and can lag several hundred slots behind the cluster leader.
-* **Operational Impact:** Transactions may encounter stale blockhash errors (`BlockhashNotFound`), and account balances or bonding curve state may be outdated.
-* **Required Countermeasure:** For live trading, operators must configure a dedicated private RPC provider (e.g., Helius, Triton One, QuickNode) with sub-20ms WebSocket feeds to active cluster validators. Set `SOLANA_RPC_URL` and `SOLANA_WS_URL` in `.env`.
+### 1.1 Public devnet RPC Rate Limits & Slot Lag
+* **Risk Description:** The free public devnet RPC (`https://api.devnet.solana.com`) is rate limited per IP and can lag or drop requests. Devnet itself has far less activity and liquidity than mainnet.
+* **Operational Impact:** Transactions may hit stale blockhash errors (`BlockhashNotFound`), and account balances or bonding curve state may be out of date, so a result seen on devnet says little about mainnet behaviour.
+* **Required Countermeasure:** Use a devnet endpoint you control or a provider's devnet URL (never commit it: URLs often embed the API key), or a local validator for `localnet`. Set `SOLANA_RPC_URL` and `SOLANA_WS_URL` in `.env`. The app logs RPC and Jito URLs as scheme and host only. `ENABLE_RPC_FALLBACK` and `RPC_FALLBACK_TIMEOUT_MS` control the RPC fallback path.
 
-### 1.2 Jito Block Engine Connectivity & Tip Floors
-* **Risk Description:** Jito bundle delivery relies on validator availability and competitive tip auction dynamics. In periods of high network congestion, tips below the dynamic floor are dropped by validators.
-* **Operational Impact:** Bundles may fail to land within their valid slot window without on-chain execution.
-* **Required Countermeasure:** 
-  - Ensure `JITO_BLOCK_ENGINE_URL` is set to the nearest geographic endpoint (e.g., Frankfurt, New York).
-  - Keep `JITO_DYNAMIC_TIP_FLOOR` enabled so the engine dynamically queries real-time tip percentiles (25th to 75th percentile).
-  - The workstation automatically validates and defaults to base58 bundle encoding.
-  - In LIVE mode, `jitoHealth` must be `HEALTHY`. A `NOT_CONFIGURED` or `UNHEALTHY` status prevents live arming.
+### 1.2 Jito is not used on devnet
+* **Risk Description:** Devnet has no Jito block engine, so there is no bundle delivery or tip auction to test here. Jito is off by default (no `JITO_BLOCK_ENGINE_URL`). Tip-floor lookups apply to mainnet-beta only. A non-mainnet block engine URL is accepted and used on devnet, which is only meaningful for a test mock.
+* **Operational Impact:** Bundle landing behaviour, tip economics and private-mempool protection are **unverified** and out of scope. Orders are sent as ordinary transactions with a priority fee, so they are exposed to the public mempool.
+* **Required Countermeasure:**
+  - Leave `JITO_BLOCK_ENGINE_URL` unset. With no block engine configured, Jito readiness reads `NOT_CONFIGURED` and is **not** a blocker for arming; RPC is the only transport. A mainnet block engine URL is refused.
+  - If a non-mainnet block engine URL is ever set (tests do, with a mock), it must be `HEALTHY` from a recent probe or live arming fails closed.
+  - `DEFAULT_JITO_TIP_SOL` (default `0.00018`) is the fallback tip, used when neither a tip floor reading nor an order size is available; a normal buy takes a size-scaled tip, never below `MIN_JITO_TIP_SOL` (default `0.00015`) and capped at 15% of the order. While Jito is off (the devnet default) the coordinator forces the tip to 0 (`resolveLiveTip`), so no tip transfer is added to the transaction. A `JITO_DYNAMIC_TIP_FLOOR` setting appears in older notes; no code reads it.
 
 ---
 
@@ -42,7 +41,7 @@ This document outlines structural, economic, and operational risks inherent to a
 * **Operational Impact:** High slippage settings can result in severe adverse execution prices.
 * **Required Countermeasure:**
   - The risk engine strictly enforces an 800 bps (8%) maximum slippage cap (`SLIPPAGE_TOO_HIGH`).
-  - In live mode, all sensitive orders are routed via private Jito bundles with direct validator tips, completely bypassing the public mempool.
+  - On devnet and localnet there is no private bundle route (see 1.2): orders go through the public mempool as ordinary transactions, so sandwich protection is not provided or tested here.
 
 ---
 
@@ -79,7 +78,7 @@ This document outlines structural, economic, and operational risks inherent to a
 * **Required Countermeasure:**
   - The application applies `requireOperatorAuth` to all state-modifying endpoints.
   - WebSocket telemetry enforces `CONNECT → AUTH_REQUIRED → authenticate → AUTHENTICATED`. Query strings are not accepted.
-  - Set `APEX_OPERATOR_TOKEN` in `.env` to a high-entropy secret.
+  - Set `OPERATOR_AUTH_TOKEN` (16+ characters) in `.env` to a high-entropy secret.
 
 ---
 
@@ -97,7 +96,7 @@ These can be set (some from the UI) and are saved, but no code path reads them t
 
 | Setting | Where it lives | What it actually does |
 |---|---|---|
-| `snipeThresholdScore` (Telegram config) | `server/socialScanner.ts` | Stored and returned only. The auto-snipe score gate is the confluence gate (70), set in the confluence engine. |
+| `snipeThresholdScore` (Telegram config) | `server/socialScanner.ts` | Stored and returned only. The auto-snipe score gate is the confluence threshold: default 70, starting from `CONFLUENCE_MIN_SCORE`, editable at runtime (`POST /api/auto/threshold`, S187). |
 | `autoForwardAlerts` (Telegram config) | `server/socialScanner.ts` | Stored only. Nothing forwards alerts to Telegram. |
 | `webhookActive` (Telegram config) | `server/socialScanner.ts` | Changes the word in the `/status` reply. No webhook is registered with Telegram. |
 | `isAutoSnipeEnvEnabled()` | `server/pumpfunService.ts` | Defined, never called. |
@@ -110,7 +109,7 @@ These can be set (some from the UI) and are saved, but no code path reads them t
 | `walletAddress`, `jitoTipAccount`, `wsRpcEndpoint`, `autoStartTrading` (wallet config body) | `server/execution/schemas`/`walletTrader.updateConfig` | Accepted by the schema, never applied by `updateConfig`. |
 | `priorityTipSol` on close-position | `ClosePositionSchema` | Labelled placeholder; ignored. |
 
-Also: the per-caller auto-snipe toggle and the callout auto-snipe rules in the Hot Callouts screen now say on screen that they are markers only. Jito bundles are used only on mainnet-beta, which this build does not use. On devnet and localnet the app sends ordinary transactions with a priority fee.
+Also: the per-caller auto-snipe toggle in the Hot Callouts screen is a screen marker only, and says so on screen; nothing reads it. The callout auto-snipe rules next to it are not markers: while the Auto controller is not OFF, `server/pumpfunService.ts` (`evaluateAutoSnipeTriggers`) reads them and submits matching callouts to the controller as candidates, and the controller applies its own gates (in SHADOW nothing is sent). Jito bundles are used only on mainnet-beta, which this build does not use. On devnet and localnet the app sends ordinary transactions with a priority fee.
 
 ## 7. What the live confirmation (`confirmLive`) is, and is not (S1)
 
@@ -120,7 +119,7 @@ It is a guard against an accidental or scripted one-click trade. It is **not** a
 
 ## 8. What score auto can reach, and what the seeded devnet token will and will not do (S5, S4)
 
-The auto gate asks for a confluence score of 70 (HOT also needs 3 of the watch window's 4 signals). The second review measured the score on the production modules at SOL $150; the earlier notes that put the ceiling at 90, or at 81, were wrong, because Liquidity cannot reach its maximum (it is real SOL x price x 2, so it is 0 to 3 below about 30 SOL real and 6 only at graduation, when the curve is complete and untradable), and Social is always 0.
+The auto gate asks for a confluence score at or above the threshold in force (HOT also needs 3 of the watch window's 4 signals). The threshold is **editable** since S187 (`CONFLUENCE_MIN_SCORE`, or `POST /api/auto/threshold`, whole number 0 to 100, default 70, kept until restart), and the table below was measured against the default 70. Lowering it buys more and weaker coins; the Auto panel warns below 50 and the replay backtest can show a what-if (`?minScore=N`). The second review measured the score on the production modules at SOL $150; the earlier notes that put the ceiling at 90, or at 81, were wrong, because Liquidity cannot reach its maximum (it is real SOL x price x 2, so it is 0 to 3 below about 30 SOL real and 6 only at graduation, when the curve is complete and untradable), and Social is always 0.
 
 | Scenario (hand-built replays, not recorded feeds) | Score |
 |---|---|

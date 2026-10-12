@@ -24,6 +24,8 @@ services:
       - BINANCE_API_SECRET=${BINANCE_API_SECRET:-}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - APEX_TRACING=${APEX_TRACING:-false} # true sends spans to the jaeger service below; see docs/TRACING.md
+      - APEX_TRACING_OTLP_ENDPOINT=http://jaeger:4318/v1/traces
     healthcheck:
       test: ['CMD', 'wget', '--spider', '-q', 'http://localhost:3000/api/health']
       interval: 10s
@@ -43,3 +45,14 @@ services:
         reservations:
           cpus: '0.5'
           memory: 512M
+
+  # Optional trace viewer for APEX_TRACING=true. Start it alone with `docker compose up jaeger`, or with the app. Host loopback only.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    container_name: apex-jaeger
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:16686:16686' # UI
+      - '127.0.0.1:4318:4318' # OTLP over http: the app, when run outside docker, sends here
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true

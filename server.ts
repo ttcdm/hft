@@ -1,4 +1,5 @@
 import './server/loadEnv'; // must stay the FIRST import: singletons built at import time read process.env
+import { tracingReady } from './server/observability/init'; // S209: starts OpenTelemetry tracing when APEX_TRACING=true; does nothing otherwise
 import './suppress-warnings.cjs';
 import express from 'express';
 import cors from 'cors';
@@ -1688,6 +1689,7 @@ process.on('uncaughtException', (err) => {
 });
 
 async function startServer() {
+  await tracingReady; // S209: instrumentation must be in place before any outbound connection is made
   assertReadOnlyStartup(); // S185: refuses to start next to a signing key in read-only mode
   { const p = envConfluenceProblem(); if (p) console.warn(`[APEX QUANT HFT] ${p}`); } // S187
   if (process.env.NODE_ENV !== 'production') {

@@ -1,6 +1,7 @@
 import { MemecoinPool, SniperPosition, SniperBotConfig } from '../src/types';
 import { EventEmitter } from 'events';
 import { PublicKey } from '@solana/web3.js';
+import { traced } from './observability/tracing';
 import { PumpCurveService } from './solana/pumpCurve';
 import { executionCoordinator } from './execution/coordinator';
 import { solPriceService } from './market/solPriceService';
@@ -800,7 +801,7 @@ export class MemecoinAggregatorService extends EventEmitter {
     // Alpha Pipeline Integration (B14): Enforce the confluence composite score (threshold in force, default 70) when gating is enabled
     const shouldEnforceConfluence = params.enforceConfluence === true || this.isConfluenceGatingEnabled;
     const minConfluence = params.minConfluenceScore ?? getConfluenceThreshold();
-    const confluenceEval = this.evaluateTokenConfluence(pool);
+    const confluenceEval = traced('gate.confluence', () => this.evaluateTokenConfluence(pool));
 
     if (shouldEnforceConfluence && confluenceEval.score < minConfluence) {
       return {

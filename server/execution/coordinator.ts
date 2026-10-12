@@ -45,6 +45,7 @@ import { workstationDb } from '../db/database';
 import { getRandomJitoTipAccount, TOKEN_2022_PROGRAM_ID } from '../solana/programs';
 import { executionConfig } from '../solana/executionConfig';
 import { Logger, endpointOrigin } from '../middleware/enterprise';
+import { traced } from '../observability/tracing';
 import { allowedCluster, assertClusterAllowed, assertClusterAllowedCached, assertSendClusterAllowed, rememberGenesisCheck, resolveRpcUrl } from '../solana/clusterGuard';
 import { PumpCurveService, TradeQuote, PumpMarketState, fetchTokenHolderDistribution } from '../solana/pumpCurve';
 import { TradeReconciler, RealMarkPriceService, PreTradeSnapshot } from './reconciliation';
@@ -1444,8 +1445,8 @@ export class ExecutionCoordinator {
     // Cluster guard: every signed buy and sell passes through here. Refuse before anything is sent
     // unless the RPC reports the allowed cluster's genesis hash (devnet unless Mike set ALLOWED_CLUSTER).
     try {
-      assertSendClusterAllowed(); // mainnet is never a send target, even when the RPC reports its genesis
-      await assertClusterAllowedCached(this.connection); // S208: a pass is remembered per Connection for 60 s
+      traced('guard.sendCluster', () => assertSendClusterAllowed()); // mainnet is never a send target, even when the RPC reports its genesis
+      await traced('guard.genesis', () => assertClusterAllowedCached(this.connection)); // S208: a pass is remembered per Connection for 60 s
     } catch (err: any) {
       Logger.error(`[R1] ${side} for order ${orderId} blocked: ${err.message}`);
       workstationDb.logJournal('CLUSTER_GUARD_BLOCK', correlationId, 'LIVE', { orderId, side, mint, error: err.message });
@@ -1528,7 +1529,7 @@ export class ExecutionCoordinator {
       }
 
       // Submit bundle to Jito
-      const submitRes = await this.jitoTransport.submit(tx);
+      const submitRes = await traced('tx.submit', () => this.jitoTransport.submit(tx), { 'apex.transport': 'JITO', 'apex.side': side });
       if (submitRes.signature) lastSignature = submitRes.signature;
       if (submitRes.bundleId) lastBundleId = submitRes.bundleId;
 
@@ -1558,7 +1559,7 @@ export class ExecutionCoordinator {
       });
 
       // Confirm with bounded timeout
-      const confirmRes = await this.jitoTransport.confirm(submitRes.signature, confirmTimeoutMs, submitRes.bundleId);
+      const confirmRes = await traced('tx.confirm', () => this.jitoTransport.confirm(submitRes.signature, confirmTimeoutMs, submitRes.bundleId), { 'apex.transport': 'JITO', 'apex.side': side });
       if (confirmRes.confirmed) {
         jitoLanded = true;
         landedSlot = confirmRes.slot;
@@ -1638,7 +1639,7 @@ export class ExecutionCoordinator {
         previousJitoBundleId: lastBundleId,
       });
 
-      const rpcSubmit = await this.rpcTransport.submit(tx);
+      const rpcSubmit = await traced('tx.submit', () => this.rpcTransport.submit(tx), { 'apex.transport': 'SOLANA_RPC', 'apex.side': side });
       if (!rpcSubmit.success || !rpcSubmit.signature) {
         return {
           success: false,
@@ -1664,7 +1665,7 @@ export class ExecutionCoordinator {
         executionMode: 'LIVE',
       });
 
-      const rpcConfirm = await this.rpcTransport.confirm(rpcSubmit.signature, cfg.rpcFallbackTimeoutMs || 15000);
+      const rpcConfirm = await traced('tx.confirm', () => this.rpcTransport.confirm(rpcSubmit.signature, cfg.rpcFallbackTimeoutMs || 15000), { 'apex.transport': 'SOLANA_RPC', 'apex.side': side });
       if (rpcConfirm.confirmed) {
         return {
           success: true,
@@ -1859,7 +1860,7 @@ export class ExecutionCoordinator {
     // Evaluate Risk in Paper Mode
     // Q51: read the open positions now (the caller's list is from before the awaits above)
     const paperOpenNow = workstationDb.loadPositions('PAPER', 'ACTIVE');
-    const riskDecision = riskEngine.evaluateOrder({
+    const riskDecision = traced('risk.evaluateOrder', () => riskEngine.evaluateOrder({
       mint: req.mint,
       orderSizeSol: req.amountSol,
       expectedPriceSol: quotePriceSol,
@@ -1875,7 +1876,7 @@ export class ExecutionCoordinator {
       // `paperSpendable` already had the reserve taken off, and passing it charged the reserve twice.
       walletSpendableSol: Math.max(0, paperBalanceSol - this.inFlightReservedSol),
       executionMode: 'PAPER',
-    });
+    }));
 
     if (!riskDecision.approved) {
       workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'PAPER', {
@@ -1958,7 +1959,7 @@ export class ExecutionCoordinator {
         );
       }
     }
-    const verdict = this.eligibilityVerdict(eligibility!, now, 'PAPER', correlationId, strict);
+    const verdict = traced('gate.eligibility', () => this.eligibilityVerdict(eligibility!, now, 'PAPER', correlationId, strict), { 'apex.mode': 'PAPER' });
     const checks = eligibility!.checks;
     const gates = {
       strict,
@@ -1972,7 +1973,12 @@ export class ExecutionCoordinator {
   }
 
   // Authoritative Central Execution Entrypoint
-  public async executeTrade(req: ExecuteTradeRequest): Promise<ExecutionResponse> {
+  /** The one entry for every trade. S209: a span of its own (a child of the auto candidate's when auto started it, else the root of a manual trade's trace). */
+  public executeTrade(req: ExecuteTradeRequest): Promise<ExecutionResponse> {
+    return traced('trade.execute', () => this.executeTradeUntraced(req), { 'apex.mode': this.executionMode });
+  }
+
+  private async executeTradeUntraced(req: ExecuteTradeRequest): Promise<ExecutionResponse> {
     const correlationId = `exec-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`;
     const now = Date.now();
     this.recordMarketEvent();
@@ -2218,7 +2224,7 @@ export class ExecutionCoordinator {
       );
     }
 
-    const verdict = this.eligibilityVerdict(eligibility!, now, 'LIVE', correlationId); // set above whenever it was missing
+    const verdict = traced('gate.eligibility', () => this.eligibilityVerdict(eligibility!, now, 'LIVE', correlationId), { 'apex.mode': 'LIVE' }); // set above whenever it was missing
     if (verdict) return verdict;
 
     // Q16: one open LIVE row per mint. A second buy over the same token account leaves two rows against one balance (the N3 adoption and the
@@ -2335,7 +2341,7 @@ export class ExecutionCoordinator {
     // that are in flight (not positions yet). There is no await between this read, the risk check and the reservation below.
     const freshOpen = workstationDb.loadPositions(this.executionMode, 'ACTIVE');
     const freshExposureSol = freshOpen.reduce((acc, p) => acc + p.costBasisLamports / 1e9, 0) + this.inFlightReservedSol;
-    const riskDecision = riskEngine.evaluateOrder({
+    const riskDecision = traced('risk.evaluateOrder', () => riskEngine.evaluateOrder({
       mint: req.mint,
       orderSizeSol: req.amountSol,
       expectedPriceSol: quote.executionPriceSol,
@@ -2353,7 +2359,7 @@ export class ExecutionCoordinator {
       // is not in getBalance, so it is not subtracted either.
       walletSpendableSol: Math.max(0, rawWalletBalance - this.inFlightReservedSol),
       executionMode: 'LIVE',
-    });
+    }));
 
     if (!riskDecision.approved) {
       workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'LIVE', {
@@ -2436,8 +2442,8 @@ export class ExecutionCoordinator {
       };
 
       // 5. Build, sign, and submit real Solana transaction
-      const v0Tx = await txBuilder.buildBuyTransaction(this.connection, buyParams);
-      await localSigner.signTransaction(v0Tx);
+      const v0Tx = await traced('tx.build', () => txBuilder.buildBuyTransaction(this.connection, buyParams), { 'apex.side': 'BUY' });
+      await traced('tx.sign', () => localSigner.signTransaction(v0Tx), { 'apex.side': 'BUY' });
 
       // Q17: risk approval was several awaits ago (curve read, holder lookup, tip floor, blockhash, snapshot, sign). Disarm, a halt or the
       // kill switch may have happened in between; nothing is sent after any of them.
@@ -2552,7 +2558,7 @@ export class ExecutionCoordinator {
 
       // 7. REAL FILL RECONCILIATION
       // Do not construct position from estimates; verify confirmed on-chain fill
-      const reconciliation = await TradeReconciler.reconcileBuyTransaction(
+      const reconciliation = await traced('tx.reconcile', () => TradeReconciler.reconcileBuyTransaction(
         this.connection,
         subRes.signature,
         buyer,
@@ -2560,7 +2566,7 @@ export class ExecutionCoordinator {
         marketState.tokenProgram,
         preSnapshot,
         resolvedTip.tipLamports
-      );
+      ), { 'apex.side': 'BUY' });
 
       if (!reconciliation.success || reconciliation.reconciliationState !== 'RECONCILED') {
         riskEngine.recordTradeFailure();
@@ -2779,7 +2785,16 @@ export class ExecutionCoordinator {
   }
 
   /** Close (part of) a position, and write the exit to the decision journal (G3). */
-  public async closePosition(
+  /** S209: the exit pass gets its own span (a trace of its own unless a caller's trace is active). */
+  public closePosition(
+    positionId: string,
+    sellPct: number = 100,
+    reason: string = 'Manual Close'
+  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number }> {
+    return traced('exit.close', () => this.closePositionUntraced(positionId, sellPct, reason), { 'apex.reason': reason, 'apex.sellPct': sellPct });
+  }
+
+  private async closePositionUntraced(
     positionId: string,
     sellPct: number = 100,
     reason: string = 'Manual Close'
@@ -3000,7 +3015,7 @@ export class ExecutionCoordinator {
       // S207: a LIVE sell on a mainnet setting is refused before anything is built, signed or simulated (submit still checks too), so no never-sent row is left behind.
       if (target.executionMode === 'LIVE') {
         try {
-          assertSendClusterAllowed();
+          traced('guard.sendCluster', () => assertSendClusterAllowed());
         } catch (err: any) {
           Logger.error(`[R1] SELL for position ${positionId} blocked before signing: ${err.message}`);
           workstationDb.logJournal('CLUSTER_GUARD_BLOCK', `exit-${positionId.slice(0, 8)}`, 'LIVE', { side: 'SELL', mint: target.mint, error: err.message });
@@ -3104,7 +3119,7 @@ export class ExecutionCoordinator {
           closeAta: closeAtaEffective,
         };
 
-        v0Tx = await txBuilder.buildSellTransaction(this.connection, sellParams, closeAtaEffective);
+        v0Tx = await traced('tx.build', () => txBuilder.buildSellTransaction(this.connection, sellParams, closeAtaEffective), { 'apex.side': 'SELL' });
       } else {
         return { success: false, pnlSol: 0, error: `Trading venue for mint ${target.mint} cannot be resolved or migrated to unknown DEX` };
       }
@@ -3117,7 +3132,7 @@ export class ExecutionCoordinator {
         tokenProgramToUse
       );
 
-      await localSigner.signTransaction(v0Tx);
+      await traced('tx.sign', () => localSigner.signTransaction(v0Tx), { 'apex.side': 'SELL' });
 
       // A sell that would revert (slippage breached, bad account) costs fees every time it lands. Simulate first and only send one that passes.
       // If the simulation call itself fails, send anyway: a stop-loss must not be blocked by a flaky RPC.
@@ -3149,7 +3164,7 @@ export class ExecutionCoordinator {
       const costSoldSol = (target.costBasisLamports / 1e9) * fraction;
 
       // Reconcile real proceeds from confirmed transaction
-      const sellRecon = await TradeReconciler.reconcileSellTransaction(
+      const sellRecon = await traced('tx.reconcile', () => TradeReconciler.reconcileSellTransaction(
         this.connection,
         subRes.signature,
         seller,
@@ -3159,7 +3174,7 @@ export class ExecutionCoordinator {
         target.costBasisLamports,
         fraction,
         expectedJitoTipLamports
-      );
+      ), { 'apex.side': 'SELL' });
 
       if (!sellRecon.success) {
         this.pendingSells.set(positionId, { signature: subRes.signature, ts: Date.now() });

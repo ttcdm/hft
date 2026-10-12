@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import { isReadOnly } from '../solana/readOnly';
 import { workstationDb } from '../db/database';
+import { traced } from '../observability/tracing';
 import { executionCoordinator, isRecoveredPosition } from '../execution/coordinator';
 import { memecoinAggregator } from '../memecoinAggregator';
 import { solPriceService } from '../market/solPriceService';
@@ -636,7 +637,12 @@ export class AutoSnipeController extends EventEmitter {
   /**
    * The single door into auto trading. Returns the decision it journaled.
    */
-  public async submitCandidate(c: AutoCandidate): Promise<AutoDecision> {
+  /** S209: the root span of an auto candidate's trace; everything below it (watch verdict, gates, risk, build, sign, submit, confirm, reconcile) nests inside. */
+  public submitCandidate(c: AutoCandidate): Promise<AutoDecision> {
+    return traced('auto.candidate', () => this.submitCandidateUntraced(c), { 'apex.source': c.source, 'apex.mode': this.mode });
+  }
+
+  private async submitCandidateUntraced(c: AutoCandidate): Promise<AutoDecision> {
     const key = c.mint.toLowerCase();
     // Q27: the 5s candidate loops resubmit the same mints forever. A drop that depends only on the watch verdict (never watched, still
     // watching, dead) cannot change until the verdict does, so a repeat inside DROP_REPEAT_MS gets the earlier decision and no new rows
@@ -659,7 +665,7 @@ export class AutoSnipeController extends EventEmitter {
 
     // G2b: only watch-window releases get this far. HOT goes straight to the execution stages; READY must also clear
     // the confluence score (the threshold in force, default 70) here; DEAD, still-watching and never-watched candidates are dropped.
-    const verdict = watchWindow.getVerdict(c.mint);
+    const verdict = traced('watch.release', () => watchWindow.getVerdict(c.mint));
     if (!verdict || verdict.state === 'WATCHING' || verdict.state === 'DEAD') {
       const reason = !verdict ? 'NOT_IN_WATCH_WINDOW' : verdict.state === 'WATCHING' ? 'WATCH_PENDING: still in the watch window' : `WATCH_DEAD: ${verdict.reason}`;
       const dropped = this.record(c, 'DROPPED', 'watch', reason);
@@ -731,7 +737,7 @@ export class AutoSnipeController extends EventEmitter {
       } else if (this.orderSolOverride !== null) {
         params.amountSolOverride = this.orderSolOverride; // S183: PAPER and SHADOW use the operator's size too
       }
-      const res = await memecoinAggregator.executeSnipe(params);
+      const res = await traced('snipe.execute', () => memecoinAggregator.executeSnipe(params), { 'apex.dryRun': shadow });
       if (!res.success) {
         // R6: a buy that was sent and may have landed (unconfirmed, or landed with an unreadable fill) spent real SOL the cap must count.
         if (startSession && !shadow && /^(UNCONFIRMED|RECONCILIATION FAILED)/.test(res.message)) {

@@ -61,6 +61,8 @@ Values are read as strings. Booleans mean the exact text `true` unless the row s
 | `APEX_RECORD_MAX_TRADES_PER_MINT` | scales with the minutes above | `server/backtest/recorderConfig.ts` | 100 to 1,000,000. Trades kept per launch. |
 | `APEX_RECORD_RETENTION_DAYS` | `14` | `server/backtest/recorderConfig.ts` | 1 to 365. Recorded launches older than this are pruned. |
 | `APEX_RECORD_MAX_ROWS` | `3000000` (`6000000` read-only) | `server/backtest/recorderConfig.ts` | 10,000 to 200,000,000. The oldest launches are pruned past this. |
+| `APEX_TRACING` | off (anything but `true`) | `server/observability/tracing.ts` | `true` turns on OpenTelemetry tracing: outbound http and fetch calls plus the trade pipeline steps become spans, sent only to a local OTLP endpoint. See [`TRACING.md`](TRACING.md). Off means no tracing code runs. |
+| `APEX_TRACING_OTLP_ENDPOINT` | `http://127.0.0.1:4318/v1/traces` | `server/observability/tracing.ts` | Where spans go. Must be loopback or the compose service `jaeger`; anything else makes tracing refuse to start. Span attributes never carry URL paths or queries. |
 | `APEX_REPLAY_MAX_LAUNCHES` | `5000` | `server.ts` | 100 to 50000. Newest launches covered by one replay. |
 | `APEX_WATCH_MAX_CANDIDATES` | `60` (`250` read-only) | `server/signals/capacity.ts` | 10 to 2000. How many launches the watch window follows at once. |
 | `APEX_PUBLIC_FUNDERS` | none | `server/signals/watchWindow.ts` | Comma-separated addresses of wallets that fund thousands of unrelated traders (exchange hot wallets, a faucet), so the watch window does not treat their customers as one cluster. Empty by default. |

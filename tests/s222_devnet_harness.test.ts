@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { PumpCurveService } from '../server/solana/pumpCurve';
-import { planFunding } from '../scripts/devnet_funding';
+import fs from 'fs';
+import { planFunding, liveBuyRequest } from '../scripts/devnet_funding';
 import { createSimulatedBondingCurveState } from './e2e/helpers/simulatedStates';
 
 describe('S222: the devnet harness fails clearly instead of crashing', () => {
@@ -24,5 +25,18 @@ describe('S222: the devnet harness fails clearly instead of crashing', () => {
     expect(() => PumpCurveService.calculateBuyQuote({ state, solAmountSol: 0.01, slippageBps: 800, executionMode: 'PAPER' } as any)).toThrow(/amountSol/);
     expect(() => PumpCurveService.calculateBuyQuote({ state, amountSol: Number.NaN, slippageBps: 800, executionMode: 'PAPER' } as any)).toThrow(/Order size/);
     expect(() => PumpCurveService.calculateBuyQuote({ state, amountSol: 0, slippageBps: 800, executionMode: 'PAPER' } as any)).toThrow(/Order size/);
+  });
+
+  it('S223: the LIVE buy request carries a signal time the coordinator accepts, and both harness calls build it with liveBuyRequest', () => {
+    const now = 1_700_000_000_000;
+    const r = liveBuyRequest('MINT', 0.01, now);
+    // the coordinator refuses LIVE with no signal time, or one in the future (MISSING_SIGNAL_TIMESTAMP)
+    expect(Number.isFinite(r.signalTimestamp) && (r.signalTimestamp as number) > 0 && (r.signalTimestamp as number) <= now + 5_000).toBe(true);
+    expect(r).toMatchObject({ mint: 'MINT', amountSol: 0.01, source: 'MANUAL', provenance: 'MANUAL_OPERATOR', executionMode: 'LIVE' });
+    const t0 = Date.now();
+    expect(liveBuyRequest('M', 0.01).signalTimestamp as number).toBeGreaterThanOrEqual(t0);
+    const src = fs.readFileSync('scripts/devnet_e2e.ts', 'utf8');
+    expect(src.match(/executeTrade\(liveBuyRequest\(/g)?.length).toBe(2);
+    expect(src).not.toMatch(/executeTrade\(\{/);
   });
 });

@@ -2,6 +2,8 @@
  * How much the devnet harness can do with the balance it found. Pure, so a test can check it.
  * The buy is about 8% of the balance (the 10% spendable ceiling), capped at 0.01 SOL; under 0.03 SOL the harness does not trade.
  */
+import type { ExecuteTradeRequest } from "../server/execution/coordinator";
+
 export interface FundingPlan {
   buySol: number;
   funded: boolean;
@@ -23,5 +25,18 @@ export function planFunding(balSol: number, address: string): FundingPlan {
   return {
     buySol, funded, unfunded: false,
     message: `${safe} SOL at ${address}; buy size ${buySol} SOL${funded ? '' : ' (too low to trade: fund this devnet address and re-run; only the simulate stage runs)'}`,
+  };
+}
+
+/**
+ * The executeTrade request the harness sends for its LIVE buy. Typed, so a field the coordinator renames fails tsc here instead of on the
+ * next devnet run. `signalTimestamp` is taken when the request is made: LIVE refuses a trade with no signal time (MISSING_SIGNAL_TIMESTAMP),
+ * and an operator command is its own signal.
+ */
+export function liveBuyRequest(mint: string, amountSol: number, now: number = Date.now()): ExecuteTradeRequest {
+  return {
+    mint, symbol: 'E2E', name: 'E2E', amountSol,
+    source: 'MANUAL', provenance: 'MANUAL_OPERATOR', executionMode: 'LIVE',
+    signalTimestamp: now,
   };
 }

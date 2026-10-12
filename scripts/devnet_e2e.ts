@@ -85,7 +85,7 @@ async function main() {
   }
   // Sizes scale down to the balance: the 10% spendable ceiling means a buy of about 8% of the balance.
   const balSol = bal / LAMPORTS_PER_SOL;
-  const { planFunding } = await import('./devnet_funding');
+  const { planFunding, liveBuyRequest } = await import('./devnet_funding');
   const plan = planFunding(balSol, kp.publicKey.toBase58());
   const BUY_SOL = plan.buySol;
   const funded = plan.funded;
@@ -133,7 +133,7 @@ async function main() {
         amountTokens: BigInt(quote.tokenAmountRaw), maxSolCostLamports: BigInt(quote.maxInputLamports),
         computeUnits: 250000, priorityFeeMicroLamports: executionConfig.getConfig().priorityFeeMicrolamports,
         jitoTipLamports: 0n, jitoTipAccount: executionConfig.getJitoTipAccountPublicKey(),
-      } as any);
+      });
       const sim = await conn.simulateTransaction(buyTx as any, { sigVerify: false, replaceRecentBlockhash: true });
       rec('simulate BUY', !sim.value.err, sim.value.err ? JSON.stringify(sim.value.err) + ' ' + (sim.value.logs || []).slice(-3).join(' | ') : `ok, ${sim.value.unitsConsumed} CU`);
     } catch (e: any) {
@@ -181,17 +181,13 @@ async function main() {
     return finish();
   }
   if (phase === 'crash') {
-    await coordinator.executeTrade({
-      mint, symbol: 'E2E', name: 'E2E', amountSol: BUY_SOL, source: 'MANUAL', provenance: 'MANUAL_OPERATOR', executionMode: 'LIVE',
-    } as any);
+    await coordinator.executeTrade(liveBuyRequest(mint, BUY_SOL));
     rec('crash phase', false, 'process should have been killed after submit');
     return finish();
   }
 
   // (a) BUY through the RPC transport
-  const buy = await coordinator.executeTrade({
-    mint, symbol: 'E2E', name: 'E2E', amountSol: BUY_SOL, source: 'MANUAL', provenance: 'MANUAL_OPERATOR', executionMode: 'LIVE',
-  } as any);
+  const buy = await coordinator.executeTrade(liveBuyRequest(mint, BUY_SOL));
   rec('(a) BUY', buy.success && buy.lifecycleState === 'CONFIRMED', `${buy.lifecycleState} ${buy.error || ''}`);
   await verify('(a)', buy.txSignature || buy.signature);
   const txRows = workstationDb.loadTransactions();
@@ -222,7 +218,7 @@ async function main() {
       quoteMint: state.quoteMint, tokenProgram: state.tokenProgram, quoteTokenProgram: state.quoteTokenProgram,
       amountTokens: BigInt(q.tokenAmountRaw), maxSolCostLamports: 1n, computeUnits: 250000, priorityFeeMicroLamports: 1000,
       jitoTipLamports: 0n, jitoTipAccount: executionConfig.getJitoTipAccountPublicKey(),
-    } as any);
+    });
     await localSigner.signTransaction(bad);
     const sig = await conn.sendRawTransaction(bad.serialize(), { skipPreflight: true });
     const st = await conn.confirmTransaction(sig, 'confirmed');
@@ -240,7 +236,7 @@ async function main() {
       feeRecipient: state.feeRecipient, buybackFeeRecipient: state.buybackFeeRecipient, quoteMint: state.quoteMint,
       tokenProgram: state.tokenProgram, quoteTokenProgram: state.quoteTokenProgram, amountTokens: 1n, maxSolCostLamports: 1000n,
       computeUnits: 250000, priorityFeeMicroLamports: 1000, jitoTipLamports: 0n, jitoTipAccount: executionConfig.getJitoTipAccountPublicKey(),
-    } as any);
+    });
     await localSigner.signTransaction(dupTx);
     const before = workstationDb.loadTransactions(prior.orderId).length;
     const r = await coordinator.submitAndConfirmWithRetry({

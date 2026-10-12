@@ -24,6 +24,9 @@ Optional env: `DEVNET_RPC_URL` (must not look like mainnet), `DEVNET_MINTS=<comm
 5. (e) a second submit with an already recorded orderId must add no transaction row.
 6. (f) a child process is killed right after `sendRawTransaction` returns; a second process on the same scratch DB runs startupReconciliation and must find the position.
 
+## Notes
+- The LIVE buy request is built by `liveBuyRequest` in `scripts/devnet_funding.ts` (typed as `ExecuteTradeRequest`, with `signalTimestamp` set when the request is made; LIVE refuses a trade without one).
+
 ## Status
 Written and type-checked, NOT run against devnet: the overnight sandbox proxy returns 403 for api.devnet.solana.com. Running it
 offline fails closed at the genesis check (verified). Expect to adjust stage details on the first real run: the exact

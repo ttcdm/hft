@@ -3,6 +3,7 @@
  * The buy is about 8% of the balance (the 10% spendable ceiling), capped at 0.01 SOL; under 0.03 SOL the harness does not trade.
  */
 import type { ExecuteTradeRequest } from "../server/execution/coordinator";
+import type { TokenEligibilityReport } from "../server/core/types";
 
 export interface FundingPlan {
   buySol: number;
@@ -53,10 +54,11 @@ export async function awaitSolPrice(svc: PriceSource, attempts = 4, pauseMs = 15
  * next devnet run. `signalTimestamp` is taken when the request is made: LIVE refuses a trade with no signal time (MISSING_SIGNAL_TIMESTAMP),
  * and an operator command is its own signal.
  */
-export function liveBuyRequest(mint: string, amountSol: number, now: number = Date.now()): ExecuteTradeRequest {
+export function liveBuyRequest(mint: string, amountSol: number, now: number = Date.now(), eligibilityReport?: TokenEligibilityReport): ExecuteTradeRequest {
   return {
     mint, symbol: 'E2E', name: 'E2E', amountSol,
     source: 'MANUAL', provenance: 'MANUAL_OPERATOR', executionMode: 'LIVE',
     signalTimestamp: now,
+    ...(eligibilityReport ? { eligibilityReport } : {}),
   };
 }

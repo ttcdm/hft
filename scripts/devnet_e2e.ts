@@ -98,27 +98,85 @@ async function main() {
   const { txBuilder } = await import('../server/solana/transactionBuilder');
   const { executionConfig } = await import('../server/solana/executionConfig');
 
-  // ---- pick a live pump mint ----
-  const mints = (process.env.DEVNET_MINTS ? process.env.DEVNET_MINTS.split(',') : DEFAULT_MINTS).map((s) => s.trim());
-  let mint: string | null = null;
-  let state: any = null;
-  for (const m of mints) {
+  // ---- pick a live pump mint the app's own eligibility filter accepts (S226) ----
+  const { PUMPFUN_PROGRAM_ID } = await import('../server/solana/programs');
+  const { fetchTokenHolderDistribution } = await import('../server/solana/pumpCurve');
+  const { MAX_CREATOR_HOLDING_PCT, MAX_TOP10_HOLDERS_PCT } = await import('../server/solana/executionConfig');
+  const M = await import('./devnet_mints');
+  const limits = { maxCreatorPct: MAX_CREATOR_HOLDING_PCT, maxTop10Pct: MAX_TOP10_HOLDERS_PCT };
+  const selectedFile = path.join(scratch, 'selected-mint.json');
+  const states = new Map<string, any>();
+  const probeMint = async (m: string): Promise<import('./devnet_mints').MintProbe> => {
+    let st: any;
     try {
-      const s = await PumpCurveService.fetchPumpMarketState({ connection: conn, mint: new PublicKey(m), executionMode: 'LIVE' });
-      if (s && !s.complete) {
-        mint = m;
-        state = s;
-        break;
-      }
+      st = await PumpCurveService.fetchPumpMarketState({ connection: conn, mint: new PublicKey(m), executionMode: 'LIVE' });
     } catch (e: any) {
-      console.log(`mint ${m} unusable: ${String(e.message).slice(0, 100)}`);
+      return { mint: m, usable: false, creatorPct: null, top10Pct: null, note: M.scrubUrls(String(e.message)).slice(0, 80) };
     }
+    if (!st || st.complete) return { mint: m, usable: false, creatorPct: null, top10Pct: null, note: 'migrated or unreadable' };
+    states.set(m, st);
+    try {
+      const d = await fetchTokenHolderDistribution(conn, new PublicKey(m), st.creator, st.bondingCurve);
+      return { mint: m, usable: true, creatorPct: d.devHoldingPct, top10Pct: d.top10HoldersPct };
+    } catch (e: any) {
+      return { mint: m, usable: true, creatorPct: null, top10Pct: null, note: M.scrubUrls(String(e.message)).slice(0, 80) };
+    }
+  };
+  const allowWaiver = process.env.DEVNET_NO_WAIVER !== '1';
+  let mint: string | null = null;
+  let waive = false;
+  let state: any = null;
+  if (phase !== 'main') {
+    // The crash and recover processes use the mint the main process chose; they do not choose again.
+    const sel = JSON.parse(fs.readFileSync(selectedFile, 'utf8'));
+    mint = sel.mint;
+    waive = !!sel.waive;
+    state = await PumpCurveService.fetchPumpMarketState({ connection: conn, mint: new PublicKey(mint!), executionMode: 'LIVE' });
+  } else {
+    const listed = (process.env.DEVNET_MINTS ? process.env.DEVNET_MINTS.split(',') : DEFAULT_MINTS).map((x) => x.trim()).filter(Boolean);
+    const probes: import('./devnet_mints').MintProbe[] = [];
+    const seen = new Set<string>();
+    const MAX_PROBES = 25;
+    const clearFound = () => probes.some((p) => M.classifyProbe(p, limits) === 'CLEAR');
+    for (const m of listed) {
+      if (clearFound() || probes.length >= MAX_PROBES) break;
+      seen.add(m);
+      probes.push(await probeMint(m));
+    }
+    if (!clearFound()) {
+      console.log(`INFO  none of the listed mints clears creator <= ${limits.maxCreatorPct}% and top-10 <= ${limits.maxTop10Pct}%; scanning recent pump.fun devnet activity`);
+      for (const m of await M.recentCreateMints(conn, PUMPFUN_PROGRAM_ID)) {
+        if (clearFound() || probes.length >= MAX_PROBES) break;
+        if (seen.has(m)) continue;
+        seen.add(m);
+        probes.push(await probeMint(m));
+      }
+    }
+    const count = (c: string) => probes.filter((p) => M.classifyProbe(p, limits) === c).length;
+    console.log(`INFO  probed ${probes.length} mint(s): ${count('CLEAR')} clear, ${count('OVER')} over a limit, ${count('UNKNOWN')} holder data unreadable, ${count('UNUSABLE')} unusable`);
+    const ordered = M.orderCandidates(probes, limits, allowWaiver);
+    const pick = ordered[0];
+    if (!pick) {
+      const why = count('UNKNOWN') > 0
+        ? `holder data could not be read for ${count('UNKNOWN')} mint(s) (the public devnet RPC rate-limits it: set DEVNET_RPC_URL to a private devnet endpoint). An unknown share is never waived.`
+        : allowWaiver ? 'no usable mint was found at all.' : 'every readable mint is over a limit and DEVNET_NO_WAIVER=1 forbids the waiver.';
+      rec('mint', false, `no eligible pump.fun devnet mint: ${why} You can also pass DEVNET_MINTS=<comma list>.`);
+      return finish();
+    }
+    mint = pick.mint;
+    state = states.get(mint);
+    waive = pick.kind === 'OVER';
+    if (waive) {
+      console.log(`WAIVER  no mint cleared the limits. Using ${mint}: creator ${pick.creatorPct.toFixed(1)}% (limit ${limits.maxCreatorPct}%), top-10 ${pick.top10Pct.toFixed(1)}% (limit ${limits.maxTop10Pct}%).`);
+      console.log("WAIVER  The creator and top-10 checks are waived for this devnet run only, in the harness report. The app's own filter is unchanged. Set DEVNET_NO_WAIVER=1 to forbid this.");
+    }
+    fs.writeFileSync(selectedFile, JSON.stringify({ mint, waive }));
   }
-  if (!mint) {
+  if (!mint || !state) {
     rec('mint', false, 'no usable active pump.fun devnet mint; pass DEVNET_MINTS=<comma list> (they go stale fast)');
     return finish();
   }
-  console.log(`INFO  mint: ${mint}`); // the failure case above is recorded; this line is not a pass
+  console.log(`INFO  mint: ${mint}${waive ? ' (holder limits waived, see above)' : ''}`); // the failure case above is recorded; this line is not a pass
   const mintPk = new PublicKey(mint);
 
   if (phase === 'main') {
@@ -184,6 +242,29 @@ async function main() {
     rec(`${label} getTransaction`, !!t && !t.meta?.err, `${solscan(sig)}${t?.meta?.err ? ' err=' + JSON.stringify(t.meta.err) : ''}`);
   };
 
+  // The eligibility report for the buy, built from fresh holder data right before it (the coordinator refuses a report older than 60 s). Built here so
+  // a rate-limited holder lookup inside the coordinator cannot refuse a mint that was already screened; with waive set, only the creator and top-10 checks are waived.
+  const buildBuyRequest = async () => {
+    let report: import('../server/core/types').TokenEligibilityReport | undefined;
+    try {
+      const { EligibilityFilter } = await import('../server/signals/eligibilityFilter');
+      const dist = await fetchTokenHolderDistribution(conn, mintPk, state.creator, state.bondingCurve);
+      const liquidityUsd = (Number(state.realSolReserves) / 1e9) * price.usd! * 2;
+      report = EligibilityFilter.evaluate(M.harnessEligibilityInput({ mint: mint!, symbol: 'E2E', name: 'E2E' }, state, dist, liquidityUsd), true);
+      if (!report.isEligible && waive) {
+        const w = M.waiveHolderChecks(report);
+        if (w) {
+          console.log(`WAIVER  waiving for this run: ${w.waived.join('; ')}`);
+          report = w.report;
+        }
+      }
+    } catch (e: any) {
+      console.log(`INFO  could not build the eligibility report (${M.scrubUrls(String(e.message)).slice(0, 100)}); the coordinator will check by itself`);
+      report = undefined;
+    }
+    return liveBuyRequest(mint!, BUY_SOL, Date.now(), report);
+  };
+
   if (phase === 'recover') {
     const r = await coordinator.startupReconciliation();
     rec('(f) startupReconciliation after kill', r.status !== 'OFFLINE', `${r.status}: ${r.details}`);
@@ -192,13 +273,13 @@ async function main() {
     return finish();
   }
   if (phase === 'crash') {
-    await coordinator.executeTrade(liveBuyRequest(mint, BUY_SOL));
+    await coordinator.executeTrade(await buildBuyRequest());
     rec('crash phase', false, 'process should have been killed after submit');
     return finish();
   }
 
   // (a) BUY through the RPC transport
-  const buy = await coordinator.executeTrade(liveBuyRequest(mint, BUY_SOL));
+  const buy = await coordinator.executeTrade(await buildBuyRequest());
   rec('(a) BUY', buy.success && buy.lifecycleState === 'CONFIRMED', `${buy.lifecycleState} ${buy.error || ''}`);
   await verify('(a)', buy.txSignature || buy.signature);
   const txRows = workstationDb.loadTransactions();

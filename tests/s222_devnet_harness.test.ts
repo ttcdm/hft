@@ -36,7 +36,8 @@ describe('S222: the devnet harness fails clearly instead of crashing', () => {
     const t0 = Date.now();
     expect(liveBuyRequest('M', 0.01).signalTimestamp as number).toBeGreaterThanOrEqual(t0);
     const src = fs.readFileSync('scripts/devnet_e2e.ts', 'utf8');
-    expect(src.match(/executeTrade\(liveBuyRequest\(/g)?.length).toBe(2);
+    expect(src.match(/executeTrade\(await buildBuyRequest\(\)\)/g)?.length).toBe(2);
+    expect(src).toMatch(/return liveBuyRequest\(/);
     expect(src).not.toMatch(/executeTrade\(\{/);
   });
 });

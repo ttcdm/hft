@@ -14,11 +14,20 @@ function targetOf(args) {
   if (a && typeof a === 'object') return `${a.protocol || ''}//${a.hostname || a.host || ''}${a.path || ''}`;
   return String(a);
 }
+// Only scheme and host are ever printed: a private RPC URL carries its key in the path or query.
+function shown(t) {
+  try {
+    const u = new URL(t);
+    return `${u.protocol}//${u.host}`;
+  } catch {
+    return String(t).replace(/[/?].*$/, '');
+  }
+}
 function check(kind, args) {
   const t = targetOf(args);
   const blocked = BLOCK.test(t);
-  log(kind, t, blocked);
-  if (blocked) throw new Error(`DEVNET_GUARD: refused ${kind} to ${t}`);
+  log(kind, shown(t), blocked);
+  if (blocked) throw new Error(`DEVNET_GUARD: refused ${kind} to ${shown(t)}`);
 }
 
 const origFetch = globalThis.fetch;

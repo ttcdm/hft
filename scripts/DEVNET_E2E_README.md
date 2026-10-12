@@ -1,7 +1,10 @@
 # Devnet end-to-end harness (R2)
 
 Run: `npm run devnet:e2e` (from a machine that can reach https://api.devnet.solana.com).
-Optional env: `DEVNET_RPC_URL` (must not look like mainnet), `DEVNET_MINTS=<comma list of active pump.fun devnet mints>`.
+Optional env:
+- `DEVNET_RPC_URL`: the devnet RPC to use (must not look like mainnet). **A private devnet endpoint is recommended**: the public `api.devnet.solana.com` rate-limits (429) the holder lookups the eligibility check needs, and the run then stops with the holder shares unknown. Set it in your shell for the run; the harness never prints it (the devnet guard logs scheme and host only, and error text is scrubbed of URLs), and never reads `.env`.
+- `DEVNET_MINTS=<comma list of active pump.fun devnet mints>`: tried first.
+- `DEVNET_NO_WAIVER=1`: forbid the holder-limit waiver described below.
 
 ## Safety
 - Devnet only. The preload `scripts/devnet_guard.cjs` wraps fetch and http/https request/get, logs every attempt to stderr
@@ -28,6 +31,10 @@ Optional env: `DEVNET_RPC_URL` (must not look like mainnet), `DEVNET_MINTS=<comm
 - The LIVE buy request is built by `liveBuyRequest` in `scripts/devnet_funding.ts` (typed as `ExecuteTradeRequest`, with `signalTimestamp` set when the request is made; LIVE refuses a trade without one).
 
 - Boot-time services: the harness does not run `server.ts`, so it starts what a LIVE buy needs from there. The SOL/USD price service is started and its first reading awaited (public Coinbase / CoinGecko / Binance hosts; no price is ever made up; if none can be read the run stops at "SOL/USD price"). The coordinator's own constructor starts the RPC heartbeat, startup reconciliation, the exit monitor and the mark feed. `MIN_LIQUIDITY_USD=0` is set because devnet pump curves hold cents (honoured off mainnet only). The top-10 and creator holding limits are fixed, so a mint that fails them is refused: pick another with `DEVNET_MINTS`.
+
+## Which mint it trades
+The app's eligibility filter refuses a creator holding over 5% or a top-10 share over 20%, and devnet test mints often fail that. So the harness probes mints (the listed ones, then the pump program's recent activity, at most 25) until one clears both limits, and uses it. It builds the eligibility report itself from fresh holder data just before the buy, with the app's own `EligibilityFilter`, so a rate-limited lookup inside the coordinator cannot refuse a mint it already screened.
+If none clears, it falls back to the readable mint with the lowest creator share and **waives only the creator and top-10 checks, in the harness's report, logging `WAIVER` lines with the real values**. The app's filter is not changed. A share it could not read is never waived, and neither is any other failed check. The mint is saved in the scratch directory so the crash and recover processes use the same one.
 
 ## Status
 Written and type-checked, NOT run against devnet: the overnight sandbox proxy returns 403 for api.devnet.solana.com. Running it

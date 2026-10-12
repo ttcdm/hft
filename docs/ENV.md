@@ -55,7 +55,6 @@ Values are read as strings. Booleans mean the exact text `true` unless the row s
 | `JITO_PROBE_INTERVAL_MS` | `15000` | `server/solana/executionConfig.ts` | Block engine health probe interval. |
 | `APEX_DB_PATH` | `apex_workstation.db` in the working directory | `server/db/database.ts` | SQLite file. Point scratch runs at a scratch path. |
 | `APEX_RETENTION_DAYS` | `90` | `server.ts` | Days of audit rows (risk decisions, auto decisions, journal) kept; `0` turns pruning off. |
-| `APEX_WAL_PATH` | `apex_engine.wal` in the working directory | `server/engine/wal.ts` | Write-ahead log file of the BTC simulation engine (not a recovery source; KNOWN_RISKS section 10). |
 | `APEX_RATE_LIMIT_BURST` | `120` | `server.ts` | Rate limiter burst size for `/api` routes. |
 | `APEX_RECORD_MINT_MINUTES` | `30` (`180` read-only) | `server/backtest/recorderConfig.ts` | 1 to 1440. How long the recorder follows each launch. |
 | `APEX_RECORD_MAX_TRADES_PER_MINT` | scales with the minutes above | `server/backtest/recorderConfig.ts` | 100 to 1,000,000. Trades kept per launch. |
@@ -87,7 +86,6 @@ Values are read as strings. Booleans mean the exact text `true` unless the row s
 | `APEX_PUMP_WS_ONLY` | off | `server/pumpfunService.ts` | `true` with `ALLOWED_CLUSTER=localnet` runs the feed from the websocket only (localnet harness). |
 | `LOCALNET_GENESIS_HASH` | none | `server/solana/clusterGuard.ts` | Required with `ALLOWED_CLUSTER=localnet`. Must differ from the public cluster hashes. |
 | `LOCALNET_SOL_PRICE_USD` | none | `server/market/solPriceService.ts` | Fixed SOL price in USD for a local validator, which has no market. |
-| `ENABLE_BINANCE_FUTURES` | off | `server/engine/engine.ts` | `true` starts the Binance futures stream of the BTC simulation engine. Not part of the Pump.fun path; leave unset. |
 
 ## Listed in `.env.example` but not read by the server
 

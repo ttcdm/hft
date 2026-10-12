@@ -41,7 +41,7 @@ describe('S182 Escape closes a dialog', () => {
   });
 
   it('every dialog component uses it, including System checks', () => {
-    for (const f of ['SystemChecksModal', 'ExecutionLatencyModal', 'AutoPipelineModal', 'BacktestModal', 'AiDiagnosticsModal', 'EngineConsoleModal', 'AuthModal', 'MemecoinSocialSniperModal', 'PlugAndPlayTradingModal']) {
+    for (const f of ['SystemChecksModal', 'ExecutionLatencyModal', 'AutoPipelineModal', 'BacktestModal', 'AiDiagnosticsModal', 'AuthModal', 'MemecoinSocialSniperModal', 'PlugAndPlayTradingModal']) {
       const src = fs.readFileSync(`src/components/${f}.tsx`, 'utf8');
       expect(src, f).toContain('useEscapeToClose(isOpen, onClose);');
       // the hook runs before the early return, or React would see a different number of hooks when the dialog opens

@@ -12,17 +12,15 @@ import { executionCoordinator } from '../server/execution/coordinator';
 import { memecoinAggregator } from '../server/memecoinAggregator';
 import { pumpFunService } from '../server/pumpfunService';
 import { walletTrader } from '../server/walletTrader';
-import { AvellanedaStoikovEngine } from '../server/engine/engine';
 import { isLiveApprovedProvenance } from '../server/core/types';
 import { localSigner } from '../server/solana/signer';
 
-describe('Phase 2 Remediation Suite (B02, B08, B09, B17, B21, B23)', () => {
+describe('Phase 2 Remediation Suite (B02, B08, B09, B21, B23)', () => {
   const origEnv = { ...process.env };
 
   beforeEach(() => {
     memecoinAggregator.setConfluenceGating(false); // C2: gating is on by default; this test is about something else
     process.env.ALLOW_LIVE_REAL_MONEY_TRADING = 'true';
-    delete process.env.ENABLE_BINANCE_FUTURES;
   });
 
   afterEach(() => {
@@ -304,28 +302,8 @@ describe('Phase 2 Remediation Suite (B02, B08, B09, B17, B21, B23)', () => {
   });
 
   // =========================================================================
-  // Task 4: B17, B21, B23 Spurious Services, Price Resilience & Documentation
+  // Task 4: B21, B23 Spurious Services, Price Resilience & Documentation
   // =========================================================================
-  describe('B17: Binance Futures Engine Isolation', () => {
-    it('AvellanedaStoikovEngine does NOT connect to Binance WebSocket when ENABLE_BINANCE_FUTURES is false or unset', () => {
-      delete process.env.ENABLE_BINANCE_FUTURES;
-      const engine = new AvellanedaStoikovEngine();
-      expect((engine as any).depthWs).toBeNull();
-      expect((engine as any).tradeWs).toBeNull();
-      expect((engine as any).reconnectTimeout).toBeNull();
-      engine.destroy();
-    });
-
-    it('AvellanedaStoikovEngine connectExchangeStreams is a no-op when ENABLE_BINANCE_FUTURES !== true', () => {
-      process.env.ENABLE_BINANCE_FUTURES = 'false';
-      const engine = new AvellanedaStoikovEngine();
-      (engine as any).connectExchangeStreams();
-      expect((engine as any).depthWs).toBeNull();
-      expect((engine as any).tradeWs).toBeNull();
-      engine.destroy();
-    });
-  });
-
   describe('B21: Rust Engine Documentation Boundary', () => {
     it('crates/apex_hft_engine/README.md clarifies that apex_hft_engine is a standalone CEX benchmark and DEX execution is driven by TypeScript', () => {
       const readmePath = path.join(process.cwd(), 'crates/apex_hft_engine/README.md');

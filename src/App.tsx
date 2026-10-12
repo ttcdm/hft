@@ -9,7 +9,6 @@ import { AiDiagnosticsModal } from './components/AiDiagnosticsModal';
 import { SystemChecksModal } from './components/SystemChecksModal';
 import { ExecutionLatencyModal } from './components/ExecutionLatencyModal';
 import { AutoPipelineModal } from './components/AutoPipelineModal';
-import { EngineConsoleModal } from './components/EngineConsoleModal';
 import { MemecoinSocialSniperModal } from './components/MemecoinSocialSniperModal';
 import { BacktestModal } from './components/BacktestModal';
 import { PlugAndPlayTradingModal } from './components/PlugAndPlayTradingModal';
@@ -45,7 +44,6 @@ export default function App() {
   const [isHalted, setIsHalted] = useState(false);
   const [selectedMint, setSelectedMint] = useState<string | null>(null);
   const [activeFeed, setActiveFeed] = useState('CME_AURORA');
-  const [selectedSymbol, setSelectedSymbol] = useState('BTC/USDT');
 
   // Strategy Fleet
 
@@ -60,22 +58,15 @@ export default function App() {
   });
 
 
-  // Capital Tier State ($10 Micro Account vs $500,000 Institutional)
-  const [capitalTier, setCapitalTier] = useState<'MICRO_10' | 'INSTITUTIONAL'>('MICRO_10');
-
   // KPIs & Risk Matrix (Initialized for $10 Micro Account)
-  const [kpis, setKpis] = useState<PerformanceKPIs>(makeEmptyKpis(10));
+  const [kpis] = useState<PerformanceKPIs>(makeEmptyKpis(10));
 
 
   // Stable references for stream callbacks to ensure persistent connection without reconnect churn
   const stressConfigRef = useRef(stressConfig);
   stressConfigRef.current = stressConfig;
-  const capitalTierRef = useRef(capitalTier);
-  capitalTierRef.current = capitalTier;
   const isHaltedRef = useRef(isHalted);
   isHaltedRef.current = isHalted;
-  const selectedSymbolRef = useRef(selectedSymbol);
-  selectedSymbolRef.current = selectedSymbol;
 
   // Alerts
   const [alerts, setAlerts] = useState<AlertEvent[]>([]);
@@ -84,7 +75,6 @@ export default function App() {
   const [isAiDiagnosticsOpen, setIsAiDiagnosticsOpen] = useState(false);
   const [isSystemChecksOpen, setIsSystemChecksOpen] = useState(false);
   const [isAutoPipelineOpen, setIsAutoPipelineOpen] = useState(false);
-  const [isEngineConsoleOpen, setIsEngineConsoleOpen] = useState(false);
   const [isMemecoinSniperOpen, setIsMemecoinSniperOpen] = useState(false);
   const [isLatencyOpen, setIsLatencyOpen] = useState(false);
   const [isBacktestModalOpen, setIsBacktestModalOpen] = useState(false);
@@ -138,14 +128,6 @@ export default function App() {
     triggerAlert('INFO', 'OPERATOR AUTHENTICATED', 'Operator session successfully established.');
     engineClient.authenticate();
   };
-
-  // Sync engine trade fills with audio and workstation blotter
-  useEffect(() => {
-    const unsub = engineClient.onTrade((trade) => {
-      hftAudio.playTradeFill(trade.side === 'BUY');
-    });
-    return () => unsub();
-  }, []);
 
   // Helper to add an alert
   const triggerAlert = useCallback(
@@ -236,41 +218,6 @@ export default function App() {
     }
   };
 
-  // Toggle Capital Allocation Tier ($10 Micro Account vs $500,000 Institutional)
-  const toggleCapitalTier = async () => {
-    const nextTier = capitalTier === 'MICRO_10' ? 'INSTITUTIONAL' : 'MICRO_10';
-    const isMicro = nextTier === 'MICRO_10';
-    // Q43: the tier changes only after the server accepted it; a refusal is shown and the old tier stays.
-    const result = await engineClient.setMicro10Mode(isMicro);
-    if (!result.ok) {
-      triggerAlert('WARNING', 'CAPITAL TIER NOT CHANGED', result.error || 'The server did not accept the change.');
-      return;
-    }
-    setCapitalTier(nextTier);
-
-    if (isMicro) {
-      setKpis(makeEmptyKpis(10));
-      triggerAlert(
-        'INFO',
-        'SWITCHED TO $10.00 MICRO ACCOUNT',
-        'All bot quotas and pre-trade risk checks scaled to Binance 5 USDT min notional. Max order: $10.00.'
-      );
-    } else {
-      setKpis(makeEmptyKpis(500000));
-      triggerAlert(
-        'INFO',
-        'SWITCHED TO $500K INSTITUTIONAL TIER',
-        'Institutional capital restored. Standard multi-tier ladder quoting active.'
-      );
-    }
-  };
-
-  // Switch Symbol
-  const handleSelectSymbol = (sym: string) => {
-    setSelectedSymbol(sym);
-    triggerAlert('INFO', 'SYMBOL SELECTED', `Showing ${sym}. This changes the view only; no market-data subscription was made.`);
-  };
-
   return (
     <div className="min-h-screen bg-[#06080D] text-slate-200 flex flex-col selection:bg-cyan-500 selection:text-white">
       {/* Q10b / Q41: mode, cluster, rpc and the age of the server's answer, always visible */}
@@ -297,8 +244,6 @@ export default function App() {
         isOperatorAuthenticated={isOperatorAuthenticated}
         activeFeed={activeFeed}
         onSelectFeed={setActiveFeed}
-        capitalTier={capitalTier}
-        onToggleCapitalTier={toggleCapitalTier}
         isMemecoinSniperOpen={isMemecoinSniperOpen}
         isPlugAndPlayOpen={isPlugAndPlayOpen}
         onSelectMainView={(view) => {
@@ -342,20 +287,11 @@ export default function App() {
       <AutoPipelineModal
         isOpen={isAutoPipelineOpen}
         onClose={() => setIsAutoPipelineOpen(false)}
-        onOpenHftConsole={() => setIsEngineConsoleOpen(true)}
-      />
-
-      <EngineConsoleModal
-        isOpen={isEngineConsoleOpen}
-        onClose={() => setIsEngineConsoleOpen(false)}
-        currentSymbol={selectedSymbol}
-        onSelectSymbol={handleSelectSymbol}
       />
 
       <MemecoinSocialSniperModal
         isOpen={isMemecoinSniperOpen}
         onClose={() => setIsMemecoinSniperOpen(false)}
-        capitalTier={capitalTier}
         onAlertTrigger={triggerAlert}
       />
 

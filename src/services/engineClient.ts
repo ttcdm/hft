@@ -1,6 +1,4 @@
 import {
-  EngineTelemetryData,
-  EngineWALEntry,
   PumpFunHotCallout,
   PumpFunCaller,
   MemecoinPool,
@@ -74,9 +72,6 @@ export async function authFetch(input: RequestInfo | URL, init?: RequestInit): P
   return res;
 }
 
-export type EngineTelemetryCallback = (data: EngineTelemetryData) => void;
-export type EngineWalCallback = (entries: EngineWALEntry[]) => void;
-export type EngineTradeFillCallback = (trade: any) => void;
 export type PumpHotCalloutsCallback = (data: {
   callouts: PumpFunHotCallout[];
   leaderboard: PumpFunCaller[];
@@ -93,23 +88,16 @@ export type SniperTradeCallback = (data: any) => void;
 class EngineClient {
   private ws: WebSocket | null = null;
   private isConnected: boolean = false;
-  private telemetryCallbacks: Set<EngineTelemetryCallback> = new Set();
-  private walCallbacks: Set<EngineWalCallback> = new Set();
-  private tradeCallbacks: Set<EngineTradeFillCallback> = new Set();
   private pumpCalloutCallbacks: Set<PumpHotCalloutsCallback> = new Set();
   private calloutSnipedCallbacks: Set<CalloutSnipedCallback> = new Set();
   private memecoinSnapshotCallbacks: Set<MemecoinSnapshotCallback> = new Set();
   private sniperTradeCallbacks: Set<SniperTradeCallback> = new Set();
   private actionErrorCallbacks: Set<(m: { action?: string; error: string }) => void> = new Set();
-  private pollingInterval: any = null;
-  private recentWal: EngineWALEntry[] = [];
-  private lastTelemetry: EngineTelemetryData | null = null;
   private lastPumpCalloutsData: { callouts: PumpFunHotCallout[]; leaderboard: PumpFunCaller[]; status: any } | null = null;
   private lastMemecoinSnapshot: { pools: MemecoinPool[]; positions: SniperPosition[]; config: SniperBotConfig } | null = null;
 
   constructor() {
     this.connectWs();
-    this.startPollingFallback();
   }
 
   private connectWs() {
@@ -131,15 +119,7 @@ class EngineClient {
       this.ws.onmessage = (event) => {
         try {
           const msg = JSON.parse(event.data);
-          if (msg.type === 'TELEMETRY' && msg.data) {
-            this.lastTelemetry = msg.data;
-            this.telemetryCallbacks.forEach((cb) => cb(msg.data));
-          } else if (msg.type === 'WAL_SNAPSHOT' && Array.isArray(msg.data)) {
-            this.recentWal = msg.data;
-            this.walCallbacks.forEach((cb) => cb(msg.data));
-          } else if (msg.type === 'TRADE_FILL' && msg.data) {
-            this.tradeCallbacks.forEach((cb) => cb(msg.data));
-          } else if (msg.type === 'PUMP_HOT_CALLOUTS' && msg.data) {
+          if (msg.type === 'PUMP_HOT_CALLOUTS' && msg.data) {
             this.lastPumpCalloutsData = msg.data;
             this.pumpCalloutCallbacks.forEach((cb) => cb(msg.data));
           } else if (msg.type === 'CALLOUT_SNIPED' && msg.data) {
@@ -194,49 +174,6 @@ class EngineClient {
     }
   }
 
-  private startPollingFallback() {
-    this.pollingInterval = setInterval(async () => {
-      // Only poll as a fallback if WebSocket is not actively connected
-      if (this.isConnected && this.ws && this.ws.readyState === WebSocket.OPEN) {
-        return;
-      }
-      try {
-        const res = await authFetch('/api/engine/status');
-        if (res.ok) {
-          const data: EngineTelemetryData = await res.json();
-          this.lastTelemetry = data;
-          this.telemetryCallbacks.forEach((cb) => cb(data));
-        }
-
-        const walRes = await authFetch('/api/engine/wal?limit=40');
-        if (walRes.ok) {
-          const walData = await walRes.json();
-          if (walData.entries) {
-            this.recentWal = walData.entries;
-            this.walCallbacks.forEach((cb) => cb(walData.entries));
-          }
-        }
-      } catch {}
-    }, 1500);
-  }
-
-  public onTelemetry(cb: EngineTelemetryCallback) {
-    this.telemetryCallbacks.add(cb);
-    if (this.lastTelemetry) cb(this.lastTelemetry);
-    return () => this.telemetryCallbacks.delete(cb);
-  }
-
-  public onWal(cb: EngineWalCallback) {
-    this.walCallbacks.add(cb);
-    if (this.recentWal.length > 0) cb(this.recentWal);
-    return () => this.walCallbacks.delete(cb);
-  }
-
-  public onTrade(cb: EngineTradeFillCallback) {
-    this.tradeCallbacks.add(cb);
-    return () => this.tradeCallbacks.delete(cb);
-  }
-
   public onPumpHotCallouts(cb: PumpHotCalloutsCallback) {
     this.pumpCalloutCallbacks.add(cb);
     if (this.lastPumpCalloutsData) cb(this.lastPumpCalloutsData);
@@ -285,124 +222,14 @@ class EngineClient {
   }
 
   public sendAction(action: string, payload: Record<string, any> = {}) {
-    // Q36: the server checks the operator token on every mutating WebSocket command, so each one carries it. With no token, use REST,
-    // which reports the refusal instead of the socket dropping it.
+    // Q36: the server checks the operator token on every mutating WebSocket command, so each one carries it. With no token or no
+    // open socket the command is not sent, and that is reported instead of being dropped silently.
     const token = cachedSessionToken || (typeof window !== 'undefined' ? localStorage.getItem('apex_operator_token') : null);
     if (this.ws && this.ws.readyState === WebSocket.OPEN && token) {
       this.ws.send(JSON.stringify({ action, ...payload, sessionToken: token.trim() }));
     } else {
-      // REST fallback
-      const endpointMap: Record<string, string> = {
-        START: '/api/engine/start',
-        STOP: '/api/engine/stop',
-        RESET: '/api/engine/reset',
-        KILL: '/api/engine/kill',
-        SET_SYMBOL: '/api/engine/symbol',
-        SET_CONFIG: '/api/engine/config',
-      };
-
-      const url = endpointMap[action];
-      const fail = (error: string) => this.actionErrorCallbacks.forEach((cb) => cb({ action, error }));
-      if (url) {
-        authFetch(url, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        })
-          .then(async (r) => {
-            if (!r.ok) {
-              const j = await r.json().catch(() => null);
-              fail(`${j?.error || j?.message || 'Request refused'} (HTTP ${r.status})`);
-            }
-          })
-          .catch((e) => fail(`Could not reach the server: ${e?.message || 'network error'}`));
-      } else {
-        fail('Not sent: the live connection is down and this command has no REST fallback.');
-      }
-    }
-  }
-
-  public start() {
-    this.sendAction('START');
-  }
-
-  public stop() {
-    this.sendAction('STOP');
-  }
-
-  public reset() {
-    this.sendAction('RESET');
-  }
-
-  public kill() {
-    this.sendAction('KILL');
-  }
-
-  public setSymbol(symbol: string) {
-    this.sendAction('SET_SYMBOL', { symbol });
-  }
-
-  public updateConfig(config: any) {
-    this.sendAction('SET_CONFIG', { config });
-  }
-
-  public async updateRiskLimits(limits: any) {
-    try {
-      const res = await authFetch('/api/engine/risk/limits', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(limits),
-      });
-      return await res.json();
-    } catch (e) {
-      console.error(e);
-    }
-  }
-
-  public async setMicro10Mode(enabled: boolean): Promise<{ ok: boolean; error?: string }> {
-    try {
-      const res = await authFetch('/api/engine/mode/micro-10', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled }),
-      });
-      if (!res.ok) {
-        const j = await res.json().catch(() => null);
-        return { ok: false, error: `${j?.error || j?.message || 'Request refused'} (HTTP ${res.status})` };
-      }
-      return { ok: true };
-    } catch (e: any) {
-      return { ok: false, error: `Could not reach the server: ${e?.message || 'network error'}` };
-    }
-  }
-
-  public async fetchRustSource() {
-    try {
-      const res = await authFetch('/api/engine/rust/source');
-      if (res.ok) {
-        return await res.json();
-      }
-    } catch (e) {
-      console.error(e);
-    }
-    return null;
-  }
-
-  public async downloadWalJournal(): Promise<{ ok: boolean; error?: string }> {
-    // A plain navigation cannot carry the Authorization header, so fetch with auth and save the blob.
-    try {
-      const res = await authFetch('/api/engine/wal/export');
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const url = URL.createObjectURL(await res.blob());
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `apex_engine_journal_${Date.now()}.wal`;
-      a.click();
-      setTimeout(() => URL.revokeObjectURL(url), 30_000); // R34: revoking right after click() can cancel the download
-      return { ok: true };
-    } catch (e: any) {
-      console.error('WAL export failed:', e);
-      return { ok: false, error: String(e?.message || e) };
+      const m = { action, error: 'Not sent: the live connection is down and this command has no REST fallback.' };
+      this.actionErrorCallbacks.forEach((cb) => cb(m));
     }
   }
 

@@ -59,7 +59,6 @@ interface SystemAudit {
   dbDriver: string;
   keypairStorage: string;
   browserPrivateKeySecurity: string;
-  hftPaperIsolation: string;
 }
 
 interface RiskControls {
@@ -488,7 +487,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                   </div>
                   <div className="p-2.5 rounded-lg bg-slate-900/60 border border-slate-800 space-y-1">
                     <strong className="text-white block">3. Isolated Paper Engine:</strong>
-                    The BTC/ETH engine console is a simulation and does not touch the Solana wallet. Paper snipes are modeled fills against the curve quote.
+                    Paper snipes are modeled fills against the curve quote; they never touch the Solana wallet.
                   </div>
                   <div className="p-2.5 rounded-lg bg-slate-900/60 border border-slate-800 space-y-1">
                     <strong className="text-white block">4. Deterministic SQLite Storage:</strong>

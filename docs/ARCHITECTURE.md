@@ -28,7 +28,7 @@ A short map of the code and three diagrams of the parts that decide whether SOL 
 | `server/pumpfunService.ts` | Hot callouts, callers and the Pump.fun feed wiring. | `server/pumpfunService.ts` |
 | `server/socialScanner.ts` | Social signals and the Telegram command parser. | `server/socialScanner.ts` |
 | `server/board.ts`, `server/walletTrader.ts` | The home-board read model and the wallet state and panic liquidation used by the UI. | `server/board.ts` |
-| `server/engine/`, `server/realismEngine.ts` | A BTC market-maker simulation with its own risk checks and write-ahead log. Nothing on the Pump.fun trade path imports it; `server.ts` exposes its telemetry. See [`KNOWN_RISKS.md`](../KNOWN_RISKS.md) section 10. | `server/engine/engine.ts` |
+| `server/realismEngine.ts` | A co-location and exchange-fee profile left from the old BTC simulation. Nothing on the Pump.fun trade path imports it; only `/api/realism/config` reads it. | `server/realismEngine.ts` |
 | `src/` | The React operator UI (Vite). It holds no keys and sends orders only through the API. | `src/App.tsx` |
 | `crates/apex_hft_engine/` | A standalone Rust benchmark. Not wired into the app. | `crates/apex_hft_engine/README.md` |
 | `scripts/` | Smoke test, devnet and localnet harnesses, signer import, release packaging. `scripts/localnet/` is the in-process LiteSVM validator. | `scripts/smoke.ts` |
@@ -151,4 +151,4 @@ The provenance and signal-timestamp checks apply to LIVE only; PAPER runs its ow
 
 ## Code that looks functional and is not
 
-Some settings and functions are accepted, stored and shown, and change nothing. [`KNOWN_RISKS.md`](../KNOWN_RISKS.md) section 6 lists them, and `tests/q34_known_risks.test.ts` checks that the list is still true. The BTC simulation under `server/engine/` is the other large area that is not part of the Pump.fun path. Treat a name that sounds like a trading control with suspicion until you have found what reads it.
+Some settings and functions are accepted, stored and shown, and change nothing. [`KNOWN_RISKS.md`](../KNOWN_RISKS.md) section 6 lists them, and `tests/q34_known_risks.test.ts` checks that the list is still true. Treat a name that sounds like a trading control with suspicion until you have found what reads it.

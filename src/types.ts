@@ -141,50 +141,6 @@ export interface MarketTickerStats {
   quoteVolume24h: number;
 }
 
-export interface EngineWALEntry {
-  seqId: number;
-  timestampNs: string;
-  timestampIso: string;
-  eventType: string;
-  payload: Record<string, any>;
-  checksum: string;
-}
-
-export interface EngineTelemetryData {
-  status: 'STOPPED' | 'INITIALIZING' | 'RUNNING' | 'HALTED_RISK' | 'HALTED_KILL_SWITCH';
-  symbol: string;
-  seqId: number;
-  uptimeSeconds: number;
-  inventoryQty: number;
-  inventoryUsd: number;
-  reservationPrice: number;
-  midPrice: number;
-  microPrice: number;
-  spreadBps: number;
-  ofi: number;
-  activeBuyQuote: { price: number; size: number } | null;
-  activeSellQuote: { price: number; size: number } | null;
-  realizedPnlUsd: number;
-  unrealizedPnlUsd: number;
-  totalPnlUsd: number;
-  totalFillsCount: number;
-  totalOrdersCount: number;
-  rejectionsCount: number;
-  ordersPerSec: number;
-  tickToTradeStats: {
-    minMicros: number;
-    medianMicros: number;
-    p99Micros: number;
-    maxMicros: number;
-    samplesCount: number;
-  };
-  walTotalEntries: number;
-  memoryUsageMb: number;
-  gcPauseEstimateMs: number;
-  environment?: 'SIMULATED_ORDERBOOK' | 'LIVE_SOLANA';
-  isSimulatedEngine?: boolean;
-}
-
 // ---------------- SOCIAL SCANNER & ALPHA INTELLIGENCE ----------------
 export type SocialSource = 'TELEGRAM' | 'X_TWITTER' | 'PUMP_FEED'; // Q33: PUMP_FEED = discovered on the pump.fun / DexScreener lists, no social post behind it
 

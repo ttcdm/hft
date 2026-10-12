@@ -11,7 +11,6 @@ import {
   ShieldAlert,
   KeyRound,
   Lock,
-  Coins,
   Globe,
   Radio,
   TrendingUp,
@@ -50,8 +49,6 @@ interface HeaderProps {
   activeFeed: string;
   onSelectFeed: (feed: string) => void;
   exchangePingMs?: number;
-  capitalTier?: 'MICRO_10' | 'INSTITUTIONAL';
-  onToggleCapitalTier?: () => void;
   isMemecoinSniperOpen?: boolean;
   isPlugAndPlayOpen?: boolean;
   onSelectMainView?: (view: 'DASHBOARD' | 'TELEGRAM_FEED' | 'PLUG_AND_PLAY') => void;
@@ -72,8 +69,6 @@ export const Header: React.FC<HeaderProps> = ({
   isOperatorAuthenticated = false,
   activeFeed,
   onSelectFeed,
-  capitalTier = 'MICRO_10',
-  onToggleCapitalTier,
   isMemecoinSniperOpen = false,
   isPlugAndPlayOpen = false,
   onSelectMainView,
@@ -223,29 +218,8 @@ export const Header: React.FC<HeaderProps> = ({
         </button>
       </nav>
 
-      {/* 3. RIGHT CONTROLS: TIER, AUTO-PROFIT PILL, QUANT SUITE, DEPLOY, KILL SWITCH */}
+      {/* 3. RIGHT CONTROLS: AUTO-PROFIT PILL, QUANT SUITE, DEPLOY, KILL SWITCH */}
       <div className="flex items-center space-x-1.5 sm:space-x-2 flex-shrink-0">
-        {/* Capital Tier Switcher ($10 Micro vs $500K Institutional) */}
-        {onToggleCapitalTier && (
-          <button
-            id="btn-capital-tier-toggle"
-            onClick={onToggleCapitalTier}
-            title={
-              capitalTier === 'MICRO_10'
-                ? 'Current: $10.00 Micro Account. Click to switch to $500k Institutional.'
-                : 'Current: $500,000 Institutional Tier. Click to switch to $10.00 Micro Account.'
-            }
-            className={`px-2 py-1 rounded-lg border text-[11px] font-mono transition flex items-center space-x-1 ${
-              capitalTier === 'MICRO_10'
-                ? 'bg-amber-950/70 border-amber-500/60 text-amber-300 hover:bg-amber-900/60 shadow-sm shadow-amber-500/20'
-                : 'bg-[#141B2D] border-[#1E293B] text-slate-300 hover:text-white'
-            }`}
-          >
-            <Coins className="w-3 h-3 text-amber-400" />
-            <span className="font-bold">{capitalTier === 'MICRO_10' ? '$10 Micro' : '$500K'}</span>
-          </button>
-        )}
-
         {/* Q35: today's realized and the open positions' marked P&L, as the server reports them (a dash when it cannot say) */}
         <button
           id="btn-auto-profit-ticker"

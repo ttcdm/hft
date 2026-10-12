@@ -87,7 +87,7 @@ Key environment variables. [`docs/ENV.md`](docs/ENV.md) lists every variable the
 - `AUTO_MANAGE_RECOVERED=true`: let the exit ladder manage positions rebuilt after a restart. Default off: recovered positions only get the hard stop.
 - `PAPER_BANKROLL_SOL` (default `0.07`), `PAPER_STRICT_GATES=1` (paper rejects unverified safety checks like LIVE), `CAPITAL_TIER` (`MICRO_10` or `INSTITUTIONAL`).
 - `DEMO_MODE=true`: loads fake callers and synthetic social data; never use it for anything but a demo.
-- `APEX_ENV_FILE`: if set (even to an empty string) it replaces `.env`, so scripts and tests that spawn the server never read the real one. `APEX_WAL_PATH` moves the engine write-ahead log; `APEX_DISABLE_EXTERNAL_FEEDS=true` stops outbound market feeds (used by smoke).
+- `APEX_ENV_FILE`: if set (even to an empty string) it replaces `.env`, so scripts and tests that spawn the server never read the real one. `APEX_DISABLE_EXTERNAL_FEEDS=true` stops outbound market feeds (used by smoke).
 - `GEMINI_API_KEY`: optional, for AI diagnostics.
 - `APEX_READ_ONLY=true`: watch-only mode (see "Read-only mode" below).
 - `CONFLUENCE_MIN_SCORE`: starting value of the confluence buy threshold, a whole number 0 to 100 (default `70`); the operator can change it at runtime (see below).
@@ -134,7 +134,7 @@ What the code does, and where the limits are:
 - **CORS and WebSocket origins**: REST requests are allowed from `localhost`, `127.0.0.1`, the request's own host, and origins listed in `ALLOWED_ORIGINS` (`server/middleware/auth.ts`). Other origins get no CORS headers.
 - **Circuit breaker**: the risk engine opens the breaker and turns the kill switch on after 3 consecutive RPC failures (`server/risk/riskEngine.ts`), and also refuses trades past the daily loss limit.
 - **Keypair file**: `.apex_trading_keypair.json` is written with POSIX `0600` permissions, and the app checks `.env` and the keypair for looser permissions. Use a throwaway devnet key only.
-- **Audit trail**: auto decisions and trade records are rows in the SQLite database. The write-ahead log (`server/engine/wal.ts`) is **not** a recovery source or an immutable ledger; see [`KNOWN_RISKS.md`](KNOWN_RISKS.md) section 10.
+- **Audit trail**: auto decisions and trade records are rows in the SQLite database; see [`KNOWN_RISKS.md`](KNOWN_RISKS.md) section 10 for its limits.
 
 ---
 
@@ -180,7 +180,7 @@ How the tests are set up (details in [`docs/TEST_FIDELITY.md`](docs/TEST_FIDELIT
 - **Behaviour tests** (`tests/behaviour_http.test.ts`) start the real server on a scratch DB and throwaway key and assert outcomes over HTTP (auth required on every route, cluster guard, PAPER never sends, halt and kill switch).
 - Unit tests still mock collaborators; they show units behave as specified, not that the system trades correctly on a cluster.
 
-Health and status endpoints (operator token required except health): `GET /api/health` (public), `GET /api/execution/can-arm`, `GET /api/execution/readiness`, `GET /api/engine/status`, `GET /api/auto/status`.
+Health and status endpoints (operator token required except health): `GET /api/health` (public), `GET /api/execution/can-arm`, `GET /api/execution/readiness`, `GET /api/auto/status`.
 
 ## Removed and relabelled
 

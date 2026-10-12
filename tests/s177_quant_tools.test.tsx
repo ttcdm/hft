@@ -130,11 +130,11 @@ describe('S177: Auto pipeline shows the real controller and watch window', () =>
     expect(html).toContain(`of ${watch.capacity.max}`);
   });
 
-  it('with the server env off it says so; the HFT console is offered only as a clearly named secondary link', () => {
+  it('with the server env off it says so, and offers no BTC simulator console (S211 removed it)', () => {
     const auto = wire({ ...autoSnipeController.getStatus(), stats: autoSnipeController.getJournalStats() }) as any;
-    const html = renderToStaticMarkup(<AutoPipelineView auto={{ ...auto, envEnabled: false }} watch={null} onOpenHftConsole={() => undefined} />);
+    const html = renderToStaticMarkup(<AutoPipelineView auto={{ ...auto, envEnabled: false }} watch={null} />);
     expect(html).toContain('AUTO_SNIPE_ENABLED is not true');
-    expect(html).toMatch(/HFT simulator console \(BTC\/ETH, in memory, separate from the Solana wallet\)/);
+    expect(html).not.toMatch(/HFT simulator console|open-hft-console/);
   });
 });
 

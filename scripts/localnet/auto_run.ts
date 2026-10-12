@@ -69,7 +69,7 @@ async function main() {
   await conn.requestAirdrop(trader.publicKey, 5 * LAMPORTS_PER_SOL);
 
   process.env.ALLOWED_CLUSTER = 'localnet'; process.env.LOCALNET_GENESIS_HASH = info.genesisHash; process.env.APEX_ENV_FILE = '';
-  process.env.SOLANA_RPC_URL = info.url; process.env.APEX_DB_PATH = path.join(scratch, 'driver.db'); process.env.APEX_WAL_PATH = path.join(scratch, 'engine.wal');
+  process.env.SOLANA_RPC_URL = info.url; process.env.APEX_DB_PATH = path.join(scratch, 'driver.db');
   const { PUMP_SDK } = await import('@pump-fun/pump-sdk');
   const { PumpCurveService } = await import('../../server/solana/pumpCurve');
   const { txBuilder } = await import('../../server/solana/transactionBuilder');
@@ -128,7 +128,7 @@ async function main() {
   const server = startProc('server', ['--import', 'tsx', 'server.ts'], {
     ...baseEnv, NODE_ENV: 'production', APP_PORT: String(port), OPERATOR_AUTH_TOKEN: token, OPERATOR_PASSWORD: 'localnet-auto-run', APEX_ENV_FILE: '',
     ALLOWED_CLUSTER: 'localnet', LOCALNET_GENESIS_HASH: info.genesisHash, SOLANA_RPC_URL: info.url, SOLANA_WS_URL: info.url.replace('http', 'ws').replace(/:(\d+)/, (_m, p) => `:${Number(p) + 1}`),
-    ENABLE_RPC_FALLBACK: 'true', APEX_DB_PATH: path.join(scratch, 'app.db'), SIGNER_KEYPAIR_PATH: keyPath, APEX_WAL_PATH: path.join(scratch, 'app.wal'),
+    ENABLE_RPC_FALLBACK: 'true', APEX_DB_PATH: path.join(scratch, 'app.db'), SIGNER_KEYPAIR_PATH: keyPath,
     LOCALNET_SOL_PRICE_USD: '150', ALLOW_LIVE_REAL_MONEY_TRADING: 'true', AUTO_SNIPE_ENABLED: 'true',
   });
   const base = `http://127.0.0.1:${port}`;

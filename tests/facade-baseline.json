@@ -171,7 +171,6 @@
 "tests/s1_social_integrations.test.ts::the Telegram webhook, config and test routes require operator auth",
 "tests/s1_social_integrations.test.ts::the snipe route refuses unverified signals while LIVE is armed (route-level; static check, no HTTP harness)",
 "tests/s7_harness_env.test.ts::liveServer baseEnv points the RPC at a closed loopback port on the local cluster, and an explicit value still wins",
-"tests/s7_harness_env.test.ts::the e2e script pins the server's WAL and checks the checkout's WAL did not grow (the check itself is proven by running the script)",
 "tests/seed_guard.test.ts::the CLI cannot be told a different genesis or cluster, and spends only with --execute",
 "tests/seed_recovery.test.ts::CI runs the localnet seeding proof, which includes the forced-429 sweep",
 "tests/seed_recovery.test.ts::CI runs the separate-funder audit proof (with its app-wallet control) after the seed proof",

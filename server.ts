@@ -10,7 +10,6 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer, createLogger } from 'vite';
 import { secretPathGuard, viteDevServerOptions } from './server/security/secretPaths';
 import { GoogleGenAI } from '@google/genai';
-import { hftEngine } from './server/engine/engine';
 import { socialScanner, isTelegramTradeCommand } from './server/socialScanner';
 import { memecoinAggregator } from './server/memecoinAggregator';
 import { onChainPoolStats } from './server/market/poolStats';
@@ -191,7 +190,6 @@ wss.on('connection', (ws: WebSocket, req: any) => {
           ws.send(JSON.stringify({ type: 'AUTHENTICATED', authenticated: true, timestamp: Date.now() }));
           ws.send(JSON.stringify({ type: 'AUTH_SUCCESS', authenticated: true }));
           // Emit telemetry and snapshots exclusively after successful authentication
-          ws.send(JSON.stringify({ type: 'TELEMETRY', data: hftEngine.getTelemetry() }));
           ws.send(
             JSON.stringify({
               type: 'PUMP_HOT_CALLOUTS',
@@ -212,7 +210,6 @@ wss.on('connection', (ws: WebSocket, req: any) => {
               },
             })
           );
-          ws.send(JSON.stringify({ type: 'WAL_SNAPSHOT', data: hftEngine.getWAL().getRecent(40) }));
           ws.send(JSON.stringify({ type: 'WALLET_STATE_UPDATED', data: walletTrader.getState() }));
           ws.send(
             JSON.stringify({
@@ -230,12 +227,6 @@ wss.on('connection', (ws: WebSocket, req: any) => {
 
       // Mutating WebSocket commands require operator session authorization
       const MUTATING_WS_ACTIONS = new Set([
-        'START',
-        'STOP',
-        'KILL',
-        'RESET',
-        'SET_SYMBOL',
-        'SET_CONFIG',
         'SNIPE_PUMP_CALLOUT',
         'TOGGLE_CALLER_SNIPE',
         'SNIPE_MEMECOIN',
@@ -256,13 +247,6 @@ wss.on('connection', (ws: WebSocket, req: any) => {
           return;
         }
       }
-
-      if (parsed.action === 'START') hftEngine.startEngine();
-      if (parsed.action === 'STOP') hftEngine.stopEngine();
-      if (parsed.action === 'KILL') hftEngine.killSwitch();
-      if (parsed.action === 'RESET') hftEngine.resetState();
-      if (parsed.action === 'SET_SYMBOL' && parsed.symbol) hftEngine.setSymbol(parsed.symbol);
-      if (parsed.action === 'SET_CONFIG' && parsed.config) hftEngine.updateConfig(parsed.config);
 
       // Real-time sniper actions via WebSocket routed through authoritative coordinator
       const rejectWsInput = (issues: Array<{ path: string; message: string }>) =>
@@ -313,15 +297,6 @@ wss.on('connection', (ws: WebSocket, req: any) => {
       }
     } catch {}
   });
-});
-
-// Broadcast engine updates over WebSocket
-hftEngine.onTelemetry((tel) => {
-  broadcastWs({ type: 'TELEMETRY', data: tel });
-});
-
-hftEngine.onTrade((trade) => {
-  broadcastWs({ type: 'TRADE_FILL', data: trade });
 });
 
 // Broadcast real-time Pump.fun Hot Callouts updates
@@ -586,68 +561,7 @@ app.post('/api/export/packets', requireOperatorAuth, (req, res) => {
   res.send(JSON.stringify(rawData, null, 2));
 });
 
-// 7. High-Performance Autonomous Execution Engine Endpoints
-app.get('/api/engine/status', requireOperatorAuth, (req, res) => {
-  res.json(hftEngine.getTelemetry());
-});
-
-app.post('/api/engine/start', requireOperatorAuth, (req, res) => {
-  hftEngine.startEngine();
-  res.json({ status: 'OK', telemetry: hftEngine.getTelemetry() });
-});
-
-app.post('/api/engine/stop', requireOperatorAuth, (req, res) => {
-  hftEngine.stopEngine();
-  res.json({ status: 'OK', telemetry: hftEngine.getTelemetry() });
-});
-
-app.post('/api/engine/reset', requireOperatorAuth, (req, res) => {
-  hftEngine.resetState();
-  res.json({ status: 'OK', telemetry: hftEngine.getTelemetry() });
-});
-
-app.post('/api/engine/kill', requireOperatorAuth, (req, res) => {
-  hftEngine.killSwitch();
-  res.json({ status: 'OK', telemetry: hftEngine.getTelemetry() });
-});
-
-app.post('/api/engine/symbol', requireOperatorAuth, (req, res) => {
-  if (req.body.symbol) {
-    hftEngine.setSymbol(req.body.symbol);
-  }
-  res.json({ status: 'OK', telemetry: hftEngine.getTelemetry() });
-});
-
-app.post('/api/engine/config', requireOperatorAuth, (req, res) => {
-  hftEngine.updateConfig(req.body);
-  res.json({ status: 'OK', telemetry: hftEngine.getTelemetry() });
-});
-
-app.get('/api/engine/wal', requireOperatorAuth, (req, res) => {
-  const limit = parseInt(req.query.limit as string) || 60;
-  res.json({
-    seqId: hftEngine.getWAL().getCurrentSeq(),
-    entries: hftEngine.getWAL().getRecent(limit),
-  });
-});
-
-app.get('/api/engine/wal/export', requireOperatorAuth, (req, res) => {
-  const journal = hftEngine.getWAL().exportJournal();
-  res.setHeader('Content-Type', 'text/plain');
-  res.setHeader('Content-Disposition', 'attachment; filename="apex_engine_journal.wal"');
-  res.send(journal);
-});
-
-app.post('/api/engine/risk/limits', requireOperatorAuth, (req, res) => {
-  hftEngine.getRiskEngine().updateLimits(req.body);
-  res.json({ status: 'OK', limits: hftEngine.getRiskEngine().getLimits() });
-});
-
-app.get('/api/engine/risk/limits', requireOperatorAuth, (req, res) => {
-  res.json(hftEngine.getRiskEngine().getLimits());
-});
-
-// 8. Standalone Rust Engine Source & $10 Micro-Capital Configuration
+// 8. Standalone Rust Engine Source
 app.get('/api/engine/rust/source', requireOperatorAuth, (req, res) => {
   try {
     const crateDir = path.join(process.cwd(), 'crates', 'apex_hft_engine');
@@ -675,47 +589,6 @@ app.get('/api/engine/rust/source', requireOperatorAuth, (req, res) => {
   } catch (err: any) {
     res.status(500).json({ status: 'ERROR', message: err.message });
   }
-});
-
-app.post('/api/engine/mode/micro-10', requireOperatorAuth, (req, res) => {
-  const { enabled } = req.body;
-  if (enabled) {
-    // Apply $10 micro-capital constraints
-    hftEngine.updateConfig({
-      baseQuoteSize: 0.0001, // ~6.80 USD on BTC, satisfying Binance's 5 USDT minimum notional
-      targetSpreadBps: 4.0,  // Wider spread to offset retail taker/maker fees
-      gamma: 0.35,           // Higher risk aversion
-      inventoryLimitQty: 0.0002,
-    });
-    hftEngine.getRiskEngine().updateLimits({
-      minOrderNotionalUsd: 5.0,  // Exchange minimum notional
-      maxOrderNotionalUsd: 10.0, // Hard ceiling for $10 account
-      maxSingleOrderQty: 0.0002,
-      maxDailyLossUsd: 2.0,      // Max 20% drawdown on $10
-      fatFingerPriceBandPct: 1.5,
-    });
-  } else {
-    // Institutional defaults
-    hftEngine.updateConfig({
-      baseQuoteSize: 0.05,
-      targetSpreadBps: 2.0,
-      gamma: 0.1,
-      inventoryLimitQty: 5.0,
-    });
-    hftEngine.getRiskEngine().updateLimits({
-      minOrderNotionalUsd: 5.0,
-      maxOrderNotionalUsd: 50000.0,
-      maxSingleOrderQty: 5.0,
-      maxDailyLossUsd: 5000.0,
-      fatFingerPriceBandPct: 2.5,
-    });
-  }
-  res.json({
-    status: 'OK',
-    isMicro10: enabled,
-    telemetry: hftEngine.getTelemetry(),
-    limits: hftEngine.getRiskEngine().getLimits(),
-  });
 });
 
 // ============================================================================
@@ -1349,7 +1222,6 @@ app.get('/api/diagnostics/system', requireOperatorAuth, (req, res) => {
       dbDriver: 'node:sqlite (WAL mode enabled)',
       keypairStorage: 'Local filesystem (mode 0600) at .apex_trading_keypair.json',
       browserPrivateKeySecurity: 'Private keys are NEVER accepted via HTTP/WebSocket requests.',
-      hftPaperIsolation: 'CME/Binance/Coinbase L2 HFT engine runs strictly in-memory simulation; completely isolated from real-money Solana wallet.',
     },
     riskControls: {
       tier: 'MICRO_10',

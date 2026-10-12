@@ -10,7 +10,7 @@ export interface WatchSnapshotData {
   capacity: { active: number; max: number; refusedFull: number };
 }
 
-export function AutoPipelineView({ auto, watch, error, onOpenHftConsole }: { auto: AutoStatusData | null; watch: WatchSnapshotData | null; error?: string | null; onOpenHftConsole?: () => void }) {
+export function AutoPipelineView({ auto, watch, error }: { auto: AutoStatusData | null; watch: WatchSnapshotData | null; error?: string | null }) {
   const stages = Object.entries(auto?.stats.rejectedByStage ?? {}).sort((a, b) => b[1] - a[1]);
   const verdicts = (watch?.released ?? []).reduce<Record<string, number>>((m, r) => { m[r.state] = (m[r.state] ?? 0) + 1; return m; }, {});
   return (
@@ -44,16 +44,11 @@ export function AutoPipelineView({ auto, watch, error, onOpenHftConsole }: { aut
           ))}
         </>
       )}
-      {onOpenHftConsole && (
-        <button onClick={onOpenHftConsole} data-testid="open-hft-console" className="mt-3 text-[10px] text-slate-500 underline">
-          Open the HFT simulator console (BTC/ETH, in memory, separate from the Solana wallet)
-        </button>
-      )}
     </div>
   );
 }
 
-export const AutoPipelineModal: React.FC<{ isOpen: boolean; onClose: () => void; onOpenHftConsole?: () => void }> = ({ isOpen, onClose, onOpenHftConsole }) => {
+export const AutoPipelineModal: React.FC<{ isOpen: boolean; onClose: () => void }> = ({ isOpen, onClose }) => {
   const a = usePolled<AutoStatusData>('/api/auto/status', 4000, isOpen);
   const w = usePolled<WatchSnapshotData>('/api/watch', 4000, isOpen);
   useEscapeToClose(isOpen, onClose);
@@ -65,7 +60,7 @@ export const AutoPipelineModal: React.FC<{ isOpen: boolean; onClose: () => void;
           <h3 className="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2"><Cpu className="w-4 h-4 text-cyan-400" /> Auto pipeline</h3>
           <button onClick={onClose} className="text-slate-400 hover:text-white" aria-label="Close"><X className="w-4 h-4" /></button>
         </div>
-        <AutoPipelineView auto={a.data} watch={w.data} error={a.error || w.error} onOpenHftConsole={onOpenHftConsole ? () => { onClose(); onOpenHftConsole(); } : undefined} />
+        <AutoPipelineView auto={a.data} watch={w.data} error={a.error || w.error} />
       </div>
     </div>
   );

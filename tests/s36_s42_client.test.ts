@@ -34,22 +34,21 @@ describe('Q42: a 401 does not make every poller re-open the token prompt', () =>
 });
 
 describe('Q36: WebSocket commands carry the operator token, and a refusal reaches the operator', () => {
-  it('sends sessionToken with the action, and reports a REST refusal', async () => {
+  it('sends sessionToken with the action, and reports a command it could not send', async () => {
     const mod = await import('../src/services/engineClient');
     mod.setOperatorSessionToken('tok');
     const sent: string[] = [];
     (mod.engineClient as any).ws = { readyState: 1, send: (m: string) => sent.push(m) };
-    mod.engineClient.sendAction('START');
+    mod.engineClient.sendAction('CLOSE_POSITION', { positionId: 'p1' });
     expect(JSON.parse(sent[0]).sessionToken).toBe('tok');
     (mod.engineClient as any).ws = null;
-    (globalThis as any).fetch = vi.fn(async () => new Response(JSON.stringify({ error: 'nope' }), { status: 403 }));
+    const f = vi.fn();
+    (globalThis as any).fetch = f;
     const errs: string[] = [];
     const off = mod.engineClient.onActionError((m) => errs.push(m.error));
-    mod.engineClient.sendAction('STOP');
-    await new Promise((r) => setTimeout(r, 20));
-    expect(errs[0]).toContain('nope');
     mod.engineClient.sendAction('SNIPE_MEMECOIN', {});
-    expect(errs[1]).toContain('no REST fallback');
+    expect(errs[0]).toContain('no REST fallback');
+    expect(f).not.toHaveBeenCalled(); // S211: the BTC simulator's REST fallbacks are gone, so nothing is sent
     off();
   });
 });

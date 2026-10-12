@@ -146,7 +146,7 @@ The seeded devnet token (`scripts/devnet_seed.ts`) is **not expected to be bough
 
 ## 10. Persistence and journal limits (Q55, Q56)
 
-- **The WAL (`server/engine/wal.ts`) is decorative.** It belongs to the BTC simulation engine: sequence and checksum restart at 0 at every boot into an append-only file, there is no `error` listener, and nothing reads it back. It is not a recovery source. Position and order recovery come from SQLite plus the startup reconciliation against the chain.
+- **There is no write-ahead log.** The BTC simulation engine and its decorative WAL were removed (S211). Position and order recovery come from SQLite plus the startup reconciliation against the chain. An `apex_engine.wal` file left over from an older build is not read and can be deleted.
 - **No multi-statement transactions.** Each save is its own statement. The mark and exit-state writes now touch only their own columns and never a CLOSED row (S11), which closes the known race, but a crash between two statements of a trade can still leave the order and the position out of step; startup reconciliation repairs that against the chain.
 - **Unbounded tables.** `positions`, `orders` and `transactions` are never pruned, and `loadPositions()` scans the table in several loops. Fine for a devnet session; revisit before long runs.
 - **Operator alerts are in memory only.** A restart forgets them (the journal keeps the events they came from).

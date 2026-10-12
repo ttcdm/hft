@@ -23,6 +23,9 @@ export interface ReplayResponse {
   replayCap?: number;
 }
 
+/** The summary covers every replayed launch; the per-launch table shows the newest rows only, so a 3,000-launch replay does not render 3,000 rows. */
+export const TABLE_ROWS_SHOWN = 300;
+
 const sol = (v: number | null) => (v === null ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(5)} SOL`);
 const dur = (ms: number | null) => (ms === null ? '—' : ms < 60_000 ? `${Math.round(ms / 1000)} s` : `${(ms / 60_000).toFixed(1)} min`);
 
@@ -83,10 +86,11 @@ export function ReplayBacktestView({ data, error }: { data: ReplayResponse | nul
               <span className="text-slate-500">Exits by reason</span><span className="text-right">{Object.entries(s.exitReasons).map(([k, v]) => `${k} ${v}`).join(' · ') || '—'}</span>
             </div>
             {s.closed < 30 && <p className="text-amber-300/90 mb-3" data-testid="replay-small-n">Only {s.closed} closed trade(s): too few to say anything about expectancy.</p>}
+            {r.launches.length > TABLE_ROWS_SHOWN && <p className="text-slate-500 mb-1" data-testid="replay-table-capped">Table: the newest {TABLE_ROWS_SHOWN} of {r.launches.length} replayed launches (the summary above counts all of them).</p>}
             <table className="w-full text-left mb-3" data-testid="replay-table">
               <thead><tr className="text-slate-500 text-[10px]"><th className="py-1">token</th><th>verdict</th><th>score</th><th>result</th><th>net</th></tr></thead>
               <tbody>
-                {r.launches.map((l) => (
+                {r.launches.slice(-TABLE_ROWS_SHOWN).reverse().map((l) => (
                   <tr key={l.mint} className="border-t border-[#1E293B] align-top">
                     <td className="py-1 text-slate-300">${l.symbol}<div className="text-[10px] text-slate-500" title={l.mint}>{l.mint.slice(0, 6)}…{l.mint.slice(-4)} · {l.trades} trades</div></td>
                     <td title={l.verdictReason}>{l.verdict}{l.releasedAfterMs !== null ? ` @${Math.round(l.releasedAfterMs / 1000)}s` : ''}</td>

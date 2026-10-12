@@ -210,6 +210,29 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
 export function replayLaunches(launches: RecordedLaunch[], funders: FunderFact[], solUsdFallback: number | null, opts: ReplayOptions = {}): ReplayReport {
   const minScore = opts.minScore ?? getConfluenceThreshold();
   const rows = launches.map((l) => replayLaunch(l, funders, solUsdFallback, { ...opts, minScore }));
+  return buildReplayReport(rows, opts, minScore);
+}
+
+/**
+ * S189: the same replay, time-sliced. The sync version holds the event loop for the whole run (about 7 s for 3,250 launches), which would
+ * stall the live feed, the watch window and the auto controller while the Backtest screen is open. This one hands the event loop back after
+ * every `sliceMs` of work, and returns exactly the report replayLaunches would.
+ */
+export async function replayLaunchesAsync(launches: RecordedLaunch[], funders: FunderFact[], solUsdFallback: number | null, opts: ReplayOptions = {}, sliceMs = 20): Promise<ReplayReport> {
+  const minScore = opts.minScore ?? getConfluenceThreshold();
+  const rows: ReplayedLaunch[] = [];
+  let sliceStart = Date.now();
+  for (const l of launches) {
+    rows.push(replayLaunch(l, funders, solUsdFallback, { ...opts, minScore }));
+    if (Date.now() - sliceStart >= sliceMs) {
+      await new Promise<void>((r) => setImmediate(r));
+      sliceStart = Date.now();
+    }
+  }
+  return buildReplayReport(rows, opts, minScore);
+}
+
+function buildReplayReport(rows: ReplayedLaunch[], opts: ReplayOptions, minScore: number): ReplayReport {
   const closed = rows.filter((r) => r.outcome === 'CLOSED');
   const wins = closed.filter((r) => (r.netPnlSol ?? 0) > 0).length;
   const released: Record<string, number> = {};

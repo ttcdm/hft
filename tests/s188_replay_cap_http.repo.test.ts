@@ -7,12 +7,12 @@ let stub: RpcStub; let app: AppHandle; let dir: string;
 beforeAll(async () => {
   stub = await startRpcStub(LOCALNET_STUB_GENESIS);
   dir = scratchDir('s188-');
-  app = await startApp(dir, { SOLANA_RPC_URL: stub.url, ALLOWED_CLUSTER: 'localnet', LOCALNET_GENESIS_HASH: LOCALNET_STUB_GENESIS });
+  app = await startApp(dir, { SOLANA_RPC_URL: stub.url, ALLOWED_CLUSTER: 'localnet', LOCALNET_GENESIS_HASH: LOCALNET_STUB_GENESIS, APEX_REPLAY_MAX_LAUNCHES: '300' });
 }, 120_000);
 afterAll(async () => { await app?.stop(); await stub?.close(); fs.rmSync(dir, { recursive: true, force: true }); });
 
 describe('S188 the replay reports its cap', () => {
-  it('with 305 recorded launches it replays the newest 300 and says so; the recorder status still shows all 305', async () => {
+  it('with a cap of 300 (APEX_REPLAY_MAX_LAUNCHES) and 305 recorded launches it replays the newest 300 and says so; the recorder status still shows all 305', async () => {
     const db = new WorkstationDatabase(app.dbPath);
     for (let i = 0; i < 305; i++) db.recordLaunchEvent(1_700_000_000_000 + i, `M${i}`, 'CREATE', { mint: `M${i}`, symbol: 'X' });
     const r = await app.call('GET', '/api/backtest/replay');

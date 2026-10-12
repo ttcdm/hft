@@ -18,7 +18,7 @@ import { realismEngine } from './server/realismEngine';
 import { buildSystemChecks } from './server/system/systemChecks';
 import { isReadOnly, assertReadOnlyStartup } from './server/solana/readOnly';
 import { LaunchRecorder } from './server/backtest/launchRecorder';
-import { replayLaunches } from './server/backtest/replay';
+import { replayLaunchesAsync } from './server/backtest/replay';
 import { checkConfluenceThreshold, getConfluenceThreshold, envConfluenceProblem } from './server/signals/confluenceThreshold';
 import { computeLatency } from './server/system/latencyStats';
 import { buildDiagnosticsContext } from './server/system/aiContext';
@@ -1378,10 +1378,14 @@ app.get('/api/backtest/recording', requireOperatorAuth, (req, res) => {
   res.json({ success: true, ...workstationDb.getLaunchRecordingStatus() });
 });
 
-/** The replay is CPU work done synchronously per launch, so it covers the newest launches only. */
-const REPLAY_LAUNCH_CAP = 300;
+/** The most launches one replay covers (newest first). 3,250 launches replay in about 7 s of CPU, now time-sliced so the live loop keeps running. APEX_REPLAY_MAX_LAUNCHES (100 to 50000) overrides. */
+function replayLaunchCap(env: NodeJS.ProcessEnv = process.env): number {
+  const n = Number((env.APEX_REPLAY_MAX_LAUNCHES ?? '').trim());
+  return Number.isInteger(n) && n >= 100 && n <= 50_000 ? n : 5_000;
+}
 let replayCache: { key: string; at: number; body: any } | null = null;
-app.get('/api/backtest/replay', requireOperatorAuth, (req, res) => {
+const replayInFlight = new Map<string, Promise<any>>();
+app.get('/api/backtest/replay', requireOperatorAuth, async (req, res) => {
   // S187: ?minScore=N replays at another confluence threshold (the what-if box); without it, the threshold in force
   let minScore: number | undefined;
   if (req.query.minScore !== undefined) {
@@ -1393,14 +1397,27 @@ app.get('/api/backtest/replay', requireOperatorAuth, (req, res) => {
   if (status.launches === 0) {
     return res.json({ success: true, recorded: status, report: null, message: 'No launch has been recorded yet, so there is nothing to replay. The recorder saves every launch the watch window scores while the app runs against a pump.fun feed.' });
   }
-  const key = `${status.events}:${status.newestTs}:${minScore ?? getConfluenceThreshold()}`;
+  const cap = replayLaunchCap();
+  const key = `${status.events}:${status.newestTs}:${minScore ?? getConfluenceThreshold()}:${cap}`;
   if (replayCache && replayCache.key === key && Date.now() - replayCache.at < 30_000) return res.json(replayCache.body);
-  const { launches, funders } = workstationDb.loadLaunchRecording(REPLAY_LAUNCH_CAP);
-  const report = replayLaunches(launches, funders, solPriceService.lastKnownPrice(), minScore === undefined ? {} : { minScore });
-  // S188: the replay covers the newest REPLAY_LAUNCH_CAP launches; the response says so, so a count below the recorder's is explained
-  const body = { success: true, recorded: status, report, message: null, replayedLaunches: launches.length, replayCap: REPLAY_LAUNCH_CAP };
-  replayCache = { key, at: Date.now(), body };
-  res.json(body);
+  try {
+    // S189: one replay per key at a time (the screen polls), time-sliced so a long replay never stalls the live feed or the auto controller
+    let running = replayInFlight.get(key);
+    if (!running) {
+      running = (async () => {
+        const { launches, funders } = workstationDb.loadLaunchRecording(cap);
+        const report = await replayLaunchesAsync(launches, funders, solPriceService.lastKnownPrice(), minScore === undefined ? {} : { minScore });
+        // S188: the replay covers the newest `cap` launches; the response says so, so a count below the recorder's is explained
+        const body = { success: true, recorded: status, report, message: null, replayedLaunches: launches.length, replayCap: cap };
+        replayCache = { key, at: Date.now(), body };
+        return body;
+      })().finally(() => replayInFlight.delete(key));
+      replayInFlight.set(key, running);
+    }
+    res.json(await running);
+  } catch (e: any) {
+    res.status(500).json({ success: false, error: `Replay failed: ${e?.message || e}` });
+  }
 });
 
 app.get('/api/execution/mode', requireOperatorAuth, (req, res) => {

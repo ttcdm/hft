@@ -13,7 +13,9 @@ export interface AutoStatusData {
   session: null | { buys: number; spentSol: number; sessionPnlSol: number; budgetsLeft: { buys: number; spendSol: number; lossSol: number; msLeft: number } };
   budgets: { maxBuys: number; maxSpendSol: number; maxLossFraction: number; maxDurationMs: number };
   /** S181: bounds the server accepts for the session budget. Absent on an older server. */
-  budgetLimits?: { maxSpendSol: number; minSpendSol: number; maxBuys: number };
+  budgetLimits?: { maxSpendSol: number; minSpendSol: number; maxBuys: number; capKind?: 'PAPER' | 'REAL'; capNote?: string };
+  /** S189: a PAPER session waiting in SHADOW for readiness to stay green. Absent on an older server. */
+  autoRestore?: { greenForMs: number; needMs: number } | null;
   /** S183: size of one auto order in SOL and the bounds the server accepts. Absent on an older server. */
   orderSol?: number;
   orderLimits?: { minSol: number; maxSol: number };
@@ -39,7 +41,7 @@ export function AutoModeBadge({ mode, halted }: { mode: AutoMode | null; halted?
 export function budgetProblem(nBuys: number, nSpend: number, limits?: AutoStatusData['budgetLimits']): string | null {
   if (!Number.isInteger(nBuys) || nBuys < 1 || nBuys > (limits?.maxBuys ?? 50)) return `Max buys must be a whole number from 1 to ${limits?.maxBuys ?? 50}.`;
   if (!Number.isFinite(nSpend) || (limits && nSpend < limits.minSpendSol)) return `Max spend must cover at least one order (${limits?.minSpendSol} SOL).`;
-  if (limits && nSpend > limits.maxSpendSol + 1e-9) return `Max spend is above the server cap of ${Number(limits.maxSpendSol.toFixed(6))} SOL (3 x MAX_POSITION_SIZE_SOL).`;
+  if (limits && nSpend > limits.maxSpendSol + 1e-9) return `Max spend is above the server cap of ${Number(limits.maxSpendSol.toFixed(6))} SOL (${limits.capNote ?? '3 x MAX_POSITION_SIZE_SOL'}).`;
   return null;
 }
 
@@ -66,7 +68,7 @@ export function AutoBudgetEditor({ budgets, limits, onSave, busy }: { budgets: A
       </div>
       {problem && <p className="text-rose-400 mt-0.5" data-testid="budget-problem">{problem}</p>}
       {runningNote && <p className="text-amber-300/90 mt-0.5" data-testid="budget-running-note">{runningNote}</p>}
-      {limits && <p className="text-slate-600 mt-0.5">Up to {Number(limits.maxSpendSol.toFixed(6))} SOL. Kept until the server restarts.</p>}
+      {limits && <p className="text-slate-600 mt-0.5">Up to {Number(limits.maxSpendSol.toFixed(6))} SOL{limits.capKind === 'PAPER' ? ' (PAPER session: paper spends nothing; a real-SOL session is capped lower)' : ''}. Kept until the server restarts.</p>}
     </div>
   );
 }
@@ -149,6 +151,9 @@ export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOr
       {status.haltReason && <p className="text-red-400 mb-2" data-testid="halt-reason">ALL TRADING HALTED: {status.haltReason} <button onClick={onResume} className="underline ml-1">clear halt</button></p>}
       {status.killReason && <p className="text-amber-400 mb-1">Killed: {status.killReason}</p>}
       {status.downgradeReason && <p className="text-amber-400 mb-1" data-testid="downgrade-reason">Dropped to SHADOW: {status.downgradeReason}</p>}
+      {status.autoRestore && (
+        <p className="text-cyan-300 mb-1" data-testid="auto-restore">PAPER comes back by itself once readiness has stayed green for {Math.round(status.autoRestore.needMs / 1000)}s (green for {Math.round(status.autoRestore.greenForMs / 1000)}s so far).</p>
+      )}
       {status.confluence && (
         <React.Fragment key={`confluence-${status.confluence.value}`}><ConfluenceThresholdEditor confluence={status.confluence} onSave={onThreshold} busy={busy} /></React.Fragment>
       )}

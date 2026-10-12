@@ -38,3 +38,19 @@ describe('S188 (a) the replay says how many recorded launches it covers', () => 
     expect(html).not.toContain('replay-capped');
   });
 });
+
+describe('S189 the replay table shows the newest rows only', () => {
+  it('summarises all replayed launches but renders at most TABLE_ROWS_SHOWN rows, and says so', async () => {
+    const { TABLE_ROWS_SHOWN } = await import('../src/components/BacktestModal');
+    const row = (i: number) => ({ mint: `M${i}xxxxxxxxxxxx`, symbol: `S${i}`, trades: 1, verdict: 'DEAD', verdictReason: '', releasedAfterMs: null, score: null, entered: false, noEntryReason: 'x', outcome: 'NO_ENTRY', entryPriceSol: null, exits: [], holdMs: null, netPnlSol: null, openValueSol: null });
+    const report: any = { rules: [], notReplayed: [], assumptions: { orderSol: 0.005, entryDelayMs: 1500, feePct: 1, networkFeeSol: 0.000005, tipSol: 0.0001, minScore: 70 },
+      summary: { launches: 400, released: { DEAD: 400 }, entries: 0, closed: 0, openAtEnd: 0, wins: 0, losses: 0, winRate: null, netPnlSol: null, avgHoldMs: null, exitReasons: {} },
+      launches: Array.from({ length: 400 }, (_, i) => row(i)) };
+    const html = renderToStaticMarkup(<ReplayBacktestView data={{ recorded: { launches: 400, events: 1, oldestTs: 1, newestTs: 2 }, report, message: null, replayedLaunches: 400, replayCap: 5000 } as ReplayResponse} />);
+    expect(html).toContain('data-testid="replay-table-capped"');
+    expect((html.match(/<tr class="border-t/g) ?? []).length).toBe(TABLE_ROWS_SHOWN);
+    expect(html).toContain('$S399'); // newest first
+    expect(html).not.toContain('$S0<');
+    expect(html).not.toContain('replay-capped'); // all 400 recorded launches were replayed
+  });
+});

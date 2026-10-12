@@ -1,6 +1,6 @@
 # Apex HFT Execution Engine (Rust)
 
-> **STATUS: not used.** Nothing in this repository builds, links, spawns or calls this crate (no `npm` script, no `server/` import, no CI step). Latency figures quoted elsewhere for it were never measured by this project.
+> **STATUS: not used.** Nothing in the app builds, links, spawns or calls this crate (no `npm` script, no `server/` import). The CI workflow does format, lint, test and build it on its own, and nothing uses the result. Latency figures quoted elsewhere for it were never measured by this project.
 
 > **ARCHITECTURAL BOUNDARY & ROLE NOTICE (B21):**
 > `crates/apex_hft_engine` is a standalone, ultra-low-latency reference benchmark and simulation harness for centralized exchange (CEX) L2 order book matching and Avellaneda-Stoikov market making.
@@ -13,7 +13,7 @@ Ultra-low latency autonomous execution and Avellaneda-Stoikov market-making engi
 - **Lock-Free Ring Buffer (`ring_buffer.rs`)**: SPSC circular buffer with atomic acquire/release semantics.
 - **Micro-Account ($10 USD) & Institutional Modes (`risk.rs`)**:
   - Enforces exchange minimum notional requirements (Binance 5 USDT rule) so small accounts don't get rejected.
-  - Sub-microsecond pre-trade risk checks: leaky bucket rate limiter, fat-finger band, circuit breaker.
+  - Pre-trade risk checks (speed never measured by this project): leaky bucket rate limiter, fat-finger band, circuit breaker.
 - **Avellaneda-Stoikov Pricing Model (`avellaneda_stoikov.rs`)**:
   - Real-time reservation price calculation with Order Flow Imbalance (OFI) skew.
 - **Write-Ahead Log (`wal.rs`)**:
@@ -36,7 +36,10 @@ MICRO_10_USD=1 SYMBOL=btcusdt ./target/release/apex_hft_engine
 MICRO_10_USD=0 SYMBOL=btcusdt ./target/release/apex_hft_engine
 ```
 
-## Latency Benchmarks
+## Latency Benchmarks (unverified)
+
+The three figures below were written in an earlier version of this file. This project has never measured them; treat them as a claim, not a result.
+
 - **Tick-to-Trade Decision Latency**: ~1.1µs - 2.4µs
 - **Pre-Trade Risk Gateway Evaluation**: ~45 nanoseconds
 - **L2 Order Book Level Update**: ~120 nanoseconds

@@ -105,6 +105,7 @@ These can be set (some from the UI) and are saved, but no code path reads them t
 | `ENABLE_SYNTHETIC_SOCIAL` | `server/solana/executionConfig.ts` | Read into the config object, never consulted. |
 
 | `minConfidenceScore` | `server/memecoinAggregator.ts` config | Accepted and stored, never read. |
+| `requireConfluenceScore` (wallet config `riskLimits`, default 70) | `server/walletTrader.ts`, `server/middleware/enterprise.ts` | Accepted by the schema and kept in the config object. No code compares a score with it. The real gate is the confluence threshold (`CONFLUENCE_MIN_SCORE`, `POST /api/auto/threshold`). |
 | Two "auto snipe" switches | env `AUTO_SNIPE_ENABLED` (`server/auto/controller.ts`) and the UI/config flag in `server/memecoinAggregator.ts` | Only the env flag and the Auto panel's mode decide whether auto trades. The other flag is stored only. |
 | `walletAddress`, `jitoTipAccount`, `wsRpcEndpoint`, `autoStartTrading` (wallet config body) | `server/execution/schemas`/`walletTrader.updateConfig` | Accepted by the schema, never applied by `updateConfig`. |
 | `priorityTipSol` on close-position | `ClosePositionSchema` | Labelled placeholder; ignored. |

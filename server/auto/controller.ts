@@ -656,7 +656,7 @@ export class AutoSnipeController extends EventEmitter {
     if (open.some((p) => p.mint.toLowerCase() === key)) return this.record(c, 'DROPPED', 'auto', 'POSITION_ALREADY_OPEN');
 
     // G2b: only watch-window releases get this far. HOT goes straight to the execution stages; READY must also clear
-    // the confluence score (>= 70) here; DEAD, still-watching and never-watched candidates are dropped.
+    // the confluence score (the threshold in force, default 70) here; DEAD, still-watching and never-watched candidates are dropped.
     const verdict = watchWindow.getVerdict(c.mint);
     if (!verdict || verdict.state === 'WATCHING' || verdict.state === 'DEAD') {
       const reason = !verdict ? 'NOT_IN_WATCH_WINDOW' : verdict.state === 'WATCHING' ? 'WATCH_PENDING: still in the watch window' : `WATCH_DEAD: ${verdict.reason}`;

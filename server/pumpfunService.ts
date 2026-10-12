@@ -754,7 +754,7 @@ export class PumpFunService extends EventEmitter {
       const meetsCallerWinRate = caller.winRate2x >= rules.minCallerWinRate2x;
       const meetsAvgMultiple = caller.avgMultiple >= rules.minAvgMultiple;
 
-      // Alpha Pipeline Integration (B14): evaluate confluence with ConfluenceEngine requiring composite score >= 70
+      // Alpha Pipeline Integration (B14): evaluate confluence with ConfluenceEngine requiring a composite score at or above the threshold in force (default 70)
       const confluence = this.evaluateCalloutConfluence(callout);
       const isConfluenceScorePassed = isConfluencePassed(confluence.compositeScore);
       const meetsConfluence =
@@ -765,7 +765,7 @@ export class PumpFunService extends EventEmitter {
       const withinPriceLimit = callout.token.currentMultiple !== null && callout.token.currentMultiple <= rules.maxEntryMultiple; // an unknown multiple is not "within the limit"
       const withinTimeLimit = (Date.now() - callout.calloutTimestamp) / 1000 <= rules.maxElapsedSeconds;
 
-      // Trigger on (caller stats) OR strong confluence (>= 70), within price and time limits.
+      // Trigger on (caller stats) OR strong confluence (at or above the threshold in force), within price and time limits.
       // A caller subscription alone is not a signal (A5).
       const shouldSnipe =
         ((meetsCallerWinRate && meetsAvgMultiple) || meetsConfluence) &&

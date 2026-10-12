@@ -12,7 +12,7 @@ import type { PumpTradeEvent } from '../solana/pumpFeedListener';
  *
  * Release states:
  *   DEAD   cumulative net inflow negative once the minimum hold has passed, or ANY creator sell (instant)
- *   HOT    minimum hold passed, >= 3 measured signals strong, and the confluence score is >= 70
+ *   HOT    minimum hold passed, >= 3 measured signals strong, and the confluence score is at or above the threshold in force (default 70)
  *   READY  the full window elapsed without a dead or hot verdict
  */
 /** Q6c: was 10, which a busy feed fills with the first ten launches while the rest are refused without a trace. */

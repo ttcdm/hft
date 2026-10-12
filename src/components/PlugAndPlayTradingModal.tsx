@@ -1,3 +1,14 @@
+/**
+ * The wallet and execution panel: arm and disarm LIVE, the PAPER and LIVE banner, generate a signer, snipe, close a position and panic
+ * liquidate.
+ *
+ * API it calls with `fetch` and the operator token: `POST /api/execution/arm`, `GET /api/diagnostics/system`, `GET /api/workstation/positions`,
+ * `GET /api/workstation/events`, `POST /api/signer/generate`, `POST /api/wallet/snipe`, `POST /api/wallet/close-position` and
+ * `POST /api/wallet/panic-liquidate`.
+ *
+ * It must not hold or show key material, and it must not arm LIVE by itself: arming needs the operator to type the confirmation code, and
+ * the server decides whether the prerequisites hold (`getLiveReadiness`). In read-only mode the server refuses to arm and to generate a key.
+ */
 import { ARMED_MESSAGE, PANIC_CONFIRM_TEXT, panicOutcome } from '../utils/tradingCopy';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import React, { useState, useEffect } from 'react';

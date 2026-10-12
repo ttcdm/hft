@@ -1,3 +1,18 @@
+/**
+ * Venue resolution, pool state, quotes and instruction building for tokens that have migrated from the Pump.fun bonding curve to the
+ * canonical PumpSwap AMM pool (via @pump-fun/pump-swap-sdk). SOL-quoted pools only: a pool with any other quote mint is refused
+ * (`UNSUPPORTED_PUMPSWAP_QUOTE_MINT`).
+ *
+ * What it must never do: sign or send (it returns instructions), or treat an unresolved venue as tradable. In LIVE mode a bonding-curve
+ * lookup that throws makes `resolveVenue` return venue `UNKNOWN` and the caller refuses the trade; a lookup that returns nothing still
+ * falls through to the pool check in either mode. `getPoolState` and the two instruction builders throw if `executionMode` is not exactly
+ * `LIVE` or `PAPER`; `resolveVenue` does not check it.
+ *
+ * Called by: `ExecutionCoordinator.closePositionImpl` (`resolveVenue`, `buildPumpSwapSellInstructions`: this is how a migrated position is
+ * sold) and `RealMarkPriceService.queryOnChainMarkPrices` in `reconciliation.ts` (`getPoolState`, to price an open position whose curve has completed). Buys are never built here in the running app: a
+ * LIVE buy of a migrated token is rejected with `BONDING_CURVE_MIGRATED`. `buildPumpSwapBuyInstructions` and the `quotePumpSwap*` helpers
+ * have no production caller (only tests), so treat them as unexercised until a send path uses them.
+ */
 import {
   Connection,
   PublicKey,
@@ -23,6 +38,7 @@ export type { ExecutionMode, TradingVenue };
 
 export { buyQuoteInput, buyBaseInput, sellBaseInput, sellQuoteInput, computeFeesBps, canonicalPumpPoolPda };
 
+/** Decoded canonical pool for one mint: reserves, token programs, fee and creator fields, and the spot price in SOL per token. `effectiveQuoteReserve` is real plus virtual quote reserves; the spot price uses it. */
 export interface PumpSwapExecutionState {
   poolAddress: PublicKey;
   baseMint: PublicKey;
@@ -47,10 +63,15 @@ export interface PumpSwapExecutionState {
 // Backwards-compatible type alias
 export type PumpSwapPoolState = PumpSwapExecutionState;
 
+/** Static helpers around the PumpSwap pool of one mint. Pool state is cached per mint for 15 s. */
 export class PumpSwapVenueService {
   private static poolCache: Map<string, { pool: PumpSwapExecutionState | null; timestamp: number }> = new Map();
   private static readonly CACHE_TTL_MS = 15000;
 
+  /**
+   * Which venue trades this mint: `PUMP_BONDING_CURVE` while the curve is open, `PUMPSWAP` once the canonical SOL-quoted pool exists, else `UNKNOWN`.
+   * An `UNKNOWN` answer means "do not trade". In LIVE a failed curve lookup is `UNKNOWN`, never a guess.
+   */
   // Resolve trading venue for a token mint: active bonding curve vs migrated canonical PumpSwap pool
   public static async resolveVenue(
     connection: Connection,
@@ -116,6 +137,10 @@ export class PumpSwapVenueService {
     };
   }
 
+  /**
+   * Decodes the canonical pool and its vault balances. Returns null when there is no pool (cached as null for 15 s). Throws in LIVE for a
+   * non-SOL quote mint; in PAPER it returns null instead. Throws if `executionMode` is not `LIVE` or `PAPER`.
+   */
   // Fetch canonical PumpSwap pool state and calculate spot price in SOL using effectiveQuoteReserves
   public static async getPoolState(
     connection: Connection,
@@ -235,6 +260,7 @@ export class PumpSwapVenueService {
     return globalConfig;
   }
 
+  /** Quote helpers (1 to 4) wrap the SDK's pure maths with this app's pool state. They read nothing from the chain. No production caller; tests only. */
   // Quoting helper 1: Buy with exact Quote (SOL) input -> Base tokens out
   public static quotePumpSwapBuyQuoteInput(params: {
     solAmountLamports: bigint;
@@ -342,6 +368,7 @@ export class PumpSwapVenueService {
   }
 
   // Build PumpSwap buy instructions using official SDK quoter and instruction builder
+  /** Instructions to buy `solAmountLamports` of a migrated token, with the minimum base output at `slippageBps`. No production caller (see the file header). */
   public static async buildPumpSwapBuyInstructions(
     connection: Connection,
     userPubkey: PublicKey,
@@ -415,6 +442,10 @@ export class PumpSwapVenueService {
   }
 
   // Build PumpSwap sell instructions using official SDK quoter and instruction builder
+  /**
+   * Instructions to sell `tokenAmountRaw` of a migrated token, with the minimum SOL output at `slippageBps`. The instructions are unsigned; the
+   * coordinator wraps them in a transaction and sends them through the same cluster-guarded path as a bonding-curve sell.
+   */
   public static async buildPumpSwapSellInstructions(
     connection: Connection,
     userPubkey: PublicKey,

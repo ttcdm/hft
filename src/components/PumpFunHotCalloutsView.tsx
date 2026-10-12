@@ -1,3 +1,16 @@
+/**
+ * The Pump.fun hot callouts board: callouts, callers and the callout rules, with a snipe button per callout.
+ *
+ * API it calls (through `engineClient`): `GET /api/pumpfun/callouts`, `POST /api/pumpfun/callouts/snipe`,
+ * `POST /api/pumpfun/callouts/toggle-autosnipe`, `GET` and `POST /api/pumpfun/callouts/rules`, `POST /api/pumpfun/refresh`. New callouts and
+ * "sniped" notices arrive over the `/ws/engine` WebSocket.
+ *
+ * The caller button is a screen marker only: nothing reads it when deciding to buy (KNOWN_RISKS.md section 6). The callout rules are not: while the
+ * Auto controller is not OFF, `pumpfunService.evaluateAutoSnipeTriggers` reads them and submits matching callouts to the controller as candidates
+ * (the controller still applies its own gates and mode; in SHADOW nothing is sent). The snipe button is a real one-click buy through the server's
+ * gates, and in LIVE it needs `confirmLive`. Explorer and market links are always offered on this screen, because the callouts come from the mainnet
+ * pump.fun list (the call passes `true` for "token is mainnet data"); this build trades devnet and localnet only.
+ */
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { SnipeAmountControl } from './SnipeAmountControl';
 import { CONFLUENCE_RULE_LABEL, CONFLUENCE_RULE_NOTE } from '../utils/calloutRuleText';

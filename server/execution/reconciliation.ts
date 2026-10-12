@@ -1,7 +1,21 @@
+/**
+ * Turns a confirmed signature into what actually happened. After a buy or sell lands, `TradeReconciler` reads the transaction from the RPC
+ * and works out tokens moved, SOL spent or received, network fee, tip and any rent the trade opened, from the on-chain balance changes rather
+ * than the quote. Position cost basis, fill price and realized PnL come from these results. `RealMarkPriceService` reads the on-chain price
+ * used to mark open positions (bonding-curve reserves, or the PumpSwap pool after migration).
+ *
+ * What it must never do: invent a fill. When the transaction cannot be read it returns `RECONCILIATION_REQUIRED` (or `ERROR`, or `REVERTED`
+ * for a failed transaction) and the coordinator keeps the order open for a retry; it must not fall back to the pre-trade estimate. It
+ * never signs or sends.
+ *
+ * Called by: `server/execution/coordinator.ts` (after each LIVE buy and sell, at startup to recover interrupted transactions, and to mark
+ * positions). PAPER fills do not pass through here; `paperEngine.ts` prices those.
+ */
 import { Connection, PublicKey } from '@solana/web3.js';
 import { PumpCurveService, ExecutionMode } from '../solana/pumpCurve';
 import { Logger } from '../middleware/enterprise';
 
+/** Wallet SOL and token balance read just before a trade is built. The reconciler measures the change against it. */
 export interface PreTradeSnapshot {
   walletSolLamports: number;
   walletSolBalance?: number;
@@ -10,6 +24,7 @@ export interface PreTradeSnapshot {
   timestamp: number;
 }
 
+/** What a buy really did. `reconciliationState` says whether the numbers can be trusted: `RECONCILED` yes; `RECONCILIATION_REQUIRED`, `ZERO_DELTA` and `ERROR` no; `REVERTED` the transaction failed. */
 export interface BuyReconciliationResult {
   success: boolean;
   reconciliationState: 'RECONCILED' | 'RECONCILIATION_REQUIRED' | 'ZERO_DELTA' | 'REVERTED' | 'ERROR';
@@ -33,6 +48,7 @@ export interface BuyReconciliationResult {
   error?: string;
 }
 
+/** What a sell really did, with the net proceeds and realized PnL against the cost basis. Same state meanings as the buy result. */
 export interface SellReconciliationResult {
   success: boolean;
   reconciliationState: 'RECONCILED' | 'RECONCILIATION_REQUIRED' | 'ZERO_DELTA' | 'REVERTED' | 'ERROR';
@@ -74,6 +90,7 @@ export function otherNewAccountRent(
   return total;
 }
 
+/** Static reconciliation of buys, sells and interrupted transactions against the chain. */
 export class TradeReconciler {
   /**
    * Delays between getTransaction retries when the RPC has not indexed a just-confirmed signature yet (returns null) or errors.
@@ -98,6 +115,7 @@ export class TradeReconciler {
     return null;
   }
 
+  /** Reads the wallet's SOL balance and token balance before a trade. In LIVE a failed balance read throws `PRE_TRADE_SNAPSHOT_FAILED`; in PAPER it continues with zero. Any error reading the token balance (a missing account, but also an RPC failure) is treated as 0 tokens: that is deliberate for a fresh buy but means a failed read cannot be told from an empty account; flagged for review, not changed. */
   // Capture pre-trade on-chain state
   public static async capturePreTradeSnapshot(
     connection: Connection,
@@ -143,6 +161,7 @@ export class TradeReconciler {
     };
   }
 
+  /** Reads a confirmed buy from the chain (retrying while the RPC has not indexed it) and returns the real spend, tokens received, fees, tip, rent and fill price. */
   // Rigorous Buy Fill Reconciliation
   public static async reconcileBuyTransaction(
     connection: Connection,
@@ -332,6 +351,7 @@ export class TradeReconciler {
     }
   }
 
+  /** Reads a confirmed sell from the chain and returns the real tokens sold, gross and net proceeds, fees, tip, remaining balance and realized PnL for the fraction sold. */
   // Rigorous Sell Fill Reconciliation
   public static async reconcileSellTransaction(
     connection: Connection,
@@ -477,6 +497,7 @@ export class TradeReconciler {
     }
   }
 
+  /** Rebuilds a buy or sell from its signature after a restart or an unconfirmed send, from the on-chain token and SOL balance changes. `recovered: false` carries the reason. */
   // Authoritative recovery of interrupted transactions from on-chain transaction records
   public static async recoverInterruptedTransaction(
     connection: Connection,
@@ -648,10 +669,12 @@ export class TradeReconciler {
   }
 }
 
+/** On-chain mark prices for open positions. No random walks and no estimates: a mint with no readable price is simply absent from the result. */
 // Real Mark Price Service (No synthetic random walks)
 export class RealMarkPriceService {
   private lastFetchTimestamp: number = 0;
 
+  /** Spot price in SOL per token for each mint: from the bonding curve while it is open, from the canonical PumpSwap pool once it has migrated. Each entry says which source it came from and when it was read. */
   // Query on-chain bonding curve reserves for active open positions
   public static async queryOnChainMarkPrices(
     connection: Connection,

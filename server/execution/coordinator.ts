@@ -48,6 +48,7 @@ import { Logger, endpointOrigin } from '../middleware/enterprise';
 import { traced } from '../observability/tracing';
 import { acquireLock, dbLockPath, isPidAlive, signerLockPath, updateHeldLock } from '../system/instanceLock';
 import crypto from 'node:crypto';
+import { createTradingConnection } from '../solana/rpcConnection';
 import { allowedCluster, assertClusterAllowed, assertClusterAllowedCached, assertSendClusterAllowed, blockhashCheckEnabled, ClusterGuardError, forgetGenesisCheck, rememberGenesisCheck, resolveRpcUrl, verifyBlockhashIndependently } from '../solana/clusterGuard';
 import { PumpCurveService, TradeQuote, PumpMarketState, fetchTokenHolderDistribution } from '../solana/pumpCurve';
 import { TradeReconciler, RealMarkPriceService, PreTradeSnapshot } from './reconciliation';
@@ -99,6 +100,8 @@ export interface ExecutionResponse {
 // A blockhash lives ~60-90s; after this a sent-but-unseen sell can no longer land.
 const PENDING_SELL_WINDOW_MS = 100_000;
 const ORPHAN_MAX_AGE_MS = 15 * 60_000;
+/** P1.7: how long one exit pass waits for the sells it started before it ends; a longer sell keeps running and the next pass goes on. */
+export const EXIT_SELL_WAIT_MS = 2_500;
 /** P1.1: a sell claim older than this is stale (longer than a sell takes end to end: build, send, confirm, reconcile). */
 const EXIT_CLAIM_STALE_MS = 2 * PENDING_SELL_WINDOW_MS;
 /** P1.1: a claim `<pid>:<nonce>` whose process has died is stale at once (a crash mid-sell must not hold the stop-loss off). */
@@ -162,10 +165,7 @@ export class ExecutionCoordinator {
     } else {
       this.isDefaultSingleton = Boolean(connectionOrIsSingleton);
       this.rpcEndpoint = resolveRpcUrl();
-      this.connection = new Connection(this.rpcEndpoint, {
-        commitment: 'confirmed',
-        confirmTransactionInitialTimeout: 30000,
-      });
+      this.connection = createTradingConnection(this.rpcEndpoint); // P1.7: bounded calls, no web3.js 429 sleeps
     }
     this.jitoTransport = new JitoTransport(this.connection);
     this.rpcTransport = new SolanaRpcTransport(this.connection);
@@ -523,10 +523,7 @@ export class ExecutionCoordinator {
       if (resolveRpcUrl(newEndpoint) !== newEndpoint.trim()) {
         throw new Error(`CLUSTER_GUARD: RPC endpoint rejected (looks like mainnet while ALLOWED_CLUSTER=${allowedCluster()})`);
       }
-      const newConn = new Connection(newEndpoint, {
-        commitment: 'confirmed',
-        confirmTransactionInitialTimeout: 30000,
-      });
+      const newConn = createTradingConnection(newEndpoint); // P1.7: the replacement is bounded the same way
       forgetGenesisCheck(this.connection); // R1-1: a switch never keeps the old connection's pass
       await assertClusterAllowed(newConn);
       rememberGenesisCheck(newConn);
@@ -2973,6 +2970,8 @@ export class ExecutionCoordinator {
       return { success: false, pnlSol: 0, error: 'EXIT_IN_PROGRESS: An exit transaction for this position is already in progress.' };
     }
     this.inFlightPositionExits.add(positionId);
+    let exitDone!: () => void;
+    this.positionExitDone.set(positionId, new Promise<void>((r) => { exitDone = r; })); // P1.7: what waitForPositionExit awaits
     let claimed = false;
     const exitClaimOwner = `${process.pid}:${crypto.randomUUID()}`;
 
@@ -3360,6 +3359,8 @@ export class ExecutionCoordinator {
     } finally {
       if (claimed) workstationDb.releaseExitClaim(positionId, exitClaimOwner);
       this.inFlightPositionExits.delete(positionId);
+      this.positionExitDone.delete(positionId);
+      exitDone();
     }
   }
 
@@ -3470,9 +3471,48 @@ export class ExecutionCoordinator {
 
   // Evaluate dynamic exit conditions for all active positions and execute exits via ExitEngine (B13)
   private exitPassInFlight: Promise<void> | null = null;
+  /** P1.7: one promise per position whose sell is running (set and cleared with inFlightPositionExits); it only ever resolves. */
+  private positionExitDone = new Map<string, Promise<void>>();
+  private panicActive = false;
+
+  /**
+   * P1.7: resolves once no exit (sell) of this position is running on this coordinator; at once when none is. Never rejects. A panic
+   * liquidation (P1.4) awaits it so it does not race a sell that is already on its way.
+   */
+  public async waitForPositionExit(positionId: string): Promise<void> {
+    for (let p = this.positionExitDone.get(positionId); p; p = this.positionExitDone.get(positionId)) await p;
+  }
+
+  /** P1.7: while a panic liquidation runs, the exit pass sends only protective exits (PROTECTIVE_EXIT_REASONS, the haltAll set). */
+  public setPanicActive(active: boolean): void {
+    this.panicActive = active;
+  }
+
+  public isPanicActive(): boolean {
+    return this.panicActive;
+  }
+
+  /**
+   * P1.7: one auto exit, started by the exit pass and not awaited in its loop. The exit stage advances here, after the sell filled, from
+   * the row as it is then. Never rejects.
+   */
+  private dispatchExit(pos: NormalizedPosition, sellPct: number, reason: string, priorExitStage: NormalizedPosition['exitStage'], newExitStage: NormalizedPosition['exitStage']): Promise<void> {
+    return this.closePosition(pos.id, sellPct, reason).then((exitRes) => {
+      if (exitRes.success && newExitStage !== priorExitStage) {
+        const after = workstationDb.loadPositions(undefined, 'ACTIVE').find((p) => p.id === pos.id);
+        if (after) {
+          after.exitStage = newExitStage;
+          workstationDb.savePosition(after);
+        }
+      }
+    }).catch((err: any) => {
+      Logger.error(`[B13 ExitEngine] ${reason} for ${pos.symbol || pos.mint} failed: ${err?.message ?? err}`);
+    });
+  }
+
   private pendingSells = new Map<string, { signature: string; ts: number }>();
 
-  // N1: one pass at a time. A pass awaits sells that can outlast the 3s timer; an overlapping pass would see the same
+  // N1: one pass at a time. A pass waits (up to EXIT_SELL_WAIT_MS) for sells that can outlast the 3s timer; an overlapping pass would see the same
   // ACTIVE row and sell it again, or write back its stale copy over a position the first pass already closed.
   public evaluateAndProcessExits(): Promise<void> {
     if (this.exitPassInFlight) return this.exitPassInFlight;
@@ -3492,7 +3532,6 @@ export class ExecutionCoordinator {
     const loadedQty = new Map(positions.map((p) => [p.id, p.tokenQuantityRaw]));
     // N17: failure counters only matter for positions still open; drop the rest so the map cannot grow forever.
     for (const id of this.exitFailures.keys()) if (!loadedQty.has(id)) this.exitFailures.delete(id);
-    const now = Date.now();
     // Nothing LIVE is open, so there is no mark to be stale (see the feed heartbeat): reset the clock here too.
     if (!positions.some((p) => p.executionMode === 'LIVE')) {
       this.lastPositionMarkTimestamp = 0;
@@ -3502,10 +3541,13 @@ export class ExecutionCoordinator {
     let paperRefreshes = 0;
     let paperAlertsThisPass = 0;
     const paperNoMark: Array<{ pos: NormalizedPosition; ageMs: number }> = [];
+    const exits: Array<{ pos: NormalizedPosition; decision: ReturnType<typeof ExitEngine.evaluate>; priorExitStage: NormalizedPosition['exitStage'] }> = [];
     for (const pos of positions) {
+      // R1-32: each position's clock is read when it is evaluated, not when the pass started (a stale-mark read above can take a while).
+      const posNow = Date.now();
       // C4: staleness is measured from the last real mark only. lastUpdatedTimestamp is rewritten on every tick
       // and would hide a dead feed, so it is never a fallback; a never-marked position ages from its entry.
-      const markAge = now - (pos.lastMarkTimestamp || pos.entryTimestamp || now);
+      const markAge = posNow - (pos.lastMarkTimestamp || pos.entryTimestamp || posNow);
       if (markAge > MARK_STALE_MS) {
         // Before skipping, read this position's curve/pool directly. A fresh read lets the stop-loss run.
         // PAPER positions cost no more than PAPER_STALE_REFRESH_PER_PASS direct reads per pass; LIVE positions always get theirs.
@@ -3523,7 +3565,7 @@ export class ExecutionCoordinator {
             );
           }
           // A position nobody can price must age the mark feed from its entry, or an empty history would read as healthy.
-          if (pos.executionMode === 'LIVE' && this.lastPositionMarkTimestamp === 0) this.lastPositionMarkTimestamp = pos.entryTimestamp || now;
+          if (pos.executionMode === 'LIVE' && this.lastPositionMarkTimestamp === 0) this.lastPositionMarkTimestamp = pos.entryTimestamp || posNow;
           continue;
         }
         this.clearOperatorAlert('POSITION_MARK_UNAVAILABLE', pos.id);
@@ -3540,7 +3582,7 @@ export class ExecutionCoordinator {
         trailingStopSol: pos.trailingStopSol,
         exitStage: pos.exitStage,
         entryTimestamp: pos.entryTimestamp,
-        currentTimestamp: now,
+        currentTimestamp: posNow,
       });
 
       // A RECOVERED position (a balance found in the wallet that this app never bought) has an entry price that is just the mark at
@@ -3562,7 +3604,7 @@ export class ExecutionCoordinator {
       pos.highWaterMarkSol = decision.newHighWaterMarkSol;
       pos.trailingStopSol = decision.newTrailingStopSol;
       pos.exitStage = decision.shouldExit ? priorExitStage : decision.newExitStage;
-      pos.lastUpdatedTimestamp = now;
+      pos.lastUpdatedTimestamp = posNow;
       // N1: this row was loaded before the awaits above (and before earlier positions' sells in this pass). If a manual
       // close, partial sell or reconcile changed it since, writing the stale copy back would resurrect a sold position
       // or undo a partial; skip it and let the next pass re-evaluate from the current row.
@@ -3575,19 +3617,32 @@ export class ExecutionCoordinator {
       }
 
       if (decision.shouldExit) {
-        const waitMs = this.exitRetryWaitMs(pos.id, now);
-        if (waitMs > 0) continue; // backing off after a failed attempt; the next tick past the deadline retries
-        Logger.info(
-          `[B13 ExitEngine] ${decision.reason} triggered for ${pos.symbol || pos.mint} (Sell ${decision.sellPercentage}%, PnL: ${decision.profitPct.toFixed(2)}%)`
-        );
-        const exitRes = await this.closePosition(pos.id, decision.sellPercentage, decision.reason);
-        if (exitRes.success && decision.newExitStage !== priorExitStage) {
-          const after = workstationDb.loadPositions(undefined, 'ACTIVE').find((p) => p.id === pos.id);
-          if (after) {
-            after.exitStage = decision.newExitStage;
-            workstationDb.savePosition(after);
-          }
+        if (this.exitRetryWaitMs(pos.id, posNow) > 0) continue; // backing off after a failed attempt; the next tick past the deadline retries
+        if (this.inFlightPositionExits.has(pos.id)) continue; // P1.7: its sell from an earlier pass is still running; it must not be sent twice
+        if (this.panicActive && !PROTECTIVE_EXIT_REASONS.test(decision.reason)) {
+          Logger.warn(`[B13 ExitEngine] ${decision.reason} for ${pos.symbol || pos.mint} refused: panic liquidation is running`);
+          continue;
         }
+        exits.push({ pos, decision, priorExitStage });
+      }
+    }
+
+    // P1.7 (R1-71): every decision above was made before any sell started. Now start the sells together, so a slow or hung sell of one
+    // position cannot hold another position's stop-loss. The pass waits for them at most EXIT_SELL_WAIT_MS; a sell still running after
+    // that keeps going in the background, its position stays in inFlightPositionExits (no second send), and the next pass evaluates the rest.
+    const sells = exits.map(({ pos, decision, priorExitStage }) => {
+      Logger.info(
+        `[B13 ExitEngine] ${decision.reason} triggered for ${pos.symbol || pos.mint} (Sell ${decision.sellPercentage}%, PnL: ${decision.profitPct.toFixed(2)}%)`
+      );
+      return this.dispatchExit(pos, decision.sellPercentage, decision.reason, priorExitStage, decision.newExitStage);
+    });
+    if (sells.length > 0) {
+      let timer: NodeJS.Timeout | undefined;
+      const deadline = new Promise<void>((r) => { timer = setTimeout(r, EXIT_SELL_WAIT_MS); });
+      try {
+        await Promise.race([Promise.allSettled(sells), deadline]);
+      } finally {
+        clearTimeout(timer);
       }
     }
 

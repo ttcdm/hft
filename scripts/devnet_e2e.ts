@@ -324,7 +324,7 @@ async function main() {
       const t = await conn.getTransaction(sig, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
       return t ? (t.meta?.err ?? null) : undefined;
     },
-    buildBuyRequest, rec, link: solscan, sleep, connection: coordinator.getConnection() as any,
+    buildBuyRequest, rec, link: solscan, sleep, connection: coordinator.getConnection() as any, rpcUrl: process.env.SOLANA_RPC_URL!,
   };
   const S = await import('./devnet_e2e_steps');
   // The (a) buy started the 30 s per-mint cooldown; (d') must reach the chain, so it waits that out first.
@@ -334,6 +334,8 @@ async function main() {
   const lastBuyAt = await S.sequentialBuysOneMint(steps);
   await S.waitPast(steps, lastBuyAt, riskEngine.getLimits().cooldownPerMintMs, "per-mint cooldown from the (e') buy");
   await S.ambiguousSendThroughApp(steps); // P1.5
+  await S.waitPast(steps, Date.now(), riskEngine.getLimits().cooldownPerMintMs, "per-mint cooldown from the (e'') buy");
+  await S.heldBlockhashStopLoss(steps); // P1.7
 
   // (f) crash after submit, then recover in a fresh process on the same scratch DB
   const env = { ...process.env, APEX_E2E_SCRATCH: scratch };

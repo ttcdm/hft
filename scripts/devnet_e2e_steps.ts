@@ -13,6 +13,8 @@
  * Kept apart from devnet_e2e.ts so the steps can be read on their own; they take every dependency as an argument and import nothing
  * from server/ themselves, so the harness's environment setup still runs before any server module loads.
  */
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import type { ExecuteTradeRequest, ExecutionResponse } from '../server/execution/coordinator';
 
 type Tx = { signature: string; orderId: string; direction: string; reconciliationState: string; mint: string };
@@ -23,7 +25,11 @@ export interface HarnessSteps {
     executeTrade(req: ExecuteTradeRequest): Promise<ExecutionResponse>;
     closePosition(id: string, pct: number, reason: string): Promise<{ success: boolean; error?: string }>;
     syncRealWalletBalance(): Promise<unknown>;
+    /** (g) points the coordinator at the loopback proxy and back. */
+    setRpcEndpoint?(url: string): Promise<{ success: boolean; error?: string }>;
   };
+  /** (g) the RPC the coordinator uses normally (the proxy forwards to it). */
+  rpcUrl?: string;
   /** The PumpCurveService class itself (its static `calculateBuyQuote` is wrapped for one call). */
   curve: { calculateBuyQuote: (...args: any[]) => any };
   db: { loadTransactions(orderId?: string): Tx[]; loadPositions(): Pos[] };
@@ -158,5 +164,83 @@ export async function ambiguousSendThroughApp(s: HarnessSteps): Promise<void> {
   for (const p of open) {
     const c = await s.coordinator.closePosition(p.id, 100, "e2e (e'') cleanup");
     s.rec(`${L}: cleanup close 100%`, c.success, c.error || 'closed');
+  }
+}
+
+/**
+ * A loopback JSON-RPC proxy in front of `upstream` for (g). The first getLatestBlockhash it sees is held: no reply for `holdMs`, then the
+ * socket is closed. Everything else is forwarded as is.
+ */
+export async function startHoldingProxy(upstream: string, holdMs: number) {
+  const st = { blockhashCalls: 0, held: 0, holdOpen: false };
+  const timers = new Set<NodeJS.Timeout>();
+  const server = http.createServer((req, res) => {
+    let body = '';
+    req.on('data', (c) => (body += c));
+    req.on('end', async () => {
+      let method = '';
+      try { method = String(JSON.parse(body)?.method ?? ''); } catch { /* a batch or junk: forward it */ }
+      if (method === 'getLatestBlockhash') {
+        st.blockhashCalls++;
+        if (st.held === 0) {
+          st.held++;
+          st.holdOpen = true;
+          const t = setTimeout(() => { st.holdOpen = false; timers.delete(t); res.destroy(); }, holdMs);
+          timers.add(t);
+          return;
+        }
+      }
+      try {
+        const up = await fetch(upstream, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+        res.writeHead(up.status, { 'content-type': up.headers.get('content-type') ?? 'application/json' }).end(await up.text());
+      } catch {
+        res.writeHead(502).end();
+      }
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  return {
+    url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    st,
+    close: () => new Promise<void>((r) => { for (const t of timers) clearTimeout(t); st.holdOpen = false; server.closeAllConnections(); server.close(() => r()); }),
+  };
+}
+
+/**
+ * (g) P1.7 (R1-71): a getLatestBlockhash that hangs does not hang the stop-loss. The coordinator is pointed (setRpcEndpoint, which also
+ * runs the genesis check through the proxy) at a loopback proxy in front of the normal RPC that holds the first getLatestBlockhash for
+ * 20 s. One buy opens a position, then closePosition(STOP_LOSS) must send and confirm while that request is still held: the trading
+ * Connection aborts it after RPC_REQUEST_TIMEOUT_MS and asks again. The two-position form (B's stop sells while A's sell is held) is
+ * tests/long/exit_concurrency.longtest.ts on localnet; this harness trades one mint.
+ */
+export async function heldBlockhashStopLoss(s: HarnessSteps, holdMs = 20_000): Promise<void> {
+  const L = '(g) held getLatestBlockhash, stop-loss still sends';
+  if (!s.coordinator.setRpcEndpoint || !s.rpcUrl) { s.rec(L, false, 'harness did not pass setRpcEndpoint and rpcUrl'); return; }
+  await s.coordinator.syncRealWalletBalance();
+  const buy = await s.coordinator.executeTrade(await s.buildBuyRequest());
+  s.rec(`${L}: buy CONFIRMED`, buy.success && buy.lifecycleState === 'CONFIRMED', `${buy.lifecycleState} ${buy.error ?? ''}`.slice(0, 300));
+  const open = openFor(s);
+  if (open.length !== 1) { s.rec(`${L}: one open position`, false, JSON.stringify(open.map((p) => ({ id: p.id, status: p.status })))); return; }
+  const proxy = await startHoldingProxy(s.rpcUrl, holdMs);
+  try {
+    const sw = await s.coordinator.setRpcEndpoint(proxy.url);
+    s.rec(`${L}: coordinator on the loopback proxy`, sw.success, sw.error ?? proxy.url);
+    if (!sw.success) return;
+    const c = await s.coordinator.closePosition(open[0].id, 100, 'STOP_LOSS');
+    const stillHeld = proxy.st.holdOpen;
+    s.rec(`${L}: STOP_LOSS sold`, c.success, c.error || 'closed');
+    s.rec(
+      `${L}: it went out while the held request was still open`,
+      c.success && proxy.st.held === 1 && stillHeld && proxy.st.blockhashCalls >= 2,
+      `held=${proxy.st.held} still open at return=${stillHeld} getLatestBlockhash calls=${proxy.st.blockhashCalls}`
+    );
+  } finally {
+    const back = await s.coordinator.setRpcEndpoint(s.rpcUrl);
+    s.rec(`${L}: coordinator back on its RPC`, back.success, back.error ?? 'ok');
+    await proxy.close();
+    for (const p of openFor(s)) {
+      const c = await s.coordinator.closePosition(p.id, 100, 'e2e (g) cleanup');
+      s.rec(`${L}: cleanup close 100%`, c.success, c.error || 'closed');
+    }
   }
 }

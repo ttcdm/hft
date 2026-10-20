@@ -74,7 +74,7 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
   const walletAuditRuns = auto.mode === 'DEVNET_LIVE';
   checks.push(halt
     ? { id: 'halt', label: 'Wallet audit / halt', status: 'FAIL', value: 'ALL TRADING HALTED', detail: halt }
-    : { id: 'halt', label: 'Wallet audit / halt', status: 'OK', value: walletAuditRuns ? 'audit running, no halt' : 'no halt', detail: walletAuditRuns ? 'The wallet balance is compared with the journal; an unexplained change halts everything.' : `The wallet audit only runs in DEVNET_LIVE (auto mode is ${auto.mode}).` });
+    : { id: 'halt', label: 'Wallet audit / halt', status: 'OK', value: walletAuditRuns ? 'audit running, no halt' : 'no halt', detail: walletAuditRuns ? 'The wallet balance is compared with the journal; an unexplained change halts every buy plus the take-profit and stale exits; stop-loss, trailing stop, manual close and panic still run.' : `The wallet audit only runs in DEVNET_LIVE (auto mode is ${auto.mode}).` });
 
   checks.push({
     id: 'killswitch', label: 'Kill switch / circuit breaker', status: riskEngine.isKillSwitchActive() ? 'FAIL' : riskEngine.getCircuitBreakerState() === 'OPEN' ? 'FAIL' : 'OK',

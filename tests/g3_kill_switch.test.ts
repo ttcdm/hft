@@ -237,7 +237,7 @@ describe('G3: decision journal and kill switch on the real controller', () => {
     expect((await autoSnipeController.checkTriggers()).map((h) => h.code)).not.toContain('NEGATIVE_EXPECTANCY');
   });
 
-  it('DEVNET_LIVE wallet audit: an explained change passes, an unexplained drain halts ALL trading including exits', async () => {
+  it('DEVNET_LIVE wallet audit: an explained change passes, an unexplained drain halts all buys and the discretionary exits', async () => {
     vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
     vi.stubEnv('ALLOWED_CLUSTER', 'devnet');
     vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('LIVE');

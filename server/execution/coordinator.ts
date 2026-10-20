@@ -2739,7 +2739,7 @@ export class ExecutionCoordinator {
   // Canonical Close Position supporting partial sells (1-100%) and real proceeds reconciliation
   private haltReason: string | null = null;
 
-  /** G3: hard stop of ALL trading, exits included (used when the wallet balance changes for a reason the journal cannot explain). */
+  /** G3: halt every buy plus the take-profit and stale exits; protective exits still run (PROTECTIVE_EXIT_REASONS). Used when the wallet balance changes for a reason the journal cannot explain. */
   public haltAll(reason: string): void {
     if (this.haltReason) return;
     this.haltReason = reason;
@@ -2748,7 +2748,7 @@ export class ExecutionCoordinator {
       // R8: the halt holds in memory but will not survive a restart; say so instead of letting the operator assume it will.
       this.raiseOperatorAlert('HALT_NOT_PERSISTED', `The halt could not be written to the database (${reason}). It holds until this process restarts; after a restart trading would not be halted. Fix the database and halt again.`);
     }
-    this.raiseOperatorAlert('TRADING_HALTED', `All trading including exits is halted: ${reason}`);
+    this.raiseOperatorAlert('TRADING_HALTED', `All buys, take-profit and stale exits are halted: ${reason}. Stop-loss, trailing stop, manual close and panic still run; clear it with POST /api/auto/resume {clearHalt:true}.`);
   }
 
   public clearHalt(): void {

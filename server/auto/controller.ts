@@ -566,7 +566,8 @@ export class AutoSnipeController extends EventEmitter {
 
   /**
    * DEVNET_LIVE only: compare the real wallet balance with what the decision journal says moved since the last look.
-   * A change nothing in the journal explains (a drain, or an unknown spend) halts ALL trading, exits included.
+   * A change nothing in the journal explains (a drain, or an unknown spend) halts every buy plus the take-profit and stale exits;
+   * stop-loss, trailing stop, manual close and panic still run (coordinator PROTECTIVE_EXIT_REASONS).
    */
   public async auditWallet(now = Date.now()): Promise<{ explained: boolean; unexplainedSol: number } | null> {
     if (this.mode !== 'DEVNET_LIVE') {

@@ -40,21 +40,24 @@ This document outlines structural, economic, and operational risks of running th
 * **Risk Description:** Volatile memecoin liquidity pools are vulnerable to sandwich attacks when transactions are submitted via public mempools.
 * **Operational Impact:** High slippage settings can result in severe adverse execution prices.
 * **Required Countermeasure:**
-  - The risk engine strictly enforces an 800 bps (8%) maximum slippage cap (`SLIPPAGE_TOO_HIGH`).
+  - Buys: the risk engine refuses a buy whose slippage is above `MAX_SLIPPAGE_BPS` (default 800 bps, 8%; `SLIPPAGE_TOO_HIGH`). That check runs for buys only.
+  - Sells are not checked by the risk engine. Each consecutive failed exit of a LIVE position widens its sell slippage along the ladder 800, 1500, 2500, 4000 bps (`SELL_SLIPPAGE_LADDER_BPS` in `server/execution/coordinator.ts`), and waits 3, 6, 12, 24, then 30 s before the next try, so a stop-loss in a fast dump can still clear. After three counted failures a stop-loss goes out accepting up to 40% less than quoted. The ladder advances only for LIVE sells and only on errors counted as attempts: a send that failed, a failed simulation (nothing was sent) and build errors count; quote failures (`EXIT_QUOTE_FAILING`) and results that attempted nothing (a pending sell, unknown venue, no signer, halt, dust, an exit already in flight) do not. A successful exit resets it.
   - On devnet and localnet there is no private bundle route (see 1.2): orders go through the public mempool as ordinary transactions, so sandwich protection is not provided or tested here.
 
 ---
 
-## 3. MICRO_10 Capital Allocation & Economic Risks
+## 3. Capital allocation on a small devnet wallet (`CAPITAL_TIER=MICRO_10`)
 
-### 3.1 Tiny Bankroll Sensitivity (~0.07 SOL)
-* **Risk Description:** At ~0.07 SOL total bankroll, fixed execution costs (SOL signature fee, ATA rent, priority fee, Jito tip) represent a substantial percentage of position size.
+All amounts in this section are devnet SOL, on a throwaway devnet key (see 4.1).
+
+### 3.1 Tiny Bankroll Sensitivity (~0.07 devnet SOL)
+* **Risk Description:** At ~0.07 SOL total bankroll, fixed execution costs (signature fee, token account rent, priority fee, and the one-time pump account rent on a wallet's first pump buy) are a large share of the order size.
 * **Operational Impact:** Indiscriminate trading can lead to severe fee drag even on winning trades.
 * **Required Countermeasure:**
-  - Hard per-trade position cap: $\le 10\%$ of spendable bankroll ($\approx 0.007\text{ SOL}$).
-  - Sizing uses spendable bankroll: $\text{Spendable} = \text{Wallet SOL} - \text{Reserve} - \text{Pending Capital}$.
-  - Pre-trade fee economics check: If projected fees exceed 20% of trade size, the trade is rejected (`EXPECTED_EDGE_BELOW_EXECUTION_COST`).
-  - Dynamic trailing stops and take-profit ladders enforce fee awareness, preventing micro-dust executions.
+  - Sizing uses spendable bankroll: $\text{Spendable} = \text{Wallet SOL} - 0.015\text{ SOL reserve} - \text{in-flight orders}$.
+  - Hard per-trade cap for a LIVE buy: 10% of spendable, so about 0.0055 SOL on a 0.07 SOL wallet (`EXCEEDS_CAPITAL_CEILING`).
+  - Pre-trade fee economics check: if the estimated round-trip cost exceeds 20% of the order, the buy is refused (`EXPECTED_EDGE_BELOW_EXECUTION_COST`). On a wallet's first pump buy that cost includes the pump volume-accumulator rent (1,346,200 lamports, never refunded), which alone is 20% of about 0.0067 SOL, so a first buy must be larger than that; the refusal names the size that would pass. If the accumulator account cannot be read, the rent is counted as unpaid.
+  - The first trailing stop is never below entry x 1.03. A LIVE sell whose proceeds would not cover its fees is refused as dust (`DUST_POSITION_EXIT_UNECONOMICAL`) unless it is a stop-loss, trailing stop or panic.
 
 ---
 
@@ -64,13 +67,9 @@ This document outlines structural, economic, and operational risks of running th
 * **Risk Description:** Compromise of the server host filesystem exposes unencrypted keypair files.
 * **Operational Impact:** Potential unauthorized asset drainage.
 * **Required Countermeasure:**
-  - Always import trading keys via the local CLI:
-    ```bash
-    npm run signer:import -- /path/to/trading-keypair.json
-    ```
-  - The import script creates `.apex_trading_keypair.json` with POSIX `0600` permissions (readable and writable solely by the running user).
+  - Use a throwaway devnet key generated for this app: the UI, `POST /api/signer/generate`, or `solana-keygen new`. Fund it only from the devnet faucet.
+  - `npm run signer:import -- /path/to/throwaway-keypair.json` copies a keypair file into `.apex_trading_keypair.json` with POSIX `0600` permissions (readable and writable solely by the running user). It does no cluster check and accepts any key, so never give it a key that holds, or has ever held, mainnet funds.
   - Key material is never transmitted to web browsers, client frontends, or WebSocket consumers.
-  - Dedicate a dedicated low-balance trading wallet (0.07 SOL). Never use cold-storage or primary treasury wallets for automated execution.
 
 ### 4.2 Operator Authentication
 * **Risk Description:** Unprotected HTTP mutation routes could allow unauthorized trade initiation or configuration changes.
@@ -86,9 +85,13 @@ This document outlines structural, economic, and operational risks of running th
 
 ## 5. Emergency Procedures
 
-1. **Immediate Execution Halt:** Engage the Hardware Kill Switch via the UI or `POST /api/live/disarm`. This halts order generation and trips the circuit breaker.
-2. **Panic Liquidation:** `POST /api/wallet/panic-liquidate` (or Telegram `/panic_sell`). It turns the kill switch on, disarms live trading and stops auto first, then sells every active position. **Decision (Q53): panic sells everything the app holds in the wallet, including balances it adopted at startup (RECOVERED) that it never bought, and rows of every mode.** It is an emergency exit, so it does not apply the "only what auto bought" scoping that auto's own kill uses (R23). If you hold a balance you want kept, do not use panic; close positions one by one.
-3. **Wallet Balance Sweep:** In the event of an infrastructure anomaly, transfer all remaining SOL out of the trading keypair to a designated cold wallet via standard CLI tools (`solana transfer`).
+Step-by-step procedures, with the commands: [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+
+1. **Stop new buys:** the KILL SWITCH button, or `POST /api/execution/kill-switch` with `{"activate":true}`. It refuses every new buy, PAPER included, and disarms LIVE. It does not open the circuit breaker, does not change the auto mode (also send `POST /api/auto/kill` with `{"exitAll":false}`, or `POST /api/auto/mode` with `{"mode":"OFF"}`), and does not stop exits. It is held in memory only, so a restart clears it. Reset it with `{"activate":false}`; the reply says whether the circuit breaker or a halt is still set.
+2. **Panic Liquidation:** `POST /api/wallet/panic-liquidate`. In this order it turns the kill switch on and disarms LIVE, sells 100% of every active position of every mode one at a time, and only then sets auto OFF, so a buy that auto already had in flight can still open a position after the sell list was read. Read the reply: a position whose exit was already in flight (for example a take-profit partial) comes back `EXIT_IN_PROGRESS` and is not retried, and one with a sell still being verified comes back `SELL_PENDING_VERIFICATION`; run panic again until nothing fails. **Decision (Q53): panic sells everything the app holds in the wallet, including balances it adopted at startup (RECOVERED) that it never bought, and rows of every mode.** It is an emergency exit, so it does not apply the "only what auto bought" scoping that auto's own kill uses (R23). If you hold a balance you want kept, do not use panic; close positions one by one.
+   - The WebSocket `PANIC_LIQUIDATE` action runs the same sell loop but does not stop auto.
+   - Telegram `/panic_sell` is not an emergency control. Telegram cannot deliver it (no webhook is registered with Telegram and nothing polls for updates); it runs only when something posts it to `POST /api/telegram/webhook` with the operator token. It then turns the kill switch on, disarms LIVE and stops auto, but because disarming switches the coordinator to PAPER it lists and sells PAPER positions only: open LIVE positions are not sold.
+3. **Move devnet SOL off the throwaway key:** `solana transfer --url devnet --keypair <throwaway.json> <another devnet address> ALL`. Always pass `--url devnet`: the Solana CLI's default cluster is not devnet. The destination is another devnet key you control.
 
 ## 6. Settings that are stored but change nothing (checked against the code, Q34)
 

@@ -7,7 +7,8 @@ import { startValidator, startLocalnetApp, armLive, waitForPosition, LocalMarket
  *
  * The app is armed on validator A and holds a LIVE position bought there. A is stopped and validator B (a new ledger with its own genesis
  * hash) is started on the same port, so the app's Connection object, URL and cached genesis pass are unchanged. After the heartbeat has
- * seen B's genesis, a LIVE trade and a close of the open position must both be refused, and B must receive no transaction at all.
+ * seen B's genesis, a LIVE trade and a close of the open position must both be refused (the position stays open: P1.6), and B must
+ * receive no transaction at all.
  */
 const dir = scratch('long-cluster-switch-');
 let a: ValidatorHandle;
@@ -68,9 +69,14 @@ describe('cluster switch behind one URL', () => {
     expect(t.json.success).toBe(false);
     expect(t.json.error).toMatch(/CLUSTER_GUARD/);
     const c = await app.call('POST', '/api/execution/close', { positionId, sellPct: 100 });
-    // Known gap (reported, not fixed here): the close reads the wallet's token balance from the new ledger, finds none and books the
-    // position CLOSED with 0 SOL moved, although the tokens are still on chain A. What this test pins is that nothing is sent.
+    // P1.6: the close used to read the wallet's token balance from the new ledger, find none and book the position CLOSED with 0 SOL
+    // moved, although the tokens are still on chain A. Now it is refused before any balance read, and the position stays open.
+    expect(c.json.success).toBe(false);
+    expect(c.json.error).toMatch(/^CLUSTER_GUARD/);
     expect(c.json.solMoved ?? 0).toBe(0);
+    const still = ((await app.call('GET', '/api/workstation/positions')).json?.positions ?? []).find((p: any) => p.id === positionId);
+    expect(still?.status, JSON.stringify(still)).toBe('OPEN');
+    expect(BigInt(still.tokenQuantityRaw)).toBeGreaterThan(0n);
     // B has transactions of its own (the market seeding above); none of them is signed by the app's wallet
     expect(await signedTxCount(b.conn, trader.publicKey)).toBe(0);
     console.log(`[cluster switch] trade: ${t.json.error ?? t.json.message}; close: ${JSON.stringify(c.json)}`);

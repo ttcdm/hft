@@ -54,7 +54,7 @@ const amountSol = z.coerce.number().positive().max(1_000).optional();
 /** Optional: absent means the executionConfig dynamic tip policy decides (C6). */
 const jitoTipSol = z.coerce.number().min(0).max(0.1).optional();
 const slippagePct = z.coerce.number().min(0.5).max(50).default(8.0);
-const sellPct = z.coerce.number().min(1).max(100).default(100);
+const sellPct = z.coerce.number().int().min(1).max(100).default(100); // N-44: whole percent only
 
 /** POST /api/memecoins/trade, WS SNIPE_MEMECOIN, POST /api/social/signals/snipe (plus signalId). */
 export const OperatorSnipeSchema = z

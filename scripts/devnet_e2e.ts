@@ -260,14 +260,16 @@ async function main() {
 
   // The eligibility report for the buy, built from fresh holder data right before it (the coordinator refuses a report older than 60 s). Built here so
   // a rate-limited holder lookup inside the coordinator cannot refuse a mint that was already screened; with waive set, only the creator and top-10 checks are waived.
-  const buildBuyRequest = async () => {
+  // (h) buys a coin the harness itself created, so this takes the mint and reads its state; the holder waiver applies to that coin always
+  // (its creator is the harness's second wallet, which holds most of it by construction).
+  const buildBuyRequestFor = async (m: string, st: any, allowWaive: boolean) => {
     let report: import('../server/core/types').TokenEligibilityReport | undefined;
     try {
       const { EligibilityFilter } = await import('../server/signals/eligibilityFilter');
-      const dist = await fetchTokenHolderDistribution(conn, mintPk, state.creator, state.bondingCurve);
-      const liquidityUsd = (Number(state.realSolReserves) / 1e9) * price.usd! * 2;
-      report = EligibilityFilter.evaluate(M.harnessEligibilityInput({ mint: mint!, symbol: 'E2E', name: 'E2E' }, state, dist, liquidityUsd), true);
-      if (!report.isEligible && waive) {
+      const dist = await fetchTokenHolderDistribution(conn, new PublicKey(m), st.creator, st.bondingCurve);
+      const liquidityUsd = (Number(st.realSolReserves) / 1e9) * price.usd! * 2;
+      report = EligibilityFilter.evaluate(M.harnessEligibilityInput({ mint: m, symbol: 'E2E', name: 'E2E' }, st, dist, liquidityUsd), true);
+      if (!report.isEligible && allowWaive) {
         const w = M.waiveHolderChecks(report);
         if (w) {
           console.log(`WAIVER  waiving for this run: ${w.waived.join('; ')}`);
@@ -278,8 +280,9 @@ async function main() {
       console.log(`INFO  could not build the eligibility report (${safe(e.message).slice(0, 100)}); the coordinator will check by itself`);
       report = undefined;
     }
-    return liveBuyRequest(mint!, BUY_SOL, Date.now(), report);
+    return liveBuyRequest(m, BUY_SOL, Date.now(), report);
   };
+  const buildBuyRequest = () => buildBuyRequestFor(mint!, state, waive);
 
   if (phase === 'recover') {
     const r = await coordinator.startupReconciliation();
@@ -343,7 +346,27 @@ async function main() {
   await S.ambiguousSendThroughApp(steps); // P1.5
   await S.waitPast(steps, Date.now(), riskEngine.getLimits().cooldownPerMintMs, "per-mint cooldown from the (e'') buy");
   await S.heldBlockhashStopLoss(steps); // P1.7
-  await S.waitPast(steps, Date.now(), riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (g) buy');
+  const gDoneAt = Date.now();
+
+  // (h) P1.6: opt-in, because moving a fresh curve past the -20% stop needs about 3.6 SOL sold into it (DEVNET_E2E_README.md)
+  const dumpSol = Number(process.env.DEVNET_DUMP_SOL || 0);
+  if (dumpSol > 0) {
+    const have = (await conn.getBalance(kp.publicKey)) / LAMPORTS_PER_SOL;
+    if (have < dumpSol + 0.3) {
+      rec('(h) funding for the dump', false, `DEVNET_DUMP_SOL=${dumpSol} needs at least ${(dumpSol + 0.3).toFixed(1)} SOL in ${kp.publicKey.toBase58()}; it has ${have.toFixed(3)}`);
+    } else {
+      const { PUMP_SDK } = await import('@pump-fun/pump-sdk');
+      const market = S.makeDumpMarket({ conn, payer: kp, web3, sdk: PUMP_SDK, curve: PumpCurveService, builder: txBuilder });
+      await S.failedReadThenDumpStopLoss(steps, market, {
+        seedSol: dumpSol,
+        buildBuyRequestFor: async (m) => buildBuyRequestFor(m, await PumpCurveService.fetchPumpMarketState({ connection: conn, mint: new PublicKey(m), executionMode: 'LIVE' }), true),
+      });
+    }
+  } else {
+    console.log('INFO  (h) skipped: set DEVNET_DUMP_SOL=5 and fund the throwaway wallet with at least 5.3 SOL to run the failed-read stop-loss step');
+  }
+
+  await S.waitPast(steps, gDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (g) buy');
   await S.emergencyStopThroughApp(steps); // P1.4, last: it leaves LIVE disarmed and auto OFF. Telegram-path panic sells the LIVE position; kill switch on/off/re-arm buys nothing
 
   // (f) crash after submit, then recover in a fresh process on the same scratch DB

@@ -225,11 +225,16 @@ export class PaperExecutionEngine {
       return { success: false, realizedPnLSol: 0, error: 'Cannot execute sell with non-positive market price' };
     }
 
-    const safeSellPct = Math.min(100, Math.max(1, sellPct));
-    const fraction = safeSellPct / 100;
+    if (typeof sellPct !== 'number' || !Number.isFinite(sellPct)) {
+      return { success: false, realizedPnLSol: 0, error: `INVALID_SELL_PCT: ${String(sellPct)} is not a number between 1 and 100` };
+    }
+    // N-44: in basis points, so a fractional percentage (33.5) sells floor(raw * 3350 / 10000) instead of throwing a BigInt RangeError
+    const sellBps = Math.round(Math.min(100, Math.max(1, sellPct)) * 100);
+    const safeSellPct = sellBps / 100;
+    const fraction = sellBps / 10_000;
 
     const totalRawBigInt = BigInt(pos.tokenQuantityRaw);
-    const tokensSoldRaw = (totalRawBigInt * BigInt(safeSellPct)) / 100n;
+    const tokensSoldRaw = (totalRawBigInt * BigInt(sellBps)) / 10_000n;
     const remainingRawBigInt = totalRawBigInt - tokensSoldRaw;
 
     const tokensSoldHuman = Number(tokensSoldRaw) / Math.pow(10, pos.tokenDecimals);

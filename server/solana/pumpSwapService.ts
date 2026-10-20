@@ -3,10 +3,12 @@
  * canonical PumpSwap AMM pool (via @pump-fun/pump-swap-sdk). SOL-quoted pools only: a pool with any other quote mint is refused
  * (`UNSUPPORTED_PUMPSWAP_QUOTE_MINT`).
  *
- * What it must never do: sign or send (it returns instructions), or treat an unresolved venue as tradable. In LIVE mode a bonding-curve
- * lookup that throws makes `resolveVenue` return venue `UNKNOWN` and the caller refuses the trade; a lookup that returns nothing still
- * falls through to the pool check in either mode. `getPoolState` and the two instruction builders throw if `executionMode` is not exactly
- * `LIVE` or `PAPER`; `resolveVenue` does not check it.
+ * What it must never do: sign or send (it returns instructions), or treat an unresolved venue as tradable. `resolveVenue` reads the curve
+ * with `PumpCurveService.fetchPumpMarketStateResult`, which says why there is no state. An open curve is `PUMP_BONDING_CURVE`, also in LIVE
+ * when only its fee tier could not be verified (the sell is then built at the highest fee tier). Any other outcome (no curve, a complete
+ * curve, or a curve read that failed) goes on to the canonical pool check in either mode; with no SOL-quoted pool the venue is `UNKNOWN`
+ * and, when the curve read itself failed, the result carries that reason (`curveFailure`) so the refusal names it. `getPoolState` and the
+ * two instruction builders throw if `executionMode` is not exactly `LIVE` or `PAPER`; `resolveVenue` does not check it.
  *
  * Called by: `ExecutionCoordinator.closePositionImpl` (`resolveVenue`, `buildPumpSwapSellInstructions`: this is how a migrated position is
  * sold) and `RealMarkPriceService.queryOnChainMarkPrices` in `reconciliation.ts` (`getPoolState`, to price an open position whose curve has completed). Buys are never built here in the running app: a
@@ -32,7 +34,7 @@ import {
 } from '@pump-fun/pump-swap-sdk';
 import { Logger } from '../middleware/enterprise';
 import { ExecutionMode, TradingVenue } from '../core/types';
-import { PumpCurveService } from './pumpCurve';
+import { PumpCurveService, NO_CURVE_REASONS, type MarketStateFailure } from './pumpCurve';
 
 export type { ExecutionMode, TradingVenue };
 
@@ -63,30 +65,29 @@ export interface PumpSwapExecutionState {
 // Backwards-compatible type alias
 export type PumpSwapPoolState = PumpSwapExecutionState;
 
-/** Static helpers around the PumpSwap pool of one mint. Pool state is cached per mint for 15 s. */
+/** Static helpers around the PumpSwap pool of one mint. Pool state is cached per mint for 15 s, unless the caller asks for a fresh read. */
 export class PumpSwapVenueService {
   private static poolCache: Map<string, { pool: PumpSwapExecutionState | null; timestamp: number }> = new Map();
   private static readonly CACHE_TTL_MS = 15000;
 
   /**
    * Which venue trades this mint: `PUMP_BONDING_CURVE` while the curve is open, `PUMPSWAP` once the canonical SOL-quoted pool exists, else `UNKNOWN`.
-   * An `UNKNOWN` answer means "do not trade". In LIVE a failed curve lookup is `UNKNOWN`, never a guess.
+   * An `UNKNOWN` answer means "do not trade", never a guess; `curveFailure` then says why the curve could not be read, when that was the cause.
    */
   // Resolve trading venue for a token mint: active bonding curve vs migrated canonical PumpSwap pool
   public static async resolveVenue(
     connection: Connection,
     mint: PublicKey,
     executionMode: ExecutionMode
-  ): Promise<{ venue: TradingVenue; isMigrated: boolean; poolAddress?: PublicKey }> {
+  ): Promise<{ venue: TradingVenue; isMigrated: boolean; poolAddress?: PublicKey; curveFailure?: MarketStateFailure }> {
     const mintStr = mint.toBase58();
 
     // 1. First check if Pump.fun bonding curve is active using the strict executionMode
+    let curveFailure: MarketStateFailure | undefined;
     try {
-      const curveState = await PumpCurveService.fetchPumpMarketState({
-        connection,
-        mint,
-        executionMode,
-      });
+      const read = await PumpCurveService.fetchPumpMarketStateResult({ connection, mint, executionMode });
+      // P1.6 (N-42): in LIVE an open curve whose only problem is the fee tier is still the curve; the sell is built at the highest tier.
+      const curveState = read.state ?? read.failure.sellableState;
       if (curveState && !curveState.complete) {
         return {
           venue: 'PUMP_BONDING_CURVE',
@@ -94,14 +95,10 @@ export class PumpSwapVenueService {
           poolAddress: curveState.bondingCurve,
         };
       }
+      if (!read.state && !NO_CURVE_REASONS.has(read.failure.reason) && !curveState) curveFailure = read.failure;
     } catch (err: any) {
-      if (executionMode === 'LIVE') {
-        Logger.warn(`LIVE bonding curve state lookup failed for ${mintStr}: ${err.message}`);
-        return {
-          venue: 'UNKNOWN',
-          isMigrated: true,
-        };
-      }
+      curveFailure = { reason: 'RPC_ERROR', message: err?.message ?? String(err) };
+      Logger.warn(`Bonding curve state lookup failed for ${mintStr}: ${curveFailure.message}`);
     }
 
     // 2. If bonding curve is complete or not found, check canonical PumpSwap AMM pool
@@ -131,28 +128,33 @@ export class PumpSwapVenueService {
       Logger.debug(`PumpSwap pool resolution check failed for ${mintStr}: ${err.message}`);
     }
 
+    if (curveFailure && executionMode === 'LIVE') Logger.warn(`LIVE venue for ${mintStr} unknown: the curve read failed (${curveFailure.reason}: ${curveFailure.message}) and no pool was found`);
     return {
       venue: 'UNKNOWN',
       isMigrated: true,
+      ...(curveFailure ? { curveFailure } : {}),
     };
   }
 
   /**
    * Decodes the canonical pool and its vault balances. Returns null when there is no pool (cached as null for 15 s). Throws in LIVE for a
-   * non-SOL quote mint; in PAPER it returns null instead. Throws if `executionMode` is not `LIVE` or `PAPER`.
+   * non-SOL quote mint; in PAPER it returns null instead. Throws if `executionMode` is not `LIVE` or `PAPER`. `opts.fresh` skips the
+   * 15 s cache (P1.6, R1-31: marks of open LIVE positions, so a migrated position's stop sees every price move and a pool created
+   * after a cached "no pool" is seen on the next pass); the fresh read still refreshes the cache.
    */
   // Fetch canonical PumpSwap pool state and calculate spot price in SOL using effectiveQuoteReserves
   public static async getPoolState(
     connection: Connection,
     mint: PublicKey,
-    executionMode: ExecutionMode
+    executionMode: ExecutionMode,
+    opts: { fresh?: boolean } = {}
   ): Promise<PumpSwapExecutionState | null> {
     if (executionMode !== 'LIVE' && executionMode !== 'PAPER') {
       throw new Error('CRITICAL_CONFIG_ERROR: executionMode ("LIVE" | "PAPER") is strictly required for getPoolState');
     }
     const mintStr = mint.toBase58();
     const cached = this.poolCache.get(mintStr);
-    if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
+    if (!opts.fresh && cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
       return cached.pool;
     }
 

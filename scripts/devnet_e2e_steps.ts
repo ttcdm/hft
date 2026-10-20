@@ -9,6 +9,7 @@
  *       no position, and an immediate second buy refused by the 15 s failure cooldown with nothing sent. The wrapper is restored in `finally`.
  *  (e') two sequential `executeTrade` calls on one mint: the first is CONFIRMED and opens one position, the second is refused before
  *       anything is signed (POSITION_ALREADY_OPEN). The position is then closed so step (f) starts flat.
+ *  (e''), (g) and (h) are described at their functions below.
  *
  *  (e''') P1.4: the emergency stop. One LIVE position is opened, auto is set to DEVNET_LIVE, then Telegram `/panic_sell` is driven
  *       through the app's `processTelegramCommand` (no bot): the LIVE position must be sold on chain and auto must end OFF. Then the
@@ -46,8 +47,8 @@ export interface HarnessSteps {
   rec: (step: string, ok: boolean, detail: string) => void;
   link: (sig: string) => string;
   sleep: (ms: number) => Promise<unknown>;
-  /** The coordinator's own Connection: (e'') wraps its `sendRawTransaction` for one call. */
-  connection?: { sendRawTransaction: (...args: any[]) => Promise<string> };
+  /** The coordinator's own Connection: (e'') wraps its `sendRawTransaction` for one call, (h) its `getMultipleAccountsInfo`. */
+  connection?: { sendRawTransaction: (...args: any[]) => Promise<string>; getMultipleAccountsInfo?: (...args: any[]) => Promise<unknown> };
   /** (e''') P1.4: the app's own singletons for the panic and kill-switch step. */
   stop?: {
     telegram: { processTelegramCommand(text: string): Promise<{ reply: string; actionTaken?: string }> };
@@ -309,5 +310,175 @@ export async function emergencyStopThroughApp(s: HarnessSteps): Promise<void> {
     st.arm(false);
     await st.auto.setMode('OFF');
     if (prevAuto === undefined) delete process.env.AUTO_SNIPE_ENABLED; else process.env.AUTO_SNIPE_ENABLED = prevAuto;
+  }
+}
+
+/** (h) the harness's own market moves: a second throwaway wallet that creates a coin, seeds it, and dumps it. Signs only its own wallets. */
+export interface DumpMarket {
+  /** Funds a fresh second throwaway wallet from the harness wallet, creates a pump coin from it and buys `seedSol` of it. */
+  createAndSeed(seedSol: number): Promise<{ mint: string; curve: string }>;
+  /** Spot price in SOL per UI token, from the curve as a separate Connection sees it. */
+  priceSol(mint: string): Promise<number>;
+  /** The second wallet sells everything it holds of `mint`. */
+  sellAll(mint: string): Promise<string | null>;
+  /** Sends what is left in the second wallet back to the harness wallet. */
+  refund(): Promise<void>;
+}
+
+/**
+ * The DumpMarket on any cluster, built from the app's own quote math and transaction builder (passed in, so this file still imports
+ * nothing from server/). `payer` is the harness's throwaway wallet; the second wallet is generated here and never written to disk.
+ */
+export function makeDumpMarket(d: {
+  conn: any; payer: any; web3: any; sdk: any; curve: any; builder: any;
+}): DumpMarket {
+  const { Keypair, PublicKey, SystemProgram, Transaction, ComputeBudgetProgram, LAMPORTS_PER_SOL } = d.web3;
+  const w2 = Keypair.generate();
+  const send = async (tx: any, signers: any[]) => {
+    tx.recentBlockhash = (await d.conn.getLatestBlockhash('confirmed')).blockhash;
+    if (!tx.feePayer) tx.feePayer = signers[0].publicKey;
+    if ('version' in tx) tx.sign(signers); else tx.sign(...signers);
+    const sig = await d.conn.sendRawTransaction(tx.serialize());
+    for (let i = 0; i < 120; i++) { // polls the status (no websocket subscription), up to 60 s
+      const st = (await d.conn.getSignatureStatuses([sig])).value[0];
+      if (st?.err) throw new Error(`tx ${sig} failed: ${JSON.stringify(st.err)}`);
+      if (st?.confirmationStatus === 'confirmed' || st?.confirmationStatus === 'finalized') return sig;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    throw new Error(`tx ${sig} not confirmed in 60 s`);
+  };
+  const state = async (mint: any) => {
+    const s = await d.curve.fetchPumpMarketState({ connection: d.conn, mint, executionMode: 'LIVE' });
+    if (!s) throw new Error(`no curve state for ${mint.toBase58()}`);
+    return s;
+  };
+  const tradeParams = (s: any, mint: any) => ({
+    mint, bondingCurve: s.bondingCurve, associatedBondingCurve: s.associatedBondingCurve,
+    associatedUser: d.curve.getAssociatedTokenAddress(mint, w2.publicKey, s.tokenProgram), creator: s.creator,
+    feeRecipient: s.feeRecipient, buybackFeeRecipient: s.buybackFeeRecipient, quoteMint: s.quoteMint,
+    tokenProgram: s.tokenProgram, quoteTokenProgram: s.quoteTokenProgram, computeUnits: 300_000, priorityFeeMicroLamports: 1000, jitoTipLamports: 0n,
+  });
+  const held = async (mint: any): Promise<bigint> => {
+    const a = await d.conn.getTokenAccountsByOwner(w2.publicKey, { mint });
+    if (!a.value.length) return 0n;
+    return BigInt((await d.conn.getTokenAccountBalance(a.value[0].pubkey)).value.amount);
+  };
+  return {
+    async createAndSeed(seedSol: number) {
+      await send(new Transaction().add(SystemProgram.transfer({ fromPubkey: d.payer.publicKey, toPubkey: w2.publicKey, lamports: Math.ceil((seedSol + 0.1) * LAMPORTS_PER_SOL) })), [d.payer]);
+      const mintKp = Keypair.generate();
+      const ix = await d.sdk.createV2Instruction({
+        mint: mintKp.publicKey, name: 'P16 harness', symbol: 'P16H', uri: 'http://127.0.0.1/none',
+        creator: w2.publicKey, user: w2.publicKey, mayhemMode: false,
+      });
+      await send(new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }), ix), [w2, mintKp]);
+      const mint = mintKp.publicKey;
+      const s = await state(mint);
+      const q = d.curve.calculateBuyQuote({ state: s, amountSol: seedSol, slippageBps: 3000, jitoTipSol: 0, priorityFeeLamports: 0, executionMode: 'LIVE' });
+      const tx = await d.builder.buildBuyTransaction(d.conn, { ...tradeParams(s, mint), buyer: w2.publicKey, amountTokens: BigInt(q.tokenAmountRaw), maxSolCostLamports: BigInt(q.maxInputLamports) });
+      await send(tx, [w2]);
+      return { mint: mint.toBase58(), curve: s.bondingCurve.toBase58() };
+    },
+    async priceSol(mint: string) {
+      const s = await state(new PublicKey(mint));
+      return (Number(s.virtualSolReserves) / 1e9) / (Number(s.virtualTokenReserves) / 10 ** s.tokenDecimals);
+    },
+    async sellAll(mint: string) {
+      const m = new PublicKey(mint);
+      const amount = await held(m);
+      if (amount <= 0n) return null;
+      const s = await state(m);
+      const q = d.curve.calculateSellQuote({ state: s, tokenAmountRaw: amount, slippageBps: 5000, jitoTipSol: 0, priorityFeeLamports: 0, executionMode: 'LIVE' });
+      const tx = await d.builder.buildSellTransaction(d.conn, { ...tradeParams(s, m), seller: w2.publicKey, amountTokens: amount, minSolOutputLamports: BigInt(q.minOutputLamports) });
+      return send(tx, [w2]);
+    },
+    async refund() {
+      const bal = await d.conn.getBalance(w2.publicKey);
+      const lamports = bal - 5000;
+      if (lamports > 0) await send(new Transaction().add(SystemProgram.transfer({ fromPubkey: w2.publicKey, toPubkey: d.payer.publicKey, lamports })), [w2]);
+    },
+  };
+}
+
+/**
+ * (h) P1.6 (R1-19, R1-112): one failed price read does not blind the stop-loss. A second throwaway wallet creates a coin and seeds it with
+ * `seedSol`; the app buys it; the harness then wraps the coordinator's `getMultipleAccountsInfo` so the next call naming the curve throws
+ * once (the app's own price read takes it), and the second wallet dumps everything. Expected: the exit loop's STOP_LOSS sell within about
+ * 6 s of the dump being visible on the curve (two 3 s passes; before P1.6 the failed read put the mint in a 60 s back-off). The pass bound
+ * is `maxMs` (10 s by default, for devnet confirmation latency). A -20% move on a fresh curve (30 SOL virtual reserves) needs about
+ * 3.6 SOL sold into it, so the seed defaults to 5 SOL and the step needs that much in the harness wallet (see DEVNET_E2E_README.md).
+ */
+export async function failedReadThenDumpStopLoss(
+  s: HarnessSteps,
+  m: DumpMarket,
+  opts: { seedSol: number; buildBuyRequestFor: (mint: string) => Promise<ExecuteTradeRequest>; maxMs?: number }
+): Promise<void> {
+  const L = '(h) failed price read, then a dump: stop-loss';
+  const maxMs = opts.maxMs ?? 10_000;
+  type Row = Pos & { entryPriceSol: number; exitReason?: string; exitTxSignature?: string };
+  const rowFor = (mint: string) => (s.db.loadPositions() as Row[]).find((p) => p.mint === mint);
+  if (!s.connection) { s.rec(L, false, 'harness did not pass the coordinator connection'); return; }
+  const conn: any = s.connection;
+  let coin: { mint: string; curve: string };
+  try {
+    coin = await m.createAndSeed(opts.seedSol);
+  } catch (e: any) {
+    s.rec(`${L}: second wallet creates and seeds a coin`, false, String(e?.message ?? e).slice(0, 300));
+    return;
+  }
+  const orig = conn.getMultipleAccountsInfo;
+  let injected = false;
+  try {
+    s.rec(`${L}: second wallet creates and seeds a coin`, true, `${coin.mint} seeded with ${opts.seedSol} SOL`);
+    await s.coordinator.syncRealWalletBalance();
+    const buy = await s.coordinator.executeTrade(await opts.buildBuyRequestFor(coin.mint));
+    s.rec(`${L}: app buy CONFIRMED`, buy.success && buy.lifecycleState === 'CONFIRMED', `${buy.lifecycleState} ${buy.error ?? ''}`.slice(0, 300));
+    const pos = rowFor(coin.mint);
+    if (!buy.success || !pos || pos.status === 'CLOSED') return;
+
+    conn.getMultipleAccountsInfo = async function (this: unknown, ...args: any[]) {
+      const keys: any[] = Array.isArray(args[0]) ? args[0] : [];
+      if (!injected && keys.some((k) => String(k?.toBase58?.() ?? k) === coin.curve)) {
+        injected = true;
+        conn.getMultipleAccountsInfo = orig; // one call only
+        throw new Error('harness: injected getMultipleAccountsInfo failure');
+      }
+      return orig.apply(this, args);
+    };
+    for (let i = 0; i < 40 && !injected; i++) await s.sleep(250);
+    s.rec(`${L}: the app's price read took the injected failure`, injected, injected ? 'one getMultipleAccountsInfo naming the curve threw' : 'no read of the curve in 10 s');
+    if (!injected) return;
+
+    const dumpSig = await m.sellAll(coin.mint);
+    let visibleAt = 0;
+    let ratio = 1;
+    for (let i = 0; i < 40 && !visibleAt; i++) {
+      ratio = (await m.priceSol(coin.mint)) / pos.entryPriceSol;
+      if (ratio <= 0.8) visibleAt = Date.now(); else await s.sleep(250);
+    }
+    s.rec(`${L}: dump visible below the -20% stop`, visibleAt > 0, `price/entry ${ratio.toFixed(3)}${dumpSig ? ` ${s.link(dumpSig)}` : ''}`);
+    if (!visibleAt) return;
+    let closed: Row | undefined;
+    for (let i = 0; i < 240 && !closed; i++) {
+      const r = rowFor(coin.mint);
+      if (r?.status === 'CLOSED') closed = r; else await s.sleep(250);
+    }
+    const tookMs = closed ? Date.now() - visibleAt : NaN;
+    s.rec(
+      `${L}: STOP_LOSS sold within ${Math.round(maxMs / 1000)} s of the dump being visible`,
+      !!closed && closed.exitReason === 'STOP_LOSS' && tookMs <= maxMs,
+      closed ? `${closed.exitReason} after ${tookMs} ms ${closed.exitTxSignature ? s.link(closed.exitTxSignature) : ''}` : 'still open after 60 s'
+    );
+    if (closed?.exitTxSignature) {
+      const err = await s.chainErr(closed.exitTxSignature);
+      s.rec(`${L}: the stop-loss sell succeeded on chain`, err === null, `err=${JSON.stringify(err)}`);
+    }
+  } finally {
+    conn.getMultipleAccountsInfo = orig;
+    for (const p of openFor({ ...s, mint: coin.mint })) {
+      const c = await s.coordinator.closePosition(p.id, 100, 'e2e (h) cleanup');
+      s.rec(`${L}: cleanup close 100%`, c.success, c.error || 'closed');
+    }
+    try { await m.refund(); } catch (e: any) { console.log(`INFO  (h) refund of the second wallet failed: ${String(e?.message ?? e).slice(0, 120)}`); }
   }
 }

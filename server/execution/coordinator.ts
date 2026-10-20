@@ -1273,7 +1273,7 @@ export class ExecutionCoordinator {
 
     // 2. Query on-chain bonding curve marks for active positions. A mint that failed recently waits out its back-off.
     for (const k of this.markRetry.keys()) if (!positions.some((p) => p.mint === k)) this.markRetry.delete(k); // closed positions leave the map
-    const askable = positions.filter((p) => !this.markBackedOff(p.mint, now));
+    const askable = positions.filter((p) => !this.markBackedOff(p, now));
     const mints = askable.map((p) => p.mint);
     try {
       const hasLivePositions = positions.some((p) => p.executionMode === 'LIVE');
@@ -2879,29 +2879,35 @@ export class ExecutionCoordinator {
   /**
    * Errors that mean no send was attempted (or that an earlier send is still being waited for), so they neither cost fees nor count
    * toward backoff or the EXIT_FAILING alert. Q12: waiting for a pending sell, an undeterminable venue, a missing signer and a zero
-   * quantity are not rejected sends; counting them walked the ladder to 4000 bps before the real resend.
+   * quantity are not rejected sends; counting them walked the ladder to 4000 bps before the real resend. P1.6: nor are a refusal by the
+   * cluster guard, an invalid sell percentage, or anything thrown before the send (closePositionImpl reports those with `notSent`).
    */
   private static isNonAttemptExitError(error?: string): boolean {
-    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found|SELL_PENDING_VERIFICATION|UNKNOWN_TRADING_VENUE|Trading venue for mint|Signer is not configured|Calculated sell quantity is zero)/.test(error) || ExecutionCoordinator.isQuoteFailure(error);
+    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found|SELL_PENDING_VERIFICATION|UNKNOWN_TRADING_VENUE|Trading venue for mint|Signer is not configured|Calculated sell quantity is zero|CLUSTER_GUARD|INVALID_SELL_PCT|BALANCE_UNTRUSTED)/.test(error) || ExecutionCoordinator.isQuoteFailure(error);
   }
 
-  /** R10: the sell could not even be quoted (fail-closed quote, fee config, market state). Nothing was sent, and widening slippage cannot help. */
+  /**
+   * R10: the sell could not even be quoted (fail-closed quote, fee config, market state). Nothing was sent, and widening slippage cannot help.
+   * P1.6 (R1-30, N-42): also the quote and pool errors thrown before anything is sent: a math cross-check, a migrated or invalid curve
+   * state, every PumpSwap pool error, and a curve read that failed (CURVE_READ_FAILED, which names the reason).
+   */
   private static isQuoteFailure(error?: string): boolean {
-    return !!error && /^(OFFICIAL_PUMP_QUOTE_FAILED|DYNAMIC_FEE_CALCULATION_FAILED|FEE_RECIPIENT_UNRESOLVED|UNSUPPORTED_QUOTE_MINT|Cannot fetch market state)/.test(error);
+    return !!error && /^(OFFICIAL_PUMP_QUOTE_FAILED|DYNAMIC_FEE_CALCULATION_FAILED|FEE_RECIPIENT_UNRESOLVED|UNSUPPORTED_QUOTE_MINT|Cannot fetch market state|QUOTE_MATH_DISCREPANCY|BONDING_CURVE_MIGRATED|Invalid curve state|PUMPSWAP_|UNSUPPORTED_PUMPSWAP_QUOTE_MINT|CURVE_READ_FAILED)/.test(error);
   }
 
-  private recordExitOutcome(positionId: string, res: { success: boolean; error?: string }, mode?: string): void {
+  private recordExitOutcome(positionId: string, res: { success: boolean; error?: string; notSent?: boolean }, mode?: string): void {
     if (res.success) {
       this.exitFailures.delete(positionId);
       this.clearOperatorAlert('EXIT_FAILING', positionId);
       this.clearOperatorAlert('EXIT_QUOTE_FAILING', positionId);
       return;
     }
-    if (mode === 'LIVE' && ExecutionCoordinator.isQuoteFailure(res.error)) {
-      // No fee was spent and the ladder must not advance, but a stop-loss that cannot be priced is exactly what an operator must hear about.
-      this.raiseOperatorAlert('EXIT_QUOTE_FAILING', `Exit for position ${positionId.slice(0, 8)} cannot be quoted, so nothing is being sent (${String(res.error).slice(0, 140)}). Retrying every tick; close it manually if this persists.`, positionId);
+    const quoteFailure = ExecutionCoordinator.isQuoteFailure(res.error);
+    if (mode === 'LIVE' && (quoteFailure || (res.notSent && !ExecutionCoordinator.isNonAttemptExitError(res.error)))) {
+      // No fee was spent and the ladder must not advance, but a stop-loss that cannot be priced or built is exactly what an operator must hear about.
+      this.raiseOperatorAlert('EXIT_QUOTE_FAILING', `Exit for position ${positionId.slice(0, 8)} cannot be quoted or built, so nothing is being sent (${String(res.error).slice(0, 140)}). Retrying every tick; close it manually if this persists.`, positionId);
     }
-    if (mode !== 'LIVE' || ExecutionCoordinator.isNonAttemptExitError(res.error)) return;
+    if (mode !== 'LIVE' || res.notSent || ExecutionCoordinator.isNonAttemptExitError(res.error)) return;
     const count = (this.exitFailures.get(positionId)?.count ?? 0) + 1;
     const wait = Math.min(EXIT_RETRY_MAX_MS, EXIT_RETRY_BASE_MS * 2 ** (count - 1));
     this.exitFailures.set(positionId, { count, nextAttemptAt: Date.now() + wait, lastError: res.error || 'unknown' });
@@ -2916,7 +2922,7 @@ export class ExecutionCoordinator {
     positionId: string,
     sellPct: number = 100,
     reason: string = 'Manual Close'
-  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number }> {
+  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number; notSent?: boolean }> {
     return traced('exit.close', () => this.closePositionUntraced(positionId, sellPct, reason), { 'apex.reason': reason, 'apex.sellPct': sellPct });
   }
 
@@ -2924,7 +2930,7 @@ export class ExecutionCoordinator {
     positionId: string,
     sellPct: number = 100,
     reason: string = 'Manual Close'
-  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number }> {
+  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number; notSent?: boolean }> {
     // A halt stops entries and discretionary exits. It never stops the exits that protect the wallet: stop-loss, trailing stop,
     // an operator's manual close and panic liquidation (a halt that froze a losing position would be the opposite of its purpose).
     if (this.haltReason && !PROTECTIVE_EXIT_REASONS.test(reason)) {
@@ -2965,7 +2971,7 @@ export class ExecutionCoordinator {
     positionId: string,
     sellPct: number,
     reason: string
-  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number }> {
+  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number; notSent?: boolean }> {
     if (this.inFlightPositionExits.has(positionId)) {
       return { success: false, pnlSol: 0, error: 'EXIT_IN_PROGRESS: An exit transaction for this position is already in progress.' };
     }
@@ -2973,6 +2979,7 @@ export class ExecutionCoordinator {
     let exitDone!: () => void;
     this.positionExitDone.set(positionId, new Promise<void>((r) => { exitDone = r; })); // P1.7: what waitForPositionExit awaits
     let claimed = false;
+    let sendStarted = false;
     const exitClaimOwner = `${process.pid}:${crypto.randomUUID()}`;
 
     try {
@@ -2983,10 +2990,15 @@ export class ExecutionCoordinator {
         return { success: false, pnlSol: 0, error: 'Position not found or already closed' };
       }
 
-      const safeSellPct = Math.min(100, Math.max(1, sellPct));
-      const fraction = safeSellPct / 100;
-      const percentageToSell = safeSellPct;
-      const closeAta = (percentageToSell === 100);
+      // N-44: the share is computed in basis points, so a fractional percentage (33.5) sells floor(raw * 3350 / 10000) instead of
+      // throwing a BigInt RangeError (the HTTP schemas take integers only; this covers every other caller).
+      if (typeof sellPct !== 'number' || !Number.isFinite(sellPct)) {
+        return { success: false, pnlSol: 0, error: `INVALID_SELL_PCT: ${String(sellPct)} is not a number between 1 and 100`, notSent: true };
+      }
+      const sellBps = Math.round(Math.min(100, Math.max(1, sellPct)) * 100);
+      const safeSellPct = sellBps / 100;
+      const fraction = sellBps / 10_000;
+      const closeAta = sellBps >= 10_000;
 
       const tipFloor = await this.jitoTransport.getTipFloorLamports();
       const resolvedTip = this.resolveLiveTip({
@@ -3028,7 +3040,7 @@ export class ExecutionCoordinator {
         try {
           const state = await PumpCurveService.fetchPumpMarketState({ connection: this.connection, mint: new PublicKey(target.mint), executionMode: 'PAPER' });
           if (state && !state.complete) {
-            const sold = (BigInt(target.tokenQuantityRaw) * BigInt(safeSellPct)) / 100n;
+            const sold = (BigInt(target.tokenQuantityRaw) * BigInt(sellBps)) / 10_000n;
             if (sold > 0n) sellQuote = PumpCurveService.calculateSellQuote({ state, tokenAmountRaw: sold, executionMode: 'PAPER' });
           }
         } catch {}
@@ -3048,6 +3060,13 @@ export class ExecutionCoordinator {
       return { success: false, pnlSol: 0, error: 'Signer is not configured or locked' };
     }
 
+    // P1.6: on an RPC the cluster check does not trust (wrong genesis, or genesis unreadable) every read answers for the wrong chain, so a
+    // wallet balance read there would "find" no tokens and close the row although the tokens are on the real chain. Refuse before any
+    // read decides anything; the position stays open and the next pass tries again once the RPC is trusted.
+    if (this.clusterProblem !== null) {
+      return { success: false, pnlSol: 0, error: `CLUSTER_GUARD: the RPC is not trusted (${this.clusterProblem.replace(/^CLUSTER_GUARD: /, '')}); not reading balances or selling`, notSent: true };
+    }
+
     // P1.1 (N-52): inFlightPositionExits guards this coordinator only. The claim in the database stops a second coordinator or a second
     // process from selling the same position at the same time (both would sell a take-profit partial or a stop-loss). Cleared in finally.
     if (!workstationDb.claimExit(positionId, exitClaimOwner, Date.now(), Date.now() - EXIT_CLAIM_STALE_MS, exitClaimOwnerAlive)) {
@@ -3059,7 +3078,7 @@ export class ExecutionCoordinator {
     const mintPubkey = new PublicKey(target.mint);
 
       let totalTokensRaw = BigInt(target.tokenQuantityRaw);
-      let amountTokensToSell = (totalTokensRaw * BigInt(safeSellPct)) / 100n;
+      let amountTokensToSell = (totalTokensRaw * BigInt(sellBps)) / 10_000n;
 
       if (amountTokensToSell <= 0n) {
         return { success: false, pnlSol: 0, error: 'Calculated sell quantity is zero' };
@@ -3069,15 +3088,10 @@ export class ExecutionCoordinator {
       // read the wallet first: if the balance dropped the sell landed (adopt it), if not wait out the blockhash window.
       const pendingSell = this.pendingSells.get(positionId);
       if (pendingSell) {
-        const tp = target.baseTokenProgram ? new PublicKey(target.baseTokenProgram) : TOKEN_PROGRAM_ID;
-        let onChain: bigint | null = null;
-        try {
-          const bal = await this.connection.getTokenAccountBalance(PumpCurveService.getAssociatedTokenAddress(mintPubkey, seller, tp), 'confirmed');
-          onChain = BigInt(bal?.value?.amount ?? '0');
-        } catch (e: any) {
-          // an unreadable ATA balance after a sell that closed the account means it is gone
-          onChain = /could not find account|Invalid param/i.test(String(e?.message)) ? 0n : null;
-        }
+        // an unreadable ATA balance after a sell that closed the account means it is gone; P1.6: only when the read is trusted
+        const read = await this.readHeldTokens(target, seller, mintPubkey);
+        if (read.untrusted) return { success: false, pnlSol: 0, error: read.untrusted, notSent: true };
+        const onChain = read.held;
         if (onChain !== null && onChain < totalTokensRaw) {
           this.pendingSells.delete(positionId);
           target.exitReason = reason;
@@ -3106,15 +3120,11 @@ export class ExecutionCoordinator {
       // Q13: a 100% sell sells what the wallet holds. When the row says more than the wallet has (tokens moved outside the app, a partial
       // that landed with no pending record), every attempt fails simulation and the stop-loss can never clear. Scale the row to the wallet
       // (the N3 adoption arithmetic) and sell that; an empty wallet closes the row without a send.
-      if (safeSellPct >= 100) {
-        let held: bigint | null = null;
-        try {
-          const tp = target.baseTokenProgram ? new PublicKey(target.baseTokenProgram) : TOKEN_PROGRAM_ID;
-          const bal = await this.connection.getTokenAccountBalance(PumpCurveService.getAssociatedTokenAddress(mintPubkey, seller, tp), 'confirmed');
-          held = BigInt(bal?.value?.amount ?? '0');
-        } catch (e: any) {
-          held = /could not find account|Invalid param/i.test(String(e?.message)) ? 0n : null; // unreadable for another reason: sell what the row says
-        }
+      if (sellBps >= 10_000) {
+        // unreadable for another reason: sell what the row says; P1.6: an empty answer closes the row only when the read is trusted
+        const read = await this.readHeldTokens(target, seller, mintPubkey);
+        if (read.untrusted) return { success: false, pnlSol: 0, error: read.untrusted, notSent: true };
+        const held = read.held;
         if (held !== null && held < totalTokensRaw) {
           target.lastUpdatedTimestamp = Date.now();
           if (held === 0n) {
@@ -3156,7 +3166,7 @@ export class ExecutionCoordinator {
         } catch (err: any) {
           Logger.error(`[R1] SELL for position ${positionId} blocked before signing: ${err.message}`);
           workstationDb.logJournal('CLUSTER_GUARD_BLOCK', `exit-${positionId.slice(0, 8)}`, 'LIVE', { side: 'SELL', mint: target.mint, error: err.message });
-          return { success: false, pnlSol: 0, error: err.message };
+          return { success: false, pnlSol: 0, error: err.message, notSent: true };
         }
       }
 
@@ -3165,10 +3175,15 @@ export class ExecutionCoordinator {
       const venueInfo = await PumpSwapVenueService.resolveVenue(this.connection, mintPubkey, posMode);
 
       if (venueInfo.venue === 'UNKNOWN' && target.executionMode === 'LIVE') {
+        // P1.6 (N-42): when the curve could not be read, say so (decode failure, fee config, RPC error) instead of an unknown venue
+        const cf = venueInfo.curveFailure;
         return {
           success: false,
           pnlSol: 0,
-          error: 'UNKNOWN_TRADING_VENUE: Could not authoritatively determine whether token is bonding curve or PumpSwap pool in LIVE mode.',
+          error: cf
+            ? `CURVE_READ_FAILED (${cf.reason}): ${cf.message}; no PumpSwap pool either, so nothing was sent.`
+            : 'UNKNOWN_TRADING_VENUE: Could not authoritatively determine whether token is bonding curve or PumpSwap pool in LIVE mode.',
+          notSent: true,
         };
       }
 
@@ -3209,14 +3224,13 @@ export class ExecutionCoordinator {
 
         v0Tx = await txBuilder.buildCustomVersionedTransaction(this.connection, seller, instructions);
       } else if (venueInfo.venue === 'PUMP_BONDING_CURVE') {
-        const marketState = await PumpCurveService.fetchPumpMarketState({
-          connection: this.connection,
-          mint: mintPubkey,
-          executionMode: posMode,
-        });
+        const read = await PumpCurveService.fetchPumpMarketStateResult({ connection: this.connection, mint: mintPubkey, executionMode: posMode });
+        // P1.6 (N-42): when only the fee tier could not be verified, the sell is quoted at the highest fee tier (a lower minimum output)
+        const marketState = read.state ?? read.failure.sellableState;
         if (!marketState) {
-          return { success: false, pnlSol: 0, error: 'Cannot fetch market state to quote and execute sell' };
+          return { success: false, pnlSol: 0, error: `Cannot fetch market state to quote and execute sell (${read.failure?.reason}: ${read.failure?.message})`, notSent: true };
         }
+        if (!read.state) Logger.warn(`[P1.6] SELL of ${target.symbol || target.mint} built with an unverified fee tier (${read.failure?.reason}); minimum output assumes ${marketState.unverifiedFeeCeilingBps} bps in fees`);
         tokenProgramToUse = marketState.tokenProgram;
 
         const sellQuote = PumpCurveService.calculateSellQuote({
@@ -3258,7 +3272,7 @@ export class ExecutionCoordinator {
 
         v0Tx = await traced('tx.build', () => txBuilder.buildSellTransaction(this.connection, sellParams, closeAtaEffective), { 'apex.side': 'SELL' });
       } else {
-        return { success: false, pnlSol: 0, error: `Trading venue for mint ${target.mint} cannot be resolved or migrated to unknown DEX` };
+        return { success: false, pnlSol: 0, error: `Trading venue for mint ${target.mint} cannot be resolved or migrated to unknown DEX`, notSent: true };
       }
 
       // Capture pre-sell balance snapshot
@@ -3274,7 +3288,7 @@ export class ExecutionCoordinator {
       const bhSell = await this.blockhashProblem(v0Tx, 'SELL');
       if (bhSell) {
         workstationDb.logJournal('CLUSTER_GUARD_BLOCK', `exit-${positionId.slice(0, 8)}`, 'LIVE', { side: 'SELL', mint: target.mint, error: bhSell });
-        return { success: false, pnlSol: 0, error: `CLUSTER_GUARD: ${bhSell}; nothing was signed or sent.` };
+        return { success: false, pnlSol: 0, error: `CLUSTER_GUARD: ${bhSell}; nothing was signed or sent.`, notSent: true };
       }
       await traced('tx.sign', () => localSigner.signTransaction(v0Tx), { 'apex.side': 'SELL' });
 
@@ -3286,6 +3300,7 @@ export class ExecutionCoordinator {
       }
 
       const exitOrderId = `ord-exit-${positionId.slice(0, 8)}-${Date.now()}`;
+      sendStarted = true; // P1.6: from here a throw may follow a send; before it, nothing left this process
       const subRes = await this.submitAndConfirmWithRetry({
         tx: v0Tx,
         orderId: exitOrderId,
@@ -3333,7 +3348,7 @@ export class ExecutionCoordinator {
       filled.exitTxSignature = subRes.signature;
       filled.lastUpdatedTimestamp = Date.now();
 
-      if (sellRecon.isFullyClosed || safeSellPct >= 100) {
+      if (sellRecon.isFullyClosed || sellBps >= 10_000) {
         filled.status = 'CLOSED';
         filled.tokenQuantityRaw = '0';
         filled.costBasisLamports = 0;
@@ -3355,13 +3370,63 @@ export class ExecutionCoordinator {
         solMoved: costSoldSol + sellRecon.actualRealizedPnLSol,
       };
     } catch (err: any) {
-      return { success: false, pnlSol: 0, error: err.message };
+      // P1.6 (N-44, R1-30): a throw before the send (quote math, pool reads, building, signing) attempted nothing, so it is not counted
+      return { success: false, pnlSol: 0, error: err?.message ?? String(err), notSent: !sendStarted };
     } finally {
       if (claimed) workstationDb.releaseExitClaim(positionId, exitClaimOwner);
       this.inFlightPositionExits.delete(positionId);
       this.positionExitDone.delete(positionId);
       exitDone();
     }
+  }
+
+  /**
+   * P1.6: the wallet's balance of a LIVE position's token, read before an exit. `held` is the raw amount, 0n when the token account does
+   * not exist, null when the read failed for another reason (the caller then sells what the row says). A zero or absent answer closes the
+   * row without a sell, so it must come from a read that can be trusted: `untrusted` (a non-attempt error the exit returns as it is) is
+   * set when the RPC is not on the allowed cluster, or when its answer is from a slot before the position's buy landed (a lagging node).
+   */
+  private async readHeldTokens(target: NormalizedPosition, owner: PublicKey, mint: PublicKey): Promise<{ held: bigint | null; untrusted?: string }> {
+    const tp = target.baseTokenProgram ? new PublicKey(target.baseTokenProgram) : TOKEN_PROGRAM_ID;
+    const ata = PumpCurveService.getAssociatedTokenAddress(mint, owner, tp);
+    let held: bigint;
+    let slot: number | undefined;
+    let absent = false;
+    try {
+      const bal = await this.connection.getTokenAccountBalance(ata, 'confirmed');
+      held = BigInt(bal?.value?.amount ?? '0');
+      slot = bal?.context?.slot;
+    } catch (e: any) {
+      if (!/could not find account|Invalid param/i.test(String(e?.message))) return { held: null };
+      held = 0n;
+      absent = true;
+    }
+    if (held > 0n) return { held };
+    if (this.clusterProblem !== null) {
+      return { held, untrusted: `CLUSTER_GUARD: the RPC is not trusted (${this.clusterProblem.replace(/^CLUSTER_GUARD: /, '')}); an empty wallet balance from it does not close the position` };
+    }
+    try {
+      await assertClusterAllowedCached(this.connection);
+    } catch (err: any) {
+      const why = String(err?.message ?? err).replace(/^CLUSTER_GUARD: /, '');
+      return { held, untrusted: `CLUSTER_GUARD: ${why}; an empty wallet balance from this RPC does not close the position` };
+    }
+    const entrySlot = target.entrySlot ?? 0;
+    if (entrySlot > 0) {
+      if (slot === undefined) {
+        try {
+          const r = await this.connection.getAccountInfoAndContext(ata, 'confirmed');
+          slot = r?.context?.slot;
+          if (absent && r?.value) slot = undefined; // the account exists after all: the two reads disagree, so neither decides
+        } catch {
+          slot = undefined;
+        }
+      }
+      if (slot === undefined || slot < entrySlot) {
+        return { held, untrusted: `BALANCE_UNTRUSTED: the RPC reported no tokens as of slot ${slot ?? 'unknown'}, but the buy landed in slot ${entrySlot}; not closing the position on that read` };
+      }
+    }
+    return { held };
   }
 
   /** Wallets whose pump volume accumulator is known to exist (it is never closed by this app), so the account is read once. */
@@ -3399,10 +3464,13 @@ export class ExecutionCoordinator {
    * A mint whose price could not be read is not asked again at once. Without this, 515 stale PAPER positions on mints that do not exist
    * cost one RPC read each on every 3 s pass (and a log line each), which also drew 429s from the endpoint. The wait doubles from
    * MARK_RETRY_BASE_MS to MARK_RETRY_MAX_MS and resets on a successful read.
+   * P1.6 (R1-19, R1-112): a LIVE position is never backed off, so one failed read cannot blind its stop-loss for a minute or more; it is
+   * read on every pass. The exception is a mint that can never be marked (PumpCurveService.getMintRejection: not a token mint).
    */
   private markRetry = new Map<string, { failures: number; nextAt: number }>();
-  private markBackedOff(mint: string, now = Date.now()): boolean {
-    const r = this.markRetry.get(mint);
+  private markBackedOff(pos: Pick<NormalizedPosition, 'mint' | 'executionMode'>, now = Date.now()): boolean {
+    if (pos.executionMode === 'LIVE' && !PumpCurveService.getMintRejection(pos.mint)) return false;
+    const r = this.markRetry.get(pos.mint);
     return !!r && now < r.nextAt;
   }
   private noteMarkFailure(mint: string, now = Date.now()): void {
@@ -3415,7 +3483,7 @@ export class ExecutionCoordinator {
 
   /** C4: isolated per-position price read used when the shared mark feed has gone stale. */
   private async refreshStaleMark(pos: NormalizedPosition): Promise<boolean> {
-    if (this.markBackedOff(pos.mint)) return false; // asked recently and failed: no RPC read this time
+    if (this.markBackedOff(pos)) return false; // asked recently and failed: no RPC read this time (never a LIVE position, P1.6)
     try {
       const marks = await RealMarkPriceService.queryOnChainMarkPrices(
         this.connection,
@@ -3548,6 +3616,7 @@ export class ExecutionCoordinator {
       // C4: staleness is measured from the last real mark only. lastUpdatedTimestamp is rewritten on every tick
       // and would hide a dead feed, so it is never a fallback; a never-marked position ages from its entry.
       const markAge = posNow - (pos.lastMarkTimestamp || pos.entryTimestamp || posNow);
+      let staleStopOnly = false;
       if (markAge > MARK_STALE_MS) {
         // Before skipping, read this position's curve/pool directly. A fresh read lets the stop-loss run.
         // PAPER positions cost no more than PAPER_STALE_REFRESH_PER_PASS direct reads per pass; LIVE positions always get theirs.
@@ -3566,10 +3635,15 @@ export class ExecutionCoordinator {
           }
           // A position nobody can price must age the mark feed from its entry, or an empty history would read as healthy.
           if (pos.executionMode === 'LIVE' && this.lastPositionMarkTimestamp === 0) this.lastPositionMarkTimestamp = pos.entryTimestamp || posNow;
-          continue;
+          // P1.6: a LIVE position whose last known mark is already past the hard stop still gets its STOP_LOSS (and nothing else): the
+          // sell re-reads the curve or pool before it is built, so it does not trade on the stale price. Every other exit waits for a mark.
+          if (pos.executionMode !== 'LIVE' || !(pos.currentPriceSol > 0)) continue;
+          staleStopOnly = true;
         }
-        this.clearOperatorAlert('POSITION_MARK_UNAVAILABLE', pos.id);
-        if (pos.executionMode === 'LIVE') this.recordPositionMarkEvent();
+        if (!staleStopOnly) {
+          this.clearOperatorAlert('POSITION_MARK_UNAVAILABLE', pos.id);
+          if (pos.executionMode === 'LIVE') this.recordPositionMarkEvent();
+        }
       } else if (pos.executionMode === 'LIVE') {
         this.recordPositionMarkEvent(); // a real mark within the staleness window
       }
@@ -3584,6 +3658,7 @@ export class ExecutionCoordinator {
         entryTimestamp: pos.entryTimestamp,
         currentTimestamp: posNow,
       });
+      if (staleStopOnly && !(decision.shouldExit && decision.reason === 'STOP_LOSS')) continue; // P1.6: no price, and not past the hard stop
 
       // A RECOVERED position (a balance found in the wallet that this app never bought) has an entry price that is just the mark at
       // adoption, so take-profit, trailing and stale exits would sell whatever lands in the wallet on an invented schedule. Only the

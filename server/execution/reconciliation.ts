@@ -672,8 +672,6 @@ export class TradeReconciler {
 /** On-chain mark prices for open positions. No random walks and no estimates: a mint with no readable price is simply absent from the result. */
 // Real Mark Price Service (No synthetic random walks)
 export class RealMarkPriceService {
-  private lastFetchTimestamp: number = 0;
-
   /** Spot price in SOL per token for each mint: from the bonding curve while it is open, from the canonical PumpSwap pool once it has migrated. Each entry says which source it came from and when it was read. */
   // Query on-chain bonding curve reserves for active open positions
   public static async queryOnChainMarkPrices(
@@ -690,11 +688,9 @@ export class RealMarkPriceService {
     for (const mintStr of uniqueMints) {
       try {
         const mintPubkey = new PublicKey(mintStr);
-        const state = await PumpCurveService.fetchPumpMarketState({
-          connection,
-          mint: mintPubkey,
-          executionMode,
-        });
+        const read = await PumpCurveService.fetchPumpMarketStateResult({ connection, mint: mintPubkey, executionMode });
+        // P1.6 (N-42): a LIVE curve whose fee tier could not be verified still has readable reserves; its spot price needs no fee.
+        const state = read.state ?? read.failure.sellableState ?? null;
         if (state && !state.complete && state.virtualTokenReserves > 0n) {
           const spotPriceSol =
             Number(state.virtualSolReserves) /
@@ -714,7 +710,9 @@ export class RealMarkPriceService {
         } else {
           // If bonding curve completed or not found, check canonical PumpSwap AMM pool
           const { PumpSwapVenueService } = await import('../solana/pumpSwapService');
-          const poolState = await PumpSwapVenueService.getPoolState(connection, mintPubkey, executionMode);
+          // P1.6 (R1-31): a LIVE mark never comes from the 15 s pool cache (a migrated position's stop must see every price move, and
+          // a pool created just after a cached "no pool" must be seen on the next pass).
+          const poolState = await PumpSwapVenueService.getPoolState(connection, mintPubkey, executionMode, { fresh: executionMode === 'LIVE' });
           if (poolState && poolState.spotPriceSol > 0) {
             result[mintStr] = {
               priceSol: poolState.spotPriceSol,

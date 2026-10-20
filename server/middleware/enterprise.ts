@@ -259,7 +259,7 @@ export const LiveSnipeOrderSchema = z.object({
 
 export const ClosePositionSchema = z.object({
   positionId: z.string().min(1, 'positionId is required'),
-  sellPct: z.number().min(1).max(100).default(100),
+  sellPct: z.number().int().min(1).max(100).default(100), // N-44: whole percent only
 });
 
 // Middleware factory for Zod validation

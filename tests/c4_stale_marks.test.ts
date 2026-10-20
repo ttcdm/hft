@@ -1,6 +1,6 @@
 import fs from 'fs';
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { executionCoordinator, MARK_STALE_MS, MARK_ALERT_AFTER_MS } from '../server/execution/coordinator';
+import { executionCoordinator, MARK_STALE_MS, MARK_ALERT_AFTER_MS, MARK_RETRY_BASE_MS } from '../server/execution/coordinator';
 import { RealMarkPriceService } from '../server/execution/reconciliation';
 import { workstationDb } from '../server/db/database';
 import { riskEngine } from '../server/risk/riskEngine';
@@ -77,7 +77,9 @@ describe('C4: exits keep working on stale marks', () => {
     const id = open(MINTS[2]).id;
     expect(executionCoordinator.getOperatorAlerts().some((a) => a.positionId === id)).toBe(true);
 
-    (executionCoordinator as any).markRetry.clear(); // the first failed read put this mint in back-off; a real mark returns later than that
+    // P1.6: this used to clear the private back-off map by hand. The first failed read put this PAPER mint in back-off; the clock now
+    // moves past that wait instead, as it would in a running app.
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now() + MARK_RETRY_BASE_MS + 1);
     q.mockResolvedValue({ [MINTS[2]]: { priceSol: 0.00006, source: 'ON_CHAIN_BONDING_CURVE', timestamp: Date.now() } } as any);
     await executionCoordinator.evaluateAndProcessExits();
     expect(executionCoordinator.getOperatorAlerts().some((a) => a.positionId === id)).toBe(false);

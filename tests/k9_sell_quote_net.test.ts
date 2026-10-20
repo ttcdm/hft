@@ -67,8 +67,15 @@ describe('K9: LIVE sell quote is net of fees, once', () => {
     expect(q.minOutputLamports).toBeLessThan(q.expectedSolAmountLamports);
   });
 
-  it('still fails closed when the app and the SDK really disagree (fee bps differ from the SDK schedule)', () => {
-    expect(() => PumpCurveService.calculateSellQuote({ state: liveState({ protocolFeeBps: 5 }), tokenAmountRaw: 40_000_000_000_000n, executionMode: 'LIVE' } as any)).toThrow(/QUOTE_MATH_DISCREPANCY/);
+  // P1.6 (R1-30): this used to expect a throw. A sell no longer fails closed on the disagreement (that blocked stop-losses over fee
+  // rounding); the official SDK's net decides the minimum output. A buy still fails closed.
+  it('when the app and the SDK really disagree (fee bps differ from the SDK schedule), a sell uses the SDK net and a buy still fails closed', () => {
+    const tokens = 40_000_000_000_000n;
+    const agreed = PumpCurveService.calculateSellQuote({ state: liveState(), tokenAmountRaw: tokens, executionMode: 'LIVE', slippageBps: 300 } as any);
+    const q = PumpCurveService.calculateSellQuote({ state: liveState({ protocolFeeBps: 5 }), tokenAmountRaw: tokens, executionMode: 'LIVE', slippageBps: 300 } as any);
+    expect(q.expectedSolAmountLamports).toBe(agreed.expectedSolAmountLamports); // the SDK net, which the state's own fee bps do not change
+    expect(q.minOutputLamports).toBe(agreed.minOutputLamports);
+    expect(() => PumpCurveService.calculateBuyQuote({ state: liveState({ protocolFeeBps: 5 }), amountSol: 0.5, executionMode: 'LIVE', slippageBps: 300 } as any)).toThrow(/QUOTE_MATH_DISCREPANCY/);
   });
 });
 

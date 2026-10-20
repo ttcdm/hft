@@ -139,6 +139,56 @@ export interface PumpMarketState {
   marketDataTimestamp: number;
   marketDataSource: string;
   token2022Report?: Token2022ExtensionReport;
+  /**
+   * P1.6 (N-42): set only on a LIVE state whose fee tier could not be verified while the fee recipients did resolve. Such a state is never
+   * returned by `fetchPumpMarketState`; it travels only in `MarketStateFailure.sellableState`, and `calculateSellQuote` prices it with this
+   * fee (the highest tier the fee config lists, or `PUMP_SELL_FEE_CEILING_BPS`), so an exit can still be built. Buys refuse it.
+   */
+  unverifiedFeeCeilingBps?: number;
+}
+
+/** P1.6 (N-42): why `fetchPumpMarketState` returned null. `MINT_NOT_FOUND` and `CURVE_NOT_FOUND` mean "no curve"; the rest mean the read failed. */
+export type MarketStateFailureReason =
+  | 'MINT_NOT_FOUND'
+  | 'CURVE_NOT_FOUND'
+  | 'NOT_A_TOKEN_MINT'
+  | 'DANGEROUS_TOKEN_2022_EXTENSION'
+  | 'BONDING_CURVE_DECODE_FAILED'
+  | 'UNSUPPORTED_QUOTE_MINT'
+  | 'FEE_RECIPIENT_UNRESOLVED'
+  | 'DYNAMIC_FEE_CALCULATION_FAILED'
+  | 'FEE_CONFIG_MISSING'
+  | 'UNVERIFIED_DYNAMIC_FEE'
+  | 'RPC_ERROR';
+
+export interface MarketStateFailure {
+  reason: MarketStateFailureReason;
+  message: string;
+  /** Only for the three fee-tier reasons, when the fee recipients resolved: the state with `unverifiedFeeCeilingBps` set, for a SELL only. */
+  sellableState?: PumpMarketState;
+}
+
+export type MarketStateResult = { state: PumpMarketState; failure?: undefined } | { state: null; failure: MarketStateFailure };
+
+/** The two failure reasons that mean the mint has no bonding curve, as opposed to a curve that could not be read. */
+export const NO_CURVE_REASONS: ReadonlySet<MarketStateFailureReason> = new Set(['MINT_NOT_FOUND', 'CURVE_NOT_FOUND']);
+
+/**
+ * P1.6 (N-42): the fee a SELL assumes when the fee config could not be read at all. A floor on the proceeds only (minOut): the program
+ * charges its real fee, so assuming more than it can only lower the minimum accepted, never what is received. 5% is above every tier
+ * pump.fun has published (about 1.25% in total).
+ */
+export const PUMP_SELL_FEE_CEILING_BPS = 500;
+
+/** The highest total fee (lp + protocol + creator) any tier of a decoded pump fee config lists, or PUMP_SELL_FEE_CEILING_BPS without one. */
+export function highestFeeTierBps(feeConfig: any): number {
+  const sets: any[] = [];
+  for (const t of [...(Array.isArray(feeConfig?.feeTiers) ? feeConfig.feeTiers : []), ...(Array.isArray(feeConfig?.stableFeeTiers) ? feeConfig.stableFeeTiers : [])]) sets.push(t?.fees);
+  sets.push(feeConfig?.flatFees, feeConfig?.exoticFlatFees);
+  const num = (v: any) => { const n = Number(v?.toString?.() ?? v ?? 0); return Number.isFinite(n) ? n : 0; };
+  let max = 0;
+  for (const f of sets) if (f) max = Math.max(max, num(f.lpFeeBps) + num(f.protocolFeeBps) + num(f.creatorFeeBps));
+  return max > 0 ? max : PUMP_SELL_FEE_CEILING_BPS;
 }
 
 export interface TradeQuote {
@@ -167,6 +217,8 @@ export interface FetchPumpMarketStateParams {
   connection: Connection;
   mint: PublicKey;
   executionMode: ExecutionMode;
+  /** P1.6 (N-42): filled with the reason when the call returns null (see `fetchPumpMarketStateResult`). */
+  failure?: Partial<MarketStateFailure>;
 }
 
 export interface CalculateBuyQuoteParams {
@@ -538,11 +590,13 @@ export class PumpCurveService {
     let connection: Connection;
     let mint: PublicKey;
     let executionMode: ExecutionMode;
+    let out: Partial<MarketStateFailure> | undefined;
 
     if ('connection' in paramsOrConn) {
       connection = paramsOrConn.connection;
       mint = paramsOrConn.mint;
       executionMode = paramsOrConn.executionMode;
+      out = paramsOrConn.failure;
     } else {
       connection = paramsOrConn;
       mint = mintArg!;
@@ -554,6 +608,11 @@ export class PumpCurveService {
 
     const isLiveMode = executionMode === 'LIVE';
     const [bondingCurve] = this.getBondingCurveAddress(mint);
+    /** P1.6 (N-42): every null says why, so a caller can tell "no curve" from "the curve could not be read". */
+    const fail = (reason: MarketStateFailureReason, message: string, sellableState?: PumpMarketState): null => {
+      if (out) { out.reason = reason; out.message = message; out.sellableState = sellableState; }
+      return null;
+    };
 
     try {
       const now = Date.now();
@@ -594,19 +653,19 @@ export class PumpCurveService {
 
       if (!finalMintInfo) {
         Logger.warn(`Mint account not found on Solana RPC: ${mint.toBase58()}`);
-        return null;
+        return fail('MINT_NOT_FOUND', `mint account ${mint.toBase58()} not found`);
       }
 
       if (!finalCurveInfo) {
         Logger.warn(`Pump.fun bonding curve account not found: ${bondingCurve.toBase58()}`);
-        return null;
+        return fail('CURVE_NOT_FOUND', `bonding curve ${bondingCurve.toBase58()} not found`);
       }
 
       // The token program is the mint account's owner, never inferred from its contents. Any other owner is not a mint.
       if (!finalMintInfo.owner.equals(TOKEN_PROGRAM_ID) && !finalMintInfo.owner.equals(TOKEN_2022_PROGRAM_ID)) {
         Logger.error(`Mint ${mint.toBase58()} is owned by ${finalMintInfo.owner.toBase58()}, not a token program`);
         PumpCurveService.mintRejections.set(mint.toBase58(), `its account is owned by ${finalMintInfo.owner.toBase58()}, not a token program`);
-        return null;
+        return fail('NOT_A_TOKEN_MINT', `mint account owned by ${finalMintInfo.owner.toBase58()}, not a token program`);
       }
       PumpCurveService.mintRejections.delete(mint.toBase58());
       let baseTokenProgram = TOKEN_PROGRAM_ID;
@@ -619,7 +678,7 @@ export class PumpCurveService {
             Logger.error(
               `DANGEROUS_TOKEN_2022_EXTENSION in LIVE mode for ${mint.toBase58()}: unsupported=[${token2022Report.unsupportedExtensionNames.join(', ')}]`
             );
-            return null;
+            return fail('DANGEROUS_TOKEN_2022_EXTENSION', `unsupported Token-2022 extensions: ${token2022Report.unsupportedExtensionNames.join(', ')}`);
           }
           Logger.warn(`Mint ${mint.toBase58()} has active Token-2022 extensions: ${token2022Report.unsupportedExtensionNames.join(', ')} (allowed in PAPER mode only)`);
         }
@@ -687,20 +746,20 @@ export class PumpCurveService {
         if (isLiveMode) {
           // In LIVE mode: Fail closed! Never guess account layout using stale binary offsets
           Logger.error(`BONDING_CURVE_DECODE_FAILED: Official SDK decode failed in LIVE mode for ${mint.toBase58()}: ${sdkErr.message}`);
-          return null;
+          return fail('BONDING_CURVE_DECODE_FAILED', `official SDK decode failed: ${sdkErr.message}`);
         }
 
         // Retain manual binary offset fallback strictly for PAPER/TEST/RESEARCH diagnostics
         const data = finalCurveInfo.data;
         if (data.length < 49) {
           Logger.warn(`Bonding curve account data truncated: ${data.length} bytes`);
-          return null;
+          return fail('BONDING_CURVE_DECODE_FAILED', `bonding curve data truncated (${data.length} bytes)`);
         }
 
         const disc = data.subarray(0, 8);
         if (!disc.equals(BONDING_CURVE_DISCRIMINATOR)) {
           Logger.warn(`Invalid bonding curve account discriminator: ${disc.toString('hex')}`);
-          return null;
+          return fail('BONDING_CURVE_DECODE_FAILED', `invalid bonding curve discriminator ${disc.toString('hex')}`);
         }
 
         virtualTokenReserves = data.readBigUInt64LE(8);
@@ -729,19 +788,23 @@ export class PumpCurveService {
       if (!quoteMint.equals(NATIVE_MINT) && !quoteMint.equals(new PublicKey('So11111111111111111111111111111111111111112'))) {
         Logger.warn(`UNSUPPORTED_QUOTE_MINT: Mint ${mint.toBase58()} uses exotic quote mint ${quoteMint.toBase58()}. Only native SOL is supported.`);
         if (isLiveMode) {
-          return null;
+          return fail('UNSUPPORTED_QUOTE_MINT', `quote mint ${quoteMint.toBase58()} is not native SOL`);
         }
       }
 
       // Authoritative fee recipient resolution according to Pump V2 protocol
-      const { feeRecipient, buybackFeeRecipient } = resolvePumpFeeRecipients(
-        this.cachedGlobal,
-        isMayhemMode,
-        executionMode
-      );
+      let feeRecipient: PublicKey;
+      let buybackFeeRecipient: PublicKey;
+      try {
+        ({ feeRecipient, buybackFeeRecipient } = resolvePumpFeeRecipients(this.cachedGlobal, isMayhemMode, executionMode));
+      } catch (recipErr: any) {
+        Logger.error(`Fee recipients unresolved for ${mint.toBase58()}: ${recipErr.message}`);
+        return fail('FEE_RECIPIENT_UNRESOLVED', recipErr.message);
+      }
 
       // Authoritative dynamic fee computation using official Pump V2 Fee Schedule
       let protocolFeeBps = 100;
+      let feeFailure: { reason: MarketStateFailureReason; message: string } | undefined;
       let feeComputationStatus: 'VERIFIED' | 'UNAVAILABLE' | 'FAILED' = 'UNAVAILABLE';
 
       if (this.cachedGlobal && this.cachedFeeConfig && typeof computeFeesBps === 'function') {
@@ -766,23 +829,24 @@ export class PumpCurveService {
           feeComputationStatus = 'FAILED';
           if (isLiveMode) {
             Logger.error(`DYNAMIC_FEE_CALCULATION_FAILED in LIVE mode for ${mint.toBase58()}: ${feeCalcErr.message}`);
-            return null;
+            feeFailure = { reason: 'DYNAMIC_FEE_CALCULATION_FAILED', message: feeCalcErr.message };
+          } else {
+            Logger.debug(`Dynamic fee calculation fallback: ${feeCalcErr.message}`);
           }
-          Logger.debug(`Dynamic fee calculation fallback: ${feeCalcErr.message}`);
         }
       } else if (isLiveMode) {
         Logger.error(`FEE_CONFIG_MISSING in LIVE mode: Cached global or feeConfig not present for ${mint.toBase58()}`);
-        return null;
+        feeFailure = { reason: 'FEE_CONFIG_MISSING', message: 'the Global or FeeConfig account is missing or could not be decoded' };
       }
 
-      if (isLiveMode && feeComputationStatus !== 'VERIFIED') {
+      if (isLiveMode && !feeFailure && feeComputationStatus !== 'VERIFIED') {
         Logger.error(`UNVERIFIED_DYNAMIC_FEE in LIVE mode for ${mint.toBase58()}: Status=${feeComputationStatus}`);
-        return null;
+        feeFailure = { reason: 'UNVERIFIED_DYNAMIC_FEE', message: `fee computation status ${feeComputationStatus}` };
       }
 
       const associatedBondingCurve = this.getAssociatedTokenAddress(mint, bondingCurve, baseTokenProgram);
 
-      return {
+      const state: PumpMarketState = {
         mint,
         creator,
         bondingCurve,
@@ -812,10 +876,28 @@ export class PumpCurveService {
         marketDataSource: 'SOLANA_RPC_BONDING_CURVE',
         token2022Report,
       };
+      if (feeFailure) {
+        // P1.6 (N-42): a LIVE buy must not guess the fee, so this call still returns null. The fee recipients did resolve, so a SELL can
+        // be built with a minimum output at the highest fee tier; the state for that goes back only through the failure.
+        return fail(feeFailure.reason, feeFailure.message, { ...state, unverifiedFeeCeilingBps: highestFeeTierBps(this.cachedFeeConfig) });
+      }
+      return state;
     } catch (err: any) {
       Logger.error(`Error querying Pump bonding curve for ${mint.toBase58()}: ${err.message}`);
-      return null;
+      return fail('RPC_ERROR', err?.message ?? String(err));
     }
+  }
+
+  /**
+   * P1.6 (N-42): `fetchPumpMarketState` with the reason when there is no state: "no curve" (`NO_CURVE_REASONS`) versus a read that failed,
+   * plus, for a LIVE state whose fee tier is unverified, a state a SELL may use (`sellableState`). Goes through `fetchPumpMarketState`, so a
+   * spy on that method steers this one too; a spy that returns null without a reason reads as `RPC_ERROR`.
+   */
+  public static async fetchPumpMarketStateResult(params: Omit<FetchPumpMarketStateParams, 'failure'>): Promise<MarketStateResult> {
+    const failure: Partial<MarketStateFailure> = {};
+    const state = await this.fetchPumpMarketState({ ...params, failure });
+    if (state) return { state };
+    return { state: null, failure: { reason: failure.reason ?? 'RPC_ERROR', message: failure.message ?? 'the curve read returned nothing', sellableState: failure.sellableState } };
   }
 
   // Calculate buy quote using official Pump SDK mathematics and authoritative dynamic fees
@@ -880,7 +962,8 @@ export class PumpCurveService {
     const creatorFeeBps = state.creatorFeeBps;
 
     // In LIVE mode: strictly verify fee calculation cannot silently assume 100 bps without fee config
-    if (isLiveMode && (!this.cachedGlobal || !this.cachedFeeConfig)) {
+    // P1.6: a state whose fee tier is unverified is for exits only (calculateSellQuote); a buy never pays a guessed fee.
+    if (isLiveMode && (!this.cachedGlobal || !this.cachedFeeConfig || state.feeComputationStatus === 'UNAVAILABLE' || state.feeComputationStatus === 'FAILED' || state.unverifiedFeeCeilingBps !== undefined)) {
       throw new Error('DYNAMIC_FEE_CALCULATION_FAILED: Global fee configuration not available for LIVE trade quote.');
     }
 
@@ -1113,7 +1196,10 @@ export class PumpCurveService {
       throw new Error(`Token sell amount must be greater than zero.`);
     }
 
-    if (isLiveMode && (!this.cachedGlobal || !this.cachedFeeConfig)) {
+    // P1.6 (N-42): a LIVE state whose fee tier could not be verified (see unverifiedFeeCeilingBps) is priced at the highest tier, without
+    // the SDK quote, so an exit can still be built; its minimum output is lower than a verified quote's, never higher.
+    const feeCeilingBps = isLiveMode ? state.unverifiedFeeCeilingBps : undefined;
+    if (isLiveMode && feeCeilingBps === undefined && (!this.cachedGlobal || !this.cachedFeeConfig)) {
       throw new Error('DYNAMIC_FEE_CALCULATION_FAILED: Global fee configuration not available for LIVE trade quote.');
     }
 
@@ -1165,7 +1251,7 @@ export class PumpCurveService {
       effectiveGlobal.creatorFeeBasisPoints = new BN(creatorFeeBps || 0);
     }
 
-    if (this.cachedGlobal && effectiveFeeConfig && typeof getSellSolAmountFromTokenAmount === 'function') {
+    if (feeCeilingBps === undefined && this.cachedGlobal && effectiveFeeConfig && typeof getSellSolAmountFromTokenAmount === 'function') {
       try {
         const solOut = getSellSolAmountFromTokenAmount({
           global: effectiveGlobal as any,
@@ -1196,7 +1282,7 @@ export class PumpCurveService {
       }
     }
 
-    if (isLiveMode && !sdkQuoteSucceeded) {
+    if (isLiveMode && !sdkQuoteSucceeded && feeCeilingBps === undefined) {
       throw new Error('OFFICIAL_PUMP_QUOTE_FAILED: Official SDK sell quote calculation failed or unavailable in LIVE mode');
     }
 
@@ -1216,17 +1302,18 @@ export class PumpCurveService {
     // non-zero, and treating the SDK value as gross charged the fee twice (found by the localnet end-to-end run).
     const ceilFee = (amount: bigint, bps: number) => (amount * BigInt(bps) + 9999n) / 10000n;
     const grossSolOut = customGrossSolOut;
-    const protocolFeeLamports = ceilFee(grossSolOut, protocolFeeBps);
-    const creatorFeeLamports = state.creator.equals(PublicKey.default) ? 0n : ceilFee(grossSolOut, creatorFeeBps);
-    const netSolOutLamports = grossSolOut - protocolFeeLamports - creatorFeeLamports;
+    const protocolFeeLamports = feeCeilingBps !== undefined ? ceilFee(grossSolOut, feeCeilingBps) : ceilFee(grossSolOut, protocolFeeBps);
+    const creatorFeeLamports = feeCeilingBps !== undefined || state.creator.equals(PublicKey.default) ? 0n : ceilFee(grossSolOut, creatorFeeBps);
+    let netSolOutLamports = grossSolOut - protocolFeeLamports - creatorFeeLamports;
+    if (feeCeilingBps !== undefined) {
+      Logger.warn(`[P1.6] SELL quote for ${state.mint.toBase58()} with an unverified fee tier: assuming ${feeCeilingBps} bps in fees (net ${netSolOutLamports} lamports)`);
+    }
 
-    if (sdkQuoteSucceeded && isLiveMode) {
-      // R0.2: cross-check the app's net proceeds against the official SDK's and require exact integer agreement.
-      if (netSolOutLamports !== grossSolOutLamports) {
-        throw new Error(
-          `QUOTE_MATH_DISCREPANCY: Custom sell math (${netSolOutLamports} net) diverges from official SDK (${grossSolOutLamports} net) in LIVE mode. Failing closed.`
-        );
-      }
+    if (sdkQuoteSucceeded && isLiveMode && netSolOutLamports !== grossSolOutLamports) {
+      // R0.2 cross-check. P1.6 (R1-30): a sell does not fail closed on it. The official SDK's net decides the minimum output, and the
+      // disagreement is logged: refusing would leave a stop-loss unsent over a lamport of fee rounding. A buy still fails closed.
+      Logger.warn(`QUOTE_MATH_DISCREPANCY (sell, not blocking): custom sell math ${netSolOutLamports} net, official SDK ${grossSolOutLamports} net for ${state.mint.toBase58()}; using the SDK value`);
+      netSolOutLamports = grossSolOutLamports;
     }
 
     // Spot price in SOL per human token

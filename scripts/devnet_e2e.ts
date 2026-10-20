@@ -62,7 +62,7 @@ async function main() {
   const { tracingReady } = await import('../server/observability/init');
   await tracingReady;
   const web3 = await import('@solana/web3.js');
-  const { Keypair, Connection, LAMPORTS_PER_SOL, PublicKey, VersionedTransaction } = web3;
+  const { Keypair, Connection, LAMPORTS_PER_SOL, PublicKey } = web3;
 
   if (!fs.existsSync(keyPath)) {
     fs.writeFileSync(keyPath, JSON.stringify(Array.from(Keypair.generate().secretKey)), { mode: 0o600 });
@@ -209,10 +209,11 @@ async function main() {
   }
   if (!funded) return finish();
 
-  const { ExecutionCoordinator } = await import('../server/execution/coordinator');
+  // P1.2: the module's own singleton, the one server.ts uses. A second `new ExecutionCoordinator(true)` here ran a second exit loop on the
+  // same DB and signer (N-55).
+  const { executionCoordinator: coordinator } = await import('../server/execution/coordinator');
   const { workstationDb } = await import('../server/db/database');
-  const { localSigner } = await import('../server/solana/signer');
-  const coordinator = new ExecutionCoordinator(true);
+  const { riskEngine } = await import('../server/risk/riskEngine');
   // server.ts starts the SOL/USD price service at boot (a LIVE buy needs a fresh price for the liquidity gate); this script does not run server.ts.
   const { solPriceService } = await import('../server/market/solPriceService');
   solPriceService.startAutoRefresh();
@@ -287,6 +288,7 @@ async function main() {
 
   // (a) BUY through the RPC transport
   const buy = await coordinator.executeTrade(await buildBuyRequest());
+  const buyDoneAt = Date.now();
   rec('(a) BUY', buy.success && buy.lifecycleState === 'CONFIRMED', `${buy.lifecycleState} ${buy.error || ''}`);
   await verify('(a)', buy.txSignature || buy.signature);
   const txRows = workstationDb.loadTransactions();
@@ -307,45 +309,21 @@ async function main() {
   rec('(c) ATA closed, rent returned', (await conn.getTokenAccountsByOwner(kp.publicKey, { mint: mintPk })).value.length === 0, `balance ${after / LAMPORTS_PER_SOL} SOL (expect ~0.00203928 rent back)`);
   for (const t of workstationDb.loadTransactions().filter((x) => x.direction === 'SELL')) await verify('(b/c) SELL', t.signature);
 
-  // (d) forced revert: max cost of 1 lamport cannot be satisfied
-  try {
-    const ata = PumpCurveService.getAssociatedTokenAddress(mintPk, kp.publicKey, state.tokenProgram);
-    const q = PumpCurveService.calculateBuyQuote({ state, amountSol: BUY_SOL, slippageBps: 800, jitoTipSol: 0, priorityFeeLamports: 0, executionMode: 'LIVE' });
-    const bad = await txBuilder.buildBuyTransaction(conn, {
-      buyer: kp.publicKey, mint: mintPk, bondingCurve: state.bondingCurve, associatedBondingCurve: state.associatedBondingCurve,
-      associatedUser: ata, creator: state.creator, feeRecipient: state.feeRecipient, buybackFeeRecipient: state.buybackFeeRecipient,
-      quoteMint: state.quoteMint, tokenProgram: state.tokenProgram, quoteTokenProgram: state.quoteTokenProgram,
-      amountTokens: BigInt(q.tokenAmountRaw), maxSolCostLamports: 1n, computeUnits: 250000, priorityFeeMicroLamports: 1000,
-      jitoTipLamports: 0n, jitoTipAccount: executionConfig.getJitoTipAccountPublicKey(),
-    });
-    await localSigner.signTransaction(bad);
-    const sig = await conn.sendRawTransaction(bad.serialize(), { skipPreflight: true });
-    const st = await conn.confirmTransaction(sig, 'confirmed');
-    rec('(d) forced revert', !!st.value.err, `${solscan(sig)} err=${JSON.stringify(st.value.err)}`);
-  } catch (e: any) {
-    rec('(d) forced revert', false, String(e.message).slice(0, 200));
-  }
-
-  // (e) same orderId is not resubmitted
-  const prior = workstationDb.loadTransactions().find((t) => t.direction === 'BUY');
-  if (prior) {
-    const dupTx = await txBuilder.buildBuyTransaction(conn, {
-      buyer: kp.publicKey, mint: mintPk, bondingCurve: state.bondingCurve, associatedBondingCurve: state.associatedBondingCurve,
-      associatedUser: PumpCurveService.getAssociatedTokenAddress(mintPk, kp.publicKey, state.tokenProgram), creator: state.creator,
-      feeRecipient: state.feeRecipient, buybackFeeRecipient: state.buybackFeeRecipient, quoteMint: state.quoteMint,
-      tokenProgram: state.tokenProgram, quoteTokenProgram: state.quoteTokenProgram, amountTokens: 1n, maxSolCostLamports: 1000n,
-      computeUnits: 250000, priorityFeeMicroLamports: 1000, jitoTipLamports: 0n, jitoTipAccount: executionConfig.getJitoTipAccountPublicKey(),
-    });
-    await localSigner.signTransaction(dupTx);
-    const before = workstationDb.loadTransactions(prior.orderId).length;
-    const r = await coordinator.submitAndConfirmWithRetry({
-      tx: dupTx, orderId: prior.orderId, correlationId: 'e2e-dup', side: 'BUY', mint, mintPubkey: mintPk, owner: kp.publicKey,
-      tokenProgram: state.tokenProgram, preSnapshot: {} as any, jitoTipLamports: 0,
-    });
-    rec('(e) same orderId skipped', workstationDb.loadTransactions(prior.orderId).length === before, `rows ${before} -> ${workstationDb.loadTransactions(prior.orderId).length}, result=${r.lifecycleState}`);
-  } else {
-    rec('(e) same orderId skipped', false, 'no prior BUY row');
-  }
+  // (d') forced revert through the app, (e') two sequential buys of one mint (scripts/devnet_e2e_steps.ts). The harness signs nothing itself.
+  const steps: import('./devnet_e2e_steps').HarnessSteps = {
+    coordinator, curve: PumpCurveService, db: workstationDb as any, riskLimits: () => riskEngine.getLimits(), mint: mint!,
+    chainErr: async (sig) => {
+      const t = await conn.getTransaction(sig, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+      return t ? (t.meta?.err ?? null) : undefined;
+    },
+    buildBuyRequest, rec, link: solscan, sleep,
+  };
+  const S = await import('./devnet_e2e_steps');
+  // The (a) buy started the 30 s per-mint cooldown; (d') must reach the chain, so it waits that out first.
+  await S.waitPast(steps, buyDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (a) buy');
+  const revertedAt = await S.forcedRevertThroughApp(steps);
+  await S.waitPast(steps, revertedAt, riskEngine.getLimits().cooldownAfterFailedTradeMs, "failure cooldown from the (d') revert");
+  await S.sequentialBuysOneMint(steps);
 
   // (f) crash after submit, then recover in a fresh process on the same scratch DB
   const env = { ...process.env, APEX_E2E_SCRATCH: scratch };

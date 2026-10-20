@@ -180,6 +180,7 @@ Commands (repo root; Node 22.5+ because of `node:sqlite`):
 | `npm run lint` | ESLint (0 errors, 162 warnings) plus `tsc --noEmit` |
 | `npm run build` | frontend + `dist/server.cjs` |
 | `npm run smoke` | boots `dist/server.cjs` on a random port and checks `/`, `/api/health`, login, session and the `/ws/engine` handshake |
+| `npm run test:long` | the long behaviour tests (`tests/long/*.longtest.ts`, about 2.5 min): the real server against the LiteSVM validator for the exit loop, crash recovery, the guards and the validator's fault controls. Runs in CI after `npm test`; `tests/test_globs.test.ts` fails if a test file under `tests/` is in neither suite. |
 | `npm run localnet:e2e` | the full flow against an in-process LiteSVM validator (real pump binaries, loopback RPC, throwaway key, scratch DB, empty `APEX_ENV_FILE`): see `scripts/localnet/README.md`. 39 checks. Not a real cluster. |
 | `npm run devnet:e2e` | the devnet harness (`scripts/DEVNET_E2E_README.md`). Needs network and a **throwaway** devnet key it generates itself; it aborts unless the genesis hash is devnet's, never uses the repo keypair, and airdrops at most once and only with `DEVNET_AIRDROP_ONCE=1`. **Not run yet** (a manual devnet round trip through the app did pass; see Status). |
 | `FIXTURE=1 node scripts/visual/click_through.cjs` | Chromium click-through of the real UI on a seeded fixture (layout and values checks); set `WIDTHS`, `OUT` to choose viewports and output |

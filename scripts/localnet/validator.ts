@@ -149,6 +149,17 @@ export class LocalnetValidator {
   /** When true the next sendTransaction lands on-chain but its HTTP response is never sent (process-kill tests). */
   private holdNextResponse = false;
   heldSignatures: string[] = [];
+  /**
+   * Read failures armed by `localnet_failNextReads`: each rule fails the next `remaining` calls of `method` (only those whose params
+   * mention `address`, when given). `mode` 'jsonrpc' answers HTTP 200 with a JSON-RPC error (web3.js throws at once); 'http429'
+   * answers HTTP 429 (web3.js retries a 429 itself, up to 5 attempts 0.5/1/2/4 s apart, unless the Connection was built with
+   * `disableRetryOnRateLimit: true`; every attempt consumes one count).
+   */
+  private readFailures: { remaining: number; method: string; address?: string; mode: 'jsonrpc' | 'http429' }[] = [];
+  /** When true the next sendTransaction that reaches the bank is executed there, then answered with HTTP 502 (a gateway that lost the reply). */
+  private landThenFailNext = false;
+  /** Signatures executed in the bank whose HTTP reply was a 502 (`localnet_landThenFailNextSend`), oldest first, never cleared. */
+  landedThenFailedSignatures: string[] = [];
   /** RPC methods that were called but are not implemented; tests assert this stays empty. */
   readonly unsupported = new Set<string>();
   /** Every RPC method call, for the endpoint-coverage report. */
@@ -246,6 +257,32 @@ export class LocalnetValidator {
   /** Make the next `count` sendRawTransaction calls fail before reaching the bank. */
   failNextSends(count: number, error = 'localnet: injected send failure') {
     this.sendFailures = { remaining: count, error };
+  }
+  /**
+   * Make the next `count` calls of the read method `method` fail like an overloaded RPC. With `address`, only calls whose params
+   * mention that base58 address count (e.g. getAccountInfo of that account, getSignaturesForAddress of that wallet, a
+   * getMultipleAccounts list holding it). Rules for different methods or addresses are independent; a second rule for the same
+   * method and address replaces the first.
+   */
+  failNextReads(count: number, method: string, address?: string, mode: 'jsonrpc' | 'http429' = 'jsonrpc') {
+    if (!method || method.startsWith('localnet_') || method === 'sendTransaction') {
+      throw new RpcError(-32602, 'localnet_failNextReads: name a read method (sends have localnet_failNextSends)');
+    }
+    if (mode !== 'jsonrpc' && mode !== 'http429') throw new RpcError(-32602, `localnet_failNextReads: unknown mode ${String(mode)}`);
+    this.readFailures = this.readFailures.filter((r) => !(r.method === method && r.address === address));
+    if (count > 0) this.readFailures.push({ remaining: count, method, address, mode });
+  }
+  /** Consumes one armed read failure matching this call, if any. */
+  private takeReadFailure(method: string, params: unknown[]): 'jsonrpc' | 'http429' | null {
+    const r = this.readFailures.find((f) => f.method === method && f.remaining > 0 && (!f.address || JSON.stringify(params ?? []).includes(f.address)));
+    if (!r) return null;
+    r.remaining--;
+    if (r.remaining === 0) this.readFailures = this.readFailures.filter((f) => f !== r);
+    return r.mode;
+  }
+  /** The next sendTransaction is executed in the bank, then its HTTP reply is a 502 Bad Gateway. */
+  landThenFailNextSend() {
+    this.landThenFailNext = true;
   }
   getSlot() {
     return Number(this.slot);
@@ -454,6 +491,9 @@ export class LocalnetValidator {
   handle(method: string, params: any[] = []): unknown {
     if (process.env.LOCALNET_TRACE) console.error('rpc', method, JSON.stringify(params).slice(0, 200));
     this.methodCounts.set(method, (this.methodCounts.get(method) ?? 0) + 1);
+    const injected = this.takeReadFailure(method, params);
+    if (injected === 'http429') throw new InjectedHttpStatus(429, 'Too many requests for a specific RPC call (localnet: injected)');
+    if (injected) throw new RpcError(-32005, `localnet: injected read failure (${method}): node is behind / overloaded`);
     switch (method) {
       case 'getHealth': return 'ok';
       case 'getVersion': return { 'solana-core': '2.0.0-localnet-litesvm', 'feature-set': 0 };
@@ -538,7 +578,10 @@ export class LocalnetValidator {
         return true;
       }
       case 'localnet_holdNextResponse': this.holdNextResponse = true; return true;
-      case 'localnet_stats': return { held: this.heldSignatures, methods: Object.fromEntries(this.methodCounts), unsupported: [...this.unsupported], txs: this.txs.size, slot: Number(this.slot) };
+      // params: [count, method, address?, mode?] ('jsonrpc' default, or 'http429'); see failNextReads
+      case 'localnet_failNextReads': this.failNextReads(Number(params[0] ?? 1), String(params[1] ?? ''), params[2] ? String(params[2]) : undefined, params[3] ?? 'jsonrpc'); return true;
+      case 'localnet_landThenFailNextSend': this.landThenFailNextSend(); return true;
+      case 'localnet_stats': return { held: this.heldSignatures, landedThenFailed: this.landedThenFailedSignatures, methods: Object.fromEntries(this.methodCounts), unsupported: [...this.unsupported], txs: this.txs.size, slot: Number(this.slot) };
       default:
         this.unsupported.add(method);
         throw new RpcError(-32601, `Method not found: ${method}`);
@@ -568,6 +611,8 @@ export class LocalnetValidator {
       let body = '';
       req.on('data', (c) => (body += c));
       req.on('end', () => {
+        // An injected HTTP status for this request (localnet_failNextReads 'http429', localnet_landThenFailNextSend's 502).
+        let httpStatus: { code: number; text?: string } | null = null;
         const run = (r: any) => {
           try {
             const result = this.handle(r.method, r.params);
@@ -576,8 +621,18 @@ export class LocalnetValidator {
               this.heldSignatures.push(String(result));
               return null;
             }
+            if (r.method === 'sendTransaction' && this.landThenFailNext) {
+              // The transaction is already in the bank (landed, or failed on chain and paid its fee); only the reply is lost.
+              this.landThenFailNext = false;
+              this.landedThenFailedSignatures.push(String(result));
+              httpStatus = { code: 502, text: '<html><body><h1>502 Bad Gateway</h1></body></html>' };
+            }
             return { jsonrpc: '2.0', id: r.id, result };
           } catch (e: any) {
+            if (e instanceof InjectedHttpStatus) {
+              httpStatus = { code: e.status };
+              return { jsonrpc: '2.0', id: r.id, error: { code: e.status, message: e.message } };
+            }
             if (e instanceof RpcError) return { jsonrpc: '2.0', id: r.id, error: { code: e.code, message: e.message } };
             return { jsonrpc: '2.0', id: r.id, error: { code: -32603, message: String(e?.message ?? e) } };
           }
@@ -586,7 +641,9 @@ export class LocalnetValidator {
           const j = JSON.parse(body);
           const out = Array.isArray(j) ? j.map(run) : run(j);
           if (out === null) return; // response deliberately withheld (localnet_holdNextResponse)
-          res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(out));
+          const injected = httpStatus as { code: number; text?: string } | null;
+          if (injected?.text) { res.writeHead(injected.code, { 'content-type': 'text/html' }).end(injected.text); return; }
+          res.writeHead(injected?.code ?? 200, { 'content-type': 'application/json' }).end(JSON.stringify(out));
         } catch {
           res.writeHead(400).end();
         }
@@ -637,6 +694,13 @@ const TRANSACTION_ERRORS: Record<number, string> = {
 
 class RpcError extends Error {
   constructor(public code: number, message: string) {
+    super(message);
+  }
+}
+
+/** Thrown by `handle` when a test control wants the whole HTTP reply to carry this status (with a JSON-RPC error body). */
+class InjectedHttpStatus extends Error {
+  constructor(public status: number, message: string) {
     super(message);
   }
 }

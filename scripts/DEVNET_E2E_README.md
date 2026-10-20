@@ -21,10 +21,10 @@ Optional env:
 
 ## Stages
 1. Simulate BUY with `sigVerify:false, replaceRecentBlockhash:true` (PumpCurveService LIVE state, calculateBuyQuote, txBuilder).
-2. (a) BUY (scaled, see above) through the real ExecutionCoordinator: sent through the RPC transport, CONFIRMED, db tokenQuantityRaw == on-chain ATA balance.
+2. (a) BUY (scaled, see above) through the app's `executionCoordinator` singleton (the one server.ts uses; the harness no longer builds a second coordinator): sent through the RPC transport, CONFIRMED, db tokenQuantityRaw == on-chain ATA balance.
 3. (b) close 50%. (c) close 100% (ATA closed, about 0.00203928 SOL rent back). Every signature is checked with getTransaction and printed as a Solscan `?cluster=devnet` link.
-4. (d) forced revert: a buy with maxSolCost of 1 lamport, sent with skipPreflight, must land with an error.
-5. (e) a second submit with an already recorded orderId must add no transaction row.
+4. (d') forced revert through the app (`scripts/devnet_e2e_steps.ts`): after the 30 s per-mint cooldown from (a), one `executionCoordinator.executeTrade` buy runs with `PumpCurveService.calculateBuyQuote` wrapped by the harness so the quote's `maxInputLamports` (the max-SOL-in bound the pump buy enforces) is 1 lamport; the wrapper is restored right after. The app signs and sends it and the program rejects it (pump error 6002 on localnet). Pass: lifecycle REVERTED, the signature failed on chain, a REVERTED BUY transaction row, no position, and an immediate second buy refused with `Cooling down after recent execution failure (Ns remaining)` (the 15 s `cooldownAfterFailedTradeMs`) adding no row.
+5. (e') after that cooldown, two sequential `executeTrade` buys of the same mint: the first CONFIRMED, the second refused before anything is sent (`POSITION_ALREADY_OPEN`), exactly one open position; the harness then closes it so (f) starts flat.
 6. (f) a child process is killed right after `sendRawTransaction` returns; a second process on the same scratch DB runs startupReconciliation and must find the position.
 
 ## Notes

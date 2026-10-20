@@ -10,7 +10,7 @@ fs.mkdirSync(OUT, { recursive: true });
 const PORT = 3188, PW = 'visualtest-pw-123456';
 const widths = (process.env.WIDTHS || '1280,1440,1920').split(',').map(Number);
 const dbp = '/tmp/apex-visual-r3.db'; for (const s of ['', '-shm', '-wal']) try { fs.unlinkSync(dbp + s); } catch {}
-const env = { PATH: process.env.PATH, HOME: process.env.HOME, NODE_ENV: 'production', APP_PORT: String(PORT), OPERATOR_PASSWORD: PW, APEX_ENV_FILE: '', TEST_DB_PATH: dbp, APEX_DB_PATH: dbp };
+const env = { PATH: process.env.PATH, HOME: process.env.HOME, NODE_ENV: 'production', APP_PORT: String(PORT), OPERATOR_PASSWORD: PW, APEX_ENV_FILE: '', TEST_DB_PATH: dbp, APEX_DB_PATH: dbp, SIGNER_KEYPAIR_PATH: '/tmp/apex-visual-no-keypair.json' }; // N-53: never the repo keypair
 // A server already on this port would answer instead of the one started below (old code, old data): refuse to run.
 if (require('child_process').spawnSync('bash', ['-c', `exec 3<>/dev/tcp/127.0.0.1/${PORT}`], { stdio: 'ignore' }).status === 0) { console.error(`FAIL: something is already listening on port ${PORT}; stop it first (pkill -f serve_fixture)`); process.exit(1); }
 const srv = process.env.FIXTURE ? spawn('npx', ['tsx', 'scripts/visual/serve_fixture.ts'], { cwd: process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'], detached: true }) : spawn(process.execPath, ['dist/server.cjs'], { cwd: process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'], detached: true });

@@ -212,6 +212,7 @@ async function main() {
   // P1.2: the module's own singleton, the one server.ts uses. A second `new ExecutionCoordinator(true)` here ran a second exit loop on the
   // same DB and signer (N-55).
   const { executionCoordinator: coordinator } = await import('../server/execution/coordinator');
+  const { localSigner } = await import('../server/solana/signer');
   const { workstationDb } = await import('../server/db/database');
   const { riskEngine } = await import('../server/risk/riskEngine');
   // server.ts starts the SOL/USD price service at boot (a LIVE buy needs a fresh price for the liquidity gate); this script does not run server.ts.
@@ -235,6 +236,12 @@ async function main() {
   coordinator.start(); // P1.1: the singleton starts nothing at import; this takes the DB and signer locks and starts the connection check, reconciliation and exit loop
   await sleep(4000); // let the background connection/reconciliation settle
   await coordinator.syncRealWalletBalance();
+  // R1-121: arm only when the app's signer is the throwaway key generated above, never a key that came from the shell or an env file.
+  const signerKey = localSigner.getStatus() === 'READY' ? localSigner.getPublicKey().toBase58() : localSigner.getStatus();
+  if (signerKey !== kp.publicKey.toBase58()) {
+    rec('signer is the throwaway key', false, `the app's signer is ${signerKey}, not the throwaway ${kp.publicKey.toBase58()}; not arming`);
+    return finish();
+  }
   const armed = coordinator.armLiveTrading(true, 'CONFIRM_LIVE_TRADING_RISK');
   rec('arm LIVE (devnet)', armed.success, armed.message);
   if (!armed.success) return finish();

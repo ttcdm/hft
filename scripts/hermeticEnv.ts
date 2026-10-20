@@ -1,10 +1,16 @@
 /**
- * Import this FIRST in any script that signs or spawns the server. It names an empty env file, so `server/loadEnv` loads no
- * `.env` at all: a script can never pick up the real wallet key, RPC URL or API keys by accident. Pass what the script needs
- * (a throwaway key path, an RPC URL) through the process environment instead.
+ * Import this FIRST in any script that signs or spawns the server. It applies `hermeticScriptEnv` (see `scripts/scriptEnv.ts`) to
+ * process.env, so a script can never pick up the real wallet key, the live database, the RPC URL or API keys by accident: no `.env` is
+ * loaded, an exported private key or TEST_DB_PATH is dropped, and the database and key path default to scratch files. Pass what the
+ * script needs (a throwaway key path, an RPC URL) through the process environment. The process exits with code 2 if the database would
+ * be `./apex_workstation.db` or the key the repo keypair, unless APEX_SCRIPT_ALLOW_REPO_STATE=true.
  */
-if (process.env.APEX_ENV_FILE === undefined) process.env.APEX_ENV_FILE = '';
-// T9/T10: an exported private key beats SIGNER_KEYPAIR_PATH in the signer, so a script that believes it signs with its throwaway
-// keypair could sign with the shell's key. A script gets its key from SIGNER_KEYPAIR_PATH only.
-delete process.env.OPERATOR_PRIVATE_KEY;
-delete process.env.SOLANA_PRIVATE_KEY;
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { hermeticScriptEnv } from './scriptEnv';
+
+const problems = hermeticScriptEnv(process.env, process.cwd(), path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'));
+if (problems.length > 0) {
+  console.error(`hermeticEnv: refusing to run: ${problems.join('; ')}. Pass a scratch APEX_DB_PATH and a throwaway SIGNER_KEYPAIR_PATH (or set APEX_SCRIPT_ALLOW_REPO_STATE=true if you really mean it).`);
+  process.exit(2);
+}

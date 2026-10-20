@@ -48,7 +48,7 @@ import { Logger, endpointOrigin } from '../middleware/enterprise';
 import { traced } from '../observability/tracing';
 import { acquireLock, dbLockPath, isPidAlive, signerLockPath, updateHeldLock } from '../system/instanceLock';
 import crypto from 'node:crypto';
-import { allowedCluster, assertClusterAllowed, assertClusterAllowedCached, assertSendClusterAllowed, blockhashCheckEnabled, rememberGenesisCheck, resolveRpcUrl, verifyBlockhashIndependently } from '../solana/clusterGuard';
+import { allowedCluster, assertClusterAllowed, assertClusterAllowedCached, assertSendClusterAllowed, blockhashCheckEnabled, ClusterGuardError, forgetGenesisCheck, rememberGenesisCheck, resolveRpcUrl, verifyBlockhashIndependently } from '../solana/clusterGuard';
 import { PumpCurveService, TradeQuote, PumpMarketState, fetchTokenHolderDistribution } from '../solana/pumpCurve';
 import { TradeReconciler, RealMarkPriceService, PreTradeSnapshot } from './reconciliation';
 export type { PreTradeSnapshot };
@@ -325,6 +325,7 @@ export class ExecutionCoordinator {
     } catch (err: any) {
       this.clusterProblem = err?.message ?? 'cluster check failed';
       this.rpcHealth = 'DISCONNECTED';
+      forgetGenesisCheck(this.connection); // R1-1/N-27: sends must not ride an earlier pass for up to 60 s
       return false;
     }
   }
@@ -526,6 +527,7 @@ export class ExecutionCoordinator {
         commitment: 'confirmed',
         confirmTransactionInitialTimeout: 30000,
       });
+      forgetGenesisCheck(this.connection); // R1-1: a switch never keeps the old connection's pass
       await assertClusterAllowed(newConn);
       rememberGenesisCheck(newConn);
       const t0 = performance.now();
@@ -534,6 +536,7 @@ export class ExecutionCoordinator {
 
       this.rpcEndpoint = newEndpoint;
       this.connection = newConn;
+      this.clusterProblem = null; // the new connection just passed the genesis check above
       this.rpcLatencyMs = latency;
       this.rpcHealth = latency > 800 ? 'DEGRADED' : 'HEALTHY';
       this.jitoTransport = new JitoTransport(this.connection);
@@ -1537,6 +1540,8 @@ export class ExecutionCoordinator {
     // unless the RPC reports the allowed cluster's genesis hash (devnet unless Mike set ALLOWED_CLUSTER).
     try {
       traced('guard.sendCluster', () => assertSendClusterAllowed()); // mainnet is never a send target, even when the RPC reports its genesis
+      // R1-1/N-27: while the heartbeat says the RPC is not on the allowed cluster, no buy or sell is sent, whatever the send-path cache holds.
+      if (this.clusterProblem !== null) throw new ClusterGuardError(`the RPC is not trusted (${this.clusterProblem.replace(/^CLUSTER_GUARD: /, '')}); refusing to send`);
       await traced('guard.genesis', () => assertClusterAllowedCached(this.connection)); // S208: a pass is remembered per Connection for 60 s
     } catch (err: any) {
       Logger.error(`[R1] ${side} for order ${orderId} blocked: ${err.message}`);

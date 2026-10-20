@@ -90,8 +90,9 @@ function pipeLogs(child: ChildProcess, file: string): () => string {
   return () => log;
 }
 
-export async function startValidator(dir: string, env: Record<string, string> = {}): Promise<ValidatorHandle> {
-  const port = await freePortPair();
+/** `port` restarts a validator on a port a stopped one used (a new chain, with its own genesis hash, behind the same URL). */
+export async function startValidator(dir: string, env: Record<string, string> = {}, port?: number): Promise<ValidatorHandle> {
+  port ??= await freePortPair();
   const child = spawn(process.execPath, ['--import', 'tsx', 'scripts/localnet/run_validator.ts', String(port)], {
     cwd: ROOT,
     env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? dir, ...env },

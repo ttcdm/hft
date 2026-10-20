@@ -103,6 +103,7 @@ export const baseEnv = (dir: string, extra: Record<string, string>): Record<stri
   APEX_ENV_FILE: '', // never the real .env
   APEX_DB_PATH: path.join(dir, 'app.db'),
   SIGNER_KEYPAIR_PATH: throwawayKeyFile(dir),
+  APEX_LOCK_DIR: path.join(dir, 'locks'), // P1.1: the signer lock of a test server stays in its scratch folder
   OPERATOR_PASSWORD: 'behaviour-test-password',
   // S7: no test child may default to a public RPC (it is outside the vitest network guard): a closed loopback port on the local cluster.
   SOLANA_RPC_URL: 'http://127.0.0.1:9',

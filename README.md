@@ -43,6 +43,8 @@ npm start
 
 Open [http://localhost:3000](http://localhost:3000) in your browser.
 
+**One server per database and per wallet.** Every guard against selling or buying twice lives in the server's memory, so two servers on one database or one signing key would both sell the same stop-loss. The server takes a lock file next to the database (`<APEX_DB_PATH>.lock`) before anything else starts, and one per signing key in `~/.apex/locks` (`APEX_LOCK_DIR`). A second server on the same database, port or key prints `INSTANCE_LOCKED` or the listen error and exits with code 1 before it reconciles, runs the exit loop or restores the auto mode. A lock left by a process that is no longer running is taken over on the next start. For a second copy (a smoke test, a scratch run) use its own scratch folder, database and throwaway key: `npm run smoke` does this.
+
 For live development with hot reloading:
 ```bash
 npm run dev

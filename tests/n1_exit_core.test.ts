@@ -18,6 +18,7 @@ import { txBuilder } from '../server/solana/transactionBuilder';
 import { MockSolanaRpc } from './e2e/helpers/mockRpc';
 import { MockJitoEngine } from './e2e/helpers/mockJito';
 import { VALID_PUMP_MINT_1, DUMMY_FEE_RECIPIENT, createSimulatedBondingCurveState, createPassingEligibilityReport } from './e2e/helpers/simulatedStates';
+import { settleLeftoverLiveBuys } from './helpers/leftoverBuys';
 
 /**
  * P4 (critique #4): a failing stop-loss must not bleed fees. Real coordinator and SQLite; the RPC, builder and reconciler are stubbed at their edges.
@@ -47,6 +48,7 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
   };
 
   beforeEach(async () => {
+    settleLeftoverLiveBuys();
     const kp = Keypair.generate();
     mockRpc = new MockSolanaRpc();
     mockJito = new MockJitoEngine();

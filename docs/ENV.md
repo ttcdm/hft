@@ -52,7 +52,8 @@ Values are read as strings. Booleans mean the exact text `true` unless the row s
 | `JITO_MAX_RETRIES` | `2` | `server/solana/executionConfig.ts` | Bundle retries. |
 | `JITO_RETRY_INTERVAL_MS` | `1000` | `server/solana/executionConfig.ts` | Delay between bundle retries. |
 | `JITO_PROBE_INTERVAL_MS` | `15000` | `server/solana/executionConfig.ts` | Block engine health probe interval. |
-| `APEX_DB_PATH` | `apex_workstation.db` in the working directory | `server/db/database.ts` | SQLite file. Point scratch runs at a scratch path. |
+| `APEX_DB_PATH` | `apex_workstation.db` in the working directory | `server/db/dbPath.ts` | SQLite file. Point scratch runs at a scratch path. |
+| `APEX_LOCK_DIR` | `~/.apex/locks` | `server/system/instanceLock.ts` | Where the per-key signer lock (`<pubkey>.lock`) lives. One process per signing key: a second process with the same key refuses to sign. Leave unset; tests point it at a scratch folder. The database lock is always `<APEX_DB_PATH>.lock`, next to the database. |
 | `APEX_RETENTION_DAYS` | `90` | `server.ts` | Days of audit rows (risk decisions, auto decisions, journal) kept; `0` turns pruning off. |
 | `APEX_RATE_LIMIT_BURST` | `120` | `server.ts` | Rate limiter burst size for `/api` routes. |
 | `APEX_RECORD_MINT_MINUTES` | `30` (`180` read-only) | `server/backtest/recorderConfig.ts` | 1 to 1440. How long the recorder follows each launch. |
@@ -77,7 +78,7 @@ Values are read as strings. Booleans mean the exact text `true` unless the row s
 | Variable | Default | Read in | Devnet-safe value and notes |
 |---|---|---|---|
 | `APEX_ENV_FILE` | unset | `server/loadEnv.ts` | Set (even to an empty string) it replaces `.env`; an empty value loads no file. Used by smoke and localnet runs so they never read the real `.env`. |
-| `TEST_DB_PATH` | unset | `server/db/database.ts` | Test database path (`:memory:` under vitest). Takes priority over `APEX_DB_PATH`. |
+| `TEST_DB_PATH` | unset | `server/db/dbPath.ts` | Test database path (`:memory:` under vitest). Takes priority over `APEX_DB_PATH`. |
 | `VITEST` | unset | `server.ts`, `server/loadEnv.ts` | Set by the test runner; keeps the server from starting on import and switches `loadEnv` to `.env.test`. |
 | `NODE_ENV` | unset | `server.ts`, `server/middleware/enterprise.ts` | `test` keeps the server from starting on import; `production` skips the development logger setup in `startServer` and turns debug logs off unless `DEBUG_LOGS=true`. |
 | `APEX_CONTAINER` | unset | `server/middleware/auth.ts` | `true` in Docker: a generated volatile token is not printed to the logs. |

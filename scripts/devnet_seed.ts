@@ -35,6 +35,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
+import { dbLockPath, liveLockHolder, signerLockPath } from '../server/system/instanceLock';
+import { resolveDbPath } from '../server/db/dbPath';
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, ComputeBudgetProgram } from '@solana/web3.js';
 
 export const HARD_CAP_SOL = 0.45;
@@ -428,9 +431,39 @@ export interface MakeFunderOptions {
   fundSol: number;
   /** The caller states that the app's auto mode is OFF; otherwise its wallet audit reads this transfer as an unexplained drain and halts trading. */
   autoOffConfirmed: boolean;
+  /**
+   * P1.1 (N-60): the app's database. The saved auto mode is read from it (read-only) and must be OFF, and no running process may hold
+   * its instance lock or the app wallet's signer lock; the flag above alone is not trusted. null only when no app database exists.
+   */
+  appDbPath: string | null;
   log?: (m: string) => void;
   sleep?: (ms: number) => Promise<void>;
   retry?: RetryOptions;
+}
+
+/**
+ * P1.1 (N-60): refuse while the app could be trading on this wallet: a live process holds the database lock or the wallet's signer lock,
+ * or the database's saved auto mode is anything but OFF. The database is opened read-only and never written.
+ */
+export function assertAppIdle(appDbPath: string | null, walletPubkey: string): void {
+  const signerHolder = liveLockHolder(signerLockPath(walletPubkey));
+  if (signerHolder && signerHolder.pid !== process.pid) throw new SeedGuardError(`process ${signerHolder.pid} is signing with the app wallet (${signerLockPath(walletPubkey)}); stop the server first`);
+  if (appDbPath === null) return;
+  const lock = dbLockPath(appDbPath);
+  const holder = lock ? liveLockHolder(lock) : null;
+  if (holder && holder.pid !== process.pid) throw new SeedGuardError(`process ${holder.pid} holds the app database ${appDbPath}; stop the server first`);
+  if (!fs.existsSync(appDbPath)) return; // no database yet: the app has never run here, so no auto mode is saved
+  let saved: unknown = null;
+  const db = new DatabaseSync(appDbPath, { readOnly: true });
+  try {
+    const row = db.prepare(`SELECT value_json FROM app_settings WHERE key = 'auto.mode'`).get() as { value_json: string } | undefined;
+    saved = row ? JSON.parse(row.value_json) : null;
+  } catch (e: any) {
+    if (!/no such table/i.test(String(e?.message))) throw new SeedGuardError(`cannot read the saved auto mode from ${appDbPath}: ${e?.message}`);
+  } finally {
+    db.close();
+  }
+  if (saved !== null && saved !== 'OFF') throw new SeedGuardError(`the app database ${appDbPath} has auto mode ${String(saved)} saved; set auto OFF in the app first (--confirm-auto-off is not enough)`);
 }
 
 export interface MakeFunderResult { pubkey: string; file: string; fundedSol: number; signature: string }
@@ -446,6 +479,7 @@ export async function makeFunder(o: MakeFunderOptions): Promise<MakeFunderResult
   if (!Number.isFinite(o.fundSol) || o.fundSol <= 0) throw new SeedGuardError('--fund-sol must be a positive number');
   if (o.fundSol > MAX_MAKE_FUNDER_SOL) throw new SeedGuardError(`--fund-sol ${o.fundSol} is over the ${MAX_MAKE_FUNDER_SOL} SOL limit`);
   if (!o.autoOffConfirmed) throw new SeedGuardError('auto mode must be OFF while the app wallet funds a seed funder (its wallet audit would halt trading on the transfer); confirm with --confirm-auto-off once it is');
+  assertAppIdle(o.appDbPath, o.signer.publicKey.toBase58());
   if (!o.file || o.file.startsWith('--')) throw new SeedGuardError('--make-funder needs a file path');
   if (fs.existsSync(o.file)) throw new SeedGuardError(`${o.file} already exists; refusing to overwrite a key file`);
   if (trackedByGitAndNotIgnored(o.file)) throw new SeedGuardError(`${o.file} is inside a git repository and not ignored; use a path under .overnight/ (ignored) or outside the repository`);
@@ -499,7 +533,7 @@ async function main() {
       const appKp = localSigner.exportKeypair();
       if (!pub || !appKp) throw new SeedGuardError('no app wallet: set OPERATOR_PRIVATE_KEY or SIGNER_KEYPAIR_PATH in .env');
       const r = await makeFunder({
-        connection: conn, allowedGenesis: DEVNET_GENESIS_HASH, file, fundSol: Number(val('fund-sol')), autoOffConfirmed: flag('confirm-auto-off'),
+        connection: conn, allowedGenesis: DEVNET_GENESIS_HASH, file, fundSol: Number(val('fund-sol')), autoOffConfirmed: flag('confirm-auto-off'), appDbPath: resolveDbPath(),
         signer: { publicKey: pub, sign: async (tx) => { tx.partialSign(appKp); } },
       });
       console.log(r.pubkey); // only the public key; the secret stays in the file

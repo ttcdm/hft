@@ -1,4 +1,5 @@
 import './server/loadEnv'; // must stay the FIRST import: singletons built at import time read process.env
+import './server/instanceLockBoot'; // P1.1: must stay the SECOND import: a second server on the same database exits here, before any singleton exists
 import { tracingReady } from './server/observability/init'; // S209: starts OpenTelemetry tracing when APEX_TRACING=true; does nothing otherwise
 import './suppress-warnings.cjs';
 import express from 'express';
@@ -93,6 +94,13 @@ import {
 const app = express();
 // Defense in depth with the normalized auth gate: `/API/...` must not reach a route at all.
 app.set('case sensitive routing', true);
+// P1.1: the trading side (reconciliation, the exit loop, the restored auto mode) starts only after `listen` succeeds. A request that
+// arrives in the few milliseconds between the two waits for it, so nobody reads the auto mode before it is restored.
+let markBootDone: () => void = () => undefined;
+const bootDone = new Promise<void>((resolve) => { markBootDone = resolve; });
+let booted = false;
+void bootDone.then(() => { booted = true; });
+app.use((_req, _res, next) => { if (booted) next(); else void bootDone.then(() => next()); });
 // Nginx/Cloud Run listens on 8080 in container; internal Node/Vite applet must listen on port 3000
 const PORT = parseInt(
   process.env.APP_PORT || (process.env.PORT && process.env.PORT !== '8080' ? process.env.PORT : '3000'),
@@ -107,6 +115,12 @@ for (const warning of loosePermissionWarnings(findLoosePermissions(defaultSecret
   Logger.warn(warning);
 }
 const server = http.createServer(app);
+// P1.1 (N-51): a port already in use, or any other listen error, ends this process. Without this, `ws` turned EADDRINUSE into a
+// warning and a "failed" second boot kept running with no HTTP port.
+server.on('error', (err: any) => {
+  Logger.error(`[PROCESS] HTTP server error, exiting: ${err?.code || ''} ${err?.message || err}`);
+  process.exit(1);
+});
 
 // WebSocket Server for High-Performance Engine Telemetry & Orders
 const wss = new WebSocketServer({ server, path: '/ws/engine' });
@@ -1530,11 +1544,24 @@ async function startServer() {
   };
   prune();
   setInterval(prune, 86_400_000).unref();
-  await autoSnipeController.restorePersisted(); // S222: the confluence threshold, and the auto mode up to PAPER, come back after a restart
-  autoSnipeController.startMonitor(); // G3: kill-switch triggers and wallet audit (inert while the mode is OFF)
   server.listen(PORT, BIND_HOST, () => {
     console.log(`[APEX QUANT HFT] Autonomous Execution Engine running on ${BIND_HOST}:${PORT}`);
+    void startTrading();
   });
+}
+
+/** P1.1: runs once the port is ours. A second instance never gets here: the database lock or the listen error ended it first. */
+async function startTrading() {
+  try {
+    executionCoordinator.start(); // takes the signer lock, then reconciliation, the exit loop and the feed heartbeat
+    await autoSnipeController.restorePersisted(); // S222: the confluence threshold, and the auto mode up to PAPER, come back after a restart
+    autoSnipeController.startMonitor(); // G3: kill-switch triggers and wallet audit (inert while the mode is OFF)
+  } catch (err: any) {
+    Logger.error(`[PROCESS] trading start refused, exiting: ${err?.message || err}`);
+    process.exit(1);
+  } finally {
+    markBootDone();
+  }
 }
 
 if (process.env.NODE_ENV !== 'test' && !process.env.VITEST) {

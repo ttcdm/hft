@@ -41,11 +41,13 @@ import { SolanaRpcTransport, JitoTransport } from '../solana/transports';
 import { riskEngine, estimateRoundTripCostLamports, MAX_ROUND_TRIP_COST_FRACTION, PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS } from '../risk/riskEngine';
 import { userVolumeAccumulatorPda } from '@pump-fun/pump-sdk';
 import { paperEngine, PaperExecutionEngine } from './paperEngine';
-import { workstationDb } from '../db/database';
+import { workstationDb, type PersistedTransaction } from '../db/database';
 import { getRandomJitoTipAccount, TOKEN_2022_PROGRAM_ID } from '../solana/programs';
 import { executionConfig } from '../solana/executionConfig';
 import { Logger, endpointOrigin } from '../middleware/enterprise';
 import { traced } from '../observability/tracing';
+import { acquireLock, dbLockPath, isPidAlive, signerLockPath, updateHeldLock } from '../system/instanceLock';
+import crypto from 'node:crypto';
 import { allowedCluster, assertClusterAllowed, assertClusterAllowedCached, assertSendClusterAllowed, blockhashCheckEnabled, rememberGenesisCheck, resolveRpcUrl, verifyBlockhashIndependently } from '../solana/clusterGuard';
 import { PumpCurveService, TradeQuote, PumpMarketState, fetchTokenHolderDistribution } from '../solana/pumpCurve';
 import { TradeReconciler, RealMarkPriceService, PreTradeSnapshot } from './reconciliation';
@@ -97,6 +99,10 @@ export interface ExecutionResponse {
 // A blockhash lives ~60-90s; after this a sent-but-unseen sell can no longer land.
 const PENDING_SELL_WINDOW_MS = 100_000;
 const ORPHAN_MAX_AGE_MS = 15 * 60_000;
+/** P1.1: a sell claim older than this is stale (longer than a sell takes end to end: build, send, confirm, reconcile). */
+const EXIT_CLAIM_STALE_MS = 2 * PENDING_SELL_WINDOW_MS;
+/** P1.1: a claim `<pid>:<nonce>` whose process has died is stale at once (a crash mid-sell must not hold the stop-loss off). */
+const exitClaimOwnerAlive = (owner: string): boolean => isPidAlive(Number(owner.split(':')[0]));
 
 /** A balance found in the wallet that this app never bought (cost basis unknown): watched with a hard stop, not a trade the app chose. */
 export const isRecoveredPosition = (p: { entryTxSignature?: string }): boolean => !!p.entryTxSignature?.startsWith('RECOVERED:');
@@ -172,9 +178,41 @@ export class ExecutionCoordinator {
         this.raiseOperatorAlert('TRADING_HALTED', `All trading is halted (restored after a restart): ${persisted}. Protective exits (stop-loss, trailing stop, manual close, panic) still run; clear it with POST /api/auto/resume {clearHalt:true}.`);
       }
     }
+    // P1.1 (N-51): the module singleton is built at import time and starts nothing; server.ts calls start() once its port is bound,
+    // so a second process that fails to boot never reconciles, runs the exit loop or polls the RPC. Instances built directly (tests,
+    // tools that pass their own Connection) start at once, as before.
+    if (!this.isDefaultSingleton) this.start();
+  }
+
+  private started = false;
+
+  /**
+   * P1.1: begin trading-side work: the instance locks (database file and signing key), the RPC connection check with startup
+   * reconciliation, the 3 s exit loop and the feed heartbeat. Idempotent. Throws InstanceLockError when another live process holds
+   * either lock, before anything has started.
+   */
+  public start(): void {
+    if (this.started) return;
+    const dbLock = dbLockPath(workstationDb.getDbPath());
+    if (dbLock) acquireLock(dbLock, { dbPath: workstationDb.getDbPath() });
+    let pub: string | null;
+    try {
+      pub = localSigner.getStatus() === 'READY' ? localSigner.getPublicKey().toBase58() : null;
+    } catch {
+      pub = null; // no key to lock; signTransaction takes the signer lock on the first signature anyway
+    }
+    if (pub) {
+      acquireLock(signerLockPath(pub), { walletPubkey: pub, dbPath: workstationDb.getDbPath() });
+      if (dbLock) updateHeldLock(dbLock, { walletPubkey: pub });
+    }
+    this.started = true;
     this.initializeConnection();
     this.startAutoPositionMonitor();
     this.startMarketFeedHeartbeat();
+  }
+
+  public isStarted(): boolean {
+    return this.started;
   }
 
   private startMarketFeedHeartbeat() {
@@ -1402,7 +1440,7 @@ export class ExecutionCoordinator {
     if (already) return already;
     const preSignature = this.signatureOf(params.tx);
     if (preSignature) {
-      workstationDb.saveTransaction({
+      const pendingRow: PersistedTransaction = {
         signature: preSignature,
         orderId: params.orderId,
         correlationId: params.correlationId,
@@ -1415,7 +1453,23 @@ export class ExecutionCoordinator {
         networkFeeLamports: 5000,
         jitoTipLamports: params.jitoTipLamports,
         executionMode: 'LIVE',
-      });
+      };
+      if (params.side === 'BUY') {
+        // P1.1 (N-57): the check for another unresolved buy of this mint and this row are one database transaction, so a second process
+        // (or a second coordinator) buying the same mint at the same moment is refused here, before anything is sent.
+        let recorded: boolean;
+        try {
+          recorded = workstationDb.savePendingBuyIfNoneUnresolved(pendingRow);
+        } catch (err: any) {
+          return { success: false, signature: '', transport: 'SOLANA_RPC', error: `PENDING_WRITE_FAILED: ${err.message}; nothing was sent`, lifecycleState: 'SUBMIT_FAILED' };
+        }
+        if (!recorded) {
+          workstationDb.logJournal('TRADE_REJECTED_UNRESOLVED_BUY', params.correlationId, 'LIVE', { mint: params.mint, orderId: params.orderId, at: 'submit' });
+          return { success: false, signature: '', transport: 'SOLANA_RPC', error: `UNRESOLVED_BUY: another buy of ${params.mint} was sent and is not reconciled yet; nothing was sent`, lifecycleState: 'SUBMIT_FAILED' };
+        }
+      } else {
+        workstationDb.saveTransaction(pendingRow);
+      }
     }
     const res = await this.submitAndConfirmInner(params);
     if (preSignature && !res.success && !res.unconfirmed) {
@@ -2878,6 +2932,8 @@ export class ExecutionCoordinator {
       return { success: false, pnlSol: 0, error: 'EXIT_IN_PROGRESS: An exit transaction for this position is already in progress.' };
     }
     this.inFlightPositionExits.add(positionId);
+    let claimed = false;
+    const exitClaimOwner = `${process.pid}:${crypto.randomUUID()}`;
 
     try {
       const positions = workstationDb.loadPositions();
@@ -2951,6 +3007,13 @@ export class ExecutionCoordinator {
     if (localSigner.getStatus() !== 'READY') {
       return { success: false, pnlSol: 0, error: 'Signer is not configured or locked' };
     }
+
+    // P1.1 (N-52): inFlightPositionExits guards this coordinator only. The claim in the database stops a second coordinator or a second
+    // process from selling the same position at the same time (both would sell a take-profit partial or a stop-loss). Cleared in finally.
+    if (!workstationDb.claimExit(positionId, exitClaimOwner, Date.now(), Date.now() - EXIT_CLAIM_STALE_MS, exitClaimOwnerAlive)) {
+      return { success: false, pnlSol: 0, error: 'EXIT_IN_PROGRESS: another process or coordinator is selling this position.' };
+    }
+    claimed = true;
 
     const seller = localSigner.getPublicKey();
     const mintPubkey = new PublicKey(target.mint);
@@ -3222,22 +3285,26 @@ export class ExecutionCoordinator {
         return { success: false, pnlSol: 0, error: sellRecon.error };
       }
 
-      target.realizedPnLSol += Number(sellRecon.actualRealizedPnLSol.toFixed(6));
-      target.exitReason = reason;
-      target.exitTxSignature = subRes.signature;
-      target.lastUpdatedTimestamp = Date.now();
+      // P1.1 (N-52): book the fill on the row as it is NOW, not on `target`, which was loaded before several awaits (marks and exit
+      // state written meanwhile would be undone, and the realized delta would be computed against a stale copy).
+      const filled = workstationDb.loadPositions().find((p) => p.id === positionId) ?? target;
+      filled.realizedPnLSol = (filled.realizedPnLSol ?? 0) + Number(sellRecon.actualRealizedPnLSol.toFixed(6));
+      filled.exitReason = reason;
+      filled.exitTxSignature = subRes.signature;
+      filled.lastUpdatedTimestamp = Date.now();
 
       if (sellRecon.isFullyClosed || safeSellPct >= 100) {
-        target.status = 'CLOSED';
-        target.tokenQuantityRaw = '0';
-        target.costBasisLamports = 0;
+        filled.status = 'CLOSED';
+        filled.tokenQuantityRaw = '0';
+        filled.costBasisLamports = 0;
       } else {
-        target.status = 'PARTIALLY_CLOSED';
-        target.tokenQuantityRaw = sellRecon.remainingTokensRaw;
-        target.costBasisLamports = Math.round(target.costBasisLamports * (1 - fraction));
+        filled.status = 'PARTIALLY_CLOSED';
+        filled.tokenQuantityRaw = sellRecon.remainingTokensRaw;
+        filled.costBasisLamports = Math.round(filled.costBasisLamports * (1 - fraction));
       }
+      target.status = filled.status;
 
-      workstationDb.savePosition(target);
+      workstationDb.savePosition(filled);
       workstationDb.markTransactionReconciled(subRes.signature, { slot: sellRecon.slot, networkFeeLamports: sellRecon.actualNetworkFeeLamports });
       await this.syncRealWalletBalance();
 
@@ -3250,6 +3317,7 @@ export class ExecutionCoordinator {
     } catch (err: any) {
       return { success: false, pnlSol: 0, error: err.message };
     } finally {
+      if (claimed) workstationDb.releaseExitClaim(positionId, exitClaimOwner);
       this.inFlightPositionExits.delete(positionId);
     }
   }

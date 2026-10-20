@@ -6,6 +6,7 @@ import { txBuilder } from '../server/solana/transactionBuilder';
 import { MockSolanaRpc } from './e2e/helpers/mockRpc';
 import { MockJitoEngine } from './e2e/helpers/mockJito';
 import { TOKEN_PROGRAM_ID } from '../server/solana/programs';
+import { settleLeftoverLiveBuys } from './helpers/leftoverBuys';
 
 function dummyTx(payer: PublicKey, blockhash = PublicKey.default.toBase58()): VersionedTransaction {
   const msg = new TransactionMessage({
@@ -27,6 +28,7 @@ describe('K4 #5 and #6: landed inference and blockhash expiry', () => {
   const snap = () => ({ timestamp: Date.now(), walletSolLamports: 1_000_000_000, tokenBalanceRaw: '0', tokenDecimals: 6, slot: 1 } as any);
 
   beforeEach(async () => {
+    settleLeftoverLiveBuys();
     mockRpc = new MockSolanaRpc();
     mockJito = new MockJitoEngine();
     await mockJito.start();

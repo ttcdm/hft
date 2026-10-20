@@ -21,7 +21,7 @@ function fakeChain(opts: { genesis?: string; balanceLamports?: number } = {}) {
 }
 const app = Keypair.generate();
 const signer = { publicKey: app.publicKey, sign: async (tx: Transaction) => { tx.partialSign(app); } };
-const base = (file: string, over: Record<string, unknown> = {}) => ({ signer, allowedGenesis: DEVNET_GENESIS_HASH, file, fundSol: 0.2, autoOffConfirmed: true, sleep: async () => undefined, ...over });
+const base = (file: string, over: Record<string, unknown> = {}) => ({ signer, allowedGenesis: DEVNET_GENESIS_HASH, file, fundSol: 0.2, autoOffConfirmed: true, appDbPath: null, sleep: async () => undefined, ...over });
 
 describe('S29: devnet_seed --make-funder', () => {
   it('writes a 0600 key in a 0700 directory, sends exactly the amount to its public key, and returns only the public key', async () => {

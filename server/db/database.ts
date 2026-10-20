@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import path from 'path';
+import { resolveDbPath } from './dbPath';
 import { NormalizedPosition, ExecutionMode } from '../core/types';
 import { Logger } from '../middleware/enterprise';
 
@@ -48,7 +48,7 @@ export class WorkstationDatabase {
   private dbPath: string;
 
   constructor(customDbPath?: string) {
-    this.dbPath = customDbPath || process.env.TEST_DB_PATH || process.env.APEX_DB_PATH || path.join(process.cwd(), 'apex_workstation.db');
+    this.dbPath = resolveDbPath(customDbPath);
     this.db = new DatabaseSync(this.dbPath);
     this.db.exec('PRAGMA busy_timeout = 10000;');
     this.db.exec('PRAGMA journal_mode = WAL;');
@@ -218,6 +218,8 @@ export class WorkstationDatabase {
     this.ensureColumn('positions', 'trailing_stop_sol', 'REAL DEFAULT 0.0');
     this.ensureColumn('positions', 'exit_stage', 'INTEGER DEFAULT 0');
     this.ensureColumn('positions', 'record_updated_at', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('positions', 'exit_claim', 'TEXT'); // P1.1: which process is selling this position (claimExit)
+    this.ensureColumn('positions', 'exit_claim_at', 'INTEGER');
 
     // Rows that carry realized PnL from before realized_events existed: one event at their updated_at, which is what the daily figure used.
     try {
@@ -550,6 +552,52 @@ export class WorkstationDatabase {
   }
 
   /** A LIVE buy of this mint was sent and not yet resolved (PENDING or RECONCILIATION_REQUIRED): it may still become a position. */
+  /**
+   * P1.1 (N-52): claim the right to sell a position, across processes. `owner` is `<pid>:<nonce>`. Succeeds when the row has no claim,
+   * the claim is older than `staleBeforeTs`, or the claiming process is dead. Returns false while another live claim stands (another
+   * process, or another coordinator in this process, is selling it). The caller clears its claim in a `finally` (releaseExitClaim).
+   */
+  public claimExit(positionId: string, owner: string, now: number, staleBeforeTs: number, isOwnerAlive: (owner: string) => boolean): boolean {
+    const tryClaim = (extra: string, ...args: Array<string | number>) => Number((this.db
+      .prepare(`UPDATE positions SET exit_claim = ?, exit_claim_at = ? WHERE id = ? AND (${extra})`)
+      .run(owner, now, positionId, ...args) as any).changes) > 0;
+    if (tryClaim('exit_claim IS NULL OR exit_claim_at IS NULL OR exit_claim_at < ?', staleBeforeTs)) return true;
+    const row = this.db.prepare('SELECT exit_claim AS c FROM positions WHERE id = ?').get(positionId) as { c: string | null } | undefined;
+    if (!row?.c || isOwnerAlive(row.c)) return false;
+    return tryClaim('exit_claim = ?', row.c); // the holder died mid-sell: take it, unless someone else just did
+  }
+
+  public releaseExitClaim(positionId: string, owner: string): void {
+    try {
+      this.db.prepare('UPDATE positions SET exit_claim = NULL, exit_claim_at = NULL WHERE id = ? AND exit_claim = ?').run(positionId, owner);
+    } catch (err: any) {
+      Logger.error(`Failed to release the exit claim on ${positionId}: ${err.message}`);
+    }
+  }
+
+  /**
+   * P1.1 (N-57): write the PENDING row of a LIVE BUY only if no other unresolved LIVE BUY of that mint exists, in one BEGIN IMMEDIATE
+   * transaction so two processes cannot both pass the check. False: another buy of the mint is unresolved (nothing written).
+   */
+  public savePendingBuyIfNoneUnresolved(tx: PersistedTransaction): boolean {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const other = this.db
+        .prepare(`SELECT 1 FROM transactions WHERE mint = ? AND direction = 'BUY' AND execution_mode = 'LIVE' AND reconciliation_state IN ('PENDING', 'RECONCILIATION_REQUIRED') AND order_id != ? LIMIT 1`)
+        .get(tx.mint, tx.orderId);
+      if (other) {
+        this.db.exec('ROLLBACK');
+        return false;
+      }
+      if (!this.saveTransaction(tx)) throw new Error(`could not record the PENDING buy ${tx.signature}`);
+      this.db.exec('COMMIT');
+      return true;
+    } catch (err) {
+      try { this.db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+      throw err;
+    }
+  }
+
   public hasUnresolvedLiveBuy(mint: string): boolean {
     try {
       const row = this.db

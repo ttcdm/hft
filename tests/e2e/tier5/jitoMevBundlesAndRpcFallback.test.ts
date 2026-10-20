@@ -10,6 +10,7 @@ import { MockSolanaRpc } from '../helpers/mockRpc';
 import { MockJitoEngine } from '../helpers/mockJito';
 import { TestDatabase } from '../helpers/testDb';
 import { VALID_PUMP_MINT_1, DUMMY_FEE_RECIPIENT, DUMMY_BUYBACK_FEE_RECIPIENT } from '../helpers/simulatedStates';
+import { settleLeftoverLiveBuys } from '../../helpers/leftoverBuys';
 
 describe('Tier 5 [mock-level]: Jito MEV Bundles, Tip Policies & Zero-Double-Fill RPC Fallback', () => {
   let mockRpc: MockSolanaRpc;
@@ -20,6 +21,7 @@ describe('Tier 5 [mock-level]: Jito MEV Bundles, Tip Policies & Zero-Double-Fill
   let sampleV0Tx: VersionedTransaction;
 
   beforeEach(async () => {
+    settleLeftoverLiveBuys();
     testKeypair = Keypair.generate();
     mockRpc = new MockSolanaRpc();
     mockJito = new MockJitoEngine();

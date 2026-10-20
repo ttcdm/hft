@@ -1,9 +1,12 @@
 import { defineConfig } from 'vitest/config';
 import path from 'path';
+import os from 'os';
 
 // Force hermetic test execution: isolate database and keys unconditionally
 process.env.TEST_DB_PATH = ':memory:';
 process.env.SIGNER_KEYPAIR_PATH = path.resolve(__dirname, '.nonexistent_test_keypair.json');
+// P1.1: signer locks taken by tests go to a scratch folder, never ~/.apex/locks
+process.env.APEX_LOCK_DIR = path.join(os.tmpdir(), 'apex-vitest-locks');
 delete process.env.OPERATOR_PRIVATE_KEY;
 delete process.env.SOLANA_PRIVATE_KEY;
 
@@ -12,6 +15,7 @@ export default defineConfig({
     env: {
       TEST_DB_PATH: ':memory:',
       SIGNER_KEYPAIR_PATH: path.resolve(__dirname, '.nonexistent_test_keypair.json'),
+      APEX_LOCK_DIR: path.join(os.tmpdir(), 'apex-vitest-locks'),
       OPERATOR_PRIVATE_KEY: '',
       SOLANA_PRIVATE_KEY: '',
       JITO_BLOCK_ENGINE_URL: 'http://127.0.0.1:9',

@@ -169,15 +169,15 @@ async function main() {
     const keyFile = path.join(scratch, 'funder-dir', 'seed-funder.json');
     const appBefore = await conn.getBalance(appKp.publicKey);
     let refusedWrong = false;
-    try { await makeFunder({ connection: conn, signer: appSigner, allowedGenesis: 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG', file: keyFile, fundSol: 0.2, autoOffConfirmed: true }); } catch { refusedWrong = true; }
+    try { await makeFunder({ connection: conn, signer: appSigner, allowedGenesis: 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG', file: keyFile, fundSol: 0.2, autoOffConfirmed: true, appDbPath: process.env.APEX_DB_PATH! }); } catch { refusedWrong = true; }
     rec('make-funder refuses a different genesis: no key written, nothing sent', refusedWrong && !fs.existsSync(keyFile) && (await conn.getBalance(appKp.publicKey)) === appBefore, 'refused');
-    const made = await makeFunder({ connection: conn, signer: appSigner, allowedGenesis: info.genesisHash, file: keyFile, fundSol: 0.2, autoOffConfirmed: true, sleep: async () => undefined });
+    const made = await makeFunder({ connection: conn, signer: appSigner, allowedGenesis: info.genesisHash, file: keyFile, fundSol: 0.2, autoOffConfirmed: true, appDbPath: process.env.APEX_DB_PATH!, sleep: async () => undefined });
     const fundedLamports = await conn.getBalance(new PublicKey(made.pubkey));
     const appAfter = await conn.getBalance(appKp.publicKey);
     rec('make-funder: the new wallet holds exactly the amount; the app wallet paid it plus one fee', fundedLamports === 200_000_000 && appBefore - appAfter === 200_000_000 + 5000, `funder ${fundedLamports} lamports, app paid ${appBefore - appAfter}`);
     rec('make-funder: key file 0600 in a 0700 directory, matches the printed public key', (fs.statSync(keyFile).mode & 0o777) === 0o600 && (fs.statSync(path.dirname(keyFile)).mode & 0o777) === 0o700 && loadFunderKeypair(keyFile).publicKey.toBase58() === made.pubkey, made.pubkey.slice(0, 6) + '...');
     let overCap = false;
-    try { await makeFunder({ connection: conn, signer: appSigner, allowedGenesis: info.genesisHash, file: path.join(scratch, 'funder-dir', 'over.json'), fundSol: MAX_MAKE_FUNDER_SOL + 0.01, autoOffConfirmed: true }); } catch { overCap = true; }
+    try { await makeFunder({ connection: conn, signer: appSigner, allowedGenesis: info.genesisHash, file: path.join(scratch, 'funder-dir', 'over.json'), fundSol: MAX_MAKE_FUNDER_SOL + 0.01, autoOffConfirmed: true, appDbPath: process.env.APEX_DB_PATH! }); } catch { overCap = true; }
     rec('make-funder refuses more than the cap', overCap && !fs.existsSync(path.join(scratch, 'funder-dir', 'over.json')), `cap ${MAX_MAKE_FUNDER_SOL} SOL`);
     const fk = loadFunderKeypair(keyFile);
     const appMid = await conn.getBalance(appKp.publicKey);

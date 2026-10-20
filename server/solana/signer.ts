@@ -7,6 +7,7 @@ import { parseSecretKey } from './parseSecretKey';
 import crypto from 'crypto';
 import { SignerStatus } from '../core/types';
 import { Logger } from '../middleware/enterprise';
+import { acquireLock, signerLockPath } from '../system/instanceLock';
 
 export interface TransactionSigner {
   getPublicKey(): PublicKey;
@@ -191,6 +192,10 @@ export class LocalKeypairSigner implements TransactionSigner {
     if (!this.keypair || this.status !== 'READY') {
       throw new Error('Local signer is not ready to sign transactions');
     }
+    // P1.1 (N-52, N-57): one process per signing key. The first signature takes `<APEX_LOCK_DIR>/<pubkey>.lock` (re-entrant for this
+    // process); another live process holding it makes this throw INSTANCE_LOCKED before anything is signed.
+    const pub = this.keypair.publicKey.toBase58();
+    acquireLock(signerLockPath(pub), { walletPubkey: pub });
     transaction.sign([this.keypair]);
     return transaction;
   }

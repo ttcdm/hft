@@ -15,6 +15,7 @@ import { evaluateKillTriggers, auditWalletChange, type KillTrigger } from './kil
 import { riskEngine } from '../risk/riskEngine';
 import { watchWindow, type WatchResult } from '../signals/watchWindow';
 import { checkConfluenceThreshold, getConfluenceThreshold, setConfluenceThreshold, confluenceThresholdInfo, type ConfluenceThresholdInfo } from '../signals/confluenceThreshold';
+import { dbLockPath, liveLockHolder } from '../system/instanceLock';
 
 /**
  * G1: the only owner of auto trading.
@@ -312,6 +313,15 @@ export class AutoSnipeController extends EventEmitter {
       if (c.ok) { setConfluenceThreshold(c.value); threshold = c.value; } else Logger.warn(`[AUTO] saved confluence threshold ignored: ${c.reason}`);
     }
     let note: string | null = null;
+    // P1.1 (N-59): another live process owns this database. Restoring here would start a second session on it and rewrite the mode that
+    // process saved, out of reach of its kill switch. The instance lock normally stops a second server before this; this is the backstop.
+    const lock = dbLockPath(workstationDb.getDbPath());
+    const holder = lock ? liveLockHolder(lock) : null;
+    if (holder && holder.pid !== process.pid) {
+      note = `restart: auto mode not restored: process ${holder.pid} holds ${lock}; auto stays OFF and the saved mode is left as it is`;
+      Logger.warn(`[AUTO] ${note}`);
+      return { threshold, mode: this.mode, note };
+    }
     const saved = workstationDb.getSetting<unknown>(SETTING_MODE);
     if (saved === 'PAPER' || saved === 'SHADOW' || saved === 'DEVNET_LIVE') {
       const target: AutoMode = saved === 'DEVNET_LIVE' ? 'SHADOW' : saved;

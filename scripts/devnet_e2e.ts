@@ -232,7 +232,8 @@ async function main() {
       process.exit(137);
     } as any;
   }
-  await sleep(4000); // let the constructor's background connection/reconciliation settle
+  coordinator.start(); // P1.1: the singleton starts nothing at import; this takes the DB and signer locks and starts the connection check, reconciliation and exit loop
+  await sleep(4000); // let the background connection/reconciliation settle
   await coordinator.syncRealWalletBalance();
   const armed = coordinator.armLiveTrading(true, 'CONFIRM_LIVE_TRADING_RISK');
   rec('arm LIVE (devnet)', armed.success, armed.message);

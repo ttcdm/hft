@@ -1,6 +1,6 @@
 # Operator runbook: emergency procedures
 
-What to do when something goes wrong, and what each control does in the code today, including where it does less than you would expect. **Devnet and localnet only**, on a throwaway devnet key funded from the faucet (`KNOWN_RISKS.md` 4.1). Explorer links, if you use one, must carry `?cluster=devnet`. Run one server per database and per wallet.
+What to do when something goes wrong, and what each control does in the code today, including where it does less than you would expect. **Devnet and localnet only**, on a throwaway devnet key funded from the faucet (`KNOWN_RISKS.md` 4.1). Explorer links, if you use one, must carry `?cluster=devnet`. Run one server per database and per wallet: a second server on the same database, port or signing key prints `INSTANCE_LOCKED` (or the listen error) and exits with code 1 before it trades (README, "One server per database and per wallet").
 
 ## 0. Setup for every procedure
 

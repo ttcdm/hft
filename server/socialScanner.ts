@@ -1,6 +1,7 @@
 import { PublicKey } from '@solana/web3.js';
 import { SocialSignal, SocialSource, AuthorTier, SignalPattern } from '../src/types';
 import { memecoinAggregator } from './memecoinAggregator';
+import { emergencyStop, type EmergencyStopReport } from './execution/emergencyStop';
 
 export interface TelegramConnectionTestResult {
   reachable: boolean;
@@ -270,10 +271,6 @@ export class SocialAlphaScanner {
   }
 
   // Handle simulated or real incoming Telegram Bot commands
-  private panicHook: (() => Promise<void>) | null = null;
-  /** S13: what /panic_sell does besides closing positions (kill switch, disarm, stop auto). Set by server.ts, so this file imports none of it. */
-  public setPanicHook(fn: (() => Promise<void>) | null): void { this.panicHook = fn; }
-
   public async processTelegramCommand(commandText: string): Promise<{ reply: string; actionTaken?: string }> {
     const trimmed = commandText.trim();
     if (trimmed.startsWith('/start') || trimmed.startsWith('/help')) {
@@ -316,28 +313,25 @@ export class SocialAlphaScanner {
     }
 
     if (trimmed.startsWith('/panic_sell') || trimmed.startsWith('/dump_all')) {
-      // S13: like the HTTP panic, stop new entries first, so auto does not re-buy after the exits.
-      let stopNote = '';
-      try { await this.panicHook?.(); } catch (e: any) { stopNote = `\n⚠️ Could not stop new entries: ${e?.message || e}`; }
-      const positions = memecoinAggregator.getPositions();
-      if (positions.length === 0) {
-        return { reply: `⚠️ No active positions to liquidate. Kill switch on, live trading disarmed, auto stopped.${stopNote}` };
+      // P1.4 (N-11, R1-119): the same emergency stop as the HTTP panic: kill switch, auto killed (after its buy in flight), LIVE disarmed,
+      // then every ACTIVE position of every mode sold with EMERGENCY_PANIC_LIQUIDATION. It used to disarm first and then list the
+      // positions of the mode it had just switched to (PAPER), so open LIVE positions were never sold.
+      let r: EmergencyStopReport;
+      try {
+        r = await emergencyStop({ exitAll: true, reason: 'telegram panic' });
+      } catch (e: any) {
+        return { reply: `❌ EMERGENCY DUMP FAILED: ${e?.message || e}. Positions may still be open; check the workstation.`, actionTaken: 'PANIC_SELL_PARTIAL' };
       }
-      let totalRealized = 0;
-      const closedNames: string[] = [];
-      const failedNames: string[] = []; // Q23: a close that failed is reported, never counted as sold
-      for (const p of positions) {
-        const res = await memecoinAggregator.closePosition(p.id, 100).catch((e: any) => ({ success: false as const, realizedPnl: 0, message: e?.message }));
-        if (res.success) {
-          totalRealized += res.realizedPnl || 0;
-          closedNames.push(p.tokenTicker);
-        } else {
-          failedNames.push(`${p.tokenTicker}${(res as any).message ? ` (${(res as any).message})` : ''}`);
-        }
+      const stopNote = r.autoStopError || !r.autoStopped ? `\n⚠️ Could not stop auto: ${r.autoStopError || 'mode is not OFF'}${r.autoStopped ? ' (it was forced OFF)' : ''}` : '';
+      const tail = `Kill switch on, live trading disarmed, ${r.autoStopped ? 'auto stopped' : 'auto NOT confirmed stopped'}.${stopNote}`;
+      if (r.attemptedCount === 0) {
+        return { reply: `⚠️ No active positions to liquidate. ${tail}` };
       }
+      const failedNames = r.failed.map((f) => `${f.symbol} (${f.error})`); // Q23: a close that failed is reported, never counted as sold
       const head = failedNames.length === 0 ? '🚨 EMERGENCY DUMP COMPLETE' : `⚠️ EMERGENCY DUMP INCOMPLETE: ${failedNames.length} position(s) STILL OPEN`;
+      const pnl = r.totalRealizedPnLSol;
       return {
-        reply: `${head}:\nClosed ${closedNames.length}: ${closedNames.join(', ') || 'none'}${failedNames.length ? `\nStill open: ${failedNames.join(', ')}` : ''}\nRealized PnL of the closed: ${totalRealized >= 0 ? '+' : ''}$${totalRealized.toFixed(2)}\nKill switch on, live trading disarmed, auto stopped.${stopNote}`,
+        reply: `${head}:\nClosed ${r.succeeded.length}: ${r.succeeded.map((x) => x.symbol).join(', ') || 'none'}${failedNames.length ? `\nStill open: ${failedNames.join(', ')}` : ''}\nRealized PnL of the closed: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(6)} SOL\n${tail}`,
         actionTaken: failedNames.length === 0 ? 'PANIC_SELL_EXECUTED' : 'PANIC_SELL_PARTIAL',
       };
     }

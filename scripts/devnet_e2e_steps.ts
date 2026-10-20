@@ -10,6 +10,11 @@
  *  (e') two sequential `executeTrade` calls on one mint: the first is CONFIRMED and opens one position, the second is refused before
  *       anything is signed (POSITION_ALREADY_OPEN). The position is then closed so step (f) starts flat.
  *
+ *  (e''') P1.4: the emergency stop. One LIVE position is opened, auto is set to DEVNET_LIVE, then Telegram `/panic_sell` is driven
+ *       through the app's `processTelegramCommand` (no bot): the LIVE position must be sold on chain and auto must end OFF. Then the
+ *       kill switch is tripped (the function the kill-switch route runs), reset, and LIVE re-armed: auto must not be DEVNET_LIVE and a
+ *       candidate must be dropped as AUTO_OFF, never BOUGHT.
+ *
  * Kept apart from devnet_e2e.ts so the steps can be read on their own; they take every dependency as an argument and import nothing
  * from server/ themselves, so the harness's environment setup still runs before any server module loads.
  */
@@ -43,6 +48,19 @@ export interface HarnessSteps {
   sleep: (ms: number) => Promise<unknown>;
   /** The coordinator's own Connection: (e'') wraps its `sendRawTransaction` for one call. */
   connection?: { sendRawTransaction: (...args: any[]) => Promise<string> };
+  /** (e''') P1.4: the app's own singletons for the panic and kill-switch step. */
+  stop?: {
+    telegram: { processTelegramCommand(text: string): Promise<{ reply: string; actionTaken?: string }> };
+    /** What POST /api/execution/kill-switch {activate:true} runs. */
+    emergencyStop(opts: { exitAll: boolean; reason?: string }): Promise<{ autoStopped: boolean }>;
+    setKillSwitch(on: boolean): void;
+    arm(arm: boolean, code?: string): { success: boolean; message: string };
+    auto: {
+      setMode(mode: 'OFF' | 'SHADOW' | 'PAPER' | 'DEVNET_LIVE', opts?: { confirmationCode?: string }): Promise<{ ok: boolean; mode: string; error?: string }>;
+      getStatus(): { mode: string; killed: boolean };
+      submitCandidate(c: { mint: string; source: 'TEST'; provenance?: 'REAL_ONCHAIN' }): Promise<{ outcome: string; reason: string }>;
+    };
+  };
 }
 
 const openFor = (s: HarnessSteps) => s.db.loadPositions().filter((p) => p.mint === s.mint && p.status !== 'CLOSED');
@@ -242,5 +260,54 @@ export async function heldBlockhashStopLoss(s: HarnessSteps, holdMs = 20_000): P
       const c = await s.coordinator.closePosition(p.id, 100, 'e2e (g) cleanup');
       s.rec(`${L}: cleanup close 100%`, c.success, c.error || 'closed');
     }
+  }
+}
+
+/** (e''') P1.4. Leaves LIVE disarmed, auto OFF and nothing open. */
+export async function emergencyStopThroughApp(s: HarnessSteps): Promise<void> {
+  const L = "(e''') P1.4 emergency stop";
+  if (!s.stop) { s.rec(L, false, 'harness did not pass the stop dependencies'); return; }
+  const st = s.stop;
+  const ARM = 'CONFIRM_LIVE_TRADING_RISK';
+  const prevAuto = process.env.AUTO_SNIPE_ENABLED;
+  process.env.AUTO_SNIPE_ENABLED = 'true'; // for this step only: nothing in the harness feeds the controller candidates except the probe below
+  try {
+    await s.coordinator.syncRealWalletBalance();
+    const buy = await s.coordinator.executeTrade(await s.buildBuyRequest());
+    s.rec(`${L}: LIVE buy CONFIRMED`, buy.success && buy.lifecycleState === 'CONFIRMED', `${buy.lifecycleState} ${buy.error ?? ''} ${buy.txSignature ? s.link(buy.txSignature) : ''}`.slice(0, 300));
+    const live = await st.auto.setMode('DEVNET_LIVE', { confirmationCode: 'CONFIRM_AUTO_DEVNET' });
+    s.rec(`${L}: auto DEVNET_LIVE set`, live.ok, live.error || live.mode);
+
+    const sellsBefore = new Set(s.db.loadTransactions().filter((t) => t.direction === 'SELL').map((t) => t.signature));
+    const tg = await st.telegram.processTelegramCommand('/panic_sell');
+    s.rec(`${L}: Telegram /panic_sell reply`, tg.actionTaken === 'PANIC_SELL_EXECUTED' && /EMERGENCY DUMP COMPLETE/.test(tg.reply), tg.reply.replace(/\n/g, ' | ').slice(0, 300));
+    const sells = s.db.loadTransactions().filter((t) => t.direction === 'SELL' && t.mint === s.mint && !sellsBefore.has(t.signature));
+    const sig = sells[0]?.signature;
+    const err = sig ? await s.chainErr(sig) : undefined;
+    s.rec(`${L}: panic SELL landed on chain`, !!sig && err === null, sig ? `${s.link(sig)} err=${JSON.stringify(err)}` : 'no SELL row for the mint');
+    const open = openFor(s);
+    s.rec(`${L}: LIVE position CLOSED`, open.length === 0, JSON.stringify(open.map((p) => ({ id: p.id, status: p.status }))));
+    const a1 = st.auto.getStatus();
+    s.rec(`${L}: auto OFF and killed after the panic`, a1.mode === 'OFF' && a1.killed, `mode=${a1.mode} killed=${a1.killed}`);
+
+    // kill switch on, off, re-arm: no auto buy follows
+    st.setKillSwitch(false);
+    const rearm1 = st.arm(true, ARM);
+    const live2 = rearm1.success ? await st.auto.setMode('DEVNET_LIVE', { confirmationCode: 'CONFIRM_AUTO_DEVNET' }) : { ok: false, mode: '?', error: rearm1.message };
+    s.rec(`${L}: re-armed and DEVNET_LIVE set again`, rearm1.success && live2.ok, live2.error || live2.mode);
+    const buysBefore = s.db.loadTransactions().filter((t) => t.direction === 'BUY').length;
+    const ks = await st.emergencyStop({ exitAll: false, reason: 'devnet e2e kill switch' });
+    st.setKillSwitch(false);
+    const rearm2 = st.arm(true, ARM);
+    const a2 = st.auto.getStatus();
+    s.rec(`${L}: kill switch on, off, re-arm: auto not DEVNET_LIVE`, ks.autoStopped && rearm2.success && a2.mode !== 'DEVNET_LIVE', `autoStopped=${ks.autoStopped} rearm=${rearm2.success} mode=${a2.mode}`);
+    const d = await st.auto.submitCandidate({ mint: s.mint, source: 'TEST', provenance: 'REAL_ONCHAIN' });
+    s.rec(`${L}: a candidate is not BOUGHT`, d.outcome !== 'BOUGHT' && d.reason === 'AUTO_OFF', `${d.outcome} ${d.reason}`);
+    const buysAfter = s.db.loadTransactions().filter((t) => t.direction === 'BUY').length;
+    s.rec(`${L}: no BUY after the re-arm`, buysAfter === buysBefore && openFor(s).length === 0, `BUY rows ${buysBefore} -> ${buysAfter}; open ${openFor(s).length}`);
+  } finally {
+    st.arm(false);
+    await st.auto.setMode('OFF');
+    if (prevAuto === undefined) delete process.env.AUTO_SNIPE_ENABLED; else process.env.AUTO_SNIPE_ENABLED = prevAuto;
   }
 }

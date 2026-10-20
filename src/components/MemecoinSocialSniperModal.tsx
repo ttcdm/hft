@@ -15,6 +15,7 @@ import { signalFeedBadge } from '../utils/signalBadge';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { probeBadge, probeLatency, hostOfService } from '../utils/probeBadge';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
+import { useAutoStatus, AutoModeBadge, type AutoMode } from './AutoPanel';
 import { buildPoolSnipeRequest } from '../utils/poolSnipe';
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { SnipeAmountControl } from './SnipeAmountControl';
@@ -66,6 +67,33 @@ import { engineClient } from '../services/engineClient';
 import { hftAudio } from '../utils/audio';
 import { PumpFunHotCalloutsView } from './PumpFunHotCalloutsView';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
+
+/**
+ * P1.4 (N-12): the sniper tab's header. The auto mode shown is the auto controller's own (GET /api/auto/status), read-only: the
+ * controller is the only thing that buys automatically, from watch-window releases of pump.fun launches, and its mode is set in the
+ * Auto panel. This used to be an "Auto-Sniper ARMED/DISARMED" switch that flipped a flag only the aggregator callout loop reads, so
+ * "DISARMED" was shown while DEVNET_LIVE kept buying.
+ */
+export function SniperAutoHeader({ autoMode, halted }: { autoMode: AutoMode | null; halted?: boolean }) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#1E293B] pb-3" data-testid="sniper-auto-header">
+      <div className="flex items-center space-x-2">
+        <Bot className="w-5 h-5 text-cyan-400" />
+        <div>
+          <h3 className="text-sm font-bold text-white">Auto sniper (pump.fun watch window)</h3>
+          <p className="text-xs text-slate-400">
+            Auto buys come only from watch-window releases (HOT or READY) of new pump.fun launches on Solana, through the auto controller&apos;s gates. No Raydium, no Base, no social-signal auto trades.
+          </p>
+        </div>
+      </div>
+      <div className="flex items-center space-x-2">
+        <span className="text-xs font-mono text-slate-300">Auto mode:</span>
+        <AutoModeBadge mode={autoMode} halted={halted} />
+        <span className="text-[10px] text-slate-500 font-mono" data-testid="sniper-auto-pointer">read-only: change it in the Auto panel on the home screen</span>
+      </div>
+    </div>
+  );
+}
 
 interface MemecoinSocialSniperModalProps {
   isOpen: boolean;
@@ -129,6 +157,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const [sendPingMsg, setSendPingMsg] = useState(false);
   const [isTestingDiagnostics, setIsTestingDiagnostics] = useState(false);
   const tradingMode = useTradingMode();
+  const autoStatus = useAutoStatus(); // P1.4 (N-12): the sniper tab mirrors the auto controller's mode; it does not set it
   const [diagnosticsResult, setDiagnosticsResult] = useState<any | null>(null);
   const [showDiagnosticsModal, setShowDiagnosticsModal] = useState(false);
 
@@ -1023,35 +1052,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
             <div className="space-y-5">
               {/* AUTONOMOUS SNIPER CONFIG PANEL */}
               <div className="p-4 rounded-xl bg-[#12192C] border border-[#1E293B] space-y-4">
-                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#1E293B] pb-3">
-                  <div className="flex items-center space-x-2">
-                    <Bot className="w-5 h-5 text-cyan-400" />
-                    <div>
-                      <h3 className="text-sm font-bold text-white">Autonomous Social & MM Sniper Swarm</h3>
-                      <p className="text-xs text-slate-400">
-                        Automatically executes trades across Pump.fun, Raydium, and Base when social signals meet criteria.
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center space-x-2">
-                    <span className="text-xs font-mono text-slate-300">Auto-Sniper:</span>
-                    <button
-                      onClick={async () => {
-                        const next = !sniperConfig.isAutoSnipeEnabled;
-                        setSniperConfig({ ...sniperConfig, isAutoSnipeEnabled: next });
-                        await engineClient.updateSniperConfig({ isAutoSnipeEnabled: next });
-                      }}
-                      className={`px-3 py-1 rounded-full text-xs font-bold font-mono transition ${
-                        sniperConfig.isAutoSnipeEnabled
-                          ? 'bg-emerald-500 text-black shadow-lg shadow-emerald-500/30'
-                          : 'bg-slate-800 text-slate-400 border border-slate-700'
-                      }`}
-                    >
-                      {sniperConfig.isAutoSnipeEnabled ? 'ARMED & ACTIVE' : 'DISARMED'}
-                    </button>
-                  </div>
-                </div>
+                <SniperAutoHeader autoMode={autoStatus?.mode ?? null} halted={!!autoStatus?.haltReason} />
 
                 {/* Configuration Inputs */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono">

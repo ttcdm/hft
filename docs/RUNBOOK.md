@@ -27,11 +27,12 @@ Operator alerts live in memory only; a restart forgets them (the journal keeps t
 
 ## 1. Stop everything
 
-There are four different stops, and none of them alone stops everything.
+There are five different stops. Only stopping the process stops the exits too.
 
 | Control | Stops new buys | Stops LIVE exits | Changes auto mode | Survives a restart |
 |---|---|---|---|---|
-| Kill switch: the KILL SWITCH button, or `POST /api/execution/kill-switch` `{"activate":true}` | yes, PAPER and LIVE; also disarms LIVE | no | no | no (memory only) |
+| Kill switch: the KILL SWITCH button, or `POST /api/execution/kill-switch` `{"activate":true}` | yes, PAPER and LIVE; also disarms LIVE | no | OFF, saved once any buy in flight has finished | the switch: no (memory only); the auto OFF: yes |
+| Panic: `POST /api/wallet/panic-liquidate` (also WebSocket `PANIC_LIQUIDATE`, Telegram `/panic_sell`) | as the kill switch, then sells every active position | no | as the kill switch | as the kill switch |
 | Auto kill: `POST /api/auto/kill` `{"exitAll":false}` | auto only | no | OFF, saved once any buy in flight has finished | the OFF does |
 | Halt (set by the DEVNET_LIVE wallet audit; no operator route sets it) | yes | take-profit and stale exits only | OFF | yes (saved in the database) |
 | Stop the process | yes | yes, all of them | n/a | n/a |
@@ -43,14 +44,13 @@ Older notes name a `/api/live/disarm` route: it does not exist (404). To disarm 
 ### 1.1 Stop buying, keep protecting open positions (the normal emergency stop)
 
 ```bash
-api -X POST $APEX/api/auto/mode -d '{"mode":"OFF"}'                 # saved, so a restart comes back OFF
-api -X POST $APEX/api/execution/kill-switch -d '{"activate":true}'  # refuses every buy, disarms LIVE
+api -X POST $APEX/api/execution/kill-switch -d '{"activate":true}'  # refuses every buy, stops auto (OFF, saved), disarms LIVE
 api $APEX/api/execution/mode                                         # expect isLiveArmed: false
 api $APEX/api/execution/can-arm                                      # reasons include "Emergency risk kill switch is active"
-api $APEX/api/auto/status                                            # expect mode OFF
+api $APEX/api/auto/status                                            # expect mode OFF, killed: true
 ```
 
-Do both. The kill switch alone leaves the auto mode as it was: a DEVNET_LIVE session stays DEVNET_LIVE, and once the switch is reset and LIVE armed again it buys again without asking for `CONFIRM_AUTO_DEVNET`. The kill switch is cleared by a restart, so the saved auto OFF is what keeps auto from coming back. Exits keep running on open positions.
+The kill switch runs the shared emergency stop without the sells: kill switch on, auto killed and set OFF once a buy it already had in flight has finished, LIVE disarmed. The reply carries `autoMode`. The switch itself is cleared by a restart; the auto OFF is saved, so a restart comes back OFF. Resetting the switch (`{"activate":false}`) turns nothing back on: auto stays OFF and LIVE stays disarmed until an operator sets them again (DEVNET_LIVE needs `CONFIRM_AUTO_DEVNET` again). A DEVNET_LIVE session that sees LIVE disarmed or the kill switch on by any other route also turns itself OFF. Exits keep running on open positions.
 
 ### 1.2 Stop buying and sell everything
 
@@ -58,13 +58,11 @@ Do both. The kill switch alone leaves the auto mode as it was: a DEVNET_LIVE ses
 api -X POST $APEX/api/wallet/panic-liquidate
 ```
 
-What it does, in this order: kill switch on and LIVE disarmed; then a 100% sell of every active position of every mode, RECOVERED balances included, one at a time; then auto OFF. Because auto is stopped last, a buy auto already had in flight can still open a position after the sell list was read, so do 1.1 first if auto is running, and check the positions afterwards.
+What it does, in this order: kill switch on; auto killed (it waits for a buy auto already had in flight, so that position is sold too) and OFF; LIVE disarmed; then a 100% sell of every active position of every mode, RECOVERED balances included, one at a time, with the protective reason `EMERGENCY_PANIC_LIQUIDATION` (it runs during a halt and the dust check does not refuse it). A position whose exit was already in flight (for example a take-profit partial) is waited for, then re-read and the rest of it sold. The active positions are read once more after the loop and any new one is sold too.
 
-Read the reply: `Failed` lists the positions still open. A position whose exit was already in flight (for example a take-profit partial) comes back `EXIT_IN_PROGRESS` and is not retried; a position with a sell still being verified comes back `SELL_PENDING_VERIFICATION`. Wait a few seconds (up to 100 s for a pending sell) and run panic again until nothing fails.
+Read the reply: `Failed` lists the positions still open, for example one with a sell still being verified (`SELL_PENDING_VERIFICATION`) or one another process is selling (`EXIT_IN_PROGRESS`). Wait a few seconds (up to 100 s for a pending sell) and run panic again until nothing fails. The message also says whether auto was confirmed stopped.
 
-Do not rely on:
-- the WebSocket `PANIC_LIQUIDATE` action: it runs the same sell loop but does not stop auto;
-- Telegram `/panic_sell`: Telegram cannot deliver it (no webhook is registered with Telegram and nothing polls for updates), and when something posts it to `POST /api/telegram/webhook` with the operator token it turns the kill switch on, disarms LIVE and stops auto, but then sells PAPER positions only. Open LIVE positions are not sold.
+The WebSocket `PANIC_LIQUIDATE` action and Telegram `/panic_sell` run the same stop. Do not rely on Telegram for it: Telegram cannot deliver the command (no webhook is registered with Telegram and nothing polls for updates); it runs only when something posts it to `POST /api/telegram/webhook` with the operator token.
 
 ### 1.3 Stop all sending, exits included
 

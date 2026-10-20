@@ -346,6 +346,7 @@ export class AutoSnipeController extends EventEmitter {
 
   public getStatus(): AutoStatus {
     this.enforceBudgets();
+    this.dropDevnetLiveIfUnarmed(); // P1.4: the status never shows a DEVNET_LIVE session that can no longer trade
     let session: AutoStatus['session'] = null;
     if (this.session) {
       const pnl = this.sessionPnlSol();
@@ -480,6 +481,7 @@ export class AutoSnipeController extends EventEmitter {
     this.autoRestore = null;
     this.killed = true;
     this.killReason = opts.reason || 'operator kill';
+    this.pendingReleases.clear(); // P1.4: a release queued behind the buy in flight is not bought after a kill
     // Q29: a buy already past the gates finishes (its position exists once it does); wait for it so its position is in the owned set below
     // and is sold by exitAll. Mode OFF already stops any new candidate.
     await this.waitInflight('kill');
@@ -509,6 +511,7 @@ export class AutoSnipeController extends EventEmitter {
    */
   public async checkTriggers(now = Date.now()): Promise<KillTrigger[]> {
     if (this.mode === 'SHADOW' && this.autoRestore) { this.tryAutoRestore(now); return []; }
+    if (this.dropDevnetLiveIfUnarmed()) return [];
     if (this.mode !== 'PAPER' && this.mode !== 'DEVNET_LIVE') return [];
     const live = this.mode === 'DEVNET_LIVE';
     const execMode = live ? 'LIVE' : 'PAPER';
@@ -548,6 +551,31 @@ export class AutoSnipeController extends EventEmitter {
     Logger.warn(`[AUTO] ${reason}. Dropped ${from} -> SHADOW; exits keep running.`);
     this.emit('mode', { mode: this.mode, reason });
     return hits;
+  }
+
+  /**
+   * P1.4 (N-0): a DEVNET_LIVE session that finds the coordinator disarmed (or not LIVE) or the kill switch on turns itself OFF, for good.
+   * Re-arming LIVE later does not revive it: only setMode('DEVNET_LIVE') with the confirmation code does. Returns the reason, or null.
+   */
+  private dropDevnetLiveIfUnarmed(): string | null {
+    if (this.mode !== 'DEVNET_LIVE') return null;
+    const coordMode = executionCoordinator.getExecutionMode();
+    const armed = executionCoordinator.isLiveArmed();
+    const killSwitch = riskEngine.isKillSwitchActive();
+    if (coordMode === 'LIVE' && armed && !killSwitch) return null;
+    const reason = killSwitch
+      ? 'the kill switch is on'
+      : `the coordinator is ${coordMode} and LIVE is ${armed ? 'armed' : 'not armed'}`;
+    const note = `DEVNET_LIVE turned OFF: ${reason}. Arm LIVE and set DEVNET_LIVE again (with its confirmation code) to trade.`;
+    this.mode = 'OFF';
+    this.session = null;
+    this.autoRestore = null;
+    this.pendingReleases.clear();
+    this.downgradeReason = note;
+    workstationDb.logDecision({ autoMode: 'DEVNET_LIVE', mint: '-', stage: 'mode', outcome: 'INFO', reason: note });
+    Logger.warn(`[AUTO] ${note}`);
+    this.emit('mode', { mode: this.mode, reason: note });
+    return reason;
   }
 
   /** S189: set only while a PAPER session sits in SHADOW because of READINESS_RED; greenSince is when readiness last turned (and stayed) all green. */
@@ -738,8 +766,9 @@ export class AutoSnipeController extends EventEmitter {
     if (mode === 'PAPER' && (coordMode !== 'PAPER' || armed)) {
       return this.record(c, 'REJECTED', 'mode', `PAPER auto refused: the coordinator is ${coordMode}${armed ? ' and LIVE is armed' : ''}; PAPER auto needs the coordinator in PAPER and disarmed`);
     }
-    if (mode === 'DEVNET_LIVE' && (coordMode !== 'LIVE' || !armed)) {
-      return this.record(c, 'REJECTED', 'mode', `DEVNET_LIVE auto refused: the coordinator is ${coordMode} and LIVE is ${armed ? 'armed' : 'not armed'}; it must be LIVE and armed`);
+    if (mode === 'DEVNET_LIVE') {
+      const dropped = this.dropDevnetLiveIfUnarmed();
+      if (dropped) return this.record(c, 'REJECTED', 'mode', `DEVNET_LIVE auto refused and turned OFF: ${dropped}`, { mode: 'DEVNET_LIVE' });
     }
     if (mode === 'DEVNET_LIVE' && open.filter((p) => !isRecoveredPosition(p)).length >= DEVNET_MAX_OPEN_POSITIONS) { // R3: adopted dust does not take the slot
       return this.record(c, 'DROPPED', 'budget', `DEVNET_MAX_OPEN_POSITIONS (${DEVNET_MAX_OPEN_POSITIONS}) reached`);

@@ -1,5 +1,6 @@
 import type { Express, Request, Response } from 'express';
 import { requireOperatorAuth } from '../middleware/auth';
+import { asyncHandler } from '../middleware/asyncHandler';
 
 /**
  * Market data proxy routes (B2). When the upstream source fails, these answer 503 with { source: 'UNAVAILABLE' } and
@@ -34,7 +35,7 @@ async function upstream(url: string): Promise<any | null> {
 }
 
 export function registerMarketRoutes(app: Express) {
-  app.get('/api/market/orderbook', requireOperatorAuth, async (req, res) => {
+  app.get('/api/market/orderbook', requireOperatorAuth, asyncHandler(async (req, res) => {
     const symbol = symbolOf(req, res);
     if (!symbol) return;
     const data = await upstream(`https://api.binance.com/api/v3/depth?symbol=${symbol}&limit=20`);
@@ -55,9 +56,9 @@ export function registerMarketRoutes(app: Express) {
       asks,
       timestamp: Date.now(),
     });
-  });
+  }));
 
-  app.get('/api/market/trades', requireOperatorAuth, async (req, res) => {
+  app.get('/api/market/trades', requireOperatorAuth, asyncHandler(async (req, res) => {
     const symbol = symbolOf(req, res);
     if (!symbol) return;
     const limit = Math.min(parseInt((req.query.limit as string) || '30', 10) || 30, 100);
@@ -74,9 +75,9 @@ export function registerMarketRoutes(app: Express) {
       symbol,
     }));
     res.json({ source: 'BINANCE_LIVE_TRADES', symbol, count: mapped.length, trades: mapped.reverse() });
-  });
+  }));
 
-  app.get('/api/market/ticker', requireOperatorAuth, async (req, res) => {
+  app.get('/api/market/ticker', requireOperatorAuth, asyncHandler(async (req, res) => {
     const symbol = symbolOf(req, res);
     if (!symbol) return;
     const data = await upstream(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`);
@@ -93,5 +94,5 @@ export function registerMarketRoutes(app: Express) {
       quoteVolume24h: parseFloat(data.quoteVolume),
       timestamp: data.closeTime,
     });
-  });
+  }));
 }

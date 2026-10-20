@@ -37,6 +37,8 @@ import { buildCurveDepth } from './server/market/curveDepth';
 import { TradeTape } from './server/market/tradeTape';
 import { registerMarketRoutes } from './server/market/marketRoutes';
 import { walletTrader } from './server/walletTrader';
+import { emergencyStop } from './server/execution/emergencyStop';
+import { asyncHandler } from './server/middleware/asyncHandler';
 import { resolveRpcUrl, allowedCluster } from './server/solana/clusterGuard';
 import { liveConfirmationRefusal } from './server/execution/liveConfirmation';
 import {
@@ -186,8 +188,9 @@ wss.on('connection', (ws: WebSocket, req: any) => {
   } catch {}
 
   ws.on('message', async (msg: any) => {
+    let parsed: any;
     try {
-      const parsed = JSON.parse(msg.toString());
+      parsed = JSON.parse(msg.toString());
 
       // Operator Authentication command
       if (
@@ -292,10 +295,17 @@ wss.on('connection', (ws: WebSocket, req: any) => {
         ws.send(JSON.stringify({ type: 'POSITION_CLOSED_RESULT', data: result }));
       }
       if (parsed.action === 'PANIC_LIQUIDATE') {
-        const result = await walletTrader.panicLiquidateAll();
+        // P1.4 (N-2): the same emergency stop as the HTTP panic, so it also kills auto (it used to only sell)
+        const result = await walletTrader.panicLiquidateAll('ws panic');
         ws.send(JSON.stringify({ type: 'PANIC_LIQUIDATION_RESULT', data: result }));
       }
-    } catch {}
+    } catch (err: any) {
+      // P1.4 (N-6): a failed action is logged and answered; it used to be swallowed with no reply and no log line
+      const action = typeof parsed?.action === 'string' ? parsed.action.slice(0, 64) : 'UNKNOWN';
+      const error = err?.message || String(err);
+      Logger.error(`[WS] ${action} failed: ${error}`);
+      try { ws.send(JSON.stringify({ type: `${action}_RESULT`, success: false, error })); } catch { /* socket already closed */ }
+    }
   });
 });
 
@@ -498,7 +508,7 @@ registerMarketRoutes(app);
 
 // 5. Quant AI Diagnostics: the model is given the server's own live state (system checks, auto journal stats, measured latency), built
 // here from the same sources the screens read. The client sends only the mode and the question; it cannot add figures.
-app.post('/api/ai/diagnostics', requireOperatorAuth, async (req, res) => {
+app.post('/api/ai/diagnostics', requireOperatorAuth, asyncHandler(async (req, res) => {
   const { mode = 'thinking', prompt } = req.body ?? {};
   const ai = getGenAI();
 
@@ -536,7 +546,7 @@ Answer with: 1. What the state shows (cite the check or counter), 2. What looks 
     console.error('Gemini API Error:', err);
     res.status(500).json({ error: err.message || 'Error processing AI Diagnostics' });
   }
-});
+}));
 
 // 6. Raw Packet Logs Exporter (PCAP-JSON formatted)
 app.post('/api/export/packets', requireOperatorAuth, (req, res) => {
@@ -585,7 +595,7 @@ const requireLiveConfirmation: express.RequestHandler = (req, res, next) => {
   res.status(409).json({ success: false, status: 'REJECTED', error: refusal, result: { success: false, message: refusal } });
 };
 
-app.post('/api/social/signals/snipe', requireOperatorAuth, validateTradeBody(SignalSnipeSchema), async (req, res) => {
+app.post('/api/social/signals/snipe', requireOperatorAuth, validateTradeBody(SignalSnipeSchema), asyncHandler(async (req, res) => {
   const { signalId } = req.body;
   const unconfirmed = liveConfirmationRefusal(executionCoordinator.isLiveArmed(), allowedCluster(), req.body); // Q10b
   if (unconfirmed) return res.status(409).json({ success: false, status: 'REJECTED', error: unconfirmed });
@@ -623,7 +633,7 @@ app.post('/api/social/signals/snipe', requireOperatorAuth, validateTradeBody(Sig
     signal: sig,
     tradeResult,
   });
-});
+}));
 
 app.get('/api/telegram/config', requireOperatorAuth, (req, res) => {
   res.json({
@@ -640,7 +650,7 @@ app.post('/api/telegram/config', requireOperatorAuth, (req, res) => {
   });
 });
 
-app.post('/api/telegram/webhook', requireOperatorAuth, async (req, res) => {
+app.post('/api/telegram/webhook', requireOperatorAuth, asyncHandler(async (req, res) => {
   const { message } = req.body;
   const text = message?.text || req.body?.text || '';
   // Q23: /snipe and /buy are one-click trades, so they need the same live confirmation as the other trade routes
@@ -654,22 +664,22 @@ app.post('/api/telegram/webhook', requireOperatorAuth, async (req, res) => {
     ok: true,
     result,
   });
-});
+}));
 
-app.post('/api/telegram/test-connection', requireOperatorAuth, async (req, res) => {
+app.post('/api/telegram/test-connection', requireOperatorAuth, asyncHandler(async (req, res) => {
   const { botToken, chatId, sendPingMessage } = req.body || {};
   const testResult = await socialScanner.testTelegramConnection(botToken, chatId, sendPingMessage);
   res.json(testResult);
-});
+}));
 
-app.post('/api/social/test-twitter', requireOperatorAuth, async (req, res) => {
+app.post('/api/social/test-twitter', requireOperatorAuth, asyncHandler(async (req, res) => {
   const { bearerToken } = req.body || {};
   const testResult = await socialScanner.testXTwitterConnection(bearerToken);
   res.json(testResult);
-});
+}));
 
 // Full External Connectivity Diagnostics & Simulation Scope Audit
-app.get('/api/connectivity/diagnostics', requireOperatorAuth, async (req, res) => {
+app.get('/api/connectivity/diagnostics', requireOperatorAuth, asyncHandler(async (req, res) => {
   const tStart = Date.now();
 
   // 1. Telegram
@@ -901,7 +911,7 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, async (req, res) =
       },
     ],
   });
-});
+}));
 
 // ============================================================================
 // 13. MULTI-PLATFORM MEMECOIN AGGREGATOR & SNIPER ENGINE ENDPOINTS
@@ -923,23 +933,23 @@ app.get('/api/memecoins/positions', requireOperatorAuth, (req, res) => {
   });
 });
 
-app.post('/api/memecoins/trade', requireOperatorAuth, requireLiveConfirmation, validateTradeBody(OperatorSnipeSchema), async (req, res) => {
+app.post('/api/memecoins/trade', requireOperatorAuth, requireLiveConfirmation, validateTradeBody(OperatorSnipeSchema), asyncHandler(async (req, res) => {
   const result = await memecoinAggregator.executeSnipe({ ...withOperatorAmount(req.body), provenance: OPERATOR_PROVENANCE, signalTimestamp: Date.now() });
 
   res.json({
     status: result.success ? 'OK' : 'REJECTED',
     result,
   });
-});
+}));
 
-app.post('/api/memecoins/close', requireOperatorAuth, validateTradeBody(OperatorCloseSchema), async (req, res) => {
+app.post('/api/memecoins/close', requireOperatorAuth, validateTradeBody(OperatorCloseSchema), asyncHandler(async (req, res) => {
   const { positionId, sellPct } = req.body;
   const result = await memecoinAggregator.closePosition(positionId, sellPct);
   res.json({
     status: result.success ? 'OK' : 'ERROR',
     result,
   });
-});
+}));
 
 /** The bot token is write-only: it never leaves the server once stored. */
 function redactSniperConfig<T extends { telegramBotToken?: string }>(c: T) {
@@ -988,7 +998,7 @@ app.get('/api/pumpfun/leaderboard', requireOperatorAuth, (req, res) => {
   });
 });
 
-app.post('/api/pumpfun/callouts/snipe', requireOperatorAuth, validateTradeBody(CalloutSnipeSchema), async (req, res) => {
+app.post('/api/pumpfun/callouts/snipe', requireOperatorAuth, validateTradeBody(CalloutSnipeSchema), asyncHandler(async (req, res) => {
   const { calloutId, amountUsd, amountSol, jitoTipSol, slippagePct } = req.body;
   const unconfirmed = liveConfirmationRefusal(executionCoordinator.isLiveArmed(), allowedCluster(), req.body); // Q10b
   if (unconfirmed) return res.status(409).json({ success: false, status: 'REJECTED', error: unconfirmed, result: { success: false, message: unconfirmed } });
@@ -999,7 +1009,7 @@ app.post('/api/pumpfun/callouts/snipe', requireOperatorAuth, validateTradeBody(C
     status: result.success ? 'OK' : 'REJECTED',
     result,
   });
-});
+}));
 
 app.get('/api/pumpfun/callouts/rules', requireOperatorAuth, (req, res) => {
   res.json({
@@ -1020,7 +1030,7 @@ app.get('/api/pumpfun/status', requireOperatorAuth, (req, res) => {
   res.json(pumpFunService.getStatus());
 });
 
-app.post('/api/pumpfun/refresh', requireOperatorAuth, async (req, res) => {
+app.post('/api/pumpfun/refresh', requireOperatorAuth, asyncHandler(async (req, res) => {
   // A manual refresh only reloads the feed; it must never evaluate auto-snipe triggers (A5).
   await pumpFunService.syncRealWorldData({ evaluateTriggers: false });
   res.json({
@@ -1028,7 +1038,7 @@ app.post('/api/pumpfun/refresh', requireOperatorAuth, async (req, res) => {
     calloutsCount: pumpFunService.getHotCallouts().length,
     timestamp: Date.now(),
   });
-});
+}));
 
 
 // ============================================================================
@@ -1042,7 +1052,7 @@ app.get('/api/wallet/state', requireOperatorAuth, (req, res) => {
   });
 });
 
-app.post('/api/wallet/config', requireOperatorAuth, validateBody(WalletConfigSchema), async (req, res) => {
+app.post('/api/wallet/config', requireOperatorAuth, validateBody(WalletConfigSchema), asyncHandler(async (req, res) => {
   try {
     const updated = await walletTrader.updateConfig(req.body);
     res.json({
@@ -1053,7 +1063,7 @@ app.post('/api/wallet/config', requireOperatorAuth, validateBody(WalletConfigSch
   } catch (err: any) {
     res.status(400).json({ success: false, error: err.message, state: walletTrader.getState() });
   }
-});
+}));
 
 app.post('/api/wallet/toggle-trading', requireOperatorAuth, validateTradeBody(ArmSchema), (req, res) => {
   const { active, confirmationCode } = req.body;
@@ -1073,7 +1083,7 @@ app.post('/api/wallet/toggle-trading', requireOperatorAuth, validateTradeBody(Ar
   });
 });
 
-app.post('/api/wallet/snipe', requireOperatorAuth, requireLiveConfirmation, validateBody(LiveSnipeOrderSchema), async (req, res) => {
+app.post('/api/wallet/snipe', requireOperatorAuth, requireLiveConfirmation, validateBody(LiveSnipeOrderSchema), asyncHandler(async (req, res) => {
   // S181: same refusal-with-a-reason as the other snipe routes (minimum and MAX_POSITION_SIZE_SOL); nothing is clamped.
   const amountCheck = checkSnipeAmountSol(req.body.amountSol);
   if (!amountCheck.ok) return res.status(400).json({ success: false, error: amountCheck.reason });
@@ -1087,9 +1097,9 @@ app.post('/api/wallet/snipe', requireOperatorAuth, requireLiveConfirmation, vali
     data: result,
     state: walletTrader.getState(),
   });
-});
+}));
 
-app.post('/api/wallet/close-position', requireOperatorAuth, validateBody(ClosePositionSchema), async (req, res) => {
+app.post('/api/wallet/close-position', requireOperatorAuth, validateBody(ClosePositionSchema), asyncHandler(async (req, res) => {
   const { positionId, sellPct } = req.body;
   const result = await walletTrader.closePosition(positionId, sellPct, 'Manual user order');
   if (!result.success) {
@@ -1100,35 +1110,28 @@ app.post('/api/wallet/close-position', requireOperatorAuth, validateBody(ClosePo
     data: result,
     state: walletTrader.getState(),
   });
-});
+}));
 
-// S13: the Telegram /panic_sell stops new entries the same way the HTTP panic does.
-socialScanner.setPanicHook(async () => {
-  riskEngine.setKillSwitch(true);
-  executionCoordinator.armLiveTrading(false);
-  await autoSnipeController.kill({ exitAll: false, reason: 'telegram panic' });
-});
-
-app.post('/api/wallet/panic-liquidate', requireOperatorAuth, async (req, res) => {
-  const result = await walletTrader.panicLiquidateAll();
-  await autoSnipeController.kill({ exitAll: false, reason: 'panic liquidate' }); // Q37: a panic also stops auto; it must not re-buy after the exits
+app.post('/api/wallet/panic-liquidate', requireOperatorAuth, asyncHandler(async (req, res) => {
+  // P1.4 (N-1): one emergency stop. Auto is killed (after its buy in flight) BEFORE the positions are read, then every ACTIVE one is sold.
+  const result = await walletTrader.panicLiquidateAll('panic liquidate');
   const failedList = result.failed.map((f) => `${f.symbol}: ${f.error}`).join('; ');
   res.json({
     success: result.failed.length === 0,
-    message: `Emergency liquidation ${result.failed.length === 0 ? 'complete' : 'INCOMPLETE, positions still open'}. Attempted: ${result.attemptedCount}, Succeeded: ${result.succeeded.length}, Failed: ${result.failed.length}${failedList ? ` (${failedList})` : ''}. Kill switch on, live trading disarmed, auto stopped.`,
+    message: `Emergency liquidation ${result.failed.length === 0 ? 'complete' : 'INCOMPLETE, positions still open'}. Attempted: ${result.attemptedCount}, Succeeded: ${result.succeeded.length}, Failed: ${result.failed.length}${failedList ? ` (${failedList})` : ''}. Kill switch on, live trading disarmed, ${result.autoStopped ? 'auto stopped' : `auto NOT confirmed stopped (${result.autoStopError ?? 'mode is not OFF'})`}.`,
     data: result,
     state: walletTrader.getState(),
   });
-});
+}));
 
-app.post('/api/wallet/sync-rpc', requireOperatorAuth, async (req, res) => {
+app.post('/api/wallet/sync-rpc', requireOperatorAuth, asyncHandler(async (req, res) => {
   const solBalance = await walletTrader.syncRpcBalance();
   res.json({
     success: true,
     solBalance,
     state: walletTrader.getState(),
   });
-});
+}));
 
 // ============================================================================
 // 16. CANONICAL DIAGNOSTICS & SYSTEM ARCHITECTURE AUDIT (SECTION 64)
@@ -1195,7 +1198,7 @@ function replayLaunchCap(env: NodeJS.ProcessEnv = process.env): number {
 }
 let replayCache: { key: string; at: number; body: any } | null = null;
 const replayInFlight = new Map<string, Promise<any>>();
-app.get('/api/backtest/replay', requireOperatorAuth, async (req, res) => {
+app.get('/api/backtest/replay', requireOperatorAuth, asyncHandler(async (req, res) => {
   // S187: ?minScore=N replays at another confluence threshold (the what-if box); without it, the threshold in force
   let minScore: number | undefined;
   if (req.query.minScore !== undefined) {
@@ -1228,7 +1231,7 @@ app.get('/api/backtest/replay', requireOperatorAuth, async (req, res) => {
   } catch (e: any) {
     res.status(500).json({ success: false, error: `Replay failed: ${e?.message || e}` });
   }
-});
+}));
 
 app.get('/api/execution/mode', requireOperatorAuth, (req, res) => {
   res.json({
@@ -1282,16 +1285,16 @@ app.get('/api/auto/status', requireOperatorAuth, (req, res) => {
   res.json({ success: true, ...autoSnipeController.getStatus(), stats: autoSnipeController.getJournalStats(), decisions: autoSnipeController.getDecisions(100) });
 });
 
-app.post('/api/auto/mode', requireOperatorAuth, validateTradeBody(AutoModeSchema), async (req, res) => {
+app.post('/api/auto/mode', requireOperatorAuth, validateTradeBody(AutoModeSchema), asyncHandler(async (req, res) => {
   const { mode, confirmationCode } = req.body;
   const result = await autoSnipeController.setMode(mode, { confirmationCode });
   res.status(result.ok ? 200 : 409).json({ success: result.ok, ...result, status: autoSnipeController.getStatus() });
-});
+}));
 
-app.post('/api/auto/kill', requireOperatorAuth, validateTradeBody(AutoKillSchema), async (req, res) => {
+app.post('/api/auto/kill', requireOperatorAuth, validateTradeBody(AutoKillSchema), asyncHandler(async (req, res) => {
   const result = await autoSnipeController.kill({ exitAll: req.body.exitAll, reason: req.body.reason });
   res.json({ success: true, ...result, status: autoSnipeController.getStatus() });
-});
+}));
 
 // H2: bonding-curve depth ladder and the selected mint's trade tape. When the source fails: 503, no generated rows.
 const tradeTape = new TradeTape(
@@ -1306,7 +1309,7 @@ const tradeTape = new TradeTape(
 );
 tradeTape.attach(pumpFeedListener);
 
-app.get('/api/market/curve/:mint', requireOperatorAuth, async (req, res) => {
+app.get('/api/market/curve/:mint', requireOperatorAuth, asyncHandler(async (req, res) => {
   try {
     const mint = new PublicKey(String(req.params.mint));
     const mode = executionCoordinator.getExecutionMode();
@@ -1322,7 +1325,7 @@ app.get('/api/market/curve/:mint', requireOperatorAuth, async (req, res) => {
   } catch (e: any) {
     res.status(503).json({ success: false, source: 'UNAVAILABLE', error: e?.message || 'curve unavailable' });
   }
-});
+}));
 
 app.get('/api/market/trades/:mint', requireOperatorAuth, (req, res) => {
   const mint = String(req.params.mint);
@@ -1358,26 +1361,27 @@ app.post('/api/execution/arm', requireOperatorAuth, validateTradeBody(ArmSchema)
   res.json(result);
 });
 
-app.post('/api/execution/kill-switch', requireOperatorAuth, (req, res) => {
+app.post('/api/execution/kill-switch', requireOperatorAuth, asyncHandler(async (req, res) => {
   // Explicit boolean only: an empty POST or {"activate":"false"} must not trip it, and must never silently reset it.
   const parsed = KillSwitchSchema.safeParse(req.body ?? {});
   if (!parsed.success) return res.status(400).json({ success: false, error: 'activate must be true or false' });
   const { activate } = parsed.data;
-  riskEngine.setKillSwitch(activate);
-  if (activate) {
-    executionCoordinator.armLiveTrading(false);
-  }
+  // P1.4 (N-0): tripping the switch is the shared emergency stop without the sells: kill switch, auto killed (OFF, after its buy in
+  // flight) and LIVE disarmed. It used to leave auto in DEVNET_LIVE, which bought again once the switch was reset and LIVE re-armed.
+  if (activate) await emergencyStop({ exitAll: false, reason: 'operator kill switch' });
+  else riskEngine.setKillSwitch(false);
   res.json({
     success: true,
     killSwitchActive: riskEngine.isKillSwitchActive(),
     // R26: resetting the switch does not lift an open circuit breaker or an all-trading halt; say so, so the UI cannot claim "allowed again"
     circuitBreaker: riskEngine.getCircuitBreakerState(),
     haltReason: executionCoordinator.getHaltReason(),
-    message: activate ? 'EMERGENCY KILL SWITCH TRIPPED. All trading halted.' : 'Kill switch reset.',
+    autoMode: autoSnipeController.getMode(),
+    message: activate ? 'EMERGENCY KILL SWITCH TRIPPED. All trading halted, auto OFF, LIVE disarmed.' : 'Kill switch reset. Auto stays OFF and LIVE stays disarmed until an operator turns them on.',
   });
-});
+}));
 
-app.post('/api/execution/trade', requireOperatorAuth, requireLiveConfirmation, validateTradeBody(OperatorExecuteTradeSchema), async (req, res) => {
+app.post('/api/execution/trade', requireOperatorAuth, requireLiveConfirmation, validateTradeBody(OperatorExecuteTradeSchema), asyncHandler(async (req, res) => {
   try {
     // Provenance and source are set here. A client cannot choose them (the schema rejects them).
     const result = await executionCoordinator.executeTrade({
@@ -1394,12 +1398,19 @@ app.post('/api/execution/trade', requireOperatorAuth, requireLiveConfirmation, v
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
-});
+}));
 
-app.post('/api/execution/close', requireOperatorAuth, validateTradeBody(OperatorCloseSchema), async (req, res) => {
+const OPERATOR_CLOSE_REASON = 'Operator close';
+app.post('/api/execution/close', requireOperatorAuth, validateTradeBody(OperatorCloseSchema), asyncHandler(async (req, res) => {
   try {
-    const { positionId, sellPct, reason = 'Operator close' } = req.body;
-    const result = await executionCoordinator.closePosition(positionId, sellPct, reason);
+    // P1.4 (N-3): the close reason is always "Operator close" (a protective reason: it runs during a halt, and is journaled as a manual
+    // close). The client's text never becomes the reason, so it cannot label a close STOP_LOSS to skip the dust check; it is kept as a note.
+    const { positionId, sellPct, reason: note } = req.body;
+    const result = await executionCoordinator.closePosition(positionId, sellPct, OPERATOR_CLOSE_REASON);
+    if (typeof note === 'string' && note.trim() && note !== OPERATOR_CLOSE_REASON) {
+      const pos = workstationDb.loadPositions().find((p) => p.id === positionId);
+      workstationDb.logDecision({ autoMode: 'n/a', mint: pos?.mint ?? '-', symbol: pos?.symbol, source: 'OPERATOR', stage: 'exit', outcome: 'INFO', reason: `operator close note: ${note.slice(0, 200)}`, positionId, inputs: { sellPct, closed: result.success } });
+    }
     if (!result.success) {
       return res.status(400).json(result);
     }
@@ -1407,16 +1418,16 @@ app.post('/api/execution/close', requireOperatorAuth, validateTradeBody(Operator
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
-});
+}));
 
-app.post('/api/execution/reconcile', requireOperatorAuth, async (req, res) => {
+app.post('/api/execution/reconcile', requireOperatorAuth, asyncHandler(async (req, res) => {
   try {
     const result = await executionCoordinator.startupReconciliation({ fresh: true }); // R17: a click never reads a run that began before it
     res.json({ success: true, result });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
-});
+}));
 
 app.get('/api/signer/status', requireOperatorAuth, (req, res) => {
   const status = localSigner.getStatus();
@@ -1566,4 +1577,9 @@ async function startTrading() {
 
 if (process.env.NODE_ENV !== 'test' && !process.env.VITEST) {
   startServer();
+} else {
+  markBootDone(); // P1.4: an in-process import (a test) starts no trading side, so no request waits for it
 }
+
+/** P1.4: an in-process test listens on `server` itself (startServer does not run under vitest) to drive the real routes with spies. */
+export { app, server };

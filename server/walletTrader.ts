@@ -8,6 +8,7 @@ import { ExecutionMode, NormalizedPosition } from './core/types';
 import { executionConfig } from './solana/executionConfig';
 import { resolveRpcUrl } from './solana/clusterGuard';
 import { solPriceService } from './market/solPriceService';
+import { emergencyStop, type EmergencyStopReport } from './execution/emergencyStop';
 
 export interface WalletTraderConfig {
   walletAddress: string;
@@ -59,13 +60,7 @@ export interface LiveWalletState {
   lastSyncTimestamp: number;
 }
 
-export interface PanicLiquidationReport {
-  attemptedCount: number;
-  succeeded: Array<{ id: string; symbol: string; pnlSol: number; status?: string }>;
-  failed: Array<{ id: string; symbol: string; error: string }>;
-  totalRealizedPnLSol: number;
-  killSwitchActivated: boolean;
-}
+export type PanicLiquidationReport = EmergencyStopReport;
 
 class PlugAndPlayWalletTrader extends EventEmitter {
   private config: WalletTraderConfig;
@@ -189,46 +184,17 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     };
   }
 
-  // Safe panic liquidator with detailed per-position reporting
-  public async panicLiquidateAll(): Promise<PanicLiquidationReport> {
-    // 1. Engage Emergency Kill Switch & Disarm Live Entry FIRST to immediately block new incoming orders
-    riskEngine.setKillSwitch(true);
-    executionCoordinator.armLiveTrading(false);
+  /**
+   * Panic: P1.4 makes this the shared emergency stop (kill switch, auto killed after its buy in flight, LIVE disarmed, every ACTIVE
+   * position of every mode sold with EMERGENCY_PANIC_LIQUIDATION, the list read again once after the loop). See emergencyStop.ts.
+   */
+  public async panicLiquidateAll(reason = 'panic liquidate'): Promise<PanicLiquidationReport> {
     this.config.isLiveTradingActive = false;
-
-    // 2. Enumerate all active holdings (both OPEN and PARTIALLY_CLOSED) across all modes
-    const activePositions = workstationDb.loadPositions(undefined, 'ACTIVE');
-    const succeeded: Array<{ id: string; symbol: string; pnlSol: number; status?: string }> = [];
-    const failed: Array<{ id: string; symbol: string; error: string }> = [];
-    let totalRealized = 0;
-
-    // 3. Liquidate each holding
-    for (const pos of activePositions) {
-      try {
-        const res = await executionCoordinator.closePosition(pos.id, 100, 'EMERGENCY_PANIC_LIQUIDATION');
-        if (res.success) {
-          succeeded.push({ id: pos.id, symbol: pos.symbol, pnlSol: res.pnlSol, status: res.status });
-          totalRealized += res.pnlSol;
-        } else {
-          failed.push({ id: pos.id, symbol: pos.symbol, error: res.error || 'Execution failed' });
-        }
-      } catch (err: any) {
-        failed.push({ id: pos.id, symbol: pos.symbol, error: err.message });
-      }
+    try {
+      return await emergencyStop({ exitAll: true, reason });
+    } finally {
+      this.emit('wallet_state_updated', this.getState());
     }
-
-    Logger.warn(
-      `PANIC LIQUIDATE REPORT: Attempted ${activePositions.length}, Succeeded ${succeeded.length}, Failed ${failed.length}. Emergency kill switch active.`
-    );
-    this.emit('wallet_state_updated', this.getState());
-
-    return {
-      attemptedCount: activePositions.length,
-      succeeded,
-      failed,
-      totalRealizedPnLSol: totalRealized,
-      killSwitchActivated: true,
-    };
   }
 
   /** Throws (before changing anything) when the new RPC endpoint is refused by the cluster guard or unreachable. */

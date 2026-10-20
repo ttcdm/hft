@@ -325,6 +325,13 @@ async function main() {
       return t ? (t.meta?.err ?? null) : undefined;
     },
     buildBuyRequest, rec, link: solscan, sleep, connection: coordinator.getConnection() as any, rpcUrl: process.env.SOLANA_RPC_URL!,
+    stop: {
+      telegram: (await import('../server/socialScanner')).socialScanner,
+      emergencyStop: (await import('../server/execution/emergencyStop')).emergencyStop,
+      setKillSwitch: (on) => riskEngine.setKillSwitch(on),
+      arm: (a, code) => coordinator.armLiveTrading(a, code),
+      auto: (await import('../server/auto/controller')).autoSnipeController as any,
+    },
   };
   const S = await import('./devnet_e2e_steps');
   // The (a) buy started the 30 s per-mint cooldown; (d') must reach the chain, so it waits that out first.
@@ -336,6 +343,8 @@ async function main() {
   await S.ambiguousSendThroughApp(steps); // P1.5
   await S.waitPast(steps, Date.now(), riskEngine.getLimits().cooldownPerMintMs, "per-mint cooldown from the (e'') buy");
   await S.heldBlockhashStopLoss(steps); // P1.7
+  await S.waitPast(steps, Date.now(), riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (g) buy');
+  await S.emergencyStopThroughApp(steps); // P1.4, last: it leaves LIVE disarmed and auto OFF. Telegram-path panic sells the LIVE position; kill switch on/off/re-arm buys nothing
 
   // (f) crash after submit, then recover in a fresh process on the same scratch DB
   const env = { ...process.env, APEX_E2E_SCRATCH: scratch };

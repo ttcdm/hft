@@ -394,6 +394,8 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
       let release!: (v: any) => void;
       const inner = vi.spyOn(coordinator as any, 'submitAndConfirmInner').mockImplementation(() => new Promise((r) => { release = r; }));
       const p = coordinator.submitAndConfirmWithRetry(params(7, 'ord-n20-a'));
+      // P1.5 (N-35): the cluster checks now run before the row is written, so wait for the send to be in flight rather than reading synchronously
+      await vi.waitFor(() => expect(inner).toHaveBeenCalledTimes(1));
       const rows = rowFor('ord-n20-a');
       expect(rows).toHaveLength(1);
       expect(rows[0].reconciliationState).toBe('PENDING');

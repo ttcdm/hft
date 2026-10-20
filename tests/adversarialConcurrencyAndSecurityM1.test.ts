@@ -300,7 +300,8 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
       const result = await coordinator.executeTrade(req);
 
       expect(result.success).toBe(false);
-      expect(result.lifecycleState).toBe('CHAIN_ERROR');
+      // P1.5 (R1-6): the buy confirmed, so its PENDING row is kept for orphan recovery (RECONCILIATION_REQUIRED), not a terminal CHAIN_ERROR
+      expect(result.lifecycleState).toBe('RECONCILIATION_REQUIRED');
       expect(result.error).toContain('Fatal deserialization exception');
       expect((coordinator as any).inFlightReservedSol).toBe(0);
     });

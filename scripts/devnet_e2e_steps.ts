@@ -35,6 +35,8 @@ export interface HarnessSteps {
   rec: (step: string, ok: boolean, detail: string) => void;
   link: (sig: string) => string;
   sleep: (ms: number) => Promise<unknown>;
+  /** The coordinator's own Connection: (e'') wraps its `sendRawTransaction` for one call. */
+  connection?: { sendRawTransaction: (...args: any[]) => Promise<string> };
 }
 
 const openFor = (s: HarnessSteps) => s.db.loadPositions().filter((p) => p.mint === s.mint && p.status !== 'CLOSED');
@@ -100,7 +102,7 @@ export async function forcedRevertThroughApp(s: HarnessSteps): Promise<number> {
 }
 
 /** (e'). */
-export async function sequentialBuysOneMint(s: HarnessSteps): Promise<void> {
+export async function sequentialBuysOneMint(s: HarnessSteps): Promise<number> {
   const L = "(e') two sequential executeTrade on one mint";
   await s.coordinator.syncRealWalletBalance();
   const rowsBefore = new Set(buyRowsFor(s).map((t) => t.signature));
@@ -118,6 +120,43 @@ export async function sequentialBuysOneMint(s: HarnessSteps): Promise<void> {
   s.rec(`${L}: exactly one open position`, open.length === 1, JSON.stringify(open.map((p) => ({ id: p.id, status: p.status }))));
   for (const p of open) {
     const c = await s.coordinator.closePosition(p.id, 100, "e2e (e') cleanup");
+    s.rec(`${L}: cleanup close 100%`, c.success, c.error || 'closed');
+  }
+  return Date.now();
+}
+
+/**
+ * (e'') P1.5 (R1-2): an ambiguous send. For one call the harness wraps the coordinator's `connection.sendRawTransaction` so the transaction
+ * is really sent (it reaches devnet) and then the call throws, as a socket reset after forwarding does. Expected: no REVERTED row for that
+ * signature, and the landed buy gets a position in this same process (no restart), which is then closed so the next step starts flat.
+ */
+export async function ambiguousSendThroughApp(s: HarnessSteps): Promise<void> {
+  const L = "(e'') ambiguous send through executeTrade";
+  if (!s.connection) { s.rec(L, false, 'harness did not pass the coordinator connection'); return; }
+  await s.coordinator.syncRealWalletBalance();
+  const conn = s.connection;
+  const orig = conn.sendRawTransaction;
+  let forwarded = '';
+  conn.sendRawTransaction = async function (this: unknown, ...args: any[]) {
+    conn.sendRawTransaction = orig; // one call only
+    forwarded = await orig.apply(this, args);
+    throw new Error('fetch failed (harness: injected after the transaction was forwarded)');
+  };
+  let res: ExecutionResponse;
+  try {
+    res = await s.coordinator.executeTrade(await s.buildBuyRequest());
+  } finally {
+    conn.sendRawTransaction = orig;
+  }
+  s.rec(`${L}: the transaction was forwarded`, forwarded !== '', forwarded ? s.link(forwarded) : 'the app never reached the send');
+  s.rec(`${L}: not REVERTED`, res.lifecycleState !== 'REVERTED' && res.lifecycleState !== 'SUBMIT_FAILED', `${res.lifecycleState} ${res.error ?? ''}`.slice(0, 300));
+  const rows = s.db.loadTransactions().filter((t) => t.signature === forwarded);
+  s.rec(`${L}: no REVERTED row for it`, rows.length > 0 && rows.every((t) => t.reconciliationState !== 'REVERTED'), JSON.stringify(rows.map((t) => ({ state: t.reconciliationState }))));
+  let open = openFor(s);
+  for (let i = 0; i < 40 && open.length === 0; i++) { await s.sleep(1500); open = openFor(s); } // orphan recovery runs 5 s, 15 s, 45 s after
+  s.rec(`${L}: one position in the same process`, open.length === 1, JSON.stringify(open.map((p) => ({ id: p.id, status: p.status }))));
+  for (const p of open) {
+    const c = await s.coordinator.closePosition(p.id, 100, "e2e (e'') cleanup");
     s.rec(`${L}: cleanup close 100%`, c.success, c.error || 'closed');
   }
 }

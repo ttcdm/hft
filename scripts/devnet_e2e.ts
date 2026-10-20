@@ -324,14 +324,16 @@ async function main() {
       const t = await conn.getTransaction(sig, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
       return t ? (t.meta?.err ?? null) : undefined;
     },
-    buildBuyRequest, rec, link: solscan, sleep,
+    buildBuyRequest, rec, link: solscan, sleep, connection: coordinator.getConnection() as any,
   };
   const S = await import('./devnet_e2e_steps');
   // The (a) buy started the 30 s per-mint cooldown; (d') must reach the chain, so it waits that out first.
   await S.waitPast(steps, buyDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (a) buy');
   const revertedAt = await S.forcedRevertThroughApp(steps);
   await S.waitPast(steps, revertedAt, riskEngine.getLimits().cooldownAfterFailedTradeMs, "failure cooldown from the (d') revert");
-  await S.sequentialBuysOneMint(steps);
+  const lastBuyAt = await S.sequentialBuysOneMint(steps);
+  await S.waitPast(steps, lastBuyAt, riskEngine.getLimits().cooldownPerMintMs, "per-mint cooldown from the (e') buy");
+  await S.ambiguousSendThroughApp(steps); // P1.5
 
   // (f) crash after submit, then recover in a fresh process on the same scratch DB
   const env = { ...process.env, APEX_E2E_SCRATCH: scratch };

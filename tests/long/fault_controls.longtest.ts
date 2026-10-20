@@ -55,6 +55,9 @@ describe('localnet_landThenFailNextSend', () => {
     const r = await transport.submit(tx);
     expect(r.success).toBe(false);
     expect(r.error).toMatch(/^502 Bad Gateway/);
+    // P1.5: the transport keeps the signature and says the outcome is unknown (it was forwarded), so the coordinator watches it
+    expect(r.ambiguous).toBe(true);
+    expect(r.signature).toBe(sig);
     // The chain has it: confirmed status, the recipient was credited, and the validator lists it as landed-then-failed.
     expect((await statusOf(sig))?.err).toBeNull();
     expect(await conn.getBalance(to)).toBe(0.01 * LAMPORTS_PER_SOL);
@@ -85,18 +88,19 @@ describe('localnet_landThenFailNextSend', () => {
 });
 
 describe('localnet_failNextReads', () => {
-  it('fails exactly the next n getSignatureStatuses calls: two confirms come back TIMED_OUT with the injected error, the third confirms', async () => {
+  it('fails exactly the next n getSignatureStatuses calls: confirm keeps polling past them (P1.5) and only times out while they last', async () => {
     const tx = await transfer(Keypair.generate().publicKey);
     const sig = (await transport.submit(tx)).signature;
     expect(sig).toBe(sigOf(tx));
+    // P1.5: a failed status read inside confirm no longer ends it; the poll after the two failures confirms
     await v.rpc('localnet_failNextReads', [2, 'getSignatureStatuses']);
-
-    const c1 = await transport.confirm(sig, 5_000);
-    expect(c1.lifecycleState).toBe('TIMED_OUT');
-    expect(c1.error).toMatch(/failed to get signature status: localnet: injected read failure/);
-    const c2 = await transport.confirm(sig, 5_000);
-    expect(c2.lifecycleState).toBe('TIMED_OUT');
-    expect(c2.error).toMatch(/injected read failure/);
+    expect((await transport.confirm(sig, 5_000)).lifecycleState).toBe('TX_CONFIRMED');
+    // while every read fails, the confirm times out and says why
+    await v.rpc('localnet_failNextReads', [50, 'getSignatureStatuses']);
+    const c = await transport.confirm(sig, 700);
+    expect(c.lifecycleState).toBe('TIMED_OUT');
+    expect(c.error).toMatch(/failed to get signature status: localnet: injected read failure/);
+    await v.rpc('localnet_failNextReads', [0, 'getSignatureStatuses']); // a count of 0 clears the rule
     expect((await transport.confirm(sig, 5_000)).lifecycleState).toBe('TX_CONFIRMED');
   });
 

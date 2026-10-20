@@ -1441,6 +1441,17 @@ export class ExecutionCoordinator {
     // to be sent; written first, a skipped resubmission left a row for a transaction that was never sent.
     const already = this.alreadyLandedResult(params.orderId);
     if (already) return already;
+    // P1.5 (N-35): the read-only and cluster refusals run before the PENDING row is written, so a refused order leaves no row for a
+    // transaction that was never sent (a REVERTED row with a fee that never existed, or a PENDING row that blocks the mint).
+    assertNotReadOnly(`sending a ${params.side} order`);
+    try {
+      traced('guard.sendCluster', () => assertSendClusterAllowed());
+      await traced('guard.genesis', () => assertClusterAllowedCached(this.connection));
+    } catch (err: any) {
+      Logger.error(`[R1] ${params.side} for order ${params.orderId} blocked before anything was recorded or sent: ${err.message}`);
+      workstationDb.logJournal('CLUSTER_GUARD_BLOCK', params.correlationId, 'LIVE', { orderId: params.orderId, side: params.side, mint: params.mint, error: err.message });
+      return { success: false, signature: '', transport: 'SOLANA_RPC', error: err.message, lifecycleState: 'SUBMIT_FAILED' };
+    }
     const preSignature = this.signatureOf(params.tx);
     if (preSignature) {
       const pendingRow: PersistedTransaction = {
@@ -1727,7 +1738,15 @@ export class ExecutionCoordinator {
       }
 
       const rpcSubmit = await traced('tx.submit', () => this.rpcTransport.submit(tx), { 'apex.transport': 'SOLANA_RPC', 'apex.side': side });
-      if (!rpcSubmit.success || !rpcSubmit.signature) {
+      // P1.5 (R1-2): a send that failed without proof of rejection (fetch failed, socket reset, 502/504 after forwarding) may still land.
+      // It is watched like any sent transaction below: confirmed means success, failed on chain means REVERTED, unseen means unconfirmed
+      // (the buy path then keeps it RECONCILIATION_REQUIRED with orphan recovery, the sell path records a pending sell). Never REVERTED here.
+      const ambiguousSend = !rpcSubmit.success && !!rpcSubmit.ambiguous && !!rpcSubmit.signature;
+      if (ambiguousSend) {
+        Logger.warn(`[P1.5] ${side} for order ${orderId}: the send failed with no proof of rejection (${rpcSubmit.error}); watching ${rpcSubmit.signature.slice(0, 8)} in case it lands`);
+        workstationDb.logJournal('SEND_OUTCOME_UNKNOWN', correlationId, 'LIVE', { orderId, side, mint, signature: rpcSubmit.signature, error: rpcSubmit.error });
+      }
+      if (!ambiguousSend && (!rpcSubmit.success || !rpcSubmit.signature)) {
         return {
           success: false,
           signature: rpcSubmit.signature || lastSignature,
@@ -1776,7 +1795,9 @@ export class ExecutionCoordinator {
           success: false,
           signature: rpcSubmit.signature,
           transport: 'SOLANA_RPC',
-          error: rpcConfirm.error || 'RPC fallback transaction dropped or unconfirmed',
+          error: ambiguousSend && rpcConfirm.lifecycleState !== 'REVERTED'
+            ? `SEND_OUTCOME_UNKNOWN: ${rpcSubmit.error}; not seen on chain yet (${rpcConfirm.error || 'unconfirmed'})`
+            : rpcConfirm.error || 'RPC fallback transaction dropped or unconfirmed',
           lifecycleState: 'REVERTED',
           unconfirmed: rpcConfirm.lifecycleState !== 'REVERTED',
         };
@@ -2781,6 +2802,21 @@ export class ExecutionCoordinator {
     } catch (err: any) {
       riskEngine.recordTradeFailure();
       Logger.error(`LIVE trade exception: ${err.message}`);
+      // P1.5 (R1-6, R1-80): an exception after the PENDING row was written (the transaction may have been sent) must not leave that row
+      // PENDING and unwatched: it becomes RECONCILIATION_REQUIRED, which orphan recovery re-reads and adopts if the buy landed.
+      const pending = workstationDb.loadTransactions(`ord-${correlationId}`).filter((t) => t.direction === 'BUY' && t.reconciliationState === 'PENDING');
+      if (pending.length > 0) {
+        for (const t of pending) workstationDb.saveTransaction({ ...t, reconciliationState: 'RECONCILIATION_REQUIRED', error: `UNCONFIRMED: exception after the send was prepared: ${err.message}` });
+        this.scheduleOrphanRecovery();
+        return {
+          success: false,
+          lifecycleState: 'RECONCILIATION_REQUIRED',
+          executionMode: 'LIVE',
+          txSignature: pending[0].signature,
+          error: `UNCONFIRMED: ${err.message}. The transaction may have been sent; it is being watched, do not retry the buy.`,
+          correlationId,
+        };
+      }
       return {
         success: false,
         lifecycleState: 'CHAIN_ERROR',

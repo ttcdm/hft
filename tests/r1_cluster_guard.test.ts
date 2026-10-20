@@ -178,7 +178,7 @@ describe('R1: cluster guard', () => {
       withJitoDisabled();
       vi.spyOn(Connection.prototype, 'getGenesisHash').mockResolvedValue(DEVNET);
       const fetchSpy = vi.spyOn(globalThis, 'fetch');
-      const send = vi.spyOn(Connection.prototype, 'sendRawTransaction').mockRejectedValue(new Error('rpc rejected'));
+      const send = vi.spyOn(Connection.prototype, 'sendRawTransaction').mockRejectedValue(new Error('Transaction signature verification failure')); // P1.5: a definite rejection; any other throw is ambiguous and is polled
       const { res } = await submit('BUY');
       expect(send).toHaveBeenCalledTimes(1);
       expect(res.transport).toBe('SOLANA_RPC');

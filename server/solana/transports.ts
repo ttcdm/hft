@@ -14,7 +14,7 @@
  *
  * Called by: `server/execution/coordinator.ts` only.
  */
-import { Connection, VersionedTransaction } from '@solana/web3.js';
+import { Connection, SendTransactionError, VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { Logger } from '../middleware/enterprise';
 import { assertSendClusterAllowed, jitoTipFloorAllowed, resolveJitoUrl } from './clusterGuard';
@@ -36,9 +36,34 @@ export type BundleLifecycleState =
   | 'TIMED_OUT'
   | 'EXPIRED_BLOCKHASH';
 
-/** What one submit attempt returned: the signature (empty on failure), which transport, timing and, on failure, the reason. */
+/**
+ * P1.5 (R1-2, R1-70, R1-82, R1-113): the send errors that prove the RPC did not accept the transaction. Only a JSON-RPC error object
+ * the node returned can prove that (web3.js SendTransactionError: a preflight failure, a sanitize or deserialize failure, a failed signature
+ * check, an unknown blockhash), or a message that names one of those. Everything else
+ * (fetch failed, a socket reset, a timeout, an HTTP 5xx or 429 page, an "already processed" answer that means it landed earlier) leaves the
+ * outcome unknown: the transaction may have been forwarded and may land.
+ */
+export const DEFINITE_SEND_REJECTION = /sanitiz|failed to deserialize|signature verification fail|Transaction signature verification failure|Blockhash not found|invalid transaction/i;
+
+/** "Already processed": the node has seen this transaction, so it may well be on chain. Never a definite rejection. */
+const ALREADY_PROCESSED = /already (?:been )?processed/i;
+
+export function isDefiniteSendRejection(err: unknown): boolean {
+  const msg = String((err as any)?.message ?? err ?? '');
+  if (ALREADY_PROCESSED.test(msg)) return false;
+  // web3.js throws SendTransactionError only when the RPC answered sendTransaction with a JSON-RPC error object (a preflight failure such as
+  // -32002, a failed signature check, a node that is behind). The node returns those before it forwards anything. An HTTP error page, a
+  // timeout or a reset socket is a plain Error and stays ambiguous.
+  if (err instanceof SendTransactionError) return true;
+  return DEFINITE_SEND_REJECTION.test(msg);
+}
+
+/** What one submit attempt returned: the signature, which transport, timing and, on failure, the reason. */
 export interface SubmitResult {
+  /** P1.5: the transaction's own signature whenever it was signed, also when the send failed (it is known before anything is sent). */
   signature: string;
+  /** P1.5: the send failed without proof that the transaction was not accepted. It may still land; the caller must watch it, not call it REVERTED. */
+  ambiguous?: boolean;
   bundleId?: string;
   transport: 'SOLANA_RPC' | 'JITO';
   success: boolean;
@@ -72,6 +97,13 @@ export interface JitoHealthTelemetry {
   tipFloorLamports: number | null;
   activeTipAccount: string | null;
   lastError: string | null;
+}
+
+/** The first signature of a signed transaction, base58; '' when it is unsigned (all zero). */
+function localSignature(tx: VersionedTransaction): string {
+  const sig = tx?.signatures?.[0];
+  if (!sig || sig.every((b) => b === 0)) return '';
+  return bs58.encode(sig);
 }
 
 /** Sends over plain RPC (`sendRawTransaction`, no preflight, 2 node-side retries) and confirms by polling signature statuses. The only transport used on devnet and localnet. */
@@ -108,11 +140,13 @@ export class SolanaRpcTransport implements ExecutionTransport {
       const duration = Math.round(performance.now() - t0);
       this.lastRequestTimestamp = Date.now();
       this.lastLatencyMs = duration;
-      Logger.error(`RPC submit failed: ${err.message}`);
+      const ambiguous = !isDefiniteSendRejection(err);
+      Logger.error(`RPC submit failed${ambiguous ? ' (outcome unknown: it may have been forwarded)' : ''}: ${err.message}`);
       return {
-        signature: '',
+        signature: localSignature(tx),
         transport: 'SOLANA_RPC',
         success: false,
+        ambiguous,
         submitDurationMs: duration,
         lifecycleState: 'SUBMIT_FAILED',
         error: err.message,
@@ -157,10 +191,16 @@ export class SolanaRpcTransport implements ExecutionTransport {
 
     try {
       // Loop with bounded timeout rather than ignoring maxWaitMs
+      let lastPollError: string | null = null;
       while (Date.now() - startTime < maxWaitMs) {
-        const statuses = await this.connection.getSignatureStatuses([signature], {
-          searchTransactionHistory: true,
-        });
+        let statuses: Awaited<ReturnType<Connection['getSignatureStatuses']>> | null = null;
+        try {
+          statuses = await this.connection.getSignatureStatuses([signature], {
+            searchTransactionHistory: true,
+          });
+        } catch (pollErr: any) {
+          lastPollError = pollErr?.message ?? String(pollErr); // P1.5: one failed poll says nothing about the transaction; keep polling
+        }
         const status = statuses?.value?.[0];
 
         if (status) {
@@ -178,7 +218,7 @@ export class SolanaRpcTransport implements ExecutionTransport {
             const txDetails = await this.connection.getTransaction(signature, {
               maxSupportedTransactionVersion: 0,
               commitment: 'confirmed',
-            });
+            }).catch(() => null); // best effort: confirmed either way
 
             return {
               signature,
@@ -200,7 +240,7 @@ export class SolanaRpcTransport implements ExecutionTransport {
         confirmed: false,
         confirmDurationMs: Math.round(performance.now() - t0),
         lifecycleState: 'TIMED_OUT',
-        error: `Transaction did not confirm within ${maxWaitMs}ms limit`,
+        error: `Transaction did not confirm within ${maxWaitMs}ms limit${lastPollError ? ` (last status read failed: ${lastPollError})` : ''}`,
       };
     } catch (err: any) {
       return {
@@ -601,6 +641,7 @@ export class JitoTransport implements ExecutionTransport {
 
     // If bundleId is present, check bundle statuses periodically
     let bundleLandedSlot: number | undefined;
+    let lastPollError: string | null = null;
 
     while (Date.now() - startTime < maxWaitMs) {
       if (bundleId && !bundleLandedSlot) {
@@ -634,10 +675,16 @@ export class JitoTransport implements ExecutionTransport {
         }
       }
 
-      // Check on-chain signature confirmation
-      const statuses = await this.connection.getSignatureStatuses([signature], {
-        searchTransactionHistory: true,
-      });
+      // Check on-chain signature confirmation. P1.5 (R1-6, R1-80): an RPC error while polling says nothing about the transaction, so it is
+      // caught here and polling goes on until the deadline (TIMED_OUT, which the caller treats as unconfirmed, never as a revert).
+      let statuses: Awaited<ReturnType<Connection['getSignatureStatuses']>> | null = null;
+      try {
+        statuses = await this.connection.getSignatureStatuses([signature], {
+          searchTransactionHistory: true,
+        });
+      } catch (pollErr: any) {
+        lastPollError = pollErr?.message ?? String(pollErr);
+      }
       const status = statuses?.value?.[0];
 
       if (status) {
@@ -652,10 +699,11 @@ export class JitoTransport implements ExecutionTransport {
         }
 
         if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
+          // The fee read is best effort: the transaction is confirmed whether or not its details can be read now.
           const txDetails = await this.connection.getTransaction(signature, {
             maxSupportedTransactionVersion: 0,
             commitment: 'confirmed',
-          });
+          }).catch(() => null);
 
           return {
             signature,
@@ -676,7 +724,7 @@ export class JitoTransport implements ExecutionTransport {
       confirmed: false,
       confirmDurationMs: Math.round(performance.now() - t0),
       lifecycleState: 'TIMED_OUT',
-      error: `Bundle transaction did not confirm within ${maxWaitMs}ms limit`,
+      error: `Bundle transaction did not confirm within ${maxWaitMs}ms limit${lastPollError ? ` (last status read failed: ${lastPollError})` : ''}`,
     };
   }
 }

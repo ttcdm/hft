@@ -24,8 +24,8 @@ All agents operating in this repository must strictly adhere to the following ar
 
 ## 5. Active Application Runtime Verification
 - **Never certify code health or release readiness solely through unit tests.** Unit tests verify isolated modules, but do not prove that bundling, runtime dependency resolution, loopback networking, and process lifecycle function end-to-end.
-- **Always execute the production binary:**
-  1. Boot the compiled artifact (`node dist/server.cjs`) on an ephemeral test port (e.g., `PORT=3001`).
+- **Always execute the production binary, hermetically.** The simplest way is `npm run build && npm run smoke` (`scripts/smoke.ts`), which does every step below with an empty env file, a scratch database and a keypair path that does not exist. A booted server is a full instance: it reads `.env`, opens `./apex_workstation.db` and loads `./.apex_trading_keypair.json` unless told otherwise, and its startup wallet scan adopts and stop-losses the tokens of whatever wallet it finds. So never boot it next to a running instance, and never from the repo with the defaults.
+  1. Boot the compiled artifact by hand only like this: from a `mkdtemp` cwd, with `APEX_ENV_FILE=''`, a scratch `APEX_DB_PATH` and a `SIGNER_KEYPAIR_PATH` that does not exist, on an ephemeral port. From the repo root: `D=$(mktemp -d) && ln -s "$PWD/dist" "$D/dist" && (cd "$D" && NODE_ENV=production APEX_ENV_FILE='' APEX_DB_PATH="$D/smoke.db" SIGNER_KEYPAIR_PATH="$D/no-keypair.json" APP_PORT=3001 OPERATOR_PASSWORD=smoke-test-pw node dist/server.cjs)` (the server serves the UI from `<cwd>/dist`, hence the link).
   2. Verify clean startup logs with zero unhandled rejections, module resolution errors, or `ERR_INVALID_ARG_VALUE`.
   3. Perform active HTTP smoke requests (`GET /` for UI assets, `GET /api/health`, `POST /api/auth/login`, and `GET /api/auth/session`).
   4. Perform active WebSocket protocol verification (`ws://127.0.0.1:<PORT>/ws/engine`), completing the authentication handshake.

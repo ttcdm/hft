@@ -416,7 +416,14 @@ async function main() {
   await S.waitPast(steps, gDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (g) buy');
   await S.emergencyStopThroughApp(steps); // P1.4, last: it leaves LIVE disarmed and auto OFF. Telegram-path panic sells the LIVE position; kill switch on/off/re-arm buys nothing
 
-  // (f) crash after submit, then recover in a fresh process on the same scratch DB
+  // (f) crash after submit, then recover in a fresh process on the same scratch DB. This process holds that DB's and that key's
+  // instance locks (P1.1), so it stops trading and releases them first; it trades nothing after this.
+  const IL = await import('../server/system/instanceLock');
+  const lockPaths = [IL.dbLockPath(workstationDb.getDbPath()), IL.signerLockPath(kp.publicKey.toBase58())].filter((p): p is string => !!p);
+  if (!S.handOverToChildPhases(steps, {
+    stopTrading: () => coordinator.cleanup(), isLiveArmed: () => coordinator.isLiveArmed(), disarm: () => coordinator.armLiveTrading(false),
+    releaseAllLocks: IL.releaseAllLocks, holdsLock: (p) => IL.readLock(p)?.pid === process.pid, lockPaths,
+  })) return finish();
   const env = { ...process.env, APEX_E2E_SCRATCH: scratch };
   const self = process.argv[1];
   const run = (p: string) => spawnSync(process.execPath, ['--require', path.resolve('scripts/devnet_guard.cjs'), '--import', 'tsx', self, `--phase=${p}`], { env, encoding: 'utf8', timeout: 240_000 });

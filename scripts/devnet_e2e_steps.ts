@@ -978,3 +978,22 @@ export async function releaseGatesOnChain(
     if (wasArmed) st.arm(true, ARM);
   }
 }
+
+/**
+ * (f) the crash and recover phases run in child processes on the same scratch DB and throwaway key, which the main process locked when its
+ * coordinator started (P1.1): a child would exit INSTANCE_LOCKED before it reached the send. So the main process first stops trading (the
+ * exit loop and the other timers; LIVE is already disarmed by (e''')) and releases its locks; it trades nothing after this, it only spawns
+ * the children and prints the summary. Returns whether the hand-over is clean: no lock held, LIVE not armed.
+ */
+export function handOverToChildPhases(
+  s: Pick<HarnessSteps, 'rec'>,
+  d: { stopTrading(): void; isLiveArmed(): boolean; disarm(): void; releaseAllLocks(): void; /** the lock file on disk still names this process */ holdsLock(p: string): boolean; lockPaths: string[] }
+): boolean {
+  if (d.isLiveArmed()) d.disarm();
+  d.stopTrading();
+  d.releaseAllLocks();
+  const still = d.lockPaths.filter((p) => d.holdsLock(p));
+  const ok = still.length === 0 && !d.isLiveArmed();
+  s.rec('(f) main process stopped trading and released its locks', ok, ok ? `released ${d.lockPaths.length} lock(s)` : `still held: ${still.join(', ') || 'none'}; LIVE armed ${d.isLiveArmed()}`);
+  return ok;
+}

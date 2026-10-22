@@ -18,14 +18,7 @@ export interface WalletTraderConfig {
   jitoTipSol: number;
   slippageToleranceBps: number;
   capitalTier: 'MICRO_10' | 'INSTITUTIONAL' | 'CUSTOM';
-  allocatedSol: number;
   isLiveTradingActive: boolean;
-  enabledStrategies: {
-    pumpFunSniper: boolean;
-    marketMaking: boolean;
-    crossArb: boolean;
-    momentumScalp: boolean;
-  };
   riskLimits: {
     maxDailyLossUsd: number;
     maxPositionSizeSol: number;
@@ -37,10 +30,13 @@ export interface WalletTraderConfig {
 export interface LiveWalletState {
   walletAddress: string;
   signerStatus: 'READY' | 'LOCKED' | 'NOT_CONFIGURED';
+  /** The wallet's real SOL balance from the last RPC read; null until one has succeeded. */
   solBalance: number | null;
-  allocatedSol: number;
-  availableSol: number;
   solPriceUsd: number | null;
+  /**
+   * The real balance plus the marked value of the open positions, in dollars; null until both the balance and a SOL price have been
+   * read. (Audit 2026-10-22: it used to be built from `allocatedSol`, a constant per capital tier that looked like a wallet figure.)
+   */
   totalPortfolioValueUsd: number | null;
   activePositions: NormalizedPosition[];
   /** Q35: the header pill reads these; it used to read two fields that were never sent. */
@@ -78,14 +74,7 @@ class PlugAndPlayWalletTrader extends EventEmitter {
       jitoTipSol: execCfg.defaultJitoTipSol,
       slippageToleranceBps: execCfg.maxSlippageBps,
       capitalTier: execCfg.capitalTier,
-      allocatedSol: execCfg.capitalTier === 'MICRO_10' ? 0.07 : 5.0,
       isLiveTradingActive: false,
-      enabledStrategies: {
-        pumpFunSniper: true,
-        marketMaking: false,
-        crossArb: false,
-        momentumScalp: false,
-      },
       riskLimits: {
         maxDailyLossUsd: execCfg.maxDailyLossUsd,
         maxPositionSizeSol: execCfg.maxPositionSizeSol,
@@ -218,11 +207,6 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     if (newConfig.jitoTipSol !== undefined) this.config.jitoTipSol = newConfig.jitoTipSol;
     if (newConfig.slippageToleranceBps !== undefined) this.config.slippageToleranceBps = newConfig.slippageToleranceBps;
     if (newConfig.capitalTier) this.config.capitalTier = newConfig.capitalTier;
-    if (newConfig.allocatedSol !== undefined) this.config.allocatedSol = newConfig.allocatedSol;
-
-    if (newConfig.enabledStrategies) {
-      this.config.enabledStrategies = { ...this.config.enabledStrategies, ...newConfig.enabledStrategies };
-    }
     if (newConfig.riskLimits) {
       this.config.riskLimits = { ...this.config.riskLimits, ...newConfig.riskLimits };
       // C3: the daily-loss limit stays derived from the live SOL price inside the risk engine; only the size is pushed.
@@ -231,7 +215,6 @@ class PlugAndPlayWalletTrader extends EventEmitter {
 
     Logger.info('Wallet Trader configuration updated', {
       wallet: this.config.walletAddress,
-      allocatedSol: this.config.allocatedSol,
       tier: this.config.capitalTier,
     });
 
@@ -247,12 +230,11 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     const mode = executionCoordinator.getExecutionMode();
     const activePositions = executionCoordinator.getPositions(mode, 'ACTIVE');
     const closedPositions = executionCoordinator.getPositions(mode, 'CLOSED');
-    const totalOpenCost = activePositions.reduce((s, p) => s + p.costBasisLamports / 1e9, 0);
     const totalOpenValue = activePositions.reduce((s, p) => s + (p.currentValueSol ?? 0), 0);
-    const availableSol = Math.max(0, this.config.allocatedSol - totalOpenCost);
+    const diag = executionCoordinator.getDiagnostics();
 
     const solPriceUsd = solPriceService.lastKnownPrice(); // null when no price has ever been read
-    const totalPortfolioValueUsd = solPriceUsd === null ? null : (availableSol + totalOpenValue) * solPriceUsd;
+    const totalPortfolioValueUsd = solPriceUsd === null || diag.walletSolBalance === null ? null : (diag.walletSolBalance + totalOpenValue) * solPriceUsd;
     const totalUnrealizedPnLSol = activePositions.reduce((s, p) => s + (Number.isFinite(p.unrealizedPnLSol) ? (p.unrealizedPnLSol as number) : 0), 0);
     const totalRealizedPnLSol = workstationDb.getDailyRealizedPnLSol(mode);
     const totalRealizedPnLUsd = solPriceUsd === null ? null : totalRealizedPnLSol * solPriceUsd;
@@ -265,14 +247,10 @@ class PlugAndPlayWalletTrader extends EventEmitter {
         ? localSigner.getPublicKey().toBase58()
         : 'NO_SIGNER_CONFIGURED';
 
-    const diag = executionCoordinator.getDiagnostics();
-
     return {
       walletAddress,
       signerStatus,
       solBalance: diag.walletSolBalance,
-      allocatedSol: this.config.allocatedSol,
-      availableSol: Number(availableSol.toFixed(4)),
       solPriceUsd: solPriceUsd === null ? null : Number(solPriceUsd.toFixed(2)),
       totalPortfolioValueUsd: totalPortfolioValueUsd === null ? null : Number(totalPortfolioValueUsd.toFixed(2)),
       activePositions,

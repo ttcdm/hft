@@ -87,8 +87,8 @@ describe('R8s: /api/wallet/config cannot raise maxPositionSizeSol past MAX_POSIT
   });
 
   it('a refused request is atomic: other fields in the same body are not applied', async () => {
-    const alloc = walletTrader.getConfig().allocatedSol;
-    await expect(walletTrader.updateConfig({ allocatedSol: alloc + 1, riskLimits: { ...walletTrader.getConfig().riskLimits, maxPositionSizeSol: 50 } })).rejects.toThrow();
-    expect(walletTrader.getConfig().allocatedSol).toBe(alloc);
+    const tip = walletTrader.getConfig().jitoTipSol;
+    await expect(walletTrader.updateConfig({ jitoTipSol: tip + 0.001, riskLimits: { ...walletTrader.getConfig().riskLimits, maxPositionSizeSol: 50 } })).rejects.toThrow();
+    expect(walletTrader.getConfig().jitoTipSol).toBe(tip);
   });
 });

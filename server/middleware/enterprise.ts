@@ -217,13 +217,8 @@ export const WalletConfigSchema = z.object({
   jitoTipSol: z.number().min(0.0001).max(0.2).optional(), // absent leaves the stored value alone (C6)
   slippageToleranceBps: z.number().min(10).max(5000).default(600), // 6.0% default for meme volatility
   capitalTier: z.enum(['MICRO_10', 'INSTITUTIONAL', 'CUSTOM']).default('MICRO_10'),
-  allocatedSol: z.number().min(0.01).max(5000).default(0.07), // ~0.07 SOL = ~$10
-  enabledStrategies: z.object({
-    pumpFunSniper: z.boolean().default(true),
-    marketMaking: z.boolean().default(false),
-    crossArb: z.boolean().default(false),
-    momentumScalp: z.boolean().default(false),
-  }),
+  // Audit 2026-10-22: `allocatedSol` and `enabledStrategies` are gone. Nothing read the strategy toggles, and `allocatedSol` was a
+  // constant that was echoed back as if it were a wallet figure. Unknown keys are dropped, as for the other removed settings (Q34).
   riskLimits: z.object({
     maxDailyLossUsd: z.number().min(1).max(100000).default(2.5),
     maxPositionSizeSol: z.number().min(0.005).max(50).default(0.02),

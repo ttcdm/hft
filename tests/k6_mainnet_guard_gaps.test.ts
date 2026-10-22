@@ -109,7 +109,7 @@ describe('K6: mainnet-guard gaps', () => {
 
 describe('K6: POST /api/wallet/config path', () => {
   it('the schema no longer defaults rpcEndpoint (a save used to re-point the RPC at the public devnet URL)', () => {
-    const parsed = WalletConfigSchema.parse({ walletAddress: 'So11111111111111111111111111111111111111112', enabledStrategies: {}, riskLimits: {} });
+    const parsed = WalletConfigSchema.parse({ walletAddress: 'So11111111111111111111111111111111111111112', riskLimits: {} });
     expect(parsed.rpcEndpoint).toBeUndefined();
   });
 
@@ -126,7 +126,7 @@ describe('K6: POST /api/wallet/config path', () => {
   it('a config save without rpcEndpoint does not touch the connection', async () => {
     const setSpy = vi.spyOn(executionCoordinator, 'setRpcEndpoint');
     vi.spyOn(solPriceService, 'refresh').mockResolvedValue(solPriceService.getPrice());
-    await walletTrader.updateConfig({ allocatedSol: 0.07 } as any);
+    await walletTrader.updateConfig({ slippageToleranceBps: walletTrader.getConfig().slippageToleranceBps });
     expect(setSpy).not.toHaveBeenCalled();
   });
 });

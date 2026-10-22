@@ -95,7 +95,7 @@ Step-by-step procedures, with the commands: [`docs/RUNBOOK.md`](docs/RUNBOOK.md)
 
 ## 6. Settings that are stored but change nothing (checked against the code, Q34)
 
-S215 removed the settings this section used to list (`snipeThresholdScore`, `autoForwardAlerts`, `webhookActive`, `isAutoSnipeEnvEnabled`, the per-caller auto-snipe marker, `requireMintRevoked`, `ENABLE_SYNTHETIC_SOCIAL`, `minConfidenceScore`, `requireConfluenceScore`, the unused wallet-config fields and `priorityTipSol`). None of them was read. The auto-snipe score gate is the confluence threshold: default 70, starting from `CONFLUENCE_MIN_SCORE`, editable at runtime (`POST /api/auto/threshold`, S187).
+S215 removed the settings this section used to list (`snipeThresholdScore`, `autoForwardAlerts`, `webhookActive`, `isAutoSnipeEnvEnabled`, the per-caller auto-snipe marker, `requireMintRevoked`, `ENABLE_SYNTHETIC_SOCIAL`, `minConfidenceScore`, `requireConfluenceScore`, the unused wallet-config fields and `priorityTipSol`), and the 2026-10-22 audit removed `enabledStrategies` (four strategy toggles nothing read) and `allocatedSol` (a constant per capital tier, 0.07 or 5 SOL, that the wallet state echoed as `allocatedSol` / `availableSol` as if it were a wallet figure; `totalPortfolioValueUsd` now comes from the real balance and is null until one has been read). None of them was read. The auto-snipe score gate is the confluence threshold: default 70, starting from `CONFLUENCE_MIN_SCORE`, editable at runtime (`POST /api/auto/threshold`, S187).
 
 | Setting | Where it lives | What it actually does |
 |---|---|---|

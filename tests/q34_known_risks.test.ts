@@ -16,8 +16,8 @@ describe('Q34/S215: the do-nothing settings are gone', () => {
     expect(typeof (pumpfun.pumpFunService as any).toggleCallerAutoSnipe).toBe('undefined');
     // the request schemas drop the removed fields instead of accepting them, and a wallet address is no longer required
     const w = WalletConfigSchema.parse({ walletAddress: 'x', wsRpcEndpoint: 'wss://a', jitoTipAccount: 'y', autoStartTrading: true, enabledStrategies: {},
-      riskLimits: { requireConfluenceScore: 90 } }) as any;
-    for (const k of ['walletAddress', 'wsRpcEndpoint', 'jitoTipAccount', 'autoStartTrading']) expect(w[k], k).toBeUndefined();
+      allocatedSol: 0.07, riskLimits: { requireConfluenceScore: 90 } }) as any;
+    for (const k of ['walletAddress', 'wsRpcEndpoint', 'jitoTipAccount', 'autoStartTrading', 'enabledStrategies', 'allocatedSol']) expect(w[k], k).toBeUndefined();
     expect(w.riskLimits.requireConfluenceScore).toBeUndefined();
     expect((ClosePositionSchema.parse({ positionId: 'p', priorityTipSol: 0.01 }) as any).priorityTipSol).toBeUndefined();
     expect(SniperConfigPatchSchema.parse({ minConfidenceScore: 90, requireMintRevoked: false, maxSlippagePct: 5 })).toEqual({ maxSlippagePct: 5 });

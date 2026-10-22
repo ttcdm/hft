@@ -16,7 +16,7 @@ Where to look:
 
 | Route | Shows |
 |---|---|
-| `GET /api/system/checks` | cluster, signer, RPC, reconciliation, halt, kill switch and circuit breaker, feed, marks, database, and the open operator alerts (`TRADING_HALTED`, `EXIT_FAILING`, `EXIT_QUOTE_FAILING`, `POSITION_MARK_UNAVAILABLE`, ...) |
+| `GET /api/system/checks` | cluster, signer, RPC, reconciliation, halt, kill switch and circuit breaker, feed, marks, database, and the open operator alerts (`TRADING_HALTED`, `EXIT_FAILING`, `EXIT_QUOTE_FAILING`, `EXIT_RATE_LIMITED`, `POSITION_MARK_UNAVAILABLE`, ...) |
 | `GET /api/execution/can-arm` | `allowed`, plus every reason arming would fail |
 | `GET /api/execution/mode` | coordinator mode and `isLiveArmed` |
 | `GET /api/auto/status` | auto mode, session, budgets, kill triggers |

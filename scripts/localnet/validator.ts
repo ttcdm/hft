@@ -150,7 +150,7 @@ export class LocalnetValidator {
   private logsDroppedWhileDown = 0;
   private nextSub = 1;
   private slot = 1000n;
-  private sendFailures: { remaining: number; error: string } | null = null;
+  private sendFailures: { remaining: number; error: string; mode: SendFailureMode } | null = null;
   /** Raw transactions (competing trades) that land immediately BEFORE the next sendTransaction from the app. */
   private frontrun: Uint8Array[] = [];
   /** When true the next sendTransaction lands on-chain but its HTTP response is never sent (process-kill tests). */
@@ -261,9 +261,15 @@ export class LocalnetValidator {
     this.validBlockhashes = [];
     this.noteBlockhash();
   }
-  /** Make the next `count` sendRawTransaction calls fail before reaching the bank. */
-  failNextSends(count: number, error = 'localnet: injected send failure') {
-    this.sendFailures = { remaining: count, error };
+  /**
+   * Make the next `count` sendRawTransaction calls fail before reaching the bank. `mode` 'jsonrpc' (default): HTTP 200 with JSON-RPC
+   * error -32002 and `error` as its message. S245: 'http429': HTTP 429 with a JSON-RPC -32007 body, as the public devnet RPC answers
+   * over its rate limit ("15/second request limit reached"); 'rpc32007': the same -32007 error with HTTP 200.
+   */
+  failNextSends(count: number, error?: string, mode: SendFailureMode = 'jsonrpc') {
+    if (mode !== 'jsonrpc' && mode !== 'http429' && mode !== 'rpc32007') throw new RpcError(-32602, `localnet_failNextSends: unknown mode ${String(mode)}`);
+    const fallback = mode === 'jsonrpc' ? 'localnet: injected send failure' : '15/second request limit reached - reduce your rate (localnet: injected)';
+    this.sendFailures = { remaining: count, error: error || fallback, mode };
   }
   /**
    * Make the next `count` calls of the read method `method` fail like an overloaded RPC. With `address`, only calls whose params
@@ -363,7 +369,8 @@ export class LocalnetValidator {
     }
     if (!internal && this.sendFailures && this.sendFailures.remaining > 0) {
       this.sendFailures.remaining--;
-      throw new RpcError(-32002, this.sendFailures.error);
+      if (this.sendFailures.mode === 'http429') throw new InjectedHttpStatus(429, this.sendFailures.error, -32007);
+      throw new RpcError(this.sendFailures.mode === 'rpc32007' ? -32007 : -32002, this.sendFailures.error);
     }
     const tx = VersionedTransaction.deserialize(raw);
     this.verifySignatures(tx);
@@ -596,7 +603,8 @@ export class LocalnetValidator {
       }
       // test controls (not part of the Solana RPC surface)
       case 'localnet_expireBlockhash': this.expireBlockhash(); return true;
-      case 'localnet_failNextSends': this.failNextSends(Number(params[0] ?? 1), params[1]); return true;
+      // params: [count, message?, mode?] ('jsonrpc' default, 'http429' or 'rpc32007'); see failNextSends
+      case 'localnet_failNextSends': this.failNextSends(Number(params[0] ?? 1), params[1] ?? undefined, params[2] ?? 'jsonrpc'); return true;
       case 'localnet_frontrunNext': this.frontrun.push(Buffer.from(params[0], 'base64')); return true;
       case 'localnet_setAccount': { // params: [pubkey, { lamports, dataBase64, owner }] writes an account straight into the bank (test setup only)
         const a = params[1];
@@ -660,7 +668,7 @@ export class LocalnetValidator {
           } catch (e: any) {
             if (e instanceof InjectedHttpStatus) {
               httpStatus = { code: e.status };
-              return { jsonrpc: '2.0', id: r.id, error: { code: e.status, message: e.message } };
+              return { jsonrpc: '2.0', id: r.id, error: { code: e.rpcCode ?? e.status, message: e.message } };
             }
             if (e instanceof RpcError) return { jsonrpc: '2.0', id: r.id, error: { code: e.code, message: e.message } };
             return { jsonrpc: '2.0', id: r.id, error: { code: -32603, message: String(e?.message ?? e) } };
@@ -751,9 +759,12 @@ class RpcError extends Error {
 
 /** Thrown by `handle` when a test control wants the whole HTTP reply to carry this status (with a JSON-RPC error body). */
 class InjectedHttpStatus extends Error {
-  constructor(public status: number, message: string) {
+  /** `rpcCode`: the JSON-RPC error code of the body (default: the HTTP status). */
+  constructor(public status: number, message: string, public rpcCode?: number) {
     super(message);
   }
 }
+
+type SendFailureMode = 'jsonrpc' | 'http429' | 'rpc32007';
 
 export { SystemProgram };

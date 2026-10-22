@@ -97,6 +97,15 @@ export interface ExecutionResponse {
   correlationId: string;
 }
 
+/**
+ * S245: the waits before resending a SELL that the RPC refused with a rate limit (HTTP 429, -32007, "request limit reached"): three
+ * resends, 0.5 s, 1 s and 2 s apart. Every sell gets them (the stop-loss, the hard stop and the panic among them: one rate-limit answer
+ * must not leave a position open). 3.5 s of waits plus four bounded sends (RPC_REQUEST_TIMEOUT_MS each) is far inside a blockhash's
+ * ~60-90 s life, and the resent bytes are the same signed transaction, so it can land at most once. A BUY gets none: it is optional,
+ * its quote ages on a fast curve, and the next signal re-quotes; a rate-limited buy fails closed as SUBMIT_FAILED.
+ */
+export const SELL_RATE_LIMIT_BACKOFF_MS: readonly number[] = [500, 1_000, 2_000];
+
 /** Exit reasons that run even while all trading is halted (see closePosition). */
 // A blockhash lives ~60-90s; after this a sent-but-unseen sell can no longer land.
 const PENDING_SELL_WINDOW_MS = 100_000;
@@ -1748,7 +1757,21 @@ export class ExecutionCoordinator {
         });
       }
 
-      const rpcSubmit = await traced('tx.submit', () => this.rpcTransport.submit(tx), { 'apex.transport': 'SOLANA_RPC', 'apex.side': side });
+      // S245: a rate-limited send was refused, not lost: a SELL is resent (same signed bytes) after short waits; a BUY is not.
+      const rpcSubmit = await traced('tx.submit', () => this.rpcTransport.submitThroughRateLimit(tx, side === 'SELL' ? SELL_RATE_LIMIT_BACKOFF_MS : []), { 'apex.transport': 'SOLANA_RPC', 'apex.side': side });
+      if (rpcSubmit.rateLimited) {
+        // Nothing was accepted (isRateLimitedSendError): SUBMIT_FAILED, so the PENDING row becomes REVERTED, a buy leaves no unresolved
+        // row for the mint and a sell leaves no pending sell; the next exit pass (or panic) may send again.
+        Logger.error(`[S245] ${side} for order ${orderId}: the RPC rate-limited the send ${rpcSubmit.rateLimitedResends + 1} time(s); nothing was accepted`);
+        workstationDb.logJournal('SEND_RATE_LIMITED', correlationId, 'LIVE', { orderId, side, mint, signature: rpcSubmit.signature, tries: rpcSubmit.rateLimitedResends + 1, error: rpcSubmit.error });
+        return {
+          success: false,
+          signature: rpcSubmit.signature || lastSignature,
+          transport: 'SOLANA_RPC',
+          error: `RPC_RATE_LIMITED: the RPC refused the ${side.toLowerCase()} ${rpcSubmit.rateLimitedResends + 1} time(s) with a rate limit; nothing was accepted (${rpcSubmit.error})`,
+          lifecycleState: 'SUBMIT_FAILED',
+        };
+      }
       // P1.5 (R1-2): a send that failed without proof of rejection (fetch failed, socket reset, 502/504 after forwarding) may still land.
       // It is watched like any sent transaction below: confirmed means success, failed on chain means REVERTED, unseen means unconfirmed
       // (the buy path then keeps it RECONCILIATION_REQUIRED with orphan recovery, the sell path records a pending sell). Never REVERTED here.
@@ -2913,9 +2936,10 @@ export class ExecutionCoordinator {
    * toward backoff or the EXIT_FAILING alert. Q12: waiting for a pending sell, an undeterminable venue, a missing signer and a zero
    * quantity are not rejected sends; counting them walked the ladder to 4000 bps before the real resend. P1.6: nor are a refusal by the
    * cluster guard, an invalid sell percentage, or anything thrown before the send (closePositionImpl reports those with `notSent`).
+   * S245: nor is a sell the RPC rate-limited past every resend (RPC_RATE_LIMITED): it was refused, not priced wrong; it raises EXIT_RATE_LIMITED.
    */
   private static isNonAttemptExitError(error?: string): boolean {
-    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found|SELL_PENDING_VERIFICATION|UNKNOWN_TRADING_VENUE|Trading venue for mint|Signer is not configured|Calculated sell quantity is zero|CLUSTER_GUARD|INVALID_SELL_PCT|BALANCE_UNTRUSTED)/.test(error) || ExecutionCoordinator.isQuoteFailure(error);
+    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found|SELL_PENDING_VERIFICATION|UNKNOWN_TRADING_VENUE|Trading venue for mint|Signer is not configured|Calculated sell quantity is zero|CLUSTER_GUARD|INVALID_SELL_PCT|BALANCE_UNTRUSTED|RPC_RATE_LIMITED)/.test(error) || ExecutionCoordinator.isQuoteFailure(error);
   }
 
   /**
@@ -2932,9 +2956,14 @@ export class ExecutionCoordinator {
       this.exitFailures.delete(positionId);
       this.clearOperatorAlert('EXIT_FAILING', positionId);
       this.clearOperatorAlert('EXIT_QUOTE_FAILING', positionId);
+      this.clearOperatorAlert('EXIT_RATE_LIMITED', positionId);
       return;
     }
     const quoteFailure = ExecutionCoordinator.isQuoteFailure(res.error);
+    if (mode === 'LIVE' && /^RPC_RATE_LIMITED/.test(res.error || '')) {
+      // S245: no fee was spent and wider slippage cannot help, but an exit the RPC keeps refusing is something an operator must hear about.
+      this.raiseOperatorAlert('EXIT_RATE_LIMITED', `Exit for position ${positionId.slice(0, 8)} was refused by the RPC's rate limit after ${SELL_RATE_LIMIT_BACKOFF_MS.length} resends; nothing was sent. Retrying on the next exit pass; use a private RPC if this persists.`, positionId);
+    }
     if (mode === 'LIVE' && (quoteFailure || (res.notSent && !ExecutionCoordinator.isNonAttemptExitError(res.error)))) {
       // No fee was spent and the ladder must not advance, but a stop-loss that cannot be priced or built is exactly what an operator must hear about.
       this.raiseOperatorAlert('EXIT_QUOTE_FAILING', `Exit for position ${positionId.slice(0, 8)} cannot be quoted or built, so nothing is being sent (${String(res.error).slice(0, 140)}). Retrying every tick; close it manually if this persists.`, positionId);
@@ -3348,7 +3377,10 @@ export class ExecutionCoordinator {
 
       if (!subRes.success || !subRes.signature) {
         if (subRes.unconfirmed && subRes.signature) this.pendingSells.set(positionId, { signature: subRes.signature, ts: Date.now() });
-        return { success: false, pnlSol: 0, error: subRes.error || 'Failed to submit or confirm sell bundle' };
+        // S245: a sell the RPC rate-limited past every resend was never accepted: no pending sell (unconfirmed is false), no fee, and not a
+        // slippage failure, so it is reported as not sent and the ladder does not widen.
+        const rateLimited = /^RPC_RATE_LIMITED/.test(subRes.error || '');
+        return { success: false, pnlSol: 0, error: subRes.error || 'Failed to submit or confirm sell bundle', ...(rateLimited ? { notSent: true } : {}) };
       }
 
       // S2: the basis being sold, AFTER any clamp to the wallet balance above (target.costBasisLamports was scaled there)

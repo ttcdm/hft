@@ -40,17 +40,42 @@ export type BundleLifecycleState =
  * P1.5 (R1-2, R1-70, R1-82, R1-113): the send errors that prove the RPC did not accept the transaction. Only a JSON-RPC error object
  * the node returned can prove that (web3.js SendTransactionError: a preflight failure, a sanitize or deserialize failure, a failed signature
  * check, an unknown blockhash), or a message that names one of those. Everything else
- * (fetch failed, a socket reset, a timeout, an HTTP 5xx or 429 page, an "already processed" answer that means it landed earlier) leaves the
+ * (fetch failed, a socket reset, a timeout, an HTTP 5xx page, an "already processed" answer that means it landed earlier) leaves the
  * outcome unknown: the transaction may have been forwarded and may land.
+ *
+ * S245: a rate-limit refusal (`isRateLimitedSendError`) is definite too. The RPC's limiter answers before the request reaches the node,
+ * so nothing was accepted or forwarded; it used to be read as unknown, which left a pending sell that blocked every later sell of that
+ * position (the stop-loss and the panic included) for the pending window.
  */
 export const DEFINITE_SEND_REJECTION = /sanitiz|failed to deserialize|signature verification fail|Transaction signature verification failure|Blockhash not found|invalid transaction/i;
 
 /** "Already processed": the node has seen this transaction, so it may well be on chain. Never a definite rejection. */
 const ALREADY_PROCESSED = /already (?:been )?processed/i;
 
+/**
+ * S245: the shapes a rate-limit refusal of sendTransaction takes through web3.js 1.x (lib/index.cjs.js):
+ *  - HTTP 429. With `disableRetryOnRateLimit` (the trading Connection, rpcConnection.ts) web3.js does not retry and throws a plain
+ *    `Error(\`${status} ${statusText}: ${body}\`)`, so the message starts with "429" (statusText may be empty over HTTP/2, "429 : {...}"),
+ *    followed by the JSON-RPC body (public devnet: code -32007 or 429, "15/second request limit reached", "Too many requests ...").
+ *  - HTTP 200 with a JSON-RPC error body: `sendEncodedTransaction` throws `SendTransactionError` whose message carries only the
+ *    error's message text (the code is dropped), e.g. "Transaction  resulted in an error. \n15/second request limit reached ...".
+ *  - a `SolanaJSONRPCError`-like object with `code` -32007 or -32005 (the codes providers use for "limit reached" / "overloaded").
+ */
+export const RATE_LIMITED_SEND = /request limit reached|too many requests|rate[ -]?limit(?:ed| exceeded| reached)|"code"\s*:\s*-3200[57]\b/i;
+export const RATE_LIMIT_RPC_CODES: ReadonlySet<number> = new Set([-32005, -32007, 429]);
+
+export function isRateLimitedSendError(err: unknown): boolean {
+  const code = Number((err as any)?.code);
+  if (Number.isFinite(code) && RATE_LIMIT_RPC_CODES.has(code)) return true;
+  const msg = String((err as any)?.message ?? err ?? '');
+  if (ALREADY_PROCESSED.test(msg)) return false;
+  return /^429\b/.test(msg) || RATE_LIMITED_SEND.test(msg);
+}
+
 export function isDefiniteSendRejection(err: unknown): boolean {
   const msg = String((err as any)?.message ?? err ?? '');
   if (ALREADY_PROCESSED.test(msg)) return false;
+  if (isRateLimitedSendError(err)) return true; // S245: refused by the RPC's limiter before anything was accepted
   // web3.js throws SendTransactionError only when the RPC answered sendTransaction with a JSON-RPC error object (a preflight failure such as
   // -32002, a failed signature check, a node that is behind). The node returns those before it forwards anything. An HTTP error page, a
   // timeout or a reset socket is a plain Error and stays ambiguous.
@@ -58,12 +83,22 @@ export function isDefiniteSendRejection(err: unknown): boolean {
   return DEFINITE_SEND_REJECTION.test(msg);
 }
 
+/**
+ * S245: the wait before each resend of a send the RPC refused with a rate limit. Tests replace `sleep` with a spy (it is the only clock
+ * the resend loop reads), so they need not wait for real.
+ */
+export const sendBackoff = {
+  sleep: (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
 /** What one submit attempt returned: the signature, which transport, timing and, on failure, the reason. */
 export interface SubmitResult {
   /** P1.5: the transaction's own signature whenever it was signed, also when the send failed (it is known before anything is sent). */
   signature: string;
   /** P1.5: the send failed without proof that the transaction was not accepted. It may still land; the caller must watch it, not call it REVERTED. */
   ambiguous?: boolean;
+  /** S245: the RPC refused the send with a rate limit (HTTP 429, -32007, "request limit reached"). Definite: nothing was accepted, so resending the same signed transaction is safe. */
+  rateLimited?: boolean;
   bundleId?: string;
   transport: 'SOLANA_RPC' | 'JITO';
   success: boolean;
@@ -141,17 +176,36 @@ export class SolanaRpcTransport implements ExecutionTransport {
       this.lastRequestTimestamp = Date.now();
       this.lastLatencyMs = duration;
       const ambiguous = !isDefiniteSendRejection(err);
-      Logger.error(`RPC submit failed${ambiguous ? ' (outcome unknown: it may have been forwarded)' : ''}: ${err.message}`);
+      const rateLimited = isRateLimitedSendError(err);
+      Logger.error(`RPC submit failed${ambiguous ? ' (outcome unknown: it may have been forwarded)' : rateLimited ? ' (rate limited: not accepted)' : ''}: ${err.message}`);
       return {
         signature: localSignature(tx),
         transport: 'SOLANA_RPC',
         success: false,
         ambiguous,
+        rateLimited,
         submitDurationMs: duration,
         lifecycleState: 'SUBMIT_FAILED',
         error: err.message,
       };
     }
+  }
+
+  /**
+   * S245: `submit`, and while the RPC refuses it with a rate limit, wait `backoffMs[i]` and send the same signed transaction again (one
+   * resend per entry). Safe: a rate-limited send was not accepted, and a resend carries the same signature, so it can land at most once.
+   * Any other outcome (sent, ambiguous, another definite rejection) is returned at once. `rateLimitedResends` counts the resends.
+   */
+  public async submitThroughRateLimit(tx: VersionedTransaction, backoffMs: readonly number[]): Promise<SubmitResult & { rateLimitedResends: number }> {
+    let res = await this.submit(tx);
+    let resends = 0;
+    while (res.rateLimited && resends < backoffMs.length) {
+      Logger.warn(`[S245] RPC rate-limited the send of ${res.signature.slice(0, 8) || 'an unsigned transaction'}; resending in ${backoffMs[resends]} ms (${resends + 1}/${backoffMs.length})`);
+      await sendBackoff.sleep(backoffMs[resends]);
+      resends++;
+      res = await this.submit(tx);
+    }
+    return { ...res, rateLimitedResends: resends };
   }
 
   /** Retries `submit` (default 2 retries, 200 ms apart). Returns the last result and the number of attempts. */

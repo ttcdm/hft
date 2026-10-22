@@ -27,6 +27,9 @@ const keyPath = path.join(scratch, 'throwaway-keypair.json');
 
 // ---- sanitized environment: must be set before any server module is imported ----
 process.env.SOLANA_RPC_URL = process.env.DEVNET_RPC_URL || 'https://api.devnet.solana.com';
+// S245: the public devnet RPC refuses more than ~15 requests a second per client (HTTP 429), and a refused stop-loss send used to stick.
+// Against it the trading Connection spaces its requests to 10 a second (sends first); a private DEVNET_RPC_URL is not throttled unless asked.
+if (!process.env.RPC_MAX_REQUESTS_PER_SEC && /(^|\/\/)api\.devnet\.solana\.com/i.test(process.env.SOLANA_RPC_URL)) process.env.RPC_MAX_REQUESTS_PER_SEC = '10';
 // Everything printed goes through safe(): a private DEVNET_RPC_URL carries its key in the path and names its endpoint in the host.
 const safe = (t: unknown) => redact(String(t), [process.env.DEVNET_RPC_URL]);
 // No block engine: devnet's real configuration. A dead Jito URL makes readiness report Jito OFFLINE and arming refuses, so the RPC transport is used directly.

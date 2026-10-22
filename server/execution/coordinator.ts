@@ -886,20 +886,18 @@ export class ExecutionCoordinator {
       for (const pos of activeLivePositions) {
         try {
           const mintPubkey = new PublicKey(pos.mint);
-          // Query ATA balance using position's actual token program (supports Token-2022 & standard SPL)
-          const tokenProgramId = pos.baseTokenProgram ? new PublicKey(pos.baseTokenProgram) : undefined;
-          const ata = PumpCurveService.getAssociatedTokenAddress(mintPubkey, walletPubkey, tokenProgramId);
           // N5: "the account does not exist" is a confirmed zero; any other RPC failure is unknown and must not close a position.
-          let onChainAmount: bigint | null = null;
-          try {
-            const balRes = await this.connection.getTokenAccountBalance(ata, 'confirmed');
-            onChainAmount = BigInt(balRes?.value?.amount ?? '0');
-          } catch (e: any) {
-            if (/could not find account|Invalid param/i.test(String(e?.message))) onChainAmount = 0n;
-            else throw e;
-          }
+          // Audit 2026-10-22 (F1): the read goes through `readHeldTokens`, the exit path's read (P1.6), so an empty answer from an RPC
+          // that is not on the allowed cluster, or from a slot before the buy landed, is `untrusted` and leaves the row open too.
+          const read = await this.readHeldTokens(pos, walletPubkey, mintPubkey);
+          if (read.held === null) throw new Error(read.error ?? 'the token balance could not be read');
+          const onChainAmount = read.held;
 
-          if (onChainAmount <= 0n && unsettledSellMints.has(pos.mint)) {
+          if (onChainAmount <= 0n && read.untrusted) {
+            mismatchesCount++; // unknown is not zero: the row stays open and readiness stays at MISMATCH until a trusted read
+            issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) shows no tokens, but the read is not trusted (${read.untrusted}); left open`);
+            this.scheduleReconcileRetry();
+          } else if (onChainAmount <= 0n && unsettledSellMints.has(pos.mint)) {
             mismatchesCount++;
             issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) shows no tokens but its sell ${String(unsettledSellMints.get(pos.mint)).slice(0, 8)}... is not settled yet; left open so the fill and its PnL can be applied`);
             this.scheduleReconcileRetry();
@@ -3419,8 +3417,9 @@ export class ExecutionCoordinator {
    * not exist, null when the read failed for another reason (the caller then sells what the row says). A zero or absent answer closes the
    * row without a sell, so it must come from a read that can be trusted: `untrusted` (a non-attempt error the exit returns as it is) is
    * set when the RPC is not on the allowed cluster, or when its answer is from a slot before the position's buy landed (a lagging node).
+   * `error` carries the RPC's message when `held` is null. Startup reconciliation (step 4b) reads through this too, with the same rules.
    */
-  private async readHeldTokens(target: NormalizedPosition, owner: PublicKey, mint: PublicKey): Promise<{ held: bigint | null; untrusted?: string }> {
+  private async readHeldTokens(target: NormalizedPosition, owner: PublicKey, mint: PublicKey): Promise<{ held: bigint | null; untrusted?: string; error?: string }> {
     const tp = target.baseTokenProgram ? new PublicKey(target.baseTokenProgram) : TOKEN_PROGRAM_ID;
     const ata = PumpCurveService.getAssociatedTokenAddress(mint, owner, tp);
     let held: bigint;
@@ -3431,7 +3430,7 @@ export class ExecutionCoordinator {
       held = BigInt(bal?.value?.amount ?? '0');
       slot = bal?.context?.slot;
     } catch (e: any) {
-      if (!/could not find account|Invalid param/i.test(String(e?.message))) return { held: null };
+      if (!/could not find account|Invalid param/i.test(String(e?.message))) return { held: null, error: String(e?.message ?? e) };
       held = 0n;
       absent = true;
     }

@@ -27,18 +27,13 @@ import {
   OnlinePumpAmmSdk,
   canonicalPumpPoolPda,
   buyQuoteInput,
-  buyBaseInput,
   sellBaseInput,
-  sellQuoteInput,
-  computeFeesBps,
 } from '@pump-fun/pump-swap-sdk';
 import { Logger } from '../middleware/enterprise';
 import { ExecutionMode, TradingVenue } from '../core/types';
 import { PumpCurveService, NO_CURVE_REASONS, type MarketStateFailure } from './pumpCurve';
 
 export type { ExecutionMode, TradingVenue };
-
-export { buyQuoteInput, buyBaseInput, sellBaseInput, sellQuoteInput, computeFeesBps, canonicalPumpPoolPda };
 
 /** Decoded canonical pool for one mint: reserves, token programs, fee and creator fields, and the spot price in SOL per token. `effectiveQuoteReserve` is real plus virtual quote reserves; the spot price uses it. */
 export interface PumpSwapExecutionState {
@@ -262,7 +257,7 @@ export class PumpSwapVenueService {
     return globalConfig;
   }
 
-  /** Quote helpers (1 to 4) wrap the SDK's pure maths with this app's pool state. They read nothing from the chain. No production caller; tests only. */
+  /** Quote helpers 1 and 3 wrap the SDK's pure maths with this app's pool state. They read nothing from the chain. No production caller; tests only. */
   // Quoting helper 1: Buy with exact Quote (SOL) input -> Base tokens out
   public static quotePumpSwapBuyQuoteInput(params: {
     solAmountLamports: bigint;
@@ -294,31 +289,6 @@ export class PumpSwapVenueService {
     };
   }
 
-  // Quoting helper 2: Buy target Base tokens -> Quote (SOL) input required
-  public static quotePumpSwapBuyBaseInput(params: {
-    baseAmountTokens: bigint;
-    slippageBps?: number;
-    swapState: any;
-  }) {
-    const { baseAmountTokens, slippageBps = 800, swapState } = params;
-    return buyBaseInput({
-      base: new BN(baseAmountTokens.toString()),
-      slippage: slippageBps / 100,
-      baseReserve: swapState.poolBaseAmount,
-      quoteReserve: swapState.poolQuoteAmount,
-      virtualQuoteReserves: swapState.pool.virtualQuoteReserves || new BN(0),
-      globalConfig: this.normalizeGlobalConfig(swapState.globalConfig),
-      feeConfig: swapState.feeConfig,
-      baseMintAccount: this.normalizeBaseMintAccount(swapState.baseMintAccount),
-      baseMint: swapState.baseMint,
-      coinCreator: swapState.pool.coinCreator,
-      creator: swapState.pool.creator,
-      quoteMint: swapState.pool.quoteMint,
-      isMayhemMode: Boolean(swapState.pool.isMayhemMode),
-      creatorFeeBps: new BN(swapState.pool.creatorFeeBps ? swapState.pool.creatorFeeBps.toString() : '0'),
-    });
-  }
-
   // Quoting helper 3: Sell exact Base tokens -> Quote (SOL) output proceeds
   public static quotePumpSwapSellBaseInput(params: {
     tokenAmountRaw: bigint;
@@ -328,31 +298,6 @@ export class PumpSwapVenueService {
     const { tokenAmountRaw, slippageBps = 800, swapState } = params;
     return sellBaseInput({
       base: new BN(tokenAmountRaw.toString()),
-      slippage: slippageBps / 100,
-      baseReserve: swapState.poolBaseAmount,
-      quoteReserve: swapState.poolQuoteAmount,
-      virtualQuoteReserves: swapState.pool.virtualQuoteReserves || new BN(0),
-      globalConfig: this.normalizeGlobalConfig(swapState.globalConfig),
-      feeConfig: swapState.feeConfig,
-      baseMintAccount: this.normalizeBaseMintAccount(swapState.baseMintAccount),
-      baseMint: swapState.baseMint,
-      coinCreator: swapState.pool.coinCreator,
-      creator: swapState.pool.creator,
-      quoteMint: swapState.pool.quoteMint,
-      isMayhemMode: Boolean(swapState.pool.isMayhemMode),
-      creatorFeeBps: new BN(swapState.pool.creatorFeeBps ? swapState.pool.creatorFeeBps.toString() : '0'),
-    });
-  }
-
-  // Quoting helper 4: Sell target Quote (SOL) output -> Base tokens required
-  public static quotePumpSwapSellQuoteInput(params: {
-    solAmountLamports: bigint;
-    slippageBps?: number;
-    swapState: any;
-  }) {
-    const { solAmountLamports, slippageBps = 800, swapState } = params;
-    return sellQuoteInput({
-      quote: new BN(solAmountLamports.toString()),
       slippage: slippageBps / 100,
       baseReserve: swapState.poolBaseAmount,
       quoteReserve: swapState.poolQuoteAmount,

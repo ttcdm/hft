@@ -121,20 +121,6 @@ export interface ApiErrorResponse {
   };
 }
 
-export class AppError extends Error {
-  public statusCode: number;
-  public code: string;
-  public details?: any;
-
-  constructor(message: string, statusCode = 500, code = 'INTERNAL_ERROR', details?: any) {
-    super(message);
-    this.statusCode = statusCode;
-    this.code = code;
-    this.details = details;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
 export function errorHandler(err: any, req: Request, res: Response, next: NextFunction) {
   const correlationId = (req as any).correlationId || crypto.randomUUID();
   const statusCode = err.statusCode || (err instanceof z.ZodError ? 400 : 500);

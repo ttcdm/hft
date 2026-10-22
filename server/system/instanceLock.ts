@@ -160,10 +160,6 @@ export function releaseAllLocks(): void {
   for (const p of [...held.keys()]) releaseLock(p);
 }
 
-export function holdsLock(lockPath: string): boolean {
-  return held.has(lockPath);
-}
-
 /** No lock for an in-memory database: nothing is shared between processes. */
 export function dbLockPath(dbPath: string): string | null {
   if (!dbPath || dbPath === ':memory:' || dbPath.startsWith('file::memory:')) return null;

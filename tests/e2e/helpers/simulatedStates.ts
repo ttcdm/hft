@@ -9,8 +9,6 @@ export const VALID_PUMP_MINT_1 = new PublicKey('CzLSujWBLFsSjncfkh59rQD4NJYsZUMf
 export const VALID_PUMP_MINT_2 = new PublicKey('2zMMhcVQEXDtdE6vsFS7S7D5oUodfJHE8vd1gnBouauv');
 export const GRADUATED_PUMP_MINT = new PublicKey('ED5nyyWEzpPPiWimP8vYm7sD7TD3LAt3Q3gRTWHzPJBY');
 export const TOKEN_2022_MINT = new PublicKey('4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU');
-export const INVALID_FORMAT_MINT = 'NotAValidSolanaBase58AddressString!!!';
-export const UNKNOWN_MINT = new PublicKey('9xQeWvG816bUx9EPjHmaT23yvVM2ZWbrrpZb9PusVFin');
 
 export const DUMMY_FEE_RECIPIENT = new PublicKey('CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM');
 export const DUMMY_RESERVED_FEE_RECIPIENT = new PublicKey('AVmoTthdrX6tKt4nDjco2D775W2YK3sDhxPcMmzUAmTY');
@@ -145,63 +143,6 @@ export function createPassingEligibilityReport(mint: string = VALID_PUMP_MINT_1.
         threshold: '> $2,000',
         reason: 'Sufficient liquidity.',
         source: 'PUMPFUN',
-        timestamp: now,
-      },
-    ],
-  };
-}
-
-export function createUnknownEligibilityReport(mint: string = VALID_PUMP_MINT_1.toBase58()): TokenEligibilityReport {
-  const now = Date.now();
-  return {
-    mint,
-    isEligible: false,
-    failedCount: 1,
-    evaluatedAt: now,
-    checks: [
-      {
-        ruleId: 'FREEZE_AUTHORITY_REVOKED',
-        ruleName: 'Freeze Authority Revoked',
-        passed: true,
-        status: 'PASS',
-        observedValue: 'Revoked',
-        threshold: 'Revoked',
-        reason: 'Freeze authority is disabled.',
-        source: 'SOLANA_RPC',
-        timestamp: now,
-      },
-      {
-        ruleId: 'MINT_AUTHORITY_REVOKED',
-        ruleName: 'Mint Authority Revoked',
-        passed: false,
-        status: 'UNKNOWN',
-        observedValue: 'Unknown',
-        threshold: 'Revoked',
-        reason: 'Mint authority status is UNKNOWN. Critical safety unverified; rejected in LIVE mode.',
-        source: 'SOLANA_RPC',
-        timestamp: now,
-      },
-    ],
-  };
-}
-
-export function createFailingEligibilityReport(mint: string = VALID_PUMP_MINT_1.toBase58(), reason: string = 'Honeypot Freeze Active'): TokenEligibilityReport {
-  const now = Date.now();
-  return {
-    mint,
-    isEligible: false,
-    failedCount: 1,
-    evaluatedAt: now,
-    checks: [
-      {
-        ruleId: 'FREEZE_AUTHORITY_REVOKED',
-        ruleName: 'Freeze Authority Revoked',
-        passed: false,
-        status: 'FAIL',
-        observedValue: 'Active',
-        threshold: 'Revoked',
-        reason: `Freeze authority is active: ${reason}`,
-        source: 'SOLANA_RPC',
         timestamp: now,
       },
     ],

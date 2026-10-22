@@ -50,11 +50,6 @@ export function assertReadOnlyStartup(env: NodeJS.ProcessEnv = process.env, exit
   exit(1);
 }
 
-/** For the banner and System checks: what the operator should read about the mode. */
-export function readOnlyBanner(cluster: string): string | null {
-  return isReadOnly() ? `${cluster === 'mainnet-beta' ? 'MAINNET' : cluster.toUpperCase()} · READ-ONLY · PAPER` : null;
-}
-
 /** Whether a default key file sits where a non-read-only server would load it. Read-only never reads it, and refuses to start while it exists. */
 export function defaultKeyFileExists(cwd: string = process.cwd()): boolean {
   try { return fs.existsSync(`${cwd}/.apex_trading_keypair.json`); } catch { return false; }

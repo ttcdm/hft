@@ -428,8 +428,3 @@ export class LocalMarket {
     return (await this.priceSol(mint)) / start;
   }
 }
-
-/** The app's own key file must never be the repo keypair: assert the path is under the scratch dir. */
-export function assertScratchPath(p: string, dir: string): void {
-  if (!path.resolve(p).startsWith(path.resolve(dir))) throw new Error(`refusing to use ${p}: not under ${dir}`);
-}

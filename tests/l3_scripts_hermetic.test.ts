@@ -66,7 +66,8 @@ function runChild(cwd: string, env: Record<string, string>, body: string) {
   const abs = (p: string) => JSON.stringify(pathToFileURL(path.resolve(p)).href);
   const file = path.join(cwd, 'child.mts');
   fs.writeFileSync(file, `import ${abs('scripts/hermeticEnv.ts')};\nimport ${abs('server/loadEnv.ts')};\n${body.replace(/@repo\/([\w/]+)/g, (_m, p) => JSON.parse(abs(`${p}.ts`)))}\n`);
-  const r = spawnSync(process.execPath, ['--import', tsxEsm, file], { cwd, env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? cwd, NODE_ENV: 'production', ...env }, encoding: 'utf8', timeout: 60_000 });
+  // TMPDIR passes through as it does for a real script (macOS puts os.tmpdir() under /var/folders, not /tmp)
+  const r = spawnSync(process.execPath, ['--import', tsxEsm, file], { cwd, env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? cwd, ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}), NODE_ENV: 'production', ...env }, encoding: 'utf8', timeout: 60_000 });
   const line = (r.stdout ?? '').split('\n').find((l) => l.startsWith('RESULT '));
   return { status: r.status, out: (r.stdout ?? '') + (r.stderr ?? ''), result: line ? JSON.parse(line.slice(7)) : null };
 }
@@ -139,6 +140,20 @@ describe('R1-121 / N-54: hermeticEnv mirrors the vitest sanitation', () => {
     const optedIn = runChild(d, { SIGNER_KEYPAIR_PATH: repoKey.f, APEX_DB_PATH: path.join(d, 'x.db'), APEX_SCRIPT_ALLOW_REPO_STATE: 'true' }, PRINT_SIGNER_AND_DB);
     expect(optedIn.status, optedIn.out).toBe(0);
     expect(optedIn.result.signer).toBe(repoKey.kp.publicKey.toBase58());
+  });
+
+  it('the repo keypair named through a symlinked directory or a symlink is still refused (macOS /var -> /private/var)', () => {
+    const d = fs.realpathSync(scratch());
+    keyFile(d, '.apex_trading_keypair.json');
+    const linkDir = path.join(fs.realpathSync(scratch()), 'linked');
+    fs.symlinkSync(d, linkDir);
+    expect(sanitized({ SIGNER_KEYPAIR_PATH: path.join(linkDir, '.apex_trading_keypair.json') }, d).problems).toHaveLength(1);
+    expect(sanitized({ SIGNER_KEYPAIR_PATH: '.apex_trading_keypair.json' }, linkDir).problems).toHaveLength(1);
+    const fileLink = path.join(path.dirname(linkDir), 'key-link.json');
+    fs.symlinkSync(path.join(d, '.apex_trading_keypair.json'), fileLink);
+    expect(sanitized({ SIGNER_KEYPAIR_PATH: fileLink }, d).problems).toHaveLength(1);
+    const run = runChild(d, { SIGNER_KEYPAIR_PATH: path.join(linkDir, '.apex_trading_keypair.json') }, PRINT_SIGNER_AND_DB);
+    expect(run.status, run.out).toBe(2);
   });
 
   it('T9: an exported private key is removed, so it cannot beat SIGNER_KEYPAIR_PATH', () => {

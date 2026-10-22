@@ -25,13 +25,25 @@ export function hermeticScriptEnv(env: NodeJS.ProcessEnv, cwd: string, repoRoot:
   if (!env.SIGNER_KEYPAIR_PATH) env.SIGNER_KEYPAIR_PATH = path.join(scratchDir(), 'no-keypair.json');
 
   if (env.APEX_SCRIPT_ALLOW_REPO_STATE === 'true') return [];
+  // Symlinks are resolved on both sides (macOS: /var is /private/var, and process.cwd() reports the real path), so a link to the repo
+  // file, or the same file named through a linked directory, is still the repo file.
   const isRepoFile = (p: string, name: string) => {
-    const r = path.resolve(cwd, p);
-    return r === path.resolve(cwd, name) || r === path.resolve(repoRoot, name);
+    const r = realPath(path.resolve(cwd, p));
+    return r === realPath(path.resolve(cwd, name)) || r === realPath(path.resolve(repoRoot, name));
   };
   const problems: string[] = [];
   const db = env.TEST_DB_PATH || env.APEX_DB_PATH;
   if (db !== ':memory:' && isRepoFile(db, 'apex_workstation.db')) problems.push(`the database would be the live ${db}`);
   if (isRepoFile(env.SIGNER_KEYPAIR_PATH, '.apex_trading_keypair.json')) problems.push(`the signer key would be the repo keypair ${env.SIGNER_KEYPAIR_PATH}`);
   return problems;
+}
+
+/** `p` with every symlink resolved; for a file that does not exist yet, its nearest existing parent is resolved instead. */
+function realPath(p: string): string {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    const parent = path.dirname(p);
+    return parent === p ? p : path.join(realPath(parent), path.basename(p));
+  }
 }

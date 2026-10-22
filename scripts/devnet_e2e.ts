@@ -267,10 +267,11 @@ async function main() {
     const b = await conn.getTokenAccountBalance(accts.value[0].pubkey);
     return BigInt(b.value.amount);
   };
+  const { readChainErr } = await import('./devnet_e2e_steps');
   const verify = async (label: string, sig?: string) => {
     if (!sig) return rec(`${label} getTransaction`, false, 'no signature');
-    const t = await conn.getTransaction(sig, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
-    rec(`${label} getTransaction`, !!t && !t.meta?.err, `${solscan(sig)}${t?.meta?.err ? ' err=' + JSON.stringify(t.meta.err) : ''}`);
+    const err = await readChainErr(conn, sig);
+    rec(`${label} getTransaction`, err === null, `${solscan(sig)}${err === undefined ? ' not read (no answer after retries)' : err ? ' err=' + JSON.stringify(err) : ''}`);
   };
 
   // The eligibility report for the buy, built from fresh holder data right before it (the coordinator refuses a report older than 60 s). Built here so
@@ -338,10 +339,7 @@ async function main() {
   // (d') forced revert through the app, (e') two sequential buys of one mint (scripts/devnet_e2e_steps.ts). The harness signs nothing itself.
   const steps: import('./devnet_e2e_steps').HarnessSteps = {
     coordinator, curve: PumpCurveService, db: workstationDb as any, riskLimits: () => riskEngine.getLimits(), mint: mint!,
-    chainErr: async (sig) => {
-      const t = await conn.getTransaction(sig, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
-      return t ? (t.meta?.err ?? null) : undefined;
-    },
+    chainErr: (sig) => readChainErr(conn, sig),
     buildBuyRequest, rec, link: solscan, sleep, connection: coordinator.getConnection() as any, rpcUrl: process.env.SOLANA_RPC_URL!,
     stop: {
       telegram: (await import('../server/socialScanner')).socialScanner,

@@ -42,7 +42,7 @@ export interface HarnessSteps {
   curve: { calculateBuyQuote: (...args: any[]) => any };
   db: { loadTransactions(orderId?: string): Tx[]; loadPositions(): Pos[] };
   riskLimits: () => { cooldownAfterFailedTradeMs: number; cooldownPerMintMs: number };
-  /** getTransaction meta.err for a signature: undefined when the chain does not know it, null when it succeeded. */
+  /** A signature's on-chain error (readChainErr): undefined when no read gave an answer, null when it succeeded. */
   chainErr: (sig: string) => Promise<unknown | undefined>;
   mint: string;
   buildBuyRequest: () => Promise<ExecuteTradeRequest>;
@@ -103,7 +103,7 @@ export async function forcedRevertThroughApp(s: HarnessSteps): Promise<number> {
   s.rec(`${L}: lifecycle REVERTED`, !r.success && r.lifecycleState === 'REVERTED' && !!sig, `${r.lifecycleState} ${r.error ?? ''}`.slice(0, 300));
   if (sig) {
     const err = await s.chainErr(sig);
-    s.rec(`${L}: failed on chain`, err !== undefined && err !== null, `${s.link(sig)} err=${JSON.stringify(err)}`);
+    s.rec(`${L}: failed on chain`, err !== undefined && err !== null, `${s.link(sig)} ${err === undefined ? 'on-chain error not read (getTransaction and getSignatureStatuses gave no answer after retries)' : `err=${JSON.stringify(err)}`}`);
   }
   const newRows = buyRowsFor(s).filter((t) => !rowsBefore.has(t.signature));
   s.rec(
@@ -996,4 +996,33 @@ export function handOverToChildPhases(
   const ok = still.length === 0 && !d.isLiveArmed();
   s.rec('(f) main process stopped trading and released its locks', ok, ok ? `released ${d.lockPaths.length} lock(s)` : `still held: ${still.join(', ') || 'none'}; LIVE armed ${d.isLiveArmed()}`);
   return ok;
+}
+
+/**
+ * A signature's on-chain error, read so a rate limit or a not-yet-indexed transaction is not mistaken for an answer: getTransaction
+ * (confirmed) up to `attempts` times with a doubling back-off, a 429 or other thrown error counting as "not read"; then, if it never
+ * returned the transaction, getSignatureStatuses with history search, which carries the same `err` for a confirmed signature.
+ * Returns the error object, null when the transaction succeeded, or undefined when neither read gave an answer (the Mac run's
+ * "failed on chain: err=undefined" for a signature whose lifecycle showed InstructionError 6002).
+ */
+export async function readChainErr(
+  conn: { getTransaction: (...a: any[]) => Promise<any>; getSignatureStatuses: (...a: any[]) => Promise<any> },
+  sig: string,
+  opts: { attempts?: number; firstDelayMs?: number; sleep?: (ms: number) => Promise<unknown> } = {}
+): Promise<unknown | undefined> {
+  const attempts = opts.attempts ?? 5;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+  let delay = opts.firstDelayMs ?? 500;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const t = await conn.getTransaction(sig, { commitment: 'confirmed', maxSupportedTransactionVersion: 0 });
+      if (t) return t.meta?.err ?? null;
+    } catch { /* rate-limited or unreachable: try again */ }
+    if (i < attempts - 1) { await sleep(delay); delay *= 2; }
+  }
+  try {
+    const st = (await conn.getSignatureStatuses([sig], { searchTransactionHistory: true }))?.value?.[0];
+    if (st && st.confirmationStatus) return st.err ?? null;
+  } catch { /* no answer */ }
+  return undefined;
 }

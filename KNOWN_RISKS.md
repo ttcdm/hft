@@ -124,7 +124,7 @@ The auto gate asks for a confluence score at or above the threshold in force (HO
 | one whale plus 30 small buyers | 56 |
 | the devnet seed, 30 x 0.01 SOL, all funded by one wallet | 35 |
 
-What to expect: **72-76 at best with an ideal crowd, 62-68 for a typical launch, and 81 only at graduation.** Reaching 70 needs Momentum 20, OrderFlow 20 (no sells), Distribution at least 10 (about 35 near-equal buyers), Curve at least 13 and DevRisk 5 at the same tick. DevRisk is 5 only when no creator report arrived; a mainnet creator who dev-buys gets 0-1. So a quiet auto run is normal, not a fault.
+What to expect: **72-76 at best with an ideal crowd, 62-68 for a typical launch, and 81 only at graduation.** Reaching 70 needs Momentum 20, OrderFlow 20 (no sells), Distribution at least 10 (about 35 near-equal buyers), Curve at least 13 and DevRisk 5 at the same tick. DevRisk is 5 live only when the creator's history report says seasoned wallet; a creator whose report is missing (lookup failed, or not back yet) scores 0 and is listed as missing data (P4.1; it used to borrow 5 points from a 0% dev holding). The scenarios above are replays, which know no creator address and still use the dev-holding stand-in, so the same crowd behind a fresh-wallet creator scores 5 lower live. So a quiet auto run is normal, not a fault.
 
 The seeded devnet token (`scripts/devnet_seed.ts`) is **not expected to be bought by auto**: the seed funds all 30 buyers from one wallet, the watch window clusters buyers by who first funded them, so it sees one buyer (HOT needs 25 unique buyers), and the measured score is 35. That is by design here; funding the buyers through disguised intermediaries to get around the check was considered and rejected. The seed is useful for watching the board and the watch window, and for manual buys, not as proof that auto can trade.
 
@@ -133,7 +133,7 @@ The seeded devnet token (`scripts/devnet_seed.ts`) is **not expected to be bough
 
 - **Finality is instant.** The in-process validator reports `finalized` for every landed signature at once. The "sent and unknown" class (SELL_PENDING_VERIFICATION, blockhash expiry, processed to confirmed) therefore runs only through explicit fault injection. Step (g) of `npm run localnet:e2e` covers "landed but the response was withheld", not "sent and the outcome is unknown". Devnet is the first place those paths meet real latency.
 - **The `localnet_*` methods are harness-only.** No production code calls them (`grep` finds none), so `localnet_setAccount` cannot be reached from the app.
-- **A buyer funded through a program call is untested.** The validator's `getTransaction` (`jsonParsed`) understands only direct system transfers. A buyer funded by a CPI (the case S4d's public-funder list handles) has no localnet test.
+- **A buyer funded through a program call is untested on localnet.** The funder lookup reads inner (CPI) system transfers, `createAccount` and `transferWithSeed` since P4.1, but only a fake Connection test covers that: the validator's `getTransaction` (`jsonParsed`) returns no inner instructions and parses only direct system transfers.
 
 ## 10. Persistence and journal limits (Q55, Q56)
 

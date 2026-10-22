@@ -1,5 +1,6 @@
 import { setAutoMode, releaseHotCallouts } from './fixtures/auto';
 import { seedSurge, clearVelocity } from './fixtures/velocity';
+import { seedSeasonedCreator } from './fixtures/creator';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair, PublicKey } from '@solana/web3.js';
 import {
@@ -788,6 +789,9 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
       };
 
       seedSurge(highQualityCallout.token.mint); // C2: velocity must be measured
+      // P4.1 (R1-53): a known creator with no report now scores 0 (it used to borrow 5 points from dev holding), so the fixture's seasoned creator gets its report
+      highQualityCallout.token.creator = Keypair.generate().publicKey.toBase58(); // CREATOR_ADDR is not a valid public key
+      await seedSeasonedCreator(highQualityCallout.token.creator);
       (pumpfunService as any).hotCallouts = [highQualityCallout];
       const snipeSpy = vi.spyOn(memecoinAggregator, 'executeSnipe').mockResolvedValueOnce({
         success: true,

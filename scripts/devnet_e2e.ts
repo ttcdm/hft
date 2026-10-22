@@ -366,6 +366,28 @@ async function main() {
     console.log('INFO  (h) skipped: set DEVNET_DUMP_SOL=5 and fund the throwaway wallet with at least 5.3 SOL to run the failed-read stop-loss step');
   }
 
+  // (i) P4.1: opt-in. The creator cluster and funder truth through the app's own pump log stream, watch window and funder lookup, wired
+  // as server.ts wires them (this script does not run server.ts). The harness's own throwaway wallets make every trade; the app trades nothing.
+  if (process.env.DEVNET_CLUSTER_CHECK === '1') {
+    const { PUMP_SDK } = await import('@pump-fun/pump-sdk');
+    const { watchWindow } = await import('../server/signals/watchWindow');
+    const { pumpFeedListener } = await import('../server/solana/pumpFeedListener');
+    const { FunderLookup, wireFunderLookup } = await import('../server/signals/funderLookup');
+    watchWindow.attach(pumpFeedListener);
+    wireFunderLookup(watchWindow, new FunderLookup(() => coordinator.getConnection()));
+    watchWindow.start();
+    const subscribed = await pumpFeedListener.start();
+    rec('(i) creator cluster: the pump log stream subscribed', subscribed, subscribed ? 'onLogs on the coordinator connection' : 'pumpFeedListener.start() returned false');
+    if (subscribed) {
+      const kit = S.makeChainKit({ conn, web3, sdk: PUMP_SDK, curve: PumpCurveService, builder: txBuilder });
+      await S.creatorClusterOnChain(steps, kit, { snapshot: () => watchWindow.getSnapshot() }, kp);
+    }
+    watchWindow.stop();
+    await pumpFeedListener.stop();
+  } else {
+    console.log('INFO  (i) skipped: set DEVNET_CLUSTER_CHECK=1 (needs about 0.4 SOL free, spends about 0.03) to run the creator-cluster and one-funder-cluster step');
+  }
+
   await S.waitPast(steps, gDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (g) buy');
   await S.emergencyStopThroughApp(steps); // P1.4, last: it leaves LIVE disarmed and auto OFF. Telegram-path panic sells the LIVE position; kill switch on/off/re-arm buys nothing
 

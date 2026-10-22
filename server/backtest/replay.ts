@@ -196,7 +196,7 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
   let fi = 0;
   const applyFacts = (upTo: number) => {
     while (fi < facts.length && facts[fi].ts <= upTo) {
-      if (facts[fi].funder) ww.setFunder(facts[fi].wallet, facts[fi].funder as string); else ww.setNoFunder(facts[fi].wallet);
+      if (facts[fi].funder) ww.setFunder(facts[fi].wallet, facts[fi].funder as string, upTo); else ww.setNoFunder(facts[fi].wallet);
       fi++;
     }
   };

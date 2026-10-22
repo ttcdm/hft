@@ -109,6 +109,7 @@ Read by files under `scripts/`, not by the server. The harness READMEs (`scripts
 | `DEVNET_RPC_URL` | `scripts/devnet_e2e.ts`: RPC for the devnet harness (must not look like mainnet). |
 | `DEVNET_MINTS` | `scripts/devnet_e2e.ts`: comma list of active devnet mints. |
 | `DEVNET_AIRDROP_ONCE` | `scripts/devnet_e2e.ts`: `1` allows one airdrop. |
+| `DEVNET_CLUSTER_CHECK` | `scripts/devnet_e2e.ts`: `1` runs step (i), the creator-cluster and one-funder-cluster check (P4.1); unset skips it. The harness wallet lends about 0.4 SOL to throwaway wallets and gets all but about 0.03 back. |
 | `DEVNET_DUMP_SOL` | `scripts/devnet_e2e.ts`: SOL a second throwaway wallet seeds its own coin with for step (h), the failed-read stop-loss (P1.6); unset skips the step. About 5; the harness wallet needs that plus 0.3 SOL. |
 | `APEX_E2E_SCRATCH` | `scripts/devnet_e2e.ts`: scratch directory. |
 | `APEX_SCRIPT_KEEP_TEST_DB_PATH` | `scripts/scriptEnv.ts` (via `hermeticEnv`): `true` keeps an exported `TEST_DB_PATH`. Otherwise every script that imports `hermeticEnv` drops it (it would beat the script's `APEX_DB_PATH`). `hermeticEnv` also always empties `APEX_ENV_FILE`, removes `OPERATOR_PRIVATE_KEY` and `SOLANA_PRIVATE_KEY`, and defaults `APEX_DB_PATH` to a scratch file and `SIGNER_KEYPAIR_PATH` to a file that does not exist. |

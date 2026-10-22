@@ -5,7 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, Transaction, ComputeBudgetProgram } from '@solana/web3.js';
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, Transaction, ComputeBudgetProgram, SystemProgram } from '@solana/web3.js';
 
 /**
  * Long behaviour tests: a REAL chain flow on loopback.
@@ -302,6 +302,14 @@ export class LocalMarket {
     const kp = Keypair.generate();
     await this.fund(kp.publicKey, sol);
     return kp;
+  }
+
+  /** A top-level system transfer from `from` (its first incoming transfer makes `from` the recipient's funder for the funder lookup). */
+  async transfer(from: Keypair, to: PublicKey, sol: number): Promise<string> {
+    const tx = new Transaction().add(SystemProgram.transfer({ fromPubkey: from.publicKey, toPubkey: to, lamports: Math.ceil(sol * LAMPORTS_PER_SOL) }));
+    tx.recentBlockhash = (await this.conn.getLatestBlockhash()).blockhash;
+    tx.feePayer = from.publicKey;
+    return this.send(tx, [from]);
   }
 
   /** Throwaway signer key file for the app, funded only by the local validator. */

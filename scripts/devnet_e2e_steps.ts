@@ -9,7 +9,7 @@
  *       no position, and an immediate second buy refused by the 15 s failure cooldown with nothing sent. The wrapper is restored in `finally`.
  *  (e') two sequential `executeTrade` calls on one mint: the first is CONFIRMED and opens one position, the second is refused before
  *       anything is signed (POSITION_ALREADY_OPEN). The position is then closed so step (f) starts flat.
- *  (e''), (g) and (h) are described at their functions below.
+ *  (e''), (g), (h) and (i) are described at their functions below.
  *
  *  (e''') P1.4: the emergency stop. One LIVE position is opened, auto is set to DEVNET_LIVE, then Telegram `/panic_sell` is driven
  *       through the app's `processTelegramCommand` (no bot): the LIVE position must be sold on chain and auto must end OFF. Then the
@@ -326,14 +326,25 @@ export interface DumpMarket {
 }
 
 /**
- * The DumpMarket on any cluster, built from the app's own quote math and transaction builder (passed in, so this file still imports
- * nothing from server/). `payer` is the harness's throwaway wallet; the second wallet is generated here and never written to disk.
+ * The harness's own chain moves on any cluster, for any throwaway keypair it holds: built from the app's own quote math and transaction
+ * builder (passed in, so this file still imports nothing from server/). Used by (h)'s DumpMarket and by (i).
  */
-export function makeDumpMarket(d: {
-  conn: any; payer: any; web3: any; sdk: any; curve: any; builder: any;
-}): DumpMarket {
+export interface ChainKit {
+  newWallet(): any;
+  transfer(from: any, to: any, sol: number): Promise<string>;
+  /** create_v2 by `creator` (who also pays), no dev buy. */
+  create(creator: any, symbol: string, name: string): Promise<{ mint: string; curve: string }>;
+  buy(kp: any, mint: string, sol: number): Promise<string>;
+  /** Sells everything `kp` holds of `mint`; null when it holds none. */
+  sellAll(kp: any, mint: string): Promise<string | null>;
+  /** Spot price in SOL per UI token, from the curve. */
+  priceSol(mint: string): Promise<number>;
+  /** Sends what is left in `kp` (less one fee) to `to`. */
+  refund(kp: any, to: any): Promise<void>;
+}
+
+export function makeChainKit(d: { conn: any; web3: any; sdk: any; curve: any; builder: any }): ChainKit {
   const { Keypair, PublicKey, SystemProgram, Transaction, ComputeBudgetProgram, LAMPORTS_PER_SOL } = d.web3;
-  const w2 = Keypair.generate();
   const send = async (tx: any, signers: any[]) => {
     tx.recentBlockhash = (await d.conn.getLatestBlockhash('confirmed')).blockhash;
     if (!tx.feePayer) tx.feePayer = signers[0].publicKey;
@@ -352,51 +363,77 @@ export function makeDumpMarket(d: {
     if (!s) throw new Error(`no curve state for ${mint.toBase58()}`);
     return s;
   };
-  const tradeParams = (s: any, mint: any) => ({
+  const tradeParams = (s: any, mint: any, owner: any) => ({
     mint, bondingCurve: s.bondingCurve, associatedBondingCurve: s.associatedBondingCurve,
-    associatedUser: d.curve.getAssociatedTokenAddress(mint, w2.publicKey, s.tokenProgram), creator: s.creator,
+    associatedUser: d.curve.getAssociatedTokenAddress(mint, owner, s.tokenProgram), creator: s.creator,
     feeRecipient: s.feeRecipient, buybackFeeRecipient: s.buybackFeeRecipient, quoteMint: s.quoteMint,
     tokenProgram: s.tokenProgram, quoteTokenProgram: s.quoteTokenProgram, computeUnits: 300_000, priorityFeeMicroLamports: 1000, jitoTipLamports: 0n,
   });
-  const held = async (mint: any): Promise<bigint> => {
-    const a = await d.conn.getTokenAccountsByOwner(w2.publicKey, { mint });
+  const held = async (owner: any, mint: any): Promise<bigint> => {
+    const a = await d.conn.getTokenAccountsByOwner(owner, { mint });
     if (!a.value.length) return 0n;
     return BigInt((await d.conn.getTokenAccountBalance(a.value[0].pubkey)).value.amount);
   };
   return {
-    async createAndSeed(seedSol: number) {
-      await send(new Transaction().add(SystemProgram.transfer({ fromPubkey: d.payer.publicKey, toPubkey: w2.publicKey, lamports: Math.ceil((seedSol + 0.1) * LAMPORTS_PER_SOL) })), [d.payer]);
+    newWallet: () => Keypair.generate(),
+    transfer: (from, to, sol) => send(new Transaction().add(SystemProgram.transfer({ fromPubkey: from.publicKey, toPubkey: to, lamports: Math.ceil(sol * LAMPORTS_PER_SOL) })), [from]),
+    async create(creator, symbol, name) {
       const mintKp = Keypair.generate();
       const ix = await d.sdk.createV2Instruction({
-        mint: mintKp.publicKey, name: 'P16 harness', symbol: 'P16H', uri: 'http://127.0.0.1/none',
-        creator: w2.publicKey, user: w2.publicKey, mayhemMode: false,
+        mint: mintKp.publicKey, name, symbol, uri: 'http://127.0.0.1/none',
+        creator: creator.publicKey, user: creator.publicKey, mayhemMode: false,
       });
-      await send(new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }), ix), [w2, mintKp]);
-      const mint = mintKp.publicKey;
-      const s = await state(mint);
-      const q = d.curve.calculateBuyQuote({ state: s, amountSol: seedSol, slippageBps: 3000, jitoTipSol: 0, priorityFeeLamports: 0, executionMode: 'LIVE' });
-      const tx = await d.builder.buildBuyTransaction(d.conn, { ...tradeParams(s, mint), buyer: w2.publicKey, amountTokens: BigInt(q.tokenAmountRaw), maxSolCostLamports: BigInt(q.maxInputLamports) });
-      await send(tx, [w2]);
-      return { mint: mint.toBase58(), curve: s.bondingCurve.toBase58() };
+      await send(new Transaction().add(ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 }), ix), [creator, mintKp]);
+      const s = await state(mintKp.publicKey);
+      return { mint: mintKp.publicKey.toBase58(), curve: s.bondingCurve.toBase58() };
     },
-    async priceSol(mint: string) {
-      const s = await state(new PublicKey(mint));
-      return (Number(s.virtualSolReserves) / 1e9) / (Number(s.virtualTokenReserves) / 10 ** s.tokenDecimals);
-    },
-    async sellAll(mint: string) {
+    async buy(kp, mint, sol) {
       const m = new PublicKey(mint);
-      const amount = await held(m);
+      const s = await state(m);
+      const q = d.curve.calculateBuyQuote({ state: s, amountSol: sol, slippageBps: 3000, jitoTipSol: 0, priorityFeeLamports: 0, executionMode: 'LIVE' });
+      const tx = await d.builder.buildBuyTransaction(d.conn, { ...tradeParams(s, m, kp.publicKey), buyer: kp.publicKey, amountTokens: BigInt(q.tokenAmountRaw), maxSolCostLamports: BigInt(q.maxInputLamports) });
+      return send(tx, [kp]);
+    },
+    async sellAll(kp, mint) {
+      const m = new PublicKey(mint);
+      const amount = await held(kp.publicKey, m);
       if (amount <= 0n) return null;
       const s = await state(m);
       const q = d.curve.calculateSellQuote({ state: s, tokenAmountRaw: amount, slippageBps: 5000, jitoTipSol: 0, priorityFeeLamports: 0, executionMode: 'LIVE' });
-      const tx = await d.builder.buildSellTransaction(d.conn, { ...tradeParams(s, m), seller: w2.publicKey, amountTokens: amount, minSolOutputLamports: BigInt(q.minOutputLamports) });
-      return send(tx, [w2]);
+      const tx = await d.builder.buildSellTransaction(d.conn, { ...tradeParams(s, m, kp.publicKey), seller: kp.publicKey, amountTokens: amount, minSolOutputLamports: BigInt(q.minOutputLamports) });
+      return send(tx, [kp]);
     },
-    async refund() {
-      const bal = await d.conn.getBalance(w2.publicKey);
+    async priceSol(mint) {
+      const s = await state(new PublicKey(mint));
+      return (Number(s.virtualSolReserves) / 1e9) / (Number(s.virtualTokenReserves) / 10 ** s.tokenDecimals);
+    },
+    async refund(kp, to) {
+      const bal = await d.conn.getBalance(kp.publicKey);
       const lamports = bal - 5000;
-      if (lamports > 0) await send(new Transaction().add(SystemProgram.transfer({ fromPubkey: w2.publicKey, toPubkey: d.payer.publicKey, lamports })), [w2]);
+      if (lamports > 0) await send(new Transaction().add(SystemProgram.transfer({ fromPubkey: kp.publicKey, toPubkey: to, lamports })), [kp]);
     },
+  };
+}
+
+/**
+ * The DumpMarket on any cluster, on top of makeChainKit. `payer` is the harness's throwaway wallet; the second wallet is generated here
+ * and never written to disk.
+ */
+export function makeDumpMarket(d: {
+  conn: any; payer: any; web3: any; sdk: any; curve: any; builder: any;
+}): DumpMarket {
+  const kit = makeChainKit(d);
+  const w2 = kit.newWallet();
+  return {
+    async createAndSeed(seedSol: number) {
+      await kit.transfer(d.payer, w2.publicKey, seedSol + 0.1);
+      const coin = await kit.create(w2, 'P16H', 'P16 harness');
+      await kit.buy(w2, coin.mint, seedSol);
+      return coin;
+    },
+    priceSol: (mint: string) => kit.priceSol(mint),
+    sellAll: (mint: string) => kit.sellAll(w2, mint),
+    refund: () => kit.refund(w2, d.payer.publicKey),
   };
 }
 
@@ -480,5 +517,89 @@ export async function failedReadThenDumpStopLoss(
       s.rec(`${L}: cleanup close 100%`, c.success, c.error || 'closed');
     }
     try { await m.refund(); } catch (e: any) { console.log(`INFO  (h) refund of the second wallet failed: ${String(e?.message ?? e).slice(0, 120)}`); }
+  }
+}
+
+/** (i) what the step reads: the app's own watch window fed by the app's own pump log stream (wired by the harness as server.ts does). */
+export interface WatchFeed {
+  /** What GET /api/watch returns. */
+  snapshot(): { watching: Array<{ metrics: any }>; released: Array<{ state: string; reason: string; metrics: any }>; capacity: { active: number; max: number } };
+}
+
+/**
+ * (i) P4.1 (R1-55, R1-54), opt-in: the creator cluster and funder truth, through the app's own log stream, watch window and funder lookup.
+ * A fresh throwaway creator (funded from the harness wallet) launches its own coin with no dev buy and funds a throwaway W; W buys, and
+ * sells 25 s later. Expected: the launch is released DEAD with CREATOR_SOLD (before P4.1 only the creator's own sell counted, so it stayed
+ * WATCHING). Then the creator launches a second coin and the harness wallet funds 5 throwaway wallets that buy it together (sent at
+ * once, so usually in one or two slots). Expected: rawUniqueBuyers 5, funderCoverage 1, uniqueBuyers 1 (one cluster, not 5). Every
+ * throwaway wallet sells what it holds and sends what is left back to the harness wallet at the end. The harness wallet lends about
+ * 0.4 SOL (0.26 to the creator, 0.02 to each of six buyers) and gets all but about 0.03 SOL back (two coins' and six token accounts'
+ * rent, fees, curve fees; measured on the local validator).
+ */
+export async function creatorClusterOnChain(s: HarnessSteps, kit: ChainKit, feed: WatchFeed, payer: any, opts: { buySol?: number; sellAfterMs?: number; waitMs?: number } = {}): Promise<void> {
+  const L = '(i) creator cluster';
+  const buySol = opts.buySol ?? 0.01;
+  const sellAfterMs = opts.sellAfterMs ?? 25_000;
+  const waitMs = opts.waitMs ?? 30_000;
+  const find = (mint: string) => {
+    const snap = feed.snapshot();
+    return snap.watching.find((w) => w.metrics?.mint === mint) as { state?: string; reason?: string; metrics: any } | undefined
+      ?? snap.released.find((r) => r.metrics?.mint === mint);
+  };
+  const waitFor = async (mint: string, pred: (e: { state?: string; reason?: string; metrics: any }) => boolean) => {
+    for (let i = 0; i < Math.ceil(waitMs / 500); i++) {
+      const e = find(mint);
+      if (e && pred(e)) return e;
+      await s.sleep(500);
+    }
+    return find(mint);
+  };
+  const creator = kit.newWallet();
+  const W = kit.newWallet();
+  const five = Array.from({ length: 5 }, () => kit.newWallet());
+  const coins: string[] = [];
+  try {
+    await kit.transfer(payer, creator.publicKey, 0.25 + buySol);
+    const a = await kit.create(creator, 'P41A', 'P41 harness');
+    coins.push(a.mint);
+    const seen = await waitFor(a.mint, () => true);
+    s.rec(`${L}: the app's feed watches the creator's launch`, !!seen, seen ? a.mint : `not in the watch window after ${waitMs / 1000} s (capacity ${JSON.stringify(feed.snapshot().capacity)})`);
+    if (!seen) return;
+    await kit.transfer(creator, W.publicKey, buySol + 0.01);
+    await kit.buy(W, a.mint, buySol);
+    const bought = await waitFor(a.mint, (e) => e.metrics.tradeCount >= 1);
+    s.rec(`${L}: W's buy reached the window`, !!bought && bought.metrics.tradeCount >= 1, `trades ${bought?.metrics.tradeCount ?? 0}, state ${bought?.state ?? 'WATCHING'}`);
+    const boughtAt = Date.now();
+    while (Date.now() < boughtAt + sellAfterMs) await s.sleep(500);
+    const sellSig = await kit.sellAll(W, a.mint);
+    const r = await waitFor(a.mint, (e) => !!e.state && e.state !== 'WATCHING');
+    s.rec(
+      `${L}: W (funded by the creator) sold at ${Math.round(sellAfterMs / 1000)} s: /api/watch shows DEAD CREATOR_SOLD`,
+      r?.state === 'DEAD' && /^CREATOR_SOLD/.test(r.reason ?? ''),
+      `${r?.state ?? 'WATCHING'} ${r?.reason ?? ''}${sellSig ? ` ${s.link(sellSig)}` : ' (W held nothing to sell)'}`.slice(0, 300)
+    );
+
+    const b = await kit.create(creator, 'P41B', 'P41 harness');
+    coins.push(b.mint);
+    if (!(await waitFor(b.mint, () => true))) { s.rec(`${L}: the second launch is watched`, false, 'not in the watch window'); return; }
+    for (const w of five) await kit.transfer(payer, w.publicKey, buySol + 0.01);
+    const buys = await Promise.allSettled(five.map((w) => kit.buy(w, b.mint, buySol)));
+    const landed = buys.filter((x) => x.status === 'fulfilled').length;
+    s.rec(`${L}: 5 wallets from one funder bought together`, landed === 5, `${landed}/5 buys confirmed`);
+    const e = await waitFor(b.mint, (x) => x.metrics.rawUniqueBuyers >= landed && x.metrics.funderCoverage === 1);
+    const m = e?.metrics;
+    s.rec(
+      `${L}: 5 wallets from one funder: one cluster, not 5`,
+      !!m && m.rawUniqueBuyers === 5 && m.funderCoverage === 1 && m.uniqueBuyers === 1,
+      m ? `rawUniqueBuyers ${m.rawUniqueBuyers}, uniqueBuyers ${m.uniqueBuyers}, funderCoverage ${m.funderCoverage}` : 'not in the watch window'
+    );
+  } catch (e: any) {
+    s.rec(L, false, String(e?.message ?? e).slice(0, 300));
+  } finally {
+    for (const w of [W, ...five]) {
+      for (const c of coins) { try { await kit.sellAll(w, c); } catch { /* nothing held or curve moved; the refund below still runs */ } }
+      try { await kit.refund(w, payer.publicKey); } catch (e: any) { console.log(`INFO  (i) refund failed: ${String(e?.message ?? e).slice(0, 120)}`); }
+    }
+    try { await kit.refund(creator, payer.publicKey); } catch (e: any) { console.log(`INFO  (i) creator refund failed: ${String(e?.message ?? e).slice(0, 120)}`); }
   }
 }

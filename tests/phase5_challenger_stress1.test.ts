@@ -1,4 +1,5 @@
 import { seedSurge } from './fixtures/velocity';
+import { seedSeasonedCreator } from './fixtures/creator';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { PublicKey } from '@solana/web3.js';
 import {
@@ -737,7 +738,7 @@ describe('Adversarial Stress & Empirical Challenge Suite: Alpha Pipeline Integra
       expect(isConfluencePassed(confluence.compositeScore)).toBe(false);
     });
 
-    it('enables auto-snipe when confluenceCount >= 2 and composite score >= 70', () => {
+    it('enables auto-snipe when confluenceCount >= 2 and composite score >= 70', async () => {
       const strongMint = 'StrongCalloutMint11111111111111111111111111';
       const strongCallout: PumpFunHotCallout = {
         id: 'callout-strong-1',
@@ -801,6 +802,8 @@ describe('Adversarial Stress & Empirical Challenge Suite: Alpha Pipeline Integra
       curveVelocityEvaluator.recordTransition(strongMint, 9000, 15.0, Date.now() - 15_000);
       curveVelocityEvaluator.recordTransition(strongMint, 9030, 28.0, Date.now());
       curveVelocityEvaluator.recordTradeFlow(strongMint, 13.0, true, Date.now() - 5_000);
+      // P4.1 (R1-53): a known creator with no report now scores 0 (it used to borrow 5 points from dev holding), so the fixture's seasoned creator gets its report
+      await seedSeasonedCreator(CREATOR_ADDR);
 
       const confluence = pumpfunService.evaluateCalloutConfluence(strongCallout);
       expect(confluence.compositeScore).toBeGreaterThanOrEqual(70);

@@ -1,5 +1,6 @@
 import { setAutoMode, releaseHotCallouts } from './fixtures/auto';
 import { seedSurge } from './fixtures/velocity';
+import { seedSeasonedCreator } from './fixtures/creator';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair, PublicKey } from '@solana/web3.js';
 import {
@@ -694,6 +695,9 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
         message: 'Mock Snipe Success',
         txHash: '0x123',
       });
+      // P4.1 (R1-53): a known creator with no report now scores 0 (it used to borrow 5 points from dev holding), so the fixture's seasoned creator gets its report
+      calloutBase.token.creator = Keypair.generate().publicKey.toBase58(); // CREATOR_SEASONED is not a valid public key
+      await seedSeasonedCreator(calloutBase.token.creator);
 
       // Scenario 1: High composite score (> 80) BUT confluenceCount = 1 -> REJECTED
       (pumpfunService as any).hotCallouts = [{ ...calloutBase, confluenceCount: 1 }];

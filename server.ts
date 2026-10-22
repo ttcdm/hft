@@ -14,7 +14,8 @@ import { GoogleGenAI } from '@google/genai';
 import { socialScanner, isTelegramTradeCommand } from './server/socialScanner';
 import { memecoinAggregator } from './server/memecoinAggregator';
 import { onChainPoolStats } from './server/market/poolStats';
-import { wireWatchPins } from './server/signals/watchPins';
+import { wireWatchPins, wireCreatorReportPins } from './server/signals/watchPins';
+import { creatorRiskScorer } from './server/signals/creatorRiskScorer';
 import { buildSystemChecks } from './server/system/systemChecks';
 import { isReadOnly, assertReadOnlyStartup } from './server/solana/readOnly';
 import { LaunchRecorder } from './server/backtest/launchRecorder';
@@ -330,6 +331,7 @@ for (const p of recorderConfigProblems()) console.warn(`[APEX QUANT HFT] ${p}`);
 const launchRecorder = new LaunchRecorder(workstationDb, watchWindow, () => solPriceService.lastKnownPrice());
 launchRecorder.attach(pumpFeedListener);
 wireWatchPins(watchWindow, memecoinAggregator, onChainPoolStats); // S4: a watched mint keeps its pool and its trade stats until the verdict
+wireCreatorReportPins(watchWindow, creatorRiskScorer); // P4.1: a watched launch's creator report lives until 60 s after its verdict
 wireFunderLookup(watchWindow, new FunderLookup(() => executionCoordinator.getConnection())); // Q6b
 watchWindow.on('release', (r) => broadcastWs({ type: 'WATCH_RELEASE', data: r }));
 watchWindow.start();

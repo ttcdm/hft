@@ -1,4 +1,5 @@
 import { seedSurge } from './fixtures/velocity';
+import { seedSeasonedCreator } from './fixtures/creator';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { Keypair } from '@solana/web3.js';
 import {
@@ -582,7 +583,7 @@ describe('Phase 5 Master Remediation Suite: Alpha Pipeline Integration (B14)', (
   // Section 5: PumpFunService Auto-Snipe Confluence Gate Integration
   // =========================================================================
   describe('PumpFunService: meetsConfluence Auto-Snipe Integration (B14)', () => {
-    it('evaluates callout confluence using evaluateCalloutConfluence', () => {
+    it('evaluates callout confluence using evaluateCalloutConfluence', async () => {
       const mockCallout: PumpFunHotCallout = {
         id: 'callout-test-1',
         calloutId: 'cid-1',
@@ -641,6 +642,8 @@ describe('Phase 5 Master Remediation Suite: Alpha Pipeline Integration (B14)', (
       };
 
       seedSurge(TEST_MINT_1); // C2: velocity must be measured
+      // P4.1 (R1-53): a known creator with no report now scores 0 (it used to borrow 5 points from dev holding), so the fixture's seasoned creator gets its report
+      await seedSeasonedCreator(CREATOR_SEASONED);
       const breakdown = pumpfunService.evaluateCalloutConfluence(mockCallout);
       expect(breakdown.compositeScore).toBeGreaterThanOrEqual(70);
       expect(isConfluencePassed(breakdown.compositeScore)).toBe(true);

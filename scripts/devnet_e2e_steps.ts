@@ -19,7 +19,9 @@
  * Kept apart from devnet_e2e.ts so the steps can be read on their own; they take every dependency as an argument and import nothing
  * from server/ themselves, so the harness's environment setup still runs before any server module loads.
  */
+import fs from 'node:fs';
 import http from 'node:http';
+import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import type { ExecuteTradeRequest, ExecutionResponse } from '../server/execution/coordinator';
 
@@ -315,13 +317,23 @@ export async function emergencyStopThroughApp(s: HarnessSteps): Promise<void> {
 
 /** (h) the harness's own market moves: a second throwaway wallet that creates a coin, seeds it, and dumps it. Signs only its own wallets. */
 export interface DumpMarket {
-  /** Funds a fresh second throwaway wallet from the harness wallet, creates a pump coin from it and buys `seedSol` of it. */
-  createAndSeed(seedSol: number): Promise<{ mint: string; curve: string }>;
+  /** The second wallet's address and the file its key is kept in (the harness's scratch directory). */
+  readonly address: string;
+  readonly keyPath: string;
+  /**
+   * Funds the second wallet with enough for the create, creates a pump coin from it, reads the coin's own curve, sizes the seed with
+   * `dumpSeedPlan` for an app buy of `appBuySol`, funds it and buys that much. Throws (after any funding, which `refund` returns) when the
+   * plan refuses, for example a seed above `maxSeedSol` or a curve that would come too close to complete.
+   */
+  createAndSeed(opts: { appBuySol: number; maxSeedSol: number }): Promise<{ mint: string; curve: string; seedSol: number; projectedRatio: number }>;
   /** Spot price in SOL per UI token, from the curve as a separate Connection sees it. */
   priceSol(mint: string): Promise<number>;
-  /** The second wallet sells everything it holds of `mint`. */
+  /** The second wallet sells everything it holds of `mint`; null when it holds none. */
   sellAll(mint: string): Promise<string | null>;
-  /** Sends what is left in the second wallet back to the harness wallet. */
+  /**
+   * Sells what the second wallet still holds of every coin it created (recorded next to its key), then sends what is left back to the
+   * harness wallet. Safe to call more than once and at the start of a run, which recovers what an earlier run left behind.
+   */
   refund(): Promise<void>;
 }
 
@@ -339,6 +351,8 @@ export interface ChainKit {
   sellAll(kp: any, mint: string): Promise<string | null>;
   /** Spot price in SOL per UI token, from the curve. */
   priceSol(mint: string): Promise<number>;
+  /** The curve's state as the app reads it (PumpMarketState). */
+  curveState(mint: string): Promise<{ virtualSolReserves: bigint; virtualTokenReserves: bigint; realTokenReserves: bigint; complete?: boolean }>;
   /** Sends what is left in `kp` (less one fee) to `to`. */
   refund(kp: any, to: any): Promise<void>;
 }
@@ -349,7 +363,13 @@ export function makeChainKit(d: { conn: any; web3: any; sdk: any; curve: any; bu
     tx.recentBlockhash = (await d.conn.getLatestBlockhash('confirmed')).blockhash;
     if (!tx.feePayer) tx.feePayer = signers[0].publicKey;
     if ('version' in tx) tx.sign(signers); else tx.sign(...signers);
-    const sig = await d.conn.sendRawTransaction(tx.serialize());
+    let sig: string;
+    try {
+      sig = await d.conn.sendRawTransaction(tx.serialize());
+    } catch (e: any) { // a simulation failure: say why (the program's last log lines), not only "Simulation failed"
+      const logs: string[] = Array.isArray(e?.logs) ? e.logs : [];
+      throw new Error(`${String(e?.message ?? e).replace(/Catch the `SendTransactionError`[^.]*\./, '').replace(/\s+/g, ' ').trim()}${logs.length ? ` logs: ${logs.slice(-3).join(' | ')}` : ''}`);
+    }
     for (let i = 0; i < 120; i++) { // polls the status (no websocket subscription), up to 60 s
       const st = (await d.conn.getSignatureStatuses([sig])).value[0];
       if (st?.err) throw new Error(`tx ${sig} failed: ${JSON.stringify(st.err)}`);
@@ -403,6 +423,7 @@ export function makeChainKit(d: { conn: any; web3: any; sdk: any; curve: any; bu
       const tx = await d.builder.buildSellTransaction(d.conn, { ...tradeParams(s, m, kp.publicKey), seller: kp.publicKey, amountTokens: amount, minSolOutputLamports: BigInt(q.minOutputLamports) });
       return send(tx, [kp]);
     },
+    curveState: (mint) => state(new PublicKey(mint)),
     async priceSol(mint) {
       const s = await state(new PublicKey(mint));
       return (Number(s.virtualSolReserves) / 1e9) / (Number(s.virtualTokenReserves) / 10 ** s.tokenDecimals);
@@ -416,39 +437,96 @@ export function makeChainKit(d: { conn: any; web3: any; sdk: any; curve: any; bu
 }
 
 /**
- * The DumpMarket on any cluster, on top of makeChainKit. `payer` is the harness's throwaway wallet; the second wallet is generated here
- * and never written to disk.
+ * (h) the seed for the dump, from the coin's own curve (constant product on the virtual reserves, fees grossed up). The app buys `appBuySol`
+ * after the seed; when the second wallet then sells everything, the curve returns to about its state before the seed plus the app's buy. The
+ * seed is sized so that price is at most `targetRatio` (0.72 by default, under the -20% stop with room for fees) of the price the app buys at,
+ * measured conservatively against the price just before the app's buy (the app's fill is above it). Refused when the seed is above
+ * `maxSeedSol` (DEVNET_DUMP_SOL), when the seed and the app's buy would take more than 95% of the tokens left on the curve (the program
+ * refuses a buy near the end of the curve), or when the curve's progress at the app's buy would be within 5 points of the app's curve-progress
+ * cap (the coordinator refuses the buy above it). With 30 SOL / 1,073M virtual reserves the seed is about 6.3 SOL for a 0.02 SOL app buy; with
+ * 1 SOL virtual reserves, about 0.24 SOL; with the about 0.3 SOL a devnet coin showed in the Mac run, about 0.07 SOL.
+ */
+export function dumpSeedPlan(
+  st: { virtualSolReserves: bigint; virtualTokenReserves: bigint; realTokenReserves: bigint },
+  appBuySol: number,
+  opts: { maxSeedSol: number; targetRatio?: number; capPct?: number; margin?: number }
+): { ok: true; seedSol: number; projectedRatio: number; progressPct: number } | { ok: false; reason: string; seedSol: number } {
+  const target = opts.targetRatio ?? 0.72;
+  const capPct = opts.capPct ?? 60;
+  const vSol = Number(st.virtualSolReserves) / 1e9;
+  const vTok = Number(st.virtualTokenReserves);
+  const k = vSol * vTok;
+  const appNet = appBuySol * (1 - BUY_FEE_FRACTION);
+  const net = Math.max(0.005, ((vSol + appNet) / Math.sqrt(target) - vSol) * (opts.margin ?? 1.15));
+  const seedSol = Math.ceil((net / (1 - BUY_FEE_FRACTION)) * 1e4) / 1e4;
+  const projectedRatio = ((vSol + appNet) / (vSol + net)) ** 2;
+  const tokensOut = (sol: number) => vTok - k / (vSol + sol);
+  const progressPct = (100 * (Number(CURVE_TOKENS_RAW - st.realTokenReserves) + tokensOut(net))) / Number(CURVE_TOKENS_RAW);
+  const left = Number(st.realTokenReserves);
+  if (seedSol > opts.maxSeedSol) return { ok: false, seedSol, reason: `the seed this curve needs is ${seedSol} SOL, above DEVNET_DUMP_SOL=${opts.maxSeedSol} (virtual reserves ${vSol.toFixed(3)} SOL)` };
+  if (tokensOut(net + appNet) > 0.95 * left) return { ok: false, seedSol, reason: `CURVE_NEARLY_COMPLETE: a ${seedSol} SOL seed and the app's buy need ${tokensOut(net + appNet).toExponential(4)} tokens, ${left.toExponential(4)} remain` };
+  if (progressPct > capPct - 5) return { ok: false, seedSol, reason: `the curve would be ${progressPct.toFixed(1)}% sold at the app's buy, too close to the ${capPct}% cap` };
+  return { ok: true, seedSol, projectedRatio, progressPct };
+}
+
+/**
+ * The DumpMarket on any cluster, on top of makeChainKit. `payer` is the harness's throwaway wallet. The second wallet's key is kept at
+ * `keyPath` (in the harness's scratch directory, next to the throwaway key) and the coins it creates in `<keyPath without .json>-coins.json`;
+ * the key is written before any SOL is sent to it, so an interrupted run leaves nothing a later run (or `solana transfer` with that key file)
+ * cannot get back. An existing key file is reused.
  */
 export function makeDumpMarket(d: {
-  conn: any; payer: any; web3: any; sdk: any; curve: any; builder: any;
+  conn: any; payer: any; web3: any; sdk: any; curve: any; builder: any; keyPath: string;
 }): DumpMarket {
   const kit = makeChainKit(d);
-  const w2 = kit.newWallet();
+  const coinsPath = d.keyPath.replace(/\.json$/, '') + '-coins.json';
+  let w2: any;
+  if (fs.existsSync(d.keyPath)) {
+    w2 = d.web3.Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(d.keyPath, 'utf8'))));
+  } else {
+    w2 = kit.newWallet();
+    fs.mkdirSync(path.dirname(d.keyPath), { recursive: true });
+    fs.writeFileSync(d.keyPath, JSON.stringify(Array.from(w2.secretKey)), { mode: 0o600 });
+  }
+  const coins = (): string[] => { try { return JSON.parse(fs.readFileSync(coinsPath, 'utf8')); } catch { return []; } };
+  const remember = (mint: string) => fs.writeFileSync(coinsPath, JSON.stringify([...new Set([...coins(), mint])]), { mode: 0o600 });
   return {
-    async createAndSeed(seedSol: number) {
-      await kit.transfer(d.payer, w2.publicKey, seedSol + 0.1);
+    address: w2.publicKey.toBase58(),
+    keyPath: d.keyPath,
+    async createAndSeed({ appBuySol, maxSeedSol }) {
+      await kit.transfer(d.payer, w2.publicKey, 0.1);
       const coin = await kit.create(w2, 'P16H', 'P16 harness');
-      await kit.buy(w2, coin.mint, seedSol);
-      return coin;
+      remember(coin.mint);
+      const plan = dumpSeedPlan(await kit.curveState(coin.mint), appBuySol, { maxSeedSol });
+      if (!plan.ok) throw new Error(plan.reason);
+      await kit.transfer(d.payer, w2.publicKey, plan.seedSol + 0.01);
+      await kit.buy(w2, coin.mint, plan.seedSol);
+      return { ...coin, seedSol: plan.seedSol, projectedRatio: plan.projectedRatio };
     },
     priceSol: (mint: string) => kit.priceSol(mint),
     sellAll: (mint: string) => kit.sellAll(w2, mint),
-    refund: () => kit.refund(w2, d.payer.publicKey),
+    async refund() {
+      for (const mint of coins()) {
+        try { await kit.sellAll(w2, mint); } catch (e: any) { console.log(`INFO  (h) second wallet could not sell ${mint}: ${String(e?.message ?? e).slice(0, 120)}`); }
+      }
+      await kit.refund(w2, d.payer.publicKey);
+    },
   };
 }
 
 /**
- * (h) P1.6 (R1-19, R1-112): one failed price read does not blind the stop-loss. A second throwaway wallet creates a coin and seeds it with
- * `seedSol`; the app buys it; the harness then wraps the coordinator's `getMultipleAccountsInfo` so the next call naming the curve throws
- * once (the app's own price read takes it), and the second wallet dumps everything. Expected: the exit loop's STOP_LOSS sell within about
- * 6 s of the dump being visible on the curve (two 3 s passes; before P1.6 the failed read put the mint in a 60 s back-off). The pass bound
- * is `maxMs` (10 s by default, for devnet confirmation latency). A -20% move on a fresh curve (30 SOL virtual reserves) needs about
- * 3.6 SOL sold into it, so the seed defaults to 5 SOL and the step needs that much in the harness wallet (see DEVNET_E2E_README.md).
+ * (h) P1.6 (R1-19, R1-112): one failed price read does not blind the stop-loss. A second throwaway wallet creates a coin and seeds it (the seed
+ * is sized from the coin's own curve by `dumpSeedPlan`, at most `maxSeedSol`); the app buys `appBuySol` of it; the harness then wraps the
+ * coordinator's `getMultipleAccountsInfo` so the next call naming the curve throws once (the app's own price read takes it), and the second
+ * wallet dumps everything. Expected: the exit loop's STOP_LOSS sell within about 6 s of the dump being visible on the curve (two 3 s passes;
+ * before P1.6 the failed read put the mint in a 60 s back-off). The pass bound is `maxMs` (10 s by default, for devnet confirmation latency).
+ * Every path, a failed create or seed included, ends in `finally`: the app's position is closed, the second wallet sells what it holds and
+ * refunds the harness wallet.
  */
 export async function failedReadThenDumpStopLoss(
   s: HarnessSteps,
   m: DumpMarket,
-  opts: { seedSol: number; buildBuyRequestFor: (mint: string) => Promise<ExecuteTradeRequest>; maxMs?: number }
+  opts: { appBuySol: number; maxSeedSol: number; buildBuyRequestFor: (mint: string) => Promise<ExecuteTradeRequest>; maxMs?: number }
 ): Promise<void> {
   const L = '(h) failed price read, then a dump: stop-loss';
   const maxMs = opts.maxMs ?? 10_000;
@@ -456,26 +534,27 @@ export async function failedReadThenDumpStopLoss(
   const rowFor = (mint: string) => (s.db.loadPositions() as Row[]).find((p) => p.mint === mint);
   if (!s.connection) { s.rec(L, false, 'harness did not pass the coordinator connection'); return; }
   const conn: any = s.connection;
-  let coin: { mint: string; curve: string };
-  try {
-    coin = await m.createAndSeed(opts.seedSol);
-  } catch (e: any) {
-    s.rec(`${L}: second wallet creates and seeds a coin`, false, String(e?.message ?? e).slice(0, 300));
-    return;
-  }
   const orig = conn.getMultipleAccountsInfo;
+  let coin: { mint: string; curve: string; seedSol: number; projectedRatio: number } | undefined;
   let injected = false;
   try {
-    s.rec(`${L}: second wallet creates and seeds a coin`, true, `${coin.mint} seeded with ${opts.seedSol} SOL`);
+    try {
+      coin = await m.createAndSeed({ appBuySol: opts.appBuySol, maxSeedSol: opts.maxSeedSol });
+    } catch (e: any) {
+      s.rec(`${L}: second wallet creates and seeds a coin`, false, String(e?.message ?? e).slice(0, 300));
+      return;
+    }
+    const c = coin;
+    s.rec(`${L}: second wallet creates and seeds a coin`, true, `${c.mint} seeded with ${c.seedSol} SOL from ${m.address} (projected price/entry after the dump at most ${c.projectedRatio.toFixed(3)})`);
     await s.coordinator.syncRealWalletBalance();
-    const buy = await s.coordinator.executeTrade(await opts.buildBuyRequestFor(coin.mint));
+    const buy = await s.coordinator.executeTrade(await opts.buildBuyRequestFor(c.mint));
     s.rec(`${L}: app buy CONFIRMED`, buy.success && buy.lifecycleState === 'CONFIRMED', `${buy.lifecycleState} ${buy.error ?? ''}`.slice(0, 300));
-    const pos = rowFor(coin.mint);
+    const pos = rowFor(c.mint);
     if (!buy.success || !pos || pos.status === 'CLOSED') return;
 
     conn.getMultipleAccountsInfo = async function (this: unknown, ...args: any[]) {
       const keys: any[] = Array.isArray(args[0]) ? args[0] : [];
-      if (!injected && keys.some((k) => String(k?.toBase58?.() ?? k) === coin.curve)) {
+      if (!injected && keys.some((k) => String(k?.toBase58?.() ?? k) === c.curve)) {
         injected = true;
         conn.getMultipleAccountsInfo = orig; // one call only
         throw new Error('harness: injected getMultipleAccountsInfo failure');
@@ -486,18 +565,18 @@ export async function failedReadThenDumpStopLoss(
     s.rec(`${L}: the app's price read took the injected failure`, injected, injected ? 'one getMultipleAccountsInfo naming the curve threw' : 'no read of the curve in 10 s');
     if (!injected) return;
 
-    const dumpSig = await m.sellAll(coin.mint);
+    const dumpSig = await m.sellAll(c.mint);
     let visibleAt = 0;
     let ratio = 1;
     for (let i = 0; i < 40 && !visibleAt; i++) {
-      ratio = (await m.priceSol(coin.mint)) / pos.entryPriceSol;
+      ratio = (await m.priceSol(c.mint)) / pos.entryPriceSol;
       if (ratio <= 0.8) visibleAt = Date.now(); else await s.sleep(250);
     }
     s.rec(`${L}: dump visible below the -20% stop`, visibleAt > 0, `price/entry ${ratio.toFixed(3)}${dumpSig ? ` ${s.link(dumpSig)}` : ''}`);
     if (!visibleAt) return;
     let closed: Row | undefined;
     for (let i = 0; i < 240 && !closed; i++) {
-      const r = rowFor(coin.mint);
+      const r = rowFor(c.mint);
       if (r?.status === 'CLOSED') closed = r; else await s.sleep(250);
     }
     const tookMs = closed ? Date.now() - visibleAt : NaN;
@@ -512,11 +591,15 @@ export async function failedReadThenDumpStopLoss(
     }
   } finally {
     conn.getMultipleAccountsInfo = orig;
-    for (const p of openFor({ ...s, mint: coin.mint })) {
-      const c = await s.coordinator.closePosition(p.id, 100, 'e2e (h) cleanup');
-      s.rec(`${L}: cleanup close 100%`, c.success, c.error || 'closed');
+    if (coin) {
+      for (const p of openFor({ ...s, mint: coin.mint })) {
+        try {
+          const c = await s.coordinator.closePosition(p.id, 100, 'e2e (h) cleanup');
+          s.rec(`${L}: cleanup close 100%`, c.success, c.error || 'closed');
+        } catch (e: any) { s.rec(`${L}: cleanup close 100%`, false, String(e?.message ?? e).slice(0, 200)); }
+      }
     }
-    try { await m.refund(); } catch (e: any) { console.log(`INFO  (h) refund of the second wallet failed: ${String(e?.message ?? e).slice(0, 120)}`); }
+    try { await m.refund(); } catch (e: any) { console.log(`INFO  (h) refund of the second wallet failed: ${String(e?.message ?? e).slice(0, 120)}; its key is in ${m.keyPath}, and the next run with this scratch directory retries the refund`); }
   }
 }
 

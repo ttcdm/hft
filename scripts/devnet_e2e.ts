@@ -363,22 +363,30 @@ async function main() {
   await S.heldBlockhashStopLoss(steps); // P1.7
   const gDoneAt = Date.now();
 
-  // (h) P1.6: opt-in, because moving a fresh curve past the -20% stop needs about 3.6 SOL sold into it (DEVNET_E2E_README.md)
+  // (h) P1.6: opt-in (DEVNET_DUMP_SOL is the most the seed may take). The seed is sized from the coin's own curve (DEVNET_E2E_README.md).
   const dumpSol = Number(process.env.DEVNET_DUMP_SOL || 0);
+  // The second wallet's key lives in the scratch directory next to the throwaway key; a run with the same APEX_E2E_SCRATCH first gets back
+  // what an earlier run left in it, whether or not (h) runs this time.
+  const secondKeyPath = path.join(scratch, 'second-wallet.json');
+  const dumpMarket = async () => S.makeDumpMarket({ conn, payer: kp, web3, sdk: (await import('@pump-fun/pump-sdk')).PUMP_SDK, curve: PumpCurveService, builder: txBuilder, keyPath: secondKeyPath });
+  if (fs.existsSync(secondKeyPath)) {
+    try { await (await dumpMarket()).refund(); } catch (e: any) { console.log(`INFO  (h) leftover refund from the second wallet failed: ${safe(e?.message ?? e).slice(0, 120)}`); }
+  }
   if (dumpSol > 0) {
+    const market = await dumpMarket();
     const have = (await conn.getBalance(kp.publicKey)) / LAMPORTS_PER_SOL;
-    if (have < dumpSol + 0.3) {
-      rec('(h) funding for the dump', false, `DEVNET_DUMP_SOL=${dumpSol} needs at least ${(dumpSol + 0.3).toFixed(1)} SOL in ${kp.publicKey.toBase58()}; it has ${have.toFixed(3)}`);
+    const maxSeedSol = Math.min(dumpSol, have - BUY_SOL - 0.3);
+    if (maxSeedSol <= 0) {
+      rec('(h) funding for the dump', false, `the throwaway ${kp.publicKey.toBase58()} has ${have.toFixed(3)} SOL; (h) needs the seed plus ${(BUY_SOL + 0.3).toFixed(2)} SOL`);
     } else {
-      const { PUMP_SDK } = await import('@pump-fun/pump-sdk');
-      const market = S.makeDumpMarket({ conn, payer: kp, web3, sdk: PUMP_SDK, curve: PumpCurveService, builder: txBuilder });
       await S.failedReadThenDumpStopLoss(steps, market, {
-        seedSol: dumpSol,
+        appBuySol: BUY_SOL,
+        maxSeedSol,
         buildBuyRequestFor: async (m) => buildBuyRequestFor(m, await PumpCurveService.fetchPumpMarketState({ connection: conn, mint: new PublicKey(m), executionMode: 'LIVE' }), true),
       });
     }
   } else {
-    console.log('INFO  (h) skipped: set DEVNET_DUMP_SOL=5 and fund the throwaway wallet with at least 5.3 SOL to run the failed-read stop-loss step');
+    console.log('INFO  (h) skipped: set DEVNET_DUMP_SOL to the most the seed may take (the seed is sized from the coin\'s own curve, see DEVNET_E2E_README.md) to run the failed-read stop-loss step');
   }
 
   // (i) P4.1: opt-in. The creator cluster and funder truth through the app's own pump log stream, watch window and funder lookup, wired

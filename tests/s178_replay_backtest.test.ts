@@ -127,7 +127,8 @@ describe('S178: replay runs the real rules over what was recorded', () => {
     const { mint, ww } = record(buyers.map((b, i) => ({ at: 1000 + i * 1500, user: b, isBuy: true, sol: 0.8 })), db, facts);
     const live = ww.evaluate(mint, t0 + 125_000)!;
     const { launches, funders } = db.loadLaunchRecording();
-    const r = replayLaunch(launches[0], funders, 150);
+    // P4.3: 32 SOL of buys takes this curve past the 60% progress cap; the live window here has no progress source, so compare without the cap
+    const r = replayLaunch(launches[0], funders, 150, { curveCap: false });
     expect(['HOT', 'READY', 'DEAD']).toContain(r.verdict);
     // the replay scores with the real engine over replay-scoped stats; the live window here had no score function, so the READY/HOT split can
     // differ, but "released at all, and not DEAD" must agree

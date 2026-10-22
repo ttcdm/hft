@@ -35,6 +35,7 @@ export const PAPER_STALE_REFRESH_PER_PASS = 5;
 /** PAPER positions with no price get their own alert up to this many per pass; the rest share one alert with a count. */
 export const PAPER_INDIVIDUAL_ALERTS = 5;
 import { EligibilityFilter } from '../signals/eligibilityFilter';
+import { curveProgressPctOfState, isCurveTooFar, curveTooFarReason } from '../signals/curveProgressCap';
 import { localSigner } from '../solana/signer';
 import { txBuilder, SolanaTransactionBuilder, PumpBuyParams, PumpSellParams } from '../solana/transactionBuilder';
 import { SolanaRpcTransport, JitoTransport } from '../solana/transports';
@@ -1937,6 +1938,16 @@ export class ExecutionCoordinator {
       }
     } catch {}
 
+    // P4.3 (R1-57): the curve-progress cap on the fresh read, so SHADOW, PAPER and manual PAPER buys stop where LIVE does
+    if (curveState) {
+      const progressPct = curveProgressPctOfState(curveState);
+      if (progressPct !== null && isCurveTooFar(progressPct)) {
+        const error = curveTooFarReason('CURVE_PROGRESS_TOO_HIGH', progressPct);
+        workstationDb.logJournal('TRADE_FILTER_REJECTED', correlationId, 'PAPER', { reason: error, curveProgressPct: progressPct });
+        return { rejection: { success: false, lifecycleState: 'FILTER_REJECTED', executionMode: 'PAPER', error, correlationId } };
+      }
+    }
+
     if (!quotePriceSol || quotePriceSol <= 0) {
       return { rejection: {
         success: false,
@@ -2293,6 +2304,14 @@ export class ExecutionCoordinator {
         error: 'BONDING_CURVE_MIGRATED: Token has graduated from bonding curve. Direct Pump.fun trade rejected.',
         correlationId,
       };
+    }
+
+    // P4.3 (R1-57): the authoritative curve-progress cap, on this fresh read, for every caller (auto, callout, manual)
+    const liveProgressPct = curveProgressPctOfState(marketState);
+    if (liveProgressPct !== null && isCurveTooFar(liveProgressPct)) {
+      const error = curveTooFarReason('CURVE_PROGRESS_TOO_HIGH', liveProgressPct);
+      workstationDb.logJournal('TRADE_FILTER_REJECTED', correlationId, 'LIVE', { reason: error, curveProgressPct: liveProgressPct });
+      return { success: false, lifecycleState: 'FILTER_REJECTED', executionMode: 'LIVE', error, correlationId };
     }
 
     // 2. Authoritative Token Eligibility Verification (Fail-Closed in LIVE mode)

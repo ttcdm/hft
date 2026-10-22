@@ -57,9 +57,9 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
       const metrics = evaluator.getMetrics(mint, 1000);
       expect(Number.isFinite(metrics.slotAcceleration)).toBe(true);
       expect(isNaN(metrics.slotAcceleration)).toBe(false);
-      // deltaSol > 0 on same slot sets acceleration to deltaSol (5.0)
-      expect(metrics.slotAcceleration).toBe(5.0);
-      expect(metrics.velocityScore).toBeGreaterThanOrEqual(6);
+      // P4.3 (R1-58): a same-slot pair says nothing about speed: acceleration 0 (it used to be the raw deltaSol, 5.0, worth the full 6 points)
+      expect(metrics.slotAcceleration).toBe(0);
+      expect(metrics.velocityScore).toBe(0);
 
       // Same-slot with negative deltaSol (sell on same slot)
       evaluator.recordTransition(mint, 500, 8.0, 1000);

@@ -258,7 +258,8 @@ export class MemecoinAggregatorService extends EventEmitter {
       cleanCa,
       event.slot,
       Number(event.realSolReserves) / 1e9,
-      event.receivedAt
+      event.receivedAt,
+      { create: true } // P4.3: the create's state is a baseline, never one end of an acceleration pair
     );
 
     if (existing) {
@@ -835,6 +836,7 @@ export class MemecoinAggregatorService extends EventEmitter {
         source: 'AUTO_SNIPER',
         provenance,
         liquidityUsd: pool.liquidityUsd,
+        signalTimestamp: params.signalTimestamp, // P4.3 (R1-59): SHADOW runs the same signal-age check as PAPER and LIVE
       });
       if (preview.status === 'REJECTED') {
         return { success: false, message: preview.error, txHash: '', confluenceScore: confluenceEval.score, dryRun: true };

@@ -22,6 +22,8 @@ import { LaunchRecorder } from './server/backtest/launchRecorder';
 import { recorderConfigProblems } from './server/backtest/recorderConfig';
 import { replayLaunchesAsync } from './server/backtest/replay';
 import { checkConfluenceThreshold, getConfluenceThreshold, envConfluenceProblem } from './server/signals/confluenceThreshold';
+import { maxCurveProgressProblem } from './server/signals/curveProgressCap';
+import { curveVelocityEvaluator } from './server/signals/curveVelocityEvaluator';
 import { computeLatency } from './server/system/latencyStats';
 import { buildDiagnosticsContext } from './server/system/aiContext';
 import { pumpFunService, pumpBootMode } from './server/pumpfunService';
@@ -325,13 +327,16 @@ watchWindow.setScoreFn((mint) => {
   const pool = memecoinAggregator.getPools().find((p) => p.contractAddress === mint);
   return pool ? memecoinAggregator.evaluateTokenConfluence(pool).score : null;
 });
+// P4.3 (R1-57): the measured curve progress (tokens sold); above APEX_MAX_CURVE_PROGRESS_PCT (60) a watched launch is released DEAD CURVE_TOO_FAR
+watchWindow.setCurveProgressFn((mint) => onChainPoolStats.get(mint)?.curveProgressPct ?? null);
+{ const p = maxCurveProgressProblem(); if (p) console.warn(`[APEX QUANT HFT] ${p}`); }
 watchWindow.attach(pumpFeedListener);
 pumpFeedListener.follow(executionCoordinator); // P4.2 (R1-63): a successful RPC switch moves the log subscription and creator lookups
 // S178: save what the window sees (launches it scores, their trades, the funder facts) so the auto rules can be replayed over real launches
 for (const p of recorderConfigProblems()) console.warn(`[APEX QUANT HFT] ${p}`); // S190
 const launchRecorder = new LaunchRecorder(workstationDb, watchWindow, () => solPriceService.lastKnownPrice());
 launchRecorder.attach(pumpFeedListener);
-wireWatchPins(watchWindow, memecoinAggregator, onChainPoolStats); // S4: a watched mint keeps its pool and its trade stats until the verdict
+wireWatchPins(watchWindow, memecoinAggregator, onChainPoolStats, curveVelocityEvaluator); // S4: a watched mint keeps its pool, its trade stats and (P4.3) its velocity data until the verdict
 wireCreatorReportPins(watchWindow, creatorRiskScorer); // P4.1: a watched launch's creator report lives until 60 s after its verdict
 wireFunderLookup(watchWindow, new FunderLookup(() => executionCoordinator.getConnection())); // Q6b
 watchWindow.on('release', (r) => broadcastWs({ type: 'WATCH_RELEASE', data: r }));

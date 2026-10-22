@@ -400,6 +400,8 @@ async function main() {
     console.log('INFO  (i) skipped: set DEVNET_CLUSTER_CHECK=1 (needs about 0.4 SOL free, spends about 0.03) to run the creator-cluster and one-funder-cluster step');
   }
 
+  await releaseGatesStep(steps, S, { conn, web3, kp, coordinator, workstationDb, PumpCurveService, txBuilder, buildBuyRequestFor });
+
   await S.waitPast(steps, gDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (g) buy');
   await S.emergencyStopThroughApp(steps); // P1.4, last: it leaves LIVE disarmed and auto OFF. Telegram-path panic sells the LIVE position; kill switch on/off/re-arm buys nothing
 
@@ -415,6 +417,54 @@ async function main() {
   rec('(f) recover process exit', rec2.status === 0, `exit ${rec2.status}`);
 
   return finish();
+}
+
+/**
+ * (k) P4.3, opt-in: the release gates through the app's own log stream, watch window and auto controller, wired as server.ts wires them (this script
+ * does not run server.ts). DEVNET_RELEASE_GATES=1 runs the SHADOW-then-PAPER part (about 1 SOL lent, most of it refunded); DEVNET_CURVE_CAP=1 adds
+ * the curve-cap push, which needs about 25.8 SOL more with 30 SOL virtual reserves (computed from the coin's own curve; see DEVNET_E2E_README.md).
+ * Kept in its own function so it merges apart from the other steps.
+ */
+async function releaseGatesStep(steps: import('./devnet_e2e_steps').HarnessSteps, S: typeof import('./devnet_e2e_steps'), d: {
+  conn: any; web3: any; kp: any; coordinator: any; workstationDb: any; PumpCurveService: any; txBuilder: any;
+  buildBuyRequestFor: (m: string, st: any, allowWaive: boolean) => Promise<any>;
+}): Promise<void> {
+  if (process.env.DEVNET_RELEASE_GATES !== '1') {
+    console.log('INFO  (k) skipped: set DEVNET_RELEASE_GATES=1 (needs about 1.2 SOL free, spends about 0.1) to run the SHADOW/PAPER release-gates step; add DEVNET_CURVE_CAP=1 (about 27 SOL more, see the README) for the curve-cap push');
+    return;
+  }
+  const { PUMP_SDK } = await import('@pump-fun/pump-sdk');
+  const { watchWindow } = await import('../server/signals/watchWindow');
+  const { pumpFeedListener } = await import('../server/solana/pumpFeedListener');
+  const { FunderLookup, wireFunderLookup } = await import('../server/signals/funderLookup');
+  const { onChainPoolStats } = await import('../server/market/poolStats');
+  const { memecoinAggregator } = await import('../server/memecoinAggregator');
+  const { maxCurveProgressPct } = await import('../server/signals/curveProgressCap');
+  const { autoSnipeController } = await import('../server/auto/controller');
+  watchWindow.setScoreFn((mint) => { const pool = memecoinAggregator.getPools().find((p) => p.contractAddress === mint); return pool ? memecoinAggregator.evaluateTokenConfluence(pool).score : null; });
+  watchWindow.setCurveProgressFn((mint) => onChainPoolStats.get(mint)?.curveProgressPct ?? null);
+  watchWindow.attach(pumpFeedListener); // idempotent in effect: a second create of a watched mint and a repeated trade are both ignored
+  wireFunderLookup(watchWindow, new FunderLookup(() => d.coordinator.getConnection()));
+  watchWindow.start();
+  autoSnipeController.attachWatchWindow();
+  const subscribed = await pumpFeedListener.start();
+  steps.rec('(k) release gates: the pump log stream subscribed', subscribed, subscribed ? 'onLogs on the coordinator connection' : 'pumpFeedListener.start() returned false');
+  if (subscribed) {
+    const kit = S.makeChainKit({ conn: d.conn, web3: d.web3, sdk: PUMP_SDK, curve: d.PumpCurveService, builder: d.txBuilder });
+    const curveState = (m: string) => d.PumpCurveService.fetchPumpMarketState({ connection: d.conn, mint: new d.web3.PublicKey(m), executionMode: 'LIVE' });
+    await S.releaseGatesOnChain(steps, kit, { snapshot: () => watchWindow.getSnapshot() }, d.kp, {
+      decisions: (mint) => d.workstationDb.loadDecisions({ mint }),
+      curveState,
+      progressPct: (mint) => onChainPoolStats.get(mint)?.curveProgressPct ?? null,
+      capPct: maxCurveProgressPct(),
+      buildBuyRequestFor: async (m) => d.buildBuyRequestFor(m, await curveState(m), true),
+      balanceSol: async (k) => (await d.conn.getBalance(k.publicKey)) / 1e9,
+      isLiveArmed: () => d.coordinator.isLiveArmed(),
+    }, { curveCap: process.env.DEVNET_CURVE_CAP === '1' });
+  }
+  autoSnipeController.detachWatchWindow();
+  watchWindow.stop();
+  await pumpFeedListener.stop();
 }
 
 function finish() {

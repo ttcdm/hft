@@ -2,15 +2,18 @@ import type { EventEmitter } from 'events';
 import type { WatchWindow, WatchResult } from './watchWindow';
 import { CREATOR_REPORT_GRACE_MS } from './creatorRiskScorer';
 
-/** S4: the pool and the trade stats of a mint the watch window is still scoring must outlive the newest-N eviction of both caches. */
+/** S4: the pool and the trade stats (and, P4.3, the curve-velocity data) of a mint the watch window is still scoring must outlive the newest-N eviction of those caches. */
 export function wireWatchPins(
   window: Pick<WatchWindow, 'isWatching'>,
   aggregator: { setPoolPinned(fn: (mint: string) => boolean): void },
   stats: { setPinned(fn: (mint: string) => boolean): void },
+  /** P4.3 (R1-58): the curve-velocity evaluator's per-mint maps too. Optional, so older callers keep working. */
+  velocity?: { setPinned(fn: (mint: string) => boolean): void },
 ): void {
   const pinned = (mint: string) => window.isWatching(mint);
   aggregator.setPoolPinned(pinned);
   stats.setPinned(pinned);
+  velocity?.setPinned(pinned);
 }
 
 /**

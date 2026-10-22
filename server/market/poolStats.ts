@@ -181,8 +181,12 @@ export class OnChainPoolStats {
   }
 }
 
-/** Q-curve: pump.fun's bar is tokens sold, not SOL raised (the curve is constant-product, so SOL lags tokens: at half the tokens sold only a quarter of the SOL is in). */
-function curveProgressOf(s: { realSolReserves: number; realTokenReserves: bigint | null }): number {
+/**
+ * Q-curve: pump.fun's bar is tokens sold, not SOL raised (the curve is constant-product, so SOL lags tokens: at half the tokens sold only a quarter of the SOL is in).
+ * P4.3: exported, so the curve-progress cap (server/signals/curveProgressCap.ts) measures progress the same way in the watch window, the auto controller and
+ * the coordinator's fresh curve read. `realSolReserves` is in SOL.
+ */
+export function curveProgressOf(s: { realSolReserves: number; realTokenReserves: bigint | null }): number {
   if (s.realTokenReserves !== null) {
     const initial = CURVE_INITIAL_REAL_TOKENS; // not the first value seen: a watch that starts mid-curve would see a smaller "initial"
     const sold = Number(initial - s.realTokenReserves) / Number(initial);

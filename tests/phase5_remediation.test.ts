@@ -72,7 +72,7 @@ describe('Phase 5 Master Remediation Suite: Alpha Pipeline Integration (B14)', (
       const evaluator = new CurveVelocityEvaluator();
       const mint = TEST_MINT_1;
 
-      evaluator.recordTransition(mint, 2000, 25.0, 100_000);
+      evaluator.recordTransition(mint, 2000, 25.0, 112_000); // P4.3 (R1-58): inside the 10 s acceleration window (was 20 s before the second)
       evaluator.recordTransition(mint, 2050, 22.5, 120_000); // 2.5 SOL net sell across 50 slots
 
       const metrics = evaluator.getMetrics(mint, 120_000);

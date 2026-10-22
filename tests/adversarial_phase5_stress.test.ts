@@ -90,8 +90,8 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
       const metricsPos = evaluator.getMetrics(MINT_A, 100_100);
       expect(Number.isNaN(metricsPos.slotAcceleration)).toBe(false);
       expect(Number.isFinite(metricsPos.slotAcceleration)).toBe(true);
-      expect(metricsPos.slotAcceleration).toBe(5.0); // Safe fallback: deltaSol > 0 ? deltaSol : 0
-      expect(metricsPos.velocityScore).toBeGreaterThan(0);
+      expect(metricsPos.slotAcceleration).toBe(0); // P4.3 (R1-58): a same-slot pair is ignored (it used to score deltaSol, 5.0)
+      expect(metricsPos.velocityScore).toBe(0);
 
       // Case 2: Negative delta in same slot
       evaluator.clear(MINT_A);
@@ -108,9 +108,10 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
       const evaluator = new CurveVelocityEvaluator();
 
       // Insert out of chronological order
+      // P4.3 (R1-58): all three inside the 10 s acceleration window (they were 50 s apart, which no longer counts)
       evaluator.recordTransition(MINT_A, 1050, 25.0, 150_000);
-      evaluator.recordTransition(MINT_A, 1000, 10.0, 100_000);
-      evaluator.recordTransition(MINT_A, 1020, 16.0, 120_000);
+      evaluator.recordTransition(MINT_A, 1000, 10.0, 141_000);
+      evaluator.recordTransition(MINT_A, 1020, 16.0, 145_000);
 
       // Sorted order should be: 1000 (10 SOL), 1020 (16 SOL), 1050 (25 SOL)
       // Latest vs previous: 1050 vs 1020 -> deltaSol = 9.0, deltaSlots = 30 -> v = 0.3 SOL/slot
@@ -175,7 +176,7 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
         evaluator.recordTransition(MINT_A, 1000 + i, 10.0 + i * 0.1, 1000 + i * 10);
       }
 
-      const metrics = evaluator.getMetrics(MINT_A);
+      const metrics = evaluator.getMetrics(MINT_A, 2490); // P4.3 (R1-58): read at the last transition's time, inside the 10 s acceleration window (was the wall clock)
       expect(metrics.transitionCount).toBe(120); // Capped at maxTransitionsPerMint
       expect(metrics.lastSlot).toBe(1149);
       expect(metrics.slotAcceleration).toBe(0.1);

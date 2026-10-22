@@ -9,6 +9,11 @@ export const CONFLUENCE_MIN_THRESHOLD = 0;
 export const CONFLUENCE_MAX_THRESHOLD = 100;
 /** Below this the screen warns plainly: more buys of weaker coins. */
 export const CONFLUENCE_WARN_BELOW = 50;
+/**
+ * P4.3 (R1-56): the threshold may be set down to 0, but a DEVNET_LIVE auto buy (real devnet SOL) never clears a score below this. The auto controller
+ * applies max(threshold, floor) to HOT and READY releases alike in DEVNET_LIVE; SHADOW, PAPER and manual snipes use the threshold as set.
+ */
+export const CONFLUENCE_DEVNET_LIVE_FLOOR = 50;
 
 export type ThresholdCheck = { ok: true; value: number } | { ok: false; reason: string };
 

@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import { watchMaxCandidates } from './capacity';
 import { CONFLUENCE_DEFAULT_THRESHOLD, getConfluenceThreshold } from './confluenceThreshold';
+import { isCurveTooFar, curveTooFarReason } from './curveProgressCap';
 import type { PumpTradeEvent } from '../solana/pumpFeedListener';
 
 /**
@@ -15,9 +16,12 @@ import type { PumpTradeEvent } from '../solana/pumpFeedListener';
  *
  * Release states:
  *   DEAD   cumulative organic net inflow negative once the minimum hold has passed, or ANY creator-cluster sell (instant; also when the
- *          funder that puts a wallet that already sold into the creator cluster arrives later)
+ *          funder that puts a wallet that already sold into the creator cluster arrives later), or (P4.3) the measured curve progress is
+ *          above the cap, 60% by default (CURVE_TOO_FAR, at any evaluation after the first trade, see curveProgressCap.ts)
  *   HOT    minimum hold passed, >= 3 measured signals strong, and the confluence score is at or above the threshold in force (default 70)
- *   READY  the full window elapsed without a dead or hot verdict
+ *   READY  the full window elapsed without a dead or hot verdict. P4.3 (R1-56): a READY release is information, not a buy signal by itself:
+ *          the auto controller (and the replay) buy it only when `readyGate` passes (concentration and at least READY_MIN_SIGNALS signals)
+ *          and its score clears the threshold.
  */
 /** Q6c: was 10, which a busy feed fills with the first ten launches while the rest are refused without a trace. */
 export const WATCH_MAX_CANDIDATES = 60;
@@ -43,6 +47,8 @@ export function publicFundersFromEnv(env: NodeJS.ProcessEnv = process.env): Set<
   return new Set((env.APEX_PUBLIC_FUNDERS ?? '').split(',').map((a) => a.trim()).filter(Boolean));
 }
 export const HOT_MIN_SIGNALS = 3;
+/** P4.3 (R1-56): a READY release must still show this many strong signals (one fewer than HOT), concentration among them. */
+export const READY_MIN_SIGNALS = HOT_MIN_SIGNALS - 1;
 /** The built-in default; the gate itself reads the one shared threshold (S187), so HOT and the execution gate never diverge. */
 export const HOT_MIN_SCORE = CONFLUENCE_DEFAULT_THRESHOLD;
 const CREATOR_CLUSTER = 'cluster:creator';
@@ -133,12 +139,38 @@ export interface WatchWindowOptions {
   publicFunders?: Iterable<string>;
   /** S187: a fixed HOT score for this window (what-if replay). Default: the shared threshold in force, read at each evaluation. */
   minScore?: number;
+  /** P4.3 (R1-57): measured curve progress (0..100, tokens sold) of a mint, or null when unknown. Above the cap the launch is released DEAD CURVE_TOO_FAR. */
+  progressOf?: (mint: string) => number | null | undefined;
+}
+
+/**
+ * P4.3 (R1-56): what a READY release must still show to be bought: concentration passing and at least READY_MIN_SIGNALS strong signals. A launch whose
+ * window ran out with one funder group behind most of the volume, or with a single passing signal, is not bought on its score alone.
+ */
+export function readyGate(m: Pick<WatchMetrics, 'passingSignals' | 'signals'>): { pass: boolean; reason: string } {
+  const conc = m.signals.concentration;
+  const concText = conc === null ? 'no buys' : `largest cluster ${(conc.share * 100).toFixed(1)}% of buy volume (limit ${HOT_MAX_LARGEST_BUYER_SHARE * 100}%)`;
+  if (!conc?.pass) return { pass: false, reason: `READY_TOO_WEAK: concentration fails (${concText}), ${m.passingSignals} strong signal(s)` };
+  if (m.passingSignals < READY_MIN_SIGNALS) return { pass: false, reason: `READY_TOO_WEAK: ${m.passingSignals} strong signal(s), a READY release needs ${READY_MIN_SIGNALS}` };
+  return { pass: true, reason: `READY with ${m.passingSignals} strong signals, concentration passing` };
+}
+
+/** What `getVerdict` reports. P4.3: a released mint also carries its release metrics' signal count and concentration (additive fields). */
+export interface WatchVerdict {
+  state: WatchState;
+  reason: string;
+  releasedAt?: number;
+  score?: number | null;
+  passingSignals?: number;
+  concentrationPass?: boolean | null;
+  /** The release-time metrics; absent while WATCHING. */
+  metrics?: WatchMetrics;
 }
 
 export class WatchWindow extends EventEmitter {
   private active = new Map<string, Candidate>();
   private released = new Map<string, WatchResult>();
-  private opts: Required<Pick<WatchWindowOptions, 'maxCandidates' | 'minMs' | 'maxMs'>> & Pick<WatchWindowOptions, 'funderOf' | 'scoreOf' | 'minScore'>;
+  private opts: Required<Pick<WatchWindowOptions, 'maxCandidates' | 'minMs' | 'maxMs'>> & Pick<WatchWindowOptions, 'funderOf' | 'scoreOf' | 'minScore' | 'progressOf'>;
   private funders = new Map<string, string>();
   private publicFunders: Set<string>;
   /** Wallets whose funder was looked up and does not exist / is out of reach: they count as known, in a cluster of their own. */
@@ -159,6 +191,7 @@ export class WatchWindow extends EventEmitter {
       minScore: opts.minScore,
       funderOf: opts.funderOf,
       scoreOf: opts.scoreOf,
+      progressOf: opts.progressOf,
     };
   }
 
@@ -195,6 +228,17 @@ export class WatchWindow extends EventEmitter {
 
   public setScoreFn(fn: WatchWindowOptions['scoreOf']): void {
     this.opts.scoreOf = fn;
+  }
+
+  /** P4.3: the measured curve progress of a mint (server.ts wires onChainPoolStats). Null: not wired or not known. */
+  public setCurveProgressFn(fn: WatchWindowOptions['progressOf']): void {
+    this.opts.progressOf = fn;
+  }
+
+  /** P4.3: the measured curve progress the window sees for a mint now, or null. */
+  public curveProgressPct(mint: string): number | null {
+    const p = this.opts.progressOf?.(mint);
+    return typeof p === 'number' && Number.isFinite(p) ? p : null;
   }
 
   private funderFor(wallet: string): string | null {
@@ -366,9 +410,14 @@ export class WatchWindow extends EventEmitter {
   }
 
   /** What the window has decided about a mint: its verdict if released, WATCHING if still held, null if never watched. */
-  public getVerdict(mint: string): { state: WatchState; reason: string; releasedAt?: number } | null {
+  public getVerdict(mint: string): WatchVerdict | null {
     const done = this.released.get(mint);
-    if (done) return { state: done.state, reason: done.reason, releasedAt: done.releasedAt ?? undefined };
+    if (done) {
+      return {
+        state: done.state, reason: done.reason, releasedAt: done.releasedAt ?? undefined, score: done.score,
+        passingSignals: done.metrics.passingSignals, concentrationPass: done.metrics.signals.concentration?.pass ?? null, metrics: done.metrics,
+      };
+    }
     if (this.active.has(mint)) return { state: 'WATCHING', reason: 'still in the watch window' };
     return null;
   }
@@ -394,6 +443,9 @@ export class WatchWindow extends EventEmitter {
       if (now - c.registeredAt >= this.opts.maxMs) return this.release(c, 'DEAD', 'NO_TRADES: no trade seen within the window', now);
       return hold('waiting for the first trade');
     }
+    // P4.3 (R1-57): a curve past the cap is never bought; checked from the first trade on, the minimum hold does not delay it
+    const progress = this.curveProgressPct(mint);
+    if (progress !== null && isCurveTooFar(progress)) return this.release(c, 'DEAD', curveTooFarReason('CURVE_TOO_FAR', progress), now);
     if (m.elapsedMs < this.opts.minMs) return hold(`holding: ${Math.ceil((this.opts.minMs - m.elapsedMs) / 1000)}s of the minimum left`);
 
     if (m.cumulativeNetInflowSol < 0) {

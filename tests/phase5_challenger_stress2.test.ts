@@ -85,11 +85,12 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
 
       // Feed slots out of chronological/numerical order
       const chaoticArrivals = [
-        { slot: 1050, reserve: 25.0, ts: 150_000 },
-        { slot: 1010, reserve: 15.0, ts: 110_000 },
+        // P4.3 (R1-58): all inside the 10 s acceleration window of the 180_000 read (they spanned 80 s)
+        { slot: 1050, reserve: 25.0, ts: 176_000 },
+        { slot: 1010, reserve: 15.0, ts: 172_000 },
         { slot: 1080, reserve: 30.0, ts: 180_000 },
-        { slot: 1000, reserve: 10.0, ts: 100_000 },
-        { slot: 1030, reserve: 20.0, ts: 130_000 },
+        { slot: 1000, reserve: 10.0, ts: 171_000 },
+        { slot: 1030, reserve: 20.0, ts: 174_000 },
       ];
 
       for (const item of chaoticArrivals) {
@@ -116,8 +117,8 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
       const metrics = evaluator.getMetrics(mint, 100_050);
       expect(Number.isFinite(metrics.slotAcceleration)).toBe(true);
       expect(isNaN(metrics.slotAcceleration)).toBe(false);
-      // When deltaSlots <= 0, deltaSol > 0 ? deltaSol : 0 -> 2.0
-      expect(metrics.slotAcceleration).toBe(2.0);
+      // P4.3 (R1-58): a same-slot pair is ignored: 0 (it used to score deltaSol, 2.0)
+      expect(metrics.slotAcceleration).toBe(0);
     });
 
     it('maintains read consistency during simultaneous high-throughput reads and writes', async () => {

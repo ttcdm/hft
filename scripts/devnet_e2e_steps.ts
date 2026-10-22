@@ -9,7 +9,7 @@
  *       no position, and an immediate second buy refused by the 15 s failure cooldown with nothing sent. The wrapper is restored in `finally`.
  *  (e') two sequential `executeTrade` calls on one mint: the first is CONFIRMED and opens one position, the second is refused before
  *       anything is signed (POSITION_ALREADY_OPEN). The position is then closed so step (f) starts flat.
- *  (e''), (g), (h), (i) and (j) are described at their functions below.
+ *  (e''), (g), (h), (i), (j) and (k) are described at their functions below.
  *
  *  (e''') P1.4: the emergency stop. One LIVE position is opened, auto is set to DEVNET_LIVE, then Telegram `/panic_sell` is driven
  *       through the app's `processTelegramCommand` (no bot): the LIVE position must be sold on chain and auto must end OFF. Then the
@@ -723,5 +723,175 @@ export async function feedGapThroughWsProxy(s: Pick<HarnessSteps, 'mint' | 'rec'
     s.rec('(j) boot: no pump.fun or DexScreener request', mode !== 'FULL' && bad.length === 0, `boot mode ${mode}; hosts in 12 s: ${[...new Set(hosts)].join(', ') || 'none'}`);
   } finally {
     globalThis.fetch = origFetch;
+  }
+}
+
+/** (k) what the release-gates step needs from the app besides HarnessSteps (passed in, so this file still imports nothing from server/). */
+export interface ReleaseGatesDeps {
+  /** The decision journal rows of one mint, oldest first (workstationDb.loadDecisions). */
+  decisions(mint: string): Array<{ autoMode: string; stage: string; outcome: string; reason: string; inputs: any }>;
+  /** The on-chain curve state of a mint (PumpCurveService.fetchPumpMarketState on the coordinator connection). */
+  curveState(mint: string): Promise<{ virtualSolReserves: bigint; virtualTokenReserves: bigint; realTokenReserves: bigint } | null>;
+  /** What the app's feed measured as the mint's curve progress (onChainPoolStats), or null. */
+  progressPct(mint: string): number | null;
+  /** The cap in force (maxCurveProgressPct). */
+  capPct: number;
+  /** A LIVE buy request for a mint (the harness's own builder, holder checks waived for the harness's coin). */
+  buildBuyRequestFor(mint: string): Promise<ExecuteTradeRequest>;
+  /** Wallet balance of a throwaway key in SOL. */
+  balanceSol(kp: any): Promise<number>;
+  /** Whether the coordinator is armed LIVE now. */
+  isLiveArmed(): boolean;
+}
+
+/** 793.1M tokens at 6 decimals: what a fresh pump.fun curve has to sell (the progress bar's 100%). */
+const CURVE_TOKENS_RAW = 793_100_000_000_000n;
+/** The pump protocol and creator fee the curve takes on a buy, plus a margin (q7: 0.95% + 0.30%). */
+const BUY_FEE_FRACTION = 0.0125 + 0.0025;
+
+/**
+ * SOL a buyer must put in to take a fresh curve from its state to `targetPct` of the tokens sold (constant product on the virtual reserves,
+ * grossed up by the buy fee). With 30 SOL / 1,073M virtual reserves, 62% needs about 25.8 SOL; with the 1 SOL devnet value the localnet
+ * accounts were dumped with, about 0.86 SOL.
+ */
+export function solToReachProgress(st: { virtualSolReserves: bigint; virtualTokenReserves: bigint; realTokenReserves: bigint }, targetPct: number): number {
+  const vSol = Number(st.virtualSolReserves) / 1e9;
+  const vTok = Number(st.virtualTokenReserves);
+  const soldNow = Number(CURVE_TOKENS_RAW - st.realTokenReserves);
+  const sellMore = Math.max(0, (targetPct / 100) * Number(CURVE_TOKENS_RAW) - soldNow);
+  const netIn = (vSol * vTok) / (vTok - sellMore) - vSol;
+  return netIn / (1 - BUY_FEE_FRACTION);
+}
+
+/**
+ * (k) P4.3 (R1-56, R1-59), opt-in (DEVNET_RELEASE_GATES=1), cheap: SHADOW, then PAPER, over two launches released about 1 s apart, through the
+ * app's own log stream, watch window and auto controller (attachWatchWindow, as server.ts wires it). For each mode a throwaway creator launches two
+ * coins 1 s apart and 10 throwaway wallets buy each with equal small buys, so both are released READY (concentration and flow pass) 1 s apart and
+ * reach the controller on their own. Expected: each mode journals a decision for both, the SHADOW and PAPER rows match (outcome WOULD_BUY / BOUGHT
+ * count as one; numbers in the reason are ignored), and every row carries passingSignals. PAPER needs the coordinator in PAPER, so LIVE is
+ * disarmed for the step and re-armed after it. The harness wallet lends about 2 x 2 x (10 x 0.02 + 0.06) SOL and gets most back.
+ *
+ * (k) P4.3 (R1-57), opt-in on top (DEVNET_CURVE_CAP=1), LARGE SOL, off by default: one more coin, which a throwaway wallet pushes past
+ * capPct + 2 points inside the window. The SOL is computed from the coin's own curve (solToReachProgress): about 25.8 SOL with 30 SOL virtual
+ * reserves; the step refuses to start unless the harness wallet holds that plus 1 SOL. Expected: /api/watch shows DEAD CURVE_TOO_FAR, the
+ * journal row for the mint is DROPPED at stage watch with WATCH_DEAD: CURVE_TOO_FAR, and a LIVE buy through executeTrade is refused on the
+ * coordinator's fresh read with CURVE_PROGRESS_TOO_HIGH and nothing sent. The wallet then sells everything and refunds (about 2.5% of the push
+ * is lost to the curve's fees both ways).
+ */
+export async function releaseGatesOnChain(
+  s: HarnessSteps, kit: ChainKit, feed: WatchFeed, payer: any, deps: ReleaseGatesDeps,
+  opts: { buyers?: number; buySol?: number; curveCap?: boolean; waitMs?: number } = {}
+): Promise<void> {
+  const L = '(k) release gates';
+  const st = s.stop;
+  if (!st) { s.rec(L, false, 'harness did not pass the app singletons (stop)'); return; }
+  const nBuyers = opts.buyers ?? 10;
+  const buySol = opts.buySol ?? 0.01;
+  const waitMs = opts.waitMs ?? 180_000;
+  const ARM = 'CONFIRM_LIVE_TRADING_RISK';
+  const prevAuto = process.env.AUTO_SNIPE_ENABLED;
+  process.env.AUTO_SNIPE_ENABLED = 'true';
+  const wallets: any[] = [];
+  const coins: string[] = [];
+  const find = (mint: string) => {
+    const snap = feed.snapshot();
+    return snap.released.find((r) => r.metrics?.mint === mint) ?? (snap.watching.some((w) => w.metrics?.mint === mint) ? { state: 'WATCHING', reason: '', metrics: null } : undefined);
+  };
+  const lastDecision = (mint: string) => deps.decisions(mint).filter((r) => r.outcome !== 'QUEUED').pop();
+  const waitUntil = async (pred: () => boolean, ms: number) => { for (let i = 0; i < Math.ceil(ms / 500) && !pred(); i++) await s.sleep(500); return pred(); };
+  const norm = (r: { outcome: string; stage: string; reason: string } | undefined) =>
+    r ? `${r.outcome === 'WOULD_BUY' ? 'BOUGHT' : r.outcome}|${r.stage}|${r.reason.replace(/[\d.]+/g, '#')}` : 'none';
+
+  const pair = async (mode: 'SHADOW' | 'PAPER'): Promise<string[] | null> => {
+    const set = await st.auto.setMode(mode);
+    if (!set.ok) { s.rec(`${L}: auto ${mode}`, false, set.error ?? set.mode); return null; }
+    const creator = kit.newWallet(); wallets.push(creator);
+    await kit.transfer(payer, creator.publicKey, 0.06);
+    const made: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      made.push((await kit.create(creator, `K${mode[0]}${i}`, 'P43 harness')).mint);
+      if (i === 0) await s.sleep(1_000);
+    }
+    coins.push(...made);
+    const seen = await waitUntil(() => made.every((m) => !!find(m)), 30_000);
+    if (!seen) { s.rec(`${L}: ${mode}: the app's feed watches both launches`, false, 'not in the watch window after 30 s'); return null; }
+    const buyers = Array.from({ length: nBuyers }, () => kit.newWallet()); wallets.push(...buyers);
+    for (const w of buyers) await kit.transfer(payer, w.publicKey, 2 * buySol + 0.02);
+    for (const m of made) {
+      const r = await Promise.allSettled(buyers.map((w) => kit.buy(w, m, buySol)));
+      s.rec(`${L}: ${mode}: ${nBuyers} equal buys of ${m.slice(0, 6)}`, r.every((x) => x.status === 'fulfilled'), `${r.filter((x) => x.status === 'fulfilled').length}/${nBuyers} confirmed`);
+    }
+    const released = await waitUntil(() => made.every((m) => { const e = find(m); return !!e && e.state !== 'WATCHING'; }), waitMs);
+    const journaled = released && (await waitUntil(() => made.every((m) => !!lastDecision(m)), 30_000));
+    const rows = made.map((m) => lastDecision(m));
+    s.rec(
+      `${L}: ${mode}: both launches released and journaled`,
+      journaled,
+      made.map((m, i) => `${find(m)?.state ?? '?'} -> ${rows[i] ? `${rows[i]!.outcome} ${rows[i]!.stage} ${rows[i]!.reason}` : 'no row'}`).join('; ').slice(0, 400)
+    );
+    return journaled ? made : null;
+  };
+
+  const wasArmed = deps.isLiveArmed();
+  st.arm(false); // PAPER auto needs the coordinator in PAPER and disarmed
+  try {
+    const shadow = await pair('SHADOW');
+    const paper = shadow ? await pair('PAPER') : null;
+    if (shadow && paper) {
+      const a = shadow.map((m) => norm(lastDecision(m)));
+      const b = paper.map((m) => norm(lastDecision(m)));
+      s.rec(`${L}: SHADOW and PAPER decision rows match`, a.every((x, i) => x === b[i]), `SHADOW ${a.join(' / ')} | PAPER ${b.join(' / ')}`.slice(0, 400));
+      const all = [...shadow, ...paper].flatMap((m) => deps.decisions(m));
+      s.rec(`${L}: every decision row carries passingSignals`, all.length > 0 && all.every((r) => r.inputs && 'passingSignals' in r.inputs), `${all.length} rows`);
+    }
+
+    if (opts.curveCap) {
+      const C = '(k) curve cap';
+      await st.auto.setMode('SHADOW');
+      const pusher = kit.newWallet(); wallets.push(pusher);
+      const creator = kit.newWallet(); wallets.push(creator);
+      await kit.transfer(payer, creator.publicKey, 0.05);
+      const coin = await kit.create(creator, 'KCAP', 'P43 harness');
+      coins.push(coin.mint);
+      const state = await deps.curveState(coin.mint);
+      if (!state) { s.rec(`${C}: read the new coin's curve`, false, 'no curve state'); return; }
+      const target = deps.capPct + 2;
+      const need = solToReachProgress(state, target);
+      const have = await deps.balanceSol(payer);
+      if (have < need + 1) { s.rec(`${C}: funding for the push`, false, `pushing to ${target}% needs about ${need.toFixed(2)} SOL; the harness wallet has ${have.toFixed(3)}, needs ${(need + 1).toFixed(2)}`); return; }
+      if (!(await waitUntil(() => !!find(coin.mint), 30_000))) { s.rec(`${C}: the app's feed watches the launch`, false, 'not in the watch window after 30 s'); return; }
+      await kit.transfer(payer, pusher.publicKey, need + 0.05);
+      const sig = await kit.buy(pusher, coin.mint, need);
+      const dead = await waitUntil(() => find(coin.mint)?.state === 'DEAD', 30_000);
+      const r = find(coin.mint);
+      s.rec(
+        `${C}: pushed past ${deps.capPct}% inside the window: /api/watch shows DEAD CURVE_TOO_FAR`,
+        dead && /^CURVE_TOO_FAR/.test(r?.reason ?? ''),
+        `${r?.state} ${r?.reason ?? ''} (measured ${deps.progressPct(coin.mint)?.toFixed(1) ?? '?'}%, ${need.toFixed(2)} SOL) ${s.link(sig)}`.slice(0, 300)
+      );
+      const d = await st.auto.submitCandidate({ mint: coin.mint, source: 'TEST', provenance: 'REAL_ONCHAIN' });
+      const row = lastDecision(coin.mint);
+      s.rec(`${C}: the journal rejects it at the watch stage (WATCH_DEAD: CURVE_TOO_FAR)`, d.outcome === 'DROPPED' && row?.stage === 'watch' && /^WATCH_DEAD: CURVE_TOO_FAR/.test(row?.reason ?? ''), `${row?.outcome} ${row?.stage} ${row?.reason ?? ''}`.slice(0, 300));
+      const rearm = st.arm(true, ARM);
+      const buysBefore = s.db.loadTransactions().filter((t) => t.direction === 'BUY').length;
+      const live = rearm.success ? await s.coordinator.executeTrade(await deps.buildBuyRequestFor(coin.mint)) : null;
+      const buysAfter = s.db.loadTransactions().filter((t) => t.direction === 'BUY').length;
+      s.rec(
+        `${C}: a LIVE buy is refused on the coordinator's fresh read (CURVE_PROGRESS_TOO_HIGH), nothing sent`,
+        !!live && !live.success && /^CURVE_PROGRESS_TOO_HIGH/.test(live.error ?? '') && buysAfter === buysBefore,
+        live ? `${live.lifecycleState} ${live.error ?? ''}; BUY rows ${buysBefore} -> ${buysAfter}`.slice(0, 300) : `could not arm: ${rearm.message}`
+      );
+      st.arm(false);
+    }
+  } catch (e: any) {
+    s.rec(L, false, String(e?.message ?? e).slice(0, 300));
+  } finally {
+    await st.auto.setMode('OFF');
+    if (prevAuto === undefined) delete process.env.AUTO_SNIPE_ENABLED; else process.env.AUTO_SNIPE_ENABLED = prevAuto;
+    for (const w of wallets) {
+      for (const c of coins) { try { await kit.sellAll(w, c); } catch { /* nothing held; the refund below still runs */ } }
+      try { await kit.refund(w, payer.publicKey); } catch (e: any) { console.log(`INFO  (k) refund failed: ${String(e?.message ?? e).slice(0, 120)}`); }
+    }
+    if (wasArmed) st.arm(true, ARM);
   }
 }

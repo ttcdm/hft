@@ -429,12 +429,23 @@ export class WatchWindow extends EventEmitter {
     };
   }
 
-  /** Subscribe to a PumpFeedListener: create events start a watch, trade events feed it. */
+  /**
+   * P4.2 (R1-52): release every active candidate DEAD with `reason`. Used when the feed had a gap: a trade in it (a creator sell) may
+   * never arrive, so no candidate that was watched across it can be judged HOT or READY.
+   */
+  public releaseAllDead(reason: string, now = Date.now()): WatchResult[] {
+    return [...this.active.values()].map((c) => this.release(c, 'DEAD', reason, now));
+  }
+
+  /** Subscribe to a PumpFeedListener: create events start a watch, trade events feed it, a feed gap releases every candidate DEAD. */
   public attach(listener: EventEmitter): void {
     listener.on('create_event', (e: { mint: string; creator: string; user?: string }) => {
       this.watch(e.mint, e.creator, Date.now(), [e.user]);
     });
     listener.on('trade_event', (t: PumpTradeEvent) => this.onTrade(t));
+    listener.on('feed_gap', (g: { reason: string; at: number; detail?: string }) => {
+      this.releaseAllDead(`FEED_GAP: the log stream had a gap (${g.reason}); trades in it may be missing`, g.at);
+    });
   }
 
   public start(intervalMs = 2_000): void {

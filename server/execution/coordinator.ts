@@ -517,6 +517,17 @@ export class ExecutionCoordinator {
     };
   }
 
+  private connectionChangeListeners = new Set<(conn: Connection) => void>();
+
+  /**
+   * P4.2 (R1-63): called with the new trading Connection after every successful `setRpcEndpoint`, so what holds a Connection of its
+   * own (the pump log listener) moves with it. Returns the unsubscribe function.
+   */
+  public onConnectionChange(fn: (conn: Connection) => void): () => void {
+    this.connectionChangeListeners.add(fn);
+    return () => { this.connectionChangeListeners.delete(fn); };
+  }
+
   // Update RPC endpoint with safe re-instantiation
   public async setRpcEndpoint(newEndpoint: string): Promise<{ success: boolean; latencyMs: number; error?: string }> {
     try {
@@ -538,6 +549,10 @@ export class ExecutionCoordinator {
       this.rpcHealth = latency > 800 ? 'DEGRADED' : 'HEALTHY';
       this.jitoTransport = new JitoTransport(this.connection);
       this.rpcTransport = new SolanaRpcTransport(this.connection);
+      PumpCurveService.resetGlobalCache(); // P4.2 (N-43): the pump Global and FeeConfig are read again from the new endpoint
+      for (const fn of this.connectionChangeListeners) {
+        try { fn(newConn); } catch (e: any) { Logger.warn(`RPC switch listener failed: ${e?.message || e}`); }
+      }
 
       Logger.info(`Switched Solana RPC endpoint to ${endpointOrigin(newEndpoint)} (${latency}ms)`);
       await this.syncRealWalletBalance();

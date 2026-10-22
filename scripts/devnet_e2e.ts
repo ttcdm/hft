@@ -187,6 +187,18 @@ async function main() {
   const mintPk = new PublicKey(mint);
 
   if (phase === 'main') {
+    // ---- (j) P4.2: a 10 s websocket block through a loopback proxy, then the pump feed boot path (scripts/devnet_e2e_steps.ts) ----
+    {
+      const S = await import('./devnet_e2e_steps');
+      const { PumpFeedListener } = await import('../server/solana/pumpFeedListener');
+      const { WatchWindow } = await import('../server/signals/watchWindow');
+      const { pumpFunService, pumpBootMode } = await import('../server/pumpfunService');
+      await S.feedGapThroughWsProxy({ mint, rec, sleep }, {
+        Listener: PumpFeedListener, Window: WatchWindow, Connection, rpcUrl: process.env.SOLANA_RPC_URL!,
+        bootPumpFeed: () => { const m = pumpBootMode(); if (m !== 'OFF') pumpFunService.startBackground({ httpPollers: m === 'FULL' }); return m; }, // as server.ts boots it
+      });
+    }
+
     // ---- stage 1: simulate (sigVerify false, replaceRecentBlockhash true) ----
     try {
       const quote = PumpCurveService.calculateBuyQuote({

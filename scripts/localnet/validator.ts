@@ -141,6 +141,13 @@ export class LocalnetValidator {
   private known = new Set<string>();
   private validBlockhashes: string[] = [];
   private logSubs = new Map<number, { ws: WebSocket; filter: any }>();
+  /** slotSubscribe subscribers: told the slot on every advance and every SLOT_HEARTBEAT_MS (LiteSVM makes a slot per transaction only). */
+  private slotSubs = new Map<number, WebSocket>();
+  private slotTimer: NodeJS.Timeout | null = null;
+  /** `localnet_dropWebSockets(ms)`: until this time (ms since epoch) every websocket connection is closed as soon as it opens. */
+  private wsDownUntil = 0;
+  /** Logs notifications that had nobody to go to because the websockets were down (`localnet_dropWebSockets`). */
+  private logsDroppedWhileDown = 0;
   private nextSub = 1;
   private slot = 1000n;
   private sendFailures: { remaining: number; error: string } | null = null;
@@ -391,6 +398,7 @@ export class LocalnetValidator {
       this.byAddress.set(k, l);
     }
     this.notifyLogs(rec);
+    this.notifySlot();
     return signature;
   }
 
@@ -453,7 +461,26 @@ export class LocalnetValidator {
   }
 
   // ---- log subscriptions ---------------------------------------------------------------------------------------
+  private notifySlot() {
+    const slot = Number(this.slot);
+    for (const [id, ws] of this.slotSubs) {
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'slotNotification', params: { subscription: id, result: { slot, parent: slot - 1, root: slot } } }));
+    }
+  }
+
+  /**
+   * Test control: close every websocket connection now (an abnormal close, as a network drop gives) and refuse every new one for
+   * `ms` (the upgrade gets HTTP 503), so a client's reconnect attempts fail until then. Logs of transactions that land meanwhile reach nobody: like a real
+   * node, the validator never replays them to the subscription made after the reconnect.
+   */
+  dropWebSockets(ms: number) {
+    this.wsDownUntil = Date.now() + Math.max(0, ms);
+    for (const ws of this.wss?.clients ?? []) ws.terminate();
+  }
+
   private notifyLogs(rec: TxRecord) {
+    if (Date.now() < this.wsDownUntil) this.logsDroppedWhileDown++;
     for (const [id, sub] of this.logSubs) {
       if (sub.ws.readyState !== WebSocket.OPEN) continue;
       const f = sub.filter;
@@ -581,7 +608,9 @@ export class LocalnetValidator {
       // params: [count, method, address?, mode?] ('jsonrpc' default, or 'http429'); see failNextReads
       case 'localnet_failNextReads': this.failNextReads(Number(params[0] ?? 1), String(params[1] ?? ''), params[2] ? String(params[2]) : undefined, params[3] ?? 'jsonrpc'); return true;
       case 'localnet_landThenFailNextSend': this.landThenFailNextSend(); return true;
-      case 'localnet_stats': return { held: this.heldSignatures, landedThenFailed: this.landedThenFailedSignatures, methods: Object.fromEntries(this.methodCounts), unsupported: [...this.unsupported], txs: this.txs.size, slot: Number(this.slot) };
+      // params: [ms] close every websocket and refuse new ones for ms (default 3000); see dropWebSockets
+      case 'localnet_dropWebSockets': this.dropWebSockets(Number(params[0] ?? 3000)); return true;
+      case 'localnet_stats': return { held: this.heldSignatures, landedThenFailed: this.landedThenFailedSignatures, methods: Object.fromEntries(this.methodCounts), unsupported: [...this.unsupported], txs: this.txs.size, slot: Number(this.slot), wsClients: this.wss?.clients.size ?? 0, wsDown: Date.now() < this.wsDownUntil, logsDroppedWhileDown: this.logsDroppedWhileDown };
       default:
         this.unsupported.add(method);
         throw new RpcError(-32601, `Method not found: ${method}`);
@@ -652,7 +681,10 @@ export class LocalnetValidator {
     await new Promise<void>((r) => this.server!.listen(port, host, r));
     this.port = (this.server.address() as any).port;
     // web3.js derives the websocket URL as http port + 1
-    this.wss = new WebSocketServer({ port: this.port + 1, host });
+    // localnet_dropWebSockets: while down, the upgrade itself is refused (HTTP 503), as a blocked port refuses the connection. Accepting
+    // the socket and closing it at once is not the same: web3.js 1.99 then retries its subscribe calls on the CLOSING socket in a
+    // microtask loop that never yields to the 'close' event, and the client runs out of memory.
+    this.wss = new WebSocketServer({ port: this.port + 1, host, verifyClient: (_info, cb) => (Date.now() < this.wsDownUntil ? cb(false, 503, 'localnet_dropWebSockets') : cb(true)) });
     this.wss.on('error', () => {});
     this.wss.on('connection', (ws) => {
       ws.on('message', (m) => {
@@ -665,17 +697,33 @@ export class LocalnetValidator {
           } else if (j.method === 'logsUnsubscribe') {
             this.logSubs.delete(j.params?.[0]);
             ws.send(JSON.stringify({ jsonrpc: '2.0', id: j.id, result: true }));
+          } else if (j.method === 'slotSubscribe') {
+            const id = this.nextSub++;
+            this.slotSubs.set(id, ws);
+            ws.send(JSON.stringify({ jsonrpc: '2.0', id: j.id, result: id }));
+          } else if (j.method === 'slotUnsubscribe') {
+            this.slotSubs.delete(j.params?.[0]);
+            ws.send(JSON.stringify({ jsonrpc: '2.0', id: j.id, result: true }));
+          } else if (j.method === 'ping' && j.id === undefined) {
+            // web3.js pings every 5 s as a JSON-RPC notification; a notification gets no reply
           } else {
             ws.send(JSON.stringify({ jsonrpc: '2.0', id: j.id, error: { code: -32601, message: 'Method not found' } }));
           }
         } catch { /* ignore */ }
       });
-      ws.on('close', () => { for (const [id, s] of this.logSubs) if (s.ws === ws) this.logSubs.delete(id); });
+      ws.on('close', () => {
+        for (const [id, s] of this.logSubs) if (s.ws === ws) this.logSubs.delete(id);
+        for (const [id, s] of this.slotSubs) if (s === ws) this.slotSubs.delete(id);
+      });
     });
+    this.slotTimer = setInterval(() => this.notifySlot(), SLOT_HEARTBEAT_MS);
+    this.slotTimer.unref?.();
     return `http://127.0.0.1:${this.port}`;
   }
 
   async close() {
+    if (this.slotTimer) clearInterval(this.slotTimer);
+    this.slotTimer = null;
     await new Promise<void>((r) => (this.wss ? this.wss.close(() => r()) : r()));
     await new Promise<void>((r) => (this.server ? this.server.close(() => r()) : r()));
   }
@@ -691,6 +739,9 @@ const TRANSACTION_ERRORS: Record<number, string> = {
   0: 'AccountInUse', 1: 'AccountLoadedTwice', 2: 'AccountNotFound', 3: 'ProgramAccountNotFound', 4: 'InsufficientFundsForFee',
   5: 'InvalidAccountForFee', 6: 'AlreadyProcessed', 7: 'BlockhashNotFound',
 };
+
+/** How often slotSubscribe subscribers hear the current slot when no transaction advanced it (a real node sends one about every 400 ms). */
+const SLOT_HEARTBEAT_MS = 1000;
 
 class RpcError extends Error {
   constructor(public code: number, message: string) {

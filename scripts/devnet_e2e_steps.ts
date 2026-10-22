@@ -9,7 +9,7 @@
  *       no position, and an immediate second buy refused by the 15 s failure cooldown with nothing sent. The wrapper is restored in `finally`.
  *  (e') two sequential `executeTrade` calls on one mint: the first is CONFIRMED and opens one position, the second is refused before
  *       anything is signed (POSITION_ALREADY_OPEN). The position is then closed so step (f) starts flat.
- *  (e''), (g), (h) and (i) are described at their functions below.
+ *  (e''), (g), (h), (i) and (j) are described at their functions below.
  *
  *  (e''') P1.4: the emergency stop. One LIVE position is opened, auto is set to DEVNET_LIVE, then Telegram `/panic_sell` is driven
  *       through the app's `processTelegramCommand` (no bot): the LIVE position must be sold on chain and auto must end OFF. Then the
@@ -601,5 +601,127 @@ export async function creatorClusterOnChain(s: HarnessSteps, kit: ChainKit, feed
       try { await kit.refund(w, payer.publicKey); } catch (e: any) { console.log(`INFO  (i) refund failed: ${String(e?.message ?? e).slice(0, 120)}`); }
     }
     try { await kit.refund(creator, payer.publicKey); } catch (e: any) { console.log(`INFO  (i) creator refund failed: ${String(e?.message ?? e).slice(0, 120)}`); }
+  }
+}
+
+/**
+ * A loopback WebSocket relay in front of `upstreamWs` for (j). `block(ms)` cuts every relayed connection at once and refuses new ones
+ * for `ms` (the TCP connection is destroyed before the upgrade, as a blocked port does), then relays again. Refusing before the upgrade
+ * matters: accepting the socket and closing it at once drives web3.js 1.99's resubscribe into a microtask loop (see the validator's
+ * `localnet_dropWebSockets`).
+ */
+export async function startBlockingWsProxy(upstreamWs: string) {
+  const { WebSocketServer, WebSocket } = await import('ws');
+  let blockedUntil = 0;
+  const pairs = new Set<{ a: any; b: any }>();
+  const server = http.createServer((_req, res) => res.writeHead(426).end());
+  const wss = new WebSocketServer({ noServer: true });
+  server.on('upgrade', (req, socket, head) => {
+    if (Date.now() < blockedUntil) { socket.destroy(); return; }
+    wss.handleUpgrade(req, socket, head, (client) => {
+      const up = new WebSocket(upstreamWs);
+      const pair = { a: client, b: up };
+      pairs.add(pair);
+      const queue: any[] = [];
+      const end = () => { pairs.delete(pair); try { client.terminate(); } catch { /* gone */ } try { up.terminate(); } catch { /* gone */ } };
+      up.on('open', () => { for (const m of queue.splice(0)) up.send(m); });
+      up.on('message', (m: any, isBinary: boolean) => { if (client.readyState === WebSocket.OPEN) client.send(m, { binary: isBinary }); });
+      client.on('message', (m: any, isBinary: boolean) => {
+        const data = isBinary ? m : String(m);
+        if (up.readyState === WebSocket.OPEN) up.send(data); else queue.push(data);
+      });
+      up.on('close', end); up.on('error', end); client.on('close', end); client.on('error', end);
+    });
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  return {
+    url: `ws://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    block(ms: number) {
+      blockedUntil = Date.now() + ms;
+      for (const p of [...pairs]) { try { p.a.terminate(); } catch { /* gone */ } try { p.b.terminate(); } catch { /* gone */ } }
+    },
+    close: () => new Promise<void>((r) => {
+      for (const p of [...pairs]) { try { p.a.terminate(); } catch { /* gone */ } try { p.b.terminate(); } catch { /* gone */ } }
+      wss.close();
+      server.closeAllConnections();
+      server.close(() => r());
+    }),
+  };
+}
+
+/** web3.js's own rule for the websocket of an RPC URL: http(s) becomes ws(s), and an explicit port becomes port + 1. */
+export function wsUrlFor(rpcUrl: string): string {
+  const u = new URL(rpcUrl);
+  u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+  if (u.port) u.port = String(Number(u.port) + 1);
+  return u.toString();
+}
+
+export interface FeedGapDeps {
+  /** The app's PumpFeedListener and WatchWindow classes and web3.js's Connection (the step imports nothing from server/). */
+  Listener: new (conn: any) => any;
+  Window: new (opts: any) => any;
+  Connection: new (url: string, cfg: any) => any;
+  rpcUrl: string;
+  blockMs?: number;
+  /** What server.ts runs at boot for the pump feed (pumpBootMode + startBackground), and the mode it chose. */
+  bootPumpFeed?: () => string;
+}
+
+/**
+ * (j) P4.2 (R1-52, R1-65). The app's `PumpFeedListener` subscribes to the devnet pump program through a loopback relay in front of the
+ * RPC's websocket, with the app's `WatchWindow` attached and the harness mint watched. The relay then blocks the websocket for
+ * `blockMs` (10 s). Expected: the listener leaves ACTIVE (RECONNECTING), the watched mint is released DEAD with FEED_GAP, and the
+ * listener is ACTIVE again after the block (web3.js reconnects and resubscribes by itself). Then the boot path: the pump feed is
+ * started as server.ts starts it and every outbound fetch for 12 s is recorded; none may go to pump.fun or DexScreener.
+ */
+export async function feedGapThroughWsProxy(s: Pick<HarnessSteps, 'mint' | 'rec' | 'sleep'>, d: FeedGapDeps): Promise<void> {
+  const L = '(j) feed gap';
+  const blockMs = d.blockMs ?? 10_000;
+  const until = async (cond: () => boolean, ms: number) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline && !cond()) await s.sleep(200);
+    return cond();
+  };
+  const proxy = await startBlockingWsProxy(wsUrlFor(d.rpcUrl));
+  const conn = new d.Connection(d.rpcUrl, { commitment: 'processed', wsEndpoint: proxy.url });
+  const listener = new d.Listener(conn);
+  const ww = new d.Window({ publicFunders: [] });
+  ww.attach(listener);
+  const seen: string[] = [];
+  listener.on('feed_gap', (g: any) => seen.push(`${g.reason}/${listener.getTelemetry().status}`));
+  try {
+    const started = await listener.start();
+    await s.sleep(3_000); // the socket opens and the subscriptions are made
+    const t0 = listener.getTelemetry();
+    s.rec(`${L}: listener ACTIVE through the loopback ws proxy`, started && t0.status === 'ACTIVE' && t0.feedGaps === 0, `status ${t0.status}, gaps ${t0.feedGaps}`);
+    ww.watch(s.mint, null);
+    proxy.block(blockMs);
+    const left = await until(() => listener.getTelemetry().status !== 'ACTIVE', 3_000);
+    s.rec(`${L}: status left ACTIVE while the ws port was blocked`, left, `gaps seen: ${seen.join(', ') || 'none'}`);
+    const v = ww.getVerdict(s.mint);
+    s.rec(`${L}: the watched mint is DEAD with FEED_GAP`, v?.state === 'DEAD' && /^FEED_GAP/.test(v?.reason ?? ''), `${v?.state} ${v?.reason ?? ''}`);
+    const back = await until(() => listener.getTelemetry().status === 'ACTIVE', blockMs + 20_000);
+    s.rec(`${L}: ACTIVE again after the ${blockMs / 1000} s block`, back, `status ${listener.getTelemetry().status}, gaps ${listener.getTelemetry().feedGaps}`);
+  } finally {
+    await listener.stop();
+    listener.destroy?.();
+    await proxy.close();
+  }
+
+  if (!d.bootPumpFeed) return;
+  const hosts: string[] = [];
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: any, init?: any) => {
+    try { hosts.push(new URL(typeof input === 'string' ? input : input?.url ?? String(input)).host); } catch { /* not a URL */ }
+    return origFetch(input, init);
+  }) as typeof fetch;
+  try {
+    const mode = d.bootPumpFeed();
+    await s.sleep(12_000); // the HTTP fallback polls at once and then every 5 s, when it runs at all
+    const bad = hosts.filter((h) => /pump\.fun|dexscreener/i.test(h));
+    s.rec('(j) boot: no pump.fun or DexScreener request', mode !== 'FULL' && bad.length === 0, `boot mode ${mode}; hosts in 12 s: ${[...new Set(hosts)].join(', ') || 'none'}`);
+  } finally {
+    globalThis.fetch = origFetch;
   }
 }

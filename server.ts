@@ -326,6 +326,7 @@ watchWindow.setScoreFn((mint) => {
   return pool ? memecoinAggregator.evaluateTokenConfluence(pool).score : null;
 });
 watchWindow.attach(pumpFeedListener);
+pumpFeedListener.follow(executionCoordinator); // P4.2 (R1-63): a successful RPC switch moves the log subscription and creator lookups
 // S178: save what the window sees (launches it scores, their trades, the funder facts) so the auto rules can be replayed over real launches
 for (const p of recorderConfigProblems()) console.warn(`[APEX QUANT HFT] ${p}`); // S190
 const launchRecorder = new LaunchRecorder(workstationDb, watchWindow, () => solPriceService.lastKnownPrice());

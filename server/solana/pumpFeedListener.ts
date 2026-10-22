@@ -1,4 +1,5 @@
-import { Connection, PublicKey, Logs, Context } from '@solana/web3.js';
+import { Connection, PublicKey, Logs, Context, SlotInfo } from '@solana/web3.js';
+import { NATIVE_MINT } from '@solana/spl-token';
 import { EventEmitter } from 'events';
 import { PUMP_FUN_PROGRAM_ID } from './programs';
 import { Logger } from '../middleware/enterprise';
@@ -15,6 +16,43 @@ export const PUMP_TRADE_EVENT_DISCRIMINATOR = Buffer.from('bddb7fd34ee661ee', 'h
 
 /** Hard cap on how long a create event waits for the creator-history lookup before scoring continues without it. */
 export const CREATOR_RISK_TIMEOUT_MS = 300;
+
+/**
+ * P4.2 (R1-52): the slot heartbeat. A gap is opened when no slot notification arrived for FEED_SLOT_SILENCE_MS while the feed was
+ * ACTIVE (checked every FEED_HEARTBEAT_CHECK_MS, and only once a first slot was seen, so an RPC without slotSubscribe is judged by its
+ * socket events alone), or when two consecutive slot notifications are more than FEED_SLOT_JUMP_MAX slots apart (about 10 s of devnet
+ * slots: the notifications in between were not delivered, so neither were the logs).
+ */
+export const FEED_SLOT_SILENCE_MS = 10_000;
+export const FEED_HEARTBEAT_CHECK_MS = 2_000;
+export const FEED_SLOT_JUMP_MAX = 25;
+
+/** Why the log stream may have missed logs. SOCKET_CLOSED and SLOT_* come from the socket and the heartbeat, ENDPOINT_SWITCH from setRpcEndpoint. */
+export type FeedGapReason = 'SOCKET_CLOSED' | 'SLOT_SILENCE' | 'SLOT_JUMP' | 'ENDPOINT_SWITCH';
+
+/** Emitted as 'feed_gap' when logs may have been lost. Every watch candidate active at that moment is released DEAD with FEED_GAP. */
+export interface FeedGapEvent {
+  reason: FeedGapReason;
+  at: number;
+  detail: string;
+}
+
+/** The quote mints a SOL launch carries: the default key (legacy curves) or wSOL. Any other quote is a non-SOL curve. */
+export function isSolQuoteMint(quoteMint: string | undefined): boolean {
+  return quoteMint === undefined || quoteMint === PublicKey.default.toBase58() || quoteMint === NATIVE_MINT.toBase58();
+}
+
+/** The part of web3.js's private websocket client the gap detector listens to ('open' and 'close'). Absent on a fake without one. */
+type SocketEvents = { on(ev: 'open' | 'close', fn: (...a: any[]) => void): unknown; off?(ev: string, fn: (...a: any[]) => void): unknown; removeListener?(ev: string, fn: (...a: any[]) => void): unknown };
+function socketOf(conn: Connection | null): SocketEvents | null {
+  const ws = (conn as any)?._rpcWebSocket;
+  return ws && typeof ws.on === 'function' ? ws : null;
+}
+
+/** Anything that announces a new trading Connection (the coordinator's `onConnectionChange`). */
+export interface ConnectionChangeSource {
+  onConnectionChange(fn: (conn: Connection) => void): () => void;
+}
 
 /**
  * Decoded pump.fun TradeEvent (fixed prefix of the IDL in @pump-fun/pump-sdk 1.37:
@@ -52,6 +90,8 @@ export interface PumpCreateEvent {
   realTokenReserves: bigint;
   realSolReserves: bigint;
   tokenTotalSupply: bigint;
+  /** P4.2 (R1-64): the CreateEvent's quote_mint (base58) when the event is long enough to carry it; undefined on the older, shorter layout (SOL). */
+  quoteMint?: string;
   initialPriceSol: number;
   initialMarketCapSol: number;
   receivedAt: number;
@@ -73,6 +113,11 @@ export interface PumpFeedListenerTelemetry {
   lastEventAgeMs: number;
   averageParseLatencyMs: number;
   activeEndpoint: string;
+  /** P4.2: gaps seen since boot (socket closes, slot silences and jumps, endpoint switches) and the last one. */
+  feedGaps: number;
+  lastFeedGap: FeedGapEvent | null;
+  /** P4.2 (R1-64): launches not emitted because their quote mint is not SOL. */
+  nonSolQuoteSkipped: number;
 }
 
 /**
@@ -93,6 +138,24 @@ export class PumpFeedListener extends EventEmitter {
   private totalParseLatencyMs: number = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private isDestroyed: boolean = false;
+  // P4.2: gap detection (socket events plus the slot heartbeat)
+  private slotSubscriptionId: number | null = null;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private lastSlot: number | null = null;
+  private lastSlotAt = 0;
+  private gapOpen = false;
+  private feedGaps = 0;
+  private lastFeedGap: FeedGapEvent | null = null;
+  private nonSolQuoteSkipped = 0;
+  private nonSolMints = new Set<string>();
+  private socket: SocketEvents | null = null;
+  private readonly onSocketClose = () => this.openGap('SOCKET_CLOSED', 'the websocket closed; logs sent before it reconnects are never redelivered');
+  private readonly onSocketOpen = () => {
+    this.lastSlot = null; // the first slot after a reconnect is not a jump: the gap is already open
+    if (this.lastSlotAt > 0) this.lastSlotAt = Date.now(); // the silence clock restarts, but only once a heartbeat was ever seen
+    this.closeGap();
+  };
+  private unfollow: (() => void) | null = null;
 
   constructor(connection?: Connection) {
     super();
@@ -129,6 +192,8 @@ export class PumpFeedListener extends EventEmitter {
     realTokenReserves?: bigint;
     realSolReserves?: bigint;
     tokenTotalSupply?: bigint;
+    /** P4.2: when given, the event carries the newer tail (token_program, is_mayhem_mode, is_cashback_enabled, quote_mint). */
+    quoteMint?: PublicKey | string;
   }): string {
     const mintPubkey = typeof params.mint === 'string' ? new PublicKey(params.mint) : params.mint;
     const curvePubkey = params.bondingCurve
@@ -142,7 +207,8 @@ export class PumpFeedListener extends EventEmitter {
 
     // IDL order: 8 disc + (4+name) + (4+sym) + (4+uri) + mint + bonding_curve + user + creator + i64 timestamp + 4 x u64 reserves
     const baseLen = 8 + 4 + nameBuf.length + 4 + symbolBuf.length + 4 + uriBuf.length + 32 * 4 + 8 + 4 * 8;
-    const buf = Buffer.alloc(baseLen);
+    const tailLen = params.quoteMint !== undefined ? 32 + 1 + 1 + 32 : 0;
+    const buf = Buffer.alloc(baseLen + tailLen);
     let offset = 0;
 
     PUMP_CREATE_EVENT_DISCRIMINATOR.copy(buf, offset);
@@ -185,6 +251,11 @@ export class PumpFeedListener extends EventEmitter {
     ]) {
       buf.writeBigUInt64LE(v, offset);
       offset += 8;
+    }
+    if (params.quoteMint !== undefined) {
+      new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA').toBuffer().copy(buf, offset); // token_program
+      offset += 32 + 1 + 1; // then is_mayhem_mode and is_cashback_enabled, both false
+      (typeof params.quoteMint === 'string' ? new PublicKey(params.quoteMint) : params.quoteMint).toBuffer().copy(buf, offset);
     }
 
     return `Program data: ${buf.toString('base64')}`;
@@ -284,6 +355,7 @@ export class PumpFeedListener extends EventEmitter {
 
   /** Feed one decoded trade into the curve velocity evaluator and notify subscribers. */
   public ingestTradeEvent(trade: PumpTradeEvent): void {
+    if (this.nonSolMints.has(trade.mint)) return; // P4.2 (R1-64): a non-SOL curve's sol_amount is not SOL
     const ts = Date.now();
     curveVelocityEvaluator.recordTradeFlow(trade.mint, Number(trade.solAmountLamports) / 1e9, trade.isBuy, ts, trade.slot);
     curveVelocityEvaluator.recordTransition(trade.mint, trade.slot, Number(trade.realSolReserves) / 1e9, ts);
@@ -393,6 +465,11 @@ export class PumpFeedListener extends EventEmitter {
               offset += 8;
               const realSolReserves = 0n; // a fresh curve holds no SOL; not part of the event
               if (virtualTokenReserves === 0n) continue;
+              // P4.2 (R1-64): the newer layout continues with token_program, is_mayhem_mode, is_cashback_enabled, quote_mint (pump-sdk 1.37).
+              let quoteMint: string | undefined;
+              if (offset + 32 + 1 + 1 + 32 <= buf.length) {
+                quoteMint = new PublicKey(buf.subarray(offset + 34, offset + 66)).toBase58();
+              }
 
               const initialPriceSol = Number(virtualSolReserves) / Number(virtualTokenReserves) / 1000;
               const initialMarketCapSol = (Number(tokenTotalSupply) / 1e6) * initialPriceSol;
@@ -413,6 +490,7 @@ export class PumpFeedListener extends EventEmitter {
                 realTokenReserves,
                 realSolReserves,
                 tokenTotalSupply,
+                quoteMint,
                 initialPriceSol,
                 initialMarketCapSol,
                 receivedAt: Date.now(),
@@ -454,7 +532,15 @@ export class PumpFeedListener extends EventEmitter {
           const handlerStart = performance.now();
           try {
             const trades = this.parseTradeLogs(logs, ctx);
-            const event = this.parseLogs(logs, ctx);
+            let event = this.parseLogs(logs, ctx);
+            if (event && !isSolQuoteMint(event.quoteMint)) {
+              // P4.2 (R1-64): a launch quoted in another mint is not watched, scored or paper-filled, and its trades are dropped too.
+              this.nonSolQuoteSkipped++;
+              this.nonSolMints.add(event.mint);
+              if (this.nonSolMints.size > 5000) this.nonSolMints.delete(this.nonSolMints.values().next().value as string);
+              Logger.info(`PumpFeedListener: skipped ${event.mint}, quote mint ${event.quoteMint} is not SOL`);
+              event = null;
+            }
             if (event) {
               this.eventsParsed++;
               this.lastEventTimestamp = Date.now();
@@ -491,6 +577,7 @@ export class PumpFeedListener extends EventEmitter {
       );
 
       this.status = 'ACTIVE';
+      this.armGapDetection(this.connection);
       Logger.info(`PumpFeedListener connected to Solana WebSocket logs (subId: ${this.subscriptionId})`);
       return true;
     } catch (err: any) {
@@ -509,14 +596,124 @@ export class PumpFeedListener extends EventEmitter {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    const conn = this.connection;
+    await this.disarmGapDetection(conn);
 
-    if (this.subscriptionId !== null && this.connection) {
+    if (this.subscriptionId !== null && conn) {
       try {
-        await this.connection.removeOnLogsListener(this.subscriptionId);
+        await conn.removeOnLogsListener(this.subscriptionId);
       } catch {}
       this.subscriptionId = null;
     }
     this.status = 'DISCONNECTED';
+  }
+
+  /**
+   * P4.2 (R1-52): watch the socket ('close' and 'open' on web3.js's websocket client, when the Connection has one) and the slot
+   * heartbeat (public `onSlotChange`). web3.js resubscribes by itself after a drop but never redelivers the logs sent meanwhile, so
+   * each of these opens a gap; see FEED_SLOT_SILENCE_MS and FEED_SLOT_JUMP_MAX.
+   */
+  private armGapDetection(conn: Connection): void {
+    this.gapOpen = false;
+    this.lastSlot = null;
+    this.lastSlotAt = 0;
+    this.socket = socketOf(conn);
+    this.socket?.on('close', this.onSocketClose);
+    this.socket?.on('open', this.onSocketOpen);
+    if (typeof (conn as any).onSlotChange === 'function') {
+      try {
+        this.slotSubscriptionId = conn.onSlotChange((info: SlotInfo) => this.onSlot(info));
+      } catch (err: any) {
+        Logger.warn(`PumpFeedListener: no slot heartbeat (${err?.message || err}); gaps are seen through the socket only`);
+      }
+    }
+    this.heartbeatTimer = setInterval(() => this.checkHeartbeat(), FEED_HEARTBEAT_CHECK_MS);
+    this.heartbeatTimer.unref?.();
+  }
+
+  private async disarmGapDetection(conn: Connection | null): Promise<void> {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    this.heartbeatTimer = null;
+    const off = (ev: string, fn: () => void) => {
+      if (!this.socket) return;
+      if (typeof this.socket.off === 'function') this.socket.off(ev, fn);
+      else this.socket.removeListener?.(ev, fn);
+    };
+    off('close', this.onSocketClose);
+    off('open', this.onSocketOpen);
+    this.socket = null;
+    if (this.slotSubscriptionId !== null && conn && typeof (conn as any).removeSlotChangeListener === 'function') {
+      try { await conn.removeSlotChangeListener(this.slotSubscriptionId); } catch { /* the socket is going anyway */ }
+    }
+    this.slotSubscriptionId = null;
+    this.gapOpen = false;
+  }
+
+  private onSlot(info: SlotInfo): void {
+    const prev = this.lastSlot;
+    this.lastSlot = info.slot;
+    this.lastSlotAt = Date.now();
+    if (prev !== null && info.slot - prev > FEED_SLOT_JUMP_MAX) {
+      this.openGap('SLOT_JUMP', `slot notifications jumped from ${prev} to ${info.slot} (more than ${FEED_SLOT_JUMP_MAX})`);
+    }
+    this.closeGap(); // a slot arrived: the stream is delivering again
+  }
+
+  private checkHeartbeat(now = Date.now()): void {
+    if (this.status !== 'ACTIVE' || this.lastSlotAt === 0) return;
+    if (now - this.lastSlotAt > FEED_SLOT_SILENCE_MS) {
+      this.openGap('SLOT_SILENCE', `no slot notification for ${now - this.lastSlotAt} ms (limit ${FEED_SLOT_SILENCE_MS} ms)`);
+    }
+  }
+
+  /** Open a gap once: status RECONNECTING and a 'feed_gap' event. It closes when the socket reopens or a slot arrives. */
+  private openGap(reason: FeedGapReason, detail: string): void {
+    if (this.gapOpen || this.subscriptionId === null) return;
+    this.gapOpen = true;
+    this.status = 'RECONNECTING';
+    this.emitGap(reason, detail);
+  }
+
+  private closeGap(): void {
+    if (!this.gapOpen) return;
+    this.gapOpen = false;
+    if (this.subscriptionId !== null) this.status = 'ACTIVE';
+    Logger.info('PumpFeedListener: log stream delivering again after a gap');
+  }
+
+  private emitGap(reason: FeedGapReason, detail: string): void {
+    const gap: FeedGapEvent = { reason, at: Date.now(), detail };
+    this.feedGaps++;
+    this.lastFeedGap = gap;
+    Logger.warn(`PumpFeedListener FEED_GAP (${reason}): ${detail}`);
+    try {
+      this.emit('feed_gap', gap);
+    } catch (emitErr: any) {
+      Logger.warn(`PumpFeedListener feed_gap subscriber error: ${emitErr?.message || emitErr}`);
+    }
+  }
+
+  /**
+   * P4.2 (R1-63): move the subscription to a new Connection: unsubscribe on the old one, resubscribe on `conn`. The switch itself is
+   * a gap (logs between the two subscriptions are lost), so it emits 'feed_gap' ENDPOINT_SWITCH. A listener that was not running only
+   * takes the new Connection. Creator lookups (`scoreCreator`) use the same Connection, so they move with it.
+   */
+  public async switchConnection(conn: Connection): Promise<boolean> {
+    if (conn === this.connection) return this.isActive();
+    const wasRunning = this.subscriptionId !== null || this.reconnectTimer !== null;
+    await this.stop();
+    this.connection = conn;
+    if (!wasRunning || this.isDestroyed) return false;
+    this.emitGap('ENDPOINT_SWITCH', 'the RPC endpoint was switched; logs between the two subscriptions are not seen');
+    return this.start();
+  }
+
+  /** Follow the coordinator's trading Connection: every successful `setRpcEndpoint` moves the subscription (switchConnection). */
+  public follow(source: ConnectionChangeSource): void {
+    this.unfollow?.();
+    this.unfollow = source.onConnectionChange((conn) => {
+      this.switchConnection(conn).catch((err: any) => Logger.warn(`PumpFeedListener could not move to the new RPC: ${err?.message || err}`));
+    });
   }
 
   /**
@@ -556,11 +753,16 @@ export class PumpFeedListener extends EventEmitter {
       averageParseLatencyMs:
         this.eventsParsed > 0 ? Number((this.totalParseLatencyMs / this.eventsParsed).toFixed(2)) : 0,
       activeEndpoint: (this.connection as any)?._rpcEndpoint || 'Solana RPC',
+      feedGaps: this.feedGaps,
+      lastFeedGap: this.lastFeedGap,
+      nonSolQuoteSkipped: this.nonSolQuoteSkipped,
     };
   }
 
   public destroy() {
     this.isDestroyed = true;
+    this.unfollow?.();
+    this.unfollow = null;
     this.stop().catch(() => {});
     this.removeAllListeners();
   }

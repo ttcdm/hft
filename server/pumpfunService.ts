@@ -20,6 +20,7 @@ import {
 import { ConfluenceBreakdown, SignalProvenance } from './core/types';
 import { autoSnipeController } from './auto/controller';
 import { checkSnipeAmountSol } from './execution/snipeAmount';
+import { allowedCluster } from './solana/clusterGuard';
 
 interface AutoSnipeRules {
   minCallerWinRate2x: number;
@@ -309,14 +310,20 @@ export function calloutProvenance(callout: PumpFunHotCallout): SignalProvenance 
 }
 
 /**
- * S28: what the server starts at boot. FULL: the log stream plus the HTTP pollers. WS_ONLY: only the log stream, which is
- * what a loopback-only server needs so auto mode can be driven by a local chain's create events. OFF: nothing.
- * WS_ONLY needs the operator's APEX_PUMP_WS_ONLY=true together with disabled external feeds, and is honoured only on
- * ALLOWED_CLUSTER=localnet, where the websocket is a loopback validator; anywhere else it falls back to OFF.
+ * S28: what the server starts at boot. FULL: the log stream plus the HTTP pollers. WS_ONLY: only the log stream. OFF: nothing.
+ * With external feeds on, FULL is for ALLOWED_CLUSTER=mainnet-beta only (P4.2, R1-65): the pollers read the mainnet pump.fun and
+ * DexScreener HTTP APIs, whose mints do not exist on devnet or localnet, so off mainnet the feed is the log stream alone (WS_ONLY).
+ * With external feeds disabled, WS_ONLY needs the operator's APEX_PUMP_WS_ONLY=true and is honoured only on ALLOWED_CLUSTER=localnet,
+ * where the websocket is a loopback validator; anywhere else it falls back to OFF.
  */
 export function pumpBootMode(env: NodeJS.ProcessEnv = process.env): 'FULL' | 'WS_ONLY' | 'OFF' {
-  if (env.APEX_DISABLE_EXTERNAL_FEEDS !== 'true') return 'FULL';
+  if (env.APEX_DISABLE_EXTERNAL_FEEDS !== 'true') return allowedCluster(env) === 'mainnet-beta' ? 'FULL' : 'WS_ONLY';
   return env.APEX_PUMP_WS_ONLY === 'true' && env.ALLOWED_CLUSTER === 'localnet' ? 'WS_ONLY' : 'OFF';
+}
+
+/** P4.2 (R1-65): the pump.fun / DexScreener HTTP pollers run only when the cluster is mainnet-beta, whatever the caller asked. */
+export function httpPollersAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
+  return allowedCluster(env) === 'mainnet-beta';
 }
 
 export class PumpFunService extends EventEmitter {
@@ -350,13 +357,14 @@ export class PumpFunService extends EventEmitter {
 
   /**
    * Begin the on-chain feed and, unless `httpPollers` is false, the pump.fun / DexScreener HTTP fallback poll. Called once by the server,
-   * never on import. `httpPollers: false` is for a server whose only feed is a loopback chain (S28).
+   * never on import. `httpPollers: false` is for a server whose only feed is a loopback chain (S28). The pollers also need
+   * ALLOWED_CLUSTER=mainnet-beta (`httpPollersAllowed`, P4.2): on devnet and localnet they are never started.
    */
-  public startBackground(opts: { httpPollers?: boolean } = {}): void {
+  public startBackground(opts: { httpPollers?: boolean; env?: NodeJS.ProcessEnv } = {}): void {
     if (this.backgroundStarted) return;
     this.backgroundStarted = true;
     pumpFeedListener.start().catch(() => {});
-    if (opts.httpPollers !== false) this.initPolling();
+    if (opts.httpPollers !== false && httpPollersAllowed(opts.env)) this.initPolling();
   }
 
   /**

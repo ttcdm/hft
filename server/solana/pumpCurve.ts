@@ -13,6 +13,7 @@ import {
   getSellSolAmountFromTokenAmount,
 } from '@pump-fun/pump-sdk';
 import { PUMP_FUN_PROGRAM_ID, PUMP_FUN_FEE_RECIPIENT } from './programs';
+import { expectedGenesisHash } from './clusterGuard';
 import { Logger } from '../middleware/enterprise';
 import { executionConfig } from './executionConfig';
 import { ExecutionMode, TriState } from '../core/types';
@@ -164,7 +165,10 @@ export type MarketStateFailureReason =
 export interface MarketStateFailure {
   reason: MarketStateFailureReason;
   message: string;
-  /** Only for the three fee-tier reasons, when the fee recipients resolved: the state with `unverifiedFeeCeilingBps` set, for a SELL only. */
+  /**
+   * Only for the three fee-tier reasons when the fee recipients resolved, and (P4.2) for FEE_RECIPIENT_UNRESOLVED when the Global read
+   * null but this endpoint returned one before: the state with `unverifiedFeeCeilingBps` set, for a SELL only.
+   */
   sellableState?: PumpMarketState;
 }
 
@@ -559,6 +563,34 @@ export class PumpCurveService {
   public static fetchTokenHolderDistribution = fetchTokenHolderDistribution;
   private static cacheTimestamp = 0;
   private static readonly CACHE_TTL_MS = 60000; // 1 minute cache for global fee parameters
+  /** P4.2 (N-43): which endpoint and cluster the cached Global and FeeConfig were read from (`globalCacheKey`). */
+  private static cacheKey: string | null = null;
+  /**
+   * P4.2 (N-43 vs S237): the last Global that decoded, with its cache key. It never prices or routes a buy: it is used only to resolve
+   * the fee recipients of the SELL-only state (`MarketStateFailure.sellableState`) when a refresh on the same endpoint and cluster read
+   * the Global as null, so a transient null read does not leave a stop-loss without a transaction to send. Cleared by `resetGlobalCache`.
+   */
+  private static lastGoodGlobal: { key: string; global: any } | null = null;
+
+  /**
+   * P4.2 (N-43): the cache key: the Connection's endpoint plus the genesis hash the cluster guard requires for ALLOWED_CLUSTER (the
+   * configured hash, not one read per call; the send path's genesis check is what proves the endpoint serves it). A read through
+   * another endpoint, or after ALLOWED_CLUSTER / LOCALNET_GENESIS_HASH changed, refreshes the Global and FeeConfig first.
+   */
+  public static globalCacheKey(connection: Connection): string {
+    let genesis = '';
+    try { genesis = expectedGenesisHash(); } catch { /* localnet without LOCALNET_GENESIS_HASH: the endpoint alone */ }
+    return `${(connection as any)?.rpcEndpoint ?? ''}|${genesis}`;
+  }
+
+  /** P4.2 (N-43): forget the cached Global and FeeConfig (called by `setRpcEndpoint`), so the next read fetches both again. */
+  public static resetGlobalCache(): void {
+    this.cachedGlobal = null;
+    this.cachedFeeConfig = null;
+    this.cacheTimestamp = 0;
+    this.cacheKey = null;
+    this.lastGoodGlobal = null;
+  }
 
   // Derive bonding curve PDA for any token mint
   public static getBondingCurveAddress(mint: PublicKey): [PublicKey, number] {
@@ -616,9 +648,11 @@ export class PumpCurveService {
 
     try {
       const now = Date.now();
+      const key = this.globalCacheKey(connection);
       const needGlobalRefresh =
         !this.cachedGlobal ||
         !this.cachedFeeConfig ||
+        key !== this.cacheKey ||
         now - this.cacheTimestamp > this.CACHE_TTL_MS;
 
       const accountsToFetch = [mint, bondingCurve];
@@ -630,22 +664,28 @@ export class PumpCurveService {
       const mintAccountInfo = accountInfos[0];
       const curveAccountInfo = accountInfos[1];
 
-      if (needGlobalRefresh && accountInfos[2]) {
-        try {
-          this.cachedGlobal = PUMP_SDK.decodeGlobal(accountInfos[2]);
-        } catch {
-          this.cachedGlobal = null;
-        }
-      }
-      if (needGlobalRefresh && accountInfos[3]) {
-        try {
-          this.cachedFeeConfig = PUMP_SDK.decodeFeeConfig(accountInfos[3]);
-        } catch {
-          this.cachedFeeConfig = null;
-        }
-      }
       if (needGlobalRefresh) {
-        this.cacheTimestamp = now;
+        // P4.2 (N-43): a refresh replaces both values. An account that reads null (or does not decode) becomes null, never the
+        // previous decode: LIVE then fails closed (FEE_RECIPIENT_UNRESOLVED without a Global, FEE_CONFIG_MISSING without a FeeConfig,
+        // where a SELL still gets its S237 fee-ceiling state). The timestamp and key are set only when both were read, so a null is
+        // asked for again on the next call instead of being kept for the TTL.
+        let global: any = null;
+        let feeConfig: any = null;
+        if (accountInfos[2]) {
+          try { global = PUMP_SDK.decodeGlobal(accountInfos[2]); } catch { global = null; }
+        }
+        if (accountInfos[3]) {
+          try { feeConfig = PUMP_SDK.decodeFeeConfig(accountInfos[3]); } catch { feeConfig = null; }
+        }
+        this.cachedGlobal = global;
+        this.cachedFeeConfig = feeConfig;
+        if (global) this.lastGoodGlobal = { key, global };
+        if (global && feeConfig) {
+          this.cacheTimestamp = now;
+          this.cacheKey = key;
+        } else {
+          this.cacheKey = null;
+        }
       }
 
       const finalMintInfo = mintAccountInfo;
@@ -784,27 +824,34 @@ export class PumpCurveService {
         }
       }
 
-      // Explicitly enforce native SOL quote mint only
+      // Explicitly enforce native SOL quote mint only. P4.2 (R1-64): PAPER too, so a non-SOL curve is never scored or paper-filled on SOL fields.
       if (!quoteMint.equals(NATIVE_MINT) && !quoteMint.equals(new PublicKey('So11111111111111111111111111111111111111112'))) {
         Logger.warn(`UNSUPPORTED_QUOTE_MINT: Mint ${mint.toBase58()} uses exotic quote mint ${quoteMint.toBase58()}. Only native SOL is supported.`);
-        if (isLiveMode) {
-          return fail('UNSUPPORTED_QUOTE_MINT', `quote mint ${quoteMint.toBase58()} is not native SOL`);
-        }
+        return fail('UNSUPPORTED_QUOTE_MINT', `quote mint ${quoteMint.toBase58()} is not native SOL`);
       }
 
       // Authoritative fee recipient resolution according to Pump V2 protocol
       let feeRecipient: PublicKey;
       let buybackFeeRecipient: PublicKey;
+      let feeFailure: { reason: MarketStateFailureReason; message: string } | undefined;
       try {
         ({ feeRecipient, buybackFeeRecipient } = resolvePumpFeeRecipients(this.cachedGlobal, isMayhemMode, executionMode));
       } catch (recipErr: any) {
         Logger.error(`Fee recipients unresolved for ${mint.toBase58()}: ${recipErr.message}`);
-        return fail('FEE_RECIPIENT_UNRESOLVED', recipErr.message);
+        // P4.2: the Global read null on this endpoint. A buy fails closed; a SELL may still be built with the recipients of the last
+        // Global this endpoint and cluster returned (through `sellableState` only, priced at the fee ceiling below).
+        const stale = !this.cachedGlobal && isLiveMode && this.lastGoodGlobal?.key === key ? this.lastGoodGlobal.global : null;
+        if (!stale) return fail('FEE_RECIPIENT_UNRESOLVED', recipErr.message);
+        try {
+          ({ feeRecipient, buybackFeeRecipient } = resolvePumpFeeRecipients(stale, isMayhemMode, executionMode));
+        } catch {
+          return fail('FEE_RECIPIENT_UNRESOLVED', recipErr.message);
+        }
+        feeFailure = { reason: 'FEE_RECIPIENT_UNRESOLVED', message: `${recipErr.message}; a SELL may use the last Global read from this endpoint` };
       }
 
       // Authoritative dynamic fee computation using official Pump V2 Fee Schedule
       let protocolFeeBps = 100;
-      let feeFailure: { reason: MarketStateFailureReason; message: string } | undefined;
       let feeComputationStatus: 'VERIFIED' | 'UNAVAILABLE' | 'FAILED' = 'UNAVAILABLE';
 
       if (this.cachedGlobal && this.cachedFeeConfig && typeof computeFeesBps === 'function') {
@@ -834,7 +881,7 @@ export class PumpCurveService {
             Logger.debug(`Dynamic fee calculation fallback: ${feeCalcErr.message}`);
           }
         }
-      } else if (isLiveMode) {
+      } else if (isLiveMode && !feeFailure) {
         Logger.error(`FEE_CONFIG_MISSING in LIVE mode: Cached global or feeConfig not present for ${mint.toBase58()}`);
         feeFailure = { reason: 'FEE_CONFIG_MISSING', message: 'the Global or FeeConfig account is missing or could not be decoded' };
       }

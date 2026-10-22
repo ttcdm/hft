@@ -2,7 +2,7 @@
 
 `npm run localnet:e2e` starts three things and drives them:
 
-1. `scripts/localnet/validator.ts`, a JSON-RPC server (plus a minimal `logsSubscribe` WebSocket) on 127.0.0.1 backed by **LiteSVM**.
+1. `scripts/localnet/validator.ts`, a JSON-RPC server (plus a minimal WebSocket: `logsSubscribe`, and `slotSubscribe`, which hears the slot on every transaction and once a second) on 127.0.0.1 backed by **LiteSVM**.
    The real pump.fun, pump fee and PumpSwap program binaries and config accounts, dumped from devnet, are in
    `scripts/localnet/accounts/` (public chain data, no keys). It is **not** `solana-test-validator`: one in-process bank, a slot
    per transaction, everything final, no lookup tables. It refuses to bind anything but loopback.
@@ -35,6 +35,7 @@ URL like any other method (`tests/helpers/localnetChain.ts` `v.rpc(...)`, or `rp
 | `localnet_frontrunNext` | `[base64Tx]` | That signed transaction lands immediately before the app's next sendTransaction. |
 | `localnet_expireBlockhash` | `[]` | Expires the current blockhash (BLOCKHASH_EXPIRED paths). |
 | `localnet_setAccount` | `[pubkey, {lamports, dataBase64, owner}]` | Writes an account straight into the bank (test setup only). |
-| `localnet_stats` | `[]` | `{held, landedThenFailed, methods, unsupported, txs, slot}`. |
+| `localnet_dropWebSockets` | `[ms?]` | Closes every WebSocket connection now (an abnormal close, as a network drop gives) and refuses each new one for `ms` (default 3000; the upgrade gets HTTP 503), so web3.js's reconnect attempts fail until then. Logs of transactions that land meanwhile reach nobody and are never replayed, as on a real node (`logsDroppedWhileDown` counts them). `tests/long/feed_gap.longtest.ts`. |
+| `localnet_stats` | `[]` | `{held, landedThenFailed, methods, unsupported, txs, slot, wsClients, wsDown, logsDroppedWhileDown}`. |
 
 `tests/long/fault_controls.longtest.ts` proves each fault control against the app's real `SolanaRpcTransport`.

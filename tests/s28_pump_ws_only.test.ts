@@ -6,12 +6,14 @@ describe('S28: pump websocket listener without the HTTP pollers', () => {
   afterEach(() => vi.restoreAllMocks());
 
   it('pumpBootMode: feeds on is FULL; feeds off is OFF unless APEX_PUMP_WS_ONLY=true on localnet', () => {
-    expect(pumpBootMode({})).toBe('FULL');
+    // P4.2 (R1-65): with feeds on, FULL (the HTTP pollers) is mainnet-beta only; the default cluster (devnet) gets the log stream alone
+    expect(pumpBootMode({})).toBe('WS_ONLY');
+    expect(pumpBootMode({ ALLOWED_CLUSTER: 'mainnet-beta' })).toBe('FULL');
     expect(pumpBootMode({ APEX_DISABLE_EXTERNAL_FEEDS: 'true' })).toBe('OFF');
     expect(pumpBootMode({ APEX_DISABLE_EXTERNAL_FEEDS: 'true', APEX_PUMP_WS_ONLY: 'true' })).toBe('OFF'); // devnet/unset: never
     expect(pumpBootMode({ APEX_DISABLE_EXTERNAL_FEEDS: 'true', APEX_PUMP_WS_ONLY: 'true', ALLOWED_CLUSTER: 'devnet' })).toBe('OFF');
     expect(pumpBootMode({ APEX_DISABLE_EXTERNAL_FEEDS: 'true', APEX_PUMP_WS_ONLY: 'true', ALLOWED_CLUSTER: 'localnet' })).toBe('WS_ONLY');
-    expect(pumpBootMode({ APEX_PUMP_WS_ONLY: 'true', ALLOWED_CLUSTER: 'localnet' })).toBe('FULL'); // flag is moot when feeds are on
+    expect(pumpBootMode({ APEX_PUMP_WS_ONLY: 'true', ALLOWED_CLUSTER: 'localnet' })).toBe('WS_ONLY'); // P4.2: feeds on off mainnet is WS_ONLY too (was FULL)
   });
 
   it('startBackground({ httpPollers: false }) starts the listener and makes no HTTP request', async () => {
@@ -27,7 +29,7 @@ describe('S28: pump websocket listener without the HTTP pollers', () => {
     } finally { vi.useRealTimers(); }
   });
 
-  it('the default still starts the pollers', () => {
+  it('the default still starts the pollers on mainnet-beta', () => {
     vi.spyOn(pumpFeedListener, 'start').mockResolvedValue(undefined as any);
     // Fake timers: initPolling also arms a 5 s interval, which must never fire for real in this process (it would call the
     // un-mocked syncRealWorldData and reach pump.fun / DexScreener, which the network guard rightly refuses).
@@ -35,7 +37,7 @@ describe('S28: pump websocket listener without the HTTP pollers', () => {
     try {
       const svc = new PumpFunService();
       const sync = vi.spyOn(svc, 'syncRealWorldData').mockResolvedValue(undefined);
-      svc.startBackground();
+      svc.startBackground({ env: { ALLOWED_CLUSTER: 'mainnet-beta' } }); // P4.2 (R1-65): the pollers need mainnet-beta now (the test env is devnet)
       expect(sync).toHaveBeenCalledTimes(1);
     } finally { vi.clearAllTimers(); vi.useRealTimers(); }
   });

@@ -183,6 +183,7 @@ describe('P1.4 N-11 / R1-119: Telegram /panic_sell sells the open LIVE position,
     const close = vi.spyOn(executionCoordinator, 'closePosition').mockResolvedValue({ success: true, pnlSol: 0.001, status: 'CLOSED' });
 
     const r = await socialScanner.processTelegramCommand('/panic_sell');
+    expect(arm).toHaveBeenCalledWith(false); // the stop disarms LIVE before it sells
     expect(close).toHaveBeenCalledWith(liveId, 100, 'EMERGENCY_PANIC_LIQUIDATION');
     expect(close.mock.calls.map((c) => c[0])).not.toContain(paperId);
     expect(r.reply).toMatch(/EMERGENCY DUMP COMPLETE/);
@@ -244,6 +245,19 @@ describe('P1.4 N-1: the HTTP panic waits for an auto buy in flight before it rea
     }
     expect(realLoad(undefined, 'ACTIVE')).toEqual([]);
     expect(autoSnipeController.getMode()).toBe('OFF');
+  });
+});
+
+describe('P1.4 step 3: the emergency stop disarms LIVE', () => {
+  // Audit 2026-10-22: with `armLiveTrading(false)` removed from emergencyStop, every test in this file still passed (two tests elsewhere
+  // caught it). The claim is pinned here, in the file named for it.
+  it('emergencyStop({ exitAll: false }) calls armLiveTrading(false) and leaves the coordinator disarmed, in PAPER', async () => {
+    const arm = vi.spyOn(executionCoordinator, 'armLiveTrading');
+    const report = await emergencyStop({ exitAll: false, reason: 'p14 disarm' });
+    expect(report.killSwitchActivated).toBe(true);
+    expect(arm).toHaveBeenCalledWith(false);
+    expect(executionCoordinator.isLiveArmed()).toBe(false);
+    expect(executionCoordinator.getExecutionMode()).toBe('PAPER');
   });
 });
 
@@ -344,9 +358,11 @@ describe('P1.4 N-0 over HTTP: kill switch on, off, re-arm leaves auto out of DEV
     const set = await app.call('POST', '/api/auto/mode', { mode: 'DEVNET_LIVE', confirmationCode: DEVNET_CONFIRMATION_CODE });
     expect(set.status, JSON.stringify(set.json)).toBe(200);
     expect(set.json.status.mode).toBe('DEVNET_LIVE');
+    expect((await app.call('GET', '/api/wallet/state')).json.data.isLiveTradingActive).toBe(true); // really armed, through the real route
     const on = await app.call('POST', '/api/execution/kill-switch', { activate: true });
     expect(on.json.killSwitchActive).toBe(true);
     expect(on.json.autoMode).toBe('OFF');
+    expect((await app.call('GET', '/api/wallet/state')).json.data.isLiveTradingActive).toBe(false); // the stop disarmed LIVE
     expect((await app.call('POST', '/api/execution/kill-switch', { activate: false })).json.killSwitchActive).toBe(false);
     expect((await app.call('POST', '/api/execution/arm', ARM)).status).toBe(200);
     const st = (await app.call('GET', '/api/auto/status')).json;

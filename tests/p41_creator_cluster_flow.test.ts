@@ -283,6 +283,22 @@ describe('P4.1 (R1-60): the funder queue and the coverage sample', () => {
     await vi.waitFor(() => expect(w.getSnapshot(T0 + 22_000).watching[0].metrics.funderCoverage).toBe(1));
   });
 
+  it('S264 (review 2026-10-24): buyers outside the sample with no known funder count as one cluster toward uniqueBuyers, so a small-wallet swarm cannot pass the gate', () => {
+    const F = wallet();
+    const big = Array.from({ length: WATCH_FUNDER_SAMPLE_BUYERS }, wallet); // the sample: all funded by F, one cluster
+    const swarm = Array.from({ length: 60 }, wallet); // small buys outside the sample, funders never looked up
+    const funderOf = (x: string) => (big.includes(x) ? F : undefined);
+    const w = new WatchWindow({ publicFunders: [], funderOf });
+    const mint = mintKey();
+    w.watch(mint, wallet(), T0);
+    run(w, mint, [...big.map((b, i): Step => [i * 0.1, b, 'buy', 0.5]), ...swarm.map((b, i): Step => [11 + i * 0.1, b, 'buy', 0.01])]);
+    const m = w.evaluate(mint, T0 + 21_000)!.metrics;
+    expect(m.rawUniqueBuyers).toBe(WATCH_FUNDER_SAMPLE_BUYERS + 60);
+    expect(m.funderCoverage).toBe(1); // over the sample
+    expect(m.uniqueBuyers).toBe(2); // F's cluster, plus one for every unknown buyer outside the sample (was 61)
+    expect(m.signals.buyers!.pass).toBe(false);
+  });
+
   it('a full queue drops the jobs of released mints first, then refuses', () => {
     let pending = 0;
     const conn: any = { getSignaturesForAddress: () => { pending++; return new Promise(() => undefined); }, getParsedTransaction: async () => null };

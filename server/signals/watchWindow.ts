@@ -381,7 +381,19 @@ export class WatchWindow extends EventEmitter {
       const rising = now30 > prev30;
       velocity = { solPerMin, rising, pass: solPerMin >= HOT_MIN_VELOCITY_SOL_PER_MIN && rising };
     }
-    const uniqueBuyers = clusters.size;
+    // S264 (review 2026-10-24, finding 3): buyers outside the funder sample whose funder was never looked up used to count as one cluster
+    // each, so on a launch with more than WATCH_FUNDER_SAMPLE_BUYERS buyers a swarm of small wallets from one funder could pass the
+    // unique-buyer gate while coverage (measured over the sample) read 1. They now count as one cluster together; concentration still sees
+    // each of them on its own, so a busy launch is not rejected for a cluster it cannot measure.
+    const sampled = new Set(sample);
+    let unknownOutside = false;
+    const countedClusters = new Set<string>();
+    for (const wallet of c.buyVolumeByWallet.keys()) {
+      if (!sampled.has(wallet) && !this.funderKnown(c, wallet)) { unknownOutside = true; continue; }
+      const k = clusterOf(wallet);
+      countedClusters.add(clusters.has(k) ? k : `funder:${wallet}`); // a buyer merged into the cluster of the wallets it funded
+    }
+    const uniqueBuyers = countedClusters.size + (unknownOutside ? 1 : 0);
     const signals: WatchSignals = {
       velocity,
       buyers: rawUnique === 0 ? null : { count: uniqueBuyers, funderCoverage, pass: uniqueBuyers >= HOT_MIN_UNIQUE_BUYERS && funderCoverage === 1 },

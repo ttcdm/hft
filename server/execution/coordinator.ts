@@ -216,6 +216,7 @@ export class ExecutionCoordinator {
       if (dbLock) updateHeldLock(dbLock, { walletPubkey: pub });
     }
     this.started = true;
+    this.seedPendingSellsFromLedger();
     this.initializeConnection();
     this.startAutoPositionMonitor();
     this.startMarketFeedHeartbeat();
@@ -328,7 +329,10 @@ export class ExecutionCoordinator {
    */
   private async verifyCluster(): Promise<boolean> {
     try {
-      await assertClusterAllowed(this.connection);
+      const { genesisHash } = await assertClusterAllowed(this.connection);
+      // P2.2 (R1-89): the database remembers the cluster it was written for and refuses an RPC on another one.
+      const stamp = workstationDb.checkClusterStamp(genesisHash);
+      if (!stamp.ok) throw new Error(`DB_CLUSTER_MISMATCH: ${workstationDb.getDbPath()} holds the ledger of genesis ${stamp.stored}, but the RPC is on ${genesisHash}; refusing to reconcile or trade against it`);
       rememberGenesisCheck(this.connection); // S208: readiness warms the send-path cache
       this.clusterProblem = null;
       return true;
@@ -730,6 +734,7 @@ export class ExecutionCoordinator {
         .finally(() => {
           if (timer) clearTimeout(timer);
           if (this.reconcileInFlight === run) this.reconcileInFlight = null;
+          this.firstReconciliationDone = true; // P2.2: whatever the outcome (a timeout included), exits stop waiting for it
         });
       this.reconcileInFlight = run;
     }
@@ -3674,6 +3679,40 @@ export class ExecutionCoordinator {
   }
 
   private pendingSells = new Map<string, { signature: string; ts: number; lastValidBlockHeight?: number }>();
+  /** P2.2: set when the first startup reconciliation run ends, whatever its result. */
+  private firstReconciliationDone = false;
+
+  /** P2.2: mints with a LIVE SELL row still PENDING or RECONCILIATION_REQUIRED. */
+  private unresolvedLiveSellMints(): Set<string> {
+    return new Set(
+      workstationDb.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED'])
+        .filter((t) => t.direction === 'SELL' && t.executionMode === 'LIVE')
+        .map((t) => t.mint)
+    );
+  }
+
+  /**
+   * P2.2 (R1-23, R1-83): pendingSells lived in memory only, so after a restart a sell that was sent but not confirmed was forgotten and the
+   * position could be sold again (or closed at cost 0 by the zero-balance branch). At start, every LIVE SELL row still PENDING or
+   * RECONCILIATION_REQUIRED becomes a pending sell of the active LIVE position of that mint (one position per mint), with its submission
+   * time and blockhash height, so closePosition reads the wallet before it sells again (the N3 adoption path).
+   */
+  private seedPendingSellsFromLedger(): void {
+    try {
+      const active = workstationDb.loadPositions(undefined, 'ACTIVE').filter((p) => p.executionMode === 'LIVE');
+      const rows = workstationDb.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED']).filter((t) => t.direction === 'SELL' && t.executionMode === 'LIVE');
+      for (const t of rows) {
+        const pos = active.find((p) => p.mint === t.mint);
+        if (!pos) continue;
+        const known = this.pendingSells.get(pos.id);
+        if (known && known.ts >= t.submissionTime) continue; // keep the latest sell of the position
+        this.pendingSells.set(pos.id, { signature: t.signature, ts: t.submissionTime, lastValidBlockHeight: t.lastValidBlockHeight });
+      }
+      if (this.pendingSells.size > 0) Logger.warn(`[P2.2] ${this.pendingSells.size} sell(s) sent before the restart are unresolved; their positions check the wallet before selling again`);
+    } catch (err: any) {
+      Logger.warn(`[P2.2] could not seed pending sells from the ledger: ${err.message}`);
+    }
+  }
 
   /**
    * P2.1: true only when the pending sell's blockhash has expired (confirmed block height past its lastValidBlockHeight) AND its signature
@@ -3706,7 +3745,13 @@ export class ExecutionCoordinator {
       await this.updatePositionMarkPrices();
     } catch {}
 
-    const positions = workstationDb.loadPositions(undefined, 'ACTIVE');
+    let positions = workstationDb.loadPositions(undefined, 'ACTIVE');
+    // P2.2 (R1-23, R1-83, R1-115): until the first startup reconciliation has applied the SELL rows from before a restart, a LIVE position
+    // with an unresolved sell is not evaluated: its earlier sell may have landed, and selling again could sell a partial twice.
+    if (!this.firstReconciliationDone) {
+      const held = this.unresolvedLiveSellMints();
+      if (held.size > 0) positions = positions.filter((p) => !(p.executionMode === 'LIVE' && held.has(p.mint)));
+    }
     const loadedQty = new Map(positions.map((p) => [p.id, p.tokenQuantityRaw]));
     // N17: failure counters only matter for positions still open; drop the rest so the map cannot grow forever.
     for (const id of this.exitFailures.keys()) if (!loadedQty.has(id)) this.exitFailures.delete(id);

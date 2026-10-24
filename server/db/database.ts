@@ -294,6 +294,18 @@ export class WorkstationDatabase {
     return this.dbPath;
   }
 
+  /**
+   * P2.2 (R1-89): the cluster this database's ledger belongs to, by genesis hash. The first verified RPC stamps it (`cluster_genesis_hash`
+   * in app_settings); after that an RPC on another genesis is refused, so a devnet ledger is never reconciled against another cluster.
+   * An in-memory database (tests, scratch tools) is never stamped. `ok: false` carries the stored hash.
+   */
+  public checkClusterStamp(genesisHash: string): { ok: true; stamped: boolean } | { ok: false; stored: string } {
+    if (!genesisHash || this.dbPath === ':memory:') return { ok: true, stamped: false };
+    const stored = this.getSetting<string>('cluster_genesis_hash');
+    if (!stored) return { ok: true, stamped: this.setSetting('cluster_genesis_hash', genesisHash) };
+    return stored === genesisHash ? { ok: true, stamped: false } : { ok: false, stored };
+  }
+
   /** The last recorded all-trading halt state: a halt survives a restart until an operator clears it. */
   public getPersistedHaltReason(): string | null {
     try {

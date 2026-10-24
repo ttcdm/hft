@@ -245,6 +245,17 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
     expect(coordinator.getOperatorAlerts().find((a) => a.code === 'SELL_ADOPTED' && a.positionId === posId)?.message).toMatch(/booked \(PnL -0\.050000 SOL\)/);
   });
 
+  it('S259 (P2.3, N-28): a 100% exit that finds an empty wallet, with no pending sell, books the basis as a realized loss and sends nothing', async () => {
+    (coordinator as any).connection.getTokenAccountBalance = vi.fn(async () => ({ value: { amount: '0' } }));
+    const res = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+    expect(res).toMatchObject({ success: true, status: 'CLOSED', solMoved: 0 });
+    expect(res.pnlSol).toBeCloseTo(-0.1, 9);
+    expect(submit).not.toHaveBeenCalled();
+    const row = workstationDb.loadPositions().find((p) => p.id === posId)!;
+    expect(row.realizedPnLSol).toBeCloseTo(-0.1, 9);
+    expect(row.exitReason).toMatch(/REALIZED_ASSUMED_LOSS/);
+  });
+
   it('N3: a partial sell that landed leaves the wallet balance as the remaining quantity', async () => {
     (TradeReconciler.reconcileSellTransaction as any).mockResolvedValue({ success: false, reconciliationState: 'RECONCILIATION_REQUIRED', error: 'fill unreadable' });
     await coordinator.closePosition(posId, 50, 'TAKE_PROFIT_1');

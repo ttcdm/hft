@@ -60,6 +60,23 @@ describe('N5-N9: startup reconciliation does not wedge readiness on states that 
     expect(coordinator.getOperatorAlerts().some((a) => a.code === 'POSITION_GONE' && a.positionId === id)).toBe(true);
   });
 
+  it('S259 (P2.3, N-28): that close books the cost basis as a realized loss, once, tagged REALIZED_ASSUMED_LOSS', async () => {
+    const id = `s259_${uid()}`;
+    livePosition(id); // cost basis 0.1 SOL
+    conn.getTokenAccountBalance = vi.fn(async () => { throw new Error('failed to get token account balance: Invalid param: could not find account'); });
+    const journal = vi.spyOn(workstationDb, 'logJournal');
+    const dayBefore = workstationDb.getDailyRealizedPnLSol('LIVE');
+    await coordinator.startupReconciliation();
+    const row = workstationDb.loadPositions().find((p) => p.id === id)!;
+    expect(row.status).toBe('CLOSED');
+    expect(row.realizedPnLSol).toBeCloseTo(-0.1, 9);
+    expect(row.exitReason).toMatch(/REALIZED_ASSUMED_LOSS/);
+    expect(workstationDb.getDailyRealizedPnLSol('LIVE')).toBeCloseTo(dayBefore - 0.1, 9);
+    expect(journal.mock.calls.filter((c) => c[0] === 'REALIZED_ASSUMED_LOSS' && (c[3] as any)?.positionId === id)).toHaveLength(1);
+    await coordinator.startupReconciliation(); // closed rows are not booked again
+    expect(workstationDb.getDailyRealizedPnLSol('LIVE')).toBeCloseTo(dayBefore - 0.1, 9);
+  });
+
   it('N5: an RPC failure while reading the balance is unknown, not zero: the position stays open', async () => {
     const id = `n5_${uid()}`;
     livePosition(id);

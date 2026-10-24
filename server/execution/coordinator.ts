@@ -918,13 +918,16 @@ export class ExecutionCoordinator {
           } else if (onChainAmount <= 0n) {
             // The tokens are gone (sold or moved outside this app). Left OPEN this position blocks arming until someone edits the DB,
             // while the exit loop keeps trying to sell an empty account. Close it with the reason on the record, and say so.
+            // P2.3 (N-28): with no sell found, the basis is booked as a realized loss (REALIZED_ASSUMED_LOSS), so the daily and session
+            // loss caps and the expectancy count it. Booking 0 made a vanished position look free.
+            const assumedLossSol = this.bookAssumedLoss(pos, 'startup reconciliation');
             pos.status = 'CLOSED';
             pos.tokenQuantityRaw = '0';
             pos.costBasisLamports = 0;
-            pos.exitReason = 'RECONCILED_ZERO_BALANCE: no tokens in the wallet at startup reconciliation';
+            pos.exitReason = 'RECONCILED_ZERO_BALANCE: no tokens in the wallet at startup reconciliation (REALIZED_ASSUMED_LOSS)';
             pos.lastUpdatedTimestamp = Date.now();
             workstationDb.savePosition(pos);
-            this.raiseOperatorAlert('POSITION_GONE', `Position ${pos.symbol || pos.mint.slice(0, 6)} was recorded open but the wallet holds none of it. Closed in the database; realized PnL for it is unknown.`, pos.id);
+            this.raiseOperatorAlert('POSITION_GONE', `Position ${pos.symbol || pos.mint.slice(0, 6)} was recorded open but the wallet holds none of it. Closed in the database and booked as a loss of its cost basis (${assumedLossSol.toFixed(6)} SOL), since no sell was found.`, pos.id);
             issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) had no on-chain balance: closed in the database`);
           }
         } catch (e: any) {
@@ -3244,13 +3247,14 @@ export class ExecutionCoordinator {
         if (held !== null && held < totalTokensRaw) {
           target.lastUpdatedTimestamp = Date.now();
           if (held === 0n) {
+            const assumedLossSol = this.bookAssumedLoss(target, 'an exit found an empty wallet'); // P2.3 (N-28)
             target.status = 'CLOSED';
             target.tokenQuantityRaw = '0';
             target.costBasisLamports = 0;
-            target.exitReason = 'RECONCILED_ZERO_BALANCE: the wallet held no tokens when the sell was prepared';
+            target.exitReason = 'RECONCILED_ZERO_BALANCE: the wallet held no tokens when the sell was prepared (REALIZED_ASSUMED_LOSS)';
             workstationDb.savePosition(target);
-            this.raiseOperatorAlert('POSITION_BALANCE_MISSING', `${target.symbol || target.mint} was closed without a sell: the wallet held none of it. Realized PnL for it was not recorded.`, positionId);
-            return { success: true, pnlSol: 0, status: 'CLOSED', solMoved: 0 }; // S2: nothing was sent, so nothing moved
+            this.raiseOperatorAlert('POSITION_BALANCE_MISSING', `${target.symbol || target.mint} was closed without a sell: the wallet held none of it. Booked as a loss of its cost basis (${assumedLossSol.toFixed(6)} SOL), since no sell was found.`, positionId);
+            return { success: true, pnlSol: -assumedLossSol, status: 'CLOSED', solMoved: 0 }; // S2: nothing was sent, so nothing moved
           }
           target.costBasisLamports = Math.round(target.costBasisLamports * Number(held) / Number(totalTokensRaw));
           target.tokenQuantityRaw = held.toString();
@@ -3701,6 +3705,19 @@ export class ExecutionCoordinator {
   private pendingSells = new Map<string, { signature: string; ts: number; lastValidBlockHeight?: number }>();
   /** P2.2: set when the first startup reconciliation run ends, whatever its result. */
   private firstReconciliationDone = false;
+
+  /**
+   * P2.3 (N-28): a position closed because the wallet holds none of it, with no sell found, loses its whole remaining cost basis.
+   * Adds that loss to `pos.realizedPnLSol` (the caller's savePosition writes the realized_events delta) and journals
+   * REALIZED_ASSUMED_LOSS. Returns the loss in SOL (0 for a RECOVERED position, whose basis is unknown and stored as 0).
+   */
+  private bookAssumedLoss(pos: NormalizedPosition, where: string): number {
+    const lossSol = Math.max(0, pos.costBasisLamports || 0) / 1e9;
+    if (lossSol <= 0) return 0;
+    pos.realizedPnLSol = Number(((pos.realizedPnLSol ?? 0) - lossSol).toFixed(9));
+    workstationDb.logJournal('REALIZED_ASSUMED_LOSS', `assumed-loss-${pos.id.slice(0, 8)}`, pos.executionMode, { positionId: pos.id, mint: pos.mint, lossSol, where });
+    return lossSol;
+  }
 
   /** P2.2: mints with a LIVE SELL row still PENDING or RECONCILIATION_REQUIRED. */
   private unresolvedLiveSellMints(): Set<string> {

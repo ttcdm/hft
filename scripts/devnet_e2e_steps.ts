@@ -371,11 +371,12 @@ export function makeChainKit(d: { conn: any; web3: any; sdk: any; curve: any; bu
       const logs: string[] = Array.isArray(e?.logs) ? e.logs : [];
       throw new Error(`${String(e?.message ?? e).replace(/Catch the `SendTransactionError`[^.]*\./, '').replace(/\s+/g, ' ').trim()}${logs.length ? ` logs: ${logs.slice(-3).join(' | ')}` : ''}`);
     }
-    for (let i = 0; i < 120; i++) { // polls the status (no websocket subscription), up to 60 s
+    // S265: polls once a second (was 500 ms): ten buyers polling together stayed over a 15/s devnet RPC limit (runs 4 and 9: 4 to 6 of 10 failed)
+    for (let i = 0; i < 60; i++) { // polls the status (no websocket subscription), up to 60 s
       const st = (await d.conn.getSignatureStatuses([sig])).value[0];
       if (st?.err) throw new Error(`tx ${sig} failed: ${JSON.stringify(st.err)}`);
       if (st?.confirmationStatus === 'confirmed' || st?.confirmationStatus === 'finalized') return sig;
-      await new Promise((r) => setTimeout(r, 500));
+      await new Promise((r) => setTimeout(r, 1_000));
     }
     throw new Error(`tx ${sig} not confirmed in 60 s`);
   };
@@ -672,7 +673,8 @@ export async function creatorClusterOnChain(s: HarnessSteps, kit: ChainKit, feed
     coins.push(b.mint);
     if (!(await waitFor(b.mint, () => true))) { s.rec(`${L}: the second launch is watched`, false, 'not in the watch window'); return; }
     for (const w of five) await kit.transfer(payer, w.publicKey, buySol + 0.01);
-    const buys = await Promise.allSettled(five.map((w) => kit.buy(w, b.mint, buySol)));
+    // S265: started 250 ms apart (all within about a second), so the harness's own sends stay under a 15/s RPC limit
+    const buys = await Promise.allSettled(five.map((w, i) => s.sleep(i * 250).then(() => kit.buy(w, b.mint, buySol))));
     const landed = buys.filter((x) => x.status === 'fulfilled').length;
     s.rec(`${L}: 5 wallets from one funder bought together`, landed === 5, `${landed}/5 buys confirmed`);
     const e = await waitFor(b.mint, (x) => x.metrics.rawUniqueBuyers >= landed && x.metrics.funderCoverage === 1);
@@ -908,7 +910,7 @@ export async function releaseGatesOnChain(
     const buyers = Array.from({ length: nBuyers }, () => kit.newWallet()); wallets.push(...buyers);
     for (const w of buyers) await kit.transfer(payer, w.publicKey, 2 * buySol + 0.02);
     for (const m of made) {
-      const r = await Promise.allSettled(buyers.map((w) => kit.buy(w, m, buySol)));
+      const r = await Promise.allSettled(buyers.map((w, i) => s.sleep(i * 250).then(() => kit.buy(w, m, buySol)))); // S265: 250 ms apart
       s.rec(`${L}: ${mode}: ${nBuyers} equal buys of ${m.slice(0, 6)}`, r.every((x) => x.status === 'fulfilled'), `${r.filter((x) => x.status === 'fulfilled').length}/${nBuyers} confirmed`);
     }
     const released = await waitUntil(() => made.every((m) => { const e = find(m); return !!e && e.state !== 'WATCHING'; }), waitMs);

@@ -10,10 +10,11 @@ import { MockSolanaRpc } from './e2e/helpers/mockRpc';
 /**
  * S261 (review 2026-10-24, HIGH on S245): a rate-limited RPC send proves only that this send was refused. When the same signed transaction
  * already went to the block engine, that copy may land, so the order must be watched, not booked as never sent (a landed buy marked
- * REVERTED is never sold). With no earlier send, S245's "not accepted" still holds. Real coordinator; transports spied at their methods.
+ * REVERTED is never sold). S262 then made every rate-limited send an unknown outcome. Real coordinator; transports spied at their methods.
  */
 afterEach(() => vi.restoreAllMocks());
 
+let fill = 60;
 function setup() {
   const real = executionConfig.getConfig();
   vi.spyOn(executionConfig, 'getConfig').mockReturnValue({ ...real, jitoBlockEngineUrl: 'http://127.0.0.1:9', enableRpcFallback: true, jitoMaxRetries: 0, jitoRetryIntervalMs: 0 });
@@ -25,7 +26,7 @@ function setup() {
     payerKey: payer, recentBlockhash: PublicKey.default.toBase58(),
     instructions: [SystemProgram.transfer({ fromPubkey: payer, toPubkey: Keypair.generate().publicKey, lamports: 5000 })],
   }).compileToV0Message());
-  tx.signatures = [new Uint8Array(64).fill(61)];
+  tx.signatures = [new Uint8Array(64).fill(++fill)]; // a fresh signature per test: rows are keyed by signature
   const sig = bs58.encode(tx.signatures[0]);
   vi.spyOn(c as any, 'isBlockhashExpired').mockResolvedValue(false);
   vi.spyOn(c, 'checkIfTransactionLanded').mockResolvedValue({ landed: false } as any);
@@ -53,14 +54,19 @@ describe('S261: a rate-limited fallback after a block-engine send is watched, no
     c.cleanup();
   });
 
-  it('nothing went out before: the 429 is still "not accepted" (S245), with no watch', async () => {
-    const { c, params, jitoSubmit } = setup();
+  it('S262: with nothing sent before, a 429 is still watched; only when the blockhash expires unseen is it RPC_RATE_LIMITED, and the row TIMED_OUT', async () => {
+    const { c, sig, params, jitoSubmit } = setup();
     jitoSubmit.mockResolvedValue({ signature: '', transport: 'JITO', success: false, submitDurationMs: 1, lifecycleState: 'SUBMIT_FAILED', error: 'Failed to submit' } as any);
-    const confirm = vi.spyOn((c as any).rpcTransport, 'confirm');
+    const confirm = vi.spyOn((c as any).rpcTransport, 'confirm').mockResolvedValue({
+      signature: sig, confirmed: false, confirmDurationMs: 1, lifecycleState: 'EXPIRED_BLOCKHASH',
+      error: 'BLOCKHASH_EXPIRED: the transaction did not land and its blockhash is no longer valid; safe to retry with a new transaction',
+    } as any);
     const res = await c.submitAndConfirmWithRetry(params as any);
+    expect(confirm).toHaveBeenCalled();
     expect(res.error).toMatch(/^RPC_RATE_LIMITED/);
     expect(res.lifecycleState).toBe('SUBMIT_FAILED');
-    expect(confirm).not.toHaveBeenCalled();
+    expect(res.unconfirmed).toBeFalsy();
+    expect(workstationDb.loadTransactions(params.orderId).map((t) => t.reconciliationState)).toEqual(['TIMED_OUT']);
     c.cleanup();
   });
 });

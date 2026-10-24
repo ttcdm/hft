@@ -44,9 +44,10 @@ export type BundleLifecycleState =
  * (fetch failed, a socket reset, a timeout, an HTTP 5xx page, an "already processed" answer that means it landed earlier) leaves the
  * outcome unknown: the transaction may have been forwarded and may land.
  *
- * S245: a rate-limit refusal (`isRateLimitedSendError`) is definite too. The RPC's limiter answers before the request reaches the node,
- * so nothing was accepted or forwarded; it used to be read as unknown, which left a pending sell that blocked every later sell of that
- * position (the stop-loss and the panic included) for the pending window.
+ * S262: a rate-limit refusal (`isRateLimitedSendError`) is NOT definite. S245 made it definite to stop a refused sell from holding the
+ * position for the pending window. A review showed that a balancer may already have forwarded the request. Since P2.1 (S251, S252) an
+ * unknown send is watched, with resends, until its blockhash expires, and then released, so S245's problem no longer needs the
+ * definite reading.
  */
 export const DEFINITE_SEND_REJECTION = /sanitiz|failed to deserialize|signature verification fail|Transaction signature verification failure|Blockhash not found|invalid transaction/i;
 
@@ -60,10 +61,10 @@ const ALREADY_PROCESSED = /already (?:been )?processed/i;
  *    followed by the JSON-RPC body (public devnet: code -32007 or 429, "15/second request limit reached", "Too many requests ...").
  *  - HTTP 200 with a JSON-RPC error body: `sendEncodedTransaction` throws `SendTransactionError` whose message carries only the
  *    error's message text (the code is dropped), e.g. "Transaction  resulted in an error. \n15/second request limit reached ...".
- *  - a `SolanaJSONRPCError`-like object with `code` -32007 or -32005 (the codes providers use for "limit reached" / "overloaded").
+ *  - a `SolanaJSONRPCError`-like object with `code` -32007 or 429 (providers' "limit reached"). Not -32005: that is Solana's "node unhealthy".
  */
 export const RATE_LIMITED_SEND = /request limit reached|too many requests|rate[ -]?limit(?:ed| exceeded| reached)|"code"\s*:\s*-3200[57]\b/i;
-export const RATE_LIMIT_RPC_CODES: ReadonlySet<number> = new Set([-32005, -32007, 429]);
+export const RATE_LIMIT_RPC_CODES: ReadonlySet<number> = new Set([-32007, 429]); // S262: not -32005, which is Solana's "node unhealthy"
 
 export function isRateLimitedSendError(err: unknown): boolean {
   const code = Number((err as any)?.code);
@@ -76,7 +77,10 @@ export function isRateLimitedSendError(err: unknown): boolean {
 export function isDefiniteSendRejection(err: unknown): boolean {
   const msg = String((err as any)?.message ?? err ?? '');
   if (ALREADY_PROCESSED.test(msg)) return false;
-  if (isRateLimitedSendError(err)) return true; // S245: refused by the RPC's limiter before anything was accepted
+  // S262 (review 2026-10-24, HIGH on S245): a rate limit proves only that this answer was a refusal. Behind a load balancer an earlier
+  // attempt of the same request may have been forwarded, so it is an unknown outcome, never proof that nothing was sent. The resend loop
+  // (`submitThroughRateLimit`) is still safe: it resends the same signed bytes.
+  if (isRateLimitedSendError(err)) return false;
   // web3.js throws SendTransactionError only when the RPC answered sendTransaction with a JSON-RPC error object (a preflight failure such as
   // -32002, a failed signature check, a node that is behind). The node returns those before it forwards anything. An HTTP error page, a
   // timeout or a reset socket is a plain Error and stays ambiguous.
@@ -184,7 +188,7 @@ export class SolanaRpcTransport implements ExecutionTransport {
       this.lastLatencyMs = duration;
       const ambiguous = !isDefiniteSendRejection(err);
       const rateLimited = isRateLimitedSendError(err);
-      Logger.error(`RPC submit failed${ambiguous ? ' (outcome unknown: it may have been forwarded)' : rateLimited ? ' (rate limited: not accepted)' : ''}: ${err.message}`);
+      Logger.error(`RPC submit failed${rateLimited ? ' (rate limited; outcome unknown, it is watched)' : ambiguous ? ' (outcome unknown: it may have been forwarded)' : ''}: ${err.message}`);
       return {
         signature: localSignature(tx),
         transport: 'SOLANA_RPC',

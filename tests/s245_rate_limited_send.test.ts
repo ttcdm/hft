@@ -56,10 +56,12 @@ async function signedTx(conn: any, payer = Keypair.generate()): Promise<Versione
 }
 const sigOf = (raw: Buffer | Uint8Array) => bs58.encode(VersionedTransaction.deserialize(Uint8Array.from(raw)).signatures[0]);
 
-describe('S245 (a): the real web3.js rate-limit errors are definite rejections', () => {
+// S262 (review 2026-10-24, HIGH on S245): a rate limit is recognised (and a sell is resent on it), but it is no longer proof that nothing was
+// sent: the transaction is watched until it lands or its blockhash expires, and only then reported RPC_RATE_LIMITED.
+describe('S245/S262 (a): the real web3.js rate-limit errors are rate limits, and unknown outcomes', () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it('HTTP 429 (a plain Error starting "429") and a JSON-RPC -32007 body (SendTransactionError) are rate limits and definite', async () => {
+  it('HTTP 429 (a plain Error starting "429") and a JSON-RPC -32007 body (SendTransactionError) are rate limits, not definite rejections', async () => {
     const e429 = await http429();
     expect(e429).not.toBeInstanceOf(SendTransactionError);
     expect(e429.message).toMatch(/^429 Too Many Requests: .*-32007/);
@@ -71,9 +73,10 @@ describe('S245 (a): the real web3.js rate-limit errors are definite rejections',
     expect(bare.message).toMatch(/^429 /);
     for (const e of [e429, e32007, bare]) {
       expect(isRateLimitedSendError(e)).toBe(true);
-      expect(isDefiniteSendRejection(e)).toBe(true);
+      expect(isDefiniteSendRejection(e)).toBe(false);
     }
-    expect(isRateLimitedSendError({ code: -32005, message: 'Node is unhealthy' })).toBe(true);
+    expect(isRateLimitedSendError({ code: -32007, message: 'limit' })).toBe(true);
+    expect(isRateLimitedSendError({ code: -32005, message: 'Node is unhealthy' })).toBe(false); // Solana's "node unhealthy", not a rate limit
     // unchanged: a network failure, a timeout, a 5xx page and "already processed" stay ambiguous, and are not rate limits
     const ambiguous = [new Error('fetch failed'), new Error('socket hang up'), new Error('RPC_TIMEOUT: sendTransaction got no answer within 1500 ms'),
       await web3SendError(502, '<html>502 Bad Gateway</html>', 'Bad Gateway'), await web3SendError(503, 'unavailable', 'Service Unavailable'),
@@ -84,7 +87,7 @@ describe('S245 (a): the real web3.js rate-limit errors are definite rejections',
     }
   });
 
-  it('SolanaRpcTransport.submit reports a 429 as rateLimited and not ambiguous, keeping the signature', async () => {
+  it('SolanaRpcTransport.submit reports a 429 as rateLimited and ambiguous, keeping the signature', async () => {
     const rpc = new MockSolanaRpc();
     const conn: any = rpc.createConnection();
     const t = new SolanaRpcTransport(conn);
@@ -94,7 +97,7 @@ describe('S245 (a): the real web3.js rate-limit errors are definite rejections',
       const r = await t.submit(tx);
       expect(r.success).toBe(false);
       expect(r.rateLimited).toBe(true);
-      expect(r.ambiguous).toBe(false);
+      expect(r.ambiguous).toBe(true);
       expect(r.signature).toBe(bs58.encode(tx.signatures[0]));
     }
   });
@@ -142,6 +145,10 @@ describe('S245: rate-limited sends through the real coordinator', () => {
       actualJitoTipLamports: 0, actualRealizedPnLSol: -0.05, remainingTokensRaw: '0', isFullyClosed: true, slot: 6,
     } as any);
     vi.spyOn(conn, 'getTokenAccountBalance').mockResolvedValue({ context: { slot: 1 }, value: { amount: '1000000000', decimals: 6, uiAmount: 1000, uiAmountString: '1000' } } as any);
+    // S262: every transaction here was built with a blockhash valid to height 100 and the chain is at 101, so a watch that sees no status
+    // after RPC_FALLBACK_TIMEOUT_MS (1.2 s here) ends as never landed (EXPIRED_BLOCKHASH)
+    vi.spyOn(txBuilder, 'lastValidBlockHeightOf').mockReturnValue(100);
+    conn.getBlockHeight = vi.fn(async () => 101);
   });
 
   afterEach(() => {
@@ -195,7 +202,7 @@ describe('S245: rate-limited sends through the real coordinator', () => {
     expect(coordinator.getExitFailureCount(id)).toBe(0);
   });
 
-  it('(c) rate-limited past every resend: RPC_RATE_LIMITED, no pending sell, the ladder does not move, and the next close sends and lands', async () => {
+  it('(c) rate-limited past every resend and never landed by blockhash expiry: RPC_RATE_LIMITED, no pending sell, the ladder does not move, and the next close sends and lands', async () => {
     const id = seedLive();
     const e = await http429();
     const j = journal();
@@ -203,17 +210,17 @@ describe('S245: rate-limited sends through the real coordinator', () => {
     const first = await coordinator.closePosition(id, 100, 'STOP_LOSS');
     expect(first.success).toBe(false);
     expect(first.error).toMatch(/^RPC_RATE_LIMITED/);
-    expect(first.error).not.toMatch(/SEND_OUTCOME_UNKNOWN/);
+    expect(first.error).toMatch(/BLOCKHASH_EXPIRED/); // S262: reported only after the watch proved it never landed
     expect(first.notSent).toBe(true);
     expect(spy).toHaveBeenCalledTimes(SELL_RATE_LIMIT_BACKOFF_MS.length + 1);
     expect(sleep.mock.calls.map((c) => c[0])).toEqual([...SELL_RATE_LIMIT_BACKOFF_MS]);
     expect(kinds(j)).toContain('SEND_RATE_LIMITED');
-    expect(kinds(j)).not.toContain('SEND_OUTCOME_UNKNOWN');
+    expect(kinds(j)).toContain('SEND_EXPIRED_UNLANDED');
     expect(coordinator.exitSlippageBps(id)).toBe(SELL_SLIPPAGE_LADDER_BPS[0]);
     expect(coordinator.getExitFailureCount(id)).toBe(0);
     expect(coordinator.exitRetryWaitMs(id)).toBe(0);
     expect(coordinator.getOperatorAlerts().some((a) => a.code === 'EXIT_RATE_LIMITED' && a.positionId === id && !a.cleared)).toBe(true);
-    // the row of the refused sell is REVERTED, not PENDING
+    // the row of the refused sell is resolved (TIMED_OUT: it never landed), not PENDING
     expect(workstationDb.getPendingTransactions().some((t) => t.mint === VALID_PUMP_MINT_1.toBase58() && t.direction === 'SELL')).toBe(false);
 
     // the RPC recovers: the next close is not refused with SELL_PENDING_VERIFICATION; it sends and lands
@@ -223,6 +230,22 @@ describe('S245: rate-limited sends through the real coordinator', () => {
     expect(spy).toHaveBeenCalledTimes(SELL_RATE_LIMIT_BACKOFF_MS.length + 2);
     expect((quote.mock.calls.at(-1)![0] as any).slippageBps).toBe(SELL_SLIPPAGE_LADDER_BPS[0]);
     expect(coordinator.getOperatorAlerts().some((a) => a.code === 'EXIT_RATE_LIMITED' && a.positionId === id && !a.cleared)).toBe(false);
+  });
+
+  it('S262: every send answered 429, but a balancer had forwarded it and it landed: the watch sees it confirmed and the position closes', async () => {
+    const id = seedLive();
+    const sent: string[] = [];
+    const e = await http429();
+    vi.spyOn(conn, 'sendRawTransaction').mockImplementation(async (raw: any) => {
+      const sig = sigOf(raw);
+      sent.push(sig);
+      rpc.setSignatureStatus(sig, { confirmationStatus: 'confirmed', slot: 9 }); // it reached a leader anyway
+      throw e;
+    });
+    const res = await coordinator.closePosition(id, 100, 'STOP_LOSS');
+    expect(res.success, res.error).toBe(true);
+    expect(new Set(sent).size).toBe(1);
+    expect(workstationDb.loadPositions().find((p) => p.id === id)!.status).toBe('CLOSED');
   });
 
   describe('(d) emergencyStop (/panic_sell) with a rate-limited first send', () => {
@@ -253,7 +276,7 @@ describe('S245: rate-limited sends through the real coordinator', () => {
       expect(first.succeeded).toEqual([]);
       expect(first.failed.map((f) => f.id)).toEqual([id]);
       expect(first.failed[0].error).toMatch(/^RPC_RATE_LIMITED/);
-      expect(first.failed[0].error).not.toMatch(/SELL_PENDING_VERIFICATION|SEND_OUTCOME_UNKNOWN/);
+      expect(first.failed[0].error).not.toMatch(/SELL_PENDING_VERIFICATION/);
       const second = await emergencyStop({ exitAll: true, reason: 's245 panic again' });
       expect(second.failed).toEqual([]);
       expect(second.succeeded.map((s) => s.id)).toEqual([id]);
@@ -261,7 +284,7 @@ describe('S245: rate-limited sends through the real coordinator', () => {
     });
   });
 
-  it('(e) a BUY rate-limited: SUBMIT_FAILED with no resend, its row REVERTED, and the mint is not blocked as unresolved', async () => {
+  it('(e) a BUY rate-limited: watched, then SUBMIT_FAILED on blockhash expiry with no backoff resend, its row TIMED_OUT, and the mint is not blocked as unresolved', async () => {
     vi.spyOn(TradeReconciler, 'capturePreTradeSnapshot').mockResolvedValue({ walletSolLamports: 1e9, tokenBalanceRaw: '0', tokenDecimals: 6, timestamp: Date.now() });
     vi.spyOn(txBuilder, 'buildBuyTransaction').mockImplementation(async () => signedTx(conn));
     vi.spyOn(coordinator, 'canExecuteLive').mockReturnValue({ allowed: true, reasons: [], readiness: { ready: true, components: { pumpFeed: { status: 'READY' } } } as any } as any);
@@ -272,6 +295,7 @@ describe('S245: rate-limited sends through the real coordinator', () => {
     expect(coordinator.armLiveTrading(true, 'CONFIRM_LIVE_TRADING_RISK').success).toBe(true);
     expect(coordinator.getExecutionMode()).toBe('LIVE');
     const mint = Keypair.generate().publicKey.toBase58();
+    vi.spyOn(conn, 'getTokenAccountBalance').mockResolvedValue({ context: { slot: 1 }, value: { amount: '0', decimals: 6, uiAmount: 0, uiAmountString: '0' } } as any);
     const { spy, sent } = sendAnswering([await http429()]);
     const res = await coordinator.executeTrade({
       signalTimestamp: Date.now(), mint, symbol: 'S241B', name: 'S241B', amountSol: 0.005,
@@ -282,7 +306,7 @@ describe('S245: rate-limited sends through the real coordinator', () => {
     expect(res.error).toMatch(/RPC_RATE_LIMITED/);
     expect(spy).toHaveBeenCalledTimes(1);
     expect(sleep).not.toHaveBeenCalled();
-    expect(workstationDb.loadTransactions().filter((t) => t.signature === sent[0]).map((t) => t.reconciliationState)).toEqual(['REVERTED']);
+    expect(workstationDb.loadTransactions().filter((t) => t.signature === sent[0]).map((t) => t.reconciliationState)).toEqual(['TIMED_OUT']);
     expect(workstationDb.hasUnresolvedLiveBuy(mint)).toBe(false);
     expect(workstationDb.loadPositions(undefined, 'ACTIVE').some((p) => p.mint === mint)).toBe(false);
   });
@@ -299,9 +323,11 @@ describe('S245: rate-limited sends through the real coordinator', () => {
     expect(sell.success, sell.error).toBe(true);
     expect(spy).toHaveBeenCalledTimes(4);
     spy.mockRejectedValue(e);
+    // the buy never lands: the wallet holds none of the token (the landed check after the watch reads this)
+    vi.spyOn(conn, 'getTokenAccountBalance').mockResolvedValue({ context: { slot: 1 }, value: { amount: '0', decimals: 6, uiAmount: 0, uiAmountString: '0' } } as any);
     const buy = await coordinator.submitAndConfirmWithRetry(await mk('BUY'));
     expect(buy.success).toBe(false);
-    expect(buy.lifecycleState).toBe('SUBMIT_FAILED');
+    expect(buy.lifecycleState, String(buy.error)).toBe('SUBMIT_FAILED');
     expect(buy.unconfirmed).toBeFalsy();
     expect(spy).toHaveBeenCalledTimes(5);
   });

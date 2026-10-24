@@ -10,10 +10,10 @@ import { startValidator, startLocalnetApp, armLive, LocalMarket, scratch, cleanu
  * limit reached"), was not accepted. Real server process, real pump.fun program (LiteSVM), real signer, trading Connection and transports;
  * the fault is the validator's `localnet_failNextSends(count, message, 'http429')`, which refuses before the bank (nothing lands).
  *
- *  - the transport, through the app's own trading Connection, reports it rateLimited and not ambiguous;
+ *  - the transport, through the app's own trading Connection, reports it rateLimited and (S262) ambiguous: a rate limit is not proof that
+ *    nothing was sent;
  *  - a LIVE close rate-limited twice is resent and lands: one sell on chain, the position CLOSED;
- *  - a close rate-limited past every resend fails RPC_RATE_LIMITED with nothing on chain, and the next close (no SELL_PENDING_VERIFICATION)
- *    sells it;
+ *  - S262: a close rate-limited past every backoff resend is watched, and a resend during the watch lands it: one sell on chain, CLOSED;
  *  - the panic (POST /api/wallet/panic-liquidate) with a rate-limited first send still closes the position.
  */
 const dir = scratch('long-ratelimit-');
@@ -52,7 +52,7 @@ afterAll(async () => {
 });
 
 describe('S245: rate-limited sends on localnet', () => {
-  it('the trading Connection sees a definite, rate-limited refusal (HTTP 429 and the -32007 body alike); nothing lands', async () => {
+  it('the trading Connection sees a rate-limited refusal (HTTP 429 and the -32007 body alike), reported as an unknown outcome; nothing lands', async () => {
     const conn = createTradingConnection(v.url);
     const transport = new SolanaRpcTransport(conn);
     const payer = Keypair.generate();
@@ -65,7 +65,7 @@ describe('S245: rate-limited sends on localnet', () => {
       const r = await transport.submit(tx);
       expect(r.success, mode).toBe(false);
       expect(r.rateLimited, mode).toBe(true);
-      expect(r.ambiguous, mode).toBe(false);
+      expect(r.ambiguous, mode).toBe(true); // S262
       expect(r.error).toMatch(mode === 'http429' ? /^429 / : /request limit reached/);
       expect((await v.conn.getSignatureStatuses([bs58.encode(tx.signatures[0])], { searchTransactionHistory: true })).value[0]).toBeNull();
       const again = await transport.submit(tx); // the same signed bytes, resent: accepted once
@@ -85,18 +85,13 @@ describe('S245: rate-limited sends on localnet', () => {
     expect([0n, null]).toContain(await market.tokenBalance(trader.publicKey, coin));
   });
 
-  it('rate-limited past every resend: RPC_RATE_LIMITED and nothing on chain; the next close is not blocked as pending and sells', async () => {
+  it('S262: rate-limited past every backoff resend, then watched: a resend during the watch lands it, once, and the position is CLOSED', async () => {
     const id = await buy(coins[1]);
     const before = await sends();
-    await v.rpc('localnet_failNextSends', [4, null, 'http429']); // the first send and its three resends
+    await v.rpc('localnet_failNextSends', [4, null, 'http429']); // the first send and its three backoff resends
     const c1 = await app.call('POST', '/api/execution/close', { positionId: id, sellPct: 100 });
-    expect(c1.json?.success).toBe(false);
-    expect(String(c1.json?.error)).toMatch(/RPC_RATE_LIMITED/);
-    expect((await sends()) - before).toBe(0);
-    const c2 = await app.call('POST', '/api/execution/close', { positionId: id, sellPct: 100 });
-    expect(String(c2.json?.error ?? '')).not.toMatch(/SELL_PENDING_VERIFICATION/);
-    expect(c2.json?.success, JSON.stringify(c2.json)).toBe(true);
-    expect((await sends()) - before).toBe(1);
+    expect(c1.json?.success, JSON.stringify(c1.json)).toBe(true);
+    expect((await sends()) - before).toBe(1); // the same signed transaction: it landed once
     expect((await position(id))?.status).toBe('CLOSED');
   });
 

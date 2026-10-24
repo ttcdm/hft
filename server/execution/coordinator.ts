@@ -1535,7 +1535,7 @@ export class ExecutionCoordinator {
       const rows = workstationDb.loadTransactions(params.orderId).filter((t) => t.signature === preSignature);
       if (rows.some((t) => t.reconciliationState === 'PENDING')) {
         // P2.1: a transaction whose blockhash expired unseen did not fail on chain; it never landed (TIMED_OUT, as orphan recovery writes it).
-        const neverLanded = /^BLOCKHASH_EXPIRED/.test(res.error ?? '');
+        const neverLanded = /^(BLOCKHASH_EXPIRED|RPC_RATE_LIMITED)/.test(res.error ?? ''); // S262: a rate-limited send is only reported after its blockhash expired
         workstationDb.saveTransaction({ ...rows[0], reconciliationState: neverLanded ? 'TIMED_OUT' : 'REVERTED', error: res.error ?? 'not sent or rejected' });
       }
     }
@@ -1785,30 +1785,18 @@ export class ExecutionCoordinator {
 
       // S245: a rate-limited send was refused, not lost: a SELL is resent (same signed bytes) after short waits; a BUY is not.
       const rpcSubmit = await traced('tx.submit', () => this.rpcTransport.submitThroughRateLimit(tx, side === 'SELL' ? SELL_RATE_LIMIT_BACKOFF_MS : []), { 'apex.transport': 'SOLANA_RPC', 'apex.side': side });
-      // Review 2026-10-24 (HIGH, on S245): a rate limit proves only that THIS send was refused. When the same signed transaction already went
-      // to a block engine (a Jito attempt above), that copy may still land, so the refusal is treated as an unknown outcome and watched.
-      const sentElsewhere = !!(lastSignature || lastBundleId);
-      if (rpcSubmit.rateLimited && sentElsewhere) {
-        rpcSubmit.ambiguous = true;
-        Logger.warn(`[S261] ${side} for order ${orderId}: the RPC rate-limited the fallback send, but the transaction already went to the block engine; watching it`);
-      }
-      if (rpcSubmit.rateLimited && !sentElsewhere) {
-        // Nothing was accepted (isRateLimitedSendError): SUBMIT_FAILED, so the PENDING row becomes REVERTED, a buy leaves no unresolved
-        // row for the mint and a sell leaves no pending sell; the next exit pass (or panic) may send again.
-        Logger.error(`[S245] ${side} for order ${orderId}: the RPC rate-limited the send ${rpcSubmit.rateLimitedResends + 1} time(s); nothing was accepted`);
+      // S262 (review 2026-10-24, HIGH on S245): a send the RPC rate-limited past every resend is an unknown outcome, not "nothing was sent"
+      // (a balancer may have forwarded an earlier attempt, or a block engine may hold the same transaction). It is watched below like any
+      // ambiguous send, with resends, until it confirms or its blockhash expires; only then is it reported RPC_RATE_LIMITED (never landed).
+      const rateLimitedOnly = !!rpcSubmit.rateLimited && !rpcSubmit.success;
+      if (rateLimitedOnly) {
+        Logger.warn(`[S262] ${side} for order ${orderId}: the RPC rate-limited the send ${rpcSubmit.rateLimitedResends + 1} time(s); watching ${rpcSubmit.signature.slice(0, 8)} until it lands or its blockhash expires`);
         workstationDb.logJournal('SEND_RATE_LIMITED', correlationId, 'LIVE', { orderId, side, mint, signature: rpcSubmit.signature, tries: rpcSubmit.rateLimitedResends + 1, error: rpcSubmit.error });
-        return {
-          success: false,
-          signature: rpcSubmit.signature || lastSignature,
-          transport: 'SOLANA_RPC',
-          error: `RPC_RATE_LIMITED: the RPC refused the ${side.toLowerCase()} ${rpcSubmit.rateLimitedResends + 1} time(s) with a rate limit; nothing was accepted (${rpcSubmit.error})`,
-          lifecycleState: 'SUBMIT_FAILED',
-        };
       }
       // P1.5 (R1-2): a send that failed without proof of rejection (fetch failed, socket reset, 502/504 after forwarding) may still land.
       // It is watched like any sent transaction below: confirmed means success, failed on chain means REVERTED, unseen means unconfirmed
       // (the buy path then keeps it RECONCILIATION_REQUIRED with orphan recovery, the sell path records a pending sell). Never REVERTED here.
-      const ambiguousSend = !rpcSubmit.success && !!rpcSubmit.ambiguous && !!rpcSubmit.signature;
+      const ambiguousSend = !rpcSubmit.success && (!!rpcSubmit.ambiguous || rateLimitedOnly) && !!rpcSubmit.signature;
       if (ambiguousSend) {
         Logger.warn(`[P1.5] ${side} for order ${orderId}: the send failed with no proof of rejection (${rpcSubmit.error}); watching ${rpcSubmit.signature.slice(0, 8)} in case it lands`);
         workstationDb.logJournal('SEND_OUTCOME_UNKNOWN', correlationId, 'LIVE', { orderId, side, mint, signature: rpcSubmit.signature, error: rpcSubmit.error });
@@ -1866,7 +1854,12 @@ export class ExecutionCoordinator {
         // BLOCKHASH_EXPIRED. Not unconfirmed, so a buy leaves no unresolved row for the mint and a sell leaves no pending sell.
         if (rpcConfirm.lifecycleState === 'EXPIRED_BLOCKHASH') {
           workstationDb.logJournal('SEND_EXPIRED_UNLANDED', correlationId, 'LIVE', { orderId, side, mint, signature: rpcSubmit.signature });
-          return { success: false, signature: rpcSubmit.signature, transport: 'SOLANA_RPC', error: rpcConfirm.error, lifecycleState: 'SUBMIT_FAILED' };
+          // S262: every send of it was rate-limited and it never landed: the refusals are now proven, so it is RPC_RATE_LIMITED (a sell then
+          // counts as no attempt and raises EXIT_RATE_LIMITED, as in S245), with BLOCKHASH_EXPIRED kept in the text.
+          const error = rateLimitedOnly
+            ? `RPC_RATE_LIMITED: the RPC refused the ${side.toLowerCase()} ${rpcSubmit.rateLimitedResends + 1} time(s) with a rate limit and it never landed (${rpcConfirm.error}; ${rpcSubmit.error})`
+            : rpcConfirm.error;
+          return { success: false, signature: rpcSubmit.signature, transport: 'SOLANA_RPC', error, lifecycleState: 'SUBMIT_FAILED' };
         }
         return {
           success: false,
@@ -2747,7 +2740,8 @@ export class ExecutionCoordinator {
           direction: 'BUY',
           submissionTransport: subRes.transport,
           submissionTime: Date.now(),
-          reconciliationState: 'REVERTED',
+          // P2.1/S262: a buy whose blockhash expired unseen never landed (TIMED_OUT, as submitAndConfirmWithRetry wrote it); it did not fail on chain
+          reconciliationState: /^(BLOCKHASH_EXPIRED|RPC_RATE_LIMITED)/.test(subRes.error ?? '') ? 'TIMED_OUT' : 'REVERTED',
           networkFeeLamports: 5000,
           jitoTipLamports: resolvedTip.tipLamports,
           executionMode: 'LIVE',

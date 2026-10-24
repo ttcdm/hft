@@ -174,6 +174,54 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
     expect(workstationDb.loadPositions().find((p) => p.id === posId)!.status).toBe('CLOSED');
   });
 
+  describe('S251 (P2.1): a pending sell whose blockhash expired unseen does not hold the next stop-loss for the rest of the 100 s', () => {
+    const unconfirmedSell = async () => {
+      submit.mockResolvedValueOnce({ success: false, signature: 'unlanded_sell', transport: 'SOLANA_RPC', error: 'UNCONFIRMED', lifecycleState: 'TIMED_OUT', unconfirmed: true });
+      vi.spyOn(txBuilder, 'lastValidBlockHeightOf').mockReturnValue(1_000);
+      const first = await coordinator.closePosition(posId, 100, 'TAKE_PROFIT_1');
+      expect(first.success).toBe(false);
+      expect(submit).toHaveBeenCalledTimes(1);
+      (coordinator as any).connection.getTokenAccountBalance = vi.fn(async () => ({ value: { amount: '1000000000' } })); // the wallet is still full
+    };
+
+    it('past lastValidBlockHeight with no signature status: the stop-loss sells on the next pass', async () => {
+      await unconfirmedSell();
+      const conn = (coordinator as any).connection;
+      conn.getBlockHeight = vi.fn(async () => 1_001);
+      conn.getSignatureStatuses = vi.fn(async () => ({ context: { slot: 1 }, value: [null] }));
+      const next = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(next.error ?? '').not.toMatch(/SELL_PENDING_VERIFICATION/);
+      expect(submit).toHaveBeenCalledTimes(2);
+      expect(conn.getSignatureStatuses).toHaveBeenCalledWith(['unlanded_sell'], { searchTransactionHistory: true });
+    });
+
+    it('while the blockhash is still valid the hold stands', async () => {
+      await unconfirmedSell();
+      (coordinator as any).connection.getBlockHeight = vi.fn(async () => 1_000);
+      const next = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(next.error).toMatch(/SELL_PENDING_VERIFICATION/);
+      expect(submit).toHaveBeenCalledTimes(1);
+    });
+
+    it('a signature that has a status is never released early, even past expiry', async () => {
+      await unconfirmedSell();
+      const conn = (coordinator as any).connection;
+      conn.getBlockHeight = vi.fn(async () => 2_000);
+      conn.getSignatureStatuses = vi.fn(async () => ({ context: { slot: 1 }, value: [{ slot: 9, confirmations: 1, err: null, confirmationStatus: 'processed' }] }));
+      const next = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(next.error).toMatch(/SELL_PENDING_VERIFICATION/);
+      expect(submit).toHaveBeenCalledTimes(1);
+    });
+
+    it('an unreadable block height keeps the hold', async () => {
+      await unconfirmedSell();
+      (coordinator as any).connection.getBlockHeight = vi.fn(async () => { throw new Error('fetch failed'); });
+      const next = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(next.error).toMatch(/SELL_PENDING_VERIFICATION/);
+      expect(submit).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('N3: a partial sell that landed leaves the wallet balance as the remaining quantity', async () => {
     (TradeReconciler.reconcileSellTransaction as any).mockResolvedValue({ success: false, reconciliationState: 'RECONCILIATION_REQUIRED', error: 'fill unreadable' });
     await coordinator.closePosition(posId, 50, 'TAKE_PROFIT_1');

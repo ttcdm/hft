@@ -3188,7 +3188,9 @@ export class ExecutionCoordinator {
           await this.syncRealWalletBalance();
           return { success: true, pnlSol: 0, status: target.status, solMoved: 0 }; // S2: the earlier sell moved the SOL; this call moved none
         }
-        if (Date.now() - pendingSell.ts < PENDING_SELL_WINDOW_MS) {
+        // P2.1: the window is only an upper bound. Once the blockhash has expired and the signature has no status, the sell can never land,
+        // so the next pass (a stop-loss included) may sell at once instead of waiting out the rest of the 100 s.
+        if (Date.now() - pendingSell.ts < PENDING_SELL_WINDOW_MS && !(await this.pendingSellCannotLand(pendingSell))) {
           return { success: false, pnlSol: 0, error: `SELL_PENDING_VERIFICATION: sell ${pendingSell.signature.slice(0, 8)} was sent and is not confirmed or expired yet; not selling again` };
         }
         this.pendingSells.delete(positionId);
@@ -3392,7 +3394,7 @@ export class ExecutionCoordinator {
       });
 
       if (!subRes.success || !subRes.signature) {
-        if (subRes.unconfirmed && subRes.signature) this.pendingSells.set(positionId, { signature: subRes.signature, ts: Date.now() });
+        if (subRes.unconfirmed && subRes.signature) this.pendingSells.set(positionId, { signature: subRes.signature, ts: Date.now(), lastValidBlockHeight: txBuilder.lastValidBlockHeightOf((v0Tx as any)?.message?.recentBlockhash) });
         // S245: a sell the RPC rate-limited past every resend was never accepted: no pending sell (unconfirmed is false), no fee, and not a
         // slippage failure, so it is reported as not sent and the ladder does not widen.
         const rateLimited = /^RPC_RATE_LIMITED/.test(subRes.error || '');
@@ -3659,7 +3661,22 @@ export class ExecutionCoordinator {
     });
   }
 
-  private pendingSells = new Map<string, { signature: string; ts: number }>();
+  private pendingSells = new Map<string, { signature: string; ts: number; lastValidBlockHeight?: number }>();
+
+  /**
+   * P2.1: true only when the pending sell's blockhash has expired (confirmed block height past its lastValidBlockHeight) AND its signature
+   * has no status, history included: it was never processed and can no longer be. Any read that fails, or a sell with no stored height, is false.
+   */
+  private async pendingSellCannotLand(p: { signature: string; lastValidBlockHeight?: number }): Promise<boolean> {
+    if (!(typeof p.lastValidBlockHeight === 'number' && p.lastValidBlockHeight > 0)) return false;
+    try {
+      if ((await this.connection.getBlockHeight('confirmed')) <= p.lastValidBlockHeight) return false;
+      const st = await this.connection.getSignatureStatuses([p.signature], { searchTransactionHistory: true });
+      return Array.isArray(st?.value) && st.value.length === 1 && st.value[0] === null;
+    } catch {
+      return false;
+    }
+  }
 
   // N1: one pass at a time. A pass waits (up to EXIT_SELL_WAIT_MS) for sells that can outlast the 3s timer; an overlapping pass would see the same
   // ACTIVE row and sell it again, or write back its stale copy over a position the first pass already closed.

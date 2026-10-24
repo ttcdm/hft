@@ -307,12 +307,25 @@ async function main() {
     rec('(f) startupReconciliation after kill', r.status !== 'OFFLINE', `${r.status}: ${r.details}`);
     const open = workstationDb.loadPositions().filter((p) => p.mint === mint);
     rec('(f) position recovered', open.length > 0, JSON.stringify(open.map((p) => ({ id: p.id, status: p.status, qty: p.tokenQuantityRaw }))));
+    // S256: sell what was recovered, so the next run's startup wallet scan does not adopt it (run 6's (a) was refused POSITION_ALREADY_OPEN on it)
+    for (const p of open.filter((x) => x.status === 'OPEN' || x.status === 'PARTIALLY_CLOSED')) {
+      const c = await coordinator.closePosition(p.id, 100, 'e2e cleanup after (f)');
+      console.log(`INFO  (f) cleanup: recovered position ${p.id.slice(0, 8)} ${c.success ? 'sold' : `not sold (${safe(c.error ?? 'unknown')})`}`);
+    }
     return finish();
   }
   if (phase === 'crash') {
     await coordinator.executeTrade(await buildBuyRequest());
     rec('crash phase', false, 'process should have been killed after submit');
     return finish();
+  }
+
+  // S256: tokens an earlier run left in this wallet are adopted at startup as RECOVERED positions; one on the harness mint would make (a)
+  // POSITION_ALREADY_OPEN. Sell it first (it is the harness wallet's own leftover, not part of this run's checks).
+  for (const p of workstationDb.loadPositions(undefined, 'ACTIVE').filter((x) => x.mint === mint && x.executionMode === 'LIVE')) {
+    const c = await coordinator.closePosition(p.id, 100, 'e2e leftover from an earlier run');
+    console.log(`INFO  leftover position ${p.id.slice(0, 8)} on the harness mint ${c.success ? 'sold before (a)' : `not sold (${safe(c.error ?? 'unknown')})`}`);
+    await sleep(31_000); // the per-mint cooldown that sell started
   }
 
   // (a) BUY through the RPC transport

@@ -21,6 +21,7 @@ Optional env:
   real-money environment variable on, inside its own process (it is never set in your shell or in any file).
 - The keypair is a throwaway generated in the temp directory. The repo keypair is never used. If the address cannot be
   funded the harness prints the address, runs only the simulate stage, and exits 1 (UNFUNDED).
+- Every throwaway wallet steps (i) and (k) create (creators, buyers, the curve-cap pusher) is written to `<scratch>/temp-wallets/<pubkey>.json` (mode 600, never overwritten) before any SOL is sent to it, and the harness never deletes it. If a refund fails, `solana transfer --keypair <scratch>/temp-wallets/<pubkey>.json <throwaway> ALL --url devnet` gets the SOL back.
 - Faucet: no airdrop by default and never a retry loop. `DEVNET_AIRDROP_ONCE=1` sends exactly one request for an empty wallet.
   Trade size scales to the balance (about 8% of it, max 0.01 SOL, because of the 10% spendable ceiling); below 0.03 SOL it does not trade.
 

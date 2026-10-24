@@ -342,6 +342,7 @@ export interface DumpMarket {
  * builder (passed in, so this file still imports nothing from server/). Used by (h)'s DumpMarket and by (i).
  */
 export interface ChainKit {
+  /** A fresh throwaway keypair, written to `<keyDir>/<pubkey>.json` (0600, never overwritten) before it is returned, so before any SOL reaches it. The file is never deleted by the harness. */
   newWallet(): any;
   transfer(from: any, to: any, sol: number): Promise<string>;
   /** create_v2 by `creator` (who also pays), no dev buy. */
@@ -357,7 +358,7 @@ export interface ChainKit {
   refund(kp: any, to: any): Promise<void>;
 }
 
-export function makeChainKit(d: { conn: any; web3: any; sdk: any; curve: any; builder: any }): ChainKit {
+export function makeChainKit(d: { conn: any; web3: any; sdk: any; curve: any; builder: any; keyDir: string }): ChainKit {
   const { Keypair, PublicKey, SystemProgram, Transaction, ComputeBudgetProgram, LAMPORTS_PER_SOL } = d.web3;
   const send = async (tx: any, signers: any[]) => {
     tx.recentBlockhash = (await d.conn.getLatestBlockhash('confirmed')).blockhash;
@@ -395,7 +396,12 @@ export function makeChainKit(d: { conn: any; web3: any; sdk: any; curve: any; bu
     return BigInt((await d.conn.getTokenAccountBalance(a.value[0].pubkey)).value.amount);
   };
   return {
-    newWallet: () => Keypair.generate(),
+    newWallet: () => {
+      const kp = Keypair.generate();
+      fs.mkdirSync(d.keyDir, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(d.keyDir, `${kp.publicKey.toBase58()}.json`), JSON.stringify(Array.from(kp.secretKey)), { flag: 'wx', mode: 0o600 });
+      return kp;
+    },
     transfer: (from, to, sol) => send(new Transaction().add(SystemProgram.transfer({ fromPubkey: from.publicKey, toPubkey: to, lamports: Math.ceil(sol * LAMPORTS_PER_SOL) })), [from]),
     async create(creator, symbol, name) {
       const mintKp = Keypair.generate();
@@ -478,7 +484,7 @@ export function dumpSeedPlan(
 export function makeDumpMarket(d: {
   conn: any; payer: any; web3: any; sdk: any; curve: any; builder: any; keyPath: string;
 }): DumpMarket {
-  const kit = makeChainKit(d);
+  const kit = makeChainKit({ ...d, keyDir: path.join(path.dirname(d.keyPath), 'temp-wallets') });
   const coinsPath = d.keyPath.replace(/\.json$/, '') + '-coins.json';
   let w2: any;
   if (fs.existsSync(d.keyPath)) {

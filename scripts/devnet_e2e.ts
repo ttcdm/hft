@@ -24,6 +24,8 @@ const DEFAULT_MINTS = [
 const phase = process.argv.includes('--phase=crash') ? 'crash' : process.argv.includes('--phase=recover') ? 'recover' : 'main';
 const scratch = process.env.APEX_E2E_SCRATCH || fs.mkdtempSync(path.join(os.tmpdir(), 'apex-e2e-'));
 const keyPath = path.join(scratch, 'throwaway-keypair.json');
+// Every throwaway wallet steps (i) and (k) create is written here before it is funded, and left here (Mike, 2026-10-24).
+const tempWalletDir = path.join(scratch, 'temp-wallets');
 
 // ---- sanitized environment: must be set before any server module is imported ----
 process.env.SOLANA_RPC_URL = process.env.DEVNET_RPC_URL || 'https://api.devnet.solana.com';
@@ -400,7 +402,7 @@ async function main() {
     const subscribed = await pumpFeedListener.start();
     rec('(i) creator cluster: the pump log stream subscribed', subscribed, subscribed ? 'onLogs on the coordinator connection' : 'pumpFeedListener.start() returned false');
     if (subscribed) {
-      const kit = S.makeChainKit({ conn, web3, sdk: PUMP_SDK, curve: PumpCurveService, builder: txBuilder });
+      const kit = S.makeChainKit({ conn, web3, sdk: PUMP_SDK, curve: PumpCurveService, builder: txBuilder, keyDir: tempWalletDir });
       await S.creatorClusterOnChain(steps, kit, { snapshot: () => watchWindow.getSnapshot() }, kp);
     }
     watchWindow.stop();
@@ -466,7 +468,7 @@ async function releaseGatesStep(steps: import('./devnet_e2e_steps').HarnessSteps
   const subscribed = await pumpFeedListener.start();
   steps.rec('(k) release gates: the pump log stream subscribed', subscribed, subscribed ? 'onLogs on the coordinator connection' : 'pumpFeedListener.start() returned false');
   if (subscribed) {
-    const kit = S.makeChainKit({ conn: d.conn, web3: d.web3, sdk: PUMP_SDK, curve: d.PumpCurveService, builder: d.txBuilder });
+    const kit = S.makeChainKit({ conn: d.conn, web3: d.web3, sdk: PUMP_SDK, curve: d.PumpCurveService, builder: d.txBuilder, keyDir: tempWalletDir });
     const curveState = (m: string) => d.PumpCurveService.fetchPumpMarketState({ connection: d.conn, mint: new d.web3.PublicKey(m), executionMode: 'LIVE' });
     await S.releaseGatesOnChain(steps, kit, { snapshot: () => watchWindow.getSnapshot() }, d.kp, {
       decisions: (mint) => d.workstationDb.loadDecisions({ mint }),

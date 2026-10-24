@@ -1785,7 +1785,14 @@ export class ExecutionCoordinator {
 
       // S245: a rate-limited send was refused, not lost: a SELL is resent (same signed bytes) after short waits; a BUY is not.
       const rpcSubmit = await traced('tx.submit', () => this.rpcTransport.submitThroughRateLimit(tx, side === 'SELL' ? SELL_RATE_LIMIT_BACKOFF_MS : []), { 'apex.transport': 'SOLANA_RPC', 'apex.side': side });
-      if (rpcSubmit.rateLimited) {
+      // Review 2026-10-24 (HIGH, on S245): a rate limit proves only that THIS send was refused. When the same signed transaction already went
+      // to a block engine (a Jito attempt above), that copy may still land, so the refusal is treated as an unknown outcome and watched.
+      const sentElsewhere = !!(lastSignature || lastBundleId);
+      if (rpcSubmit.rateLimited && sentElsewhere) {
+        rpcSubmit.ambiguous = true;
+        Logger.warn(`[S261] ${side} for order ${orderId}: the RPC rate-limited the fallback send, but the transaction already went to the block engine; watching it`);
+      }
+      if (rpcSubmit.rateLimited && !sentElsewhere) {
         // Nothing was accepted (isRateLimitedSendError): SUBMIT_FAILED, so the PENDING row becomes REVERTED, a buy leaves no unresolved
         // row for the mint and a sell leaves no pending sell; the next exit pass (or panic) may send again.
         Logger.error(`[S245] ${side} for order ${orderId}: the RPC rate-limited the send ${rpcSubmit.rateLimitedResends + 1} time(s); nothing was accepted`);

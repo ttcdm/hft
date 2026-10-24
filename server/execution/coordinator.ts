@@ -3188,6 +3188,17 @@ export class ExecutionCoordinator {
         const onChain = read.held;
         if (onChain !== null && onChain < totalTokensRaw) {
           this.pendingSells.delete(positionId);
+          // P2.3 (R1-21, R1-22, R1-86): the earlier sell landed. Read its transaction and book the chain's numbers (proceeds, PnL, the row
+          // RECONCILED) instead of 0, so the daily loss, the realized events and the DEVNET_LIVE wallet audit see the SOL it moved.
+          // Only when the transaction cannot be read does it fall back to matching the wallet with no PnL, as before.
+          const adoptedTp = target.baseTokenProgram ? new PublicKey(target.baseTokenProgram) : TOKEN_PROGRAM_ID;
+          const adopted = await TradeReconciler.reconcileSellTransaction(
+            this.connection, pendingSell.signature, seller, mintPubkey, adoptedTp,
+            { walletSolLamports: 0, tokenBalanceRaw: totalTokensRaw.toString(), tokenDecimals: target.tokenDecimals ?? 6, timestamp: Date.now() },
+            target.costBasisLamports, Number(totalTokensRaw - onChain) / Number(totalTokensRaw), 0
+          ).catch(() => null);
+          const booked = !!adopted?.success && BigInt(adopted.actualTokensSoldRaw) > 0n;
+          if (booked) target.realizedPnLSol = (target.realizedPnLSol ?? 0) + Number(adopted!.actualRealizedPnLSol.toFixed(6));
           target.exitReason = reason;
           target.exitTxSignature = pendingSell.signature;
           target.lastUpdatedTimestamp = Date.now();
@@ -3201,9 +3212,18 @@ export class ExecutionCoordinator {
             target.tokenQuantityRaw = onChain.toString();
           }
           workstationDb.savePosition(target);
-          this.raiseOperatorAlert('SELL_ADOPTED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed but its fill could not be read. The position now matches the wallet; realized PnL for it was not recorded.`, positionId);
+          if (booked) {
+            workstationDb.markTransactionReconciled(pendingSell.signature, { slot: adopted!.slot, networkFeeLamports: adopted!.actualNetworkFeeLamports });
+            this.raiseOperatorAlert('SELL_ADOPTED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed after its confirmation was missed. Its fill was read from the chain and booked (PnL ${adopted!.actualRealizedPnLSol.toFixed(6)} SOL); the position now matches the wallet.`, positionId);
+          } else {
+            this.raiseOperatorAlert('SELL_ADOPTED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed but its fill could not be read. The position now matches the wallet; realized PnL for it was not recorded.`, positionId);
+          }
           await this.syncRealWalletBalance();
-          return { success: true, pnlSol: 0, status: target.status, solMoved: 0 }; // S2: the earlier sell moved the SOL; this call moved none
+          // S2: with no readable fill this call moved nothing it can account for. P2.3: with one, it reports the earlier sell's net proceeds,
+          // which reached the wallet unjournaled, so the wallet audit can explain them.
+          return booked
+            ? { success: true, pnlSol: adopted!.actualRealizedPnLSol, status: target.status, solMoved: adopted!.actualNetSolProceedsLamports / 1e9 }
+            : { success: true, pnlSol: 0, status: target.status, solMoved: 0 };
         }
         // P2.1: the window is only an upper bound. Once the blockhash has expired and the signature has no status, the sell can never land,
         // so the next pass (a stop-loss included) may sell at once instead of waiting out the rest of the 100 s.

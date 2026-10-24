@@ -222,6 +222,29 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
     });
   });
 
+  it('S258 (P2.3): an adopted sell whose transaction is readable books its proceeds and PnL, and its row is RECONCILED', async () => {
+    const recon = TradeReconciler.reconcileSellTransaction as any;
+    recon.mockResolvedValueOnce({ success: false, reconciliationState: 'RECONCILIATION_REQUIRED', error: 'fill unreadable' });
+    workstationDb.saveTransaction({
+      signature: 'sellsig', orderId: `ord-exit-${uid()}`, correlationId: 'exit-s258', mint: VALID_PUMP_MINT_1.toBase58(), direction: 'SELL',
+      submissionTransport: 'SOLANA_RPC', submissionTime: Date.now(), reconciliationState: 'RECONCILIATION_REQUIRED', networkFeeLamports: 5000, jitoTipLamports: 0, executionMode: 'LIVE',
+    });
+    const before = workstationDb.loadPositions().find((p) => p.id === posId)!.realizedPnLSol ?? 0;
+    const first = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+    expect(first.success).toBe(false);
+    // the wallet is empty: the first sell landed; now its transaction reads (the beforeEach answer: 1e9 sold, net 0.049 SOL, PnL -0.05)
+    (coordinator as any).connection.getTokenAccountBalance = vi.fn(async () => ({ value: { amount: '0' } }));
+    const adopted = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+    expect(adopted).toMatchObject({ success: true, pnlSol: -0.05, solMoved: 0.049 });
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(recon.mock.calls.at(-1)[1]).toBe('sellsig');
+    const row = workstationDb.loadPositions().find((p) => p.id === posId)!;
+    expect(row.status).toBe('CLOSED');
+    expect(row.realizedPnLSol).toBeCloseTo(before - 0.05, 9);
+    expect(workstationDb.loadTransactions().find((t) => t.signature === 'sellsig')?.reconciliationState).toBe('RECONCILED');
+    expect(coordinator.getOperatorAlerts().find((a) => a.code === 'SELL_ADOPTED' && a.positionId === posId)?.message).toMatch(/booked \(PnL -0\.050000 SOL\)/);
+  });
+
   it('N3: a partial sell that landed leaves the wallet balance as the remaining quantity', async () => {
     (TradeReconciler.reconcileSellTransaction as any).mockResolvedValue({ success: false, reconciliationState: 'RECONCILIATION_REQUIRED', error: 'fill unreadable' });
     await coordinator.closePosition(posId, 50, 'TAKE_PROFIT_1');

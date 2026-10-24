@@ -43,7 +43,7 @@ describe('S255: the database is stamped with its cluster', () => {
     expect(mem.checkClusterStamp(MAINNET)).toEqual({ ok: true, stamped: false });
   });
 
-  it('a refused stamp fails the coordinator's cluster check with DB_CLUSTER_MISMATCH', async () => {
+  it('a refused stamp fails the cluster check of the coordinator with DB_CLUSTER_MISMATCH', async () => {
     vi.spyOn(workstationDb, 'checkClusterStamp').mockReturnValue({ ok: false, stored: DEVNET });
     const c = new ExecutionCoordinator(new MockSolanaRpc().createConnection());
     expect(await (c as any).verifyCluster()).toBe(false);

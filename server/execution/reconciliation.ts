@@ -148,7 +148,13 @@ export class TradeReconciler {
         tokenDecimals = tokenBalRes.value.decimals;
       }
     } catch (e: any) {
-      // ATA likely does not exist yet (common for fresh buys) -> 0 balance
+      // The ATA does not exist yet (common for fresh buys): a balance of 0. P2.3 (R1-88, R1-138, N-26): any other error (a 429, a timeout)
+      // says nothing about the balance. In LIVE (the buy path) it throws: a 0 taken for a wallet that already holds the token would make the
+      // landed check read the old balance as this buy's fill. A sell (called without 'LIVE') keeps 0, so a stop-loss is never blocked on it;
+      // its fill comes from the transaction's own token balances, and a 0 baseline can only make its landed check say "not landed".
+      if (executionMode === 'LIVE' && !/could not find account|Invalid param/i.test(String(e?.message ?? e))) {
+        throw new Error(`PRE_TRADE_SNAPSHOT_FAILED: Cannot read the token balance in LIVE mode: ${e?.message ?? e}`, { cause: e });
+      }
       tokenBalanceRaw = '0';
     }
 

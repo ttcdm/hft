@@ -41,6 +41,8 @@ export interface PersistedTransaction {
   jitoTipLamports: number;
   executionMode: ExecutionMode;
   error?: string;
+  /** P2.1: the last block height at which this transaction's blockhash is valid. Past it, a signature with no status never landed. */
+  lastValidBlockHeight?: number;
 }
 
 export class WorkstationDatabase {
@@ -245,6 +247,7 @@ export class WorkstationDatabase {
     this.ensureColumn('transactions', 'confirmation_time', 'INTEGER');
     this.ensureColumn('transactions', 'reconciliation_state', "TEXT NOT NULL DEFAULT 'PENDING'");
     this.ensureColumn('transactions', 'error', 'TEXT');
+    this.ensureColumn('transactions', 'last_valid_block_height', 'INTEGER');
 
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
@@ -468,8 +471,8 @@ export class WorkstationDatabase {
         INSERT INTO transactions (
           signature, bundle_id, order_id, correlation_id, mint, direction,
           submission_transport, submission_time, landing_slot, confirmation_time,
-          reconciliation_state, network_fee_lamports, jito_tip_lamports, execution_mode, error
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          reconciliation_state, network_fee_lamports, jito_tip_lamports, execution_mode, error, last_valid_block_height
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(signature) DO UPDATE SET
           submission_transport = excluded.submission_transport,
           bundle_id = excluded.bundle_id,
@@ -478,7 +481,8 @@ export class WorkstationDatabase {
           reconciliation_state = excluded.reconciliation_state,
           network_fee_lamports = excluded.network_fee_lamports,
           jito_tip_lamports = excluded.jito_tip_lamports,
-          error = excluded.error
+          error = excluded.error,
+          last_valid_block_height = COALESCE(excluded.last_valid_block_height, transactions.last_valid_block_height)
       `);
       stmt.run(
         tx.signature,
@@ -495,7 +499,8 @@ export class WorkstationDatabase {
         tx.networkFeeLamports,
         tx.jitoTipLamports,
         tx.executionMode,
-        tx.error || null
+        tx.error || null,
+        tx.lastValidBlockHeight ?? null
       );
       return true;
     } catch (err: any) {
@@ -728,6 +733,7 @@ export class WorkstationDatabase {
       jitoTipLamports: r.jito_tip_lamports,
       executionMode: r.execution_mode as ExecutionMode,
       error: r.error || undefined,
+      lastValidBlockHeight: r.last_valid_block_height ?? undefined,
     }));
   }
 

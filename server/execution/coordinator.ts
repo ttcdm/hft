@@ -1054,9 +1054,10 @@ export class ExecutionCoordinator {
           t.reconciliationState = 'REVERTED';
           t.error = recovery.error;
           workstationDb.saveTransaction(t);
-        } else if (recovery.error && /not found on-chain/i.test(recovery.error) && Date.now() - t.submissionTime > ORPHAN_MAX_AGE_MS) {
-          // N6: a transaction that is still not on chain long after its blockhash expired never landed. Any tokens it did buy would be
-          // found by the wallet scan; leaving the row open would hold readiness at MISMATCH forever.
+        } else if (recovery.error && /not found on-chain/i.test(recovery.error) && (await this.blockhashExpired(t) || Date.now() - t.submissionTime > ORPHAN_MAX_AGE_MS)) {
+          // N6: a transaction that is still not on chain after its blockhash expired never landed. Any tokens it did buy would be
+          // found by the wallet scan; leaving the row open would hold readiness at MISMATCH, and block buys of the mint, until a restart.
+          // P2.1: decided by the chain's block height against the row's lastValidBlockHeight; the 15-minute age is only for rows without one.
           t.reconciliationState = 'TIMED_OUT';
           t.error = 'never landed: not found on chain after the blockhash window';
           workstationDb.saveTransaction(t);
@@ -1149,6 +1150,19 @@ export class ExecutionCoordinator {
       }
     }
     return { untracked, adopted };
+  }
+
+  /**
+   * P2.1: true when the chain's `confirmed` block height is past the row's lastValidBlockHeight, so the transaction can no longer land.
+   * False when the row has no height or the height cannot be read (the caller then falls back to the wall-clock rule).
+   */
+  private async blockhashExpired(t: PersistedTransaction): Promise<boolean> {
+    if (!(typeof t.lastValidBlockHeight === 'number' && t.lastValidBlockHeight > 0)) return false;
+    try {
+      return (await this.connection.getBlockHeight('confirmed')) > t.lastValidBlockHeight;
+    } catch {
+      return false;
+    }
   }
 
   /** Delays (ms) at which a failed live-buy reconciliation is retried in the background. Tests set [] . */
@@ -1487,6 +1501,8 @@ export class ExecutionCoordinator {
         networkFeeLamports: 5000,
         jitoTipLamports: params.jitoTipLamports,
         executionMode: 'LIVE',
+        // P2.1: past this height a signature with no status never landed; orphan recovery resolves the row on it instead of on wall-clock age.
+        lastValidBlockHeight: txBuilder.lastValidBlockHeightOf((params.tx as any)?.message?.recentBlockhash),
       };
       if (params.side === 'BUY') {
         // P1.1 (N-57): the check for another unresolved buy of this mint and this row are one database transaction, so a second process

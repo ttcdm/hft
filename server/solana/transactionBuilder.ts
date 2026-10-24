@@ -78,6 +78,8 @@ export interface PumpSellParams {
 export class SolanaTransactionBuilder {
   private cachedBlockhash: { blockhash: string; lastValidBlockHeight: number; timestamp: number } | null = null;
   private readonly BLOCKHASH_MAX_AGE_MS = 25000; // 25s for fast Solana slot time
+  /** P2.1: lastValidBlockHeight of each blockhash fetched recently, so the coordinator can store it on the PENDING row of a transaction built with it. */
+  private validUntil = new Map<string, number>();
 
   /** Derives an associated token account address for any token program. Production code uses `PumpCurveService.getAssociatedTokenAddress` instead; only tests call this one. */
   public static getAssociatedTokenAddress(
@@ -109,7 +111,14 @@ export class SolanaTransactionBuilder {
 
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
     this.cachedBlockhash = { blockhash, lastValidBlockHeight, timestamp: now };
+    this.validUntil.set(blockhash, lastValidBlockHeight);
+    if (this.validUntil.size > 256) this.validUntil.delete(this.validUntil.keys().next().value as string); // oldest first
     return blockhash;
+  }
+
+  /** P2.1: the lastValidBlockHeight `getLatestBlockhash` returned with `blockhash`, if this builder fetched it; undefined otherwise. */
+  public lastValidBlockHeightOf(blockhash: string | undefined): number | undefined {
+    return blockhash ? this.validUntil.get(blockhash) : undefined;
   }
 
   /** Associated-token-account CreateIdempotent: succeeds whether or not the account exists, so a repeat buy never fails on it. The payer funds the rent on first creation. */

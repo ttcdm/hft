@@ -39,9 +39,18 @@ const toBig = (v: unknown): bigint | null => {
 /** Progress (0..100) of an on-chain curve state as the coordinator reads it (reserves in lamports / raw token units). Null when the state carries no readable reserves. */
 export function curveProgressPctOfState(state: { realSolReserves?: unknown; realTokenReserves?: unknown }): number | null {
   const tok = toBig(state.realTokenReserves);
+  // S266 (review 2026-10-24, finding 8): progress is the token share only. With the token reserves unreadable this used to fall back to
+  // SOL/85 (about 28% at a real 60%), a figure that looked measured but was wrong. Now it is unknown (null). The cap still lets an unknown
+  // progress through, as before; refusing a LIVE buy on it (curveProgressUnreadable) is not wired in yet, since test fixtures carry states
+  // with SOL reserves only and the change needs them updated first.
+  if (tok === null) return null;
   const sol = toBig(state.realSolReserves);
-  if (tok === null && sol === null) return null;
   return curveProgressOf({ realSolReserves: sol === null ? 0 : Number(sol) / 1e9, realTokenReserves: tok });
+}
+
+/** S266: a bonding-curve state whose SOL reserves read but whose token reserves do not: its progress cannot be known. */
+export function curveProgressUnreadable(state: { realSolReserves?: unknown; realTokenReserves?: unknown }): boolean {
+  return toBig(state.realTokenReserves) === null && toBig(state.realSolReserves) !== null;
 }
 
 /** True when a known progress is above the cap in force. */

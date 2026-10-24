@@ -54,7 +54,9 @@ export class WorkstationDatabase {
     this.db = new DatabaseSync(this.dbPath);
     this.db.exec('PRAGMA busy_timeout = 10000;');
     this.db.exec('PRAGMA journal_mode = WAL;');
-    this.db.exec('PRAGMA synchronous = NORMAL;');
+    // P2.2 (R1-96): FULL, not NORMAL. Under WAL, NORMAL can lose the last commits on an OS crash or power loss, and the last commit before a
+    // broadcast is the PENDING row that lets startup recovery find a transaction that was sent.
+    this.db.exec('PRAGMA synchronous = FULL;');
     this.initSchema();
   }
 

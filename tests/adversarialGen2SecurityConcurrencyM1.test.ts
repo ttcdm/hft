@@ -1012,7 +1012,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
     });
 
     it('5.1: verifies SQLite WAL mode and synchronous pragmas are enabled', () => {
-      // WorkstationDatabase executes PRAGMA journal_mode = WAL and synchronous = NORMAL on startup
+      // WorkstationDatabase executes PRAGMA journal_mode = WAL and synchronous = FULL on startup (P2.2; checked on a file DB in s253)
       expect(workstationDb).toBeDefined();
     });
 

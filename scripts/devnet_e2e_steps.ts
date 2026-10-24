@@ -687,9 +687,10 @@ export async function creatorClusterOnChain(s: HarnessSteps, kit: ChainKit, feed
   } finally {
     for (const w of [W, ...five]) {
       for (const c of coins) { try { await kit.sellAll(w, c); } catch { /* nothing held or curve moved; the refund below still runs */ } }
-      try { await kit.refund(w, payer.publicKey); } catch (e: any) { console.log(`INFO  (i) refund failed: ${String(e?.message ?? e).slice(0, 120)}`); }
+      // S263 (review 2026-10-24, finding 9): a refund that fails is a FAIL line, so a run cannot pass with SOL stranded; the key is in temp-wallets/
+      try { await kit.refund(w, payer.publicKey); } catch (e: any) { s.rec(`${L}: refund ${w.publicKey.toBase58()}`, false, `${String(e?.message ?? e).slice(0, 120)}; key in <scratch>/temp-wallets/`); }
     }
-    try { await kit.refund(creator, payer.publicKey); } catch (e: any) { console.log(`INFO  (i) creator refund failed: ${String(e?.message ?? e).slice(0, 120)}`); }
+    try { await kit.refund(creator, payer.publicKey); } catch (e: any) { s.rec(`${L}: refund creator ${creator.publicKey.toBase58()}`, false, `${String(e?.message ?? e).slice(0, 120)}; key in <scratch>/temp-wallets/`); }
   }
 }
 
@@ -979,9 +980,11 @@ export async function releaseGatesOnChain(
     if (prevAuto === undefined) delete process.env.AUTO_SNIPE_ENABLED; else process.env.AUTO_SNIPE_ENABLED = prevAuto;
     for (const w of wallets) {
       for (const c of coins) { try { await kit.sellAll(w, c); } catch { /* nothing held; the refund below still runs */ } }
-      try { await kit.refund(w, payer.publicKey); } catch (e: any) { console.log(`INFO  (k) refund failed: ${String(e?.message ?? e).slice(0, 120)}`); }
+      try { await kit.refund(w, payer.publicKey); } catch (e: any) { s.rec(`${L}: refund ${w.publicKey.toBase58()}`, false, `${String(e?.message ?? e).slice(0, 120)}; key in <scratch>/temp-wallets/`); }
     }
-    if (wasArmed) st.arm(true, ARM);
+    // S263 (review 2026-10-24, finding 4): the curve-cap check re-arms LIVE; a throw there skipped its disarm, and this only re-armed. Put
+    // LIVE back exactly as it was before the step.
+    if (wasArmed) st.arm(true, ARM); else st.arm(false);
   }
 }
 

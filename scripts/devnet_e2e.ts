@@ -355,7 +355,10 @@ async function main() {
   const steps: import('./devnet_e2e_steps').HarnessSteps = {
     coordinator, curve: PumpCurveService, db: workstationDb as any, riskLimits: () => riskEngine.getLimits(), mint: mint!,
     chainErr: (sig) => readChainErr(conn, sig),
-    buildBuyRequest, rec, link: solscan, sleep, connection: coordinator.getConnection() as any, rpcUrl: process.env.SOLANA_RPC_URL!,
+    buildBuyRequest, rec, link: solscan, sleep, rpcUrl: process.env.SOLANA_RPC_URL!,
+    // S257: read when a step runs, not once here. (g) points the coordinator at a proxy and back, which gives it a new Connection; (h) then
+    // wrapped the old one, and the app's price read never reached the wrapper (runs 6 and 7: "no read of the curve in 10 s").
+    get connection() { return coordinator.getConnection() as any; },
     stop: {
       telegram: (await import('../server/socialScanner')).socialScanner,
       emergencyStop: (await import('../server/execution/emergencyStop')).emergencyStop,

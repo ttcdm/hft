@@ -1526,7 +1526,9 @@ export class ExecutionCoordinator {
       // Definitely not landing (never sent, rejected, or seen failing): do not leave a PENDING row to block readiness.
       const rows = workstationDb.loadTransactions(params.orderId).filter((t) => t.signature === preSignature);
       if (rows.some((t) => t.reconciliationState === 'PENDING')) {
-        workstationDb.saveTransaction({ ...rows[0], reconciliationState: 'REVERTED', error: res.error ?? 'not sent or rejected' });
+        // P2.1: a transaction whose blockhash expired unseen did not fail on chain; it never landed (TIMED_OUT, as orphan recovery writes it).
+        const neverLanded = /^BLOCKHASH_EXPIRED/.test(res.error ?? '');
+        workstationDb.saveTransaction({ ...rows[0], reconciliationState: neverLanded ? 'TIMED_OUT' : 'REVERTED', error: res.error ?? 'not sent or rejected' });
       }
     }
     return res;
@@ -1821,7 +1823,11 @@ export class ExecutionCoordinator {
         executionMode: 'LIVE',
       });
 
-      const rpcConfirm = await traced('tx.confirm', () => this.rpcTransport.confirm(rpcSubmit.signature, cfg.rpcFallbackTimeoutMs || 15000), { 'apex.transport': 'SOLANA_RPC', 'apex.side': side });
+      // P2.1: the same signed bytes are resent while the transaction is watched, and the watch runs until the blockhash expires (not a fixed 15 s).
+      const rpcConfirm = await traced('tx.confirm', () => this.rpcTransport.confirm(rpcSubmit.signature, cfg.rpcFallbackTimeoutMs || 15000, undefined, {
+        rebroadcast: tx,
+        lastValidBlockHeight: txBuilder.lastValidBlockHeightOf((tx as any)?.message?.recentBlockhash),
+      }), { 'apex.transport': 'SOLANA_RPC', 'apex.side': side });
       if (rpcConfirm.confirmed) {
         return {
           success: true,
@@ -1840,6 +1846,12 @@ export class ExecutionCoordinator {
             slot: postRpcCheck.slot,
             lifecycleState: 'CONFIRMED',
           };
+        }
+        // P2.1: expired with no status and not landed by the balance check either: a definite "never landed", like the Jito path's
+        // BLOCKHASH_EXPIRED. Not unconfirmed, so a buy leaves no unresolved row for the mint and a sell leaves no pending sell.
+        if (rpcConfirm.lifecycleState === 'EXPIRED_BLOCKHASH') {
+          workstationDb.logJournal('SEND_EXPIRED_UNLANDED', correlationId, 'LIVE', { orderId, side, mint, signature: rpcSubmit.signature });
+          return { success: false, signature: rpcSubmit.signature, transport: 'SOLANA_RPC', error: rpcConfirm.error, lifecycleState: 'SUBMIT_FAILED' };
         }
         return {
           success: false,

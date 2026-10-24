@@ -22,8 +22,9 @@ import { executionConfig } from './executionConfig';
 import { assertNotReadOnly } from './readOnly';
 
 /**
- * Where a submission stands. `SUBMITTED_TO_JITO` and `BUNDLE_PENDING` only occur on the Jito path. `BUNDLE_LANDED`, `TX_RECONCILED` and
- * `EXPIRED_BLOCKHASH` are declared but nothing assigns them (checked by searching `server/`).
+ * Where a submission stands. `SUBMITTED_TO_JITO` and `BUNDLE_PENDING` only occur on the Jito path. `EXPIRED_BLOCKHASH` is what
+ * `SolanaRpcTransport.confirm` returns when the blockhash expired with no status (P2.1). `BUNDLE_LANDED` and `TX_RECONCILED` are declared
+ * but nothing assigns them (checked by searching `server/`).
  */
 export type BundleLifecycleState =
   | 'SUBMITTED_TO_JITO'
@@ -91,6 +92,12 @@ export const sendBackoff = {
   sleep: (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)),
 };
 
+/** P2.1: the clock `SolanaRpcTransport.confirm` reads. Tests replace both with a virtual clock (sleep advances now), so no test waits for real. */
+export const confirmPacing = {
+  now: (): number => Date.now(),
+  sleep: (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
 /** What one submit attempt returned: the signature, which transport, timing and, on failure, the reason. */
 export interface SubmitResult {
   /** P1.5: the transaction's own signature whenever it was signed, also when the send failed (it is known before anything is sent). */
@@ -149,7 +156,7 @@ export class SolanaRpcTransport implements ExecutionTransport {
   constructor(private connection: Connection) {}
 
   /** Sends one signed transaction with `sendRawTransaction`, `skipPreflight: true`. Throws `READ_ONLY` before touching the network in read-only mode. */
-  public async submit(tx: VersionedTransaction): Promise<SubmitResult> {
+  public async submit(tx: VersionedTransaction, opts: { maxRetries?: number } = {}): Promise<SubmitResult> {
     assertNotReadOnly('sending a transaction over RPC'); // S185: before anything is serialized or sent
     assertSendClusterAllowed(); // S206: the lowest choke point; a mainnet setting never reaches the network from here
     const t0 = performance.now();
@@ -157,7 +164,7 @@ export class SolanaRpcTransport implements ExecutionTransport {
       const raw = tx.serialize();
       const signature = await this.connection.sendRawTransaction(raw, {
         skipPreflight: true,
-        maxRetries: 2,
+        maxRetries: opts.maxRetries ?? 2,
         preflightCommitment: 'processed',
       });
       const duration = Math.round(performance.now() - t0);
@@ -238,74 +245,89 @@ export class SolanaRpcTransport implements ExecutionTransport {
     return { ...lastResult, attempts };
   }
 
-  /** Polls signature status (including history) until confirmed, failed on chain or `maxWaitMs` (default 25 s). */
-  public async confirm(signature: string, maxWaitMs = 25000): Promise<ConfirmationResult> {
+  /**
+   * Polls the signature's status until it is confirmed, fails on chain, or the wait ends.
+   * P2.1 (R1-20, R1-69, R1-77): with `opts.rebroadcast` (the signed transaction) the same transaction is resent through `submit` every `resendEveryMs` (default 1.5 s)
+   * with `maxRetries: 0`. It has the same signature, so it can land at most once. With `opts.lastValidBlockHeight` the wait does not stop at
+   * `maxWaitMs` while the blockhash is still valid. It goes on until the confirmed block height passes that height, capped at
+   * `maxWaitMs + maxExtendMs` (default 60 s more). Past the height, with no status even in history, the result is `EXPIRED_BLOCKHASH`:
+   * the transaction never landed and never can. A failed status read or resend only skips that round. No `getTransaction` is made.
+   */
+  public async confirm(
+    signature: string,
+    maxWaitMs = 25000,
+    _bundleId?: string,
+    opts: { rebroadcast?: VersionedTransaction; lastValidBlockHeight?: number; resendEveryMs?: number; maxExtendMs?: number } = {}
+  ): Promise<ConfirmationResult> {
     const t0 = performance.now();
-    const startTime = Date.now();
-
-    try {
-      // Loop with bounded timeout rather than ignoring maxWaitMs
-      let lastPollError: string | null = null;
-      while (Date.now() - startTime < maxWaitMs) {
-        let statuses: Awaited<ReturnType<Connection['getSignatureStatuses']>> | null = null;
-        try {
-          statuses = await this.connection.getSignatureStatuses([signature], {
-            searchTransactionHistory: true,
-          });
-        } catch (pollErr: any) {
-          lastPollError = pollErr?.message ?? String(pollErr); // P1.5: one failed poll says nothing about the transaction; keep polling
-        }
-        const status = statuses?.value?.[0];
-
-        if (status) {
-          if (status.err) {
-            return {
-              signature,
-              confirmed: false,
-              confirmDurationMs: Math.round(performance.now() - t0),
-              lifecycleState: 'REVERTED',
-              error: JSON.stringify(status.err),
-            };
-          }
-
-          if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
-            const txDetails = await this.connection.getTransaction(signature, {
-              maxSupportedTransactionVersion: 0,
-              commitment: 'confirmed',
-            }).catch(() => null); // best effort: confirmed either way
-
-            return {
-              signature,
-              confirmed: true,
-              slot: status.slot || txDetails?.slot,
-              feeLamports: txDetails?.meta?.fee || 5000,
-              confirmDurationMs: Math.round(performance.now() - t0),
-              lifecycleState: 'TX_CONFIRMED',
-            };
-          }
-        }
-
-        // Sleep 400ms before next polling attempt
-        await new Promise((r) => setTimeout(r, 400));
+    const now = confirmPacing.now;
+    const startTime = now();
+    const lvbh = typeof opts.lastValidBlockHeight === 'number' && opts.lastValidBlockHeight > 0 ? opts.lastValidBlockHeight : undefined;
+    const hardStop = startTime + maxWaitMs + (lvbh !== undefined ? (opts.maxExtendMs ?? 60_000) : 0);
+    const resendEveryMs = opts.resendEveryMs ?? 1_500;
+    let lastResend = startTime;
+    let lastPollError: string | null = null;
+    let expired = false;
+    const statusOf = async (history: boolean) => {
+      try {
+        return (await this.connection.getSignatureStatuses([signature], { searchTransactionHistory: history }))?.value?.[0] ?? null;
+      } catch (pollErr: any) {
+        lastPollError = pollErr?.message ?? String(pollErr); // P1.5: one failed poll says nothing about the transaction; keep polling
+        return undefined;
       }
+    };
+    const settled = (status: any): ConfirmationResult | null => {
+      if (!status) return null;
+      if (status.err) {
+        return { signature, confirmed: false, confirmDurationMs: Math.round(performance.now() - t0), lifecycleState: 'REVERTED', error: JSON.stringify(status.err) };
+      }
+      if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
+        return { signature, confirmed: true, slot: status.slot, feeLamports: 5000, confirmDurationMs: Math.round(performance.now() - t0), lifecycleState: 'TX_CONFIRMED' };
+      }
+      return null;
+    };
 
+    for (;;) {
+      const done = settled(await statusOf(false));
+      if (done) return done;
+      const t = now();
+      if (t >= hardStop) break;
+      if (t - startTime >= maxWaitMs) {
+        if (lvbh === undefined) break;
+        try {
+          if ((await this.connection.getBlockHeight('confirmed')) > lvbh) { expired = true; break; }
+        } catch (hErr: any) {
+          lastPollError = hErr?.message ?? String(hErr); // an unreadable height is not expiry: keep watching until the hard stop
+        }
+      }
+      if (opts.rebroadcast && t - lastResend >= resendEveryMs) {
+        lastResend = t;
+        // through submit, so the read-only and cluster guards run on every resend; a failed resend is logged there and only skips this round
+        await this.submit(opts.rebroadcast, { maxRetries: 0 });
+      }
+      await confirmPacing.sleep(400);
+    }
+
+    // One last look with history before saying it did not land.
+    const last = await statusOf(true);
+    const done = settled(last);
+    if (done) return done;
+    if (expired && last === null) {
       return {
         signature,
         confirmed: false,
         confirmDurationMs: Math.round(performance.now() - t0),
-        lifecycleState: 'TIMED_OUT',
-        error: `Transaction did not confirm within ${maxWaitMs}ms limit${lastPollError ? ` (last status read failed: ${lastPollError})` : ''}`,
-      };
-    } catch (err: any) {
-      return {
-        signature,
-        confirmed: false,
-        confirmDurationMs: Math.round(performance.now() - t0),
-        // An RPC exception while polling says nothing about the transaction: it may still land. Not a revert (N2).
-        lifecycleState: 'TIMED_OUT',
-        error: err.message,
+        lifecycleState: 'EXPIRED_BLOCKHASH',
+        error: 'BLOCKHASH_EXPIRED: the transaction did not land and its blockhash is no longer valid; safe to retry with a new transaction',
       };
     }
+    return {
+      signature,
+      confirmed: false,
+      confirmDurationMs: Math.round(performance.now() - t0),
+      lifecycleState: 'TIMED_OUT',
+      error: `Transaction did not confirm within ${Math.round(now() - startTime)}ms${lastPollError ? ` (last status read failed: ${lastPollError})` : ''}`,
+    };
   }
 }
 

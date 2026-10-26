@@ -9,6 +9,7 @@ import { executionConfig } from './solana/executionConfig';
 import { allowedCluster, resolveJitoUrl, resolveRpcUrl } from './solana/clusterGuard';
 import { solPriceService } from './market/solPriceService';
 import { emergencyStop, type EmergencyStopReport } from './execution/emergencyStop';
+import { memecoinAggregator } from './memecoinAggregator';
 
 export interface WalletTraderConfig {
   walletAddress: string;
@@ -129,10 +130,12 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     liquidityUsd?: number;
     signalTimestamp?: number;
   }): Promise<{ success: boolean; positionId?: string; txSignature?: string; error?: string }> {
+    // UI-3: a mint the board already lists keeps the board's symbol and name; only an unknown mint falls back to its prefix
+    const known = memecoinAggregator.getPools().find((p) => p.contractAddress === order.mint);
     const res = await executionCoordinator.executeTrade({
       mint: order.mint,
-      symbol: order.symbol || order.mint.slice(0, 6).toUpperCase(),
-      name: order.name || `Solana Token (${order.mint.slice(0, 4)}...${order.mint.slice(-4)})`,
+      symbol: order.symbol || known?.symbol || order.mint.slice(0, 6).toUpperCase(),
+      name: order.name || known?.name || `Solana Token (${order.mint.slice(0, 4)}...${order.mint.slice(-4)})`,
       amountSol: order.amountSol,
       currentPriceSol: order.currentPriceSol, // No invented fallback price! Coordinator queries on-chain bonding curve
       slippageBps: Math.round((order.slippagePct || 8.0) * 100),

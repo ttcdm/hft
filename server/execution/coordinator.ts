@@ -2619,8 +2619,11 @@ export class ExecutionCoordinator {
 
     // N13: reserve the worst case the transaction can spend, not the nominal order: the buy instruction may pull up to maxInputLamports
     // (the slippage headroom, about 8% over the order) and the first buy of a mint also pays rent for the new token account.
+    // S6: the wallet's first pump buy also pays the (never refunded) rent of its volume accumulator account; later buys do not.
+    // P3.1 (R1-14): read before requiredSol, so the reserve check and the reservation include it too.
+    const accumulatorRentLamports = await this.unrefundedFirstBuyRentLamports();
     const worstCaseOrderSol = Math.max(req.amountSol, Number(quote.maxInputLamports) / 1e9);
-    const requiredSol = worstCaseOrderSol + CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS / 1e9 + (quote.expectedJitoTipLamports + quote.expectedPriorityFeeLamports + 5000) / 1e9;
+    const requiredSol = worstCaseOrderSol + (CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS + accumulatorRentLamports) / 1e9 + (quote.expectedJitoTipLamports + quote.expectedPriorityFeeLamports + 5000) / 1e9;
 
     // Check balance concurrency reservation
     if (rawWalletBalance - this.inFlightReservedSol - requiredSol < 0.015) {
@@ -2635,8 +2638,7 @@ export class ExecutionCoordinator {
 
     // C7b: an entry whose round-trip execution cost (both tips, both base+priority fees, pump fees both sides)
     // exceeds 20% of the order cannot realistically be profitable. The size is never rounded up to make it pass.
-    // S6: the wallet's first pump buy also pays the (never refunded) rent of its volume accumulator account; later buys do not.
-    const accumulatorRentLamports = await this.unrefundedFirstBuyRentLamports();
+    // S6: accumulatorRentLamports (read above) is part of the round trip too.
     const roundTripCostLamports = estimateRoundTripCostLamports({
       buyTipLamports: quote.expectedJitoTipLamports,
       sellTipLamports: resolvedTip.tipLamports,

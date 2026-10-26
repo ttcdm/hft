@@ -245,4 +245,26 @@ describe('3A: per-buy readiness and fail-closed buy checks (real coordinator, LI
     expect(coordinator.getSpendableBankrollSol()).toBe(before);
   });
 
+  it('R1-14: the reservation of a first buy (no volume accumulator yet) holds the accumulator rent on top of a later buy\'s', async () => {
+    vi.spyOn(ExecutionCoordinator.prototype as any, 'unrefundedFirstBuyRentLamports').mockRestore(); // the suite setup stubs it to 0 (S6)
+    const reservedAtBuild: number[] = [];
+    const before = coordinator.getSpendableBankrollSol();
+    build.mockImplementation(async () => {
+      reservedAtBuild.push(before - coordinator.getSpendableBankrollSol());
+      throw new Error('TEST_BUILD_REACHED');
+    });
+    const accumulator = userVolumeAccumulatorPda(wallet.publicKey);
+    const realGetAccountInfo = conn.getAccountInfo.bind(conn);
+    let accumulatorExists = false;
+    vi.spyOn(conn, 'getAccountInfo').mockImplementation(async (key: any, ...rest: any[]) => {
+      if ((key as PublicKey).equals(accumulator)) return accumulatorExists ? ({ lamports: PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS, data: Buffer.alloc(137), owner: SystemProgram.programId, executable: false } as any) : null;
+      return realGetAccountInfo(key, ...rest);
+    });
+    const first = await coordinator.executeTrade(buyReq());
+    accumulatorExists = true;
+    const later = await coordinator.executeTrade(buyReq());
+    expect(reservedAtBuild, `${first.error} | ${later.error}`).toHaveLength(2);
+    expect(reservedAtBuild[0] - reservedAtBuild[1]).toBeCloseTo(PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS / 1e9, 9);
+  });
+
 });

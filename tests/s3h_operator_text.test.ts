@@ -327,3 +327,72 @@ describe('3H A12: the PumpSwap buy builder refuses instead of building a wrong i
     expect(callers).toEqual([]);
   });
 });
+
+describe('3H A4/A5: every sniper and wallet config key has a reader or a KNOWN_RISKS section 6 row', () => {
+  /** A key with a reader: the production line that reads it (not the line that stores it). */
+  const READERS: Record<string, { file: string; read: RegExp }> = {
+    'WalletConfigSchema.rpcEndpoint': { file: 'server/walletTrader.ts', read: /executionCoordinator\.setRpcEndpoint\(newConfig\.rpcEndpoint\)/ },
+    'WalletConfigSchema.jitoBlockEngineUrl': { file: 'server/walletTrader.ts', read: /executionCoordinator\.setJitoBlockEngineUrl\(jitoUrl\)/ },
+    'WalletConfigSchema.jitoTipSol': { file: 'server/walletTrader.ts', read: /jitoTipSol: order\.jitoTipSol \|\| this\.config\.jitoTipSol/ },
+    'WalletConfigSchema.riskLimits.maxPositionSizeSol': { file: 'server/walletTrader.ts', read: /riskEngine\.updateLimits\(\{ maxPositionSol: limits\.maxPositionSizeSol \}\)/ },
+    'SniperConfigPatchSchema.isAutoSnipeEnabled': { file: 'server/memecoinAggregator.ts', read: /if \(!this\.config\.isAutoSnipeEnabled\) return;/ },
+    'SniperConfigPatchSchema.defaultSnipeAmountUsd': { file: 'server/memecoinAggregator.ts', read: /amountUsd = Math\.max\(1\.0, this\.config\.defaultSnipeAmountUsd\)/ },
+    'SniperConfigPatchSchema.maxSlippagePct': { file: 'server/memecoinAggregator.ts', read: /\(params\.slippagePct \|\| this\.config\.maxSlippagePct\) \* 100/ },
+    'SniperConfigPatchSchema.jitoTipSol': { file: 'server/memecoinAggregator.ts', read: /params\.jitoTipSol \|\| this\.config\.jitoTipSol/ },
+    'SniperConfigPatchSchema.requireFreezeRevoked': { file: 'server/memecoinAggregator.ts', read: /if \(this\.config\.requireFreezeRevoked && !pool\.isFreezeRevoked\)/ },
+    'SniperConfigPatchSchema.maxDevHoldingPct': { file: 'server/memecoinAggregator.ts', read: /pool\.devHoldingPct > this\.config\.maxDevHoldingPct/ },
+  };
+  /** Keys the schema refuses outright: nothing is stored, so nothing can look live. */
+  const REFUSED = ['WalletConfigSchema.riskLimits.maxDailyLossUsd'];
+
+  const schemaKeys = async () => {
+    const { WalletConfigSchema } = await import('../server/middleware/enterprise');
+    const { SniperConfigPatchSchema } = await import('../server/execution/tradeInputs');
+    const w: any = WalletConfigSchema;
+    const wallet = Object.keys(w.shape).flatMap((k) => (k === 'riskLimits' ? Object.keys(w.shape.riskLimits.unwrap().shape).map((r) => `riskLimits.${r}`) : [k]));
+    const sniper = Object.keys((SniperConfigPatchSchema as any).in.shape);
+    return [...wallet.map((k) => `WalletConfigSchema.${k}`), ...sniper.map((k) => `SniperConfigPatchSchema.${k}`)];
+  };
+  const section6Rows = () => {
+    const doc = fs.readFileSync('KNOWN_RISKS.md', 'utf8');
+    return doc.slice(doc.indexOf('## 6.'), doc.indexOf('## 7.')).split('\n').filter((l) => l.startsWith('| `')).map((l) => l.split('|')[1]);
+  };
+  const inSection6 = (qualified: string) => {
+    const [schema, ...rest] = qualified.split('.');
+    return section6Rows().some((cell) => cell.includes(`\`${schema}\``) && cell.includes(`\`${rest.join('.')}\``));
+  };
+
+  it('each key is read in production, refused by the schema, or listed in section 6 as doing nothing (riskLimits.stopLossPct and takeProfitMultiple included)', async () => {
+    const keys = await schemaKeys();
+    expect(keys.length).toBe(21);
+    const unaccounted = keys.filter((k) => !READERS[k] && !REFUSED.includes(k) && !inSection6(k));
+    expect(unaccounted).toEqual([]);
+    expect(inSection6('WalletConfigSchema.riskLimits.stopLossPct')).toBe(true);
+    expect(inSection6('WalletConfigSchema.riskLimits.takeProfitMultiple')).toBe(true);
+    // a key is either read or listed as doing nothing, not both
+    expect(keys.filter((k) => READERS[k] && inSection6(k))).toEqual([]);
+  });
+
+  it('each claimed reader is really in the production file', () => {
+    for (const [k, r] of Object.entries(READERS)) expect(fs.readFileSync(r.file, 'utf8'), k).toMatch(r.read);
+  });
+
+  it('the refused key is refused', async () => {
+    const { WalletConfigSchema } = await import('../server/middleware/enterprise');
+    expect(WalletConfigSchema.safeParse({ riskLimits: { maxDailyLossUsd: 5 } }).success).toBe(false);
+  });
+
+  it('a listed key really changes nothing: riskLimits.stopLossPct is stored and echoed, and the exit rules stay the same', async () => {
+    const { walletTrader } = await import('../server/walletTrader');
+    const { exitRulesSummary } = await import('../server/exits/exitEngine');
+    const before = exitRulesSummary();
+    const cfg = await walletTrader.updateConfig({ riskLimits: { stopLossPct: 50 } } as any);
+    expect(cfg.riskLimits.stopLossPct).toBe(50); // the success reply a caller sees
+    expect(exitRulesSummary()).toEqual(before);
+    expect(exitRulesSummary().stopLossPct).toBe(-20);
+    // and no production file outside the store reads it
+    const prod = ['server.ts', ...fs.readdirSync('server', { recursive: true }).map((f) => `server/${f}`).filter((f) => f.endsWith('.ts'))];
+    const readers = prod.filter((f) => /riskLimits\.(stopLossPct|takeProfitMultiple)/.test(fs.readFileSync(f, 'utf8').replace(/this\.config\.riskLimits\.(stopLossPct|takeProfitMultiple) = limits\.\w+/g, '').replace(/limits\.(stopLossPct|takeProfitMultiple) !== undefined/g, '')));
+    expect(readers).toEqual([]);
+  });
+});

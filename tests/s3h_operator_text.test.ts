@@ -168,3 +168,63 @@ describe('3H P3.7: the pump.fun feed status comes from real feed activity', () =
     expect(renderToStaticMarkup(React.createElement(FeedStatusPill, { status: null }))).toContain('UNKNOWN');
   });
 });
+
+describe('3H: callout copy says what the feed gave', () => {
+  const MINT_PLAIN = 'PlainCoin111111111111111111111111111111pump';
+  const MINT_BOOSTED = 'BoostCoin111111111111111111111111111111pump';
+  /** The pump.fun and DexScreener HTTP answers, at the fetch boundary. Two coins: one with no description or image, one also boosted. */
+  const stubFeeds = () => vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) => {
+    const url = String(input);
+    const json = (b: unknown) => new Response(JSON.stringify(b), { status: 200, headers: { 'content-type': 'application/json' } });
+    if (url.includes('frontend-api-v3.pump.fun')) {
+      return json([
+        { mint: MINT_PLAIN, symbol: 'PLN', name: 'Plain', usd_market_cap: 9000, last_trade_timestamp: Date.now() - 600_000, complete: false },
+        { mint: MINT_BOOSTED, symbol: 'BST', name: 'Boosted', usd_market_cap: 20000, last_trade_timestamp: Date.now() - 600_000, complete: false, image_uri: 'https://img.example/b.png', description: 'its own words' },
+      ]);
+    }
+    if (url.includes('token-boosts')) return json([{ chainId: 'solana', tokenAddress: MINT_BOOSTED }]);
+    if (url.includes('latest/dex/tokens')) return json({ pairs: [] });
+    throw new Error(`unexpected fetch ${url}`);
+  });
+
+  it('a coin with no description gets no "Verified" text and an empty image; a boosted one is not said to be called by anyone or elevated when it is not', async () => {
+    const { PumpFunService } = await import('../server/pumpfunService');
+    const svc = new PumpFunService();
+    const fetchSpy = stubFeeds();
+    try {
+      await svc.syncRealWorldData({ evaluateTriggers: false, env: { ...process.env, ALLOWED_CLUSTER: 'mainnet-beta' } });
+    } finally {
+      fetchSpy.mockRestore();
+    }
+    const byMint = new Map(svc.getHotCallouts().map((c) => [c.token.mint, c]));
+    const plain = byMint.get(MINT_PLAIN)!;
+    expect(plain.token.description).toBe('');
+    expect(plain.token.imageUri).toBe('');
+    expect(JSON.stringify(plain)).not.toMatch(/Verified|unsplash|Alpha Meme Token/);
+    const boosted = byMint.get(MINT_BOOSTED)!;
+    expect(boosted.confluenceCount).toBeGreaterThanOrEqual(2);
+    expect(boosted.token.description).toBe('its own words');
+    expect(boosted.token.imageUri).toBe('https://img.example/b.png');
+    expect(boosted.hftAction).not.toBe('INSTANT_SNIPE'); // 10 minutes since the last trade
+    expect(boosted.calloutNote).not.toMatch(/MULTI-CALLER CONFLUENCE|Called by|Elevated to INSTANT_SNIPE/);
+    expect(boosted.calloutNote).toContain('DexScreener paid-boost list');
+    expect(boosted.calloutNote).toContain(`Marked ${boosted.hftAction}`);
+    expect(svc.getStatus().status).toBe('ONLINE'); // the poll brought coins
+  });
+
+  it('the note says INSTANT_SNIPE only when the callout is INSTANT_SNIPE', async () => {
+    const { confluenceCalloutNote } = await import('../server/pumpfunService');
+    expect(confluenceCalloutNote({ hasOrderFlowSurge: true, curveProgress: 40, volume5mUsd: 1200, hftAction: 'INSTANT_SNIPE' })).toContain('Marked INSTANT_SNIPE.');
+    const late = confluenceCalloutNote({ hasOrderFlowSurge: false, curveProgress: 40, volume5mUsd: null, hftAction: 'DUMP_RISK' });
+    expect(late).toContain('Marked DUMP_RISK');
+    expect(late).toContain('5m Vol: n/a');
+  });
+
+  it('the board shows an empty tile, not a stock photo, for a coin with no image', async () => {
+    const { TokenImage } = await import('../src/components/PumpFunHotCalloutsView');
+    const html = renderToStaticMarkup(React.createElement(TokenImage, { uri: '', symbol: 'PLN' }));
+    expect(html).toContain('token-image-missing');
+    expect(html).not.toContain('unsplash');
+    expect(fs.readFileSync('src/components/PumpFunHotCalloutsView.tsx', 'utf8')).not.toContain('photo-1622979135225');
+  });
+});

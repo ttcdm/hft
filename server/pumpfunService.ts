@@ -327,6 +327,20 @@ export function httpPollersAllowed(env: NodeJS.ProcessEnv = process.env): boolea
 }
 
 /**
+ * 3H: the note of a callout that is on both lists. It used to read "MULTI-CALLER CONFLUENCE ... Called by @a & @b ... Elevated to INSTANT_SNIPE"
+ * for every such callout: the callers are placeholder names given by list position (nobody called it), and INSTANT_SNIPE also needs a known
+ * multiple of at most 2.5x and at most 180 s since the last trade, so many of them were not elevated at all.
+ */
+export function confluenceCalloutNote(p: { hasOrderFlowSurge: boolean; curveProgress: number; volume5mUsd: number | null; hftAction: CalloutHftAction }): string {
+  const lists = `On both the pump.fun recent list and the DexScreener paid-boost list${p.hasOrderFlowSurge ? ', with a 5-minute buy surge' : ''}`;
+  const vol = p.volume5mUsd != null ? '$' + Number(p.volume5mUsd).toLocaleString() : 'n/a';
+  const action = p.hftAction === 'INSTANT_SNIPE'
+    ? 'Marked INSTANT_SNIPE.'
+    : `Marked ${p.hftAction}: INSTANT_SNIPE also needs a known multiple of at most 2.5x and at most 180 s since the last trade.`;
+  return `📊 ${lists}. Curve: ${p.curveProgress}% | 5m Vol: ${vol}. ${action} No person called it.`;
+}
+
+/**
  * 3H (P3.7): how long after the last feed event that brought data the board still reads ONLINE. The HTTP fallback polls every 5 s and the
  * log stream counts as active for 60 s (initPolling), so a quiet minute means nothing is arriving.
  */
@@ -645,7 +659,7 @@ export class PumpFunService extends EventEmitter {
       // Callout note generated from real on-chain metrics
       let calloutNote: string;
       if (confluenceCount >= 2) {
-        calloutNote = `🚨 MULTI-CALLER CONFLUENCE (Pump.fun Velocity + DexScreener Boosted): Called by @${caller.userId}${otherCallers.length > 0 ? ' & ' + otherCallers.join(', ') : ''}. Curve: ${curveProgress}% | 5m Vol: ${pair?.volume?.m5 != null ? '$' + Number(pair.volume.m5).toLocaleString() : 'n/a'}. Elevated to INSTANT_SNIPE.`;
+        calloutNote = confluenceCalloutNote({ hasOrderFlowSurge, curveProgress, volume5mUsd: pair?.volume?.m5 ?? null, hftAction });
       } else if (c.complete) {
         calloutNote = `🎓 MIGRATED: the feed reports this curve as complete (graduated to the AMM).`;
       } else if (curveProgress >= 80) {
@@ -664,10 +678,12 @@ export class PumpFunService extends EventEmitter {
         caller,
         token: {
           mint,
-          symbol: c.symbol || 'MEME',
-          name: c.name || 'Alpha Meme Token',
-          imageUri: c.image_uri || 'https://images.unsplash.com/photo-1622979135225-d2ba269bc1df?w=120&auto=format&fit=crop&q=80',
-          description: c.description || 'Verified token from Pump.fun hot callouts discovery engine.',
+          // 3H: what the feed gave, or a plain stand-in. A coin with no description used to read "Verified token from Pump.fun hot callouts
+          // discovery engine" (nothing verifies it), with a stock photo as its image and "Alpha Meme Token" / "MEME" as its name and symbol.
+          symbol: c.symbol || mint.slice(0, 6).toUpperCase(),
+          name: c.name || `${mint.slice(0, 4)}...${mint.slice(-4)}`,
+          imageUri: c.image_uri || '',
+          description: c.description || '',
           bondingCurveProgress: curveProgress,
           bondingCurveAddress: c.bonding_curve || '',
           associatedBondingCurve: c.associated_bonding_curve,

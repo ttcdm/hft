@@ -68,6 +68,19 @@ interface PumpFunHotCalloutsViewProps {
   onRefreshParent?: () => void;
 }
 
+/** 3H: the coin's own image, or an empty tile with its first letters. A missing or broken image used to show a stock photo as if it were the coin's. */
+export function TokenImage({ uri, symbol }: { uri: string; symbol: string }) {
+  const [broken, setBroken] = useState(false);
+  if (!uri || broken) {
+    return (
+      <div data-testid="token-image-missing" className="w-11 h-11 rounded-lg border border-slate-700 bg-slate-800 flex items-center justify-center flex-shrink-0 text-[10px] font-mono text-slate-400">
+        {symbol.slice(0, 3)}
+      </div>
+    );
+  }
+  return <img src={uri} alt={symbol} className="w-11 h-11 rounded-lg border border-slate-700 object-cover flex-shrink-0" onError={() => setBroken(true)} />;
+}
+
 /** 3H (P3.7): the feed status as the server measures it. It used to be implied by fixed "Live ingest" text whether or not anything arrived. */
 export function FeedStatusPill({ status }: { status: string | null }) {
   const tone =
@@ -610,15 +623,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                     <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-center">
                       {/* TOKEN IDENTITY (Cols 1-4) */}
                       <div className="lg:col-span-4 flex items-start space-x-3">
-                        <img
-                          src={c.token.imageUri}
-                          alt={c.token.symbol}
-                          className="w-11 h-11 rounded-lg border border-slate-700 object-cover flex-shrink-0"
-                          onError={(e) => {
-                            (e.target as HTMLImageElement).src =
-                              'https://images.unsplash.com/photo-1622979135225-d2ba269bc1df?w=120&auto=format&fit=crop&q=80';
-                          }}
-                        />
+                        <TokenImage uri={c.token.imageUri} symbol={c.token.symbol} />
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center space-x-2">
                             <span className="font-extrabold text-white text-sm tracking-wide font-sans">

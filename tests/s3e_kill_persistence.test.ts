@@ -1,4 +1,6 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
+import { startApp, scratchDir } from './helpers/liveServer';
+import { AutoResumeSchema } from '../server/execution/tradeInputs';
 import { Keypair } from '@solana/web3.js';
 import { autoSnipeController } from '../server/auto/controller';
 import { executionCoordinator } from '../server/execution/coordinator';
@@ -269,4 +271,35 @@ describe('3E: NEGATIVE_EXPECTANCY and LOSS_STREAK over the last auto trades acro
     expect(ok.ok, ok.error).toBe(true);
     expect(await autoSnipeController.checkTriggers()).toEqual([]);
   });
+});
+
+describe('3E over HTTP: kill, restart on the same database (real server, two processes)', () => {
+  it('auto kill then the kill switch, stop, start again: status OFF and killed with the reason, can-arm names KILL_SWITCH_WAS_ON; resume takes ackLossTriggers', async () => {
+    expect(AutoResumeSchema.parse({ ackLossTriggers: true })).toEqual({ ackLossTriggers: true });
+    const dir = scratchDir('s3e-restart');
+    const env = { AUTO_SNIPE_ENABLED: 'true' };
+    let app = await startApp(dir, env);
+    try {
+      const mode = await app.call('POST', '/api/auto/mode', { mode: 'SHADOW' });
+      expect(mode.status, JSON.stringify(mode.json)).toBe(200);
+      expect((await app.call('POST', '/api/auto/kill', { reason: 's3e http kill' })).json.status.killed).toBe(true);
+      expect((await app.call('POST', '/api/execution/kill-switch', { activate: true })).json.killSwitchActive).toBe(true);
+    } finally {
+      await app.stop();
+    }
+    app = await startApp(dir, env);
+    try {
+      const st = (await app.call('GET', '/api/auto/status')).json;
+      expect(st.mode).toBe('OFF');
+      expect(st.killed).toBe(true);
+      expect(st.killReason).toBe('operator kill switch');
+      const can = (await app.call('GET', '/api/execution/can-arm')).json;
+      expect(JSON.stringify(can.reasons)).toMatch(/KILL_SWITCH_WAS_ON/);
+      const res = await app.call('POST', '/api/auto/resume', { ackLossTriggers: true });
+      expect(res.status).toBe(200);
+      expect(res.json.lossTriggersAcked).toBe(true);
+    } finally {
+      await app.stop();
+    }
+  }, 300_000);
 });

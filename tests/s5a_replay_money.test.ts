@@ -248,8 +248,10 @@ describe('5A (R1-111): the own-recordings study holds out 30% by default', () =>
   });
 });
 
-// ---- follow-up: the corpus replay's open mark ----------------------------------------
+// ---- follow-ups: the corpus replay's open mark, and the exit-variant studies on the shared model ----------------------------------------
 import { thresholdSummary } from '../scripts/hfcorpus/replay';
+import { simulate as corpusVariant, COSTS as CORPUS_COSTS } from '../scripts/hfcorpus/exit_variants';
+import { simulate as recordedVariant, rowsOf, COSTS as RECORDED_COSTS } from '../scripts/recorder_backtest/exit_variants';
 
 describe('5A (R1-98): the corpus replay\'s open mark keeps the take-profit proceeds', () => {
   afterEach(() => restoreStockEngine());
@@ -261,5 +263,24 @@ describe('5A (R1-98): the corpus replay\'s open mark keeps the take-profit proce
     expect(s.openMarkSol).toBeCloseTo(r.openNetPnlSol as number, 12);
     expect(s.openMarkSol).toBeGreaterThan((r.openValueSol as number) - REPLAY_DEFAULTS.orderSol);
     expect(s.realizedNetSol).toBe(0);
+  });
+});
+
+describe('5A: both exit-variant studies price on the shared model and agree with the replay', () => {
+  afterEach(() => restoreStockEngine());
+  it('the stock variant at the replay\'s costs equals replayLaunch, closed and open, in the corpus and the recordings copy', () => {
+    const { rows, at } = released();
+    for (const path of [[...rows, at(4_000, 1.35), at(10_000, 1.35), at(16_000, 0.5), at(20_000, 0.5)], [...rows, at(4_000, 1.35), at(10_000, 1.35)]]) {
+      const c = launch(path);
+      const rec = toRecordedLaunch(c, 150);
+      const r = replay(path);
+      const want = r.outcome === 'CLOSED' ? r.netPnlSol : r.openNetPnlSol;
+      const a = corpusVariant(c, r.releasedAfterMs as number, STOCK_VARIANT, CORPUS_COSTS[0].cost)!;
+      const b = recordedVariant(rowsOf(rec), T0 + (r.releasedAfterMs as number), STOCK_VARIANT, RECORDED_COSTS[0].cost)!;
+      expect(a.open).toBe(r.outcome === 'OPEN_AT_END');
+      expect(a.net).toBeCloseTo(want as number, 12);
+      expect(b.net).toBeCloseTo(want as number, 12);
+      expect(a.exits).toEqual(r.exits.map((e) => e.reason));
+    }
   });
 });

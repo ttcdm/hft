@@ -2,8 +2,8 @@ import { describe, it, expect } from 'vitest';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
-  hasBudget, sessionSpendMatchesWallet, killSurvivesRestart, startSendHoldingRelay,
-  type SessionSpendDeps, type KillRestartDeps, type ChildApp,
+  hasBudget, sessionSpendMatchesWallet, killSurvivesRestart, startSendHoldingRelay, freshMintIfExited, mintNeedsReplacing,
+  type SessionSpendDeps, type KillRestartDeps, type ChildApp, type ChainKit,
 } from '../scripts/devnet_e2e_steps';
 
 /**
@@ -251,5 +251,50 @@ describe('3K startSendHoldingRelay', () => {
       await relay.close();
       await new Promise<void>((r) => upstream.close(() => r()));
     }
+  });
+});
+
+// ---- 3F: a fresh harness coin for each step that buys after an exit ----
+
+describe('3K 3F: freshMintIfExited', () => {
+  const fakeKit = (o: { createThrows?: boolean; refundThrows?: boolean } = {}) => {
+    const log: string[] = [];
+    const kit = {
+      newWallet: () => ({ publicKey: { toBase58: () => 'CREATOR' } }),
+      transfer: async (_f: any, _t: any, sol: number) => { log.push(`lend ${sol}`); return 'sig'; },
+      create: async () => { log.push('create'); if (o.createThrows) throw new Error('create failed'); return { mint: 'FRESH', curve: 'C' }; },
+      refund: async () => { log.push('refund'); if (o.refundThrows) throw new Error('refund failed'); },
+    } as unknown as ChainKit;
+    return { kit, log };
+  };
+  const payer = { publicKey: { toBase58: () => 'PAYER' } };
+  it('mintNeedsReplacing: any closed position, a loss, or an unreadable answer', () => {
+    expect(mintNeedsReplacing({ lastExit: null, loss: null })).toBe(false);
+    expect(mintNeedsReplacing({ lastExit: { positionId: 'p', exitedAt: 1 }, loss: null })).toBe(true);
+    expect(mintNeedsReplacing({ lastExit: { positionId: 'p', exitedAt: 1 }, loss: { positionId: 'p', realizedLamports: -1 } })).toBe(true);
+    expect(mintNeedsReplacing(null)).toBe(true);
+  });
+  it('a mint never closed: kept, nothing lent or made', async () => {
+    const r = recorder(); const k = fakeKit();
+    expect(await freshMintIfExited(r, '(g)', { mint: 'OLD', exits: () => ({ lastExit: null, loss: null }), kit: k.kit, creator: () => k.kit.newWallet(), payer })).toBe('OLD');
+    expect(k.log).toEqual([]);
+    expect(r.recs).toEqual([]);
+  });
+  it('a closed mint: a fresh coin, the creator lent before the create and refunded after', async () => {
+    const r = recorder(); const k = fakeKit();
+    expect(await freshMintIfExited(r, '(g)', { mint: 'OLD', exits: () => ({ lastExit: { positionId: 'p', exitedAt: 1 }, loss: null }), kit: k.kit, creator: () => k.kit.newWallet(), payer })).toBe('FRESH');
+    expect(k.log).toEqual(['lend 0.012', 'create', 'refund']);
+    expect(r.recs).toEqual([]);
+  });
+  it('the create fails: a FAIL line, null, and the creator is still refunded', async () => {
+    const r = recorder(); const k = fakeKit({ createThrows: true });
+    expect(await freshMintIfExited(r, '(n)', { mint: 'OLD', exits: () => null, kit: k.kit, creator: () => k.kit.newWallet(), payer })).toBeNull();
+    expect(fails(r.recs)).toEqual([expect.objectContaining({ step: '(n): a fresh harness coin (3F)', detail: expect.stringMatching(/could not be read.*create failed/) })]);
+    expect(k.log).toEqual(['lend 0.012', 'create', 'refund']);
+  });
+  it('the refund fails: a FAIL line naming the key, and the fresh coin is still used', async () => {
+    const r = recorder(); const k = fakeKit({ refundThrows: true });
+    expect(await freshMintIfExited(r, '(l)', { mint: 'OLD', exits: () => ({ lastExit: null, loss: { positionId: 'p', realizedLamports: -5 } }), kit: k.kit, creator: () => k.kit.newWallet(), payer })).toBe('FRESH');
+    expect(fails(r.recs)).toEqual([expect.objectContaining({ step: '(l): refund CREATOR', detail: expect.stringMatching(/temp-wallets/) })]);
   });
 });

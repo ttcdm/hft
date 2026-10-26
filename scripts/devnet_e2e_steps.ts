@@ -2068,3 +2068,48 @@ export async function killSurvivesRestart(s: Pick<HarnessSteps, 'rec' | 'sleep'>
     try { await d.cleanup(); } catch (e: any) { s.rec(`${L}: sell out and refund the step's wallet`, false, `${String(e?.message ?? e).slice(0, 160)}; key in <scratch>/temp-wallets/`); }
   }
 }
+
+// ---- 3F (task 3K): a fresh harness coin for each step that buys after an exit. ----
+
+/** What `workstationDb.loadMintExits(mint, 'LIVE')` answers (3F): null when the positions table could not be read. */
+export type MintExits = { lastExit: unknown | null; loss: unknown | null } | null;
+
+/**
+ * 3F (R1-9): the app refuses a LIVE buy (MINT_RECENTLY_EXITED) of a mint with a closed LIVE position less than 24 h old, of a mint ever
+ * closed at a loss, and when it cannot read the positions. A harness round trip always loses its fees, so the harness does not tell these
+ * apart: any closed position on the mint in the scratch DB, or an unreadable answer, means the next buy needs another coin.
+ */
+export function mintNeedsReplacing(exits: MintExits): boolean {
+  return exits === null || exits.lastExit !== null || exits.loss !== null;
+}
+
+/**
+ * 3F (task 3K): called before each step that buys the harness mint. When the scratch DB holds a closed position on `mint` (an earlier step
+ * or an earlier run sold it), a throwaway creator (made once by `creator()`, key on disk before it is funded) is lent `lendSol`, creates a
+ * fresh pump coin with no dev buy, and is refunded at once. Returns the coin the step should buy: `mint` itself when it was never closed,
+ * the new coin otherwise, or null when no coin could be made (a FAIL line; the step then runs on the old mint and says why it is refused).
+ * A refund that fails is a FAIL line naming the key, and the new coin is still returned.
+ */
+export async function freshMintIfExited(
+  s: Pick<HarnessSteps, 'rec'>, label: string,
+  d: { mint: string; exits(mint: string): MintExits; kit: ChainKit; creator(): any; payer: any; lendSol?: number },
+): Promise<string | null> {
+  const exits = d.exits(d.mint);
+  if (!mintNeedsReplacing(exits)) return d.mint;
+  const why = exits === null ? 'its closed positions could not be read' : 'it has a closed LIVE position in this scratch DB';
+  const creator = d.creator();
+  let fresh: string;
+  try {
+    await d.kit.transfer(d.payer, creator.publicKey, d.lendSol ?? 0.012);
+    fresh = (await d.kit.create(creator, 'F3K', '3K fresh harness coin')).mint;
+  } catch (e: any) {
+    s.rec(`${label}: a fresh harness coin (3F)`, false, `${d.mint.slice(0, 8)}... cannot be bought again (${why}) and no new coin was made: ${String(e?.message ?? e).slice(0, 160)}`);
+    await d.kit.refund(creator, d.payer.publicKey).catch(() => undefined);
+    return null;
+  }
+  try { await d.kit.refund(creator, d.payer.publicKey); } catch (e: any) {
+    s.rec(`${label}: refund ${creator.publicKey.toBase58()}`, false, `${String(e?.message ?? e).slice(0, 120)}; key in <scratch>/temp-wallets/`);
+  }
+  console.log(`INFO  ${label}: ${d.mint.slice(0, 8)}... cannot be bought again (3F MINT_RECENTLY_EXITED: ${why}); this step buys a fresh harness coin ${fresh}`);
+  return fresh;
+}

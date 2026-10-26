@@ -157,15 +157,19 @@ async function run(info: { url: string; genesisHash: string }) {
   {
     const { executionConfig } = await import('../../server/solana/executionConfig');
     const { autoSnipeController } = await import('../../server/auto/controller');
-    const mkt = Keypair.generate();
-    await conn.requestAirdrop(mkt.publicKey, 2 * LAMPORTS_PER_SOL);
-    const seeded = await kit.create(mkt, 'N3CL', 'S3C harness');
-    await kit.buy(mkt, seeded.mint, 0.2);
-    for (let i = 0; i < 14; i++) {
-      const w = Keypair.generate();
-      await conn.requestAirdrop(w.publicKey, 2 * LAMPORTS_PER_SOL);
-      await kit.buy(w, seeded.mint, 0.6);
-    }
+    const seedCoin = async (symbol: string, name: string) => {
+      const mkt = Keypair.generate();
+      await conn.requestAirdrop(mkt.publicKey, 2 * LAMPORTS_PER_SOL);
+      const c = await kit.create(mkt, symbol, name);
+      await kit.buy(mkt, c.mint, 0.2);
+      for (let i = 0; i < 14; i++) {
+        const w = Keypair.generate();
+        await conn.requestAirdrop(w.publicKey, 2 * LAMPORTS_PER_SOL);
+        await kit.buy(w, c.mint, 0.6);
+      }
+      return c;
+    };
+    const seeded = await seedCoin('N3CL', 'S3C harness');
     // Run 16 on devnet: a 429 on the balance sync right before the clearDailyLossLatch buy. The resume below has the validator answer the
     // next two getBalance reads with HTTP 429 (under the kill switch's 3), and the step's next sync waits until the validator took that.
     let failReads: Promise<unknown> | null = null;
@@ -199,7 +203,8 @@ async function run(info: { url: string; genesisHash: string }) {
       rec('(n) cleanup: MAX_DAILY_LOSS_USD back to the tier default, latch clear', executionConfig.getConfig().maxDailyLossUsd === 7 && riskEngine.getDailyLossLatch('LIVE') === null, `MAX_DAILY_LOSS_USD ${executionConfig.getConfig().maxDailyLossUsd}`);
     }
 
-    // (l) 3A on the same coin, wired as devnet_e2e.ts's readinessGateStep. What the step must ride out is injected: two HTTP 429s on
+    // (l) 3A on a coin of its own (3F: (n) sold its coin at a loss, and a mint closed at a loss is never bought again, MINT_RECENTLY_EXITED),
+    // wired as devnet_e2e.ts's readinessGateStep. What the step must ride out is injected: two HTTP 429s on
     // getBalance at the first balance sync after the MISMATCH Reconcile (run 16's shape), and one JSON-RPC error on the wallet token scan
     // (getParsedTokenAccountsByOwner, sent as getTokenAccountsByOwner, of the harness wallet) in the first Reconcile after the row is resolved, which leaves that pass at MISMATCH for a reason
     // other than the row, so the step must Reconcile again (4 Reconciles in all, with the cleanup's).
@@ -234,13 +239,15 @@ async function run(info: { url: string; genesisHash: string }) {
       },
     };
     await S.waitPast(nSteps, nDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (n) trades');
-    if (await S.hasBudget(nSteps, '(l) 3A: per-buy readiness', bal, 0.05, 'DEVNET_READINESS_GATE')) {
+    const lSeeded = await seedCoin('L3AL', 'S3A harness');
+    const lSteps = { ...nSteps, mint: lSeeded.mint, buildBuyRequest: async () => liveBuyRequest(lSeeded.mint, 0.01, Date.now()) } as typeof steps;
+    if (await S.hasBudget(lSteps, '(l) 3A: per-buy readiness', bal, 0.05, 'DEVNET_READINESS_GATE')) {
       const bl = await bal();
-      await S.readinessGateAfterMismatch(nSteps, lDeps);
+      await S.readinessGateAfterMismatch(lSteps, lDeps);
       console.log(`INFO  (l) cost the harness wallet ${(bl - (await bal())).toFixed(5)} SOL; ${reconciles} Reconcile(s)`);
       rec('(l) the injected faults were met: two getBalance 429s after the MISMATCH Reconcile, one failed wallet scan after the row was resolved', failReads === null && scanFailed && reconciles === 4, `${reconciles} Reconciles; balance faults ${failReads === null ? 'taken' : 'not taken'}; scan fault ${scanFailed ? 'armed' : 'not armed'}`);
       const rr = coordinator.getLiveReadiness().reasons.filter((x) => /reconcil/i.test(x));
-      rec('(l) cleanup: readiness names no reconciliation problem, nothing open on the coin', rr.length === 0 && workstationDb.loadPositions().every((p) => p.mint !== seeded.mint || p.status === 'CLOSED'), rr.join('; ').slice(0, 200) || 'reconciliation clear');
+      rec('(l) cleanup: readiness names no reconciliation problem, nothing open on the coin', rr.length === 0 && workstationDb.loadPositions().every((p) => p.mint !== lSeeded.mint || p.status === 'CLOSED'), rr.join('; ').slice(0, 200) || 'reconciliation clear');
     }
     coordinator.armLiveTrading(false);
     const bootDb = path.join(scratch, 'boot-check-abc.db');

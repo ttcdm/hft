@@ -24,7 +24,7 @@ const DEFAULT_MINTS = [
 const phase = process.argv.includes('--phase=crash') ? 'crash' : process.argv.includes('--phase=recover') ? 'recover' : 'main';
 const scratch = process.env.APEX_E2E_SCRATCH || fs.mkdtempSync(path.join(os.tmpdir(), 'apex-e2e-'));
 const keyPath = path.join(scratch, 'throwaway-keypair.json');
-// Every throwaway wallet steps (i), (k), (t), (u), (m) and (o) create is written here before it is funded, and left here (Mike, 2026-10-24).
+// Every throwaway wallet steps (i), (k), (t), (u), (m), (o) and the 3F fresh-coin creator create is written here before it is funded, and left here (Mike, 2026-10-24).
 const tempWalletDir = path.join(scratch, 'temp-wallets');
 // 3I: what the opt-in steps (t), (u) and (n) need free in the harness wallet before they start: what they lend, plus fees and a margin.
 const RPC_SWITCH_NEED_SOL = 0.1;
@@ -211,7 +211,7 @@ async function main() {
     return finish();
   }
   console.log(`INFO  mint: ${mint}${waive ? ' (holder limits waived, see above)' : ''}`); // the failure case above is recorded; this line is not a pass
-  const mintPk = new PublicKey(mint);
+  let mintPk = new PublicKey(mint); // 3F: a step that buys after an exit moves to a fresh harness coin (freshMintFor below)
 
   if (phase === 'main') {
     // ---- (j) P4.2: a 10 s websocket block through a loopback proxy, then the pump feed boot path (scripts/devnet_e2e_steps.ts) ----
@@ -342,6 +342,26 @@ async function main() {
     return finish();
   }
 
+  // 3F (task 3K): the app never buys a mint again within 24 h of an exit, or ever after a loss (MINT_RECENTLY_EXITED). Every harness round
+  // trip loses its fees, so before each step that buys the harness mint after it was sold (in this run or an earlier one on the same scratch
+  // DB) the harness moves to a fresh pump coin it creates (S.freshMintIfExited: one throwaway creator, key under temp-wallets/ before it is
+  // funded, refunded after each create; about 0.006 SOL of rent per coin). The new coin is written to selected-mint.json for (f)'s children.
+  let stepsRef: { mint: string } | null = null;
+  let freshCreator: any = null;
+  const freshMintFor = async (label: string): Promise<void> => {
+    const S3 = await import('./devnet_e2e_steps');
+    const { PUMP_SDK } = await import('@pump-fun/pump-sdk');
+    const kit = S3.makeChainKit({ conn, web3, sdk: PUMP_SDK, curve: PumpCurveService, builder: txBuilder, keyDir: tempWalletDir });
+    const m = await S3.freshMintIfExited({ rec }, label, { mint: mint!, exits: (x) => workstationDb.loadMintExits(x, 'LIVE'), kit, creator: () => (freshCreator ??= kit.newWallet()), payer: kp });
+    if (!m || m === mint) return;
+    mint = m;
+    mintPk = new PublicKey(m);
+    waive = true; // the harness's own coin: the holder waiver applies, as for (h)'s coin
+    state = await PumpCurveService.fetchPumpMarketState({ connection: conn, mint: mintPk, executionMode: 'LIVE' });
+    if (stepsRef) stepsRef.mint = m;
+    fs.writeFileSync(selectedFile, JSON.stringify({ mint, waive }));
+  };
+
   // S256: tokens an earlier run left in this wallet are adopted at startup as RECOVERED positions; one on the harness mint would make (a)
   // POSITION_ALREADY_OPEN. Sell it first (it is the harness wallet's own leftover, not part of this run's checks).
   for (const p of workstationDb.loadPositions(undefined, 'ACTIVE').filter((x) => x.mint === mint && x.executionMode === 'LIVE')) {
@@ -351,6 +371,7 @@ async function main() {
     await sleep(31_000); // the per-mint cooldown that sell started
   }
 
+  await freshMintFor('(a)');
   // (a) BUY through the RPC transport
   const buy = await coordinator.executeTrade(await buildBuyRequest());
   const buyDoneAt = Date.now();
@@ -390,16 +411,20 @@ async function main() {
       auto: (await import('../server/auto/controller')).autoSnipeController as any,
     },
   };
+  stepsRef = steps;
   const S = await import('./devnet_e2e_steps');
   // The (a) buy started the 30 s per-mint cooldown; (d') must reach the chain, so it waits that out first.
   await S.waitPast(steps, buyDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (a) buy');
+  await freshMintFor("(d')"); // (c) sold the harness mint
   const revertedAt = await S.forcedRevertThroughApp(steps);
   await S.unreadableReservesRefused(steps); // (s) 3I: free, nothing is sent, so it runs inside the (d') failure cooldown
   await S.waitPast(steps, revertedAt, riskEngine.getLimits().cooldownAfterFailedTradeMs, "failure cooldown from the (d') revert");
   const lastBuyAt = await S.sequentialBuysOneMint(steps);
   await S.waitPast(steps, lastBuyAt, riskEngine.getLimits().cooldownPerMintMs, "per-mint cooldown from the (e') buy");
+  await freshMintFor("(e'')"); // (e') sold it
   await S.ambiguousSendThroughApp(steps); // P1.5
   await S.waitPast(steps, Date.now(), riskEngine.getLimits().cooldownPerMintMs, "per-mint cooldown from the (e'') buy");
+  await freshMintFor('(g)');
   await S.heldBlockhashStopLoss(steps); // P1.7
   const gDoneAt = Date.now();
   await rpcSwitchStep(steps, S, { conn, web3, kp, coordinator, PumpCurveService, txBuilder });
@@ -458,14 +483,18 @@ async function main() {
   await releaseGatesStep(steps, S, { conn, web3, kp, coordinator, workstationDb, PumpCurveService, txBuilder, buildBuyRequestFor });
 
   await S.waitPast(steps, gDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (g) buy');
+  if (process.env.DEVNET_LOSS_FLOOR === '1') await freshMintFor('(n)');
   const nDoneAt = await lossFloorStep(steps, S, { conn, kp, buySol: BUY_SOL });
   await S.waitPast(steps, nDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (n) trades');
+  if (process.env.DEVNET_READINESS_GATE === '1') await freshMintFor('(l)');
   const lDoneAt = await readinessGateStep(steps, S, { conn, kp, Keypair, coordinator, workstationDb });
   await S.waitPast(steps, lDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (l) trades');
   await sessionSpendStep(steps, S, { conn, web3, kp, coordinator, workstationDb, PumpCurveService, txBuilder }); // 3K (m): its own coins
   await killRestartStep(steps, S, { conn, web3, kp, PumpCurveService, txBuilder }); // 3K (o): its own server, DB, wallet and coin
+  await freshMintFor("(e''')");
   await S.emergencyStopThroughApp(steps); // P1.4, last: it leaves LIVE disarmed and auto OFF. Telegram-path panic sells the LIVE position; kill switch on/off/re-arm buys nothing
 
+  await freshMintFor('(f)'); // (e''') sold it; the crash child buys the coin selected-mint.json names
   // (f) crash after submit, then recover in a fresh process on the same scratch DB. This process holds that DB's and that key's
   // instance locks (P1.1), so it stops trading and releases them first; it trades nothing after this.
   const IL = await import('../server/system/instanceLock');

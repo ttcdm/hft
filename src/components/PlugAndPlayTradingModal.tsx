@@ -9,7 +9,7 @@
  * It must not hold or show key material, and it must not arm LIVE by itself: arming needs the operator to type the confirmation code, and
  * the server decides whether the prerequisites hold (`getLiveReadiness`). In read-only mode the server refuses to arm and to generate a key.
  */
-import { ARMED_MESSAGE, PANIC_CONFIRM_TEXT, panicOutcome } from '../utils/tradingCopy';
+import { ARMED_MESSAGE, PANIC_CONFIRM_TEXT, armRefusalText, panicOutcome } from '../utils/tradingCopy';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import React, { useState, useEffect } from 'react';
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
@@ -164,8 +164,14 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
         }),
       });
 
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Failed to arm live trading');
+      const data = await res.json().catch(() => null);
+      if (!res.ok || data?.success === false) {
+        // UI-4: close the dialog so the reason is in view, not behind it
+        setShowArmConfirmModal(false);
+        setConfirmationCodeInput('');
+        setStatusMessage({ text: armRefusalText(res.status, data), type: 'error' });
+        return;
+      }
 
       setStatusMessage({
         text: ARMED_MESSAGE(systemAudit?.allowedCluster),

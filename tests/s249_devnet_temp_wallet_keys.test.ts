@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import * as web3 from '@solana/web3.js';
-import { makeChainKit } from '../scripts/devnet_e2e_steps';
+import { makeChainKit, writeKeyFile } from '../scripts/devnet_e2e_steps';
 
 // Mike (2026-10-24): every temporary wallet the harness makes has its key on disk before it can receive SOL, and keeps it there.
 describe('S249: the devnet harness writes every throwaway wallet key before returning it', () => {
@@ -29,5 +29,16 @@ describe('S249: the devnet harness writes every throwaway wallet key before retu
     const blocker = path.join(base, 'not-a-dir');
     fs.writeFileSync(blocker, 'x');
     expect(() => kitIn(blocker).newWallet()).toThrow();
+  });
+
+  it('S268: writeKeyFile syncs, reads back, and with wx never overwrites an existing key', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 's268-'));
+    const f = path.join(dir, 'k.json');
+    const a = web3.Keypair.generate();
+    writeKeyFile(f, a, 'wx');
+    expect(web3.Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(f, 'utf8')))).publicKey.equals(a.publicKey)).toBe(true);
+    expect((fs.statSync(f).mode & 0o777).toString(8)).toBe('600');
+    expect(() => writeKeyFile(f, web3.Keypair.generate(), 'wx')).toThrow(); // the first key stays
+    expect(web3.Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(f, 'utf8')))).publicKey.equals(a.publicKey)).toBe(true);
   });
 });

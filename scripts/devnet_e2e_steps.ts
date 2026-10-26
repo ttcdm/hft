@@ -358,6 +358,22 @@ export interface ChainKit {
   refund(kp: any, to: any): Promise<void>;
 }
 
+/**
+ * S268 (review of S249-S266, L5): writes a throwaway key (0600), fsyncs it and reads it back before the caller may fund the wallet, so a
+ * crash or a short write cannot leave a funded wallet without a usable key on disk. Throws if the file does not hold this key.
+ */
+export function writeKeyFile(file: string, kp: { secretKey: Uint8Array }, flag: 'wx' | 'w'): void {
+  const body = JSON.stringify(Array.from(kp.secretKey));
+  const fd = fs.openSync(file, flag, 0o600);
+  try {
+    fs.writeSync(fd, body);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  if (fs.readFileSync(file, 'utf8') !== body) throw new Error(`key file ${file} did not read back as written; not funding that wallet`);
+}
+
 export function makeChainKit(d: { conn: any; web3: any; sdk: any; curve: any; builder: any; keyDir: string }): ChainKit {
   const { Keypair, PublicKey, SystemProgram, Transaction, ComputeBudgetProgram, LAMPORTS_PER_SOL } = d.web3;
   const send = async (tx: any, signers: any[]) => {
@@ -400,7 +416,7 @@ export function makeChainKit(d: { conn: any; web3: any; sdk: any; curve: any; bu
     newWallet: () => {
       const kp = Keypair.generate();
       fs.mkdirSync(d.keyDir, { recursive: true, mode: 0o700 });
-      fs.writeFileSync(path.join(d.keyDir, `${kp.publicKey.toBase58()}.json`), JSON.stringify(Array.from(kp.secretKey)), { flag: 'wx', mode: 0o600 });
+      writeKeyFile(path.join(d.keyDir, `${kp.publicKey.toBase58()}.json`), kp, 'wx');
       return kp;
     },
     transfer: (from, to, sol) => send(new Transaction().add(SystemProgram.transfer({ fromPubkey: from.publicKey, toPubkey: to, lamports: Math.ceil(sol * LAMPORTS_PER_SOL) })), [from]),
@@ -491,9 +507,12 @@ export function makeDumpMarket(d: {
   if (fs.existsSync(d.keyPath)) {
     w2 = d.web3.Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(d.keyPath, 'utf8'))));
   } else {
-    w2 = kit.newWallet();
+    w2 = kit.newWallet(); // its key is already on disk in temp-wallets/
     fs.mkdirSync(path.dirname(d.keyPath), { recursive: true });
-    fs.writeFileSync(d.keyPath, JSON.stringify(Array.from(w2.secretKey)), { mode: 0o600 });
+    // S268 (L5): written to a temporary name, synced, then renamed, so a crash never leaves a half-written second-wallet.json
+    const tmp = `${d.keyPath}.tmp-${process.pid}`;
+    writeKeyFile(tmp, w2, 'w');
+    fs.renameSync(tmp, d.keyPath);
   }
   const coins = (): string[] => { try { return JSON.parse(fs.readFileSync(coinsPath, 'utf8')); } catch { return []; } };
   const remember = (mint: string) => fs.writeFileSync(coinsPath, JSON.stringify([...new Set([...coins(), mint])]), { mode: 0o600 });
@@ -606,7 +625,8 @@ export async function failedReadThenDumpStopLoss(
         } catch (e: any) { s.rec(`${L}: cleanup close 100%`, false, String(e?.message ?? e).slice(0, 200)); }
       }
     }
-    try { await m.refund(); } catch (e: any) { console.log(`INFO  (h) refund of the second wallet failed: ${String(e?.message ?? e).slice(0, 120)}; its key is in ${m.keyPath}, and the next run with this scratch directory retries the refund`); }
+    // S268 (M5): a failed refund is a FAIL line, so a run cannot pass with SOL stranded in the second wallet
+    try { await m.refund(); } catch (e: any) { s.rec(`${L}: refund of the second wallet`, false, `${String(e?.message ?? e).slice(0, 120)}; its key is in ${m.keyPath}, and the next run with this scratch directory retries the refund`); }
   }
 }
 
@@ -910,7 +930,7 @@ export async function releaseGatesOnChain(
     const buyers = Array.from({ length: nBuyers }, () => kit.newWallet()); wallets.push(...buyers);
     for (const w of buyers) await kit.transfer(payer, w.publicKey, 2 * buySol + 0.02);
     for (const m of made) {
-      const r = await Promise.allSettled(buyers.map((w, i) => s.sleep(i * 250).then(() => kit.buy(w, m, buySol)))); // S265: 250 ms apart
+      const r = await Promise.allSettled(buyers.map((w, i) => s.sleep(i * 400).then(() => kit.buy(w, m, buySol)))); // S265/S268: 400 ms apart (run 10 still lost 1 of 10 at 250 ms)
       s.rec(`${L}: ${mode}: ${nBuyers} equal buys of ${m.slice(0, 6)}`, r.every((x) => x.status === 'fulfilled'), `${r.filter((x) => x.status === 'fulfilled').length}/${nBuyers} confirmed`);
     }
     const released = await waitUntil(() => made.every((m) => { const e = find(m); return !!e && e.state !== 'WATCHING'; }), waitMs);
@@ -978,7 +998,9 @@ export async function releaseGatesOnChain(
   } catch (e: any) {
     s.rec(L, false, String(e?.message ?? e).slice(0, 300));
   } finally {
-    await st.auto.setMode('OFF');
+    // S268 (review of S249-S266, M3): a throw here skipped the env restore, every sell and refund (the curve-cap pusher can hold ~25 SOL)
+    // and the LIVE restore. Each cleanup step now runs on its own.
+    try { await st.auto.setMode('OFF'); } catch (e: any) { s.rec(`${L}: auto OFF after the step`, false, String(e?.message ?? e).slice(0, 200)); }
     if (prevAuto === undefined) delete process.env.AUTO_SNIPE_ENABLED; else process.env.AUTO_SNIPE_ENABLED = prevAuto;
     for (const w of wallets) {
       for (const c of coins) { try { await kit.sellAll(w, c); } catch { /* nothing held; the refund below still runs */ } }
@@ -986,7 +1008,13 @@ export async function releaseGatesOnChain(
     }
     // S263 (review 2026-10-24, finding 4): the curve-cap check re-arms LIVE; a throw there skipped its disarm, and this only re-armed. Put
     // LIVE back exactly as it was before the step.
-    if (wasArmed) st.arm(true, ARM); else st.arm(false);
+    // S268 (M4): a re-arm that fails is a FAIL line, not silent.
+    try {
+      const restored = wasArmed ? st.arm(true, ARM) : st.arm(false);
+      if (wasArmed && !restored.success) s.rec(`${L}: LIVE re-armed after the step`, false, restored.message);
+    } catch (e: any) {
+      s.rec(`${L}: LIVE restored after the step`, false, String(e?.message ?? e).slice(0, 200));
+    }
   }
 }
 
@@ -995,13 +1023,20 @@ export async function releaseGatesOnChain(
  * coordinator started (P1.1): a child would exit INSTANCE_LOCKED before it reached the send. So the main process first stops trading (the
  * exit loop and the other timers; LIVE is already disarmed by (e''')) and releases its locks; it trades nothing after this, it only spawns
  * the children and prints the summary. Returns whether the hand-over is clean: no lock held, LIVE not armed.
+ * S268 (review 2026-10-24, finding 15): stopping the timers does not stop an exit pass that is already running, which could still write
+ * to the scratch DB while a child starts on it. The locks are released only after `exitPassDone` (the running pass, if any) settles.
  */
-export function handOverToChildPhases(
+export async function handOverToChildPhases(
   s: Pick<HarnessSteps, 'rec'>,
-  d: { stopTrading(): void; isLiveArmed(): boolean; disarm(): void; releaseAllLocks(): void; /** the lock file on disk still names this process */ holdsLock(p: string): boolean; lockPaths: string[] }
-): boolean {
+  d: {
+    stopTrading(): void; isLiveArmed(): boolean; disarm(): void; releaseAllLocks(): void;
+    /** the lock file on disk still names this process */ holdsLock(p: string): boolean; lockPaths: string[];
+    /** settles when the exit pass running now (if any) has finished */ exitPassDone(): Promise<unknown>;
+  }
+): Promise<boolean> {
   if (d.isLiveArmed()) d.disarm();
   d.stopTrading();
+  await d.exitPassDone().catch(() => undefined); // a failed pass has still ended
   d.releaseAllLocks();
   const still = d.lockPaths.filter((p) => d.holdsLock(p));
   const ok = still.length === 0 && !d.isLiveArmed();

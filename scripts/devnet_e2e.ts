@@ -309,7 +309,7 @@ async function main() {
     rec('(f) position recovered', open.length > 0, JSON.stringify(open.map((p) => ({ id: p.id, status: p.status, qty: p.tokenQuantityRaw }))));
     // S256: sell what was recovered, so the next run's startup wallet scan does not adopt it (run 6's (a) was refused POSITION_ALREADY_OPEN on it)
     for (const p of open.filter((x) => x.status === 'OPEN' || x.status === 'PARTIALLY_CLOSED')) {
-      const c = await coordinator.closePosition(p.id, 100, 'e2e cleanup after (f)');
+      const c = await coordinator.closePosition(p.id, 100, 'e2e cleanup after (f)').catch((e: any) => ({ success: false, error: String(e?.message ?? e) }));
       console.log(`INFO  (f) cleanup: recovered position ${p.id.slice(0, 8)} ${c.success ? 'sold' : `not sold (${safe(c.error ?? 'unknown')})`}`);
     }
     return finish();
@@ -323,7 +323,8 @@ async function main() {
   // S256: tokens an earlier run left in this wallet are adopted at startup as RECOVERED positions; one on the harness mint would make (a)
   // POSITION_ALREADY_OPEN. Sell it first (it is the harness wallet's own leftover, not part of this run's checks).
   for (const p of workstationDb.loadPositions(undefined, 'ACTIVE').filter((x) => x.mint === mint && x.executionMode === 'LIVE')) {
-    const c = await coordinator.closePosition(p.id, 100, 'e2e leftover from an earlier run');
+    // S268 (L5): a throw here used to end the run before results.json was written
+    const c = await coordinator.closePosition(p.id, 100, 'e2e leftover from an earlier run').catch((e: any) => ({ success: false, error: String(e?.message ?? e) }));
     console.log(`INFO  leftover position ${p.id.slice(0, 8)} on the harness mint ${c.success ? 'sold before (a)' : `not sold (${safe(c.error ?? 'unknown')})`}`);
     await sleep(31_000); // the per-mint cooldown that sell started
   }
@@ -386,7 +387,8 @@ async function main() {
   const secondKeyPath = path.join(scratch, 'second-wallet.json');
   const dumpMarket = async () => S.makeDumpMarket({ conn, payer: kp, web3, sdk: (await import('@pump-fun/pump-sdk')).PUMP_SDK, curve: PumpCurveService, builder: txBuilder, keyPath: secondKeyPath });
   if (fs.existsSync(secondKeyPath)) {
-    try { await (await dumpMarket()).refund(); } catch (e: any) { console.log(`INFO  (h) leftover refund from the second wallet failed: ${safe(e?.message ?? e).slice(0, 120)}`); }
+    // S268 (M5): a failed leftover refund is a FAIL line, not INFO
+    try { await (await dumpMarket()).refund(); } catch (e: any) { rec('(h) leftover refund from the second wallet', false, `${safe(e?.message ?? e).slice(0, 120)}`); }
   }
   if (dumpSol > 0) {
     const market = await dumpMarket();
@@ -436,10 +438,12 @@ async function main() {
   // instance locks (P1.1), so it stops trading and releases them first; it trades nothing after this.
   const IL = await import('../server/system/instanceLock');
   const lockPaths = [IL.dbLockPath(workstationDb.getDbPath()), IL.signerLockPath(kp.publicKey.toBase58())].filter((p): p is string => !!p);
-  if (!S.handOverToChildPhases(steps, {
+  if (!(await S.handOverToChildPhases(steps, {
     stopTrading: () => coordinator.cleanup(), isLiveArmed: () => coordinator.isLiveArmed(), disarm: () => coordinator.armLiveTrading(false),
     releaseAllLocks: IL.releaseAllLocks, holdsLock: (p) => IL.readLock(p)?.pid === process.pid, lockPaths,
-  })) return finish();
+    // the coordinator has no public handle on its running exit pass; the harness reads the private field it keeps (read only)
+    exitPassDone: () => (coordinator as any).exitPassInFlight ?? Promise.resolve(),
+  }))) return finish();
   const env = { ...process.env, APEX_E2E_SCRATCH: scratch };
   const self = process.argv[1];
   const run = (p: string) => spawnSync(process.execPath, ['--require', path.resolve('scripts/devnet_guard.cjs'), '--import', 'tsx', self, `--phase=${p}`], { env, encoding: 'utf8', timeout: 240_000 });

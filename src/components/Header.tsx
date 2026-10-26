@@ -137,10 +137,11 @@ export const Header: React.FC<HeaderProps> = ({
     }
   };
 
+  // UI-6: below 1024 px the header wraps onto more rows instead of running off the right edge, so the nav and KILL SWITCH stay reachable
   return (
     <header
       id="apex-header"
-      className="h-16 border-b border-[#1E293B] bg-[#0A0E17]/98 backdrop-blur px-3 sm:px-4 lg:px-6 flex items-center justify-between sticky top-0 z-50 w-full"
+      className="min-h-16 lg:h-16 border-b border-[#1E293B] bg-[#0A0E17]/98 backdrop-blur px-3 sm:px-4 lg:px-6 py-2 lg:py-0 flex flex-wrap lg:flex-nowrap gap-y-2 items-center justify-between sticky top-0 z-50 w-full"
     >
       {/* 1. BRAND & FEED SELECTOR */}
       <div className="flex items-center space-x-2.5 sm:space-x-3 flex-shrink-0">

@@ -192,3 +192,24 @@ describe('5A replay: fills, exits and money from the shared model', () => {
     expect(rep.rules.join(' ')).toMatch(/fee on the buy and on every sell/);
   });
 });
+
+// ---- the studies: realized and open apart, open marks never pick the setting ----------------------------------------------------------
+import { runStudy, keyIndex, type StudyOptions } from '../scripts/hfcorpus/ev_study';
+
+describe('5A studies (R1-100): open marks are reported apart and never pick the best setting on train', () => {
+  afterEach(() => restoreStockEngine());
+  it('a +25% open mark does not beat a take-profit that banked part of it', async () => {
+    const { rows, at } = released();
+    // +25% four seconds after the release, then the data ends: TP1 at +15% sells a third, TP1 at +30% sells nothing; both end open
+    const path = [...rows, at(4_000, 1.25), at(60_000, 1.25)];
+    const o: StudyOptions = { thresholds: [0], sizes: [0.01], splitTs: T0 + 1, solUsd: 150, minTrainEntries: 1, bootstrapResamples: 10, seed: 1 };
+    const { report, totals } = await runStudy({ launches: [{ rec: toRecordedLaunch(launch(path), 150), t0: T0, trades: path }], firstDay: 0, lastDay: 30_000, options: o, source: 'fixture', note: 'n', splitNote: 's' });
+    const s = report.scenarios.find((x) => x.latency === '1.5s/1.5s' && x.cost === 'rpc_1.25')!;
+    expect(s.chosen!.variant).toMatch(/tp15/);
+    expect(s.chosen!.train.openEntries).toBe(1);
+    // on the raw marked EV (open gains included) a tp30 variant would have been chosen: the cap is what changed the pick
+    const d = totals.dims, li = d.lat.findIndex((l) => l.entryMs === 1500 && l.exitMs === 1500), ci = d.costs.findIndex((c) => c.name === 'rpc_1.25');
+    const raw = d.variants.map((v, vi) => ({ v, ev: totals.sum[0][keyIndex(d, 0, li, vi, 0, ci)] }));
+    expect(raw.reduce((a, b) => (b.ev > a.ev ? b : a)).v.tp1).toBe(30);
+  });
+});

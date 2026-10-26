@@ -1,7 +1,7 @@
 import '../hermeticEnv';
 import { replayLaunch, replayCostCase, REPLAY_DEFAULTS, type RecordedLaunch } from '../../server/backtest/replay';
 import {
-  COST_CASES, LATENCIES, VARIANTS, STOCK_VARIANT, latencyName, variantName, priceEntry, priceEntryParts, simulatePath, restoreStockEngine,
+  COST_CASES, LATENCIES, VARIANTS, STOCK_VARIANT, latencyName, variantName, priceEntryParts, simulatePath, restoreStockEngine,
   type TradeRow, type CostCase, type Latency, type Variant,
 } from '../../server/backtest/costModel';
 
@@ -13,7 +13,9 @@ import {
  *   - entries: replayLaunch at every threshold with entryDelayMs 0, which yields the watch-window release for each launch the gate lets in.
  *     The fill, the exits and every cost are then modelled by ev_model.ts, per latency x exit variant (path) and per size x cost case (price).
  *   - selection: for each scenario (latency x cost case) the best (threshold, size, exit variant) by TRAIN EV as % of size, among those with
- *     at least `minTrainEntries` train entries. Nothing on the test side is looked at to choose.
+ *     at least `minTrainEntries` train entries. Nothing on the test side is looked at to choose. 5A: a position still open when the data
+ *     ends counts in selection with any gain above its cost share set to zero, so open marks never pick the setting; the report shows the
+ *     open entries and their marked net apart.
  *   - test: reported once per scenario, for the chosen settings only, with a 90% block-bootstrap interval resampling launch days.
  *   - `combinationsTried` is the size of the selection search (per scenario and in total).
  */
@@ -39,6 +41,10 @@ export interface Totals {
   dims: Dims;
   /** [split 0 train / 1 test][key] */
   count: Float64Array[]; sum: Float64Array[]; wins: Float64Array[];
+  /** 5A (R1-100): positions still open when the data ends, and their marked net (inside `sum` too, reported apart) */
+  openCount: Float64Array[]; openSum: Float64Array[];
+  /** 5A: what selection reads: `sum` with every open mark's gain above its cost share counted as zero, so open marks never pick a setting */
+  selSum: Float64Array[];
   /** test and train per-day sums, keyed [split][key * nDays + day] and counts [split][(thr,lat,var) * nDays + day] */
   daySum: Float64Array[]; dayCount: Float64Array[];
   firstDay: number; nDays: number;
@@ -57,7 +63,7 @@ export function newTotals(dims: Dims, firstDay: number, lastDay: number): Totals
   const nDays = lastDay - firstDay + 1;
   const mk = (n: number) => [new Float64Array(n), new Float64Array(n)];
   return {
-    dims, count: mk(nKeys), sum: mk(nKeys), wins: mk(nKeys), daySum: mk(nKeys * nDays), dayCount: mk(nPaths * nDays), firstDay, nDays,
+    dims, count: mk(nKeys), sum: mk(nKeys), wins: mk(nKeys), openCount: mk(nKeys), openSum: mk(nKeys), selSum: mk(nKeys), daySum: mk(nKeys * nDays), dayCount: mk(nPaths * nDays), firstDay, nDays,
     daysSeen: [new Set(), new Set()], launches: 0, releasedLaunches: 0, noFill: dims.lat.map(() => 0), legacyChecked: 0, legacyDiffer: 0,
   };
 }
@@ -84,10 +90,15 @@ export function addLaunch(t: Totals, l: StudyLaunch, o: StudyOptions): void {
         const path = simulatePath(l.trades, releaseTs, d.lat[li], d.variants[vi]);
         if (!path) { if (vi === 0) t.noFill[li] += thrIdx.length; continue; }
         for (let si = 0; si < d.sizes.length; si++) for (let ci = 0; ci < d.costs.length; ci++) {
-          const pnl = priceEntry(l.trades, path, d.sizes[si], d.costs[ci]);
+          const m = priceEntryParts(l.trades, path, d.sizes[si], d.costs[ci]);
+          const pnl = m.netSol;
+          const open = m.openFraction > 0;
+          const sel = open ? pnl - Math.max(0, m.openMarkSol - d.sizes[si] * m.openFraction) : pnl;
           for (const ti of thrIdx) {
             const k = keyIndex(d, ti, li, vi, si, ci);
             t.count[split][k]++; t.sum[split][k] += pnl; if (pnl > 0) t.wins[split][k]++;
+            t.selSum[split][k] += sel;
+            if (open) { t.openCount[split][k]++; t.openSum[split][k] += pnl; }
             t.daySum[split][k * t.nDays + day] += pnl;
           }
         }
@@ -146,12 +157,20 @@ export function bootstrapEv(t: Totals, split: number, ti: number, li: number, vi
   return { lo: at(0.05), hi: at(0.95), resamples: evs.length, days: days.length };
 }
 
-export interface Cell { entries: number; evSol: number; evPct: number; winRate: number | null }
+/**
+ * evSol / evPct: all entries, open ones marked at the end. 5A: openEntries and openNetSol (their total) say how much of that is open marks;
+ * selEvPct is what selection compares (open gains above cost counted as zero).
+ */
+export interface Cell { entries: number; evSol: number; evPct: number; winRate: number | null; openEntries: number; openNetSol: number; selEvPct: number }
 export function cell(t: Totals, split: number, ti: number, li: number, vi: number, si: number, ci: number): Cell {
   const k = keyIndex(t.dims, ti, li, vi, si, ci);
   const n = t.count[split][k];
   const ev = n ? t.sum[split][k] / n : 0;
-  return { entries: n, evSol: ev, evPct: (ev / t.dims.sizes[si]) * 100, winRate: n ? t.wins[split][k] / n : null };
+  const size = t.dims.sizes[si];
+  return {
+    entries: n, evSol: ev, evPct: (ev / size) * 100, winRate: n ? t.wins[split][k] / n : null,
+    openEntries: t.openCount[split][k], openNetSol: t.openSum[split][k], selEvPct: n ? (t.selSum[split][k] / n / size) * 100 : 0,
+  };
 }
 
 export interface Chosen {
@@ -171,7 +190,7 @@ export function selectAndReport(t: Totals, o: StudyOptions): { scenarios: Scenar
     for (let ti = 0; ti < d.thr.length; ti++) for (let vi = 0; vi < d.variants.length; vi++) for (let si = 0; si < d.sizes.length; si++) {
       const c = cell(t, 0, ti, li, vi, si, ci);
       if (c.entries < o.minTrainEntries) continue;
-      if (!best || c.evPct > best.evPct) best = { ti, vi, si, evPct: c.evPct };
+      if (!best || c.selEvPct > best.evPct) best = { ti, vi, si, evPct: c.selEvPct }; // 5A: open marks never pick the setting
     }
     if (!best) { scenarios.push({ latency: latencyName(d.lat[li]), cost: d.costs[ci].name, combinationsTried: per, chosen: null }); continue; }
     const { ti, vi, si } = best;
@@ -224,12 +243,13 @@ export function renderMarkdown(r: Report, t: Totals, grid: { latency: string; va
   L.push(`Built-in check: this model vs the in-app replayLaunch at its defaults: ${r.validation.checked} entries compared, ${r.validation.differ} differ.`, '');
   L.push('## Cost cases', '', ...r.costCases.map((c) => `- \`${c.name}\`: ${c.note}`), '');
   L.push('## Chosen settings per scenario (entry delay / exit delay x cost case)', '');
-  L.push(row(['latency', 'cost', 'thr', 'size SOL', 'exit variant', 'train n', 'train EV %', 'test n', 'test EV SOL', 'test EV %', 'test 90% CI % (block bootstrap)']));
-  L.push(row(Array(11).fill('---')));
+  L.push('EV counts every entry; a position still open when the data ends is marked at the last price with its sell cost. The "open" columns say how many entries and how much of the net are such marks; selection never counts an open gain above cost.', '');
+  L.push(row(['latency', 'cost', 'thr', 'size SOL', 'exit variant', 'train n', 'train EV %', 'test n', 'test open n', 'test open net SOL', 'test EV SOL', 'test EV %', 'test 90% CI % (block bootstrap)']));
+  L.push(row(Array(13).fill('---')));
   for (const s of r.scenarios) {
     const c = s.chosen;
-    if (!c) { L.push(row([s.latency, s.cost, '-', '-', '-', '<min', '-', '-', '-', '-', '-'])); continue; }
-    L.push(row([s.latency, s.cost, c.threshold, c.sizeSol, c.variant, c.train.entries, fmtPct(c.train.evPct), c.test.entries, fmtSol(c.test.evSol), fmtPct(c.test.evPct), c.testCi90Pct ? `${fmtPct(c.testCi90Pct.lo)} .. ${fmtPct(c.testCi90Pct.hi)}` : 'n/a']));
+    if (!c) { L.push(row([s.latency, s.cost, '-', '-', '-', '<min', '-', '-', '-', '-', '-', '-', '-'])); continue; }
+    L.push(row([s.latency, s.cost, c.threshold, c.sizeSol, c.variant, c.train.entries, fmtPct(c.train.evPct), c.test.entries, c.test.openEntries, fmtSol(c.test.openNetSol), fmtSol(c.test.evSol), fmtPct(c.test.evPct), c.testCi90Pct ? `${fmtPct(c.testCi90Pct.lo)} .. ${fmtPct(c.testCi90Pct.hi)}` : 'n/a']));
   }
   L.push('', '## Gross edge before costs, and what each cost takes (chosen settings of the rpc_1.25 scenario at each latency; EV per entry as % of size)', '');
   L.push(row(['latency', 'thr', 'size', 'variant', 'split', ...d.costs.map((c) => c.name)]));
@@ -256,10 +276,10 @@ export function renderMarkdown(r: Report, t: Totals, grid: { latency: string; va
 /** CSV of the full grid, both splits: one line per threshold x size x latency x cost x exit variant. */
 export function gridCsv(t: Totals, source: string): string {
   const d = t.dims;
-  const out = ['source,split,threshold,size_sol,entry_delay_s,exit_delay_s,cost,exit_variant,entries,ev_sol,ev_pct,win_rate'];
+  const out = ['source,split,threshold,size_sol,entry_delay_s,exit_delay_s,cost,exit_variant,entries,ev_sol,ev_pct,win_rate,open_entries,open_net_sol'];
   for (let split = 0; split < 2; split++) for (let ti = 0; ti < d.thr.length; ti++) for (let li = 0; li < d.lat.length; li++) for (let vi = 0; vi < d.variants.length; vi++) for (let si = 0; si < d.sizes.length; si++) for (let ci = 0; ci < d.costs.length; ci++) {
     const c = cell(t, split, ti, li, vi, si, ci);
-    out.push([JSON.stringify(source), split ? 'test' : 'train', d.thr[ti], d.sizes[si], d.lat[li].entryMs / 1000, d.lat[li].exitMs / 1000, d.costs[ci].name, variantName(d.variants[vi]), c.entries, c.evSol.toFixed(8), c.evPct.toFixed(4), c.winRate === null ? '' : c.winRate.toFixed(4)].join(','));
+    out.push([JSON.stringify(source), split ? 'test' : 'train', d.thr[ti], d.sizes[si], d.lat[li].entryMs / 1000, d.lat[li].exitMs / 1000, d.costs[ci].name, variantName(d.variants[vi]), c.entries, c.evSol.toFixed(8), c.evPct.toFixed(4), c.winRate === null ? '' : c.winRate.toFixed(4), c.openEntries, c.openNetSol.toFixed(8)].join(','));
   }
   return out.join('\n') + '\n';
 }

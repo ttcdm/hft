@@ -504,7 +504,7 @@ describe('Milestone 1 Empirical Adversarial Challenge Suite', () => {
       const conn = mockRpc.createConnection();
       const dummyUser = new PublicKey('4Nd1mBQtrMJVYVfKf2PJy9NZWsWC89S2qMTrE57sR8Q1');
 
-      // Attempting to build on non-existent or zero liquidity pool fails closed
+      // Attempting to build on non-existent or zero liquidity pool fails closed (3H/A12: the buy builder refuses before reading the pool)
       await expect(
         PumpSwapVenueService.buildPumpSwapBuyInstructions(
           conn,
@@ -514,7 +514,7 @@ describe('Milestone 1 Empirical Adversarial Challenge Suite', () => {
           800,
           'LIVE'
         )
-      ).rejects.toThrow(/PUMPSWAP_POOL_NOT_FOUND/);
+      ).rejects.toThrow(/PUMPSWAP_BUY_NOT_SUPPORTED/);
 
       await expect(
         PumpSwapVenueService.buildPumpSwapSellInstructions(

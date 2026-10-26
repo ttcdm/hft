@@ -464,18 +464,16 @@ describe('Empirical Adversarial Challenger Suite: Protocol & Execution Correctne
       );
     });
 
-    it('2.2: PumpSwapVenueService.buildPumpSwapBuyInstructions throws CRITICAL_CONFIG_ERROR when executionMode is omitted or invalid', async () => {
+    it('2.2: PumpSwapVenueService.buildPumpSwapBuyInstructions refuses in every mode (3H/A12: the builder is not built)', async () => {
       const conn = mockRpc.createConnection();
       const user = Keypair.generate().publicKey;
       const mint = VALID_PUMP_MINT_1;
 
-      await expect(
-        PumpSwapVenueService.buildPumpSwapBuyInstructions(conn, user, mint, 10_000_000n, 800, undefined as any)
-      ).rejects.toThrow(/CRITICAL_CONFIG_ERROR.*executionMode/);
-
-      await expect(
-        PumpSwapVenueService.buildPumpSwapBuyInstructions(conn, user, mint, 10_000_000n, 800, 'MOCK' as any)
-      ).rejects.toThrow(/CRITICAL_CONFIG_ERROR.*executionMode/);
+      for (const mode of [undefined as any, 'MOCK' as any, 'LIVE', 'PAPER']) {
+        await expect(
+          PumpSwapVenueService.buildPumpSwapBuyInstructions(conn, user, mint, 10_000_000n, 800, mode)
+        ).rejects.toThrow(/PUMPSWAP_BUY_NOT_SUPPORTED/);
+      }
     });
 
     it('2.3: PumpSwapVenueService.buildPumpSwapSellInstructions throws CRITICAL_CONFIG_ERROR when executionMode is omitted or invalid', async () => {

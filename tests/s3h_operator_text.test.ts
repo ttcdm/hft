@@ -301,3 +301,17 @@ describe('3H A2/A3: the Sniper tab has no input that does nothing, and says what
     expect(src).toContain('{jitoUseText(jitoStatus).tipLabel}');
   });
 });
+
+describe('3H A12: the PumpSwap buy builder refuses instead of building a wrong instruction', () => {
+  it('calling it throws PUMPSWAP_BUY_NOT_SUPPORTED without touching the RPC, and nothing in the app calls it', async () => {
+    const { Connection, Keypair } = await import('@solana/web3.js');
+    const { PumpSwapVenueService } = await import('../server/solana/pumpSwapService');
+    const conn = new Connection('http://127.0.0.1:9');
+    const read = vi.spyOn(conn, 'getAccountInfo');
+    await expect(PumpSwapVenueService.buildPumpSwapBuyInstructions(conn, Keypair.generate().publicKey, Keypair.generate().publicKey, 1_000_000n, 800, 'PAPER')).rejects.toThrow(/PUMPSWAP_BUY_NOT_SUPPORTED/);
+    expect(read).not.toHaveBeenCalled();
+    const prod = ['server.ts', ...fs.readdirSync('server', { recursive: true }).map((f) => `server/${f}`).filter((f) => f.endsWith('.ts'))];
+    const callers = prod.filter((f) => f !== 'server/solana/pumpSwapService.ts' && fs.readFileSync(f, 'utf8').includes('buildPumpSwapBuyInstructions'));
+    expect(callers).toEqual([]);
+  });
+});

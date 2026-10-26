@@ -20,3 +20,11 @@ describe('3H B1: the Binance market routes left over from the BTC market maker a
     expect(fs.existsSync('server/market/marketRoutes.ts')).toBe(false);
   });
 });
+
+describe('3H B2: the fake PCAP export route is gone', () => {
+  it('no /api/export/packets route, and no screen asks for one', () => {
+    expect(serverRoutes().filter((r) => r.includes('/api/export/'))).toEqual([]);
+    const ui = fs.readdirSync('src', { recursive: true }).map(String).filter((f) => /\.(ts|tsx)$/.test(f));
+    for (const f of ui) expect(fs.readFileSync(`src/${f}`, 'utf8'), f).not.toContain('/api/export/packets');
+  });
+});

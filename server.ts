@@ -569,28 +569,7 @@ Answer with: 1. What the state shows (cite the check or counter), 2. What looks 
   }
 }));
 
-// 6. Raw Packet Logs Exporter (PCAP-JSON formatted)
-app.post('/api/export/packets', requireOperatorAuth, (req, res) => {
-  const { logs } = req.body;
-  const rawData = {
-    pcapHeader: {
-      magicNumber: '0xa1b2c3d4',
-      versionMajor: 2,
-      versionMinor: 4,
-      thisZone: 0,
-      sigFigs: 0,
-      snapLen: 65535,
-      network: 1, // Ethernet
-    },
-    exportTimestamp: new Date().toISOString(),
-    packetsCount: logs?.length || 0,
-    packets: logs || [],
-  };
-
-  res.setHeader('Content-Type', 'application/json');
-  res.setHeader('Content-Disposition', 'attachment; filename="apex_hft_packet_stream.json"');
-  res.send(JSON.stringify(rawData, null, 2));
-});
+// 6. (removed, 3H/B2) /api/export/packets wrapped whatever the client posted in made-up PCAP header fields; no screen called it.
 
 // ============================================================================
 // 12. SOCIAL SCANNER (TELEGRAM & X.COM) ALPHA INTELLIGENCE ENDPOINTS

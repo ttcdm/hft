@@ -659,10 +659,15 @@ export class AutoSnipeController extends EventEmitter {
     if (this.busy || executionCoordinator.hasTradeInFlight()) return null; // a trade started during the balance read
     const bal = executionCoordinator.getRealWalletBalanceSol();
     if (bal === null || bal === undefined) return null;
+    // 3B (P3.2, R1-62): LIVE buys sent and still unresolved are in flight too, for as long as they stay unresolved (a buy that returned
+    // UNCONFIRMED, any caller, any process). A drop up to their worst case is held as theirs and the old mark is kept, so the look after
+    // orphan recovery journals the buy spans both. Unreadable: skip this look, keep the mark.
+    const unresolved = executionCoordinator.getUnresolvedLiveBuys({ includeOwnInFlight: true });
+    if (unresolved === null) return null;
     const prev = this.walletMark;
-    this.walletMark = { sol: bal, ts: now };
+    if (!prev || unresolved.mints.length === 0) this.walletMark = { sol: bal, ts: now };
     if (!prev) return null;
-    const audit = auditWalletChange(prev.sol, bal, workstationDb.sumDecisionSolDelta(prev.ts, now));
+    const audit = auditWalletChange(prev.sol, bal, workstationDb.sumDecisionSolDelta(prev.ts, now), { worstCaseSol: unresolved.reservedSol, count: unresolved.mints.length });
     if (!audit.explained) {
       const reason = `wallet changed by an unexplained ${audit.unexplainedSol.toFixed(6)} SOL (tolerance ${audit.toleranceSol.toFixed(6)})`;
       executionCoordinator.haltAll(reason);

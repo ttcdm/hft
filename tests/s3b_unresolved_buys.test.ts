@@ -255,6 +255,53 @@ describe('3B: unresolved LIVE buys count everywhere; the wallet audit knows them
     expect(snipe).toHaveBeenCalledTimes(1);
   });
 
+  it('R1-62, R1-38: an auto buy whose getTransaction is null, balance down 0.0075: held, not halted; recovery journals it once and the audit explains it', async () => {
+    const bal = await armAuto();
+    const t0 = Date.now();
+    expect(await autoSnipeController.auditWallet(t0)).toBeNull(); // the first look sets the mark
+
+    // the auto buy landed; its fill could not be read (getTransaction null), so its row is RECONCILIATION_REQUIRED and nothing is journaled
+    const mint = Keypair.generate().publicKey;
+    build.mockImplementation(async () => signedTx(conn) as any);
+    vi.spyOn(conn, 'getTransaction').mockResolvedValue(null);
+    const a = await coordinator.executeTrade(buyReq(mint.toBase58()));
+    expect(a.lifecycleState, a.error).toBe('RECONCILIATION_REQUIRED');
+    expect(workstationDb.hasUnresolvedLiveBuy(mint.toBase58())).toBe(true);
+
+    const halt = vi.spyOn(executionCoordinator, 'haltAll');
+    const delta = 7_500_000;
+    bal.mockReturnValue(1 - delta / SOL);
+    const held = await autoSnipeController.auditWallet(t0 + 1);
+    expect(held?.explained).toBe(true);
+    expect(halt).not.toHaveBeenCalled();
+    expect(autoSnipeController.getMode()).toBe('DEVNET_LIVE');
+
+    // orphan recovery reads the landed buy and adopts it: one LIVE_BUY_FILLED row with the whole wallet delta
+    vi.spyOn(conn, 'getTransaction').mockResolvedValue(landedBuy(wallet.publicKey, mint, delta) as any);
+    const rec = await coordinator.recoverOrphanedBuys();
+    expect(rec.recovered).toEqual([a.txSignature]);
+    await coordinator.recoverOrphanedBuys(); // idempotent: already RECONCILED, journals nothing more
+    const rows = workstationDb.loadDecisions({ mint: mint.toBase58(), outcome: LIVE_BUY_FILLED });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].solDelta).toBeCloseTo(-delta / SOL, 12);
+    expect(workstationDb.sumDecisionSolDelta(t0, Date.now() + 1).delta).toBeCloseTo(-delta / SOL, 12);
+
+    const after = await autoSnipeController.auditWallet(Date.now() + 2);
+    expect(after?.explained).toBe(true);
+    expect(after?.unexplainedSol).toBeCloseTo(0, 9);
+    expect(halt).not.toHaveBeenCalled();
+    expect(executionCoordinator.getHaltReason()).toBeNull();
+  });
+
+  it('R1-62: a drop larger than the unresolved buys can take still halts', () => {
+    const journal = { delta: 0, gross: 0, count: 0 };
+    const unresolved = { worstCaseSol: 0.0075, count: 1 };
+    expect(auditWalletChange(1, 1 - 0.0075, journal, unresolved)).toMatchObject({ explained: true, heldByUnresolved: true });
+    expect(auditWalletChange(1, 1 - 0.0075, journal).explained).toBe(false); // the same drop with nothing unresolved
+    expect(auditWalletChange(1, 1 - 0.0075 - WALLET_AUDIT_RENT_ALLOWANCE_SOL - 0.01, journal, unresolved).explained).toBe(false);
+    expect(auditWalletChange(1, 1.01, journal, unresolved).explained).toBe(false); // a rise is never an unresolved buy
+  });
+
   it('R1-38: a manual LIVE buy during DEVNET_LIVE journals its wallet delta once and does not halt', async () => {
     const bal = await armAuto();
     const t0 = Date.now();

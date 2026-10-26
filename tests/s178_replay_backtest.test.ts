@@ -241,7 +241,9 @@ describe('S190: the replay measures time to peak from the release over recorded 
     const b = Object.fromEntries(rep.peakAnalysis.buckets.map((x) => [x.label, x]));
     expect(b['60 to 180 min'].launches).toBe(1);
     expect(b['60 to 180 min'].peakAtLeast2x).toBe(1);
-    expect(rep.peakAnalysis.late.peakAfter60MinAtLeast2x).toBe(1);
+    // 5C (R1-108): 75 min of data is in the 60-minute denominator, not the 180-minute one, and each count follows its denominator
+    expect(rep.peakAnalysis.late.peakAfter30MinAtLeast2x).toBe(1);
+    expect(rep.peakAnalysis.late.peakAfter60MinAtLeast2x).toBe(0);
     expect(mint).toBe(withLate.mint);
   });
   it('a launch with nothing recorded after the release has no peak', () => {

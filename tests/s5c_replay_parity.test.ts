@@ -96,3 +96,29 @@ describe('5C (R1-61): the replay scores the creator as live does without a repor
     expect(none.creatorRiskScore).toBe(0);
   });
 });
+
+// ---- the peak analysis -----------------------------------------------------------------------------------------------------------------
+import { analysePeaks, type ReplayedLaunch } from '../server/backtest/replay';
+
+describe('5C (R1-108): the late-spike counts and their "of" are the same launches', () => {
+  const MIN = 60_000;
+  const row = (timeToPeakMin: number, observedMin: number, multiple: number): ReplayedLaunch => ({
+    mint: `m${timeToPeakMin}-${observedMin}`, symbol: 'P', trades: 10, verdict: 'READY', verdictReason: '', releasedAfterMs: 120_000, score: 70, entered: false, noEntryReason: null,
+    outcome: 'NO_ENTRY', entryPriceSol: null, exits: [], holdMs: null, netPnlSol: null, openValueSol: null,
+    peak: { refPriceSol: 1, peakPriceSol: multiple, peakMultiple: multiple, timeToPeakMs: timeToPeakMin * MIN, observedMs: observedMin * MIN },
+  });
+
+  it('a 2x peak at 35 min with 40 min observed counts 0 when no launch has 60+ min of data', () => {
+    const a = analysePeaks([row(35, 40, 2.5), row(5, 20, 3)]);
+    expect(a.late.ofLaunchesWithAtLeast60MinData).toBe(0);
+    expect(a.late.peakAfter30MinAtLeast2x).toBe(0);
+  });
+
+  it('a late peak counts only where the recording reaches the denominator\'s length (and likewise for 60 / 180 min)', () => {
+    const a = analysePeaks([row(35, 40, 2.5), row(45, 70, 2.5), row(50, 90, 1.5), row(70, 120, 4), row(90, 200, 3)]);
+    expect(a.late.ofLaunchesWithAtLeast60MinData).toBe(4);
+    expect(a.late.peakAfter30MinAtLeast2x).toBe(3); // 45/70, 70/120, 90/200; not 35/40 (40 min observed), not 50/90 (1.5x)
+    expect(a.late.ofLaunchesWithAtLeast180MinData).toBe(1);
+    expect(a.late.peakAfter60MinAtLeast2x).toBe(1); // 90/200; not 70/120 (120 min observed)
+  });
+});

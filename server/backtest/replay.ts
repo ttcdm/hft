@@ -132,7 +132,7 @@ export interface PeakAnalysis {
   /** launches whose recorded data reaches at least this long past the release: a late spike can only be seen where the recording is long enough */
   coverage: { atLeast30Min: number; atLeast60Min: number; atLeast180Min: number };
   buckets: Array<{ label: string; launches: number; medianPeakMultiple: number | null; peakAtLeast2x: number; peakAtLeast5x: number }>;
-  /** the question behind it: how often does the best price come late, and is it a real move */
+  /** the question behind it: how often does the best price come late, and is it a real move. Each count is out of the launches in its "of" (5C). */
   late: { peakAfter30MinAtLeast2x: number; ofLaunchesWithAtLeast60MinData: number; peakAfter60MinAtLeast2x: number; ofLaunchesWithAtLeast180MinData: number };
   caveats: string[];
 }
@@ -200,9 +200,10 @@ export function analysePeaks(rows: ReplayedLaunch[]): PeakAnalysis {
     coverage: { atLeast30Min: cover(30), atLeast60Min: cover(60), atLeast180Min: cover(180) },
     buckets,
     late: {
-      peakAfter30MinAtLeast2x: peaks.filter((p) => min(p.timeToPeakMs) >= 30 && p.peakMultiple >= 2).length,
+      // 5C (R1-108): the count and its "of" are the same launches: only those recorded long enough to be in the denominator
+      peakAfter30MinAtLeast2x: peaks.filter((p) => min(p.observedMs) >= 60 && min(p.timeToPeakMs) >= 30 && p.peakMultiple >= 2).length,
       ofLaunchesWithAtLeast60MinData: cover(60),
-      peakAfter60MinAtLeast2x: peaks.filter((p) => min(p.timeToPeakMs) >= 60 && p.peakMultiple >= 2).length,
+      peakAfter60MinAtLeast2x: peaks.filter((p) => min(p.observedMs) >= 180 && min(p.timeToPeakMs) >= 60 && p.peakMultiple >= 2).length,
       ofLaunchesWithAtLeast180MinData: cover(180),
     },
     caveats: [

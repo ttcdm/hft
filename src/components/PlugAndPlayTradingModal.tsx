@@ -40,6 +40,7 @@ import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExtern
 import { authFetch } from '../services/engineClient';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
 import { positionPnlCell } from '../utils/positionPnl';
+import { BELOW_HEADER_TOP } from '../utils/headerOffset';
 
 interface PlugAndPlayTradingModalProps {
   isOpen: boolean;
@@ -294,7 +295,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   if (!isOpen) return null;
 
   return (
-    <div className="fixed top-16 inset-x-0 bottom-0 z-40 flex items-start justify-center bg-black/85 backdrop-blur-md p-2 sm:p-4 overflow-y-auto font-sans">
+    <div className={`fixed ${BELOW_HEADER_TOP} inset-x-0 bottom-0 z-40 flex items-start justify-center bg-black/85 backdrop-blur-md p-2 sm:p-4 overflow-y-auto font-sans`}>
       <div className="bg-slate-900 border border-slate-700/80 rounded-2xl w-full max-w-5xl shadow-2xl overflow-hidden my-2 sm:my-4">
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800 bg-slate-950/90 gap-3">

@@ -66,6 +66,7 @@ import { engineClient } from '../services/engineClient';
 import { hftAudio } from '../utils/audio';
 import { PumpFunHotCalloutsView } from './PumpFunHotCalloutsView';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
+import { BELOW_HEADER_TOP } from '../utils/headerOffset';
 
 /**
  * P1.4 (N-12): the sniper tab's header. The auto mode shown is the auto controller's own (GET /api/auto/status), read-only: the
@@ -453,7 +454,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   });
 
   return (
-    <div className="fixed top-16 inset-x-0 bottom-0 z-40 flex items-start justify-center bg-black/85 backdrop-blur-md p-2 sm:p-4 overflow-y-auto">
+    <div className={`fixed ${BELOW_HEADER_TOP} inset-x-0 bottom-0 z-40 flex items-start justify-center bg-black/85 backdrop-blur-md p-2 sm:p-4 overflow-y-auto`}>
       <div className="relative w-full max-w-7xl bg-[#0B101D] border border-[#1E293B] rounded-2xl shadow-2xl flex flex-col my-2 sm:my-3 text-slate-200">
         {/* HEADER BAR */}
         <div className="px-5 py-4 border-b border-[#1E293B] bg-[#0E1526] flex flex-wrap items-center justify-between gap-3">

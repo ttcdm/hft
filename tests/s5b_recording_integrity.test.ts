@@ -147,3 +147,71 @@ describe('5B: pruning keeps the funder facts surviving launches need (R1-92)', (
     expect(collapsedBuyers(r.db, r.second)).toBe(1);
   });
 });
+
+/** Every SQL text prepared while `fn` runs, with SQLite's query plan for it (EXPLAIN QUERY PLAN on the same connection). */
+function plansWhile(fn: () => void): Array<{ sql: string; plan: string[] }> {
+  const orig = DatabaseSync.prototype.prepare;
+  const seen: Array<{ sql: string; plan: string[] }> = [];
+  const spy = vi.spyOn(DatabaseSync.prototype, 'prepare').mockImplementation(function (this: DatabaseSync, sql: string) {
+    if (!/^\s*EXPLAIN/i.test(sql)) seen.push({ sql, plan: (orig.call(this, `EXPLAIN QUERY PLAN ${sql}`).all() as any[]).map((r) => String(r.detail)) });
+    return orig.call(this, sql);
+  } as any);
+  try { fn(); } finally { spy.mockRestore(); }
+  return seen;
+}
+/** A plan step that reads a whole table or a whole index of one of the big tables. */
+const fullScans = (plans: Array<{ plan: string[] }>) => plans.flatMap((p) => p.plan).filter((d) => /^SCAN (launch_recording|system_journal)\b/.test(d));
+
+describe('5B: status counters live in memory; the journal is read by index (R1-93, R1-107)', () => {
+  it('the recording status reads no table, and its counts match a fresh read of the table after writes and prunes', () => {
+    const r = recorder({ mintMs: 10 * 60_000, maxTradesPerMint: 3 });
+    const a = wallet(); const b = wallet();
+    r.rec.onCreate(createEvent(a) as any);
+    for (let i = 1; i <= 5; i++) { r.at(i * 1000); r.rec.onTrade(trade(a, i) as any); } // 3 trades and END/TRADE_CAP
+    r.rec.onFunder({ wallet: wallet(), funder: wallet() });
+    r.at(60_000); r.rec.onCreate(createEvent(b) as any);
+    r.at(61_000); r.rec.onTrade(trade(b, 1) as any);
+    expect(plansWhile(() => r.db.getLaunchRecordingStatus()).filter((p) => /launch_recording/i.test(p.sql))).toEqual([]);
+    const reopened = () => new WorkstationDatabase(r.file).getLaunchRecordingStatus();
+    expect(r.db.getLaunchRecordingStatus()).toEqual(reopened());
+    expect(r.db.getLaunchRecordingStatus()).toMatchObject({ launches: 2, events: 8, launchRows: 7, funderRows: 1, endedLaunches: 1, oldestTs: t0, newestTs: t0 + 61_000, newestCreateTs: t0 + 60_000 });
+    // a prune by row count drops the oldest launch rows; the counts follow it without a COUNT(*)
+    const pruned = plansWhile(() => r.db.pruneLaunchRecording(14, 2, t0 + 62_000));
+    expect(pruned.some((p) => /COUNT\(\*\)/i.test(p.sql))).toBe(false);
+    expect(r.db.getLaunchRecordingStatus()).toEqual(reopened());
+    expect(r.db.getLaunchRecordingStatus()).toMatchObject({ launches: 1, launchRows: 2, funderRows: 1, endedLaunches: 0, newestCreateTs: t0 + 60_000 });
+  });
+
+  it('rows another connection writes to the file are counted at the next status read', () => {
+    const r = recorder({ mintMs: 10 * 60_000, maxTradesPerMint: 100 });
+    expect(r.db.getLaunchRecordingStatus().launches).toBe(0);
+    const other = new WorkstationDatabase(r.file);
+    for (let i = 0; i < 3; i++) other.recordLaunchEvent(t0 + i, `M${i}`, 'CREATE', {});
+    expect(r.db.getLaunchRecordingStatus()).toMatchObject({ launches: 3, newestCreateTs: t0 + 2 });
+  });
+
+  it('EXPLAIN QUERY PLAN: the 5-second unverified-fill read uses the system_journal(event_type) index', () => {
+    const { db } = scratchDb();
+    db.logJournal('PAPER_FILL_GATES', 'c1', 'PAPER', { positionId: 'p1' });
+    const plans = plansWhile(() => db.getUnverifiedFillIds());
+    expect(plans.length).toBeGreaterThan(0);
+    for (const p of plans) expect(p.plan.join(' | ')).toMatch(/USING (COVERING )?INDEX idx_journal_event_type \(event_type=\?\)/);
+  });
+
+  it('System checks\' recorder row reads no whole table (seeded recording and journal)', async () => {
+    const { workstationDb } = await import('../server/db/database');
+    const { recorderCheck } = await import('../server/system/systemChecks');
+    const win: any = Object.assign(new EventEmitter(), { isWatching: () => true });
+    let now = Date.now();
+    const rec = new LaunchRecorder(workstationDb, win, () => 150, () => now, { mintMs: 10 * 60_000, maxTradesPerMint: 50, retentionDays: 14, maxRows: 1_000_000 });
+    vi.spyOn(workstationDb, 'pruneLaunchRecording').mockReturnValue(0);
+    for (let l = 0; l < 20; l++) {
+      const m = wallet();
+      rec.onCreate(createEvent(m) as any);
+      for (let i = 0; i < 30; i++) { now += 100; rec.onTrade(trade(m, i) as any); }
+    }
+    const plans = plansWhile(() => recorderCheck(now + 3_600_000));
+    expect(fullScans(plans)).toEqual([]);
+    rec.detach();
+  });
+});

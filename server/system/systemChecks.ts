@@ -140,17 +140,18 @@ export function recorderCheck(now: number): SystemCheck {
   const st = workstationDb.getLaunchRecordingStatus();
   if (!rateCache || now - rateCache.at > 30_000) rateCache = { at: now, rows: workstationDb.getLaunchRecordingRows(now - 3_600_000) };
   const perHour = rateCache.rows;
-  const room = rt.config.maxRows - st.events;
+  // 5B: the row limit applies to launch rows; funder facts are kept outside it (they are never pruned)
+  const room = rt.config.maxRows - st.launchRows;
   const hoursLeft = perHour > 0 ? Math.max(0, room) / perHour : null;
   const days = (h: number) => (h / 24).toFixed(1);
   const spanDays = st.oldestTs !== null && st.newestTs !== null ? (st.newestTs - st.oldestTs) / 86_400_000 : 0;
   const pruned = rt.prunedRows > 0;
-  const nearFull = st.events >= rt.config.maxRows * 0.8;
+  const nearFull = st.launchRows >= rt.config.maxRows * 0.8;
   const limits = `window ${Math.round(rt.config.mintMs / 60_000)} min per launch, up to ${rt.config.maxTradesPerMint} trades each; keeps ${rt.config.maxRows} rows (about ${(rt.config.maxRows * 333 / 1e9).toFixed(1)} GB) and ${rt.config.retentionDays} days`;
   return {
     id: 'recorder', label: 'Launch recorder (backtest data)',
     status: pruned || nearFull ? 'WARN' : 'OK',
-    value: `${st.launches} launches, ${st.events} of ${rt.config.maxRows} rows${pruned ? `, PRUNING (${rt.prunedRows} dropped)` : ''}`,
-    detail: `${limits}. Last hour: ${perHour} rows${hoursLeft === null ? '' : `, so about ${days(hoursLeft)} days until the row limit at this rate`}. Recorded span so far: ${spanDays.toFixed(1)} days. ${pruned ? `Pruning started ${new Date(rt.firstPruneAt as number).toISOString()}: the OLDEST launches are being dropped; raise APEX_RECORD_MAX_ROWS or APEX_RECORD_RETENTION_DAYS to keep them.` : nearFull ? 'Over 80% of the row limit: the oldest launches will start to be dropped soon. Raise APEX_RECORD_MAX_ROWS to keep them.' : 'Nothing has been pruned.'}`,
+    value: `${st.launches} launches, ${st.launchRows} of ${rt.config.maxRows} rows${pruned ? `, PRUNING (${rt.prunedRows} dropped)` : ''}`,
+    detail: `${limits}. ${st.endedLaunches} of ${st.launches} launches have an end marker (trade cap, window or curve complete); the rest are still recording or were cut off by a stop. ${st.funderRows} funder facts are kept outside the row limit (never pruned). Last hour: ${perHour} rows${hoursLeft === null ? '' : `, so about ${days(hoursLeft)} days until the row limit at this rate`}. Recorded span so far: ${spanDays.toFixed(1)} days. ${pruned ? `Pruning started ${new Date(rt.firstPruneAt as number).toISOString()}: the OLDEST launches are being dropped; raise APEX_RECORD_MAX_ROWS or APEX_RECORD_RETENTION_DAYS to keep them.` : nearFull ? 'Over 80% of the row limit: the oldest launches will start to be dropped soon. Raise APEX_RECORD_MAX_ROWS to keep them.' : 'Nothing has been pruned.'}`,
   };
 }

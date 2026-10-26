@@ -87,7 +87,7 @@ describe('S190 System checks shows the recorder against its limits', () => {
     const win: any = Object.assign(new EventEmitter(), { isWatching: () => true });
     const now = Date.now();
     const rec = new LaunchRecorder({ recordLaunchEvent: () => true, pruneLaunchRecording: () => 0 } as any, win, () => 150, () => now, { mintMs: 180 * 60_000, maxTradesPerMint: 100, retentionDays: 14, maxRows: 10_000 });
-    const status = vi.spyOn(workstationDb, 'getLaunchRecordingStatus').mockReturnValue({ launches: 7, events: 100, oldestTs: now - 86_400_000, newestTs: now });
+    const status = vi.spyOn(workstationDb, 'getLaunchRecordingStatus').mockReturnValue({ launches: 7, events: 100, launchRows: 100, funderRows: 0, endedLaunches: 0, oldestTs: now - 86_400_000, newestTs: now, newestCreateTs: now });
     vi.spyOn(workstationDb, 'getLaunchRecordingRows').mockReturnValue(100);
     const ok = recorderCheck(now + 60_000); // past the 30 s rate cache of any earlier call
     expect(ok.status).toBe('OK');
@@ -95,7 +95,7 @@ describe('S190 System checks shows the recorder against its limits', () => {
     expect(ok.detail).toMatch(/window 180 min per launch/);
     expect(ok.detail).toMatch(/Last hour: 100 rows, so about 4\.1 days until the row limit/); // 9,900 rows left at 100 an hour
     expect(ok.detail).toMatch(/Nothing has been pruned/);
-    status.mockReturnValue({ launches: 70, events: 8_500, oldestTs: now - 86_400_000, newestTs: now });
+    status.mockReturnValue({ launches: 70, events: 8_500, launchRows: 8_500, funderRows: 0, endedLaunches: 0, oldestTs: now - 86_400_000, newestTs: now, newestCreateTs: now });
     const near = recorderCheck(now + 120_000);
     expect(near.status).toBe('WARN');
     expect(near.detail).toMatch(/Over 80%/);

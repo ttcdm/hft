@@ -49,9 +49,26 @@ export interface PersistedTransaction {
   exitReason?: string;
 }
 
+/** 5B: the launch-recording kinds that belong to a launch (FUNDER rows have mint '' and are kept for good). */
+const LAUNCH_ROW_KINDS = ['CREATE', 'TRADE', 'END'] as const;
+interface LaunchRecordingCounts { byKind: Record<string, number>; dataVersion: number; oldestTs: number | null; newestTs: number | null; newestCreateTs: number | null }
+export interface LaunchRecordingStatus {
+  launches: number;
+  events: number;
+  launchRows: number;
+  funderRows: number;
+  endedLaunches: number;
+  oldestTs: number | null;
+  newestTs: number | null;
+  newestCreateTs: number | null;
+}
+
 export class WorkstationDatabase {
   private db: DatabaseSync;
   private dbPath: string;
+  /** 5B: the launch recording's counts, read once when the database opens and kept by recordLaunchEvent and pruneLaunchRecording, so the
+   *  status that System checks polls every 15 s runs no query. Null only if that first read failed (it is retried on the next status read). */
+  private recCounts: LaunchRecordingCounts | null = null;
 
   constructor(customDbPath?: string) {
     this.dbPath = resolveDbPath(customDbPath);
@@ -276,7 +293,12 @@ export class WorkstationDatabase {
       CREATE INDEX IF NOT EXISTS idx_risk_decisions_created ON risk_decisions(created_at);
       CREATE INDEX IF NOT EXISTS idx_launch_rec_mint ON launch_recording(mint, ts);
       CREATE INDEX IF NOT EXISTS idx_launch_rec_ts ON launch_recording(ts);
+      -- 5B (R1-93, R1-107): the journal is read by event_type (getUnverifiedFillIds every 5 s, the halt and kill-switch rows), and the
+      -- recorder's per-kind counts and oldest/newest reads go through (kind, ts) instead of scanning the table.
+      CREATE INDEX IF NOT EXISTS idx_journal_event_type ON system_journal(event_type);
+      CREATE INDEX IF NOT EXISTS idx_launch_rec_kind_ts ON launch_recording(kind, ts);
     `);
+    this.recCounts = this.countLaunchRecording();
     Logger.info(`SQLite persistence initialized at ${this.dbPath}`);
   }
 
@@ -747,6 +769,12 @@ export class WorkstationDatabase {
   public recordLaunchEvent(ts: number, mint: string, kind: 'CREATE' | 'TRADE' | 'FUNDER' | 'END', payload: Record<string, unknown>): boolean {
     try {
       this.db.prepare('INSERT INTO launch_recording (ts, mint, kind, payload_json) VALUES (?, ?, ?, ?)').run(ts, mint, kind, JSON.stringify(payload));
+      const c = this.recCounts;
+      if (c) {
+        c.byKind[kind] = (c.byKind[kind] ?? 0) + 1;
+        if (kind !== 'FUNDER') { c.oldestTs = c.oldestTs === null ? ts : Math.min(c.oldestTs, ts); c.newestTs = c.newestTs === null ? ts : Math.max(c.newestTs, ts); }
+        if (kind === 'CREATE') c.newestCreateTs = c.newestCreateTs === null ? ts : Math.max(c.newestCreateTs, ts);
+      }
       return true;
     } catch {
       return false;
@@ -770,14 +798,52 @@ export class WorkstationDatabase {
     }
   }
 
-  public getLaunchRecordingStatus(): { launches: number; events: number; oldestTs: number | null; newestTs: number | null } {
+  /**
+   * The recording's size, from the in-memory counts (5B: no table is read unless another connection wrote to the file). `events` is every row; `launchRows` the CREATE, TRADE and END rows the
+   * row limit applies to; `funderRows` the FUNDER rows, which are never pruned; `endedLaunches` the END rows (a launch without one is
+   * unresolved). `oldestTs` / `newestTs` span the launch rows only, because funder rows are kept for good. `newestCreateTs` keys the replay cache.
+   */
+  public getLaunchRecordingStatus(): LaunchRecordingStatus {
     try {
-      const r = this.db.prepare(`SELECT COUNT(*) AS n, MIN(ts) AS lo, MAX(ts) AS hi FROM launch_recording`).get() as any;
-      const l = this.db.prepare(`SELECT COUNT(*) AS n FROM launch_recording WHERE kind = 'CREATE'`).get() as any;
-      return { launches: Number(l.n), events: Number(r.n), oldestTs: r.lo ?? null, newestTs: r.hi ?? null };
+      const c = this.launchCounts();
+      const k = (kind: string) => c.byKind[kind] ?? 0;
+      const events = Object.values(c.byKind).reduce((a, b) => a + b, 0);
+      return { launches: k('CREATE'), events, launchRows: events - k('FUNDER'), funderRows: k('FUNDER'), endedLaunches: k('END'), oldestTs: c.oldestTs, newestTs: c.newestTs, newestCreateTs: c.newestCreateTs };
     } catch {
-      return { launches: 0, events: 0, oldestTs: null, newestTs: null };
+      return { launches: 0, events: 0, launchRows: 0, funderRows: 0, endedLaunches: 0, oldestTs: null, newestTs: null, newestCreateTs: null };
     }
+  }
+
+  /** 5B: the kept counts, read again from the table first if another connection (a script, a test seeding the file) committed since. SQLite's
+   *  data_version does not change for this connection's own writes, which keep the counts themselves. */
+  private launchCounts(): LaunchRecordingCounts {
+    if (this.recCounts && this.dataVersion() !== this.recCounts.dataVersion) this.recCounts = null;
+    this.recCounts ??= this.countLaunchRecording();
+    return this.recCounts;
+  }
+
+  /** 5B: the counts read from the table: per kind through idx_launch_rec_kind_ts, and the launch rows' oldest, newest and newest CREATE ts as index probes. */
+  private countLaunchRecording(): LaunchRecordingCounts {
+    const dataVersion = this.dataVersion();
+    const byKind: Record<string, number> = {};
+    for (const r of this.db.prepare('SELECT kind, COUNT(*) AS n FROM launch_recording GROUP BY kind').all() as Array<{ kind: string; n: number }>) byKind[r.kind] = Number(r.n);
+    return { byKind, dataVersion, ...this.launchRecordingSpan() };
+  }
+
+  /** SQLite's PRAGMA data_version: changes when another connection commits to this database file (no table is read). */
+  private dataVersion(): number {
+    return Number((this.db.prepare('PRAGMA data_version').get() as any).data_version);
+  }
+
+  private launchRecordingSpan(): Pick<LaunchRecordingCounts, 'oldestTs' | 'newestTs' | 'newestCreateTs'> {
+    const lo = this.db.prepare('SELECT MIN(ts) AS v FROM launch_recording WHERE kind = ?');
+    const hi = this.db.prepare('SELECT MAX(ts) AS v FROM launch_recording WHERE kind = ?');
+    const pick = (st: typeof lo, f: (a: number, b: number) => number) => {
+      const vs = LAUNCH_ROW_KINDS.map((k) => (st.get(k) as any)?.v).filter((v): v is number => typeof v === 'number');
+      return vs.length ? vs.reduce((a, b) => f(a, b)) : null;
+    };
+    const createHi = (hi.get('CREATE') as any)?.v;
+    return { oldestTs: pick(lo, Math.min), newestTs: pick(hi, Math.max), newestCreateTs: typeof createHi === 'number' ? createHi : null };
   }
 
   /** S190: rows written in the last `windowMs` (uses the ts index). The recorder's measured rate, for System checks. */
@@ -797,11 +863,17 @@ export class WorkstationDatabase {
    */
   public pruneLaunchRecording(retentionDays: number, maxRows: number, now: number = Date.now()): number {
     try {
-      let n = Number((this.db.prepare(`DELETE FROM launch_recording WHERE ts < ? AND kind <> 'FUNDER'`).run(now - retentionDays * 86_400_000) as any).changes ?? 0);
-      const total = Number((this.db.prepare(`SELECT COUNT(*) AS n FROM launch_recording WHERE kind <> 'FUNDER'`).get() as any).n);
-      if (total > maxRows) n += Number((this.db.prepare(`DELETE FROM launch_recording WHERE id IN (SELECT id FROM launch_recording WHERE kind <> 'FUNDER' ORDER BY id ASC LIMIT ?)`).run(total - maxRows) as any).changes ?? 0);
+      const c = this.launchCounts();
+      // 5B: RETURNING kind keeps the in-memory counts exact without a COUNT(*) over the table
+      const drop = (rows: Array<{ kind: string }>) => { for (const r of rows) c.byKind[r.kind] = (c.byKind[r.kind] ?? 0) - 1; return rows.length; };
+      let n = drop(this.db.prepare(`DELETE FROM launch_recording WHERE ts < ? AND kind <> 'FUNDER' RETURNING kind`).all(now - retentionDays * 86_400_000) as any[]);
+      const total = Object.entries(c.byKind).reduce((a, [k, v]) => (k === 'FUNDER' ? a : a + v), 0);
+      if (total > maxRows) n += drop(this.db.prepare(`DELETE FROM launch_recording WHERE id IN (SELECT id FROM launch_recording WHERE kind <> 'FUNDER' ORDER BY id ASC LIMIT ?) RETURNING kind`).all(total - maxRows) as any[]);
+      if (n > 0) Object.assign(c, this.launchRecordingSpan());
       return n;
     } catch {
+      // the counts may be off after a failed delete: read them again from the table on the next status read
+      this.recCounts = null;
       return 0;
     }
   }

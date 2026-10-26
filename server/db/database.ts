@@ -692,6 +692,35 @@ export class WorkstationDatabase {
   }
 
   /**
+   * 3B (P3.2): every LIVE BUY that was sent and is not resolved (PENDING or RECONCILIATION_REQUIRED), with its order's amount and quote
+   * when the order row exists. Such a buy may still become a position, so callers count it as an open slot and as reserved SOL.
+   * null when the query cannot run: the caller cannot know nothing is unresolved, so it must refuse (fail closed).
+   */
+  public loadUnresolvedLiveBuys(): Array<{ signature: string; mint: string; orderId: string; submissionTime: number; jitoTipLamports: number; amountLamports: number | null; quoteJson: string | null }> | null {
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT t.signature, t.mint, t.order_id, t.submission_time, t.jito_tip_lamports, o.amount_lamports, o.quote_json
+             FROM transactions t LEFT JOIN orders o ON o.id = t.order_id
+            WHERE t.direction = 'BUY' AND t.execution_mode = 'LIVE' AND t.reconciliation_state IN ('PENDING', 'RECONCILIATION_REQUIRED')`
+        )
+        .all() as any[];
+      return rows.map((r) => ({
+        signature: r.signature,
+        mint: r.mint,
+        orderId: r.order_id,
+        submissionTime: r.submission_time,
+        jitoTipLamports: r.jito_tip_lamports ?? 0,
+        amountLamports: r.amount_lamports ?? null,
+        quoteJson: r.quote_json ?? null,
+      }));
+    } catch (err: any) {
+      Logger.error(`loadUnresolvedLiveBuys could not read the transactions table (${err?.message || err}); callers refuse buys`);
+      return null;
+    }
+  }
+
+  /**
    * N18: the append-only audit tables (risk_decisions, decisions, system_journal) grew without bound. Rows older than the retention
    * window are deleted. Kept regardless of age because something still reads them: the halt journal (the latest row decides whether
    * trading is halted after a restart) and PAPER_FILL_GATES / PAPER_SELL_FILLED (mark which old paper fills and exits are unverified or model-priced, for the closed-trade statistics).

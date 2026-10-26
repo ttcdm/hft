@@ -2631,13 +2631,31 @@ export class ExecutionCoordinator {
     const worstCaseOrderSol = Math.max(req.amountSol, Number(quote.maxInputLamports) / 1e9);
     const requiredSol = worstCaseOrderSol + (CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS + accumulatorRentLamports) / 1e9 + (quote.expectedJitoTipLamports + quote.expectedPriorityFeeLamports + 5000) / 1e9;
 
-    // Check balance concurrency reservation
-    if (rawWalletBalance - this.inFlightReservedSol - requiredSol < 0.015) {
+    // Q51: count and exposure are read now, not from the snapshot taken before the awaits above. There is no await from here to the
+    // reservation below, so the reserve check, the risk check and the reservation all see the same rows.
+    const freshOpen = workstationDb.loadPositions(this.executionMode, 'ACTIVE');
+    // 3B (P3.2, R1-4): LIVE buys sent earlier and still unresolved (UNCONFIRMED, or landed with an unread fill) can become positions any
+    // moment. They hold a slot and their worst-case SOL like a buy in flight here does, until reconciliation or orphan recovery settles them.
+    const unresolved = this.getUnresolvedLiveBuys({ activeLive: freshOpen });
+    if (unresolved === null) {
+      workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'LIVE', { reason: 'UNRESOLVED_BUYS_UNREADABLE', mint: req.mint });
       return {
         success: false,
         lifecycleState: 'RISK_REJECTED',
         executionMode: 'LIVE',
-        error: `INSUFFICIENT_FUNDS_CONCURRENCY: Wallet balance (${rawWalletBalance.toFixed(4)} SOL) minus in-flight reservations (${this.inFlightReservedSol.toFixed(4)} SOL) cannot cover required ${requiredSol.toFixed(4)} SOL plus 0.015 SOL reserve.`,
+        error: 'UNRESOLVED_BUY: the ledger of unresolved LIVE buys could not be read, so their slots and SOL cannot be counted; buy refused.',
+        correlationId,
+      };
+    }
+    const reservedSol = this.inFlightReservedSol + unresolved.reservedSol;
+
+    // Check balance concurrency reservation
+    if (rawWalletBalance - reservedSol - requiredSol < 0.015) {
+      return {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'LIVE',
+        error: `INSUFFICIENT_FUNDS_CONCURRENCY: Wallet balance (${rawWalletBalance.toFixed(4)} SOL) minus in-flight reservations (${this.inFlightReservedSol.toFixed(4)} SOL) and unresolved buys (${unresolved.reservedSol.toFixed(4)} SOL) cannot cover required ${requiredSol.toFixed(4)} SOL plus 0.015 SOL reserve.`,
         correlationId,
       };
     }
@@ -2668,10 +2686,8 @@ export class ExecutionCoordinator {
       };
     }
 
-    // Q51: count and exposure are read now, not from the snapshot taken before the awaits above, and they include the buys of other mints
-    // that are in flight (not positions yet). There is no await between this read, the risk check and the reservation below.
-    const freshOpen = workstationDb.loadPositions(this.executionMode, 'ACTIVE');
-    const freshExposureSol = freshOpen.reduce((acc, p) => acc + p.costBasisLamports / 1e9, 0) + this.inFlightReservedSol;
+    // Q51: count and exposure include the buys of other mints that are in flight (not positions yet) and (3B) the unresolved ones.
+    const freshExposureSol = freshOpen.reduce((acc, p) => acc + p.costBasisLamports / 1e9, 0) + reservedSol;
     const riskDecision = traced('risk.evaluateOrder', () => riskEngine.evaluateOrder({
       mint: req.mint,
       orderSizeSol: req.amountSol,
@@ -2683,12 +2699,12 @@ export class ExecutionCoordinator {
       signalTimestamp: req.signalTimestamp as number,
       marketDataTimestamp: marketState.marketDataTimestamp,
       // R3: adopted wallet dust is not a position the app chose to open; it must not fill the position cap forever.
-      currentOpenPositionsCount: freshOpen.filter((p) => !isRecoveredPosition(p)).length + this.inFlightBuyMints.size,
+      currentOpenPositionsCount: freshOpen.filter((p) => !isRecoveredPosition(p)).length + this.inFlightBuyMints.size + unresolved.mints.length,
       currentTotalExposureSol: freshExposureSol,
-      // N12: the risk engine applies the minimum reserve itself, so it gets the balance net of in-flight orders only. `spendable` already
+      // N12: the risk engine applies the minimum reserve itself, so it gets the balance net of in-flight orders (3B: and unresolved buys) only. `spendable` already
       // has the reserve and the in-flight amount taken off; passing it (minus in-flight again) charged both twice. Rent held in token accounts
       // is not in getBalance, so it is not subtracted either.
-      walletSpendableSol: Math.max(0, rawWalletBalance - this.inFlightReservedSol),
+      walletSpendableSol: Math.max(0, rawWalletBalance - reservedSol),
       executionMode: 'LIVE',
     }));
 
@@ -3122,6 +3138,39 @@ export class ExecutionCoordinator {
 
   public getHaltReason(): string | null {
     return this.haltReason;
+  }
+
+  /**
+   * 3B (P3.2, R1-4): LIVE buys that were sent and are not resolved (PENDING or RECONCILIATION_REQUIRED in the ledger), each priced at the
+   * worst case it can still take from the wallet. Such a buy can land any moment (orphan recovery then opens its position), so it fills a
+   * position slot and holds its SOL until it is resolved; before, an UNCONFIRMED buy stopped counting the moment executeTrade returned.
+   * Left out: a row whose buy already has an ACTIVE position (a landed buy whose ledger write failed; the position counts already), and,
+   * unless `includeOwnInFlight`, this process's own buys still in executeTrade (they count through inFlightBuyMints and inFlightReservedSol).
+   * The worst case is the order's quoted maxInputLamports (or the order amount) plus token-account rent, tip, priority and base fee; a row
+   * without a readable quote is priced at the largest order the risk limits allow. It may double-count a buy that landed and already left
+   * the wallet; that refuses a buy too many, never one too few. null when the ledger cannot be read: callers refuse (fail closed).
+   */
+  public getUnresolvedLiveBuys(opts: { includeOwnInFlight?: boolean; activeLive?: Array<{ entryTxSignature?: string }> } = {}): { mints: string[]; reservedSol: number } | null {
+    const rows = workstationDb.loadUnresolvedLiveBuys();
+    if (rows === null) return null;
+    const active = opts.activeLive ?? workstationDb.loadPositions('LIVE', 'ACTIVE');
+    const positionSigs = new Set(active.map((p) => p.entryTxSignature));
+    const limits = riskEngine.getLimits();
+    const mints = new Set<string>();
+    let reservedLamports = 0;
+    for (const r of rows) {
+      if (positionSigs.has(r.signature)) continue;
+      if (!opts.includeOwnInFlight && this.inFlightBuyMints.has(r.mint)) continue;
+      let quote: { maxInputLamports?: unknown; expectedJitoTipLamports?: unknown; expectedPriorityFeeLamports?: unknown } | null;
+      try { quote = r.quoteJson ? JSON.parse(r.quoteJson) : null; } catch { quote = null; }
+      const maxInput = Number(quote?.maxInputLamports);
+      const worst = quote && Number.isFinite(maxInput) && maxInput > 0
+        ? Math.max(maxInput, r.amountLamports ?? 0) + Math.max(Number(quote.expectedJitoTipLamports) || 0, r.jitoTipLamports) + (Number(quote.expectedPriorityFeeLamports) || 0) + 5000
+        : Math.max(r.amountLamports ?? 0, limits.maxPositionSol * 1e9) * (1 + limits.maxSlippageBps / 10_000) + limits.maxExecutionCostLamports;
+      reservedLamports += worst + CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS;
+      mints.add(r.mint);
+    }
+    return { mints: [...mints], reservedSol: reservedLamports / 1e9 };
   }
 
   private exitFailures = new Map<string, { count: number; nextAttemptAt: number; lastError: string; waitMs?: number }>();

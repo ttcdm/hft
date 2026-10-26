@@ -95,6 +95,34 @@ export function SniperAutoHeader({ autoMode, halted }: { autoMode: AutoMode | nu
   );
 }
 
+/** The fixed exit rules as GET /api/memecoins/config reports them (server/exits/exitEngine.ts exitRulesSummary). */
+export interface ExitRulesData {
+  stopLossPct: number;
+  trailingStartPct: number;
+  trailingBelowHighPct: number;
+  takeProfit: Array<{ atPct: number; sellPct: number }>;
+  finalTrailBelowHighPct: number;
+  staleAfterMinutes: number;
+  staleBelowPct: number;
+}
+
+export function formatExitRules(r: ExitRulesData): string {
+  const tps = r.takeProfit.map((t) => `sell ${t.sellPct}% at +${t.atPct}%`).join(', ');
+  return `Exits (fixed): stop ${r.stopLossPct}%, trailing stop ${r.trailingBelowHighPct}% below the high from +${r.trailingStartPct}%, ${tps}, then trail ${r.finalTrailBelowHighPct}% below the high; sell all after ${r.staleAfterMinutes} min under +${r.staleBelowPct}%`;
+}
+
+/**
+ * The exit rules every position follows. This used to read "Auto TP / Auto SL" from the sniper config, numbers no exit ever used;
+ * the real rules are ExitEngine's constants, sent by the server.
+ */
+export function ExitRulesNote({ rules }: { rules: ExitRulesData | null }) {
+  return (
+    <span className="text-slate-500 hidden sm:inline text-[11px]" data-testid="exit-rules-note">
+      {rules ? formatExitRules(rules) : 'Exit rules not loaded from the server'}
+    </span>
+  );
+}
+
 interface MemecoinSocialSniperModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -114,6 +142,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const [signals, setSignals] = useState<SocialSignal[]>([]);
   const [pools, setPools] = useState<MemecoinPool[]>([]);
   const [positions, setPositions] = useState<SniperPosition[]>([]);
+  const [exitRules, setExitRules] = useState<ExitRulesData | null>(null);
   const [sniperConfig, setSniperConfig] = useState<SniperBotConfig>({
     isAutoSnipeEnabled: false,
     defaultSnipeAmountUsd: capitalTier === 'MICRO_10' ? 5.0 : 50.0,
@@ -238,6 +267,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
       const cfgData = await engineClient.getSniperConfig();
       if (cfgData?.config) setSniperConfig(cfgData.config);
+      if (cfgData?.exitRules) setExitRules(cfgData.exitRules);
     } catch (e) {
       console.error(e);
     } finally {
@@ -1088,7 +1118,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
                   <div>
                     <label className="block text-slate-400 text-[10px] mb-1">
-                      Take-Profit Target (%)
+                      Take-Profit Target (%) (not used by exits)
                     </label>
                     <input
                       type="number"
@@ -1177,9 +1207,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                             </button>
                           )}
                         </div>
-                        <span className="text-slate-500 hidden sm:inline text-[11px]">
-                          Auto TP: +{sniperConfig.takeProfitPct}% | Auto SL: -{sniperConfig.stopLossPct}%
-                        </span>
+                        <ExitRulesNote rules={exitRules} />
                       </div>
                     </div>
 

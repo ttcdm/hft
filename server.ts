@@ -39,6 +39,7 @@ import { PumpCurveService } from './server/solana/pumpCurve';
 import { buildCurveDepth } from './server/market/curveDepth';
 import { TradeTape } from './server/market/tradeTape';
 import { registerMarketRoutes } from './server/market/marketRoutes';
+import { exitRulesSummary } from './server/exits/exitEngine';
 import { walletTrader } from './server/walletTrader';
 import { emergencyStop } from './server/execution/emergencyStop';
 import { asyncHandler } from './server/middleware/asyncHandler';
@@ -968,6 +969,7 @@ app.get('/api/memecoins/config', requireOperatorAuth, (req, res) => {
   res.json({
     status: 'OK',
     config: redactSniperConfig(memecoinAggregator.getConfig()),
+    exitRules: exitRulesSummary(), // the fixed ExitEngine rules; config.takeProfitPct / stopLossPct do not drive exits
   });
 });
 

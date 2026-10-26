@@ -179,3 +179,29 @@ export class ExitEngine {
 }
 
 export const exitEngine = new ExitEngine();
+
+/** The exit rules every position follows, as numbers. No setting changes them; screens show these instead of a sniper-config value. */
+export interface ExitRulesSummary {
+  stopLossPct: number;
+  trailingStartPct: number;
+  trailingBelowHighPct: number;
+  takeProfit: Array<{ atPct: number; sellPct: number }>;
+  finalTrailBelowHighPct: number;
+  staleAfterMinutes: number;
+  staleBelowPct: number;
+}
+
+export function exitRulesSummary(): ExitRulesSummary {
+  return {
+    stopLossPct: ExitEngine.HARD_STOP_LOSS_PCT,
+    trailingStartPct: ExitEngine.TRAILING_STOP_TRIGGER_PCT,
+    trailingBelowHighPct: Math.round((1 - ExitEngine.TRAILING_STOP_RATCHET_RATIO) * 100),
+    takeProfit: [
+      { atPct: ExitEngine.TP1_TRIGGER_PCT, sellPct: ExitEngine.TP1_SELL_PCT },
+      { atPct: ExitEngine.TP2_TRIGGER_PCT, sellPct: ExitEngine.TP2_SELL_PCT },
+    ],
+    finalTrailBelowHighPct: Math.round((1 - ExitEngine.STAGE_2_TRAILING_RATIO) * 100),
+    staleAfterMinutes: ExitEngine.STALE_POSITION_HOLD_MS / 60_000,
+    staleBelowPct: ExitEngine.STALE_POSITION_PROFIT_THRESHOLD_PCT,
+  };
+}

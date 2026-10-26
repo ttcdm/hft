@@ -235,3 +235,20 @@ describe('5B: the replay cache key is the newest CREATE per minute (R1-107)', ()
     expect(replayCacheKey(r.db.getLaunchRecordingStatus(), 70, 1_000)).not.toBe(k2);
   });
 });
+
+describe('5B: the replay loader hands each launch its END time, so coverage follows the recording that was made', () => {
+  it('a launch recorded under a 10-minute window carries endTs at its window end; one still recording has none', () => {
+    const r = recorder({ mintMs: 10 * 60_000, maxTradesPerMint: 2_000 });
+    const old = wallet(); const live = wallet();
+    r.rec.onCreate(createEvent(old) as any);
+    r.at(1000); r.rec.onTrade(trade(old, 1) as any);
+    r.at(11 * 60_000); r.rec.onCreate(createEvent(live) as any);
+    r.at(11 * 60_000 + 500); r.rec.onTrade(trade(live, 1) as any);
+    const { launches } = r.db.loadLaunchRecording();
+    const o = launches.find((l) => l.mint === old)!; const l = launches.find((x) => x.mint === live)!;
+    expect(o).toMatchObject({ endTs: t0 + 10 * 60_000, endReason: 'WINDOW' });
+    expect(o.events.map((e) => e.kind)).toEqual(['CREATE', 'TRADE']);
+    expect(l.endTs).toBeUndefined();
+    expect(l.endReason).toBeUndefined();
+  });
+});

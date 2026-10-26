@@ -782,14 +782,24 @@ export class WorkstationDatabase {
   }
 
   /** Recorded events of the `limit` most recently created launches, oldest event first, plus every funder fact. */
-  public loadLaunchRecording(limit = 500): { launches: Array<{ mint: string; events: Array<{ ts: number; kind: 'CREATE' | 'TRADE'; payload: any }> }>; funders: Array<{ ts: number; wallet: string; funder: string | null }> } {
+  /**
+   * 5B: a launch with an END row carries `endTs` (when its recording stopped) and `endReason` (TRADE_CAP, WINDOW or CURVE_COMPLETE); the
+   * replay's coverage then follows the recording that was really made, not the window the server runs with now. A launch without one is
+   * unresolved and has neither.
+   */
+  public loadLaunchRecording(limit = 500): { launches: Array<{ mint: string; events: Array<{ ts: number; kind: 'CREATE' | 'TRADE'; payload: any }>; endTs?: number; endReason?: string }>; funders: Array<{ ts: number; wallet: string; funder: string | null }> } {
     try {
       const mints = (this.db.prepare(`SELECT mint FROM launch_recording WHERE kind = 'CREATE' ORDER BY ts DESC LIMIT ?`).all(limit) as any[]).map((r) => r.mint as string).reverse();
-      const launches = mints.map((mint) => ({
-        mint,
-        events: (this.db.prepare(`SELECT ts, kind, payload_json FROM launch_recording WHERE mint = ? AND kind IN ('CREATE','TRADE') ORDER BY ts ASC, id ASC`).all(mint) as any[])
-          .map((r) => ({ ts: r.ts as number, kind: r.kind as 'CREATE' | 'TRADE', payload: JSON.parse(r.payload_json) })),
-      }));
+      const q = this.db.prepare(`SELECT ts, kind, payload_json FROM launch_recording WHERE mint = ? AND kind IN ('CREATE','TRADE','END') ORDER BY ts ASC, id ASC`);
+      const launches = mints.map((mint) => {
+        const rows = q.all(mint) as any[];
+        const end = rows.find((r) => r.kind === 'END');
+        return {
+          mint,
+          events: rows.filter((r) => r.kind !== 'END').map((r) => ({ ts: r.ts as number, kind: r.kind as 'CREATE' | 'TRADE', payload: JSON.parse(r.payload_json) })),
+          ...(end ? { endTs: end.ts as number, endReason: String(JSON.parse(end.payload_json).reason) } : {}),
+        };
+      });
       const funders = (this.db.prepare(`SELECT ts, payload_json FROM launch_recording WHERE kind = 'FUNDER' ORDER BY ts ASC, id ASC`).all() as any[])
         .map((r) => ({ ts: r.ts as number, ...JSON.parse(r.payload_json) }));
       return { launches, funders };

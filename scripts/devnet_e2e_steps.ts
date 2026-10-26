@@ -854,6 +854,11 @@ export async function feedGapThroughWsProxy(s: Pick<HarnessSteps, 'mint' | 'rec'
   } finally {
     await listener.stop();
     listener.destroy?.();
+    // Devnet run 25: this Connection's socket was down when the listener stopped, so web3.js never idle-closed it and its client redialed
+    // the closed proxy port once a second for the rest of the run (565 "ws error: connect ECONNREFUSED"). web3.js has no public close.
+    const ws = conn._rpcWebSocket;
+    ws?.setAutoReconnect?.(false);
+    ws?.close?.();
     await proxy.close();
   }
 

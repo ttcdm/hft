@@ -104,6 +104,25 @@ async function run(info: { url: string; genesisHash: string }) {
   const bal = async () => (await conn.getBalance(kp.publicKey)) / LAMPORTS_PER_SOL;
   const steps = { coordinator, rec, sleep, skip: (step: string, detail: string) => rec(`${step} (a SKIP in the dry run)`, false, detail) };
 
+  if (!only || only === 'j') {
+    // Devnet run 25: after (j) closed its loopback ws proxy, the proxy Connection's socket kept redialing it (565 "ws error: connect
+    // ECONNREFUSED" lines to the end of the run). (j) as devnet_e2e.ts runs it, then 10 s with nothing else running: no redial may follow.
+    const { PumpFeedListener } = await import('../../server/solana/pumpFeedListener');
+    const { WatchWindow } = await import('../../server/signals/watchWindow');
+    const wsErrors: string[] = [];
+    const origError = console.error;
+    console.error = (...a: any[]) => { if (a[0] === 'ws error:') wsErrors.push(String(a[1])); else origError(...a); };
+    try {
+      await S.feedGapThroughWsProxy({ mint: kp.publicKey.toBase58(), rec, sleep }, { Listener: PumpFeedListener, Window: WatchWindow, Connection, rpcUrl: info.url });
+      const before = wsErrors.length;
+      await sleep(10_000);
+      const after = wsErrors.slice(before);
+      rec('(j) feed gap: no socket left redialing the closed proxy', after.length === 0, `${after.length} ws error(s) in the 10 s after (j)${after.length ? `: ${after[0]}` : ''}`);
+    } finally {
+      console.error = origError;
+    }
+  }
+
   if (!only || only === 'm') {
     if (armed.success && (await S.hasBudget(steps, '(m) 3B: DEVNET_LIVE session spend', bal, 0.25, 'DEVNET_SESSION_SPEND'))) {
       const coins = S.stepCoins(steps, '(m) 3B: DEVNET_LIVE session spend', kit, kp);

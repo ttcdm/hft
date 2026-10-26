@@ -1489,7 +1489,9 @@ app.get('/api/workstation/positions', requireOperatorAuth, (req, res) => {
 });
 
 app.get('/api/workstation/events', requireOperatorAuth, (req, res) => {
-  const limit = Math.min(parseInt((req.query.limit as string) || '50', 10), 200);
+  // 3G (N-10): 1..200, else 50. A negative limit reached SQLite as LIMIT -1 (no limit) and NaN was bound as is.
+  const n = Number.parseInt(String(req.query.limit ?? ''), 10);
+  const limit = Number.isInteger(n) && n >= 1 ? Math.min(n, 200) : 50;
   const events = workstationDb.getEvents(limit);
   res.json({
     success: true,

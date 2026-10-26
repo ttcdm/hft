@@ -7,6 +7,7 @@ import { walletTrader } from '../server/walletTrader';
 import { executionCoordinator } from '../server/execution/coordinator';
 import { executionConfig } from '../server/solana/executionConfig';
 import { riskEngine } from '../server/risk/riskEngine';
+import { workstationDb } from '../server/db/database';
 
 /**
  * Stage 3 task 3G (P3.6: N-67, N-8, N-19, N-5, N-10, N-4). API inputs cannot silently change limits, and auth follows the token.
@@ -202,6 +203,18 @@ describe('3G N-5: the rate limiter keys on the peer address, login is limited ha
     }
     expect(statuses.slice(0, LOGIN_RATE_LIMIT.maxTokens).every((s) => s === 401)).toBe(true);
     expect(statuses[LOGIN_RATE_LIMIT.maxTokens]).toBe(429);
+  });
+});
+
+describe('3G N-10: /api/workstation/events clamps limit to 1..200', () => {
+  it('limit=-1 and limit=abc return at most 50 events', async () => {
+    for (let i = 0; i < 60; i++) workstationDb.logJournal('S3G_TEST_EVENT', `s3g-${i}`, 'PAPER', { i });
+    for (const q of ['-1', 'abc', '0']) {
+      const r = await call('GET', `/api/workstation/events?limit=${q}`);
+      expect(r.status, q).toBe(200);
+      expect(r.json.count, q).toBe(50);
+    }
+    expect((await call('GET', '/api/workstation/events?limit=3')).json.count).toBe(3);
   });
 });
 

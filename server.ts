@@ -95,8 +95,7 @@ import {
   validateBody,
   WalletConfigSchema,
   LiveSnipeOrderSchema,
-  ClosePositionSchema,
-} from './server/middleware/enterprise';
+  ClosePositionSchema, publicHealthBody } from './server/middleware/enterprise';
 
 
 const app = express();
@@ -471,7 +470,7 @@ app.get('/api/auth/session', (req, res) => {
     return res.json({
       success: true,
       token: provided,
-      role: 'OPERATOR',
+      role: authManager.isOperatorToken(String(provided)) ? 'OPERATOR' : 'READONLY', // T3: the session's own role, not a constant
     });
   }
 
@@ -519,19 +518,7 @@ function getGenAI(): GoogleGenAI | null {
 
 // 1. Health check & Honest System Telemetry
 app.get('/api/health', (req, res) => {
-  const mem = process.memoryUsage();
-  res.json({
-    status: 'ONLINE',
-    runtime: 'Node.js',
-    nodeVersion: process.version,
-    platform: process.platform,
-    pid: process.pid,
-    engineUptimeSeconds: Math.floor(process.uptime()),
-    memoryHeapUsedMB: Number((mem.heapUsed / 1024 / 1024).toFixed(2)),
-    memoryHeapTotalMB: Number((mem.heapTotal / 1024 / 1024).toFixed(2)),
-    memoryRssMB: Number((mem.rss / 1024 / 1024).toFixed(2)),
-    telemetryMode: 'AUTHENTIC_LOCAL_NODE',
-  });
+  res.json(publicHealthBody());
 });
 
 // 3. Market data proxy routes (orderbook, trades, ticker) live in server/market/marketRoutes.ts (B2).

@@ -22,6 +22,11 @@ export const SELL_SLIPPAGE_LADDER_BPS = [800, 1500, 2500, 4000];
 /** Auto-exit retry backoff after a failed attempt: base * 2^(n-1), capped. Each failed LIVE send can pay fees. */
 export const EXIT_RETRY_BASE_MS = 3_000;
 export const EXIT_RETRY_MAX_MS = 30_000;
+/**
+ * T6: after a LIVE exit the RPC rate-limited past every resend, the exit pass waits this long before that position's next try. Flat and
+ * short: it neither counts as a failure nor widens slippage; it only stops each 3 s tick from spending four more sends on a throttled RPC.
+ */
+export const EXIT_RATE_LIMITED_WAIT_MS = 6_000;
 /** Consecutive failed exits before an operator alert is raised. */
 export const EXIT_FAILURE_ALERT_AFTER = 4;
 
@@ -497,6 +502,11 @@ export class ExecutionCoordinator {
 
     if (riskEngine.isKillSwitchActive()) {
       reasons.push('Emergency risk kill switch is active');
+    }
+
+    // T1: the switch is off after a restart (by decision), but LIVE does not arm until the operator has cleared the boot alert that says it was on.
+    if (this.operatorAlerts.some((a) => a.code === 'KILL_SWITCH_WAS_ON' && !a.cleared)) {
+      reasons.push('The kill switch was on before the restart; clear KILL_SWITCH_WAS_ON with POST /api/auto/resume {clearHalt:true} before arming');
     }
 
     if (riskEngine.getCircuitBreakerState() !== 'CLOSED') {
@@ -3068,10 +3078,14 @@ export class ExecutionCoordinator {
 
   private exitFailures = new Map<string, { count: number; nextAttemptAt: number; lastError: string; waitMs?: number }>();
 
-  /** Sell slippage for the next attempt on this position: starts at 800 bps and widens after each consecutive failure. */
+  /**
+   * Sell slippage for the next attempt on this position: starts at 800 bps and widens after each consecutive failure.
+   * T2: never above MAX_SELL_SLIPPAGE_BPS (default 4000, the last step), so an operator can keep a stop-loss from accepting 40% less.
+   */
   public exitSlippageBps(positionId: string): number {
     const n = this.exitFailures.get(positionId)?.count ?? 0;
-    return SELL_SLIPPAGE_LADDER_BPS[Math.min(n, SELL_SLIPPAGE_LADDER_BPS.length - 1)];
+    const step = SELL_SLIPPAGE_LADDER_BPS[Math.min(n, SELL_SLIPPAGE_LADDER_BPS.length - 1)];
+    return Math.min(step, executionConfig.getConfig().maxSellSlippageBps);
   }
 
   /** ms until the auto-exit loop may try this position again (0 when free). */
@@ -3125,7 +3139,11 @@ export class ExecutionCoordinator {
     const quoteFailure = ExecutionCoordinator.isQuoteFailure(res.error);
     if (mode === 'LIVE' && /^RPC_RATE_LIMITED/.test(res.error || '')) {
       // S245: no fee was spent and wider slippage cannot help, but an exit the RPC keeps refusing is something an operator must hear about.
-      this.raiseOperatorAlert('EXIT_RATE_LIMITED', `Exit for position ${positionId.slice(0, 8)} was refused by the RPC's rate limit after ${SELL_RATE_LIMIT_BACKOFF_MS.length} resends; nothing was sent. Retrying on the next exit pass; use a private RPC if this persists.`, positionId);
+      this.raiseOperatorAlert('EXIT_RATE_LIMITED', `Exit for position ${positionId.slice(0, 8)} was refused by the RPC's rate limit after ${SELL_RATE_LIMIT_BACKOFF_MS.length} resends; nothing was sent. Retrying in ${EXIT_RATE_LIMITED_WAIT_MS / 1000}s; set RPC_MAX_REQUESTS_PER_SEC or use a private RPC if this persists.`, positionId);
+      // T6: wait before the next try, keeping the failure count (and so the slippage step) as it was. waitMs caps it as A2 caps every
+      // exit wait, so a wall clock set back cannot stretch it.
+      const prev = this.exitFailures.get(positionId);
+      this.exitFailures.set(positionId, { count: prev?.count ?? 0, nextAttemptAt: Date.now() + EXIT_RATE_LIMITED_WAIT_MS, lastError: res.error || 'RPC_RATE_LIMITED', waitMs: EXIT_RATE_LIMITED_WAIT_MS });
     }
     if (mode === 'LIVE' && (quoteFailure || (res.notSent && !ExecutionCoordinator.isNonAttemptExitError(res.error)))) {
       // No fee was spent and the ladder must not advance, but a stop-loss that cannot be priced or built is exactly what an operator must hear about.

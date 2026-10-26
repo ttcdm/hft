@@ -50,7 +50,7 @@ api $APEX/api/execution/can-arm                                      # reasons i
 api $APEX/api/auto/status                                            # expect mode OFF, killed: true
 ```
 
-The kill switch runs the shared emergency stop without the sells: kill switch on, auto killed and set OFF once a buy it already had in flight has finished, LIVE disarmed. The reply carries `autoMode`. The switch itself is cleared by a restart; the auto OFF is saved, so a restart comes back OFF. Resetting the switch (`{"activate":false}`) turns nothing back on: auto stays OFF and LIVE stays disarmed until an operator sets them again (DEVNET_LIVE needs `CONFIRM_AUTO_DEVNET` again). A DEVNET_LIVE session that sees LIVE disarmed or the kill switch on by any other route also turns itself OFF. Exits keep running on open positions.
+The kill switch runs the shared emergency stop without the sells: kill switch on, auto killed and set OFF once a buy it already had in flight has finished, LIVE disarmed. The reply carries `autoMode`. The switch itself is cleared by a restart; the auto OFF is saved, so a restart comes back OFF. After such a restart the `KILL_SWITCH_WAS_ON` alert is raised and LIVE refuses to arm (can-arm lists it) until it is cleared with `POST /api/auto/resume {"clearHalt":true}`. Resetting the switch (`{"activate":false}`) turns nothing back on: auto stays OFF and LIVE stays disarmed until an operator sets them again (DEVNET_LIVE needs `CONFIRM_AUTO_DEVNET` again). A DEVNET_LIVE session that sees LIVE disarmed or the kill switch on by any other route also turns itself OFF. Exits keep running on open positions.
 
 ### 1.2 Stop buying and sell everything
 

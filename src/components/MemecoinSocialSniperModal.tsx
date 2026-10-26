@@ -1513,7 +1513,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                     <li><strong className="text-cyan-300">/signals</strong> - Show top 3 alpha signals</li>
                     <li><strong className="text-cyan-300">/snipe &lt;CA&gt; [$$]</strong> - Instant Jito snipe</li>
                     <li><strong className="text-cyan-300">/positions</strong> - View open PnL</li>
-                    <li><strong className="text-cyan-300">/panic_sell</strong> - Dump all memecoins</li>
+                    <li><strong className="text-cyan-300">/panic_sell</strong> - Dump all memecoins (not delivered from Telegram: no webhook is registered and nothing polls; use the panic button here)</li>
                   </ul>
                 </div>
               </div>

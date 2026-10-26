@@ -33,6 +33,11 @@ export const REPLAY_DEFAULTS = {
   tipSol: 0.0001,
   /** How often the window is ticked while replaying (the live loop ticks every 2 s). */
   tickMs: 2_000,
+  /**
+   * 5C (R1-105): executeSnipe refuses a launch whose creator and create signer hold more than this % of the supply (0 turns it off, as live).
+   * 5 is the sniper config's default (memecoinAggregator.ts `maxDevHoldingPct`); /api/backtest/replay passes the setting in force.
+   */
+  maxDevHoldingPct: 5,
 };
 /**
  * `minScore`: the confluence buy threshold to replay at (S187 what-if). Default: the threshold in force.
@@ -310,8 +315,18 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
     const g = readyGate(released.metrics);
     if (!g.pass) return { ...result, noEntryReason: g.reason };
   }
-  if (released.state === 'READY' && !(released.score !== null && released.score !== undefined && isConfluencePassed(released.score, minScore))) {
-    return { ...result, noEntryReason: `READY below the confluence gate (score ${released.score ?? 'n/a'} < ${minScore})` };
+  // 5C (R1-105): the gates executeSnipe runs when the controller buys, in its order: dev holding, then the confluence score taken again at
+  // that moment against the buy threshold (HOT and READY alike; the running app always enforces it). The replay decides at the release, so
+  // the re-score reads the state the release saw; a HOT release already needed that score, a READY one did not.
+  const atDecision = stats.get(launch.mint, releasedAt);
+  const devPct = atDecision?.devHoldingPct ?? null;
+  if (o.maxDevHoldingPct > 0 && devPct !== null && devPct > o.maxDevHoldingPct) {
+    return { ...result, noEntryReason: `DEV_HOLDING: creator holds ${devPct.toFixed(2)}% (limit ${o.maxDevHoldingPct}%)` };
+  }
+  clock = releasedAt;
+  const execScore = scoreAt(releasedAt);
+  if (!(execScore !== null && isConfluencePassed(execScore, minScore))) {
+    return { ...result, noEntryReason: `${released.state} below the confluence gate at the buy (score ${execScore ?? 'n/a'} < ${minScore})` };
   }
 
   // 5A: entry, exits and money from the shared cost and latency model
@@ -363,7 +378,8 @@ export const NOT_REPLAYED = {
   optimistic: [
     'Failed or reverted transactions: every buy and sell lands (no revert on slippage, no failed send)',
     'Risk limits, capital sizing and the one-position cap: every release is bought',
-    'Eligibility filter (mint / freeze authority, holder concentration): not recorded',
+    'Mint and freeze authority: not recorded (live reads them from the curve at the buy)',
+    'The coordinator\'s eligibility filter reads holder concentration from an RPC holder query; the replay applies only the dev-holding gate, from the recorded trades',
   ],
   pessimistic: [
     'The tip is charged on every transaction; a straight-to-RPC send (Jito unset) pays none',
@@ -384,6 +400,7 @@ function buildReplayReport(rows: ReplayedLaunch[], opts: ReplayOptions, minScore
   const wins = closed.filter((r) => (r.netPnlSol ?? 0) > 0).length;
   const released: Record<string, number> = {};
   const exitReasons: Record<string, number> = {};
+  const devLimit = opts.maxDevHoldingPct ?? REPLAY_DEFAULTS.maxDevHoldingPct;
   for (const r of rows) {
     released[r.verdict] = (released[r.verdict] ?? 0) + 1;
     for (const e of r.exits) exitReasons[e.reason] = (exitReasons[e.reason] ?? 0) + 1;
@@ -392,6 +409,7 @@ function buildReplayReport(rows: ReplayedLaunch[], opts: ReplayOptions, minScore
     rules: [
       'Watch window verdict (real WatchWindow: 20 s minimum, 120 s maximum, HOT / READY / DEAD)',
       `READY needs a confluence score of at least ${minScore} (real ConfluenceEngine over the replayed pool stats)`,
+      `At the buy, as executeSnipe: ${devLimit > 0 ? `the creator and create signer hold at most ${devLimit}% of the supply, and ` : ''}the confluence score is taken again against the threshold (HOT and READY)`,
       `READY also needs concentration passing and at least ${READY_MIN_SIGNALS} strong signals, as the auto controller asks (P4.3); a curve past the progress cap (default 60% of the tokens sold) is DEAD CURVE_TOO_FAR`,
       'Exits: real ExitEngine polled every 3 s, also between prints (hard stop -20%, trailing stop, take-profit ladder: sell 33% of the holding at +30%, then 33% of what is left at +60%, stale exit at 30 min)',
       'Fills: the buy lands the entry delay after the release and each sell the exit delay after its decision, at the curve state then, with the order\'s own impact on the curve',

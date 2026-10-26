@@ -1206,7 +1206,9 @@ app.get('/api/backtest/replay', requireOperatorAuth, asyncHandler(async (req, re
     return res.json({ success: true, recorded: status, report: null, message: 'No launch has been recorded yet, so there is nothing to replay. The recorder saves every launch the watch window scores while the app runs against a pump.fun feed.' });
   }
   const cap = replayLaunchCap();
-  const key = replayCacheKey(status, minScore ?? getConfluenceThreshold(), cap);
+  // 5C (R1-105): the replay applies the dev-holding limit in force, so a changed limit is a different report
+  const maxDevHoldingPct = memecoinAggregator.getConfig().maxDevHoldingPct;
+  const key = `${replayCacheKey(status, minScore ?? getConfluenceThreshold(), cap)}:dev${maxDevHoldingPct}`;
   if (replayCache && replayCache.key === key && Date.now() - replayCache.at < 30_000) return res.json(replayCache.body);
   try {
     // S189: one replay per key at a time (the screen polls), time-sliced so a long replay never stalls the live feed or the auto controller
@@ -1216,7 +1218,7 @@ app.get('/api/backtest/replay', requireOperatorAuth, asyncHandler(async (req, re
         const { launches, funders } = workstationDb.loadLaunchRecording(cap);
         // 5A: the recorder's window and trade cap tell the replay how far each recording reaches (a quiet coin's stale exit is then visible)
         const rc = recorderConfig();
-        const report = await replayLaunchesAsync(launches, funders, solPriceService.lastKnownPrice(), { ...(minScore === undefined ? {} : { minScore }), recordedForMs: rc.mintMs, recordedMaxTrades: rc.maxTradesPerMint });
+        const report = await replayLaunchesAsync(launches, funders, solPriceService.lastKnownPrice(), { ...(minScore === undefined ? {} : { minScore }), recordedForMs: rc.mintMs, recordedMaxTrades: rc.maxTradesPerMint, maxDevHoldingPct });
         // S188: the replay covers the newest `cap` launches; the response says so, so a count below the recorder's is explained
         const body = { success: true, recorded: status, report, message: null, replayedLaunches: launches.length, replayCap: cap };
         replayCache = { key, at: Date.now(), body };

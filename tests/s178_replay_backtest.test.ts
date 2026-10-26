@@ -194,7 +194,7 @@ describe('S178: exits come from the real ExitEngine over the recorded prices', (
     expect(rep.summary.launches).toBe(0);
     expect(rep.summary.winRate).toBeNull();
     expect(rep.summary.netPnlSol).toBeNull();
-    expect(rep.notReplayed.join(' ')).toMatch(/Eligibility filter/);
+    expect(rep.notReplayed.join(' ')).toMatch(/eligibility filter/i);
     expect(rep.assumptions.entryDelayMs).toBeGreaterThan(0);
   });
 });

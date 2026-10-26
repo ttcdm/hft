@@ -11,7 +11,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer, createLogger } from 'vite';
 import { secretPathGuard, viteDevServerOptions } from './server/security/secretPaths';
 import { GoogleGenAI } from '@google/genai';
-import { socialScanner, isTelegramTradeCommand } from './server/socialScanner';
+import { socialScanner, isTelegramTradeCommand, xTwitterScopeEntry } from './server/socialScanner';
 import { memecoinAggregator } from './server/memecoinAggregator';
 import { onChainPoolStats } from './server/market/poolStats';
 import { wireWatchPins, wireCreatorReportPins } from './server/signals/watchPins';
@@ -879,12 +879,7 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, asyncHandler(async
         details:
           'The command handler (/snipe, /signals, /positions, /status, /panic_sell) runs when something posts to the operator-authenticated /api/telegram/webhook. NOT implemented: setWebhook registration with Telegram, getUpdates polling, and alert forwarding. Outbound connectivity can be tested with a bot token; nothing is sent automatically.',
       },
-      {
-        subsystem: 'X.com / Twitter Feed & Social Ingestion',
-        nature: 'LIVE_REACHABLE_METADATA',
-        details:
-          'Outbound HTTPS routing to api.twitter.com verified (HTTP 200). Actively ingests live creator and community X/Twitter links directly from on-chain Pump.fun and DexScreener metadata, with full one-click links to live tweets, search feeds, and profiles. Ready to connect to Twitter API v2 if TWITTER_BEARER_TOKEN is supplied.',
-      },
+      xTwitterScopeEntry(xTwitterTest, allowedCluster()),
       {
         subsystem: 'Coinbase Spot Reference',
         nature: 'LIVE',

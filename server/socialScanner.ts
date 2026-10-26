@@ -544,7 +544,7 @@ export class SocialAlphaScanner {
           httpStatus: probeRes.status,
           latencyMs,
           bearerAuthorized: false,
-          diagnosis: `api.twitter.com is REACHABLE (HTTP ${probeRes.status}, ${latencyMs}ms). No TWITTER_BEARER_TOKEN configured in environment. The engine is pulling live token X/Twitter and Telegram feeds directly from on-chain Pump.fun and DexScreener metadata.`,
+          diagnosis: `api.twitter.com answered HTTP ${probeRes.status} in ${latencyMs}ms. No TWITTER_BEARER_TOKEN is configured. Nothing reads the X API; X links on the board come from token metadata.`,
           timestamp,
         };
       }
@@ -774,3 +774,17 @@ export class SocialAlphaScanner {
 }
 
 export const socialScanner = new SocialAlphaScanner();
+
+/**
+ * The X/Twitter row of the connectivity audit, built from the probe that just ran. It used to be fixed text claiming "verified (HTTP 200)"
+ * and "ready to connect to Twitter API v2" whatever the probe found. The bearer token is only used by the probe: nothing ingests from the
+ * X API. X links shown on tokens come from pump.fun / DexScreener metadata, which this server fetches on mainnet-beta only.
+ */
+export function xTwitterScopeEntry(test: { reachable: boolean; httpStatus: number | null; bearerAuthorized: boolean }, cluster: string) {
+  const probe = test.reachable ? `api.twitter.com answered HTTP ${test.httpStatus}` : `api.twitter.com was not reachable${test.httpStatus ? ` (HTTP ${test.httpStatus})` : ''}`;
+  const token = test.bearerAuthorized ? 'the bearer token was accepted, but nothing reads the X API with it' : 'no accepted bearer token, and nothing reads the X API';
+  const links = cluster === 'mainnet-beta'
+    ? 'X links on tokens come from pump.fun and DexScreener metadata.'
+    : `X links come from pump.fun and DexScreener metadata, which is not fetched on ${cluster}, so tokens here carry none.`;
+  return { subsystem: 'X.com / Twitter', nature: test.reachable ? 'PROBE_ONLY' : 'UNREACHABLE', details: `${probe}; ${token}. ${links}` };
+}

@@ -109,9 +109,15 @@ export class HardenedRiskEngine {
     return this.consecutiveRpcFailures;
   }
 
-  public setKillSwitch(active: boolean) {
+  /**
+   * The flag itself stays in memory (off after a restart: LIVE starts disarmed and auto's OFF is persisted, so no buy follows a restart
+   * without an operator). The module singleton journals each change, so the next boot can tell the operator the switch was on.
+   */
+  public setKillSwitch(active: boolean, reason = 'no reason given') {
+    const changed = this.killSwitchActive !== active;
     this.killSwitchActive = active;
     Logger.warn(`Risk Engine Kill Switch state changed: ${active ? 'TRIPPED (SHUTDOWN)' : 'RESET'}`);
+    if (changed && this === riskEngine) workstationDb.logJournal(active ? 'KILL_SWITCH_TRIPPED' : 'KILL_SWITCH_RESET', 'kill-switch', 'PAPER', { reason });
   }
 
   public isKillSwitchActive(): boolean {

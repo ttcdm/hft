@@ -46,7 +46,7 @@ export async function emergencyStop(opts: { exitAll: boolean; reason?: string })
   running++;
   executionCoordinator.setPanicActive(true);
   try {
-    riskEngine.setKillSwitch(true);
+    riskEngine.setKillSwitch(true, reason);
     let autoStopped = true;
     let autoStopError: string | undefined;
     try {

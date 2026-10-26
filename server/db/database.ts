@@ -349,6 +349,20 @@ export class WorkstationDatabase {
     }
   }
 
+  /** The reason of the last kill-switch trip when the switch was still on at the last journal row (it is off after a restart), else null. */
+  public getKillSwitchTripBeforeRestart(): string | null {
+    try {
+      const row = this.db
+        .prepare(`SELECT event_type, payload_json FROM system_journal WHERE event_type IN ('KILL_SWITCH_TRIPPED','KILL_SWITCH_RESET') ORDER BY id DESC LIMIT 1`)
+        .get() as { event_type: string; payload_json: string } | undefined;
+      if (!row || row.event_type !== 'KILL_SWITCH_TRIPPED') return null;
+      return String(JSON.parse(row.payload_json)?.reason ?? 'no reason given');
+    } catch (err: any) {
+      Logger.error(`Kill-switch state could not be read: ${err.message}`);
+      return null;
+    }
+  }
+
   /** Returns false when the row could not be written (the error is logged; callers that must know, like halt persistence, check it). */
   public logJournal(eventType: string, correlationId: string, mode: ExecutionMode, payload: Record<string, any>): boolean {
     try {
@@ -680,7 +694,7 @@ export class WorkstationDatabase {
       return {
         riskDecisions: run('DELETE FROM risk_decisions WHERE created_at < ?', cutoff),
         decisions: run('DELETE FROM decisions WHERE ts < ?', cutoff),
-        journal: run(`DELETE FROM system_journal WHERE created_at < ? AND event_type NOT IN ('TRADING_HALTED','TRADING_HALT_CLEARED','PAPER_FILL_GATES','PAPER_SELL_FILLED')`, cutoff),
+        journal: run(`DELETE FROM system_journal WHERE created_at < ? AND event_type NOT IN ('TRADING_HALTED','TRADING_HALT_CLEARED','KILL_SWITCH_TRIPPED','KILL_SWITCH_RESET','PAPER_FILL_GATES','PAPER_SELL_FILLED')`, cutoff),
       };
     } catch (e: any) {
       Logger.error(`Retention prune failed: ${e?.message ?? e}`);

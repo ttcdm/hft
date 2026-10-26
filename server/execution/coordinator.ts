@@ -210,6 +210,14 @@ export class ExecutionCoordinator {
         Logger.error(`[HALT] Trading is still halted from before the restart: ${persisted}`);
         this.raiseOperatorAlert('TRADING_HALTED', `All trading is halted (restored after a restart): ${persisted}. Protective exits (stop-loss, trailing stop, manual close, panic) still run; clear it with POST /api/auto/resume {clearHalt:true}.`);
       }
+      // The kill switch is in memory and off after a restart (by decision: LIVE boots disarmed, auto's OFF persists). An operator who
+      // tripped it must still hear that it no longer holds. The reset row makes the alert fire on this boot only.
+      const killSwitchTrip = workstationDb.getKillSwitchTripBeforeRestart();
+      if (killSwitchTrip) {
+        Logger.warn(`[KILL SWITCH] It was on before the restart (${killSwitchTrip}) and is off now`);
+        this.raiseOperatorAlert('KILL_SWITCH_WAS_ON', `The kill switch was on before the restart (${killSwitchTrip}) and is off now. LIVE is disarmed and auto keeps its persisted mode (a panic left it OFF); check why it was tripped before arming. Cleared by POST /api/auto/resume {clearHalt:true}.`);
+        workstationDb.logJournal('KILL_SWITCH_RESET', 'kill-switch', 'PAPER', { reason: 'process restart' });
+      }
     }
     // P1.1 (N-51): the module singleton is built at import time and starts nothing; server.ts calls start() once its port is bound,
     // so a second process that fails to boot never reconciles, runs the exit loop or polls the RPC. Instances built directly (tests,
@@ -3023,6 +3031,7 @@ export class ExecutionCoordinator {
     if (this.haltReason && this.isDefaultSingleton) workstationDb.logJournal('TRADING_HALT_CLEARED', 'halt', this.executionMode, {});
     this.haltReason = null;
     this.clearOperatorAlert('TRADING_HALTED');
+    this.clearOperatorAlert('KILL_SWITCH_WAS_ON');
   }
 
   /** One promise per LIVE buy past its reservation (any caller: auto, manual routes, Telegram); it resolves when the buy has settled. */

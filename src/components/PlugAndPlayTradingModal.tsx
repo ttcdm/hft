@@ -9,6 +9,7 @@
  * It must not hold or show key material, and it must not arm LIVE by itself: arming needs the operator to type the confirmation code, and
  * the server decides whether the prerequisites hold (`getLiveReadiness`). In read-only mode the server refuses to arm and to generate a key.
  */
+import { probeLatency } from '../utils/probeBadge';
 import { ARMED_MESSAGE, PANIC_CONFIRM_TEXT, armRefusalText, panicOutcome } from '../utils/tradingCopy';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import React, { useState, useEffect } from 'react';
@@ -315,9 +316,6 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                 >
                   {!systemAudit ? 'MODE UNKNOWN' : systemAudit.isLiveArmed ? 'LIVE BROADCAST ACTIVE' : 'PAPER TRADING'}
                 </span>
-                <span className="px-1.5 py-0.5 text-[10px] font-mono rounded bg-slate-800 text-slate-300 border border-slate-700">
-                  MICRO $10 TIER
-                </span>
               </div>
               <p className="text-xs text-slate-400">
                 Pump.fun & Raydium sniper engine with isolated risk enforcement and deterministic SQLite persistence
@@ -393,7 +391,8 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
               <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-0.5">RPC Latency</span>
               <span className="text-cyan-400 font-bold text-sm flex items-center">
                 <Radio className="w-3.5 h-3.5 mr-1" />
-                {systemAudit?.rpcLatencyMs != null ? `${systemAudit.rpcLatencyMs} ms` : 'n/a'}
+                {/* UI-7: the server reports 0 until the RPC has answered once; 0 ms is not a measurement */}
+                {probeLatency(systemAudit?.rpcLatencyMs)}
               </span>
             </div>
             <button

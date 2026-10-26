@@ -42,7 +42,6 @@ import {
   Terminal,
   Crosshair,
   RefreshCw,
-  Coins,
   CheckCircle2,
   XCircle,
   Clock,
@@ -465,7 +464,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
             <div>
               <div className="flex items-center space-x-2">
                 <h2 className="text-base sm:text-lg font-bold text-white tracking-wide">
-                  Telegram & X Market Maker Intelligence & Memecoin Sniper Swarm
+                  Telegram & X Signals and Memecoin Sniper
                 </h2>
                 {isWsLive && (
                   <span className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 flex items-center space-x-1">
@@ -483,11 +482,6 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
           <div className="flex items-center space-x-2">
             <SnipeAmountControl compact />
 
-            {/* Capital Tier Pill */}
-            <div className="px-2.5 py-1 rounded-lg bg-amber-950/60 border border-amber-500/40 text-amber-300 text-xs font-mono flex items-center space-x-1.5">
-              <Coins className="w-3.5 h-3.5" />
-              <span>{capitalTier === 'MICRO_10' ? '$10 Micro Account' : '$500k Inst Tier'}</span>
-            </div>
 
             {/* Run Outside World Diagnostics Button */}
             <button
@@ -556,9 +550,10 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
           <div className="p-3 flex items-center justify-between">
             <span className="text-slate-400 flex items-center space-x-1.5">
               <ShieldCheck className="w-3.5 h-3.5 text-purple-400" />
-              <span>Jito MEV Protection</span>
+              <span>Jito bundles</span>
             </span>
-            <span className="font-bold text-purple-300">0.005 SOL Tip (Direct Slot)</span>
+            {/* UI-7: this card used to read "Jito MEV Protection 0.005 SOL Tip (Direct Slot)" on every cluster; Jito is used on mainnet-beta only */}
+            <span className="font-bold text-purple-300">{tradingMode.cluster === 'mainnet-beta' ? 'mainnet only (read-only here)' : `not used on ${tradingMode.cluster ?? 'this cluster'}`}</span>
           </div>
         </div>
 
@@ -1695,7 +1690,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
               <div>
                 <h4 className="font-bold text-slate-200 uppercase tracking-wider text-[11px] mb-2 flex items-center space-x-1.5">
                   <Crosshair className="w-3.5 h-3.5 text-amber-400" />
-                  <span>Market Maker & Caller Profiles Attribution</span>
+                  <span>Caller Profiles</span>
                 </h4>
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2">
                   {diagnosticsResult.marketMakerProfiles.profiles.map((p: any) => (

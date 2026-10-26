@@ -19,7 +19,7 @@ import { creatorRiskScorer } from './server/signals/creatorRiskScorer';
 import { buildSystemChecks } from './server/system/systemChecks';
 import { isReadOnly, assertReadOnlyStartup } from './server/solana/readOnly';
 import { LaunchRecorder } from './server/backtest/launchRecorder';
-import { recorderConfig, recorderConfigProblems } from './server/backtest/recorderConfig';
+import { recorderConfig, recorderConfigProblems, replayCacheKey } from './server/backtest/recorderConfig';
 import { replayLaunchesAsync } from './server/backtest/replay';
 import { checkConfluenceThreshold, getConfluenceThreshold, envConfluenceProblem } from './server/signals/confluenceThreshold';
 import { maxCurveProgressProblem } from './server/signals/curveProgressCap';
@@ -1230,7 +1230,7 @@ app.get('/api/backtest/replay', requireOperatorAuth, asyncHandler(async (req, re
     return res.json({ success: true, recorded: status, report: null, message: 'No launch has been recorded yet, so there is nothing to replay. The recorder saves every launch the watch window scores while the app runs against a pump.fun feed.' });
   }
   const cap = replayLaunchCap();
-  const key = `${status.events}:${status.newestTs}:${minScore ?? getConfluenceThreshold()}:${cap}`;
+  const key = replayCacheKey(status, minScore ?? getConfluenceThreshold(), cap);
   if (replayCache && replayCache.key === key && Date.now() - replayCache.at < 30_000) return res.json(replayCache.body);
   try {
     // S189: one replay per key at a time (the screen polls), time-sliced so a long replay never stalls the live feed or the auto controller

@@ -215,3 +215,23 @@ describe('5B: status counters live in memory; the journal is read by index (R1-9
     rec.detach();
   });
 });
+
+describe('5B: the replay cache key is the newest CREATE per minute (R1-107)', () => {
+  it('more trades on recorded launches keep the key; a launch created in a later minute, another threshold or cap change it', async () => {
+    const { replayCacheKey } = await import('../server/backtest/recorderConfig');
+    const r = recorder({ mintMs: 30 * 60_000, maxTradesPerMint: 2_000 });
+    const a = wallet();
+    r.rec.onCreate(createEvent(a) as any);
+    r.at(1000); r.rec.onTrade(trade(a, 1) as any);
+    const k1 = replayCacheKey(r.db.getLaunchRecordingStatus(), 70, 5_000);
+    for (let i = 2; i <= 20; i++) { r.at(i * 1000); r.rec.onTrade(trade(a, i) as any); }
+    expect(replayCacheKey(r.db.getLaunchRecordingStatus(), 70, 5_000)).toBe(k1);
+    const b = wallet();
+    r.at(2 * 60_000); r.rec.onCreate(createEvent(b) as any);
+    r.at(2 * 60_000 + 500); r.rec.onTrade(trade(b, 1) as any);
+    const k2 = replayCacheKey(r.db.getLaunchRecordingStatus(), 70, 5_000);
+    expect(k2).not.toBe(k1);
+    expect(replayCacheKey(r.db.getLaunchRecordingStatus(), 60, 5_000)).not.toBe(k2);
+    expect(replayCacheKey(r.db.getLaunchRecordingStatus(), 70, 1_000)).not.toBe(k2);
+  });
+});

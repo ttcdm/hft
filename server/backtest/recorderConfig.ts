@@ -71,3 +71,13 @@ export interface RecorderRuntime {
 let runtime: RecorderRuntime | null = null;
 export function setRecorderRuntime(r: RecorderRuntime | null): void { runtime = r; }
 export function getRecorderRuntime(): RecorderRuntime | null { return runtime; }
+
+/**
+ * 5B (R1-107): the replay cache key. It used to include the row count and the newest row's ts, which change with every recorded trade, so
+ * the 30-second cache never hit and each Backtest poll reloaded up to 5,000 launches on the event loop. The key now changes when a launch
+ * is created in a later minute (or the threshold or cap changes); trades on the launches already recorded wait for the cache's 30 s.
+ */
+export function replayCacheKey(status: { newestCreateTs: number | null }, minScore: number, cap: number): string {
+  const minute = status.newestCreateTs === null ? 'none' : String(Math.floor(status.newestCreateTs / 60_000));
+  return `${minute}:${minScore}:${cap}`;
+}

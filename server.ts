@@ -90,6 +90,7 @@ import {
   correlationIdMiddleware,
   errorHandler,
   rateLimiter,
+  LOGIN_RATE_LIMIT,
   securityHeadersMiddleware,
   validateBody,
   WalletConfigSchema,
@@ -413,7 +414,8 @@ app.use(apiAuthGate);
 // ============================================================================
 // OPERATOR AUTHENTICATION & SESSION MANAGEMENT
 // ============================================================================
-app.post('/api/auth/login', (req, res) => {
+// 3G (N-5): password guessing gets its own, much tighter, per-address limit on top of the /api one.
+app.post('/api/auth/login', rateLimiter(LOGIN_RATE_LIMIT), (req, res) => {
   const { password, token } = req.body || {};
   const authRes = authManager.authenticateOperator({ password, token });
   if (!authRes.success) {

@@ -273,17 +273,36 @@ interface RateLimitBucket {
   lastRefillMs: number;
 }
 
-const rateLimitBuckets = new Map<string, RateLimitBucket>();
+export type RateLimitMiddleware = ((req: Request, res: Response, next: NextFunction) => void) & {
+  /** How many peers this limiter is tracking now (idle ones are dropped). */
+  bucketCount(): number;
+};
 
-export function rateLimiter(opts: { maxTokens: number; refillRatePerSec: number }) {
-  return (req: Request, res: Response, next: NextFunction) => {
-    const key = (req.headers['x-api-key'] as string) || req.ip || 'global';
+/**
+ * Token bucket per peer. 3G (N-5): the key is the TCP peer address only. It used to be the client-chosen `x-api-key` header, checked
+ * before the auth gate, so a new header value on every POST /api/auth/login got a fresh bucket (no throttle on password guessing) and
+ * a new map entry that was never removed. `req.ip` is not used: it follows X-Forwarded-For when `trust proxy` is set.
+ * Each limiter has its own buckets. A bucket idle long enough to have refilled completely is the same as a new one, so it is dropped
+ * (swept at most once per refill period, on a request); the map holds only peers seen within that period.
+ */
+export function rateLimiter(opts: { maxTokens: number; refillRatePerSec: number }): RateLimitMiddleware {
+  const buckets = new Map<string, RateLimitBucket>();
+  const fullRefillMs = (opts.maxTokens / opts.refillRatePerSec) * 1000;
+  let lastSweepMs = Date.now();
+
+  const middleware = (req: Request, res: Response, next: NextFunction) => {
+    const key = req.socket?.remoteAddress || 'unknown-peer';
     const now = Date.now();
 
-    let bucket = rateLimitBuckets.get(key);
+    if (now - lastSweepMs >= fullRefillMs) {
+      for (const [k, b] of buckets) if (now - b.lastRefillMs >= fullRefillMs) buckets.delete(k);
+      lastSweepMs = now;
+    }
+
+    let bucket = buckets.get(key);
     if (!bucket) {
       bucket = { tokens: opts.maxTokens, lastRefillMs: now };
-      rateLimitBuckets.set(key, bucket);
+      buckets.set(key, bucket);
     }
 
     // Refill tokens based on elapsed time
@@ -292,7 +311,7 @@ export function rateLimiter(opts: { maxTokens: number; refillRatePerSec: number 
     bucket.lastRefillMs = now;
 
     if (bucket.tokens < 1) {
-      res.setHeader('Retry-After', '1');
+      res.setHeader('Retry-After', String(Math.max(1, Math.ceil((1 - bucket.tokens) / opts.refillRatePerSec))));
       return res.status(429).json({
         success: false,
         error: {
@@ -308,7 +327,11 @@ export function rateLimiter(opts: { maxTokens: number; refillRatePerSec: number 
     res.setHeader('X-RateLimit-Remaining', Math.floor(bucket.tokens).toString());
     next();
   };
+  return Object.assign(middleware, { bucketCount: () => buckets.size });
 }
+
+/** 3G (N-5): POST /api/auth/login on top of the /api limiter: 5 attempts at once, then one every 12 s, per peer address. */
+export const LOGIN_RATE_LIMIT = { maxTokens: 5, refillRatePerSec: 5 / 60 } as const;
 
 // ============================================================================
 // 5. SECURITY HEADERS & SANITIZATION

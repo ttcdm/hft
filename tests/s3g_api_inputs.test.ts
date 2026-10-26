@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from 'vitest';
 import net from 'node:net';
-import { WalletConfigSchema } from '../server/middleware/enterprise';
+import type { Request, Response } from 'express';
+import { rateLimiter, LOGIN_RATE_LIMIT, WalletConfigSchema } from '../server/middleware/enterprise';
 import { authManager } from '../server/middleware/auth';
 import { walletTrader } from '../server/walletTrader';
 import { executionCoordinator } from '../server/execution/coordinator';
@@ -150,6 +151,57 @@ describe('3G N-8, N-19: Jito can be turned off, and a refused Jito URL changes n
     const state = await call('GET', '/api/wallet/state');
     for (const cfg of [saved.json.config, state.json.config]) expect(cfg.jitoBlockEngineUrl).toBe('https://block-engine.example.org');
     expect(JSON.stringify([saved.json, state.json])).not.toContain('SECRET-JITO-KEY');
+  });
+});
+
+describe('3G N-5: the rate limiter keys on the peer address, login is limited harder, idle buckets go', () => {
+  const fakeReq = (remoteAddress: string, apiKey?: string) =>
+    ({ socket: { remoteAddress }, headers: apiKey ? { 'x-api-key': apiKey } : {}, ip: remoteAddress }) as unknown as Request;
+  const fakeRes = () => {
+    const r: any = { statusCode: 200, headers: {} as Record<string, string> };
+    r.setHeader = (k: string, v: string) => { r.headers[k] = v; return r; };
+    r.status = (c: number) => { r.statusCode = c; return r; };
+    r.json = () => r;
+    return r as Response & { statusCode: number };
+  };
+  afterEach(() => vi.useRealTimers());
+
+  it('200 requests from one address with 200 different x-api-key values get 429s after the burst', () => {
+    const limiter = rateLimiter({ maxTokens: 120, refillRatePerSec: 30 });
+    vi.useFakeTimers(); // no refill between the requests: the clock does not move
+    let passed = 0;
+    let limited = 0;
+    for (let i = 0; i < 200; i++) {
+      const res = fakeRes();
+      limiter(fakeReq('10.0.0.7', `key-${i}`), res, () => { passed++; });
+      if (res.statusCode === 429) limited++;
+    }
+    expect(passed).toBe(120);
+    expect(limited).toBe(80);
+  });
+
+  it('a bucket idle for a full refill period is dropped', () => {
+    vi.useFakeTimers();
+    const limiter = rateLimiter({ maxTokens: 10, refillRatePerSec: 1 });
+    for (let i = 0; i < 50; i++) limiter(fakeReq(`10.0.1.${i}`), fakeRes(), () => {});
+    expect(limiter.bucketCount()).toBe(50);
+    vi.advanceTimersByTime(10_000); // 10 tokens at 1/s: every bucket is full again
+    limiter(fakeReq('10.0.2.1'), fakeRes(), () => {});
+    expect(limiter.bucketCount()).toBe(1);
+  });
+
+  it('POST /api/auth/login: the sixth wrong password in a row from one address gets a 429, whatever x-api-key says', async () => {
+    const statuses: number[] = [];
+    for (let i = 0; i <= LOGIN_RATE_LIMIT.maxTokens; i++) {
+      const r = await fetch(`${base}/api/auth/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-api-key': `guess-${i}` },
+        body: JSON.stringify({ password: `wrong-${i}` }),
+      });
+      statuses.push(r.status);
+    }
+    expect(statuses.slice(0, LOGIN_RATE_LIMIT.maxTokens).every((s) => s === 401)).toBe(true);
+    expect(statuses[LOGIN_RATE_LIMIT.maxTokens]).toBe(429);
   });
 });
 

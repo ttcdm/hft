@@ -35,7 +35,7 @@ export const PAPER_STALE_REFRESH_PER_PASS = 5;
 /** PAPER positions with no price get their own alert up to this many per pass; the rest share one alert with a count. */
 export const PAPER_INDIVIDUAL_ALERTS = 5;
 import { EligibilityFilter } from '../signals/eligibilityFilter';
-import { curveProgressPctOfState, isCurveTooFar, curveTooFarReason } from '../signals/curveProgressCap';
+import { curveProgressPctOfState, curveProgressUnreadable, isCurveTooFar, curveTooFarReason } from '../signals/curveProgressCap';
 import { localSigner } from '../solana/signer';
 import { txBuilder, SolanaTransactionBuilder, PumpBuyParams, PumpSellParams } from '../solana/transactionBuilder';
 import { SolanaRpcTransport, JitoTransport } from '../solana/transports';
@@ -2365,7 +2365,16 @@ export class ExecutionCoordinator {
 
     // P4.3 (R1-57): the authoritative curve-progress cap, on this fresh read, for every caller (auto, callout, manual)
     const liveProgressPct = curveProgressPctOfState(marketState);
-    if (liveProgressPct !== null && isCurveTooFar(liveProgressPct)) {
+    // Review 2026-10-24, finding 8: a LIVE buy needs a known progress. With the token reserves unreadable the cap cannot be
+    // checked, so the buy is refused (fail closed). PAPER and SHADOW still let an unknown progress through (see curveProgressCap.ts).
+    if (liveProgressPct === null) {
+      const error = curveProgressUnreadable(marketState)
+        ? 'CURVE_PROGRESS_UNREADABLE: the bonding curve\'s token reserves could not be read (SOL reserves did), so its progress is unknown; LIVE buy refused'
+        : 'CURVE_PROGRESS_UNREADABLE: the bonding curve state carries no readable reserves, so its progress is unknown; LIVE buy refused';
+      workstationDb.logJournal('TRADE_FILTER_REJECTED', correlationId, 'LIVE', { reason: error, curveProgressPct: null });
+      return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'LIVE', error, correlationId };
+    }
+    if (isCurveTooFar(liveProgressPct)) {
       const error = curveTooFarReason('CURVE_PROGRESS_TOO_HIGH', liveProgressPct);
       workstationDb.logJournal('TRADE_FILTER_REJECTED', correlationId, 'LIVE', { reason: error, curveProgressPct: liveProgressPct });
       return { success: false, lifecycleState: 'FILTER_REJECTED', executionMode: 'LIVE', error, correlationId };

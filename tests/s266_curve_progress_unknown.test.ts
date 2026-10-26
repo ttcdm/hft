@@ -5,7 +5,7 @@ import { CURVE_INITIAL_REAL_TOKENS } from '../server/market/poolStats';
 /**
  * S266 (review 2026-10-24, finding 8): curve progress is the share of the curve's tokens sold. With the token reserves unreadable the cap
  * used to fall back to SOL/85 (about 28% at a real 60%), a wrong figure that looked measured. Now the progress is unknown (null), and
- * curveProgressUnreadable names that state (not yet used to refuse a buy). The real functions; the states are plain values.
+ * curveProgressUnreadable names that state (the coordinator refuses a LIVE buy on it: tests/review_f8_live_buy_unreadable_curve.test.ts). The real functions; the states are plain values.
  */
 describe('S266: curve progress without readable token reserves is unknown, not a SOL estimate', () => {
   it('62% of the tokens sold reads 62, whatever the SOL reserves say', () => {

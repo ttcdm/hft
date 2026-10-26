@@ -9,7 +9,8 @@ import { curveProgressOf } from '../market/poolStats';
  *   - the watch window releases a watched launch DEAD with CURVE_TOO_FAR as soon as its measured progress is above the cap;
  *   - the auto controller drops a HOT or READY release whose measured progress is above it now (stage `curve`);
  *   - the coordinator checks it again on its own fresh curve read, for every caller (auto, callout, manual), PAPER, SHADOW and LIVE alike.
- * An unknown progress (no trade measured yet, curve not readable) never blocks here; the coordinator's fresh read is the authoritative one.
+ * An unknown progress (no trade measured yet, curve not readable) never blocks here; the coordinator's fresh read is the authoritative one;
+ * a LIVE buy whose fresh read gives no progress is refused there (CURVE_PROGRESS_UNREADABLE). PAPER and SHADOW let it through.
  */
 export const MAX_CURVE_PROGRESS_PCT_DEFAULT = 60;
 
@@ -40,9 +41,8 @@ const toBig = (v: unknown): bigint | null => {
 export function curveProgressPctOfState(state: { realSolReserves?: unknown; realTokenReserves?: unknown }): number | null {
   const tok = toBig(state.realTokenReserves);
   // S266 (review 2026-10-24, finding 8): progress is the token share only. With the token reserves unreadable this used to fall back to
-  // SOL/85 (about 28% at a real 60%), a figure that looked measured but was wrong. Now it is unknown (null). The cap still lets an unknown
-  // progress through, as before; refusing a LIVE buy on it (curveProgressUnreadable) is not wired in yet, since test fixtures carry states
-  // with SOL reserves only and the change needs them updated first.
+  // SOL/85 (about 28% at a real 60%), a figure that looked measured but was wrong. Now it is unknown (null). The cap itself still lets an
+  // unknown progress through; the coordinator's LIVE branch refuses the buy on it (CURVE_PROGRESS_UNREADABLE).
   if (tok === null) return null;
   const sol = toBig(state.realSolReserves);
   return curveProgressOf({ realSolReserves: sol === null ? 0 : Number(sol) / 1e9, realTokenReserves: tok });

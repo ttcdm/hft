@@ -223,7 +223,10 @@ describe('S245: rate-limited sends through the real coordinator', () => {
     expect(coordinator.exitRetryWaitMs(id)).toBeGreaterThan(0);
     expect(coordinator.exitRetryWaitMs(id)).toBeLessThanOrEqual(EXIT_RATE_LIMITED_WAIT_MS);
     // A2: a wall clock set back an hour does not stretch it
-    expect(coordinator.exitRetryWaitMs(id, Date.now() - 3_600_000)).toBe(EXIT_RATE_LIMITED_WAIT_MS);
+    // (A3: it also runs down on the monotonic clock, so it is the flat wait less the real time since it was set)
+    const stepped = coordinator.exitRetryWaitMs(id, Date.now() - 3_600_000);
+    expect(stepped).toBeGreaterThan(EXIT_RATE_LIMITED_WAIT_MS - 1_000);
+    expect(stepped).toBeLessThanOrEqual(EXIT_RATE_LIMITED_WAIT_MS);
     expect(coordinator.getOperatorAlerts().some((a) => a.code === 'EXIT_RATE_LIMITED' && a.positionId === id && !a.cleared)).toBe(true);
     // the row of the refused sell is resolved (TIMED_OUT: it never landed), not PENDING
     expect(workstationDb.getPendingTransactions().some((t) => t.mint === VALID_PUMP_MINT_1.toBase58() && t.direction === 'SELL')).toBe(false);

@@ -3206,7 +3206,7 @@ export class ExecutionCoordinator {
     return { mints: [...mints], reservedSol: reservedLamports / 1e9 };
   }
 
-  private exitFailures = new Map<string, { count: number; nextAttemptAt: number; lastError: string; waitMs?: number }>();
+  private exitFailures = new Map<string, { count: number; nextAttemptAt: number; lastError: string; waitMs?: number; setAtMono?: number }>();
 
   /**
    * Sell slippage for the next attempt on this position: starts at 800 bps and widens after each consecutive failure.
@@ -3224,8 +3224,12 @@ export class ExecutionCoordinator {
     if (!f) return 0;
     // S271 review: never more than the backoff that was set. nextAttemptAt is wall-clock time; set under a clock that was later set back
     // (devnet harness, NTP), it would hold this position's exits, its stop-loss included, for the size of the jump.
+    // A3: and a wall clock set back after that never stretches it either: the wait also runs down on the monotonic clock, which ignores
+    // wall-clock steps, so the cap alone (which left the full wait on every poll) cannot hold the position past waitMs of real time.
     const left = f.nextAttemptAt - now;
-    return Math.max(0, f.waitMs === undefined ? left : Math.min(left, f.waitMs));
+    if (f.waitMs === undefined) return Math.max(0, left);
+    const monoLeft = f.setAtMono === undefined ? f.waitMs : Math.ceil(f.waitMs - (performance.now() - f.setAtMono));
+    return Math.max(0, Math.min(left, f.waitMs, monoLeft));
   }
 
   public getExitFailureCount(positionId: string): number {
@@ -3273,7 +3277,7 @@ export class ExecutionCoordinator {
       // T6: wait before the next try, keeping the failure count (and so the slippage step) as it was. waitMs caps it as A2 caps every
       // exit wait, so a wall clock set back cannot stretch it.
       const prev = this.exitFailures.get(positionId);
-      this.exitFailures.set(positionId, { count: prev?.count ?? 0, nextAttemptAt: Date.now() + EXIT_RATE_LIMITED_WAIT_MS, lastError: res.error || 'RPC_RATE_LIMITED', waitMs: EXIT_RATE_LIMITED_WAIT_MS });
+      this.exitFailures.set(positionId, { count: prev?.count ?? 0, nextAttemptAt: Date.now() + EXIT_RATE_LIMITED_WAIT_MS, lastError: res.error || 'RPC_RATE_LIMITED', waitMs: EXIT_RATE_LIMITED_WAIT_MS, setAtMono: performance.now() });
     }
     if (mode === 'LIVE' && (quoteFailure || (res.notSent && !ExecutionCoordinator.isNonAttemptExitError(res.error)))) {
       // No fee was spent and the ladder must not advance, but a stop-loss that cannot be priced or built is exactly what an operator must hear about.
@@ -3282,7 +3286,7 @@ export class ExecutionCoordinator {
     if (mode !== 'LIVE' || res.notSent || ExecutionCoordinator.isNonAttemptExitError(res.error)) return;
     const count = (this.exitFailures.get(positionId)?.count ?? 0) + 1;
     const wait = Math.min(EXIT_RETRY_MAX_MS, EXIT_RETRY_BASE_MS * 2 ** (count - 1));
-    this.exitFailures.set(positionId, { count, nextAttemptAt: Date.now() + wait, lastError: res.error || 'unknown', waitMs: wait });
+    this.exitFailures.set(positionId, { count, nextAttemptAt: Date.now() + wait, lastError: res.error || 'unknown', waitMs: wait, setAtMono: performance.now() });
     if (count >= EXIT_FAILURE_ALERT_AFTER) {
       this.raiseOperatorAlert('EXIT_FAILING', `Exit for position ${positionId.slice(0, 8)} failed ${count} times in a row (last: ${res.error}). Retrying every ${Math.round(wait / 1000)}s with wider slippage; consider closing manually.`, positionId);
     }

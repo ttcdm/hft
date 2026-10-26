@@ -1,7 +1,7 @@
 import '../suppress-warnings.cjs';
 import { describe, it, expect, afterEach, vi } from 'vitest';
 import { Keypair } from '@solana/web3.js';
-import { ExecutionCoordinator, EXIT_RETRY_BASE_MS } from '../server/execution/coordinator';
+import { ExecutionCoordinator, EXIT_RETRY_BASE_MS, EXIT_RATE_LIMITED_WAIT_MS } from '../server/execution/coordinator';
 import { PumpSwapVenueService as PumpSwapService } from '../server/solana/pumpSwapService';
 
 /**
@@ -41,5 +41,36 @@ describe('S271 review: exit-path timers after the wall clock is set back', () =>
     vi.advanceTimersByTime(16_000); // past the 15 s TTL
     await PumpSwapService.getPoolState(conn as any, mint, 'PAPER');
     expect(conn.getAccountInfo).toHaveBeenCalledTimes(2); // re-read, not served from a cache the old clock kept "fresh"
+  });
+});
+
+describe('A3: a failed sell backoff runs down after the wall clock is set back', () => {
+  it('after a clock set-back the wait reaches 0 within the backoff of real time, not when the old deadline passes', () => {
+    vi.useFakeTimers({ toFake: ['Date', 'performance'] });
+    const c = new ExecutionCoordinator();
+    try {
+      vi.setSystemTime(Date.now() + HOURS_18);
+      (c as any).recordExitOutcome('pos-a3', { success: false, error: 'custom program error: 0x1772 (slippage)' }, 'LIVE');
+      vi.setSystemTime(Date.now() - HOURS_18);
+      expect(c.exitRetryWaitMs('pos-a3')).toBeGreaterThan(0);
+      vi.advanceTimersByTime(EXIT_RETRY_BASE_MS + 1); // the clock now reads 18 h before the stamped deadline
+      expect(c.exitRetryWaitMs('pos-a3')).toBe(0); // was EXIT_RETRY_BASE_MS on every poll until the old deadline
+    } finally {
+      c.cleanup();
+    }
+  });
+
+  it('the same for an RPC_RATE_LIMITED wait', () => {
+    vi.useFakeTimers({ toFake: ['Date', 'performance'] });
+    const c = new ExecutionCoordinator();
+    try {
+      vi.setSystemTime(Date.now() + HOURS_18);
+      (c as any).recordExitOutcome('pos-a3b', { success: false, error: 'RPC_RATE_LIMITED: 429' }, 'LIVE');
+      vi.setSystemTime(Date.now() - HOURS_18);
+      vi.advanceTimersByTime(EXIT_RATE_LIMITED_WAIT_MS + 1);
+      expect(c.exitRetryWaitMs('pos-a3b')).toBe(0);
+    } finally {
+      c.cleanup();
+    }
   });
 });

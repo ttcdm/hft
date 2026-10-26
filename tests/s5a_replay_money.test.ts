@@ -284,3 +284,19 @@ describe('5A: both exit-variant studies price on the shared model and agree with
     }
   });
 });
+
+describe('5A: what the recording window may assume', () => {
+  afterEach(() => restoreStockEngine());
+  const W = { impact: false, recordedForMs: 40 * 60_000 };
+  it('a launch at the recorder\'s trade cap gets no coverage past its last print, since it may have been cut off', () => {
+    const { rows } = released();
+    expect(replay(rows, W).outcome).toBe('CLOSED');
+    expect(replay(rows, { ...W, recordedMaxTrades: rows.length }).outcome).toBe('OPEN_AT_END');
+    expect(replay(rows, { ...W, recordedMaxTrades: rows.length + 1 }).outcome).toBe('CLOSED');
+  });
+  it('an END time on the launch decides the coverage over the window', () => {
+    const { rows } = released();
+    const rec = { ...toRecordedLaunch(launch(rows), 150), endTs: rows[rows.length - 1][0] + 60_000 };
+    expect(replayLaunch(rec, [], 150, { ...GATE, ...W }).outcome).toBe('OPEN_AT_END');
+  });
+});

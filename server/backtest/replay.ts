@@ -49,6 +49,11 @@ export type ReplayOptions = Partial<typeof REPLAY_DEFAULTS> & {
    * priced at that print (no print: the curve did not move) up to create + this; without it nothing is assumed past the last recorded print.
    */
   recordedForMs?: number;
+  /**
+   * 5A: the recorder's per-launch trade cap. A launch with this many recorded trades may have been cut off, so `recordedForMs` does not
+   * extend its coverage (5B's END rows, as `RecordedLaunch.endTs`, say so exactly).
+   */
+  recordedMaxTrades?: number;
 };
 
 /** 5A: the replay's costs as a costModel cost case. */
@@ -69,7 +74,7 @@ export function tradeRow(ev: RecordedEvent): TradeRow | null {
 }
 
 export interface RecordedEvent { ts: number; kind: 'CREATE' | 'TRADE'; payload: any }
-/** `endTs` (optional): when the recording of this launch is known to have ended (an END row); see ReplayOptions.recordedForMs. */
+/** `endTs` (optional): when the recording of this launch is known to have ended (an END row). When present it decides the coverage, not ReplayOptions.recordedForMs. */
 export interface RecordedLaunch { mint: string; events: RecordedEvent[]; endTs?: number }
 export interface FunderFact { ts: number; wallet: string; funder: string | null }
 
@@ -313,7 +318,9 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
   const rows = trades.map(tradeRow).filter((r): r is TradeRow => r !== null);
   if (rows.length === 0) return { ...result, noEntryReason: 'no recorded trade carries a price, so no price to buy at' };
   const lastEventTs = launch.events[launch.events.length - 1]?.ts ?? rows[rows.length - 1][0];
-  const coveredUntilTs = Math.max(lastEventTs, launch.endTs ?? -Infinity, o.recordedForMs !== undefined ? startTs + o.recordedForMs : -Infinity);
+  const capped = o.recordedMaxTrades !== undefined && trades.length >= o.recordedMaxTrades;
+  const window = launch.endTs !== undefined ? launch.endTs : (o.recordedForMs !== undefined && !capped ? startTs + o.recordedForMs : -Infinity);
+  const coveredUntilTs = Math.max(lastEventTs, window);
   const path = simulatePath(rows, releasedAt, { entryMs: o.entryDelayMs, exitMs: o.exitDelayMs }, null, { coveredUntilTs });
   if (!path) return { ...result, noEntryReason: 'the entry trade carries no price' };
   const money = priceEntryParts(rows, path, o.orderSol, replayCostCase({ ...o, impact: optsIn.impact }));

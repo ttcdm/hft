@@ -36,6 +36,8 @@ export interface LiveWalletState {
   /**
    * The real balance plus the marked value of the open positions, in dollars; null until both the balance and a SOL price have been
    * read. (Audit 2026-10-22: it used to be built from `allocatedSol`, a constant per capital tier that looked like a wallet figure.)
+   * Also null while any open position has no finite mark (none yet, or NaN): such a position used to count as 0, and a NaN mark made
+   * the whole total NaN (review 2026-10-24, finding 13).
    */
   totalPortfolioValueUsd: number | null;
   activePositions: NormalizedPosition[];
@@ -230,11 +232,14 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     const mode = executionCoordinator.getExecutionMode();
     const activePositions = executionCoordinator.getPositions(mode, 'ACTIVE');
     const closedPositions = executionCoordinator.getPositions(mode, 'CLOSED');
-    const totalOpenValue = activePositions.reduce((s, p) => s + (p.currentValueSol ?? 0), 0);
+    // null when any open position is unpriced: a total that silently leaves one out would read as a real figure
+    const totalOpenValue = activePositions.every((p) => Number.isFinite(p.currentValueSol))
+      ? activePositions.reduce((s, p) => s + (p.currentValueSol as number), 0)
+      : null;
     const diag = executionCoordinator.getDiagnostics();
 
     const solPriceUsd = solPriceService.lastKnownPrice(); // null when no price has ever been read
-    const totalPortfolioValueUsd = solPriceUsd === null || diag.walletSolBalance === null ? null : (diag.walletSolBalance + totalOpenValue) * solPriceUsd;
+    const totalPortfolioValueUsd = solPriceUsd === null || diag.walletSolBalance === null || totalOpenValue === null ? null : (diag.walletSolBalance + totalOpenValue) * solPriceUsd;
     const totalUnrealizedPnLSol = activePositions.reduce((s, p) => s + (Number.isFinite(p.unrealizedPnLSol) ? (p.unrealizedPnLSol as number) : 0), 0);
     const totalRealizedPnLSol = workstationDb.getDailyRealizedPnLSol(mode);
     const totalRealizedPnLUsd = solPriceUsd === null ? null : totalRealizedPnLSol * solPriceUsd;

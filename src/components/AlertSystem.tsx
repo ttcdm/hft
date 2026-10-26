@@ -1,6 +1,21 @@
-import React from 'react';
+import React, { useState } from 'react';
 import { AlertCircle, AlertTriangle, ShieldCheck, X } from 'lucide-react';
 import { AlertEvent } from '../types';
+
+/**
+ * UI-2: alerts used to pile up three deep in the bottom-right corner and stay until dismissed, covering the Plug & Play footer
+ * (ARM LIVE TRADING, PAPER SNIPE). INFO and WARNING now expire on their own; CRITICAL stays until the operator dismisses it.
+ * The stack shows the newest alert only, with "Show all" for the rest.
+ */
+export const ALERT_TTL_MS: Record<AlertEvent['level'], number | null> = { INFO: 8_000, WARNING: 20_000, CRITICAL: null };
+
+export function isAlertExpired(alert: Pick<AlertEvent, 'level' | 'timestamp'>, now: number): boolean {
+  const ttl = ALERT_TTL_MS[alert.level];
+  return ttl !== null && now - alert.timestamp >= ttl;
+}
+
+export const COLLAPSED_ALERTS = 1;
+export const EXPANDED_ALERTS = 3;
 
 interface AlertSystemProps {
   alerts: AlertEvent[];
@@ -13,7 +28,10 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
   onDismissAlert,
   onClearAll,
 }) => {
+  const [expanded, setExpanded] = useState(false);
   if (alerts.length === 0) return null;
+  const shown = alerts.slice(0, expanded ? EXPANDED_ALERTS : COLLAPSED_ALERTS);
+  const hidden = alerts.length - shown.length;
 
   return (
     <div
@@ -25,15 +43,26 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
           <AlertTriangle className="w-3.5 h-3.5 mr-1" />
           <span>Active Risk Alerts ({alerts.length})</span>
         </span>
-        <button
-          onClick={onClearAll}
-          className="text-slate-400 hover:text-white text-[10px]"
-        >
-          Clear All
-        </button>
+        <span className="flex items-center space-x-3">
+          {alerts.length > COLLAPSED_ALERTS && (
+            <button
+              onClick={() => setExpanded(!expanded)}
+              className="text-slate-400 hover:text-white text-[10px]"
+              data-testid="alerts-toggle"
+            >
+              {expanded ? 'Show less' : `Show all (+${hidden})`}
+            </button>
+          )}
+          <button
+            onClick={onClearAll}
+            className="text-slate-400 hover:text-white text-[10px]"
+          >
+            Clear All
+          </button>
+        </span>
       </div>
 
-      {alerts.slice(0, 3).map((alert) => (
+      {shown.map((alert) => (
         <div
           key={alert.id}
           className={`pointer-events-auto p-3 rounded-lg border shadow-xl flex items-start justify-between backdrop-blur-md transition-all duration-300 font-mono text-xs ${

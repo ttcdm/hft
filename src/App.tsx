@@ -4,7 +4,7 @@ import { PerformanceKPIs, AlertEvent } from './types';
 import { hftAudio } from './utils/audio';
 
 import { Header } from './components/Header';
-import { AlertSystem } from './components/AlertSystem';
+import { AlertSystem, isAlertExpired } from './components/AlertSystem';
 import { AiDiagnosticsModal } from './components/AiDiagnosticsModal';
 import { SystemChecksModal } from './components/SystemChecksModal';
 import { ExecutionLatencyModal } from './components/ExecutionLatencyModal';
@@ -126,6 +126,15 @@ export default function App() {
     },
     []
   );
+
+  // UI-2: INFO and WARNING alerts expire on their own so the stack does not sit on the Plug & Play footer; CRITICAL stays.
+  useEffect(() => {
+    const t = setInterval(() => {
+      const now = Date.now();
+      setAlerts((prev) => (prev.some((a) => isAlertExpired(a, now)) ? prev.filter((a) => !isAlertExpired(a, now)) : prev));
+    }, 1000);
+    return () => clearInterval(t);
+  }, []);
 
   // Q36: a refused WebSocket command is shown, not dropped.
   useEffect(() => {

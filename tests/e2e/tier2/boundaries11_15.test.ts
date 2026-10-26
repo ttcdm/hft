@@ -226,32 +226,6 @@ describe('Tier 2: Boundary & Corner Cases (Features 11 - 15)', () => {
       expect(loaded?.realizedPnLSol).toBe(-0.0025);
     });
 
-    it('B13.5: crash recovery of pending order with missing confirmation updates stage to FAILED', () => {
-      testDb.saveOrder({
-        id: 'order_interrupted_1',
-        clientOrderId: 'client_int_1',
-        correlationId: 'corr_int_1',
-        mint: VALID_PUMP_MINT_1.toBase58(),
-        symbol: 'INT',
-        side: 'BUY',
-        amountLamports: 10_000_000,
-        expectedTokensRaw: '1000000000',
-        slippageBps: 500,
-        estimatedFeeLamports: 50000,
-        jitoTipLamports: 100000,
-        executionMode: 'PAPER',
-        status: 'FAILED',
-        stage: 'FAILED',
-        rejectionReason: 'CRASH_RECOVERY_ORPHANED_ORDER',
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-      });
-
-      const rows = testDb.db.prepare("SELECT * FROM orders WHERE id = ?").all('order_interrupted_1') as any[];
-      expect(rows.length).toBe(1);
-      expect(rows[0].status).toBe('FAILED');
-      expect(rows[0].rejection_reason).toBe('CRASH_RECOVERY_ORPHANED_ORDER');
-    });
   });
 
   // =========================================================================

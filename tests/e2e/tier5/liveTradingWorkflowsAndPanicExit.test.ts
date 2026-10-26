@@ -7,6 +7,7 @@ import { workstationDb } from '../../../server/db/database';
 import { executionConfig } from '../../../server/solana/executionConfig';
 import { PumpCurveService } from '../../../server/solana/pumpCurve';
 import { walletTrader } from '../../../server/walletTrader';
+import { PANIC_CLOSE_REASON } from '../../../server/execution/emergencyStop';
 import { MockSolanaRpc } from '../helpers/mockRpc';
 import { MockJitoEngine } from '../helpers/mockJito';
 import { TestDatabase } from '../helpers/testDb';
@@ -475,9 +476,12 @@ describe('Tier 5 [mock-level]: Live Trading Workflows, Token Safety & Panic Exit
       expect(report.killSwitchActivated).toBe(true);
       expect(riskEngine.isKillSwitchActive()).toBe(true);
       expect(executionCoordinator.isLiveArmed()).toBe(false);
-      expect(report.attemptedCount).toBeGreaterThanOrEqual(2);
-      expect(report.succeeded.length).toBeGreaterThanOrEqual(2);
-      expect(closeSpy).toHaveBeenCalled();
+      // both seeded rows, the PARTIALLY_CLOSED one included, are sold in full with the panic reason (other files' rows may be sold too)
+      for (const id of [pos1Id, pos2Id]) {
+        expect(closeSpy).toHaveBeenCalledWith(id, 100, PANIC_CLOSE_REASON);
+        expect(report.succeeded.map((r) => r.id)).toContain(id);
+      }
+      expect(report.failed).toEqual([]);
 
       // Verify that subsequent trade requests fail closed due to active kill switch
       vi.spyOn(executionCoordinator, 'canExecuteLive').mockRestore();

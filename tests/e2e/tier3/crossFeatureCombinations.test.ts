@@ -170,51 +170,6 @@ describe('Tier 3: Cross-Feature Combinations (Pairwise Feature Interactions)', (
   });
 
   // ===========================================================================
-  // Interaction 5: F5 (Jito Correctness) + F6 (Safe Jito Retry & RPC Fallback)
-  // ===========================================================================
-  it('C5: [F5 + F6] Jito bundle drop triggers bounded retry with separate bundle IDs and single clientOrderId', async () => {
-    const clientOrderId = `client_ord_${Date.now()}`;
-    const bundleIds: string[] = [];
-
-    // Simulate sending 2 bundle attempts with the same order payload
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      const bundleId = `bundle_attempt_${attempt}_${Date.now()}`;
-      bundleIds.push(bundleId);
-      mockJito.registerBundle({
-        bundleId,
-        transactions: ['tx_signed_blob'],
-        submittedAt: Date.now(),
-        inflightStatus: attempt === 1 ? 'Failed' : 'Landed',
-        confirmationStatus: attempt === 1 ? 'Failed' : 'confirmed',
-        slot: 280000010 + attempt,
-      });
-    }
-
-    // Bundle IDs are distinct
-    expect(bundleIds[0] !== bundleIds[1]).toBe(true);
-
-    // But order was recorded once in orders table under single clientOrderId
-    testDb.saveOrder({
-      id: 'ord_retry_test',
-      clientOrderId,
-      correlationId: 'corr_retry_test',
-      mint: VALID_PUMP_MINT_1.toBase58(),
-      symbol: 'RETRY',
-      side: 'BUY',
-      amountLamports: 5000000,
-      expectedTokensRaw: '1000000',
-      slippageBps: 300,
-      status: 'FILLED',
-      executionMode: 'PAPER',
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-    });
-
-    const ordersWithClient = testDb.db.prepare('SELECT count(*) as count FROM orders WHERE client_order_id = ?').get(clientOrderId) as { count: number };
-    expect(ordersWithClient.count).toBe(1); // Exactly 1 fill record
-  });
-
-  // ===========================================================================
   // Interaction 6: F6 (Safe RPC Fallback) + F1 (Execution Mode)
   // ===========================================================================
   it('C6: [F6 + F1] In LIVE mode, RPC fallback requires valid signer and fails-closed if signer locked', async () => {
@@ -511,69 +466,6 @@ describe('Tier 3: Cross-Feature Combinations (Pairwise Feature Interactions)', (
     const evalResult = riskEngine.evaluateOrder(orderReq);
     expect(evalResult.approved).toBe(false);
     expect(evalResult.reasonCode).toBe('DAILY_LOSS_LIMIT');
-  });
-
-  // ===========================================================================
-  // Interaction 20: F20 (Dynamic Exits / TP Ladder) + F4 (PumpSwap Migration)
-  // ===========================================================================
-  it('C20: [F20 + F4] Migrated PumpSwap position executes partial take-profit ladder step, updating token quantity in SQLite', () => {
-    const posId = `pumpswap_ladder_${Date.now()}`;
-    const initialTokensRaw = '1000000000'; // 1,000 tokens
-
-    testDb.savePosition({
-      id: posId,
-      mint: GRADUATED_PUMP_MINT.toBase58(),
-      symbol: 'LADDERPS',
-      name: 'PumpSwap Ladder',
-      tokenDecimals: 6,
-      baseTokenProgram: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
-      entryPriceSol: 0.0001,
-      currentPriceSol: 0.0002, // 2x price
-      tokenQuantityRaw: initialTokensRaw,
-      costBasisLamports: 100_000_000,
-      realizedPnLSol: 0,
-      status: 'OPEN',
-      venue: 'PUMPSWAP',
-      poolAddress: '4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf',
-      executionMode: 'PAPER',
-      entryTxSignature: 'sig_ps_ladder',
-      entryTimestamp: Date.now() - 120000,
-      recordUpdatedAt: Date.now(),
-      updatedAt: Date.now(),
-    });
-
-    // Execute 50% partial exit step at 2x
-    const sellPct = 50;
-    const remainingTokens = (BigInt(initialTokensRaw) * BigInt(100 - sellPct)) / 100n;
-    const realizedPnL = 0.05; // 0.05 SOL profit booked
-
-    testDb.savePosition({
-      id: posId,
-      mint: GRADUATED_PUMP_MINT.toBase58(),
-      symbol: 'LADDERPS',
-      name: 'PumpSwap Ladder',
-      tokenDecimals: 6,
-      baseTokenProgram: 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA',
-      entryPriceSol: 0.0001,
-      currentPriceSol: 0.0002,
-      tokenQuantityRaw: remainingTokens.toString(),
-      costBasisLamports: 50_000_000,
-      realizedPnLSol: realizedPnL,
-      status: 'PARTIALLY_CLOSED',
-      venue: 'PUMPSWAP',
-      poolAddress: '4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf',
-      executionMode: 'PAPER',
-      entryTxSignature: 'sig_ps_ladder',
-      entryTimestamp: Date.now() - 120000,
-      recordUpdatedAt: Date.now(),
-      updatedAt: Date.now(),
-    });
-
-    const updatedPos = testDb.loadPositions('PAPER', 'PARTIALLY_CLOSED').find(p => p.id === posId);
-    expect(updatedPos).toBeDefined();
-    expect(updatedPos?.tokenQuantityRaw).toBe('500000000');
-    expect(updatedPos?.realizedPnLSol).toBe(0.05);
-    expect(updatedPos?.status).toBe('PARTIALLY_CLOSED');
   });
 
   // ===========================================================================

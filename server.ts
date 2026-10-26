@@ -38,7 +38,6 @@ import { checkSnipeAmountSol, getSnipeLimits } from './server/execution/snipeAmo
 import { PumpCurveService } from './server/solana/pumpCurve';
 import { buildCurveDepth } from './server/market/curveDepth';
 import { TradeTape } from './server/market/tradeTape';
-import { registerMarketRoutes } from './server/market/marketRoutes';
 import { exitRulesSummary } from './server/exits/exitEngine';
 import { walletTrader } from './server/walletTrader';
 import { emergencyStop } from './server/execution/emergencyStop';
@@ -521,9 +520,9 @@ app.get('/api/health', (req, res) => {
   res.json(publicHealthBody());
 });
 
-// 3. Market data proxy routes (orderbook, trades, ticker) live in server/market/marketRoutes.ts (B2).
-registerMarketRoutes(app);
 
+// 3. (removed, 3H/B1) /api/market/orderbook, /api/market/trades and /api/market/ticker proxied Binance (BTCUSDT by default), left over from
+// the BTC market maker; no screen called them. The curve panel's /api/market/curve/:mint and /api/market/trades/:mint are separate and stay.
 // 3h. (removed, Q57) /api/account/balance was a Binance-testnet route with invented "institutional" balances and hardcoded BTC/ETH prices; nothing in src/ called it.
 
 // 4. (removed) /api/unit-tests ran 700 arithmetic self-checks on toy numbers; System checks (/api/system/checks) reads live state instead.

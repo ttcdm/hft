@@ -15,7 +15,6 @@
 "tests/architecture_docs.test.ts::names a useful number of paths (so the extraction cannot silently match nothing)",
 "tests/architecture_docs.test.ts::path %s exists",
 "tests/b1_no_fake_pnl.test.ts::has no Math.random() or tx-real ids left in App.tsx outside the alert id",
-"tests/b2_market_routes.test.ts::has no Math.random and no hardcoded prices in the market routes or in server.ts market section",
 "tests/b3_callout_metrics.test.ts::none of the fabricated constants remain in pumpfunService.ts",
 "tests/b4_synthetic_labels.test.tsx::STRATEGY_EVALUATION.md marks the PF 2.36 / +0.000677 SOL claims unverified",
 "tests/b4_synthetic_labels.test.tsx::the benchmark output is renamed and carries a header note saying its inputs are hand-written",
@@ -176,5 +175,6 @@
 "tests/v1_ui_labels.test.ts::Plug & Play carries no static LIVE badge (the mode pill shows the real mode)",
 "tests/v1_ui_labels.test.ts::left-aligned headers do not also carry text-right (CSS order made the right one win)",
 "tests/v1_ui_labels.test.ts::no 30 / 120 / 85 / 142 fallbacks for tokens monitored and latency",
-"tests/v1_ui_labels.test.ts::the wide-only nav badge and the AUTH label are hidden below their breakpoints"
+"tests/v1_ui_labels.test.ts::the wide-only nav badge and the AUTH label are hidden below their breakpoints",
+"tests/s3h_operator_text.test.ts::the route walk finds no /api/market/orderbook, /trades (without a mint), /ticker or /depth"
 ]

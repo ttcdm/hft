@@ -45,9 +45,12 @@ const realConnect = net.Socket.prototype.connect;
 // - Jito points at the in-process mock block engine (tests/e2e/helpers/mockJito.ts), never a real host.
 // - S6: the test wallet already owns its pump volume accumulator, so the first-buy rent (1.35M lamports, 27% of a 0.005 SOL order) is not in
 //   the round-trip cost gate of every unrelated buy test. The S6 tests restore the real method.
+// - 3A (P3.1): the per-buy readiness checks (cluster, RPC, DB, reconciliation, breaker, marks, DEMO_MODE) pass. Most LIVE buy tests arm a
+//   coordinator that never connected or reconciled, to reach a later gate. tests/s3a_per_buy_readiness.test.ts restores the real method.
 beforeEach(() => {
   vi.spyOn(Connection.prototype, 'getGenesisHash').mockResolvedValue(CLUSTER_GENESIS_HASH.devnet);
   vi.spyOn(ExecutionCoordinator.prototype as any, 'unrefundedFirstBuyRentLamports').mockResolvedValue(0);
+  vi.spyOn(ExecutionCoordinator.prototype as any, 'liveBuyReadinessProblems').mockReturnValue([]);
   solPriceService.setPrice(150, 'TEST_FIXTURE');
 });
 

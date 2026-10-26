@@ -580,6 +580,26 @@ export class ExecutionCoordinator {
     };
   }
 
+  /**
+   * P3.1 (R1-0): the cheap readiness checks every LIVE buy runs, not only the arm. canExecuteLive runs once, when LIVE is armed; a database
+   * that turns read-only, a reconciliation mismatch, a tripped breaker or a stale mark feed after that must still stop the next buy. Direct
+   * reads, no cache (the plan leaves a 2 s cached canExecuteLive open; these are cheap enough to run on every buy). Sells never call this.
+   * Returns why the buy is refused; empty means it may go on.
+   */
+  private liveBuyReadinessProblems(): string[] {
+    const problems: string[] = [];
+    if (this.clusterProblem !== null) problems.push(`the RPC is not on the allowed cluster (${this.clusterProblem})`);
+    if (this.rpcHealth === 'DISCONNECTED') problems.push('Solana RPC is DISCONNECTED');
+    if (!workstationDb.isWritable()) problems.push('the workstation database is not writable');
+    if (!this.lastStartupReconciliation || this.lastStartupReconciliation.status !== 'EXECUTION_READY') {
+      problems.push(`startup reconciliation is ${this.lastStartupReconciliation?.status ?? 'not finished'}`);
+    }
+    const breaker = riskEngine.getCircuitBreakerState();
+    if (breaker !== 'CLOSED') problems.push(`the risk circuit breaker is ${breaker}`);
+    if (this.positionMarkHealth === 'STALE') problems.push('the position mark feed is STALE');
+    return problems;
+  }
+
   private connectionChangeListeners = new Set<(conn: Connection) => void>();
 
   /**
@@ -2415,6 +2435,12 @@ export class ExecutionCoordinator {
     } catch (err: any) {
       return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'LIVE', error: err.message, correlationId };
     }
+    const notReady = this.liveBuyReadinessProblems();
+    if (notReady.length > 0) {
+      const error = `LIVE_NOT_READY: ${notReady.join('; ')}; the buy is refused (exits are not affected)`;
+      workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'LIVE', { reason: 'LIVE_NOT_READY', problems: notReady });
+      return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'LIVE', error, correlationId };
+    }
 
     let mintPubkey: PublicKey;
     try {
@@ -2752,8 +2778,10 @@ export class ExecutionCoordinator {
 
       // Q17: risk approval was several awaits ago (curve read, holder lookup, tip floor, blockhash, snapshot, sign). Disarm, a halt or the
       // kill switch may have happened in between; nothing is sent after any of them.
-      if (!this.isLiveTradingArmed || this.executionMode !== 'LIVE' || this.haltReason || riskEngine.isKillSwitchActive()) {
-        const why = !this.isLiveTradingArmed || this.executionMode !== 'LIVE' ? 'live trading was disarmed' : this.haltReason ? `trading was halted (${this.haltReason})` : 'the kill switch was activated';
+      // P3.1 (R1-0): the per-buy readiness checks run again here, for the same reason.
+      const notReadyAtSend = this.liveBuyReadinessProblems();
+      if (!this.isLiveTradingArmed || this.executionMode !== 'LIVE' || this.haltReason || riskEngine.isKillSwitchActive() || notReadyAtSend.length > 0) {
+        const why = !this.isLiveTradingArmed || this.executionMode !== 'LIVE' ? 'live trading was disarmed' : this.haltReason ? `trading was halted (${this.haltReason})` : riskEngine.isKillSwitchActive() ? 'the kill switch was activated' : `live readiness failed (${notReadyAtSend.join('; ')})`;
         workstationDb.logJournal('TRADE_REVOKED_BEFORE_SEND', correlationId, 'LIVE', { mint: req.mint, reason: why });
         return {
           success: false,

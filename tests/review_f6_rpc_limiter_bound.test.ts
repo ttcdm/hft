@@ -65,3 +65,20 @@ describe('Finding 6: the RPC limiter wait is bounded', () => {
     expect(isRateLimitedSendError(new Error(`failed to send transaction: ${new RpcLimiterWaitError(3000, 10, 'sendTransaction').message}`))).toBe(true);
   });
 });
+
+describe('S271: the limiter survives the wall clock moving back', () => {
+  it('a slot booked under a later clock does not hold requests once the clock is set back', async () => {
+    const { RpcRateLimiter } = await import('../server/solana/rpcConnection');
+    const real = Date.now;
+    const l = new RpcRateLimiter(10);
+    try {
+      Date.now = () => real() + 18 * 3_600_000; // the clock runs 18 h ahead for one request
+      await l.acquire(false, 3_000);
+      Date.now = real; // and is set back
+      // before S271 this waited for the slot booked 18 h ahead, so it failed with RPC_LIMITER_WAIT after 3 s
+      await expect(l.acquire(false, 3_000)).resolves.toBeUndefined();
+    } finally {
+      Date.now = real;
+    }
+  });
+});

@@ -122,6 +122,10 @@ export class RpcRateLimiter {
     if (this.timer) return;
     while (this.waiting.length > 0) {
       const now = Date.now();
+      // S271 (devnet run 15): the next slot is never more than one interval away. When the wall clock moves back (an NTP correction, or the
+      // harness restoring a shifted clock) a slot booked under the later time would hold every request until the clock caught up; each one
+      // then failed RPC_LIMITER_WAIT after 3 s, for hours, and the wallet read, the curve reads and the arming checks with them.
+      if (this.nextSlotAt - now > this.intervalMs) this.nextSlotAt = now;
       if (now >= this.nextSlotAt) {
         this.nextSlotAt = now + this.intervalMs;
         const w = this.waiting.shift()!;

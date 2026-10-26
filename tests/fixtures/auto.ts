@@ -49,7 +49,10 @@ export function releaseAs(mint: string, verdict: 'HOT' | 'READY' | 'READY_WEAK' 
     hotMints.add(mint);
     const b = buyers(30, 25);
     b.wallets.forEach((w, i) => watchWindow.setFunder(w, `fx-funder-${mint.slice(0, 6)}-${i}`));
-    for (const { trade, at } of replay(mint, start, [...b.steps, [26, walletFx(), 'sell', 0.05], [27, walletFx(), 'sell', 0.05]])) watchWindow.onTrade(trade, at);
+    // B3: with server.ts's funder lookup wired, a seller whose funder is unknown holds HOT until its lookup answers
+    const sellers = [walletFx(), walletFx()];
+    sellers.forEach((w, i) => watchWindow.setFunder(w, `fx-funder-${mint.slice(0, 6)}-s${i}`));
+    for (const { trade, at } of replay(mint, start, [...b.steps, [26, sellers[0], 'sell', 0.05], [27, sellers[1], 'sell', 0.05]])) watchWindow.onTrade(trade, at);
     watchWindow.evaluate(mint, start + 28_000);
   } else if (verdict === 'READY') {
     for (const { trade, at } of replay(mint, start, buyers(10, 15).steps)) watchWindow.onTrade(trade, at);

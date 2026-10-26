@@ -90,20 +90,26 @@ export class FunderLookup {
     this.listeners.push(fn);
   }
 
-  /** Ask for a wallet's funder. Cached wallets answer at once; the rest are queued, bounded per mint. */
-  public request(wallet: string, mint: string): void {
+  /**
+   * Ask for a wallet's funder. Cached wallets answer at once; the rest are queued, bounded per mint. B3: a `priority` request (a seller,
+   * whose sell may be the creator cluster's) is not held to the per-mint bound and goes to the front of the queue; the queue bound still
+   * applies. Returns false when the request was refused (no answer will come), true when it was answered or is waiting.
+   */
+  public request(wallet: string, mint: string, priority = false): boolean {
     const hit = this.cache.get(wallet);
     if (hit) {
       for (const fn of this.listeners) fn(wallet, hit);
-      return;
+      return true;
     }
     const waiting = this.queued.get(wallet);
     if (waiting) {
       waiting.mints.add(mint); // one lookup answers every mint the wallet bought; a released first mint must not drop it for the others
-      return;
+      const at = priority ? this.queue.indexOf(waiting) : -1;
+      if (at > 0) this.queue.unshift(...this.queue.splice(at, 1));
+      return true;
     }
     const used = this.perMint.get(mint) ?? 0;
-    if (used >= (this.opts.maxPerMint ?? FUNDER_LOOKUP_MAX_PER_MINT)) return;
+    if (!priority && used >= (this.opts.maxPerMint ?? FUNDER_LOOKUP_MAX_PER_MINT)) return false;
     const maxQueue = this.opts.maxQueue ?? FUNDER_LOOKUP_MAX_QUEUE;
     if (this.waitingCount() >= maxQueue) {
       const keep: Job[] = [];
@@ -117,15 +123,16 @@ export class FunderLookup {
       }
       if (this.waitingCount() >= maxQueue) {
         this.refusedFull++;
-        return;
+        return false;
       }
     }
     this.perMint.set(mint, used + 1);
     if (this.perMint.size > 500) this.perMint.delete(this.perMint.keys().next().value as string);
     const job: Job = { wallet, mints: new Set([mint]), attempt: 0 };
     this.queued.set(wallet, job);
-    this.queue.push(job);
+    if (priority) this.queue.unshift(job); else this.queue.push(job);
     this.pump();
+    return true;
   }
 
   private pump(): void {
@@ -201,15 +208,22 @@ export class FunderLookup {
   }
 }
 
-/** Connect a lookup to a watch window: new buyers are looked up, answers are fed back. */
+/**
+ * Connect a lookup to a watch window: new buyers are looked up, answers are fed back. B3: sellers are asked for with priority, and a
+ * lookup that still fails after its retries is reported (setFunderUnreadable), so the window stops waiting for it.
+ */
 export function wireFunderLookup(
-  ww: { setFunder(w: string, f: string): void; setNoFunder(w: string): void; setFunderRequester(fn: ((wallet: string, mint: string) => void) | null): void; isWatching(mint: string): boolean },
+  ww: {
+    setFunder(w: string, f: string): void; setNoFunder(w: string): void; setFunderUnreadable(w: string): void; isWatching(mint: string): boolean;
+    setFunderRequester(fn: ((wallet: string, mint: string, priority?: boolean) => boolean | void) | null): void;
+  },
   lookup: FunderLookup
 ): void {
   lookup.setWanted((mint) => ww.isWatching(mint)); // P4.1 (R1-60): a released mint's waiting lookups are dropped
   lookup.onResult((wallet, r) => {
     if (r.funder) ww.setFunder(wallet, r.funder);
     else if (r.reason !== 'ERROR') ww.setNoFunder(wallet);
+    else ww.setFunderUnreadable(wallet);
   });
-  ww.setFunderRequester((wallet, mint) => lookup.request(wallet, mint));
+  ww.setFunderRequester((wallet, mint, priority) => lookup.request(wallet, mint, priority));
 }

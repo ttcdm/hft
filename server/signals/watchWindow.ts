@@ -19,6 +19,14 @@ import type { PumpTradeEvent } from '../solana/pumpFeedListener';
  *          funder that puts a wallet that already sold into the creator cluster arrives later), or (P4.3) the measured curve progress is
  *          above the cap, 60% by default (CURVE_TOO_FAR, at any evaluation after the first trade, see curveProgressCap.ts)
  *   HOT    minimum hold passed, >= 3 measured signals strong, and the confluence score is at or above the threshold in force (default 70)
+ *
+ * B3 (review 2026-10-24, finding 3, second half): when a funder lookup is wired, every seller whose funder is not known is looked up
+ * (ahead of buyer lookups, outside the buyer sample), and no HOT or READY verdict is given while that lookup is outstanding, because the
+ * sell may be the creator cluster's (an answer in the creator cluster releases CREATOR_SOLD). A seller whose funder could not be read
+ * (the lookup failed after its retries, or was refused), or whose lookup is still outstanding when the full window has elapsed, costs a
+ * signal, not the launch, as an unreadable buyer does: it counts as an unknown funder in funderCoverage, so the buyers signal cannot pass,
+ * and its sell stays in the organic flow (the pessimistic side for net inflow and flow). A lost Connection or a full queue therefore never
+ * releases launches DEAD on its own.
  *   READY  the full window elapsed without a dead or hot verdict. P4.3 (R1-56): a READY release is information, not a buy signal by itself:
  *          the auto controller (and the replay) buy it only when `readyGate` passes (concentration and at least READY_MIN_SIGNALS signals)
  *          and its score clears the threshold.
@@ -84,7 +92,8 @@ export interface WatchMetrics {
   rawUniqueBuyers: number;
   /** Buyers after merging wallets with one funder, and everything the creator funded, into one. */
   uniqueBuyers: number;
-  /** Share of the sampled buyers (the largest WATCH_FUNDER_SAMPLE_BUYERS by volume) whose funder is known. 0 when nothing is known. */
+  /** Share of the sampled buyers (the largest WATCH_FUNDER_SAMPLE_BUYERS by volume) whose funder is known. 0 when nothing is known.
+   *  B3: a seller outside the sample whose funder lookup is outstanding or failed counts as one more unknown. */
   funderCoverage: number;
   /** Organic buy and sell counts (creator cluster left out). */
   buyCount: number;
@@ -122,6 +131,9 @@ interface Candidate {
   flow: Array<{ at: number; sol: number; wallet: string; buy: boolean }>;
   /** Wallets that sold this mint: a funder arriving later can make one of them a creator-cluster seller. */
   sellers: Set<string>;
+  /** B3: sellers whose funder lookup was asked for and has not answered yet, and sellers whose funder could not be read. */
+  sellersPending: Set<string>;
+  sellersUnreadable: Set<string>;
   /** Wallets whose funder was asked for on this mint's behalf. */
   requested: Set<string>;
   seen: Set<string>;
@@ -175,7 +187,7 @@ export class WatchWindow extends EventEmitter {
   private publicFunders: Set<string>;
   /** Wallets whose funder was looked up and does not exist / is out of reach: they count as known, in a cluster of their own. */
   private noFunder = new Set<string>();
-  private requestFunder: ((wallet: string, mint: string) => void) | null = null;
+  private requestFunder: ((wallet: string, mint: string, priority?: boolean) => boolean | void) | null = null;
   /** Q6c: launches that were not watched because the window was full. */
   private refusedFull = 0;
   private lastRefusedMint: string | null = null;
@@ -203,6 +215,7 @@ export class WatchWindow extends EventEmitter {
     this.emit('funder', { wallet, funder });
     this.funders.set(wallet, funder);
     if (this.funders.size > MAX_FUNDERS_KEPT) this.funders.delete(this.funders.keys().next().value as string);
+    this.sellerAnswered(wallet);
     for (const c of [...this.active.values()]) {
       if (!c.creatorSold && c.sellers.has(wallet) && this.clusterOf(c, wallet) === CREATOR_CLUSTER) this.releaseCreatorSold(c, wallet, at);
     }
@@ -219,10 +232,28 @@ export class WatchWindow extends EventEmitter {
     this.emit('funder', { wallet, funder: null });
     this.noFunder.add(wallet);
     if (this.noFunder.size > MAX_FUNDERS_KEPT) this.noFunder.delete(this.noFunder.values().next().value as string);
+    this.sellerAnswered(wallet);
   }
 
-  /** Q6b: ask this function for the funder of every new buyer. The answer comes back through setFunder / setNoFunder. */
-  public setFunderRequester(fn: ((wallet: string, mint: string) => void) | null): void {
+  /** B3: a wallet's funder lookup failed for good (after its retries). A watched launch it sold loses the buyers signal (funderCoverage < 1). */
+  public setFunderUnreadable(wallet: string): void {
+    for (const c of this.active.values()) {
+      if (c.sellersPending.delete(wallet)) c.sellersUnreadable.add(wallet);
+    }
+  }
+
+  private sellerAnswered(wallet: string): void {
+    for (const c of this.active.values()) {
+      c.sellersPending.delete(wallet);
+      c.sellersUnreadable.delete(wallet);
+    }
+  }
+
+  /**
+   * Q6b: ask this function for the funder of every new buyer, and (B3) of every seller whose funder is not known, with `priority` true.
+   * The answer comes back through setFunder / setNoFunder (setFunderUnreadable when it failed); a `false` return means it was refused.
+   */
+  public setFunderRequester(fn: ((wallet: string, mint: string, priority?: boolean) => boolean | void) | null): void {
     this.requestFunder = fn;
   }
 
@@ -256,7 +287,8 @@ export class WatchWindow extends EventEmitter {
     }
     this.active.set(mint, {
       mint, creator, insiders: new Set([creator, ...alsoInsiders].filter((w): w is string => !!w)), registeredAt: now, firstTradeAt: null, buyVolumeByWallet: new Map(),
-      sellVolumeSol: 0, tradeCount: 0, creatorSold: false, flow: [], sellers: new Set(), requested: new Set(), seen: new Set(),
+      sellVolumeSol: 0, tradeCount: 0, creatorSold: false, flow: [], sellers: new Set(), sellersPending: new Set(), sellersUnreadable: new Set(),
+      requested: new Set(), seen: new Set(),
     });
     return true;
   }
@@ -281,6 +313,19 @@ export class WatchWindow extends EventEmitter {
     this.requestFunder?.(wallet, c.mint);
   }
 
+  /**
+   * B3: a seller outside the buyer sample, or one whose lookup was refused or failed, is asked for again, ahead of buyers. setFunder
+   * releases CREATOR_SOLD when the answer puts it in the creator cluster. Without a lookup wired (replay, fixtures) nothing is pending.
+   */
+  private askSellerFunder(c: Candidate, wallet: string): void {
+    if (!this.requestFunder || c.sellersPending.has(wallet)) return;
+    c.requested.add(wallet);
+    c.sellersUnreadable.delete(wallet);
+    c.sellersPending.add(wallet);
+    const accepted = this.requestFunder(wallet, c.mint, true);
+    if (accepted === false && c.sellersPending.delete(wallet)) c.sellersUnreadable.add(wallet);
+  }
+
   /** Feed one decoded TradeEvent. `at` is when it was seen (ms). Duplicate signatures are ignored. */
   public onTrade(trade: PumpTradeEvent, at = Date.now()): void {
     const c = this.active.get(trade.mint);
@@ -303,6 +348,7 @@ export class WatchWindow extends EventEmitter {
       c.sellers.add(trade.user);
       // P4.1 (R1-55): any creator-cluster wallet, not only the literal creator and create signer
       if (!c.creatorSold && this.clusterOf(c, trade.user) === CREATOR_CLUSTER) this.releaseCreatorSold(c, trade.user, at);
+      else if (!this.funderKnown(c, trade.user)) this.askSellerFunder(c, trade.user);
     }
   }
 
@@ -370,7 +416,10 @@ export class WatchWindow extends EventEmitter {
       }
     }
     const rawUnique = c.buyVolumeByWallet.size;
-    const funderCoverage = sample.length === 0 ? 0 : known / sample.length;
+    // B3: a seller whose funder lookup is outstanding or failed, and who is not in the sample, counts as one more unknown funder
+    const inSample = new Set(sample);
+    const unresolvedSellers = [...c.sellersPending, ...c.sellersUnreadable].filter((w) => !inSample.has(w)).length;
+    const funderCoverage = sample.length + unresolvedSellers === 0 ? 0 : known / (sample.length + unresolvedSellers);
     const largestShare = buyVolume > 0 ? Math.max(...clusters.values()) / buyVolume : null;
 
     let velocity: WatchSignals['velocity'] = null;
@@ -463,6 +512,8 @@ export class WatchWindow extends EventEmitter {
     if (m.cumulativeNetInflowSol < 0) {
       return this.release(c, 'DEAD', `NET_OUTFLOW: cumulative net inflow ${m.cumulativeNetInflowSol.toFixed(4)} SOL is negative`, now);
     }
+    // B3: no HOT or READY while a seller's lookup may still answer "creator cluster"; at the window end the launch is judged without it
+    if (c.sellersPending.size > 0 && m.elapsedMs < this.opts.maxMs) return hold(`holding: waiting for the funder of ${c.sellersPending.size} seller(s)`);
     const score = this.opts.scoreOf?.(mint) ?? null;
     const min = this.minScore();
     if (m.passingSignals >= HOT_MIN_SIGNALS && score !== null && score >= min) {

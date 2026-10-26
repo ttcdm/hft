@@ -37,3 +37,11 @@ describe('3H B3: the exchange-era types are gone from src/types.ts', () => {
     }
   });
 });
+
+describe('3H B9: the engine client has no methods without a caller', () => {
+  it('updateSniperConfig, getPumpFunLeaderboard, getPumpFunRules and getPumpFunStatus are gone; the methods the screens call stay', async () => {
+    const { engineClient } = await import('../src/services/engineClient');
+    for (const m of ['updateSniperConfig', 'getPumpFunLeaderboard', 'getPumpFunRules', 'getPumpFunStatus']) expect(typeof (engineClient as any)[m], m).toBe('undefined');
+    for (const m of ['getSniperConfig', 'getPumpFunCallouts', 'updatePumpFunRules', 'refreshPumpFunData']) expect(typeof (engineClient as any)[m], m).toBe('function');
+  });
+});

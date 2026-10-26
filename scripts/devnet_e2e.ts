@@ -24,7 +24,7 @@ const DEFAULT_MINTS = [
 const phase = process.argv.includes('--phase=crash') ? 'crash' : process.argv.includes('--phase=recover') ? 'recover' : 'main';
 const scratch = process.env.APEX_E2E_SCRATCH || fs.mkdtempSync(path.join(os.tmpdir(), 'apex-e2e-'));
 const keyPath = path.join(scratch, 'throwaway-keypair.json');
-// Every throwaway wallet steps (i), (k), (t) and (u) create is written here before it is funded, and left here (Mike, 2026-10-24).
+// Every throwaway wallet steps (i), (k), (t), (u) and (m) create is written here before it is funded, and left here (Mike, 2026-10-24).
 const tempWalletDir = path.join(scratch, 'temp-wallets');
 // 3I: what the opt-in steps (t), (u) and (n) need free in the harness wallet before they start: what they lend, plus fees and a margin.
 const RPC_SWITCH_NEED_SOL = 0.1;
@@ -33,6 +33,8 @@ const SELLER_NEVER_BOUGHT_NEED_SOL = 0.15;
 const LOSS_FLOOR_NEED_SOL = 0.05;
 // (l): one harness buy and sell, the same as (n).
 const READINESS_GATE_NEED_SOL = 0.05;
+// 3K (m): 0.15 lent to the coin creator, and enough left for five 0.008 SOL auto buys under the 10% spendable ceiling, with a margin.
+const SESSION_SPEND_NEED_SOL = 0.3;
 
 // ---- sanitized environment: must be set before any server module is imported ----
 process.env.SOLANA_RPC_URL = process.env.DEVNET_RPC_URL || 'https://api.devnet.solana.com';
@@ -458,6 +460,7 @@ async function main() {
   await S.waitPast(steps, nDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (n) trades');
   const lDoneAt = await readinessGateStep(steps, S, { conn, kp, Keypair, coordinator, workstationDb });
   await S.waitPast(steps, lDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (l) trades');
+  await sessionSpendStep(steps, S, { conn, web3, kp, coordinator, workstationDb, PumpCurveService, txBuilder }); // 3K (m): its own coins
   await S.emergencyStopThroughApp(steps); // P1.4, last: it leaves LIVE disarmed and auto OFF. Telegram-path panic sells the LIVE position; kill switch on/off/re-arm buys nothing
 
   // (f) crash after submit, then recover in a fresh process on the same scratch DB. This process holds that DB's and that key's
@@ -660,6 +663,39 @@ async function sellerNeverBoughtStep(steps: import('./devnet_e2e_steps').Harness
     watchWindow.stop();
     await pumpFeedListener.stop();
   }
+}
+
+/**
+ * (m) 3B, task 3K, opt-in (DEVNET_SESSION_SPEND=1): a 5-buy DEVNET_LIVE auto session through the app's own auto controller and coordinator;
+ * the session's spentSol (what GET /api/auto/status returns) against the wallet's drop around each buy (S.sessionSpendMatchesWallet).
+ */
+async function sessionSpendStep(steps: import('./devnet_e2e_steps').HarnessSteps, S: typeof import('./devnet_e2e_steps'), d: FeedStepDeps & { workstationDb: any }): Promise<void> {
+  const L = '(m) 3B: DEVNET_LIVE session spend';
+  if (process.env.DEVNET_SESSION_SPEND !== '1') {
+    console.log(`INFO  (m) skipped: set DEVNET_SESSION_SPEND=1 (needs ${SESSION_SPEND_NEED_SOL} SOL free, spends about 0.04) to run the 5-buy DEVNET_LIVE session spend step (3B)`);
+    return;
+  }
+  const bal = async () => (await d.conn.getBalance(d.kp.publicKey)) / 1e9;
+  if (!(await S.hasBudget(steps, L, bal, SESSION_SPEND_NEED_SOL, 'DEVNET_SESSION_SPEND'))) return;
+  const { PUMP_SDK } = await import('@pump-fun/pump-sdk');
+  const { watchWindow } = await import('../server/signals/watchWindow');
+  const { autoSnipeController } = await import('../server/auto/controller');
+  const { memecoinAggregator } = await import('../server/memecoinAggregator');
+  const kit = S.makeChainKit({ conn: d.conn, web3: d.web3, sdk: PUMP_SDK, curve: d.PumpCurveService, builder: d.txBuilder, keyDir: tempWalletDir });
+  const coins = S.stepCoins(steps, L, kit, d.kp);
+  const b0 = await bal().catch(() => null);
+  await S.sessionSpendMatchesWallet(steps, {
+    auto: autoSnipeController as any,
+    watch: watchWindow as any,
+    confluence: memecoinAggregator,
+    balanceLamports: () => d.conn.getBalance(d.kp.publicKey),
+    haltReason: () => d.coordinator.getHaltReason(),
+    openLive: () => d.workstationDb.loadPositions('LIVE', 'ACTIVE'),
+    makeCoins: (n) => coins.make(n),
+    cleanupCoins: () => coins.cleanup(),
+  });
+  const b1 = await bal().catch(() => null);
+  if (b0 !== null && b1 !== null) console.log(`INFO  (m) cost the harness wallet ${(b0 - b1).toFixed(5)} SOL`);
 }
 
 function finish() {

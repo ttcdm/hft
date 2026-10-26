@@ -1706,3 +1706,172 @@ export function bootRefusesBadLimit(s: Pick<HarnessSteps, 'rec'>, boot: () => { 
     `exit ${r.status}; message ${/is not a number above 0/.test(out) ? 'shown' : 'missing'}; outbound attempts ${attempts.length}; DB file ${fs.existsSync(dbPath) ? 'created' : 'not created'}`
   );
 }
+
+// ---- Stage 3 steps (task 3K): (m) for 3B. ----
+
+/** 3K: a balance read retried after 0.5, 1 and 2 s; null when no read answered (the caller SKIPs the check that needed it). */
+async function readWithRetry<T>(read: () => Promise<T | null>, sleep: (ms: number) => Promise<unknown>): Promise<T | null> {
+  for (const ms of [0, 500, 1_000, 2_000]) {
+    if (ms) await sleep(ms);
+    try {
+      const v = await read();
+      if (v !== null && v !== undefined) return v;
+    } catch { /* rate-limited or unreachable: try again */ }
+  }
+  return null;
+}
+
+export interface SessionSpendDeps {
+  /** The app's auto controller (what /api/auto/* call). */
+  auto: {
+    setMode(mode: 'OFF' | 'DEVNET_LIVE', opts?: { confirmationCode?: string }): Promise<{ ok: boolean; mode: string; error?: string }>;
+    setBudget(b: { maxBuys: number; maxSpendSol: number }): { ok: boolean; reason?: string };
+    getStatus(): { mode: string; budgets: { maxBuys: number; maxSpendSol: number }; session: { buys: number; spentSol: number } | null };
+    orderSol(): number;
+    setOrderSol(sol: number): { ok: boolean; reason?: string };
+    submitCandidate(c: { mint: string; source: 'TEST'; provenance?: 'REAL_ONCHAIN' }): Promise<{ outcome: string; stage?: string; reason: string; positionId?: string }>;
+  };
+  /** The app's watch window: its `getVerdict` is wrapped for the step's own coins only, and put back in `finally`. */
+  watch: { getVerdict(mint: string): any };
+  /** The aggregator's confluence gate (the operator switch `setConfluenceGating`): off for the step, put back in `finally`. */
+  confluence: { getConfluenceGating(): boolean; setConfluenceGating(on: boolean): void };
+  /** The harness wallet's balance in lamports (one read; may throw or return null on a lost read). */
+  balanceLamports(): Promise<number | null>;
+  /** The app's halt reason (coordinator), null when not halted. */
+  haltReason(): string | null;
+  /** LIVE positions not CLOSED (any mint), as the DB has them. */
+  openLive(): Array<{ id: string; mint: string; status: string }>;
+  /** Makes the step's coins: `n` fresh pump coins from one throwaway creator (key on disk before funding). */
+  makeCoins(n: number): Promise<string[]>;
+  /** Sells and refunds the creator and anything else the coins needed. Always called, in `finally`. */
+  cleanupCoins(): Promise<void>;
+}
+
+/**
+ * (m) 3B, opt-in (DEVNET_SESSION_SPEND=1): a 5-buy DEVNET_LIVE auto session, its spentSol against the wallet. The harness makes five fresh
+ * pump coins (one throwaway creator, no dev buy), sets the session budget to five buys, and puts auto in DEVNET_LIVE. Each coin is handed to
+ * the auto controller as a candidate. The release gates and the confluence score are not what this step checks (fresh coins have no feed
+ * history to score), so for these five mints the watch window's verdict is a fresh HOT, and the aggregator's confluence gate is switched
+ * off for the step with its operator switch; both are put back in `finally`. Every other gate, the coordinator and the send are the app's own. The
+ * wallet is read right before and right after each auto buy, and the position is sold before the next one (DEVNET_MAX_OPEN_POSITIONS is 1),
+ * so the reads around a buy see that buy alone.
+ * Expected: five BOUGHT decisions, never more than one open LIVE position, `getStatus().session.spentSol` (what GET /api/auto/status
+ * returns) equal to the sum of the five wallet drops within 0.0002 SOL (the token account's rent is in both since 3B; before 3B spentSol
+ * left out about 0.00204 SOL of rent per buy), five buys counted, and no halt (the wallet audit explains every buy).
+ * A lost balance read makes the comparison a SKIP, never a FAIL.
+ */
+export async function sessionSpendMatchesWallet(s: Pick<HarnessSteps, 'rec' | 'skip' | 'sleep' | 'coordinator'>, d: SessionSpendDeps, opts: { buys?: number; orderSol?: number } = {}): Promise<number> {
+  const L = '(m) 3B: DEVNET_LIVE session spend';
+  const n = opts.buys ?? 5;
+  const TOLERANCE_SOL = 0.0002;
+  const skip = (step: string, detail: string) => (s.skip ? s.skip(step, detail) : console.log(`SKIP  ${step}: ${detail}`));
+  const prevAuto = process.env.AUTO_SNIPE_ENABLED;
+  const origVerdict = d.watch.getVerdict;
+  const prevGating = d.confluence.getConfluenceGating();
+  const prevBudget = { ...d.auto.getStatus().budgets };
+  const prevOrder = d.auto.orderSol();
+  let lastTradeAt = Date.now();
+  const coins = new Set<string>();
+  try {
+    process.env.AUTO_SNIPE_ENABLED = 'true';
+    for (const m of await d.makeCoins(n)) coins.add(m);
+    if (coins.size !== n) { s.rec(`${L}: ${n} coins made`, false, `${coins.size} made`); return lastTradeAt; }
+    // 0.008 SOL by default: the app refuses a 0.005 SOL first buy from a wallet that has not paid pump's one-time account rent yet
+    // (EXPECTED_EDGE_BELOW_EXECUTION_COST), and five buys with rent must fit the 3 x MAX_POSITION_SIZE_SOL session cap (0.06 by default)
+    const order = opts.orderSol ?? 0.008;
+    // the order plus fee, the token account's rent and a margin, per buy (budget first: the order size must fit inside it)
+    const budget = d.auto.setBudget({ maxBuys: n, maxSpendSol: Number((n * (order + 0.0035)).toFixed(4)) });
+    if (!budget.ok) { s.rec(`${L}: session budget of ${n} buys`, false, budget.reason ?? 'refused'); return lastTradeAt; }
+    const sized = d.auto.setOrderSol(order);
+    if (!sized.ok) { s.rec(`${L}: auto order size ${order} SOL`, false, sized.reason ?? 'refused'); return lastTradeAt; }
+    d.watch.getVerdict = function (mint: string) {
+      if (coins.has(mint)) return { state: 'HOT', reason: 'harness (m): release gates not under test', releasedAt: Date.now() - 200, score: null, passingSignals: 3, concentrationPass: true };
+      return origVerdict.call(this, mint);
+    };
+    d.confluence.setConfluenceGating(false);
+    const set = await d.auto.setMode('DEVNET_LIVE', { confirmationCode: 'CONFIRM_AUTO_DEVNET' });
+    if (!set.ok) { s.rec(`${L}: auto DEVNET_LIVE`, false, set.error ?? set.mode); return lastTradeAt; }
+    let measured = 0;
+    let unmeasured = 0;
+    let maxOpen = 0;
+    let bought = 0;
+    for (const mint of coins) {
+      await s.coordinator.syncRealWalletBalance();
+      const before = await readWithRetry(d.balanceLamports, s.sleep);
+      const dec = await d.auto.submitCandidate({ mint, source: 'TEST', provenance: 'REAL_ONCHAIN' });
+      lastTradeAt = Date.now();
+      const after = await readWithRetry(d.balanceLamports, s.sleep);
+      const open = d.openLive();
+      maxOpen = Math.max(maxOpen, open.length);
+      const drop = before !== null && after !== null ? (before - after) / 1e9 : null;
+      if (drop === null) unmeasured++; else measured += drop;
+      s.rec(`${L}: auto buy ${mint.slice(0, 6)} BOUGHT`, dec.outcome === 'BOUGHT', `${dec.outcome} ${dec.stage ?? ''} ${dec.reason}; wallet drop ${drop === null ? 'not read' : drop.toFixed(6)} SOL; spentSol ${d.auto.getStatus().session?.spentSol?.toFixed(6) ?? 'no session'}`.slice(0, 300));
+      for (const p of open) {
+        const c = await s.coordinator.closePosition(p.id, 100, 'e2e (m) sell before the next auto buy');
+        lastTradeAt = Date.now();
+        if (!c.success) s.rec(`${L}: sell ${p.mint.slice(0, 6)}`, false, c.error ?? 'not closed');
+      }
+      if (dec.outcome !== 'BOUGHT') break;
+      bought++;
+    }
+    const st = d.auto.getStatus();
+    const spent = st.session?.spentSol ?? null;
+    s.rec(`${L}: never more than one open LIVE position`, maxOpen <= 1, `at most ${maxOpen} open`);
+    s.rec(`${L}: ${n} buys counted in the session`, st.session?.buys === n, `session buys ${st.session?.buys ?? 'no session'}, mode ${st.mode}`);
+    if (bought < n) s.rec(`${L}: spentSol equals the wallet's drop`, false, `not compared: only ${bought} of ${n} auto buys went through`);
+    else if (unmeasured > 0) skip(`${L}: spentSol equals the wallet's drop`, `${unmeasured} of ${n} balance reads around a buy were lost; not compared (spentSol ${spent})`);
+    else {
+      s.rec(
+        `${L}: spentSol equals the wallet's drop over the ${n} buys (within ${TOLERANCE_SOL} SOL)`,
+        spent !== null && Math.abs(spent - measured) <= TOLERANCE_SOL,
+        `spentSol ${spent?.toFixed(6) ?? 'no session'}, wallet drop ${measured.toFixed(6)} SOL, gap ${spent === null ? '?' : (measured - spent).toFixed(6)}`
+      );
+    }
+    s.rec(`${L}: no halt (the wallet audit explains every buy)`, d.haltReason() === null, d.haltReason() ?? 'not halted');
+  } catch (e: any) {
+    s.rec(L, false, String(e?.message ?? e).slice(0, 300));
+  } finally {
+    d.watch.getVerdict = origVerdict;
+    d.confluence.setConfluenceGating(prevGating);
+    try { await d.auto.setMode('OFF'); } catch (e: any) { s.rec(`${L}: auto OFF after the step`, false, String(e?.message ?? e).slice(0, 200)); }
+    if (prevAuto === undefined) delete process.env.AUTO_SNIPE_ENABLED; else process.env.AUTO_SNIPE_ENABLED = prevAuto;
+    const back = d.auto.setBudget(prevBudget);
+    if (!back.ok) s.rec(`${L}: session budget put back`, false, back.reason ?? 'refused');
+    const backOrder = d.auto.setOrderSol(prevOrder);
+    if (!backOrder.ok) s.rec(`${L}: auto order size put back`, false, backOrder.reason ?? 'refused');
+    for (const p of d.openLive().filter((x) => coins.has(x.mint))) {
+      try {
+        const c = await s.coordinator.closePosition(p.id, 100, 'e2e (m) cleanup');
+        lastTradeAt = Date.now();
+        if (!c.success) s.rec(`${L}: cleanup close ${p.mint.slice(0, 6)}`, false, c.error ?? 'not closed');
+      } catch (e: any) { s.rec(`${L}: cleanup close ${p.mint.slice(0, 6)}`, false, String(e?.message ?? e).slice(0, 200)); }
+    }
+    await d.cleanupCoins();
+  }
+  return lastTradeAt;
+}
+
+/**
+ * 3K: the coins (m) buys, made by one throwaway creator (key on disk before it is funded; no dev buy), and its refund (sell out, then send
+ * the rest back; a failed refund is a FAIL line naming the key).
+ */
+export function stepCoins(s: Pick<HarnessSteps, 'rec'>, label: string, kit: ChainKit, payer: any, opts: { lendSol?: number } = {}) {
+  let creator: any = null;
+  const made: string[] = [];
+  return {
+    async make(n: number): Promise<string[]> {
+      creator = kit.newWallet();
+      await kit.transfer(payer, creator.publicKey, opts.lendSol ?? 0.03 * n);
+      for (let i = 0; i < n; i++) {
+        const c = await kit.create(creator, `M3K${i}`, '3K harness');
+        made.push(c.mint);
+      }
+      return [...made];
+    },
+    async cleanup(): Promise<void> {
+      if (!creator) return;
+      await sellAndRefund(s, label, kit, [creator], made, payer);
+    },
+  };
+}
+

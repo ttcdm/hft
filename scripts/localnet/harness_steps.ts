@@ -15,6 +15,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import net from 'node:net';
 import path from 'node:path';
+import crypto from 'node:crypto';
+import bs58 from 'bs58';
 import { spawn, spawnSync } from 'node:child_process';
 
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'apex-3i-steps-'));
@@ -173,9 +175,10 @@ async function run(info: { url: string; genesisHash: string }) {
     });
     const nSteps = { ...steps, coordinator: nCoordinator, mint: seeded.mint, buildBuyRequest: async () => liveBuyRequest(seeded.mint, 0.01, Date.now()) } as typeof steps;
     for (let i = 0; i < 30 && !coordinator.isLiveArmed(); i++) { coordinator.armLiveTrading(true, 'CONFIRM_LIVE_TRADING_RISK'); if (!coordinator.isLiveArmed()) await sleep(1000); }
+    let nDoneAt = Date.now();
     if (await S.hasBudget(nSteps, '(n) 3C: net daily PnL floor', bal, 0.05, 'DEVNET_LOSS_FLOOR')) {
       const bn = await bal();
-      await S.lossFloorLatch(nSteps, {
+      nDoneAt = await S.lossFloorLatch(nSteps, {
         floorUsd: () => executionConfig.getConfig().maxDailyLossUsd,
         setFloorUsd: (usd) => { executionConfig.updateConfig({ maxDailyLossUsd: usd }); },
         price: () => solPriceService.getPrice(),
@@ -194,6 +197,50 @@ async function run(info: { url: string; genesisHash: string }) {
       });
       console.log(`INFO  (n) cost the harness wallet ${(bn - (await bal())).toFixed(5)} SOL`);
       rec('(n) cleanup: MAX_DAILY_LOSS_USD back to the tier default, latch clear', executionConfig.getConfig().maxDailyLossUsd === 7 && riskEngine.getDailyLossLatch('LIVE') === null, `MAX_DAILY_LOSS_USD ${executionConfig.getConfig().maxDailyLossUsd}`);
+    }
+
+    // (l) 3A on the same coin, wired as devnet_e2e.ts's readinessGateStep. What the step must ride out is injected: two HTTP 429s on
+    // getBalance at the first balance sync after the MISMATCH Reconcile (run 16's shape), and one JSON-RPC error on the wallet token scan
+    // (getParsedTokenAccountsByOwner, sent as getTokenAccountsByOwner, of the harness wallet) in the first Reconcile after the row is resolved, which leaves that pass at MISMATCH for a reason
+    // other than the row, so the step must Reconcile again (4 Reconciles in all, with the cleanup's).
+    const inject = (count: number, method: string, mode: 'http429' | 'jsonrpc' = 'http429', address: string | null = null) => fetch(info.url, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'localnet_failNextReads', params: [count, method, address, mode] }) }).then((r) => r.json());
+    let reconciles = 0;
+    let rowResolved = false;
+    let scanFailed = false;
+    const lDeps = {
+      reconcile: async () => {
+        reconciles++;
+        if (rowResolved && !scanFailed) { scanFailed = true; await inject(1, 'getTokenAccountsByOwner', 'jsonrpc', kp.publicKey.toBase58()); }
+        const r = await coordinator.startupReconciliation({ fresh: true });
+        if (reconciles === 1 && r.status === 'RECONCILIATION_MISMATCH') failReads = inject(2, 'getBalance');
+        return r;
+      },
+      isLiveArmed: () => coordinator.isLiveArmed(),
+      plantUnresolvedBuy: () => {
+        const signature = bs58.encode(crypto.randomBytes(64));
+        if (!workstationDb.saveTransaction({
+          signature, orderId: `e2e-l-${signature.slice(0, 8)}`, correlationId: 'e2e-l', mint: Keypair.generate().publicKey.toBase58(), direction: 'BUY',
+          submissionTransport: 'SOLANA_RPC', submissionTime: Date.now(), reconciliationState: 'RECONCILIATION_REQUIRED', networkFeeLamports: 5000,
+          jitoTipLamports: 0, executionMode: 'LIVE',
+        })) throw new Error('the unresolved buy row could not be written');
+        return signature;
+      },
+      resolveRow: (sig: string) => {
+        const row = workstationDb.loadTransactions().find((t) => t.signature === sig);
+        if (!row) throw new Error(`row ${sig.slice(0, 8)} not found`);
+        workstationDb.saveTransaction({ ...row, reconciliationState: 'REVERTED', error: 'e2e (l): resolved by the harness' });
+        rowResolved = true;
+      },
+    };
+    await S.waitPast(nSteps, nDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (n) trades');
+    if (await S.hasBudget(nSteps, '(l) 3A: per-buy readiness', bal, 0.05, 'DEVNET_READINESS_GATE')) {
+      const bl = await bal();
+      await S.readinessGateAfterMismatch(nSteps, lDeps);
+      console.log(`INFO  (l) cost the harness wallet ${(bl - (await bal())).toFixed(5)} SOL; ${reconciles} Reconcile(s)`);
+      rec('(l) the injected faults were met: two getBalance 429s after the MISMATCH Reconcile, one failed wallet scan after the row was resolved', failReads === null && scanFailed && reconciles === 4, `${reconciles} Reconciles; balance faults ${failReads === null ? 'taken' : 'not taken'}; scan fault ${scanFailed ? 'armed' : 'not armed'}`);
+      const rr = coordinator.getLiveReadiness().reasons.filter((x) => /reconcil/i.test(x));
+      rec('(l) cleanup: readiness names no reconciliation problem, nothing open on the coin', rr.length === 0 && workstationDb.loadPositions().every((p) => p.mint !== seeded.mint || p.status === 'CLOSED'), rr.join('; ').slice(0, 200) || 'reconciliation clear');
     }
     coordinator.armLiveTrading(false);
     const bootDb = path.join(scratch, 'boot-check-abc.db');

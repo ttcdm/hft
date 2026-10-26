@@ -31,6 +31,8 @@ const RPC_SWITCH_NEED_SOL = 0.1;
 const SELLER_NEVER_BOUGHT_NEED_SOL = 0.15;
 // (n): one harness buy plus the 0.015 SOL reserve, the first buy's token-account rent and fees, with a margin.
 const LOSS_FLOOR_NEED_SOL = 0.05;
+// (l): one harness buy and sell, the same as (n).
+const READINESS_GATE_NEED_SOL = 0.05;
 
 // ---- sanitized environment: must be set before any server module is imported ----
 process.env.SOLANA_RPC_URL = process.env.DEVNET_RPC_URL || 'https://api.devnet.solana.com';
@@ -454,6 +456,8 @@ async function main() {
   await S.waitPast(steps, gDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (g) buy');
   const nDoneAt = await lossFloorStep(steps, S, { conn, kp, buySol: BUY_SOL });
   await S.waitPast(steps, nDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (n) trades');
+  const lDoneAt = await readinessGateStep(steps, S, { conn, kp, Keypair, coordinator, workstationDb });
+  await S.waitPast(steps, lDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (l) trades');
   await S.emergencyStopThroughApp(steps); // P1.4, last: it leaves LIVE disarmed and auto OFF. Telegram-path panic sells the LIVE position; kill switch on/off/re-arm buys nothing
 
   // (f) crash after submit, then recover in a fresh process on the same scratch DB. This process holds that DB's and that key's
@@ -562,6 +566,44 @@ async function lossFloorStep(steps: import('./devnet_e2e_steps').HarnessSteps, S
     },
   }), bootDb);
   return doneAt;
+}
+
+/**
+ * (l) 3A, opt-in (DEVNET_READINESS_GATE=1): a Reconcile that ends in RECONCILIATION_MISMATCH after the arm refuses the next LIVE buy
+ * (LIVE_NOT_READY), and a buy goes through again once the row is resolved and Reconcile is EXECUTION_READY. The unresolved row is written
+ * into this run's scratch database with a made-up signature for a made-up mint; nothing is sent for it. Returns when its last trade settled.
+ */
+async function readinessGateStep(
+  steps: import('./devnet_e2e_steps').HarnessSteps,
+  S: typeof import('./devnet_e2e_steps'),
+  d: { conn: any; kp: any; Keypair: any; coordinator: any; workstationDb: any },
+): Promise<number> {
+  if (process.env.DEVNET_READINESS_GATE !== '1') {
+    console.log(`INFO  (l) skipped: set DEVNET_READINESS_GATE=1 (needs ${READINESS_GATE_NEED_SOL} SOL free, spends about 0.003: one buy and sell's fees) to run the per-buy readiness step (3A)`);
+    return 0;
+  }
+  if (!(await S.hasBudget(steps, '(l) 3A: per-buy readiness', async () => (await d.conn.getBalance(d.kp.publicKey)) / 1e9, READINESS_GATE_NEED_SOL, 'DEVNET_READINESS_GATE'))) return 0;
+  const bs58 = (await import('bs58')).default;
+  const { randomBytes } = await import('crypto');
+  return S.readinessGateAfterMismatch(steps, {
+    reconcile: () => d.coordinator.startupReconciliation({ fresh: true }),
+    isLiveArmed: () => d.coordinator.isLiveArmed(),
+    plantUnresolvedBuy: () => {
+      const signature = bs58.encode(randomBytes(64));
+      const saved = d.workstationDb.saveTransaction({
+        signature, orderId: `e2e-l-${signature.slice(0, 8)}`, correlationId: 'e2e-l', mint: d.Keypair.generate().publicKey.toBase58(), direction: 'BUY',
+        submissionTransport: 'SOLANA_RPC', submissionTime: Date.now(), reconciliationState: 'RECONCILIATION_REQUIRED', networkFeeLamports: 5000,
+        jitoTipLamports: 0, executionMode: 'LIVE',
+      });
+      if (!saved) throw new Error('the unresolved buy row could not be written');
+      return signature;
+    },
+    resolveRow: (sig) => {
+      const row = d.workstationDb.loadTransactions().find((t: any) => t.signature === sig);
+      if (!row) throw new Error(`row ${sig.slice(0, 8)} not found`);
+      if (!d.workstationDb.saveTransaction({ ...row, reconciliationState: 'REVERTED', error: 'e2e (l): resolved by the harness' })) throw new Error('the row could not be resolved');
+    },
+  });
 }
 
 type FeedStepDeps = { conn: any; web3: any; kp: any; coordinator: any; PumpCurveService: any; txBuilder: any };

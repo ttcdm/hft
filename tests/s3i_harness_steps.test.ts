@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { EventEmitter } from 'node:events';
 import {
-  hasBudget, unreadableReservesRefused, rpcSwitchMovesFeed, sellerWhoNeverBought, lossFloorLatch, msToNextUtcMidnight, bootRefusesBadLimit,
+  hasBudget, unreadableReservesRefused, rpcSwitchMovesFeed, sellerWhoNeverBought, readinessGateAfterMismatch, lossFloorLatch, msToNextUtcMidnight, bootRefusesBadLimit,
   type HarnessSteps, type ChainKit, type WatchFeed,
 } from '../scripts/devnet_e2e_steps';
 
@@ -264,6 +264,126 @@ describe('3I (u): a seller that never bought', () => {
     const k = stubKit({ refund: true });
     await sellerWhoNeverBought(r, k.kit, feedFor(k.calls), wallet('payer'), { waitMs: 100 });
     expect(r.recs.filter((x) => /: refund /.test(x.step) && !x.ok)).toHaveLength(3);
+  });
+});
+
+describe('3I (l): per-buy readiness after a Reconcile at MISMATCH (3A)', () => {
+  /**
+   * The app reduced to what (l) drives: Reconcile reads the rows (a RECONCILIATION_REQUIRED row makes it MISMATCH naming the signature),
+   * and executeTrade refuses LIVE_NOT_READY while the last Reconcile is not ready (unless `gate: false`, 3A missing).
+   */
+  function harness(opts: { gate?: boolean; reconcileOut?: (n: number) => { status: string; details: string } | null; syncOk?: (n: number) => boolean; bankrollOn?: number[]; readyIgnoresRow?: boolean; rowStuck?: boolean } = {}) {
+    const r = recorder();
+    const skips: Array<{ step: string; detail: string }> = [];
+    const rows: any[] = [];
+    let open: any[] = [];
+    let last = 'EXECUTION_READY';
+    let reconciles = 0;
+    let syncs = 0;
+    let calls = 0;
+    let armed = true;
+    const planted: any[] = [];
+    const coordinator = {
+      syncRealWalletBalance: async () => ((opts.syncOk ?? (() => true))(++syncs) ? 1 : null),
+      closePosition: async (id: string) => { open = open.filter((p) => p.id !== id); return { success: true }; },
+      executeTrade: async () => {
+        calls++;
+        if (!armed) return { success: false, lifecycleState: 'RISK_REJECTED', error: 'LIVE trading is not armed' };
+        if (opts.gate !== false && last !== 'EXECUTION_READY') return { success: false, lifecycleState: 'RISK_REJECTED', error: `LIVE_NOT_READY: startup reconciliation is ${last}; the buy is refused (exits are not affected)` };
+        if (opts.bankrollOn?.includes(calls)) return { success: false, lifecycleState: 'RISK_REJECTED', error: 'INSUFFICIENT_SPENDABLE_BANKROLL: Spendable bankroll is 0.0000 SOL' };
+        rows.push({ signature: `s${calls}`, orderId: 'o', direction: 'BUY', reconciliationState: 'CONFIRMED', mint: 'MINT11111111' });
+        open.push({ id: `p${calls}`, mint: 'MINT11111111', status: 'OPEN' });
+        return { success: true, lifecycleState: 'CONFIRMED', txSignature: `s${calls}` };
+      },
+    };
+    const s = {
+      ...r, skip: (step: string, detail: string) => skips.push({ step, detail }), coordinator, mint: 'MINT11111111', curve: {} as any,
+      db: { loadTransactions: () => rows, loadPositions: () => open },
+      riskLimits: () => ({ cooldownAfterFailedTradeMs: 15_000, cooldownPerMintMs: 0 }),
+      buildBuyRequest: async () => ({ mint: 'MINT11111111' }),
+    } as unknown as HarnessSteps;
+    const d = {
+      reconcile: async () => {
+        reconciles++;
+        const injected = opts.reconcileOut?.(reconciles);
+        const out = injected ?? (() => {
+          const stuck = planted.filter((p) => p.reconciliationState === 'RECONCILIATION_REQUIRED' || opts.rowStuck);
+          if (stuck.length && !opts.readyIgnoresRow) return { status: 'RECONCILIATION_MISMATCH', details: `1 landed buy(s) have no position record: ${stuck[0].signature.slice(0, 8)}` };
+          return { status: 'EXECUTION_READY', details: 'All on-chain state reconciled.' };
+        })();
+        last = out.status;
+        return out;
+      },
+      isLiveArmed: () => armed,
+      plantUnresolvedBuy: () => { const row = { signature: `PLANT${planted.length}xyzabcdefgh`, reconciliationState: 'RECONCILIATION_REQUIRED' }; planted.push(row); return row.signature; },
+      resolveRow: (sig: string) => { const row = planted.find((p) => p.signature === sig); if (row) row.reconciliationState = 'REVERTED'; },
+    };
+    return { s, r, d, skips, planted, open: () => open, reconciles: () => reconciles, calls: () => calls, disarm: () => { armed = false; } };
+  }
+
+  it('an app with the per-buy gate: every line passes, the buy is sold back, the row ends resolved', async () => {
+    const h = harness();
+    await readinessGateAfterMismatch(h.s, h.d);
+    expect(h.r.recs.filter((x) => !x.ok)).toEqual([]);
+    for (const part of ['RECONCILIATION_MISMATCH naming it', 'refused LIVE_NOT_READY', 'EXECUTION_READY', 'buy after EXECUTION_READY: CONFIRMED', 'sell back']) expect(line(h.r.recs, part)?.ok).toBe(true);
+    expect(h.skips).toEqual([]);
+    expect(h.open()).toEqual([]);
+    expect(h.planted.every((p) => p.reconciliationState === 'REVERTED')).toBe(true);
+  });
+
+  it('an app without the per-buy gate (3A missing): the refused-buy line FAILs; the position is still closed', async () => {
+    const h = harness({ gate: false });
+    await readinessGateAfterMismatch(h.s, h.d);
+    expect(line(h.r.recs, 'refused LIVE_NOT_READY')?.ok).toBe(false);
+    expect(h.open()).toEqual([]);
+  });
+
+  it('a Reconcile that answers EXECUTION_READY with the row unresolved is the app\'s answer: FAIL, not retried', async () => {
+    const h = harness({ readyIgnoresRow: true });
+    await readinessGateAfterMismatch(h.s, h.d);
+    expect(line(h.r.recs, 'RECONCILIATION_MISMATCH naming it')?.ok).toBe(false);
+    expect(h.calls()).toBe(0);
+    expect(h.planted[0].reconciliationState).toBe('REVERTED');
+  });
+
+  it('a Reconcile at MISMATCH for an RPC reason is retried until it names the row; the line says which try', async () => {
+    const h = harness({ reconcileOut: (n) => (n === 1 ? { status: 'RECONCILIATION_MISMATCH', details: 'Wallet token scan failed (429)' } : null) });
+    await readinessGateAfterMismatch(h.s, h.d);
+    expect(h.r.recs.filter((x) => !x.ok)).toEqual([]);
+    expect(line(h.r.recs, 'RECONCILIATION_MISMATCH naming it')?.detail).toContain('try 2');
+  });
+
+  it('Reconcile never finishes on the row (RPC): a SKIP with the reason, no buy, no FAIL; the row is still resolved', async () => {
+    const h = harness({ reconcileOut: (n) => (n <= 3 ? { status: 'OFFLINE', details: 'Solana RPC is DISCONNECTED' } : null) });
+    await readinessGateAfterMismatch(h.s, h.d);
+    expect(h.r.recs.filter((x) => !x.ok)).toEqual([]);
+    expect(h.skips).toHaveLength(1);
+    expect(h.skips[0].detail).toMatch(/OFFLINE/);
+    expect(h.calls()).toBe(0);
+    expect(h.planted[0].reconciliationState).toBe('REVERTED');
+  });
+
+  it('the row still counted after it was resolved: the EXECUTION_READY line FAILs at once', async () => {
+    const h = harness({ rowStuck: true });
+    await readinessGateAfterMismatch(h.s, h.d);
+    expect(line(h.r.recs, 'after the row is resolved: EXECUTION_READY')?.ok).toBe(false);
+    expect(line(h.r.recs, 'buy after EXECUTION_READY')).toBeUndefined();
+  });
+
+  it('after the row is resolved, an RPC miss on Reconcile is retried; the allowed buy rides out a lost balance read', async () => {
+    const h = harness({ reconcileOut: (n) => (n === 2 ? { status: 'RECONCILIATION_MISMATCH', details: 'Reconciliation did not finish within 30s' } : null), bankrollOn: [2] });
+    await readinessGateAfterMismatch(h.s, h.d);
+    expect(h.r.recs.filter((x) => !x.ok)).toEqual([]);
+    expect(line(h.r.recs, 'after the row is resolved: EXECUTION_READY')?.detail).toContain('try 2');
+    expect(line(h.r.recs, 'buy after EXECUTION_READY: CONFIRMED')?.detail).toContain('try 2');
+  });
+
+  it('a balance sync that never recovers before the refused buy: a SKIP, no FAIL, the step goes on to the allowed buy', async () => {
+    const h = harness({ syncOk: (n) => n > 5 });
+    await readinessGateAfterMismatch(h.s, h.d);
+    expect(h.r.recs.filter((x) => !x.ok)).toEqual([]);
+    expect(h.skips.map((x) => x.step)).toEqual([expect.stringContaining('refused LIVE_NOT_READY')]);
+    expect(line(h.r.recs, 'buy after EXECUTION_READY: CONFIRMED')?.ok).toBe(true);
   });
 });
 

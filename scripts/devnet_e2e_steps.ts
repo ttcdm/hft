@@ -9,7 +9,7 @@
  *       no position, and an immediate second buy refused by the 15 s failure cooldown with nothing sent. The wrapper is restored in `finally`.
  *  (e') two sequential `executeTrade` calls on one mint: the first is CONFIRMED and opens one position, the second is refused before
  *       anything is signed (POSITION_ALREADY_OPEN). The position is then closed so step (f) starts flat.
- *  (e''), (g), (h), (i), (j) and (k) are described at their functions below, and so are the Stage 3 steps (s), (t) and (u) (task 3I).
+ *  (e''), (g), (h), (i), (j) and (k) are described at their functions below, and so are the Stage 3 steps (l), (n), (s), (t) and (u) (task 3I).
  *
  *  (e''') P1.4: the emergency stop. One LIVE position is opened, auto is set to DEVNET_LIVE, then Telegram `/panic_sell` is driven
  *       through the app's `processTelegramCommand` (no bot): the LIVE position must be sold on chain and auto must end OFF. Then the
@@ -1409,6 +1409,157 @@ export async function sellerWhoNeverBought(
   }
 }
 
+const skipOf = (s: Pick<HarnessSteps, 'skip'>) => (step: string, detail: string) => (s.skip ? s.skip(step, detail) : console.log(`SKIP  ${step}: ${detail}`));
+
+/** The balance sync, retried after 0.5, 1, 2 and 4 s: ok once one read answered. Run 16: a 429 on the sync just before a buy left the
+ * balance unknown, and the buy was refused INSUFFICIENT_SPENDABLE_BANKROLL before it reached the gate the step was checking. */
+async function syncWithRetry(s: Pick<HarnessSteps, 'coordinator' | 'sleep'>): Promise<{ ok: boolean; failures: number }> {
+  let failures = 0;
+  for (const ms of [0, 500, 1_000, 2_000, 4_000]) {
+    if (ms) await s.sleep(ms);
+    if ((await s.coordinator.syncRealWalletBalance()) != null) return { ok: true, failures };
+    failures++;
+  }
+  return { ok: false, failures };
+}
+
+/**
+ * One `executeTrade` of the harness mint after a balance sync that answered (`syncWithRetry`). A refusal with nothing sent because the
+ * balance read was lost (INSUFFICIENT_SPENDABLE_BANKROLL) is re-synced and retried, up to 3 tries; it is never handed back as the answer.
+ * When the sync cannot recover, the bankroll refusal comes back on every try, or the failed reads disarmed LIVE (the kill switch), the
+ * check is a SKIP with the reason and this returns null: the RPC, not the app, kept the check from being made. Otherwise it returns the
+ * response, the BUY row count before it, and the try it took, and the caller records the strict check.
+ */
+async function tradeAfterSync(s: HarnessSteps, step: string): Promise<{ r: ExecutionResponse; before: number; attempt: number } | null> {
+  const skip = skipOf(s);
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const sync = await syncWithRetry(s);
+    if (sync.ok && sync.failures) console.log(`INFO  ${step}: the balance sync answered after ${sync.failures} failed read(s)`);
+    if (!sync.ok) { skip(step, `the wallet balance could not be read (5 tries, 0.5 to 4 s apart; attempt ${attempt} of 3); the check was not made`); return null; }
+    const before = buyRowsFor(s).length;
+    const r = await s.coordinator.executeTrade(await s.buildBuyRequest());
+    const unsent = !r.success && buyRowsFor(s).length === before && !(r.txSignature || r.signature);
+    if (unsent && /^INSUFFICIENT_SPENDABLE_BANKROLL/.test(r.error ?? '')) {
+      if (attempt < 3) { console.log(`INFO  ${step}: refused before the gate under test (${(r.error ?? '').slice(0, 120)}); balance re-synced, buy retried`); continue; }
+      skip(step, `refused INSUFFICIENT_SPENDABLE_BANKROLL on all 3 tries after a successful sync (the balance read keeps getting lost); the gate under test was not reached`);
+      return null;
+    }
+    if (unsent && sync.failures > 0 && /not armed/i.test(r.error ?? '')) {
+      skip(step, `${sync.failures} failed balance read(s) before this buy; LIVE was disarmed (consecutive RPC failures trip the kill switch): ${(r.error ?? '').slice(0, 120)}`);
+      return null;
+    }
+    return { r, before, attempt };
+  }
+  return null;
+}
+
+/** (l) what the readiness step needs from the app (passed in, so this file still imports nothing from server/). */
+export interface ReadinessGateDeps {
+  /** What POST /api/execution/reconcile runs: executionCoordinator.startupReconciliation({ fresh: true }). */
+  reconcile(): Promise<{ status: string; details: string }>;
+  isLiveArmed(): boolean;
+  /** Writes an unresolved LIVE BUY row (RECONCILIATION_REQUIRED, a fresh made-up signature, a mint the wallet never bought) into the app's
+   * database, the row a crash between send and confirm leaves, and returns its signature. */
+  plantUnresolvedBuy(): string;
+  /** Marks that row REVERTED (what reconciliation does once its blockhash expires). */
+  resolveRow(sig: string): void;
+}
+
+/**
+ * (l) 3A (R1-0), opt-in (DEVNET_READINESS_GATE=1), one buy and sell of the harness mint: every LIVE buy re-checks live readiness, not only
+ * the arm. With LIVE armed, an unresolved LIVE buy row is planted and Reconcile run: RECONCILIATION_MISMATCH naming that row, LIVE still
+ * armed. The next buy is refused `LIVE_NOT_READY: ... startup reconciliation is RECONCILIATION_MISMATCH`, nothing sent. The row is
+ * resolved (REVERTED), Reconcile reaches EXECUTION_READY, and a buy is CONFIRMED, then sold. Before 3A the refused buy went through.
+ * Each buy runs after a balance sync that answered (`tradeAfterSync`), and each Reconcile is retried (3 tries, 2 and 4 s apart) while the
+ * reason it is not at the expected status is not the planted row (an RPC read failed in the pass): a check the RPC kept from being made is
+ * a SKIP with the reason, never a PASS. `finally` resolves the row, reconciles until ready, and closes anything open on the mint, so the
+ * steps after this one start ready. Returns when the last trade settled.
+ */
+export async function readinessGateAfterMismatch(s: HarnessSteps, d: ReadinessGateDeps): Promise<number> {
+  const L = '(l) 3A: per-buy readiness';
+  const skip = skipOf(s);
+  let lastTradeAt = Date.now();
+  let planted: string | null = null;
+  let resolved = false;
+  /** Reconcile until `want(result)`. A miss that `appMiss` says is the app's own answer is final; any other miss (an RPC read failed in
+   * the pass: OFFLINE, a scan error, a timeout) is retried. */
+  type Recon = { status: string; details: string };
+  const reconcileUntil = async (want: (r: Recon) => boolean, appMiss: (r: Recon) => boolean) => {
+    let last: { status: string; details: string } = { status: 'not run', details: '' };
+    for (const [i, ms] of [0, 2_000, 4_000].entries()) {
+      if (ms) await s.sleep(ms);
+      try { last = await d.reconcile(); } catch (e: any) { last = { status: 'threw', details: String(e?.message ?? e) }; }
+      if (want(last)) return { ok: true, last, tries: i + 1, final: true };
+      if (appMiss(last)) return { ok: false, last, tries: i + 1, final: true };
+    }
+    return { ok: false, last, tries: 3, final: false };
+  };
+  const brief = (r: Recon) => `${r.status}: ${r.details}`.slice(0, 260);
+  try {
+    // 1. an unresolved LIVE buy, then Reconcile
+    planted = d.plantUnresolvedBuy();
+    const tag = planted.slice(0, 8);
+    // EXECUTION_READY with the row in the database is the app's own (wrong) answer; anything else short of a mismatch naming it is retried
+    const m = await reconcileUntil((r) => r.status === 'RECONCILIATION_MISMATCH' && r.details.includes(tag), (r) => r.status === 'EXECUTION_READY');
+    const step1 = `${L}: Reconcile with an unresolved LIVE buy row: RECONCILIATION_MISMATCH naming it, LIVE still armed`;
+    if (!m.ok && !m.final) { skip(step1, `3 Reconciles did not finish on the row (an RPC read failed in the pass); last ${brief(m.last)}`); return lastTradeAt; }
+    s.rec(step1, m.ok && d.isLiveArmed(), `row ${tag}...; ${brief(m.last)}; armed ${d.isLiveArmed()}${m.tries > 1 ? `; try ${m.tries}` : ''}`);
+    if (!m.ok || !d.isLiveArmed()) return lastTradeAt;
+
+    // 2. the next buy is refused by the per-buy gate
+    const step2 = `${L}: buy while reconciliation is at MISMATCH: refused LIVE_NOT_READY, nothing sent`;
+    const t = await tradeAfterSync(s, step2);
+    if (t) {
+      const sig = t.r.txSignature || t.r.signature || '';
+      s.rec(
+        step2,
+        !t.r.success && t.r.lifecycleState === 'RISK_REJECTED' && /^LIVE_NOT_READY: .*startup reconciliation is RECONCILIATION_MISMATCH/.test(t.r.error ?? '')
+          && buyRowsFor(s).length === t.before && !sig && openFor(s).length === 0,
+        `${t.r.lifecycleState} ${t.r.error ?? ''}; BUY rows ${t.before} -> ${buyRowsFor(s).length}; open positions ${openFor(s).length}${t.attempt > 1 ? `; try ${t.attempt}` : ''}`.slice(0, 400)
+      );
+      if (t.r.success) { lastTradeAt = Date.now(); return lastTradeAt; } // the gate let it through: `finally` sells it; the rest would say nothing new
+    }
+
+    // 3. the row resolved, Reconcile, buy again
+    d.resolveRow(planted);
+    resolved = true;
+    const step3 = `${L}: Reconcile after the row is resolved: EXECUTION_READY`;
+    const ready = await reconcileUntil((r) => r.status === 'EXECUTION_READY', (r) => r.details.includes(tag)); // the row still counted: the app's answer
+    if (!ready.ok && !ready.final) { skip(step3, `3 Reconciles did not reach EXECUTION_READY for a reason other than the row (an RPC read failed in the pass); last ${brief(ready.last)}`); return lastTradeAt; }
+    s.rec(step3, ready.ok, `${brief(ready.last)}${ready.tries > 1 ? `; try ${ready.tries}` : ''}`);
+    if (!ready.ok) return lastTradeAt;
+    const step4 = `${L}: buy after EXECUTION_READY: CONFIRMED`;
+    const b = await tradeAfterSync(s, step4);
+    if (b) {
+      if (b.r.success) lastTradeAt = Date.now();
+      s.rec(step4, b.r.success && b.r.lifecycleState === 'CONFIRMED', `${b.r.lifecycleState} ${b.r.error ?? ''}${b.attempt > 1 ? `; try ${b.attempt}` : ''}`.slice(0, 300));
+    }
+    for (const p of openFor(s)) {
+      const c = await s.coordinator.closePosition(p.id, 100, 'e2e (l) sell back');
+      lastTradeAt = Date.now();
+      s.rec(`${L}: sell back`, c.success, c.error || 'closed');
+    }
+  } catch (e: any) {
+    s.rec(L, false, String(e?.message ?? e).slice(0, 300));
+  } finally {
+    if (planted && !resolved) {
+      try { d.resolveRow(planted); } catch (e: any) { s.rec(`${L}: cleanup, planted row resolved`, false, String(e?.message ?? e).slice(0, 200)); }
+    }
+    if (planted) {
+      const r = await d.reconcile().catch((e: any) => ({ status: 'threw', details: String(e?.message ?? e) }));
+      if (r.status !== 'EXECUTION_READY') console.log(`INFO  ${L}: cleanup Reconcile ${brief(r)} (the app's background retries keep trying)`);
+    }
+    for (const p of openFor(s)) {
+      try {
+        const c = await s.coordinator.closePosition(p.id, 100, 'e2e (l) cleanup');
+        lastTradeAt = Date.now();
+        s.rec(`${L}: cleanup close 100%`, c.success, c.error || 'closed');
+      } catch (e: any) { s.rec(`${L}: cleanup close 100%`, false, String(e?.message ?? e).slice(0, 200)); }
+    }
+  }
+  return lastTradeAt;
+}
+
 /** (n) what the loss-floor step needs from the app (passed in, so this file still imports nothing from server/). */
 export interface LossFloorDeps {
   /** executionConfig's MAX_DAILY_LOSS_USD as the floor reads it, and the in-process setter (`updateConfig`, which runs the same check as boot). */
@@ -1455,50 +1606,22 @@ export async function lossFloorLatch(s: HarnessSteps, d: LossFloorDeps): Promise
   const realNow = Date.now;
   let lastTradeAt = Date.now();
   const buyRows = () => buyRowsFor(s).length;
-  const skip = (step: string, detail: string) => (s.skip ? s.skip(step, detail) : console.log(`SKIP  ${step}: ${detail}`));
-  /** The balance sync, retried after 0.5, 1, 2 and 4 s: true once one read answered. Run 16: a 429 on the sync just before a buy left the
-   * balance unknown, and the buy was refused INSUFFICIENT_SPENDABLE_BANKROLL before it reached the daily-loss gate. */
-  const syncWithRetry = async (): Promise<{ ok: boolean; failures: number }> => {
-    let failures = 0;
-    for (const ms of [0, 500, 1_000, 2_000, 4_000]) {
-      if (ms) await s.sleep(ms);
-      if ((await s.coordinator.syncRealWalletBalance()) != null) return { ok: true, failures };
-      failures++;
-    }
-    return { ok: false, failures };
-  };
   /**
-   * A buy that must be refused by the floor: DAILY_LOSS_LIMIT, nothing sent, the latch set. A refusal before the floor's gate because the
-   * balance read was lost (INSUFFICIENT_SPENDABLE_BANKROLL) is retried, up to 3 times, after a fresh sync; it is never taken as the floor's.
-   * When the sync cannot recover (or its failures disarmed LIVE), the check is a SKIP with the reason, not a FAIL. Returns null on a SKIP.
+   * A buy that must be refused by the floor: DAILY_LOSS_LIMIT, nothing sent, the latch set, after a balance sync that answered
+   * (`tradeAfterSync`: a refusal for a lost balance read is retried, and a check the RPC kept from being made is a SKIP). Null on a SKIP.
    */
   const refusedBuy = async (label: string, wantLatched: boolean) => {
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      const sync = await syncWithRetry();
-      if (sync.ok && sync.failures) console.log(`INFO  ${L}: ${label}: the balance sync answered after ${sync.failures} failed read(s)`);
-      if (!sync.ok) { skip(`${L}: ${label}`, `the wallet balance could not be read (5 tries, 0.5 to 4 s apart; attempt ${attempt} of 3); the check was not made`); return null; }
-      const before = buyRows();
-      const r = await s.coordinator.executeTrade(await s.buildBuyRequest());
-      const sig = r.txSignature || r.signature || '';
-      const unsent = !r.success && buyRows() === before && !sig;
-      if (unsent && /^INSUFFICIENT_SPENDABLE_BANKROLL/.test(r.error ?? '')) {
-        if (attempt < 3) { console.log(`INFO  ${L}: ${label}: refused before the floor's gate (${(r.error ?? '').slice(0, 120)}); balance re-synced, buy retried`); continue; }
-        skip(`${L}: ${label}`, `refused INSUFFICIENT_SPENDABLE_BANKROLL on all 3 tries after a successful sync (the balance read keeps getting lost); the floor's gate was not reached`);
-        return null;
-      }
-      if (unsent && sync.failures > 0 && /not armed/i.test(r.error ?? '')) {
-        skip(`${L}: ${label}`, `${sync.failures} failed balance read(s) before this buy; LIVE was disarmed (consecutive RPC failures trip the kill switch): ${(r.error ?? '').slice(0, 120)}`);
-        return null;
-      }
-      const latched = /latched/.test(r.error ?? '');
-      s.rec(
-        `${L}: ${label}`,
-        !r.success && /^DAILY_LOSS_LIMIT: Net daily PnL floor/.test(r.error ?? '') && (!wantLatched || latched) && buyRows() === before && !sig && d.latch() !== null,
-        `${r.lifecycleState} ${r.error ?? ''}; BUY rows ${before} -> ${buyRows()}; latch ${d.latch() ? 'set' : 'not set'}${attempt > 1 ? `; try ${attempt}` : ''}`.slice(0, 400)
-      );
-      return r;
-    }
-    return null;
+    const t = await tradeAfterSync(s, `${L}: ${label}`);
+    if (!t) return null;
+    const { r, before, attempt } = t;
+    const sig = r.txSignature || r.signature || '';
+    const latched = /latched/.test(r.error ?? '');
+    s.rec(
+      `${L}: ${label}`,
+      !r.success && /^DAILY_LOSS_LIMIT: Net daily PnL floor/.test(r.error ?? '') && (!wantLatched || latched) && buyRows() === before && !sig && d.latch() !== null,
+      `${r.lifecycleState} ${r.error ?? ''}; BUY rows ${before} -> ${buyRows()}; latch ${d.latch() ? 'set' : 'not set'}${attempt > 1 ? `; try ${attempt}` : ''}`.slice(0, 400)
+    );
+    return r;
   };
   try {
     const usd = d.price().usd;

@@ -267,3 +267,37 @@ describe('3H A7: one truth for the callout auto-snipe rules', () => {
     expect(view).not.toMatch(/setRules\(\{ \.\.\.rules,/); // every input goes through editRules, which marks the form dirty
   });
 });
+
+describe('3H A2/A3: the Sniper tab has no input that does nothing, and says what the tip does', () => {
+  it('the Jito text follows readiness: with no block engine the tip is said not to be paid on LIVE', async () => {
+    const { jitoUseText } = await import('../src/components/MemecoinSocialSniperModal');
+    expect(jitoUseText('NOT_CONFIGURED')).toEqual({ card: 'off: no block engine, LIVE tip is 0', tipLabel: 'Jito Tip (SOL) (not paid on LIVE: Jito is off)' });
+    expect(jitoUseText('HEALTHY').card).toBe('block engine HEALTHY');
+    expect(jitoUseText(null).card).toBe('status not loaded');
+  });
+
+  it('readiness reports NOT_CONFIGURED for a coordinator with no block engine (localnet refuses any URL), the status the screen turns into "not paid on LIVE"', async () => {
+    const { Connection } = await import('@solana/web3.js');
+    const { ExecutionCoordinator } = await import('../server/execution/coordinator');
+    const { JitoTransport } = await import('../server/solana/transports');
+    vi.stubEnv('ALLOWED_CLUSTER', 'localnet');
+    try {
+      const conn = new Connection('http://127.0.0.1:9');
+      const c = new ExecutionCoordinator(conn);
+      c.setJitoTransport(new JitoTransport(conn, 'http://127.0.0.1:9'));
+      expect(c.getJitoReadiness()).toMatchObject({ enabled: false, status: 'NOT_CONFIGURED' });
+      expect(c.getLiveReadiness().components.jito.status).toBe('NOT_CONFIGURED');
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it('the screen has no "Snipe Amount (USD)" box and no longer says Jito is used on mainnet-beta only; the Telegram fields are not in the polled config', () => {
+    const src = fs.readFileSync('src/components/MemecoinSocialSniperModal.tsx', 'utf8');
+    expect(src).not.toMatch(/>\s*Snipe Amount \(USD\)\s*</);
+    expect(src).not.toContain("mainnet only (read-only here)");
+    expect(src).not.toMatch(/sniperConfig\.telegram(BotToken|ChatId)/);
+    expect(src).toContain('{jitoUseText(jitoStatus).card}');
+    expect(src).toContain('{jitoUseText(jitoStatus).tipLabel}');
+  });
+});

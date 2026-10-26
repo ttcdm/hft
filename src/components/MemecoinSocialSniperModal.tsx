@@ -13,6 +13,7 @@
  */
 import { signalFeedBadge } from '../utils/signalBadge';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
+import { usePolled } from '../utils/usePolled';
 import { probeBadge, probeBadgeClass, probeLatency, hostOfService, connectivityAuditSummary } from '../utils/probeBadge';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
 import { useAutoStatus, AutoModeBadge, type AutoMode } from './AutoPanel';
@@ -123,6 +124,16 @@ export function ExitRulesNote({ rules }: { rules: ExitRulesData | null }) {
   );
 }
 
+/**
+ * 3H (A3): what the Jito card and the tip field say, from the Jito status readiness reports. With no block engine (the devnet and localnet
+ * default) the coordinator forces the LIVE tip to 0 (resolveLiveTip), so the tip typed here is not paid on LIVE.
+ */
+export function jitoUseText(jitoStatus: string | null | undefined): { card: string; tipLabel: string } {
+  if (!jitoStatus) return { card: 'status not loaded', tipLabel: 'Jito Tip (SOL) (Jito status not loaded)' };
+  if (jitoStatus === 'NOT_CONFIGURED') return { card: 'off: no block engine, LIVE tip is 0', tipLabel: 'Jito Tip (SOL) (not paid on LIVE: Jito is off)' };
+  return { card: `block engine ${jitoStatus}`, tipLabel: 'Jito Tip (SOL)' };
+}
+
 /** What the Telegram "Save Config" click reports, from the server's answer (it used to say "saved securely" without waiting for one). */
 export function telegramSaveOutcome(res: any): { level: 'INFO' | 'WARNING'; title: string; message: string } {
   if (res?.status === 'OK') {
@@ -196,6 +207,11 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const [isTestingDiagnostics, setIsTestingDiagnostics] = useState(false);
   const tradingMode = useTradingMode();
   const autoStatus = useAutoStatus(); // P1.4 (N-12): the sniper tab mirrors the auto controller's mode; it does not set it
+  // 3H (A3): the Jito card and tip label say what the transport does, from GET /api/execution/readiness
+  const readiness = usePolled<{ components?: { jito?: { status?: string } } }>('/api/execution/readiness', 15_000, isOpen);
+  const jitoStatus = readiness.data?.components?.jito?.status ?? null;
+  // 3H: the Telegram fields have their own state. In sniperConfig they were wiped by every config snapshot (the server never sends the token back).
+  const [telegramDraft, setTelegramDraft] = useState({ botToken: '', chatId: '' });
   const [diagnosticsResult, setDiagnosticsResult] = useState<any | null>(null);
   const [showDiagnosticsModal, setShowDiagnosticsModal] = useState(false);
 
@@ -203,8 +219,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     setIsTestingTelegram(true);
     try {
       const res = await engineClient.testTelegramConnection(
-        sniperConfig.telegramBotToken,
-        sniperConfig.telegramChatId,
+        telegramDraft.botToken,
+        telegramDraft.chatId,
         sendPingMsg
       );
       setTelegramTestResult(res);
@@ -553,8 +569,9 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
               <ShieldCheck className="w-3.5 h-3.5 text-purple-400" />
               <span>Jito bundles</span>
             </span>
-            {/* UI-7: this card used to read "Jito MEV Protection 0.005 SOL Tip (Direct Slot)" on every cluster; Jito is used on mainnet-beta only */}
-            <span className="font-bold text-purple-300">{tradingMode.cluster === 'mainnet-beta' ? 'mainnet only (read-only here)' : `not used on ${tradingMode.cluster ?? 'this cluster'}`}</span>
+            {/* UI-7: this card used to read "Jito MEV Protection 0.005 SOL Tip (Direct Slot)" on every cluster. 3H: it then said Jito is used on
+                mainnet-beta only, which is not the rule; it now shows the transport readiness reports. */}
+            <span className="font-bold text-purple-300" data-testid="jito-card">{jitoUseText(jitoStatus).card}</span>
           </div>
         </div>
 
@@ -1088,24 +1105,11 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
                 {/* Configuration Inputs */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono">
+                  {/* 3H (A2): a "Snipe Amount (USD)" box was here. It edited local state only and nothing sent it; every buy on this screen
+                      takes its size from the shared snipe amount control (S181). */}
                   <div>
-                    <label className="block text-slate-400 text-[10px] mb-1">
-                      Snipe Amount (USD)
-                    </label>
-                    <input
-                      type="number"
-                      step="0.5"
-                      value={sniperConfig.defaultSnipeAmountUsd}
-                      onChange={(e) =>
-                        setSniperConfig({ ...sniperConfig, defaultSnipeAmountUsd: Number(e.target.value) })
-                      }
-                      className="w-full bg-[#141B2D] border border-[#1E293B] rounded p-2 text-white font-mono outline-none focus:border-cyan-400"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-slate-400 text-[10px] mb-1">
-                      Jito MEV Tip (SOL)
+                    <label className="block text-slate-400 text-[10px] mb-1" data-testid="jito-tip-label">
+                      {jitoUseText(jitoStatus).tipLabel}
                     </label>
                     <input
                       type="number"
@@ -1407,10 +1411,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                     <input
                       type="password"
                       placeholder="Enter Bot Token from @BotFather..."
-                      value={sniperConfig.telegramBotToken}
-                      onChange={(e) =>
-                        setSniperConfig({ ...sniperConfig, telegramBotToken: e.target.value })
-                      }
+                      value={telegramDraft.botToken}
+                      onChange={(e) => setTelegramDraft((d) => ({ ...d, botToken: e.target.value }))}
                       className="w-full bg-[#141B2D] border border-[#1E293B] rounded p-2 text-slate-300 text-xs font-mono outline-none focus:border-cyan-500/50"
                     />
                   </div>
@@ -1420,10 +1422,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                     <input
                       type="text"
                       placeholder="e.g. @apex_alpha_vip_snipers or chat ID"
-                      value={sniperConfig.telegramChatId}
-                      onChange={(e) =>
-                        setSniperConfig({ ...sniperConfig, telegramChatId: e.target.value })
-                      }
+                      value={telegramDraft.chatId}
+                      onChange={(e) => setTelegramDraft((d) => ({ ...d, chatId: e.target.value }))}
                       className="w-full bg-[#141B2D] border border-[#1E293B] rounded p-2 text-slate-300 text-xs font-mono outline-none focus:border-cyan-500/50"
                     />
                   </div>
@@ -1432,8 +1432,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                     <button
                       onClick={async () => {
                         const res = await engineClient.updateTelegramConfig({
-                          botToken: sniperConfig.telegramBotToken,
-                          chatId: sniperConfig.telegramChatId,
+                          botToken: telegramDraft.botToken,
+                          chatId: telegramDraft.chatId,
                         });
                         const out = telegramSaveOutcome(res);
                         onAlertTrigger?.(out.level, out.title, out.message);

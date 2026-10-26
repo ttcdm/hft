@@ -141,6 +141,9 @@ export function exitStageAfterFill(reason: string | undefined, current: Normaliz
 }
 
 /** A balance found in the wallet that this app never bought (cost basis unknown): watched with a hard stop, not a trade the app chose. */
+/** E2: true when a token program (SPL Token or Token-2022) owns the account; an unknown owner counts as owned, so a read that cannot tell decides nothing. */
+const ownedByTokenProgram = (owner: PublicKey | undefined): boolean => !owner || typeof (owner as any).equals !== 'function' || owner.equals(TOKEN_PROGRAM_ID) || owner.equals(TOKEN_2022_PROGRAM_ID);
+
 export const isRecoveredPosition = (p: { entryTxSignature?: string }): boolean => !!p.entryTxSignature?.startsWith('RECOVERED:');
 
 // Q11: the reasons the operator routes actually pass ('Manual user order' from POST /api/wallet/close, 'Aggregator Close' from the WS
@@ -3662,9 +3665,24 @@ export class ExecutionCoordinator {
       held = BigInt(bal?.value?.amount ?? '0');
       slot = bal?.context?.slot;
     } catch (e: any) {
-      // S259: only "could not find account" means the account is absent. Another "Invalid param" (an account that is not a token
-      // account of this program, say) says nothing about the balance, and a 0 here closes the row as an assumed loss.
-      if (!/could not find account/i.test(String(e?.message))) return { held: null, error: String(e?.message ?? e) };
+      // S259: "could not find account" means the account is absent. E2 (devnet run 12): an ATA closed by a 100% sell reads as "not a Token
+      // account" on devnet, which is no tokens too, once the account read below shows no token program owns that address. Any other
+      // "Invalid param" (a mint that cannot be unpacked, say) says nothing about the balance, and a 0 here closes the row as an assumed loss.
+      const msg = String(e?.message ?? e);
+      if (/not a Token account/i.test(msg)) {
+        let r: Awaited<ReturnType<Connection['getAccountInfoAndContext']>> | null;
+        try {
+          r = await this.connection.getAccountInfoAndContext(ata, 'confirmed');
+        } catch (err: any) {
+          return { held: null, error: `${msg}; the account itself could not be read (${err?.message ?? err})` };
+        }
+        if (r?.value && ownedByTokenProgram(r.value.owner)) {
+          return { held: null, error: `${msg}, but the token program owns the account; the balance is unknown` };
+        }
+        slot = r?.context?.slot;
+      } else if (!/could not find account/i.test(msg)) {
+        return { held: null, error: msg };
+      }
       held = 0n;
       absent = true;
     }
@@ -3694,7 +3712,8 @@ export class ExecutionCoordinator {
         try {
           const r = await this.connection.getAccountInfoAndContext(ata, 'confirmed');
           slot = r?.context?.slot;
-          if (absent && r?.value) slot = undefined; // the account exists after all: the two reads disagree, so neither decides
+          // a token account exists after all: the two reads disagree, so neither decides (an account no token program owns holds no tokens)
+          if (absent && r?.value && ownedByTokenProgram(r.value.owner)) slot = undefined;
         } catch {
           slot = undefined;
         }

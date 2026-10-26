@@ -190,6 +190,30 @@ describe('Review E: LIVE sell bookkeeping in closePosition', () => {
     expect(row().tokenQuantityRaw).toBe('500000000');
     expect(txState(sent[0])).toBe('RECONCILED');
   });
+
+  it('E2: a stop-loss after a full sell closed the ATA ("not a Token account") closes the row without selling again', async () => {
+    conn.getTokenAccountBalance = vi.fn(async () => { throw new Error('failed to get token account balance: Invalid param: not a Token account'); });
+    conn.getAccountInfoAndContext = vi.fn(async () => ({ context: { slot: 500 }, value: null }));
+    const res = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+    expect(res.success).toBe(true);
+    expect(submit).not.toHaveBeenCalled();
+    expect(row().status).toBe('CLOSED');
+  });
+
+  it('E2: a full sell that landed unconfirmed and closed the ATA is adopted and booked from its transaction', async () => {
+    recon.mockResolvedValueOnce({ success: false, reconciliationState: 'RECONCILIATION_REQUIRED', error: 'fill unreadable' } as any);
+    const first = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+    expect(first.success).toBe(false); // sent; its fill could not be read, so it is pending
+    conn.getTokenAccountBalance = vi.fn(async () => { throw new Error('failed to get token account balance: Invalid param: not a Token account'); });
+    conn.getAccountInfoAndContext = vi.fn(async () => ({ context: { slot: 500 }, value: null }));
+    recon.mockResolvedValueOnce(sellFill('1000000000', '0', -0.05, 49_995_000));
+    const adopted = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+    expect(adopted).toMatchObject({ success: true, pnlSol: -0.05 });
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(row().status).toBe('CLOSED');
+    expect(row().realizedPnLSol).toBeCloseTo(-0.05, 9);
+    expect(txState(sent[0])).toBe('RECONCILED');
+  });
 });
 
 describe('Review E: wallet balance reads that close a position (S259, S260)', () => {
@@ -218,13 +242,13 @@ describe('Review E: wallet balance reads that close a position (S259, S260)', ()
     clearLedger();
   });
 
-  const legacyPosition = () => {
+  const legacyPosition = (entrySlot?: number) => {
     const id = `e259_${uid()}`;
     // saved without baseTokenProgram, as rows from before the column were: the column default (SPL Token) is stored
     workstationDb.savePosition({
       id, mint: MINT, symbol: 'E', name: 'E', tokenDecimals: 6, tokenQuantityRaw: '1000', entryPriceSol: 1e-4, currentPriceSol: 1e-4,
       currentValueSol: 0.1, costBasisLamports: 100_000_000, realizedPnLSol: 0, status: 'OPEN', venue: 'PUMP_BONDING_CURVE',
-      executionMode: 'LIVE', entryTxSignature: `sig_${id}`, entryTimestamp: Date.now(), lastMarkTimestamp: Date.now(),
+      executionMode: 'LIVE', entryTxSignature: `sig_${id}`, entryTimestamp: Date.now(), lastMarkTimestamp: Date.now(), entrySlot,
       recordUpdatedAt: Date.now(), updatedAt: Date.now(),
     } as any);
     return id;
@@ -246,9 +270,10 @@ describe('Review E: wallet balance reads that close a position (S259, S260)', ()
     expect(after.exitReason ?? '').not.toMatch(/REALIZED_ASSUMED_LOSS/);
   });
 
-  it('S259: an "Invalid param" that is not "could not find account" is an unreadable balance, not 0', async () => {
+  it('S259: an "Invalid param" that is not a missing or closed account is an unreadable balance, not 0', async () => {
     const id = legacyPosition();
-    conn.getTokenAccountBalance = vi.fn(async () => { throw new Error('failed to get token account balance: Invalid param: not a Token account'); });
+    // E2: "not a Token account" (a closed ATA on devnet) is decided by the account read below; this one says nothing about the balance
+    conn.getTokenAccountBalance = vi.fn(async () => { throw new Error('failed to get token account balance: Invalid param: Token mint could not be unpacked'); });
     await coordinator.startupReconciliation();
     const after = workstationDb.loadPositions().find((p) => p.id === id)!;
     expect(after.status).toBe('OPEN');
@@ -261,6 +286,48 @@ describe('Review E: wallet balance reads that close a position (S259, S260)', ()
     conn.getTokenAccountBalance = vi.fn(async () => { throw new Error('failed to get token account balance: Invalid param: could not find account'); });
     await coordinator.startupReconciliation();
     expect(workstationDb.loadPositions().find((p) => p.id === id)!.status).toBe('OPEN');
+  });
+
+  // E2 (devnet run 12): the exact answer devnet gave for an ATA a 100% sell had closed
+  const CLOSED_ATA = 'failed to get token account balance: Invalid param: not a Token account';
+
+  it('E2: a closed ATA ("not a Token account", no account behind it) is an empty wallet: startup closes the row', async () => {
+    const id = legacyPosition();
+    conn.getTokenAccountBalance = vi.fn(async () => { throw new Error(CLOSED_ATA); });
+    conn.getAccountInfoAndContext = vi.fn(async () => ({ context: { slot: 500 }, value: null }));
+    await coordinator.startupReconciliation();
+    const after = workstationDb.loadPositions().find((p) => p.id === id)!;
+    expect(after.status).toBe('CLOSED');
+    expect(after.exitReason).toMatch(/RECONCILED_ZERO_BALANCE|REALIZED_ASSUMED_LOSS/);
+  });
+
+  it('E2: with a buy slot on the row, the account read is the slot that vouches for the empty answer', async () => {
+    const id = legacyPosition(400);
+    expect(workstationDb.loadPositions().find((p) => p.id === id)!.entrySlot).toBe(400);
+    conn.getTokenAccountBalance = vi.fn(async () => { throw new Error(CLOSED_ATA); });
+    conn.getAccountInfoAndContext = vi.fn(async () => ({ context: { slot: 300 }, value: null })); // a node behind the buy
+    await coordinator.startupReconciliation();
+    expect(workstationDb.loadPositions().find((p) => p.id === id)!.status).toBe('OPEN');
+    conn.getAccountInfoAndContext = vi.fn(async () => ({ context: { slot: 500 }, value: null }));
+    await coordinator.startupReconciliation();
+    expect(workstationDb.loadPositions().find((p) => p.id === id)!.status).toBe('CLOSED');
+  });
+
+  it('E2: an account at that address that no token program owns holds no tokens; one a token program owns leaves the balance unknown', async () => {
+    const sys = legacyPosition();
+    conn.getTokenAccountBalance = vi.fn(async () => { throw new Error(CLOSED_ATA); });
+    conn.getAccountInfoAndContext = vi.fn(async () => ({ context: { slot: 500 }, value: { owner: PublicKey.default, lamports: 1_000, data: Buffer.alloc(0), executable: false } }));
+    await coordinator.startupReconciliation();
+    expect(workstationDb.loadPositions().find((p) => p.id === sys)!.status).toBe('CLOSED');
+
+    const tok = legacyPosition();
+    conn.getAccountInfoAndContext = vi.fn(async () => ({ context: { slot: 500 }, value: { owner: TOKEN_PROGRAM_ID, lamports: 2_039_280, data: Buffer.alloc(165), executable: false } }));
+    await coordinator.startupReconciliation();
+    expect(workstationDb.loadPositions().find((p) => p.id === tok)!.status).toBe('OPEN');
+
+    conn.getAccountInfoAndContext = vi.fn(async () => { throw new Error('fetch failed'); });
+    await coordinator.startupReconciliation();
+    expect(workstationDb.loadPositions().find((p) => p.id === tok)!.status).toBe('OPEN');
   });
 
   it('S260: the LIVE buy baseline throws on an "Invalid param" other than a missing account', async () => {

@@ -5,6 +5,8 @@ import { memecoinAggregator } from '../server/memecoinAggregator';
 import { executionCoordinator } from '../server/execution/coordinator';
 import { riskEngine } from '../server/risk/riskEngine';
 import { MINT_A, MINT_B, pumpCoin, dexBoosts, dexPairs, jsonResponse } from './fixtures/socialFeeds';
+/** The pump.fun / DexScreener HTTP feeds run on mainnet-beta only (P4.2); these tests replay recorded feed responses as if there. */
+const MAINNET_FEEDS = { ALLOWED_CLUSTER: 'mainnet-beta' };
 
 const liveTokenInput = (over: Record<string, any> = {}) => ({
   symbol: 'GOAT', name: 'Goatseus', mint: MINT_A, curveProgress: 40, twitter: 'https://x.com/goatse', ...over,
@@ -164,7 +166,7 @@ describe('S1: Telegram / social integrations', () => {
     it('builds callouts from a recorded feed with normalized socials, never auto-sniping', async () => {
       mockFeeds([pumpCoin()], dexBoosts([MINT_A]), dexPairs(MINT_A));
       const snipe = vi.spyOn(memecoinAggregator, 'executeSnipe');
-      await svc.syncRealWorldData({ evaluateTriggers: true });
+      await svc.syncRealWorldData({ evaluateTriggers: true, env: MAINNET_FEEDS });
       const [c] = svc.getHotCallouts();
       expect(c.token.mint).toBe(MINT_A);
       expect(c.token.twitter).toBe('https://x.com/goatse');
@@ -177,23 +179,23 @@ describe('S1: Telegram / social integrations', () => {
 
     it('skips coins with no mint instead of inventing one', async () => {
       mockFeeds([pumpCoin({ mint: undefined }), pumpCoin({ mint: '' }), pumpCoin({ mint: MINT_B }), null]);
-      await svc.syncRealWorldData({ evaluateTriggers: false });
+      await svc.syncRealWorldData({ evaluateTriggers: false, env: MAINNET_FEEDS });
       expect(svc.getHotCallouts().map((c) => c.token.mint)).toEqual([MINT_B]);
     });
 
     it('survives an HTTP error and malformed JSON from the feed', async () => {
       mockFeeds({ error: 'rate limited' }, [], { pairs: [] }, 429);
-      await expect(svc.syncRealWorldData({ evaluateTriggers: false })).resolves.toBeUndefined();
+      await expect(svc.syncRealWorldData({ evaluateTriggers: false, env: MAINNET_FEEDS })).resolves.toEqual({});
       expect(svc.getHotCallouts()).toEqual([]);
 
       vi.restoreAllMocks();
       vi.spyOn(globalThis, 'fetch').mockImplementation(async () => new Response('<html>blocked</html>', { status: 200 }));
-      await expect(svc.syncRealWorldData({ evaluateTriggers: false })).resolves.toBeUndefined();
+      await expect(svc.syncRealWorldData({ evaluateTriggers: false, env: MAINNET_FEEDS })).resolves.toEqual({});
     });
 
     it('keeps unknown holder/authority data null (not defaulted to safe) on the callout', async () => {
       mockFeeds([pumpCoin()]);
-      await svc.syncRealWorldData({ evaluateTriggers: false });
+      await svc.syncRealWorldData({ evaluateTriggers: false, env: MAINNET_FEEDS });
       const t = svc.getHotCallouts()[0].token;
       expect(t.top10HoldersPct).toBeNull();
       expect(t.devHoldingPct).toBeNull();
@@ -204,8 +206,8 @@ describe('S1: Telegram / social integrations', () => {
     it('re-polling the same mint does not duplicate the social signal', async () => {
       const spy = vi.spyOn((await import('../server/socialScanner')).socialScanner, 'ingestLiveTokenSignal');
       mockFeeds([pumpCoin()]);
-      await svc.syncRealWorldData({ evaluateTriggers: false });
-      await svc.syncRealWorldData({ evaluateTriggers: false });
+      await svc.syncRealWorldData({ evaluateTriggers: false, env: MAINNET_FEEDS });
+      await svc.syncRealWorldData({ evaluateTriggers: false, env: MAINNET_FEEDS });
       expect(spy).toHaveBeenCalledTimes(2);
       const { socialScanner } = await import('../server/socialScanner');
       expect(socialScanner.getSignals().filter((s) => s.contractAddress === MINT_A)).toHaveLength(1);
@@ -259,7 +261,7 @@ describe('S1: Telegram / social integrations', () => {
       vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('LIVE');
       vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) =>
         String(input).includes('frontend-api-v3.pump.fun') ? jsonResponse([pumpCoin({ mint: MINT_B })]) : jsonResponse([]));
-      await svc.syncRealWorldData({ evaluateTriggers: false });
+      await svc.syncRealWorldData({ evaluateTriggers: false, env: MAINNET_FEEDS });
       const { pumpFunService } = await import('../server/pumpfunService');
       vi.spyOn(pumpFunService, 'getHotCallouts').mockReturnValue(svc.getHotCallouts());
       const exec = vi.spyOn(executionCoordinator, 'executeTrade');

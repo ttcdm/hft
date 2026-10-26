@@ -354,7 +354,7 @@ describe('R1-65: no pump.fun / DexScreener HTTP polling off mainnet', () => {
     vi.useFakeTimers();
     try {
       const svc = new PumpFunService();
-      const sync = vi.spyOn(svc, 'syncRealWorldData').mockResolvedValue(undefined);
+      const sync = vi.spyOn(svc, 'syncRealWorldData').mockResolvedValue({});
       svc.startBackground({ env: { ALLOWED_CLUSTER: 'mainnet-beta' } });
       expect(sync).toHaveBeenCalledTimes(1);
     } finally { vi.clearAllTimers(); }

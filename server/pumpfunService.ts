@@ -364,7 +364,7 @@ export class PumpFunService extends EventEmitter {
     if (this.backgroundStarted) return;
     this.backgroundStarted = true;
     pumpFeedListener.start().catch(() => {});
-    if (opts.httpPollers !== false && httpPollersAllowed(opts.env)) this.initPolling();
+    if (opts.httpPollers !== false && httpPollersAllowed(opts.env)) this.initPolling(opts.env);
   }
 
   /**
@@ -414,9 +414,9 @@ export class PumpFunService extends EventEmitter {
   }
 
   // Start background sync from real-world APIs (relegated to secondary fallback behind WebSocket)
-  private initPolling() {
+  private initPolling(env?: NodeJS.ProcessEnv) {
     // Initial fetch immediately
-    this.syncRealWorldData().catch(console.error);
+    this.syncRealWorldData({ env }).catch(console.error);
 
     // Poll every 5 seconds as secondary fallback when WebSocket logs are inactive or reconnecting (B08)
     setInterval(() => {
@@ -425,14 +425,19 @@ export class PumpFunService extends EventEmitter {
         // WebSocket is actively streaming on-chain events; HTTP polling is relegated to standby
         return;
       }
-      this.syncRealWorldData().catch(() => {});
+      this.syncRealWorldData({ env }).catch(() => {});
     }, 5000);
   }
 
   // Real-world API synchronization: pump.fun + DexScreener
   // `evaluateTriggers: false` refreshes the feed without ever evaluating auto-snipe (used by the manual refresh route).
-  public async syncRealWorldData(opts: { evaluateTriggers?: boolean } = {}): Promise<void> {
-    if (this.isPolling) return;
+  // Returns a reason when nothing was fetched because the cluster is not mainnet-beta (the same rule as the pollers, P4.2): these are
+  // mainnet feeds, and their mints do not exist on devnet or localnet. The manual refresh route used to skip that check.
+  public async syncRealWorldData(opts: { evaluateTriggers?: boolean; env?: NodeJS.ProcessEnv } = {}): Promise<{ skipped?: string }> {
+    if (!httpPollersAllowed(opts.env)) {
+      return { skipped: `HTTP_FEEDS_MAINNET_ONLY: pump.fun and DexScreener are mainnet feeds; on ${allowedCluster(opts.env)} the board fills from the on-chain log stream only` };
+    }
+    if (this.isPolling) return {};
     this.isPolling = true;
     const t0 = performance.now();
 
@@ -504,6 +509,7 @@ export class PumpFunService extends EventEmitter {
     } finally {
       this.isPolling = false;
     }
+    return {};
   }
 
   // Transform real-world tokens into Hot Callouts with caller attribution

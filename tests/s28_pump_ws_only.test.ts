@@ -36,7 +36,7 @@ describe('S28: pump websocket listener without the HTTP pollers', () => {
     vi.useFakeTimers();
     try {
       const svc = new PumpFunService();
-      const sync = vi.spyOn(svc, 'syncRealWorldData').mockResolvedValue(undefined);
+      const sync = vi.spyOn(svc, 'syncRealWorldData').mockResolvedValue({});
       svc.startBackground({ env: { ALLOWED_CLUSTER: 'mainnet-beta' } }); // P4.2 (R1-65): the pollers need mainnet-beta now (the test env is devnet)
       expect(sync).toHaveBeenCalledTimes(1);
     } finally { vi.clearAllTimers(); vi.useRealTimers(); }

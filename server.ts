@@ -1042,9 +1042,10 @@ app.get('/api/pumpfun/status', requireOperatorAuth, (req, res) => {
 
 app.post('/api/pumpfun/refresh', requireOperatorAuth, asyncHandler(async (req, res) => {
   // A manual refresh only reloads the feed; it must never evaluate auto-snipe triggers (A5).
-  await pumpFunService.syncRealWorldData({ evaluateTriggers: false });
+  const sync = await pumpFunService.syncRealWorldData({ evaluateTriggers: false });
   res.json({
-    status: 'OK',
+    status: sync.skipped ? 'SKIPPED' : 'OK',
+    ...(sync.skipped ? { reason: sync.skipped } : {}),
     calloutsCount: pumpFunService.getHotCallouts().length,
     timestamp: Date.now(),
   });

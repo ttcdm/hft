@@ -180,7 +180,9 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   const handleManualSync = async () => {
     setIsRefreshing(true);
     hftAudio.playClick();
-    await engineClient.refreshPumpFunData();
+    const r = await engineClient.refreshPumpFunData();
+    // Off mainnet the server fetches nothing (the HTTP feeds are mainnet-only) and says why
+    if (r?.status === 'SKIPPED') onAlertTrigger?.('INFO', 'LIVE SYNC NOT RUN', String(r.reason ?? 'the HTTP feeds run on mainnet-beta only'));
     await fetchData();
     setIsRefreshing(false);
   };

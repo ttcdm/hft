@@ -117,6 +117,7 @@ async function main() {
 
   // ---- pick a live pump mint the app's own eligibility filter accepts (S226) ----
   const { PUMPFUN_PROGRAM_ID } = await import('../server/solana/programs');
+  const { curveProgressPctOfState, isCurveTooFar } = await import('../server/signals/curveProgressCap');
   const { fetchTokenHolderDistribution } = await import('../server/solana/pumpCurve');
   const { MAX_CREATOR_HOLDING_PCT, MAX_TOP10_HOLDERS_PCT } = await import('../server/solana/executionConfig');
   const M = await import('./devnet_mints');
@@ -131,6 +132,10 @@ async function main() {
       return { mint: m, usable: false, creatorPct: null, top10Pct: null, note: safe(e.message).slice(0, 80) };
     }
     if (!st || st.complete) return { mint: m, usable: false, creatorPct: null, top10Pct: null, note: 'migrated or unreadable' };
+    // S270 (run 14): a mint already past the app's curve-progress cap is refused by every LIVE buy (CURVE_PROGRESS_TOO_HIGH), so it cannot be
+    // the harness mint. The listed default 3St3fM... reached 60.8% after the earlier runs' buys.
+    const progress = curveProgressPctOfState(st);
+    if (progress === null || isCurveTooFar(progress)) return { mint: m, usable: false, creatorPct: null, top10Pct: null, note: progress === null ? 'curve progress unreadable' : `curve ${progress.toFixed(1)}% sold, past the cap` };
     states.set(m, st);
     try {
       const d = await fetchTokenHolderDistribution(conn, new PublicKey(m), st.creator, st.bondingCurve);

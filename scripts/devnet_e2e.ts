@@ -26,9 +26,11 @@ const scratch = process.env.APEX_E2E_SCRATCH || fs.mkdtempSync(path.join(os.tmpd
 const keyPath = path.join(scratch, 'throwaway-keypair.json');
 // Every throwaway wallet steps (i), (k), (t) and (u) create is written here before it is funded, and left here (Mike, 2026-10-24).
 const tempWalletDir = path.join(scratch, 'temp-wallets');
-// 3I: what the opt-in steps (t) and (u) need free in the harness wallet before they start: what they lend, plus fees and a margin.
+// 3I: what the opt-in steps (t), (u) and (n) need free in the harness wallet before they start: what they lend, plus fees and a margin.
 const RPC_SWITCH_NEED_SOL = 0.1;
 const SELLER_NEVER_BOUGHT_NEED_SOL = 0.15;
+// (n): one harness buy plus the 0.015 SOL reserve, the first buy's token-account rent and fees, with a margin.
+const LOSS_FLOOR_NEED_SOL = 0.05;
 
 // ---- sanitized environment: must be set before any server module is imported ----
 process.env.SOLANA_RPC_URL = process.env.DEVNET_RPC_URL || 'https://api.devnet.solana.com';
@@ -439,6 +441,8 @@ async function main() {
   await releaseGatesStep(steps, S, { conn, web3, kp, coordinator, workstationDb, PumpCurveService, txBuilder, buildBuyRequestFor });
 
   await S.waitPast(steps, gDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (g) buy');
+  const nDoneAt = await lossFloorStep(steps, S, { conn, kp, buySol: BUY_SOL });
+  await S.waitPast(steps, nDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (n) trades');
   await S.emergencyStopThroughApp(steps); // P1.4, last: it leaves LIVE disarmed and auto OFF. Telegram-path panic sells the LIVE position; kill switch on/off/re-arm buys nothing
 
   // (f) crash after submit, then recover in a fresh process on the same scratch DB. This process holds that DB's and that key's
@@ -510,6 +514,43 @@ async function releaseGatesStep(steps: import('./devnet_e2e_steps').HarnessSteps
   autoSnipeController.detachWatchWindow();
   watchWindow.stop();
   await pumpFeedListener.stop();
+}
+
+/**
+ * (n) 3C, opt-in (DEVNET_LOSS_FLOOR=1): the net daily PnL floor, its latch and the resume flags through executeTrade on the harness mint, then
+ * a child boot with MAX_POSITION_SIZE_SOL=abc that must refuse before any network call. Returns when its last trade settled.
+ */
+async function lossFloorStep(steps: import('./devnet_e2e_steps').HarnessSteps, S: typeof import('./devnet_e2e_steps'), d: { conn: any; kp: any; buySol: number }): Promise<number> {
+  if (process.env.DEVNET_LOSS_FLOOR !== '1') {
+    console.log(`INFO  (n) skipped: set DEVNET_LOSS_FLOOR=1 (needs ${LOSS_FLOOR_NEED_SOL} SOL free, spends about 0.003: one buy and sell's fees) to run the net daily PnL floor step (3C)`);
+    return 0;
+  }
+  if (!(await S.hasBudget(steps, '(n) 3C: net daily PnL floor', async () => (await d.conn.getBalance(d.kp.publicKey)) / 1e9, LOSS_FLOOR_NEED_SOL, 'DEVNET_LOSS_FLOOR'))) return 0;
+  const { executionConfig } = await import('../server/solana/executionConfig');
+  const { solPriceService } = await import('../server/market/solPriceService');
+  const { riskEngine } = await import('../server/risk/riskEngine');
+  const { autoSnipeController } = await import('../server/auto/controller');
+  const doneAt = await S.lossFloorLatch(steps, {
+    floorUsd: () => executionConfig.getConfig().maxDailyLossUsd,
+    setFloorUsd: (usd) => { executionConfig.updateConfig({ maxDailyLossUsd: usd }); },
+    price: () => solPriceService.getPrice(),
+    refreshPrice: () => solPriceService.refresh(),
+    dailyPnlSol: () => riskEngine.getDailyTotalPnLSol('LIVE'),
+    latch: () => riskEngine.getDailyLossLatch('LIVE'),
+    clearLatch: () => riskEngine.clearDailyLossLatch(),
+    resume: (o) => autoSnipeController.resume(o),
+    orderSol: d.buySol,
+  });
+  const bootDb = path.join(scratch, 'boot-check-abc.db');
+  S.bootRefusesBadLimit(steps, () => spawnSync(process.execPath, ['--require', path.resolve('scripts/devnet_guard.cjs'), '--import', 'tsx', 'server.ts'], {
+    encoding: 'utf8', timeout: 60_000,
+    env: {
+      PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? scratch, APEX_ENV_FILE: '', NODE_ENV: 'production', APP_PORT: '0',
+      ALLOWED_CLUSTER: 'devnet', SOLANA_RPC_URL: process.env.SOLANA_RPC_URL!, APEX_DB_PATH: bootDb, SIGNER_KEYPAIR_PATH: path.join(scratch, 'no-such-key.json'),
+      APEX_DISABLE_EXTERNAL_FEEDS: 'true', MAX_POSITION_SIZE_SOL: 'abc',
+    },
+  }), bootDb);
+  return doneAt;
 }
 
 type FeedStepDeps = { conn: any; web3: any; kp: any; coordinator: any; PumpCurveService: any; txBuilder: any };

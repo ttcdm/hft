@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { EventEmitter } from 'node:events';
 import {
-  hasBudget, unreadableReservesRefused, rpcSwitchMovesFeed, sellerWhoNeverBought,
+  hasBudget, unreadableReservesRefused, rpcSwitchMovesFeed, sellerWhoNeverBought, lossFloorLatch, msToNextUtcMidnight, bootRefusesBadLimit,
   type HarnessSteps, type ChainKit, type WatchFeed,
 } from '../scripts/devnet_e2e_steps';
 
@@ -264,5 +264,92 @@ describe('3I (u): a seller that never bought', () => {
     const k = stubKit({ refund: true });
     await sellerWhoNeverBought(r, k.kit, feedFor(k.calls), wallet('payer'), { waitMs: 100 });
     expect(r.recs.filter((x) => /: refund /.test(x.step) && !x.ok)).toHaveLength(3);
+  });
+});
+
+describe('3I (n): the net daily PnL floor step (3C)', () => {
+  /** The app reduced to what (n) drives: one realized loss per round trip, gate 10 with its latch, and the resume flags. */
+  function harness(opts: { latchWorks?: boolean; throwOn?: number } = {}) {
+    const r = recorder();
+    const rows: any[] = [];
+    let floorUsd = 7;
+    let pnl = 0;
+    let latch: { at: number; message: string } | null = null;
+    let open: any[] = [];
+    let calls = 0;
+    const clockSeen: number[] = [];
+    const coordinator = {
+      syncRealWalletBalance: async () => undefined,
+      closePosition: async (id: string) => { open = open.filter((p) => p.id !== id); pnl -= 0.0016; return { success: true }; },
+      executeTrade: async () => {
+        calls++;
+        clockSeen.push(Date.now());
+        if (opts.throwOn === calls) throw new Error('injected');
+        const floorSol = floorUsd / 150;
+        if (latch && opts.latchWorks !== false) return { success: false, lifecycleState: 'RISK_REJECTED', error: 'DAILY_LOSS_LIMIT: Net daily PnL floor latched at x; the oldest loss in the 24 h window leaves it at y' };
+        if (pnl <= -floorSol) { latch = { at: Date.now(), message: 'm' }; return { success: false, lifecycleState: 'RISK_REJECTED', error: 'DAILY_LOSS_LIMIT: Net daily PnL floor: reached; latched until an operator clears it' }; }
+        rows.push({ signature: `s${calls}`, orderId: 'o', direction: 'BUY', reconciliationState: 'CONFIRMED', mint: 'MINT11111111' });
+        open.push({ id: `p${calls}`, mint: 'MINT11111111', status: 'OPEN' });
+        return { success: true, lifecycleState: 'CONFIRMED', txSignature: `s${calls}` };
+      },
+    };
+    const s = {
+      ...r, coordinator, mint: 'MINT11111111', curve: {} as any,
+      db: { loadTransactions: () => rows, loadPositions: () => open },
+      riskLimits: () => ({ cooldownAfterFailedTradeMs: 15_000, cooldownPerMintMs: 0 }),
+      buildBuyRequest: async () => ({ mint: 'MINT11111111' }),
+    } as unknown as HarnessSteps;
+    const restamps: number[] = [];
+    const d = {
+      floorUsd: () => floorUsd, setFloorUsd: (u: number) => { floorUsd = u; },
+      price: () => ({ usd: 150, source: 'TEST' }), refreshPrice: async () => { restamps.push(Date.now()); },
+      dailyPnlSol: () => pnl, latch: () => latch, clearLatch: () => { latch = null; },
+      resume: (o: { clearDailyLossLatch?: boolean }) => { if (o.clearDailyLossLatch) latch = null; return {}; },
+      orderSol: 0.01,
+    };
+    return { s, r, d, floor: () => floorUsd, latch: () => latch, open: () => open, clockSeen, restamps };
+  }
+
+  it('an app with the floor and latch: every line passes; the floor, latch and clock are put back', async () => {
+    const h = harness();
+    const realNow = Date.now;
+    await lossFloorLatch(h.s, h.d);
+    expect(h.r.recs.filter((x) => !x.ok)).toEqual([]);
+    expect(h.r.recs.length).toBeGreaterThanOrEqual(9);
+    expect(h.floor()).toBe(7);
+    expect(h.latch()).toBeNull();
+    expect(Date.now).toBe(realNow);
+    // one executeTrade ran past the next 00:00 UTC, and the price was read under that clock and again after
+    expect(h.clockSeen.some((t) => t - realNow() > msToNextUtcMidnight(realNow()))).toBe(true);
+    expect(h.restamps).toHaveLength(2);
+  });
+
+  it('an app without the latch: the latched lines FAIL', async () => {
+    const h = harness({ latchWorks: false });
+    await lossFloorLatch(h.s, h.d);
+    expect(line(h.r.recs, 'floor raised back')?.ok).toBe(false);
+    expect(h.open()).toEqual([]); // the buy that got through is closed in finally
+  });
+
+  it('executeTrade throws mid-step: a FAIL line; floor, latch and clock still put back', async () => {
+    const realNow = Date.now;
+    const h = harness({ throwOn: 4 }); // the buy under the jumped clock
+    await lossFloorLatch(h.s, h.d);
+    expect(h.r.recs.some((x) => x.step === '(n) 3C: net daily PnL floor' && !x.ok)).toBe(true);
+    expect(Date.now).toBe(realNow);
+    expect(h.floor()).toBe(7);
+    expect(h.latch()).toBeNull();
+  });
+
+  it('msToNextUtcMidnight', () => {
+    expect(msToNextUtcMidnight(Date.UTC(2026, 9, 26, 23, 59, 0))).toBe(60_000);
+    expect(msToNextUtcMidnight(Date.UTC(2026, 9, 31, 0, 0, 0))).toBe(86_400_000);
+  });
+
+  it('boot check: passes on a refusal with no outbound attempt, FAILs when the server got further', () => {
+    const r = recorder();
+    bootRefusesBadLimit(r, () => ({ status: 1, stdout: '', stderr: 'Error: MAX_POSITION_SIZE_SOL="abc" is not a number above 0. Fix it' }), '/nonexistent/x.db');
+    bootRefusesBadLimit(r, () => ({ status: null, stdout: '', stderr: '[devnet-guard] allow   fetch http://127.0.0.1:9' }), '/nonexistent/x.db');
+    expect(r.recs.map((x) => x.ok)).toEqual([true, false]);
   });
 });

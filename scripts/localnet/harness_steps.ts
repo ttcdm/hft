@@ -1,5 +1,5 @@
 /**
- * Localnet dry run of the devnet harness's Stage 3 steps (task 3I): (s), (t) and (u) in scripts/devnet_e2e_steps.ts, the same functions
+ * Localnet dry run of the devnet harness's Stage 3 steps (task 3I): (s), (t), (u) and (n) in scripts/devnet_e2e_steps.ts, the same functions
  * `npm run devnet:e2e` runs, against the LiteSVM local validator (real pump.fun program binaries, scripts/localnet/validator.ts).
  *
  *   npx tsx scripts/localnet/harness_steps.ts            (prints PASS/FAIL lines, exits 1 on any FAIL)
@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import net from 'node:net';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'apex-3i-steps-'));
 const tempWalletDir = path.join(scratch, 'temp-wallets');
@@ -147,6 +147,50 @@ async function run(info: { url: string; genesisHash: string }) {
   console.log(`INFO  (u) cost the harness wallet ${(b1 - b2).toFixed(5)} SOL`);
   watchWindow.stop();
   await pumpFeedListener.stop();
+
+  // (n) 3C: a coin the app's own filters accept (a creator buy and 14 buyers, funded by the local airdrop: market setup, not harness
+  // wallets), then the loss-floor step through executeTrade, then the child boot with MAX_POSITION_SIZE_SOL=abc.
+  {
+    const { executionConfig } = await import('../../server/solana/executionConfig');
+    const { autoSnipeController } = await import('../../server/auto/controller');
+    const mkt = Keypair.generate();
+    await conn.requestAirdrop(mkt.publicKey, 2 * LAMPORTS_PER_SOL);
+    const seeded = await kit.create(mkt, 'N3CL', 'S3C harness');
+    await kit.buy(mkt, seeded.mint, 0.2);
+    for (let i = 0; i < 14; i++) {
+      const w = Keypair.generate();
+      await conn.requestAirdrop(w.publicKey, 2 * LAMPORTS_PER_SOL);
+      await kit.buy(w, seeded.mint, 0.6);
+    }
+    const nSteps = { ...steps, mint: seeded.mint, buildBuyRequest: async () => liveBuyRequest(seeded.mint, 0.01, Date.now()) } as typeof steps;
+    for (let i = 0; i < 30 && !coordinator.isLiveArmed(); i++) { coordinator.armLiveTrading(true, 'CONFIRM_LIVE_TRADING_RISK'); if (!coordinator.isLiveArmed()) await sleep(1000); }
+    if (await S.hasBudget(nSteps, '(n) 3C: net daily PnL floor', bal, 0.05, 'DEVNET_LOSS_FLOOR')) {
+      const bn = await bal();
+      await S.lossFloorLatch(nSteps, {
+        floorUsd: () => executionConfig.getConfig().maxDailyLossUsd,
+        setFloorUsd: (usd) => { executionConfig.updateConfig({ maxDailyLossUsd: usd }); },
+        price: () => solPriceService.getPrice(),
+        refreshPrice: () => solPriceService.refresh(),
+        dailyPnlSol: () => riskEngine.getDailyTotalPnLSol('LIVE'),
+        latch: () => riskEngine.getDailyLossLatch('LIVE'),
+        clearLatch: () => riskEngine.clearDailyLossLatch(),
+        resume: (o) => autoSnipeController.resume(o),
+        orderSol: 0.01,
+      });
+      console.log(`INFO  (n) cost the harness wallet ${(bn - (await bal())).toFixed(5)} SOL`);
+      rec('(n) cleanup: MAX_DAILY_LOSS_USD back to the tier default, latch clear', executionConfig.getConfig().maxDailyLossUsd === 7 && riskEngine.getDailyLossLatch('LIVE') === null, `MAX_DAILY_LOSS_USD ${executionConfig.getConfig().maxDailyLossUsd}`);
+    }
+    coordinator.armLiveTrading(false);
+    const bootDb = path.join(scratch, 'boot-check-abc.db');
+    S.bootRefusesBadLimit(steps, () => spawnSync(process.execPath, ['--require', path.resolve('scripts/devnet_guard.cjs'), '--import', 'tsx', 'server.ts'], {
+      encoding: 'utf8', timeout: 60_000,
+      env: {
+        PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? scratch, APEX_ENV_FILE: '', NODE_ENV: 'production', APP_PORT: '0',
+        ALLOWED_CLUSTER: 'localnet', LOCALNET_GENESIS_HASH: info.genesisHash, SOLANA_RPC_URL: info.url, APEX_DB_PATH: bootDb,
+        SIGNER_KEYPAIR_PATH: path.join(scratch, 'no-such-key.json'), APEX_DISABLE_EXTERNAL_FEEDS: 'true', MAX_POSITION_SIZE_SOL: 'abc',
+      },
+    }), bootDb);
+  }
 
   // Underfunded: the budget check refuses and no wallet is made.
   const before = fs.readdirSync(tempWalletDir).length;

@@ -1406,3 +1406,146 @@ export async function sellerWhoNeverBought(
     await sellAndRefund(s, L, kit, [W, X, creator], coins, payer);
   }
 }
+
+/** (n) what the loss-floor step needs from the app (passed in, so this file still imports nothing from server/). */
+export interface LossFloorDeps {
+  /** executionConfig's MAX_DAILY_LOSS_USD as the floor reads it, and the in-process setter (`updateConfig`, which runs the same check as boot). */
+  floorUsd(): number;
+  setFloorUsd(usd: number): void;
+  /** The SOL/USD reading the floor converts with (solPriceService.getPrice). */
+  price(): { usd: number | null; source: string | null };
+  /** A real price read (solPriceService.refresh); under the jumped clock it is stamped with that clock, so LIVE does not refuse it as stale. */
+  refreshPrice(): Promise<unknown>;
+  /** riskEngine.getDailyTotalPnLSol('LIVE'): net PnL over the rolling 24 h (realized, open unrealized, minus unbooked fees). */
+  dailyPnlSol(): number;
+  /** riskEngine.getDailyLossLatch('LIVE') and clearDailyLossLatch (the harness's own cleanup). */
+  latch(): { at: number; message: string } | null;
+  clearLatch(): void;
+  /** What POST /api/auto/resume runs (autoSnipeController.resume). */
+  resume(opts: { clearHalt?: boolean; clearDailyLossLatch?: boolean }): unknown;
+  /** The harness buy size in SOL. */
+  orderSol: number;
+}
+
+/** Milliseconds from `now` to the next 00:00 UTC. */
+export function msToNextUtcMidnight(now: number): number {
+  const d = new Date(now);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1) - now;
+}
+
+/**
+ * (n) 3C (N-61, N-62, N-63, N-65), opt-in (DEVNET_LOSS_FLOOR=1), one buy and sell of the harness mint: the net daily PnL floor over a rolling
+ * 24 h, its latch, and the two resume flags, through the app's own executeTrade. The floor is MAX_DAILY_LOSS_USD, changed in-process with
+ * executionConfig.updateConfig (the env's own check runs; the USD-to-SOL conversion is the real one, nothing is pinned).
+ *  1. The floor is set generously above the 24 h window's net PnL plus three orders; one buy and a full sell lose their fees.
+ *  2. The floor is set to half the window's loss: the next buy is refused DAILY_LOSS_LIMIT, nothing is sent, and the latch is set.
+ *  3. The floor is raised back: still refused, "latched".
+ *  4. The clock jumps past the next 00:00 UTC (Date.now offset for one executeTrade, with a real SOL price read under that clock so LIVE
+ *     does not refuse a stale price first, and read again after): still refused, latched. Before 3C the window restarted at UTC midnight.
+ *  5. resume {clearHalt}: still refused. resume {clearDailyLossLatch} with the floor below the window's loss: refused again and latched
+ *     again (the window itself is below the floor).
+ * `finally` puts MAX_DAILY_LOSS_USD back, clears the latch, restores the clock, and closes anything open on the mint.
+ * Returns when the last trade settled (for the per-mint cooldown before the next step).
+ */
+export async function lossFloorLatch(s: HarnessSteps, d: LossFloorDeps): Promise<number> {
+  const L = '(n) 3C: net daily PnL floor';
+  const origUsd = d.floorUsd();
+  const realNow = Date.now;
+  let lastTradeAt = Date.now();
+  const buyRows = () => buyRowsFor(s).length;
+  const refusedBuy = async (label: string, wantLatched: boolean) => {
+    await s.coordinator.syncRealWalletBalance();
+    const before = buyRows();
+    const r = await s.coordinator.executeTrade(await s.buildBuyRequest());
+    const sig = r.txSignature || r.signature || '';
+    const latched = /latched/.test(r.error ?? '');
+    s.rec(
+      `${L}: ${label}`,
+      !r.success && /^DAILY_LOSS_LIMIT: Net daily PnL floor/.test(r.error ?? '') && (!wantLatched || latched) && buyRows() === before && !sig && d.latch() !== null,
+      `${r.lifecycleState} ${r.error ?? ''}; BUY rows ${before} -> ${buyRows()}; latch ${d.latch() ? 'set' : 'not set'}`.slice(0, 400)
+    );
+    return r;
+  };
+  try {
+    const usd = d.price().usd;
+    if (!usd) { s.rec(L, false, 'no SOL/USD reading; the floor cannot be converted'); return lastTradeAt; }
+    const pnl0 = d.dailyPnlSol();
+    const orderCost = d.orderSol + 0.003; // the order plus fee and the first buy's token-account rent, rounded up
+    const roomySol = Math.max(0, -pnl0) + 3 * orderCost + 0.003;
+    d.setFloorUsd(Math.ceil(roomySol * usd * 100) / 100);
+
+    // 1. one losing round trip
+    await s.coordinator.syncRealWalletBalance();
+    const buy = await s.coordinator.executeTrade(await s.buildBuyRequest());
+    lastTradeAt = Date.now();
+    s.rec(`${L}: buy under a roomy floor CONFIRMED`, buy.success && buy.lifecycleState === 'CONFIRMED', `floor $${d.floorUsd()} (${roomySol.toFixed(4)} SOL at $${usd}); window PnL before ${pnl0.toFixed(6)} SOL; ${buy.lifecycleState} ${buy.error ?? ''}`.slice(0, 300));
+    for (const p of openFor(s)) {
+      const c = await s.coordinator.closePosition(p.id, 100, "e2e (n) round trip");
+      lastTradeAt = Date.now();
+      s.rec(`${L}: full sell`, c.success, c.error || 'closed');
+    }
+    if (!buy.success) return lastTradeAt;
+    const pnl1 = d.dailyPnlSol();
+    s.rec(`${L}: the round trip lost its fees`, pnl1 < pnl0, `window net PnL ${pnl0.toFixed(6)} -> ${pnl1.toFixed(6)} SOL (loss ${(pnl0 - pnl1).toFixed(6)})`);
+    if (!(pnl1 < 0)) return lastTradeAt;
+    await waitPast(s, lastTradeAt, s.riskLimits().cooldownPerMintMs, 'per-mint cooldown from the (n) sell');
+
+    // 2. floor below the window's loss: refused, latched
+    const tightUsd = Math.max(0.01, Math.floor(((-pnl1) / 2) * usd * 100) / 100);
+    d.setFloorUsd(tightUsd);
+    await refusedBuy(`floor $${tightUsd} below the window's loss: refused DAILY_LOSS_LIMIT, nothing sent, latched`, false);
+    // 3. floor raised back: the latch still holds
+    d.setFloorUsd(Math.ceil(roomySol * usd * 100) / 100);
+    await refusedBuy('floor raised back: still refused, latched', true);
+    // 4. past the next 00:00 UTC
+    const jump = msToNextUtcMidnight(realNow()) + 60_000;
+    Date.now = () => realNow() + jump;
+    try {
+      await d.refreshPrice();
+      const r = await refusedBuy(`clock past the next 00:00 UTC (+${(jump / 3_600_000).toFixed(2)} h): still refused, latched`, true);
+      s.rec(`${L}: the refusal says when the oldest loss leaves the window`, /leaves it at|no realized loss is left/.test(r.error ?? ''), (r.error ?? '').slice(-160));
+    } finally {
+      Date.now = realNow;
+      await d.refreshPrice(); // stamped with the real clock again
+    }
+    // 5. the two resume flags
+    d.resume({ clearHalt: true });
+    await refusedBuy('resume {clearHalt}: still refused, latched', true);
+    d.setFloorUsd(tightUsd);
+    d.resume({ clearDailyLossLatch: true });
+    const cleared = d.latch() === null;
+    await refusedBuy('resume {clearDailyLossLatch} with the window below the floor: refused and latched again', false);
+    s.rec(`${L}: clearDailyLossLatch cleared the latch before that buy`, cleared, cleared ? 'cleared, then set again by the buy' : 'still set right after the resume');
+  } catch (e: any) {
+    s.rec(L, false, String(e?.message ?? e).slice(0, 300));
+  } finally {
+    Date.now = realNow;
+    try { d.setFloorUsd(origUsd); } catch (e: any) { s.rec(`${L}: MAX_DAILY_LOSS_USD put back`, false, String(e?.message ?? e).slice(0, 200)); }
+    d.clearLatch();
+    for (const p of openFor(s)) {
+      try {
+        const c = await s.coordinator.closePosition(p.id, 100, 'e2e (n) cleanup');
+        lastTradeAt = Date.now();
+        s.rec(`${L}: cleanup close 100%`, c.success, c.error || 'closed');
+      } catch (e: any) { s.rec(`${L}: cleanup close 100%`, false, String(e?.message ?? e).slice(0, 200)); }
+    }
+  }
+  return lastTradeAt;
+}
+
+/**
+ * (n) 3C (R1-8, R1-36), free, part of the same opt-in: the server refuses to start on MAX_POSITION_SIZE_SOL=abc before any network call.
+ * `boot` runs server.ts in a child process under the devnet guard (which logs every outbound attempt to stderr) with that value and a
+ * scratch DB path; expected: a non-zero exit, the startup message naming the variable, no `[devnet-guard] allow` line, no DB file.
+ */
+export function bootRefusesBadLimit(s: Pick<HarnessSteps, 'rec'>, boot: () => { status: number | null; stderr: string; stdout: string }, dbPath: string): void {
+  const L = '(n) 3C: boot with MAX_POSITION_SIZE_SOL=abc';
+  const r = boot();
+  const out = `${r.stdout}\n${r.stderr}`;
+  const attempts = out.split('\n').filter((l) => l.includes('[devnet-guard] allow'));
+  s.rec(
+    `${L} refuses before any RPC call`,
+    r.status !== 0 && r.status !== null && /MAX_POSITION_SIZE_SOL="abc" is not a number above 0/.test(out) && attempts.length === 0 && !fs.existsSync(dbPath),
+    `exit ${r.status}; message ${/is not a number above 0/.test(out) ? 'shown' : 'missing'}; outbound attempts ${attempts.length}; DB file ${fs.existsSync(dbPath) ? 'created' : 'not created'}`
+  );
+}

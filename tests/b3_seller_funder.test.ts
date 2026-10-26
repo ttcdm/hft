@@ -220,3 +220,50 @@ describe('B3: seller lookups go first and are not held to the per-mint bound', (
     release.shift()!();
   });
 });
+
+describe('B3b: unread seller funders are counted, so lookup capacity can be judged', () => {
+  it('failed, refused and still-pending-at-window-end seller lookups are counted, and a release says its buyers signal was not counted', async () => {
+    const w = new WatchWindow({ publicFunders: [] });
+    const failing = wallet(), hanging = wallet(), answered = wallet();
+    const f = fakeConn({ [answered]: wallet(), [hanging]: wallet() });
+    f.fail.add(failing);
+    f.hang.set(hanging, () => undefined);
+    wireFunderLookup(w, new FunderLookup(() => f.conn, { retryDelaysMs: [] }));
+    const mint = mintKey();
+    w.watch(mint, wallet(), T0);
+    const b = buyers(10, 15);
+    b.wallets.forEach((x, i) => w.setFunder(x, `fx-funder-${i}`));
+    run(w, mint, [...b.steps, [16, failing, 'sell', 0.01], [17, hanging, 'sell', 0.01], [18, answered, 'sell', 0.01]]);
+    await vi.waitFor(() => expect(w.getSellerFunderStats()).toEqual({ asked: 3, unreadable: 1, pendingAtWindowEnd: 0 }));
+    const r = w.evaluate(mint, T0 + 120_000)!;
+    expect(r.state).toBe('READY');
+    expect(r.reason).toMatch(/; 2 seller funder\(s\) unread, buyers signal not counted$/);
+    expect(w.getSellerFunderStats()).toEqual({ asked: 3, unreadable: 1, pendingAtWindowEnd: 1 });
+  });
+
+  it('a refused seller lookup (full queue) counts as unreadable', () => {
+    const conn: any = { getSignaturesForAddress: () => new Promise(() => undefined), getParsedTransaction: async () => null };
+    const w = new WatchWindow({ publicFunders: [] });
+    const lookup = new FunderLookup(() => conn, { concurrency: 1, maxQueue: 1 });
+    wireFunderLookup(w, lookup);
+    const mint = mintKey();
+    w.watch(mint, wallet(), T0);
+    lookup.request(wallet(), mint);
+    lookup.request(wallet(), mint);
+    run(w, mint, [[0, wallet(), 'buy', 0.5], [1, wallet(), 'sell', 0.1]]);
+    expect(w.getSellerFunderStats()).toEqual({ asked: 1, unreadable: 1, pendingAtWindowEnd: 0 });
+  });
+
+  it('a launch with every seller funder known gives the plain release reason', () => {
+    const w = new WatchWindow({ publicFunders: [], scoreOf: () => 80 });
+    wireFunderLookup(w, new FunderLookup(() => fakeConn({}).conn));
+    const mint = mintKey(), seller = wallet();
+    hotLaunch(w, mint);
+    w.setNoFunder(seller);
+    run(w, mint, [[26, seller, 'sell', 0.05]]);
+    const r = w.evaluate(mint, T0 + 28_000)!;
+    expect(r.state).toBe('HOT');
+    expect(r.reason).not.toMatch(/unread/);
+    expect(w.getSellerFunderStats().asked).toBe(0);
+  });
+});

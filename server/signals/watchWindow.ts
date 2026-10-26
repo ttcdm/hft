@@ -192,6 +192,8 @@ export class WatchWindow extends EventEmitter {
   private refusedFull = 0;
   private lastRefusedMint: string | null = null;
   private timer: NodeJS.Timeout | null = null;
+  /** B3b: seller funder lookups asked for, those that failed or were refused, and sellers still pending when a launch reached its window end. */
+  private sellerFunderStats = { asked: 0, unreadable: 0, pendingAtWindowEnd: 0 };
 
   constructor(opts: WatchWindowOptions = {}) {
     super();
@@ -238,7 +240,7 @@ export class WatchWindow extends EventEmitter {
   /** B3: a wallet's funder lookup failed for good (after its retries). A watched launch it sold loses the buyers signal (funderCoverage < 1). */
   public setFunderUnreadable(wallet: string): void {
     for (const c of this.active.values()) {
-      if (c.sellersPending.delete(wallet)) c.sellersUnreadable.add(wallet);
+      if (c.sellersPending.delete(wallet)) { c.sellersUnreadable.add(wallet); this.sellerFunderStats.unreadable++; }
     }
   }
 
@@ -322,8 +324,9 @@ export class WatchWindow extends EventEmitter {
     c.requested.add(wallet);
     c.sellersUnreadable.delete(wallet);
     c.sellersPending.add(wallet);
+    this.sellerFunderStats.asked++;
     const accepted = this.requestFunder(wallet, c.mint, true);
-    if (accepted === false && c.sellersPending.delete(wallet)) c.sellersUnreadable.add(wallet);
+    if (accepted === false && c.sellersPending.delete(wallet)) { c.sellersUnreadable.add(wallet); this.sellerFunderStats.unreadable++; }
   }
 
   /** Feed one decoded TradeEvent. `at` is when it was seen (ms). Duplicate signatures are ignored. */
@@ -515,13 +518,16 @@ export class WatchWindow extends EventEmitter {
     }
     // B3: no HOT or READY while a seller's lookup may still answer "creator cluster"; at the window end the launch is judged without it
     if (c.sellersPending.size > 0 && m.elapsedMs < this.opts.maxMs) return hold(`holding: waiting for the funder of ${c.sellersPending.size} seller(s)`);
+    this.sellerFunderStats.pendingAtWindowEnd += c.sellersPending.size; // only non-zero at the window end, where this evaluation releases
+    const unread = c.sellersPending.size + c.sellersUnreadable.size;
+    const unreadText = unread > 0 ? `; ${unread} seller funder(s) unread, buyers signal not counted` : '';
     const score = this.opts.scoreOf?.(mint) ?? null;
     const min = this.minScore();
     if (m.passingSignals >= HOT_MIN_SIGNALS && score !== null && score >= min) {
-      return this.release(c, 'HOT', `${m.passingSignals} strong signals and score ${score} (threshold ${min})`, now, score);
+      return this.release(c, 'HOT', `${m.passingSignals} strong signals and score ${score} (threshold ${min})${unreadText}`, now, score);
     }
     if (m.elapsedMs >= this.opts.maxMs) {
-      return this.release(c, 'READY', `window elapsed with ${m.passingSignals} strong signal(s)${score === null ? ', no score' : `, score ${score}`} (threshold ${min})`, now, score);
+      return this.release(c, 'READY', `window elapsed with ${m.passingSignals} strong signal(s)${score === null ? ', no score' : `, score ${score}`} (threshold ${min})${unreadText}`, now, score);
     }
     return hold(`watching: ${m.passingSignals}/${HOT_MIN_SIGNALS} strong signals`);
   }
@@ -537,6 +543,14 @@ export class WatchWindow extends EventEmitter {
   }
 
   /** Everything the board needs: live metrics for watched mints and the verdicts already given. */
+  /**
+   * B3b: how often a seller's funder ended up unread (the lookup failed after its retries or was refused, or was still pending at the
+   * window end), out of the seller lookups asked for. A growing share means the funder lookups need more RPC capacity.
+   */
+  public getSellerFunderStats(): { asked: number; unreadable: number; pendingAtWindowEnd: number } {
+    return { ...this.sellerFunderStats };
+  }
+
   public getSnapshot(now = Date.now()): { watching: Array<{ metrics: WatchMetrics; state: 'WATCHING' }>; released: WatchResult[]; capacity: { active: number; max: number; refusedFull: number; lastRefusedMint: string | null } } {
     return {
       capacity: { active: this.active.size, max: this.opts.maxCandidates, refusedFull: this.refusedFull, lastRefusedMint: this.lastRefusedMint },

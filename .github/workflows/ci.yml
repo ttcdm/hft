@@ -1,0 +1,75 @@
+name: Apex Quant Engine CI/CD
+
+on:
+  push:
+    branches: ['**']   # S25: any branch, so a work branch such as overnight/integration is checked before it is proposed
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+# S25: CI only reads the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-and-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [22.x]  # node:sqlite needs >= 22.5
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Static Code Analysis (ESLint & TypeScript)
+        run: npm run lint
+
+      - name: Run Test Suites
+        run: npm test
+
+      # R1-122 (P1.2): the only on-chain tests of the exit loop, crash recovery, the guards and the validator's fault controls. Each file
+      # boots the LiteSVM validator and the real server as loopback child processes (about 2.5 min in all). tests/test_globs.test.ts
+      # (in npm test above) fails when a file under tests/ is in neither this suite nor the default one.
+      - name: Long behaviour tests (real server against the in-process localnet validator, loopback only)
+        run: npm run test:long
+        timeout-minutes: 20
+
+      - name: No new facade tests (tests that touch no production code; baseline in tests/facade-baseline.json)
+        run: npm run test:facades
+
+      - name: Production Build Compilation
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+      - name: Verify Distribution Artifacts
+        run: |
+          test -f dist/server.cjs || exit 1
+          test -f dist/index.html || exit 1
+          echo "Production artifacts verified successfully."
+
+      - name: Runtime Smoke Test (boot bundle, auth, websocket)
+        run: npm run smoke
+
+      - name: Localnet end-to-end (real pump programs in an in-process bank, loopback only)
+        run: npm run localnet:e2e
+
+      - name: Devnet seeding script proof (local chain, incl. forced 429 and sweep)
+        run: npm run localnet:seed
+
+      - name: Seeding from a separate funder keeps the wallet audit quiet (local chain, app in DEVNET_LIVE)
+        run: npm run localnet:seed-audit

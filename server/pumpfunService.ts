@@ -1,0 +1,955 @@
+import { solPriceService } from './market/solPriceService';
+import {
+  PumpFunCaller,
+  PumpFunHotCallout,
+  CalloutHftAction,
+  CallerReputationTier,
+  TopCalloutRecord,
+} from '../src/types';
+import { memecoinAggregator } from './memecoinAggregator';
+import { socialScanner } from './socialScanner';
+import { evaluateTokenSafety } from './risk/tokenSafety';
+import { EventEmitter } from 'events';
+import { executionCoordinator } from './execution/coordinator';
+import { pumpFeedListener, PumpCreateEvent } from './solana/pumpFeedListener';
+import {
+  ConfluenceEngine,
+  isConfluencePassed,
+  ConfluenceFactorsInput,
+} from './signals/confluenceEngine';
+import { ConfluenceBreakdown, SignalProvenance } from './core/types';
+import { autoSnipeController } from './auto/controller';
+import { checkSnipeAmountSol } from './execution/snipeAmount';
+import { allowedCluster } from './solana/clusterGuard';
+
+interface AutoSnipeRules {
+  minCallerWinRate2x: number;
+  minAvgMultiple: number;
+  autoSnipeOnConfluence: boolean;
+  maxEntryMultiple: number;
+  maxElapsedSeconds: number;
+  snipeAmountUsd: number;
+  /** Explicit operator override only; absent means the dynamic tip policy decides (C6). */
+  jitoPriorityTipSol?: number;
+}
+
+// Canonical Top Callers Leaderboard modeled on Pump.fun's live API capture
+const INITIAL_CALLERS: PumpFunCaller[] = [
+  {
+    userId: 'sol_cabal_insider',
+    userUuid: 'usr-cb19-9402-48192a',
+    primaryWallet: '7xK9nMQk3mPzV1W8L5tG7yD2jX4vB6nS8cF9eR3tY1uQ',
+    avatarUrl: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=120&auto=format&fit=crop&q=80',
+    totalCallouts: 67,
+    avgMultiple: 5.84,
+    medianMultiple: 1.76,
+    winRate1_2x: 77.05,
+    winRate1_5x: 56.72,
+    winRate2x: 44.0,
+    avgTimeToPeakMs: 9 * 60 * 1000 + 36 * 1000, // 9m 36s
+    followersCount: 38400,
+    totalVolumeDrivenUsd: 14850000,
+    reputationTier: 'LEGENDARY_WHALE',
+    topCallouts: [
+      {
+        calloutId: 'top-01',
+        coinMint: 'CzLSujWBLFsSjncfkh59rQD4NJYsZUMffEFrNJfiBAGS',
+        symbol: 'GOAT',
+        name: 'Goatseus Maximus',
+        calloutPrice: 0.00000213,
+        marketCapAtCall: 22738,
+        multiple: 164.4,
+        createdAt: Date.now() - 86400000 * 5,
+        maxPriceSol: 0.0000373,
+        peakTimestamp: Date.now() - 86400000 * 4,
+      },
+      {
+        calloutId: 'top-02',
+        coinMint: '9BB6NFEcjBCtnNLFko2FqVQBq8HHM13kCyYcdQbgpump',
+        symbol: 'FARTCOIN',
+        name: 'Fartcoin AI',
+        calloutPrice: 0.00000115,
+        marketCapAtCall: 14591,
+        multiple: 146.0,
+        createdAt: Date.now() - 86400000 * 7,
+        maxPriceSol: 0.0000349,
+        peakTimestamp: Date.now() - 86400000 * 6,
+      },
+      {
+        calloutId: 'top-03',
+        coinMint: '2qEH8vxXMwYePYNpdkmcz69g78mXfW7kG2bV3e7X6h8L',
+        symbol: 'PNUT',
+        name: 'Peanut the Squirrel',
+        calloutPrice: 0.00000354,
+        marketCapAtCall: 23563,
+        multiple: 46.2,
+        createdAt: Date.now() - 86400000 * 9,
+        maxPriceSol: 0.0000189,
+        peakTimestamp: Date.now() - 86400000 * 8,
+      },
+    ],
+  },
+  {
+    userId: 'ansem_tracker_bot',
+    userUuid: 'usr-an82-1920-58190c',
+    primaryWallet: '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM',
+    avatarUrl: 'https://images.unsplash.com/photo-1639762681485-074b7f938ba0?w=120&auto=format&fit=crop&q=80',
+    totalCallouts: 84,
+    avgMultiple: 7.3,
+    medianMultiple: 1.62,
+    winRate1_2x: 73.13,
+    winRate1_5x: 60.66,
+    winRate2x: 37.0,
+    avgTimeToPeakMs: 14 * 60 * 1000 + 35 * 1000,
+    followersCount: 72100,
+    totalVolumeDrivenUsd: 28900000,
+    reputationTier: 'VERIFIED_ALPHA',
+    topCallouts: [
+      {
+        calloutId: 'top-04',
+        coinMint: 'ED5nyyWEzpPPiWimP8vYm7sD7TD3LAt3Q3gRTWHzPJBY',
+        symbol: 'MOODENG',
+        name: 'Moo Deng',
+        calloutPrice: 0.00000143,
+        marketCapAtCall: 18439,
+        multiple: 63.0,
+        createdAt: Date.now() - 86400000 * 12,
+        maxPriceSol: 0.0000169,
+        peakTimestamp: Date.now() - 86400000 * 11,
+      },
+      {
+        calloutId: 'top-05',
+        coinMint: 'HeLp6NuQkmYB4pYWo2zYs22mESHXPQYzXbB8n4V98jwC',
+        symbol: 'AI16Z',
+        name: 'ai16z DAO Agent',
+        calloutPrice: 0.00000281,
+        marketCapAtCall: 20208,
+        multiple: 44.9,
+        createdAt: Date.now() - 86400000 * 14,
+        maxPriceSol: 0.0000130,
+        peakTimestamp: Date.now() - 86400000 * 13,
+      },
+    ],
+  },
+  {
+    userId: 'kobe_cabal_watcher',
+    userUuid: 'usr-kb55-3819-10294e',
+    primaryWallet: '4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R',
+    avatarUrl: 'https://images.unsplash.com/photo-1620641788421-7a1c342ea42e?w=120&auto=format&fit=crop&q=80',
+    totalCallouts: 53,
+    avgMultiple: 6.2,
+    medianMultiple: 1.82,
+    winRate1_2x: 81.2,
+    winRate1_5x: 64.1,
+    winRate2x: 48.0,
+    avgTimeToPeakMs: 8 * 60 * 1000 + 45 * 1000,
+    followersCount: 41200,
+    totalVolumeDrivenUsd: 19400000,
+    reputationTier: 'LEGENDARY_WHALE',
+    topCallouts: [
+      {
+        calloutId: 'top-06',
+        coinMint: 'GJAFwWjJ3vnTsrQVabjBVK2TYB1YtRCQXRDfDgq7pump',
+        symbol: 'ACT',
+        name: 'Act I : The AI Prophecy',
+        calloutPrice: 0.00000301,
+        marketCapAtCall: 57110,
+        multiple: 37.3,
+        createdAt: Date.now() - 86400000 * 15,
+        maxPriceSol: 0.0000367,
+        peakTimestamp: Date.now() - 86400000 * 14,
+      },
+    ],
+  },
+  {
+    userId: 'dex_momentum_bot',
+    userUuid: 'usr-dx99-2810-74920b',
+    primaryWallet: 'H2vD5kMQP7bNzX8wL4tC3yJ1vB9nS6cF2eR5tY8uQ1wZ',
+    avatarUrl: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=120&auto=format&fit=crop&q=80',
+    totalCallouts: 112,
+    avgMultiple: 4.12,
+    medianMultiple: 1.55,
+    winRate1_2x: 79.4,
+    winRate1_5x: 52.3,
+    winRate2x: 41.0,
+    avgTimeToPeakMs: 7 * 60 * 1000 + 20 * 1000,
+    followersCount: 26300,
+    totalVolumeDrivenUsd: 9800000,
+    reputationTier: 'HIGH_MOMENTUM',
+    topCallouts: [],
+  },
+  {
+    userId: 'pump_insider_whale',
+    userUuid: 'usr-pi49-8102-39201f',
+    primaryWallet: '3bF9tQ2mPzV1W8L5tG7yD2jX4vB6nS8cF9eR3tY1uQ7x',
+    avatarUrl: 'https://images.unsplash.com/photo-1634017839464-5c339ebe3cb4?w=120&auto=format&fit=crop&q=80',
+    totalCallouts: 49,
+    avgMultiple: 3.69,
+    medianMultiple: 1.49,
+    winRate1_2x: 71.43,
+    winRate1_5x: 48.98,
+    winRate2x: 33.0,
+    avgTimeToPeakMs: 16 * 60 * 1000 + 28 * 1000,
+    followersCount: 18900,
+    totalVolumeDrivenUsd: 6200000,
+    reputationTier: 'VERIFIED_ALPHA',
+    topCallouts: [],
+  },
+];
+
+// Helper to clean and classify social/website links accurately, resolving swapped metadata
+function normalizeSocialLinks(
+  rawTwitter?: string,
+  rawTelegram?: string,
+  rawWebsite?: string
+): { twitter?: string; telegram?: string; website?: string } {
+  const candidates = [rawTwitter, rawTelegram, rawWebsite]
+    .map((u) => (typeof u === 'string' ? u.trim() : ''))
+    .filter(
+      (u) =>
+        u &&
+        u.toLowerCase() !== 'none' &&
+        u.toLowerCase() !== 'n/a' &&
+        u.toLowerCase() !== 'null' &&
+        u.toLowerCase() !== 'undefined'
+    );
+
+  let twitter: string | undefined;
+  let telegram: string | undefined;
+  let website: string | undefined;
+
+  for (const raw of candidates) {
+    const lower = raw.toLowerCase();
+    if (lower.includes('twitter.com') || lower.includes('x.com')) {
+      if (!twitter) {
+        twitter = raw.startsWith('http://') || raw.startsWith('https://') ? raw : `https://${raw.replace(/^@/, '')}`;
+      }
+    } else if (lower.includes('t.me') || lower.includes('telegram.me')) {
+      if (!telegram) {
+        telegram = raw.startsWith('http://') || raw.startsWith('https://') ? raw : `https://${raw.replace(/^@/, '')}`;
+      }
+    } else if (!website && (lower.startsWith('http://') || lower.startsWith('https://') || lower.includes('.'))) {
+      website = raw.startsWith('http://') || raw.startsWith('https://') ? raw : `https://${raw}`;
+    }
+  }
+
+  // Handle bare handles or missing prefix cases
+  if (!twitter && rawTwitter) {
+    const t = rawTwitter.trim();
+    if (t && t.toLowerCase() !== 'none' && t.toLowerCase() !== 'n/a') {
+      const clean = t.replace(/^@/, '');
+      if (!clean.includes('/') && !clean.includes(' ')) {
+        twitter = `https://x.com/${clean}`;
+      } else if (clean.startsWith('http')) {
+        twitter = clean;
+      }
+    }
+  }
+
+  if (!telegram && rawTelegram) {
+    const tg = rawTelegram.trim();
+    if (tg && tg.toLowerCase() !== 'none' && tg.toLowerCase() !== 'n/a') {
+      const clean = tg.replace(/^@/, '');
+      if (!clean.includes('/') && !clean.includes(' ')) {
+        telegram = `https://t.me/${clean}`;
+      } else if (clean.startsWith('http')) {
+        telegram = clean;
+      }
+    }
+  }
+
+  if (!website && rawWebsite) {
+    const w = rawWebsite.trim();
+    if (w && w.toLowerCase() !== 'none' && w.toLowerCase() !== 'n/a') {
+      if (w.startsWith('http://') || w.startsWith('https://')) {
+        website = w;
+      } else if (w.includes('.')) {
+        website = `https://${w}`;
+      }
+    }
+  }
+
+  return { twitter, telegram, website };
+}
+
+// Placeholder attribution for real-feed tokens when no real caller data exists.
+// Zeroed stats and never auto-snipe subscribed, so it can't satisfy any caller-based trigger.
+const UNATTRIBUTED_CALLER: PumpFunCaller = {
+  userId: 'unattributed',
+  userUuid: 'unattributed',
+  primaryWallet: '',
+  totalCallouts: 0,
+  avgMultiple: 0,
+  medianMultiple: 0,
+  winRate1_2x: 0,
+  winRate1_5x: 0,
+  winRate2x: 0,
+  avgTimeToPeakMs: 0,
+  followersCount: 0,
+  totalVolumeDrivenUsd: 0,
+  reputationTier: 'EMERGING_CALLER',
+  topCallouts: [],
+};
+
+const DEMO_CALLER_IDS: ReadonlySet<string> = new Set(INITIAL_CALLERS.map((c) => c.userId));
+
+/** Fake hardcoded callers are only loaded when DEMO_MODE=true (A5). */
+function isDemoMode(): boolean {
+  return process.env.DEMO_MODE === 'true';
+}
+
+/**
+ * Demo callers are SYNTHETIC_TEST. A real-feed token with no attributed caller comes from pump.fun/DexScreener market
+ * data, not from a social post, so it is PUMP_HTTP_API (it was labelled REAL_ONCHAIN, which claims an on-chain event). REAL_SOCIAL is reserved for a callout traced to an actual
+ * social post, which no code path produces yet.
+ */
+export function calloutProvenance(callout: PumpFunHotCallout): SignalProvenance {
+  if (DEMO_CALLER_IDS.has(callout.caller.userId)) return 'SYNTHETIC_TEST';
+  if (callout.caller.userId === UNATTRIBUTED_CALLER.userId) return 'PUMP_HTTP_API'; // Q33: it came from an HTTP list, not the chain
+  return 'REAL_SOCIAL';
+}
+
+/**
+ * S28: what the server starts at boot. FULL: the log stream plus the HTTP pollers. WS_ONLY: only the log stream. OFF: nothing.
+ * With external feeds on, FULL is for ALLOWED_CLUSTER=mainnet-beta only (P4.2, R1-65): the pollers read the mainnet pump.fun and
+ * DexScreener HTTP APIs, whose mints do not exist on devnet or localnet, so off mainnet the feed is the log stream alone (WS_ONLY).
+ * With external feeds disabled, WS_ONLY needs the operator's APEX_PUMP_WS_ONLY=true and is honoured only on ALLOWED_CLUSTER=localnet,
+ * where the websocket is a loopback validator; anywhere else it falls back to OFF.
+ */
+export function pumpBootMode(env: NodeJS.ProcessEnv = process.env): 'FULL' | 'WS_ONLY' | 'OFF' {
+  if (env.APEX_DISABLE_EXTERNAL_FEEDS !== 'true') return allowedCluster(env) === 'mainnet-beta' ? 'FULL' : 'WS_ONLY';
+  return env.APEX_PUMP_WS_ONLY === 'true' && env.ALLOWED_CLUSTER === 'localnet' ? 'WS_ONLY' : 'OFF';
+}
+
+/** P4.2 (R1-65): the pump.fun / DexScreener HTTP pollers run only when the cluster is mainnet-beta, whatever the caller asked. */
+export function httpPollersAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
+  return allowedCluster(env) === 'mainnet-beta';
+}
+
+/**
+ * 3H: the note of a callout that is on both lists. It used to read "MULTI-CALLER CONFLUENCE ... Called by @a & @b ... Elevated to INSTANT_SNIPE"
+ * for every such callout: the callers are placeholder names given by list position (nobody called it), and INSTANT_SNIPE also needs a known
+ * multiple of at most 2.5x and at most 180 s since the last trade, so many of them were not elevated at all.
+ */
+export function confluenceCalloutNote(p: { hasOrderFlowSurge: boolean; curveProgress: number; volume5mUsd: number | null; hftAction: CalloutHftAction }): string {
+  const lists = `On both the pump.fun recent list and the DexScreener paid-boost list${p.hasOrderFlowSurge ? ', with a 5-minute buy surge' : ''}`;
+  const vol = p.volume5mUsd != null ? '$' + Number(p.volume5mUsd).toLocaleString() : 'n/a';
+  const action = p.hftAction === 'INSTANT_SNIPE'
+    ? 'Marked INSTANT_SNIPE.'
+    : `Marked ${p.hftAction}: INSTANT_SNIPE also needs a known multiple of at most 2.5x and at most 180 s since the last trade.`;
+  return `📊 ${lists}. Curve: ${p.curveProgress}% | 5m Vol: ${vol}. ${action} No person called it.`;
+}
+
+/**
+ * 3H (P3.7): how long after the last feed event that brought data the board still reads ONLINE. The HTTP fallback polls every 5 s and the
+ * log stream counts as active for 60 s (initPolling), so a quiet minute means nothing is arriving.
+ */
+export const PUMP_FEED_ONLINE_WINDOW_MS = 60_000;
+export type PumpFeedStatus = 'NO_DATA' | 'ONLINE' | 'STALE';
+
+export class PumpFunService extends EventEmitter {
+  private callers: PumpFunCaller[] = isDemoMode() ? [...INITIAL_CALLERS] : [];
+  private hotCallouts: PumpFunHotCallout[] = [];
+  private firstSeenMcap = new Map<string, { mcapUsd: number; priceUsd: number }>();
+  private lastSyncTimestamp: number = 0; // wall clock, for display
+  private lastSyncMonotonicMs: number | null = null; // performance.now() of the same event, for the age
+  private lastSyncLatencyMs: number = 0;
+  private liveSource: string = 'none yet'; // 3H: named after the feed that last delivered data, never before one has
+  private isPolling: boolean = false;
+  private rawTokensCache: any[] = [];
+  private snipedMints: Set<string> = new Set();
+  private autoSnipeRules: AutoSnipeRules = {
+    minCallerWinRate2x: 40.0,
+    minAvgMultiple: 4.0,
+    autoSnipeOnConfluence: true,
+    maxEntryMultiple: 1.35,
+    maxElapsedSeconds: 60,
+    snipeAmountUsd: 5.0, // Scaled for $10 Micro Account
+  };
+
+  private backgroundStarted = false;
+
+  constructor() {
+    super();
+    // Wire real Solana WebSocket listener for Pump.fun V2 CreateEvents (B08)
+    pumpFeedListener.on('create_event', (event: PumpCreateEvent) => {
+      this.handleOnChainCreateEvent(event);
+    });
+  }
+
+  /**
+   * Begin the on-chain feed and, unless `httpPollers` is false, the pump.fun / DexScreener HTTP fallback poll. Called once by the server,
+   * never on import. `httpPollers: false` is for a server whose only feed is a loopback chain (S28). The pollers also need
+   * ALLOWED_CLUSTER=mainnet-beta (`httpPollersAllowed`, P4.2): on devnet and localnet they are never started.
+   */
+  public startBackground(opts: { httpPollers?: boolean; env?: NodeJS.ProcessEnv } = {}): void {
+    if (this.backgroundStarted) return;
+    this.backgroundStarted = true;
+    pumpFeedListener.start().catch(() => {});
+    if (opts.httpPollers !== false && httpPollersAllowed(opts.env)) this.initPolling(opts.env);
+  }
+
+  /**
+   * Handle real on-chain CreateEvent received from Solana WebSocket logs
+   */
+  public handleOnChainCreateEvent(event: PumpCreateEvent) {
+    executionCoordinator.recordPumpFeedEvent('SOLANA_WS_LISTENER', event.mint);
+    this.lastSyncTimestamp = Date.now();
+    this.lastSyncMonotonicMs = performance.now();
+    this.lastSyncLatencyMs = Math.round(event.parseLatencyMs);
+    this.liveSource = 'Solana WebSocket Logs (Pump.fun V2)';
+
+    const rawCoin = {
+      mint: event.mint,
+      name: event.name,
+      symbol: event.symbol,
+      description: '',
+      image_uri: '',
+      metadata_uri: event.uri,
+      twitter: null,
+      telegram: null,
+      website: null,
+      bonding_curve: event.bondingCurve,
+      associated_bonding_curve: '',
+      creator: event.creator,
+      created_timestamp: event.receivedAt,
+      raydium_pool: null,
+      complete: false,
+      total_supply: Number(event.tokenTotalSupply),
+      virtual_sol_reserves: Number(event.virtualSolReserves),
+      virtual_token_reserves: Number(event.virtualTokenReserves),
+      usd_market_cap: event.initialMarketCapSol * (solPriceService.lastKnownPrice() ?? 0),
+      market_cap_usd: event.initialMarketCapSol * (solPriceService.lastKnownPrice() ?? 0),
+      reply_count: 0,
+      last_reply: null,
+      nsfw: false,
+      market_id: null,
+      inverted: null,
+      is_currently_live: true,
+      username: 'onchain_creator',
+      profile_image: null,
+      video_uri: null,
+      last_trade_timestamp: event.receivedAt,
+    };
+
+    this.rawTokensCache = [rawCoin, ...this.rawTokensCache.filter((c) => c.mint !== event.mint)].slice(0, 30);
+    this.rebuildHotCallouts(this.rawTokensCache, new Map(), []);
+  }
+
+  // Start background sync from real-world APIs (relegated to secondary fallback behind WebSocket)
+  private initPolling(env?: NodeJS.ProcessEnv) {
+    // Initial fetch immediately
+    this.syncRealWorldData({ env }).catch(console.error);
+
+    // Poll every 5 seconds as secondary fallback when WebSocket logs are inactive or reconnecting (B08)
+    setInterval(() => {
+      const wsActive = pumpFeedListener.isActive() && Date.now() - pumpFeedListener.getLastEventTimestamp() < 60000;
+      if (wsActive) {
+        // WebSocket is actively streaming on-chain events; HTTP polling is relegated to standby
+        return;
+      }
+      this.syncRealWorldData({ env }).catch(() => {});
+    }, 5000);
+  }
+
+  // Real-world API synchronization: pump.fun + DexScreener
+  // `evaluateTriggers: false` refreshes the feed without ever evaluating auto-snipe (used by the manual refresh route).
+  // Returns a reason when nothing was fetched because the cluster is not mainnet-beta (the same rule as the pollers, P4.2): these are
+  // mainnet feeds, and their mints do not exist on devnet or localnet. The manual refresh route used to skip that check.
+  public async syncRealWorldData(opts: { evaluateTriggers?: boolean; env?: NodeJS.ProcessEnv } = {}): Promise<{ skipped?: string }> {
+    if (!httpPollersAllowed(opts.env)) {
+      return { skipped: `HTTP_FEEDS_MAINNET_ONLY: pump.fun and DexScreener are mainnet feeds; on ${allowedCluster(opts.env)} the board fills from the on-chain log stream only` };
+    }
+    if (this.isPolling) return {};
+    this.isPolling = true;
+    const t0 = performance.now();
+
+    try {
+      // 1. Fetch real-time newly traded tokens from pump.fun
+      const pumpUrl =
+        'https://frontend-api-v3.pump.fun/coins?offset=0&limit=30&sort=last_trade_timestamp&order=DESC&includeNsfw=false';
+      const pumpRes = await fetch(pumpUrl, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+          Accept: 'application/json',
+        },
+      }).catch(() => null);
+
+      let pumpCoins: any[] = [];
+      if (pumpRes && pumpRes.ok) {
+        const parsed = await pumpRes.json();
+        // S1: tolerate a non-array body and drop malformed entries so one bad element cannot abort the whole sync.
+        pumpCoins = Array.isArray(parsed)
+          ? parsed.filter((c: any) => c && typeof c === 'object' && typeof c.mint === 'string' && c.mint.length > 0)
+          : [];
+      }
+
+      // 2. Fetch real-time boosted tokens from DexScreener
+      let dexBoosted: any[] = [];
+      try {
+        const dexRes = await fetch('https://api.dexscreener.com/token-boosts/top/v1').catch(() => null);
+        if (dexRes && dexRes.ok) {
+          const parsedBoosts = await dexRes.json();
+        dexBoosted = Array.isArray(parsedBoosts) ? parsedBoosts : [];
+        }
+      } catch {}
+
+      // Filter solana boosted
+      const solanaBoostedMints = dexBoosted
+        .filter((d: any) => d.chainId === 'solana' && d.tokenAddress)
+        .map((d: any) => d.tokenAddress);
+
+      // 3. Enrich top token addresses with real-time pair data from DexScreener
+      const candidateMints = [
+        ...solanaBoostedMints.slice(0, 8),
+        ...pumpCoins.map((c: any) => c.mint).slice(0, 12),
+      ].filter(Boolean);
+
+      const pairMetricsMap: Map<string, any> = new Map();
+      if (candidateMints.length > 0) {
+        try {
+          const uniqueMints = Array.from(new Set(candidateMints)).slice(0, 20).join(',');
+          const pairsRes = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${uniqueMints}`).catch(() => null);
+          if (pairsRes && pairsRes.ok) {
+            const pairsData = await pairsRes.json();
+            (pairsData.pairs || []).forEach((p: any) => {
+              if (p.baseToken?.address) {
+                pairMetricsMap.set(p.baseToken.address.toLowerCase(), p);
+              }
+            });
+          }
+        } catch {}
+      }
+
+      this.rawTokensCache = pumpCoins;
+      // 3H: a poll counts as feed activity only when pump.fun returned coins; a failed or empty fetch used to move the sync time too.
+      if (pumpCoins.length > 0) {
+        this.lastSyncLatencyMs = Math.round(performance.now() - t0);
+        this.lastSyncTimestamp = Date.now();
+        this.lastSyncMonotonicMs = performance.now();
+        this.liveSource = 'frontend-api-v3.pump.fun + DexScreener v1 (HTTP poll)';
+      }
+
+      // 4. Construct Live Hot Callouts feed with caller attribution & HFT decay
+      this.rebuildHotCallouts(pumpCoins, pairMetricsMap, solanaBoostedMints, opts.evaluateTriggers !== false);
+    } catch (e) {
+      console.error('Error syncing real-world pump.fun / dexscreener data:', e);
+    } finally {
+      this.isPolling = false;
+    }
+    return {};
+  }
+
+  // Transform real-world tokens into Hot Callouts with caller attribution
+  private rebuildHotCallouts(
+    pumpCoins: any[],
+    pairMetricsMap: Map<string, any>,
+    boostedMints: string[],
+    evaluateTriggers: boolean = true,
+  ) {
+    const now = Date.now();
+    if (pumpCoins.length > 0) {
+      executionCoordinator.recordPumpFeedEvent('PUMPFUN_SERVICE');
+    }
+    const newCallouts: PumpFunHotCallout[] = [];
+
+    // Combine coins and sort by activity
+    const activeTokens = [...pumpCoins].slice(0, 15);
+
+    activeTokens.forEach((c, index) => {
+      // S1: a coin without a mint cannot be traded or attributed; never invent a placeholder mint.
+      if (!c || typeof c.mint !== 'string' || !c.mint) return;
+      const mint = c.mint;
+      const pair = pairMetricsMap.get(mint.toLowerCase());
+
+      // Assign caller based on coin index & hash to maintain stable personality attribution
+      const callerIndex = this.callers.length > 0 ? index % this.callers.length : -1;
+      const caller = callerIndex >= 0 ? this.callers[callerIndex] : UNATTRIBUTED_CALLER;
+
+      // Production Confluence Detection:
+      // When a token appears on both the live Pump.fun high-velocity feed and DexScreener boosted list simultaneously,
+      // the engine flags it as Multi-Caller Confluence (>= 2 callers), elevating its priority score to INSTANT_SNIPE.
+      const isBoosted = boostedMints.includes(mint);
+      const inPumpVelocity = index < 10 || (c.market_cap_usd && c.market_cap_usd > 15000);
+      const hasOrderFlowSurge = pair?.txns?.m5?.buys
+        ? pair.txns.m5.buys >= 20 && pair.txns.m5.buys > (pair.txns.m5.sells || 1) * 1.4
+        : false;
+
+      // Real Confluence Count
+      let confluenceCount = 1;
+      if (inPumpVelocity && isBoosted) {
+        confluenceCount = hasOrderFlowSurge ? 3 : 2;
+      } else if (isBoosted || hasOrderFlowSurge) {
+        confluenceCount = 1;
+      }
+
+      const otherCallers =
+        confluenceCount > 1
+          ? this.callers
+              .filter((_, i) => i !== callerIndex)
+              .slice(0, confluenceCount - 1)
+              .map((u) => `@${u.userId}`)
+          : [];
+
+      // Bonding curve progress comes from the curve's own reserves: tokens sold out of the 793.1M
+      // that sit on the curve. Market cap is NOT a proxy (it moves with SOL price and supply).
+      // With no reserve fields the progress is unknown and reported as 0 (lowest curve score).
+      const CURVE_TOKENS = 793_100_000_000_000; // initial real token reserves, 6 decimals
+      const INITIAL_VIRTUAL_TOKENS = 1_073_000_000_000_000;
+      let curveProgress: number;
+      if (c.complete) {
+        curveProgress = 100;
+      } else if (Number(c.real_token_reserves) > 0 || c.real_token_reserves === 0) {
+        curveProgress = Math.min(99.5, Math.max(0, Number(((1 - Number(c.real_token_reserves) / CURVE_TOKENS) * 100).toFixed(1))));
+      } else if (Number(c.virtual_token_reserves) > 0) {
+        const realTokens = Number(c.virtual_token_reserves) - (INITIAL_VIRTUAL_TOKENS - CURVE_TOKENS);
+        curveProgress = Math.min(99.5, Math.max(0, Number(((1 - realTokens / CURVE_TOKENS) * 100).toFixed(1))));
+      } else {
+        curveProgress = 0;
+      }
+
+      // Real-world pricing & multiples
+      // B3: unknown price is 0 (never an invented number)
+      const currentPriceUsd = pair?.priceUsd
+        ? parseFloat(pair.priceUsd)
+        : c.usd_market_cap
+        ? c.usd_market_cap / 1_000_000_000
+        : 0;
+
+      const currentMarketCapUsd = pair?.fdv
+        ? pair.fdv
+        : c.usd_market_cap || c.market_cap_usd || currentPriceUsd * 1_000_000_000;
+
+      // Token trade & creation timestamp from on-chain data
+      // B3: with no timestamp the age is unknown; treat it as stale so it can never qualify as a fresh INSTANT_SNIPE.
+      const tokenTradeTime = c.last_trade_timestamp || c.created_timestamp || 0;
+      const elapsedMs = tokenTradeTime > 0 ? Math.max(2000, now - tokenTradeTime) : 3_600_000;
+      const elapsedSeconds = Math.floor(elapsedMs / 1000);
+      const calloutTimestamp = tokenTradeTime > 0 ? tokenTradeTime : now - elapsedMs;
+
+      // Callout market cap = the market cap the first time THIS server saw the token as a callout (a measured number). It used to be a
+      // fixed $5,000 "launch floor", which made every multiple an invention. With no market cap in the feed it is unknown: no multiple.
+      const mintKey = mint.toLowerCase();
+      if (!this.firstSeenMcap.has(mintKey) && currentMarketCapUsd > 0) {
+        this.firstSeenMcap.set(mintKey, { mcapUsd: currentMarketCapUsd, priceUsd: currentPriceUsd });
+        if (this.firstSeenMcap.size > 2_000) this.firstSeenMcap.delete(this.firstSeenMcap.keys().next().value as string);
+      }
+      const firstSeen = this.firstSeenMcap.get(mintKey) ?? null;
+      const marketCapAtCalloutUsd: number | null = firstSeen ? firstSeen.mcapUsd : null;
+      const calloutPriceUsd: number | null = firstSeen && firstSeen.priceUsd > 0 ? firstSeen.priceUsd : null;
+      const currentMultiple: number | null =
+        firstSeen && currentMarketCapUsd > 0 ? Number((currentMarketCapUsd / firstSeen.mcapUsd).toFixed(2)) : null;
+
+      // Determine Production HFT Execution Action
+      let hftAction: CalloutHftAction = 'MOMENTUM_ENTRY';
+      if (confluenceCount >= 2 && currentMultiple !== null && currentMultiple <= 2.5 && elapsedSeconds <= 180) {
+        // Multi-Caller Confluence on Pump.fun + DexScreener Boosted elevates to INSTANT_SNIPE
+        hftAction = 'INSTANT_SNIPE';
+      } else if (curveProgress >= 80 && !c.complete) {
+        hftAction = 'PRE_GRADUATION_WATCH';
+      } else if ((currentMultiple !== null && currentMultiple >= 3.8) || elapsedSeconds > 480) {
+        hftAction = 'DUMP_RISK';
+      } else if (currentMultiple !== null && currentMultiple > 1.8) {
+        hftAction = 'LATE_STAGE_HOLD';
+      }
+
+      // Prime entry window remaining (decay calculation)
+      const decayWindowSecondsRemaining = Math.max(0, 90 - elapsedSeconds);
+
+      // Callout note generated from real on-chain metrics
+      let calloutNote: string;
+      if (confluenceCount >= 2) {
+        calloutNote = confluenceCalloutNote({ hasOrderFlowSurge, curveProgress, volume5mUsd: pair?.volume?.m5 ?? null, hftAction });
+      } else if (c.complete) {
+        calloutNote = `🎓 MIGRATED: the feed reports this curve as complete (graduated to the AMM).`;
+      } else if (curveProgress >= 80) {
+        calloutNote = `⚡ GRADUATION IMMINENT: Bonding curve is ${curveProgress}% filled. PumpSwap AMM migration happens when the curve's tokens are sold out.`;
+      } else if (isBoosted) {
+        calloutNote = `🔥 DEXSCREENER BOOSTED: ${pair?.txns?.m5?.buys !== undefined ? `${pair.txns.m5.buys} buys in the last 5m` : 'order flow not available'}.`;
+      } else {
+        calloutNote = `Live pump.fun token. Curve ${curveProgress}%. Holder, dev and authority data: ${c.top10_holders_pct != null || c.dev_holding_pct != null ? 'partial' : 'not provided by the feed'}.`;
+      }
+
+      const isAlreadySniped = this.snipedMints.has(mint.toLowerCase());
+
+      const callout: PumpFunHotCallout = {
+        id: `callout-${mint.slice(0, 10).toLowerCase()}-${index}`,
+        calloutId: `cid-${index}-${now}`,
+        caller,
+        token: {
+          mint,
+          // 3H: what the feed gave, or a plain stand-in. A coin with no description used to read "Verified token from Pump.fun hot callouts
+          // discovery engine" (nothing verifies it), with a stock photo as its image and "Alpha Meme Token" / "MEME" as its name and symbol.
+          symbol: c.symbol || mint.slice(0, 6).toUpperCase(),
+          name: c.name || `${mint.slice(0, 4)}...${mint.slice(-4)}`,
+          imageUri: c.image_uri || '',
+          description: c.description || '',
+          bondingCurveProgress: curveProgress,
+          bondingCurveAddress: c.bonding_curve || '',
+          associatedBondingCurve: c.associated_bonding_curve,
+          creator: c.creator || '',
+          calloutPriceUsd,
+          currentPriceUsd,
+          marketCapAtCalloutUsd,
+          currentMarketCapUsd,
+          athPriceSol: solPriceService.lastKnownPrice() ? (c.ath_market_cap || currentMarketCapUsd) / solPriceService.lastKnownPrice()! : 0,
+          peakMultiple: currentMultiple, // B3: the true peak is not in the feed; never invent a 1.35x
+          currentMultiple,
+          complete: c.complete || curveProgress >= 100,
+          raydiumPool: c.raydium_pool,
+          // B3: null means "not provided". Never filled with invented numbers.
+          volume5mUsd: pair?.volume?.m5 ?? null,
+          buys5m: pair?.txns?.m5?.buys ?? null,
+          sells5m: pair?.txns?.m5?.sells ?? null,
+          priceChange5mPct: pair?.priceChange?.m5 ?? null,
+          top10HoldersPct: c.top10_holders_pct ?? null,
+          devHoldingPct: c.dev_holding_pct ?? null, // S20: a migrated token is not assumed to have 0% dev holding
+          isMintRevoked: c.is_mint_revoked ?? null,
+          isFreezeRevoked: c.is_freeze_revoked ?? null,
+          rugcheckScore: evaluateTokenSafety({
+            mint,
+            isMintRevoked: c.is_mint_revoked ?? null,
+            isFreezeRevoked: c.is_freeze_revoked ?? null,
+            devHoldingPct: c.dev_holding_pct ?? null, // S20: a migrated token is not assumed to have 0% dev holding
+            top10HoldersPct: c.top10_holders_pct ?? null,
+            curveProgress,
+            hasSocials: !!(c.twitter || c.telegram || c.website || pair?.info?.socials?.length),
+            complete: c.complete || curveProgress >= 100,
+          }).score,
+          createdTimestamp: c.created_timestamp || now - elapsedMs,
+          timeAgoStr: `${Math.floor(elapsedSeconds / 60)}m ${elapsedSeconds % 60}s ago`,
+          ...normalizeSocialLinks(
+            c.twitter || pair?.info?.socials?.find((s: any) => s.type === 'twitter')?.url,
+            c.telegram || pair?.info?.socials?.find((s: any) => s.type === 'telegram')?.url,
+            c.website || pair?.info?.websites?.[0]?.url
+          ),
+        },
+        calloutTimestamp,
+        calloutNote,
+        confluenceCount,
+        otherCallers,
+        hftAction,
+        decayWindowSecondsRemaining,
+        status: isAlreadySniped ? 'SNIPED' : 'ACTIVE',
+      };
+
+      // Feed live token social telemetry into SocialAlphaScanner
+      socialScanner.ingestLiveTokenSignal({
+        symbol: c.symbol || 'MEME',
+        name: c.name || 'Token',
+        mint,
+        curveProgress,
+        twitter: callout.token.twitter,
+        telegram: callout.token.telegram,
+        website: callout.token.website,
+        marketCapUsd: currentMarketCapUsd,
+        volume5mUsd: pair?.volume?.m5,
+        isBoosted,
+        callerHandle: `@${caller.userId}`,
+      });
+
+      newCallouts.push(callout);
+    });
+
+    this.hotCallouts = newCallouts;
+
+    // Emit live callouts update to WebSockets
+    this.emit('callouts_updated', {
+      callouts: this.hotCallouts,
+      leaderboard: this.callers,
+      status: this.getStatus(),
+    });
+
+    // Check autonomous auto-snipe execution
+    if (evaluateTriggers) {
+      this.evaluateAutoSnipeTriggers();
+    }
+  }
+
+  // Evaluate if any fresh hot callouts trigger the auto-snipe rules
+  private async evaluateAutoSnipeTriggers() {
+    // G1: candidate source only. With the controller OFF there is nothing to evaluate for.
+    if (autoSnipeController.getMode() === 'OFF') return;
+    const rules = this.autoSnipeRules;
+
+    for (const callout of this.getHotCallouts()) {
+      if (callout.status !== 'ACTIVE') continue;
+      const mintKey = callout.token.mint.toLowerCase();
+      if (this.snipedMints.has(mintKey)) {
+        callout.status = 'SNIPED';
+        continue;
+      }
+
+      const caller = callout.caller;
+      const meetsCallerWinRate = caller.winRate2x >= rules.minCallerWinRate2x;
+      const meetsAvgMultiple = caller.avgMultiple >= rules.minAvgMultiple;
+
+      // Alpha Pipeline Integration (B14): evaluate confluence with ConfluenceEngine requiring a composite score at or above the threshold in force (default 70)
+      const confluence = this.evaluateCalloutConfluence(callout);
+      const isConfluenceScorePassed = isConfluencePassed(confluence.compositeScore);
+      const meetsConfluence =
+        rules.autoSnipeOnConfluence &&
+        callout.confluenceCount >= 2 &&
+        isConfluenceScorePassed;
+
+      const withinPriceLimit = callout.token.currentMultiple !== null && callout.token.currentMultiple <= rules.maxEntryMultiple; // an unknown multiple is not "within the limit"
+      const withinTimeLimit = (Date.now() - callout.calloutTimestamp) / 1000 <= rules.maxElapsedSeconds;
+
+      // Trigger on (caller stats) OR strong confluence (at or above the threshold in force), within price and time limits.
+      // A caller subscription alone is not a signal (A5).
+      const shouldSnipe =
+        ((meetsCallerWinRate && meetsAvgMultiple) || meetsConfluence) &&
+        withinPriceLimit &&
+        withinTimeLimit &&
+        callout.hftAction === 'INSTANT_SNIPE';
+
+      if (shouldSnipe) {
+        this.snipedMints.add(mintKey);
+        callout.status = 'SNIPED';
+
+        // Execute snipe routed through the central canonical coordinator
+        // G1: this is a candidate source only. The auto-snipe controller owns the decision and the execution.
+        const decision = await autoSnipeController.submitCandidate({
+          mint: callout.token.mint,
+          symbol: callout.token.symbol,
+          source: 'PUMPFUN_CALLOUT',
+          signalId: callout.id,
+          provenance: calloutProvenance(callout),
+          amountUsd: rules.snipeAmountUsd,
+          slippagePct: 6.0,
+          jitoTipSol: rules.jitoPriorityTipSol,
+          enforceConfluence: rules.autoSnipeOnConfluence,
+        });
+
+        if (decision.outcome === 'DROPPED' && !['POSITION_ALREADY_OPEN', 'ALREADY_ATTEMPTED_THIS_SESSION'].includes(decision.reason)) {
+          // Nothing was tried (controller said no for a session-level reason): keep the candidate available.
+          this.snipedMints.delete(mintKey);
+          callout.status = 'ACTIVE';
+          continue;
+        }
+        this.emit('callout_sniped', { callout, decision, confluence });
+      }
+    }
+  }
+
+  /**
+   * Evaluate multi-factor confluence score for a callout using ConfluenceEngine (B14)
+   */
+  public evaluateCalloutConfluence(callout: PumpFunHotCallout): ConfluenceBreakdown {
+    const t = callout.token as any;
+    const num = (n: unknown): number | null => (typeof n === 'number' && Number.isFinite(n) && n >= 0 ? n : null);
+    // B3: only measured values go in. Unknown stays null and earns no points. There is no real social call yet,
+    // so the social factor is not awarded (it used to be hardcoded to true).
+    const input: ConfluenceFactorsInput = {
+      mint: t.mint,
+      creatorAddress: t.creator,
+      priceChange5mPct: typeof t.priceChange5mPct === 'number' ? t.priceChange5mPct : null,
+      liquidityUsd: null, // no measured liquidity in the callout feed (the old value was a curve-progress x 145 guess)
+      top10HoldersPct: num(t.top10HoldersPct),
+      bondingCurveProgress: t.bondingCurveProgress,
+      buys5m: num(t.buys5m),
+      sells5m: num(t.sells5m),
+      devHoldingPct: num(t.devHoldingPct),
+      hasVerifiedSocialCall: false,
+      socialCallCount: 0,
+    };
+
+    return ConfluenceEngine.calculate(input);
+  }
+
+  // Public Getters and Actions
+  public getHotCallouts(): PumpFunHotCallout[] {
+    return this.hotCallouts;
+  }
+
+  public getLeaderboard(): PumpFunCaller[] {
+    return this.callers;
+  }
+
+  public getAutoSnipeRules(): AutoSnipeRules {
+    return this.autoSnipeRules;
+  }
+
+  public updateAutoSnipeRules(rules: Partial<AutoSnipeRules>): AutoSnipeRules {
+    this.autoSnipeRules = { ...this.autoSnipeRules, ...rules };
+    return this.autoSnipeRules;
+  }
+
+  /**
+   * 3H (P3.7): the feed status comes from real feed activity. It used to be a fixed 'ONLINE', with a 1970 sync time before any sync.
+   * NO_DATA: no feed event has brought data yet. ONLINE: the last one is at most PUMP_FEED_ONLINE_WINDOW_MS old. STALE: older than that.
+   */
+  public getStatus(): {
+    status: PumpFeedStatus;
+    liveSource: string;
+    syncLatencyMs: number;
+    lastSyncTimestamp: number;
+    lastSyncAgeMs: number | null;
+    lastSyncTimeStr: string | null;
+    tokensTrackedCount: number;
+    hotCalloutsCount: number;
+    topCallersCount: number;
+  } {
+    const ageMs = this.lastSyncMonotonicMs === null ? null : Math.max(0, Math.round(performance.now() - this.lastSyncMonotonicMs));
+    const status: PumpFeedStatus = ageMs === null ? 'NO_DATA' : ageMs <= PUMP_FEED_ONLINE_WINDOW_MS ? 'ONLINE' : 'STALE';
+    return {
+      status,
+      liveSource: this.liveSource,
+      syncLatencyMs: this.lastSyncLatencyMs,
+      lastSyncTimestamp: this.lastSyncTimestamp,
+      lastSyncAgeMs: ageMs,
+      lastSyncTimeStr: this.lastSyncTimestamp > 0 ? new Date(this.lastSyncTimestamp).toLocaleTimeString() : null,
+      tokensTrackedCount: this.rawTokensCache.length,
+      hotCalloutsCount: this.hotCallouts.length,
+      topCallersCount: this.callers.length,
+    };
+  }
+
+  // 1-Click manual snipe on a specific callout routed through ExecutionCoordinator
+  public async snipeCallout(
+    calloutId: string,
+    amountUsd: number = 5.0,
+    jitoTipSol?: number,
+    maxSlippagePct: number = 6.0,
+    operatorAmountSol?: number
+  ): Promise<{ success: boolean; message: string; txHash?: string }> {
+    // S181: an explicit size is judged before anything is marked, so a refused amount leaves the callout snipeable.
+    if (operatorAmountSol !== undefined) {
+      const check = checkSnipeAmountSol(operatorAmountSol);
+      if (!check.ok) return { success: false, message: check.reason };
+    }
+    const target = calloutId.trim().toLowerCase();
+    const callout = this.hotCallouts.find(
+      (c) =>
+        c.id.toLowerCase() === target ||
+        c.calloutId.toLowerCase() === target ||
+        c.token.mint.toLowerCase() === target
+    );
+    if (!callout) {
+      return { success: false, message: 'Callout not found or expired' };
+    }
+
+    this.snipedMints.add(callout.token.mint.toLowerCase());
+    const tradeRes = await memecoinAggregator.executeSnipe({
+      contractAddress: callout.token.mint,
+      amountUsd,
+      operatorAmountSol,
+      platform: 'PUMP_FUN',
+      jitoTipSol,
+      slippagePct: maxSlippagePct,
+      signalId: callout.id,
+      signalTimestamp: callout.calloutTimestamp,
+      provenance: calloutProvenance(callout), // R20: a demo callout is SYNTHETIC_TEST here too, not whatever executeSnipe defaults to
+    });
+
+    if (tradeRes.success) {
+      callout.status = 'SNIPED';
+      this.emit('callout_sniped', { callout, tradeRes });
+    }
+
+    return tradeRes;
+  }
+}
+
+export const pumpFunService = new PumpFunService();
+export const pumpfunService = pumpFunService;

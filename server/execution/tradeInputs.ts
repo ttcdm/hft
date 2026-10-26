@@ -1,0 +1,270 @@
+import { z } from 'zod';
+import type { NextFunction, Request, Response } from 'express';
+import type { SignalProvenance } from '../core/types';
+
+/**
+ * Validation for every client-reachable trade and close entry point (HTTP and WebSocket).
+ *
+ * Rules enforced here:
+ * - Provenance is set by the server, never read from a client. Operator-initiated trades are always
+ *   MANUAL_OPERATOR. Clients cannot choose provenance, confluence gating, eligibility reports,
+ *   execution mode or signal/market timestamps; those keys are rejected or stripped.
+ * - Numbers must be finite and inside sanity bounds. Position sizing and risk limits are still
+ *   enforced downstream by CapitalSizer and RiskEngine; these bounds only stop malformed input.
+ */
+
+/** Provenance given to every trade a signed-in operator starts by hand. */
+export const OPERATOR_PROVENANCE: SignalProvenance = 'MANUAL_OPERATOR';
+
+export const SOLANA_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+/** Keys a client must never supply on a trade request. Presence is a 400, not a silent strip. */
+const FORBIDDEN_TRADE_KEYS = [
+  'provenance',
+  'enforceConfluence',
+  'minConfluenceScore',
+  'eligibilityReport',
+  'executionMode',
+  'signalTimestamp',
+  'marketDataTimestamp',
+  'source',
+  'dryRun',
+  'amountSolOverride',
+] as const;
+
+function rejectForbiddenKeys(value: unknown, ctx: z.RefinementCtx) {
+  if (!value || typeof value !== 'object') return;
+  for (const key of FORBIDDEN_TRADE_KEYS) {
+    if (key in (value as Record<string, unknown>)) {
+      ctx.addIssue({
+        code: 'custom',
+        path: [key],
+        message: `${key} is set by the server and cannot be supplied by a client`,
+      });
+    }
+  }
+}
+
+const address = z.string().trim().regex(SOLANA_ADDRESS, 'must be a valid Base58 Solana address');
+const id = z.string().trim().min(1).max(128);
+
+const amountUsd = z.coerce.number().positive().max(100_000).default(5.0);
+/** S181: an explicit size in SOL (the operator's saved snipe amount). When present it wins over amountUsd and is checked, never clamped. */
+const amountSol = z.coerce.number().positive().max(1_000).optional();
+/** Optional: absent means the executionConfig dynamic tip policy decides (C6). */
+const jitoTipSol = z.coerce.number().min(0).max(0.1).optional();
+const slippagePct = z.coerce.number().min(0.5).max(50).default(8.0);
+const sellPct = z.coerce.number().int().min(1).max(100).default(100); // N-44: whole percent only
+
+/** POST /api/memecoins/trade, WS SNIPE_MEMECOIN, POST /api/social/signals/snipe (plus signalId). */
+export const OperatorSnipeSchema = z
+  .object({
+    contractAddress: address,
+    amountUsd,
+    amountSol,
+    platform: z.string().trim().max(32).optional(),
+    jitoTipSol,
+    slippagePct,
+    signalId: id.optional(),
+  })
+  .loose()
+  .superRefine(rejectForbiddenKeys)
+  .transform(({ contractAddress, amountUsd, amountSol, platform, jitoTipSol, slippagePct, signalId }) => ({
+    contractAddress,
+    amountUsd,
+    amountSol,
+    platform,
+    jitoTipSol,
+    slippagePct,
+    signalId,
+  }));
+export type OperatorSnipe = z.output<typeof OperatorSnipeSchema>;
+
+/** POST /api/social/signals/snipe: the signal supplies the contract, so the client sends only the signal id. */
+export const SignalSnipeSchema = z
+  .object({
+    signalId: id,
+    amountUsd,
+    amountSol,
+    platform: z.string().trim().max(32).optional(),
+    jitoTipSol,
+    slippagePct,
+    confirmLive: z.boolean().optional(),
+  })
+  .loose()
+  .superRefine(rejectForbiddenKeys)
+  .transform(({ signalId, amountUsd, amountSol, platform, jitoTipSol, slippagePct, confirmLive }) => ({
+    signalId,
+    amountUsd,
+    amountSol,
+    platform,
+    jitoTipSol,
+    slippagePct,
+    confirmLive,
+  }));
+
+/** POST /api/pumpfun/callouts/snipe, WS SNIPE_PUMP_CALLOUT. */
+export const CalloutSnipeSchema = z
+  .object({
+    calloutId: id,
+    amountUsd,
+    amountSol,
+    jitoTipSol,
+    slippagePct: z.coerce.number().min(0.5).max(50).default(6.0),
+    confirmLive: z.boolean().optional(),
+  })
+  .loose()
+  .superRefine(rejectForbiddenKeys)
+  .transform(({ calloutId, amountUsd, amountSol, jitoTipSol, slippagePct, confirmLive }) => ({ calloutId, amountUsd, amountSol, jitoTipSol, slippagePct, confirmLive }));
+
+/** POST /api/pumpfun/callouts/rules. Only these keys, inside these bounds, reach the rules object (Q25: it used to be a spread of the raw body). */
+export const AutoSnipeRulesSchema = z
+  .object({
+    minCallerWinRate2x: z.number().min(0).max(100).optional(),
+    minAvgMultiple: z.number().min(0).max(1000).optional(),
+    autoSnipeOnConfluence: z.boolean().optional(),
+    maxEntryMultiple: z.number().min(1).max(100).optional(),
+    maxElapsedSeconds: z.number().min(1).max(3600).optional(),
+    snipeAmountUsd: z.number().min(0.01).max(1000).optional(),
+    jitoPriorityTipSol: z.number().min(0).max(0.1).optional(),
+  })
+  .loose()
+  .transform((o) => {
+    const out: Record<string, number | boolean> = {};
+    for (const k of ['minCallerWinRate2x', 'minAvgMultiple', 'autoSnipeOnConfluence', 'maxEntryMultiple', 'maxElapsedSeconds', 'snipeAmountUsd', 'jitoPriorityTipSol'] as const) {
+      if (o[k] !== undefined) out[k] = o[k] as number | boolean;
+    }
+    return out;
+  });
+
+/** POST /api/memecoins/close, POST /api/execution/close, WS CLOSE_POSITION. */
+export const OperatorCloseSchema = z
+  .object({
+    positionId: id,
+    sellPct,
+    reason: z.string().trim().max(200).optional(),
+  })
+  .loose()
+  .transform(({ positionId, sellPct, reason }) => ({ positionId, sellPct, reason }));
+
+/** POST /api/execution/trade. Server sets provenance and source. */
+export const OperatorExecuteTradeSchema = z
+  .object({
+    mint: address,
+    symbol: z.string().trim().min(1).max(32),
+    name: z.string().trim().min(1).max(64),
+    amountSol: z.coerce.number().positive().max(1000),
+    currentPriceSol: z.coerce.number().positive().optional(),
+    slippageBps: z.coerce.number().int().min(1).max(5000).optional(),
+    jitoTipSol: z.coerce.number().min(0).max(0.1).optional(),
+    liquidityUsd: z.coerce.number().min(0).optional(),
+  })
+  .loose()
+  .superRefine(rejectForbiddenKeys)
+  .transform(({ mint, symbol, name, amountSol, currentPriceSol, slippageBps, jitoTipSol, liquidityUsd }) => ({
+    mint,
+    symbol,
+    name,
+    amountSol,
+    currentPriceSol,
+    slippageBps,
+    jitoTipSol,
+    liquidityUsd,
+  }));
+
+/**
+ * A boolean from JSON or a form: true/false or the strings "true"/"false". `z.coerce.boolean()` turns the STRING "false"
+ * into true (any non-empty string is truthy), which would arm, or sell everything, on a request that said the opposite.
+ */
+const strictBool = z.preprocess((v) => (v === 'true' ? true : v === 'false' ? false : v), z.boolean());
+
+/** POST /api/execution/arm and POST /api/wallet/toggle-trading. */
+export const ArmSchema = z.object({
+  arm: strictBool.optional(),
+  active: strictBool.optional(),
+  confirmationCode: z.string().max(64).optional(),
+});
+
+/** POST /api/auto/mode (G1). */
+export const KillSwitchSchema = z.object({ activate: strictBool });
+
+/** POST /api/auto/budget (S181): the session budget the operator may edit. The server's caps are applied in the controller. */
+export const AutoBudgetSchema = z.object({
+  maxBuys: z.coerce.number().int().min(1).max(50),
+  maxSpendSol: z.coerce.number().positive().max(1_000),
+});
+
+/** POST /api/auto/order-size (S183). */
+export const AutoOrderSizeSchema = z.object({ orderSol: z.coerce.number().positive().max(1_000) });
+
+/** POST /api/auto/threshold (S187). The range and whole-number rule are judged in confluenceThreshold.ts, so the reason is the same everywhere. */
+export const AutoThresholdSchema = z.object({ threshold: z.union([z.number(), z.string().max(12)]) });
+
+export const AutoModeSchema = z.object({
+  mode: z.enum(['OFF', 'SHADOW', 'PAPER', 'DEVNET_LIVE']),
+  confirmationCode: z.string().max(64).optional(),
+});
+
+/** POST /api/auto/kill (G1). */
+export const AutoKillSchema = z.object({
+  exitAll: strictBool.optional(),
+  reason: z.string().trim().max(200).optional(),
+});
+
+/** POST /api/auto/resume (G3): clear an all-trading halt and/or the daily-loss latch (3C). It never turns auto trading back on. */
+export const AutoResumeSchema = z.object({
+  clearHalt: z.boolean().optional(),
+  clearDailyLossLatch: z.boolean().optional(),
+  /** 3E: acknowledge NEGATIVE_EXPECTANCY / LOSS_STREAK; auto trades closed until now stop counting, so a mode can be set again. */
+  ackLossTriggers: z.boolean().optional(),
+});
+
+
+/** POST /api/memecoins/config: a whitelist of the sniper bot settings. Everything else is dropped. */
+const SniperConfigFields = z
+  .object({
+    isAutoSnipeEnabled: z.boolean(),
+    defaultSnipeAmountUsd: z.coerce.number().positive().max(100_000),
+    maxSlippagePct: z.coerce.number().min(0.5).max(50),
+    jitoTipSol: z.coerce.number().min(0).max(0.1),
+    takeProfitPct: z.coerce.number().min(0).max(100_000),
+    stopLossPct: z.coerce.number().min(0).max(100),
+    trailingStopEnabled: z.boolean(),
+    requireFreezeRevoked: z.boolean(),
+    maxDevHoldingPct: z.coerce.number().min(0).max(100),
+    telegramBotToken: z.string().max(256),
+    telegramChatId: z.string().max(64),
+    telegramWebhookActive: z.boolean(),
+  })
+  .partial();
+const SNIPER_CONFIG_KEYS = new Set(Object.keys(SniperConfigFields.shape));
+export const SniperConfigPatchSchema = SniperConfigFields.loose().transform((value) =>
+  Object.fromEntries(Object.entries(value).filter(([key]) => SNIPER_CONFIG_KEYS.has(key)))
+);
+
+export type ValidationFailure = { status: 'invalid'; error: string; issues: Array<{ path: string; message: string }> };
+
+export function validateTradeInput<S extends z.ZodTypeAny>(
+  schema: S,
+  input: unknown
+): { status: 'valid'; data: z.output<S> } | ValidationFailure {
+  const parsed = schema.safeParse(input ?? {});
+  if (parsed.success) return { status: 'valid', data: parsed.data };
+  return {
+    status: 'invalid',
+    error: 'INVALID_REQUEST',
+    issues: parsed.error.issues.map((issue) => ({ path: issue.path.join('.'), message: issue.message })),
+  };
+}
+
+/** Express middleware: replaces req.body with the validated, server-trusted shape or answers 400. */
+export function validateTradeBody(schema: z.ZodTypeAny) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    const result = validateTradeInput(schema, req.body);
+    if (result.status === 'invalid') {
+      return res.status(400).json({ success: false, status: 'REJECTED', error: result.error, issues: result.issues });
+    }
+    req.body = result.data;
+    next();
+  };
+}

@@ -1,0 +1,194 @@
+import '../suppress-warnings.cjs';
+import { describe, it, expect } from 'vitest';
+import fs from 'node:fs';
+import { WATCH_MIN_MS, WATCH_MAX_MS } from '../server/signals/watchWindow';
+import { FEED_SLOT_SILENCE_MS, FEED_SLOT_JUMP_MAX } from '../server/solana/pumpFeedListener';
+import { FUNDER_RETRY_DELAYS_MS, FUNDER_LOOKUP_CONCURRENCY, FUNDER_LOOKUP_MAX_PER_MINT } from '../server/signals/funderLookup';
+import { RELEASE_RETRY_MS, PENDING_RELEASE_MAX_AGE_MS, DEVNET_MAX_OPEN_POSITIONS } from '../server/auto/controller';
+import { riskEngine, DAILY_LOSS_WINDOW_MS, DAILY_LOSS_PRICE_MAX_AGE_MS, WORST_CASE_LOSS_FRACTION } from '../server/risk/riskEngine';
+import { SOL_PRICE_MAX_AGE_MS, SOL_PRICE_ANCHOR_MAX_AGE_MS } from '../server/market/solPriceService';
+import { GENESIS_CHECK_TTL_MS } from '../server/solana/clusterGuard';
+import { WorkstationDatabase } from '../server/db/database';
+import { DEFAULT_RPC_REQUEST_TIMEOUT_MS, RPC_READ_TRIES, SLOW_READ_TIMEOUT_MS, DEFAULT_RPC_LIMITER_MAX_WAIT_MS } from '../server/solana/rpcConnection';
+import {
+  SELL_RATE_LIMIT_BACKOFF_MS, EXIT_RATE_LIMITED_WAIT_MS, EXIT_SELL_WAIT_MS, MARK_STALE_MS, MARK_RETRY_BASE_MS, MARK_RETRY_MAX_MS,
+  MARK_ALERT_AFTER_MS, EXIT_RETRY_BASE_MS, EXIT_RETRY_MAX_MS, SELL_SLIPPAGE_LADDER_BPS, LIVE_BUY_FILLED, ExecutionCoordinator,
+} from '../server/execution/coordinator';
+import { PANIC_BUY_SETTLE_WAIT_MS } from '../server/execution/emergencyStop';
+import { READINESS_RED_LIMIT_MS, WALLET_AUDIT_BASE_TOLERANCE_SOL } from '../server/auto/killSwitch';
+import { CONFLUENCE_DEVNET_LIVE_FLOOR } from '../server/signals/confluenceThreshold';
+import { LOGIN_RATE_LIMIT } from '../server/middleware/enterprise';
+import { REPLAY_DEFAULTS } from '../server/backtest/replay';
+import { PUMP_FEED_ONLINE_WINDOW_MS } from '../server/pumpfunService';
+
+/**
+ * 3J: every constant that docs/LATENCY.md, docs/RUNBOOK.md and docs/ARCHITECTURE.md state a value for has that value in the code, and the
+ * document still states it. A change to the constant fails the first check; a rewrite of the document that drops or changes the figure
+ * fails the second. Constants that are not exported are read from the source text with a pattern that must match exactly once.
+ * The checks that only read repository files (paths named in the documents, code references in LATENCY.md) are in s3j_docs_paths.repo.test.ts.
+ */
+const read = (f: string) => fs.readFileSync(f, 'utf8');
+const doc = { latency: read('docs/LATENCY.md'), runbook: read('docs/RUNBOOK.md'), arch: read('docs/ARCHITECTURE.md'), env: read('docs/ENV.md') };
+
+/** The value of a constant that is not exported: the first capture group of a pattern over the file's source. */
+function fromSource(file: string, re: RegExp): string {
+  const m = re.exec(read(file));
+  expect(m, `${re} in ${file}`).not.toBeNull();
+  return m![1];
+}
+const num = (s: string) => Number(s.replace(/_/g, ''));
+const limits = riskEngine.getLimits();
+
+type Row = [name: string, actual: unknown, expected: unknown, document: keyof typeof doc, phrase: string];
+const rows: Row[] = [
+  ['WATCH_MIN_MS', WATCH_MIN_MS, 20_000, 'latency', '20 s and 120 s from the first trade'],
+  ['WATCH_MAX_MS', WATCH_MAX_MS, 120_000, 'latency', '20 s and 120 s from the first trade'],
+  ['FEED_SLOT_SILENCE_MS', FEED_SLOT_SILENCE_MS, 10_000, 'latency', '10 s without a slot notification'],
+  ['FEED_SLOT_JUMP_MAX', FEED_SLOT_JUMP_MAX, 25, 'latency', 'more than 25 slots'],
+  ['FUNDER_RETRY_DELAYS_MS', FUNDER_RETRY_DELAYS_MS, [1_500, 4_000, 10_000], 'latency', 'after 1.5 s, 4 s and 10 s'],
+  ['FUNDER_LOOKUP_CONCURRENCY', FUNDER_LOOKUP_CONCURRENCY, 4, 'latency', '4 lookups at a time'],
+  ['FUNDER_LOOKUP_MAX_PER_MINT', FUNDER_LOOKUP_MAX_PER_MINT, 150, 'latency', '150 per mint'],
+  ['RELEASE_RETRY_MS', RELEASE_RETRY_MS, 2_000, 'latency', '2 s (`RELEASE_RETRY_MS`)'],
+  ['PENDING_RELEASE_MAX_AGE_MS', PENDING_RELEASE_MAX_AGE_MS, 6_000, 'latency', 'younger than 6 s'],
+  ['maxSignalAgeMs', limits.maxSignalAgeMs, 8_000, 'latency', '8 s (`maxSignalAgeMs: 8000`)'],
+  ['maxDataAgeMs', limits.maxDataAgeMs, 5_000, 'latency', '5 s (`maxDataAgeMs: 5000`)'],
+  ['cooldownAfterFailedTradeMs', limits.cooldownAfterFailedTradeMs, 15_000, 'latency', '15 s, global'],
+  ['cooldownPerMintMs', limits.cooldownPerMintMs, 30_000, 'latency', '30 s after a buy'],
+  ['eligibility report age', num(fromSource('server/execution/coordinator.ts', /evaluatedAt > (\d+)\)/)), 60_000, 'latency', '| Eligibility report age | 60 s |'],
+  ['SOL_PRICE_MAX_AGE_MS', SOL_PRICE_MAX_AGE_MS, 120_000, 'latency', '120 s (`SOL_PRICE_MAX_AGE_MS`)'],
+  ['SOL_PRICE_ANCHOR_MAX_AGE_MS', SOL_PRICE_ANCHOR_MAX_AGE_MS, 600_000, 'latency', 'under 10 min old'],
+  ['DAILY_LOSS_WINDOW_MS', DAILY_LOSS_WINDOW_MS, 24 * 3_600_000, 'latency', '24 h rolling'],
+  ['DAILY_LOSS_PRICE_MAX_AGE_MS', DAILY_LOSS_PRICE_MAX_AGE_MS, 3_600_000, 'latency', 'older than 1 h'],
+  ['WORST_CASE_LOSS_FRACTION', WORST_CASE_LOSS_FRACTION, 1, 'arch', '`WORST_CASE_LOSS_FRACTION` = 1'],
+  ['GENESIS_CHECK_TTL_MS', GENESIS_CHECK_TTL_MS, 60_000, 'latency', '60 s per Connection'],
+  ['blockhash check retry', num(fromSource('server/solana/clusterGuard.ts', /await sleep\((\d+)\)/)), 500, 'latency', 'a second after 500 ms'],
+  ['WRITABLE_CACHE_MS', WorkstationDatabase.WRITABLE_CACHE_MS, 1_000, 'latency', 'reused for 1 s'],
+  ['MIN_FREE_BYTES', WorkstationDatabase.MIN_FREE_BYTES, 32 * 1024 * 1024, 'latency', 'needs 32 MiB free'],
+  ['LOW_FREE_WARN_BYTES', WorkstationDatabase.LOW_FREE_WARN_BYTES, 128 * 1024 * 1024, 'latency', 'warns below 128 MiB free'],
+  ['DEFAULT_RPC_REQUEST_TIMEOUT_MS', DEFAULT_RPC_REQUEST_TIMEOUT_MS, 1_500, 'latency', '1.5 s per request'],
+  ['RPC_READ_TRIES', RPC_READ_TRIES, 2, 'latency', 'reads are tried twice'],
+  ['SLOW_READ_TIMEOUT_MS', SLOW_READ_TIMEOUT_MS, 10_000, 'latency', 'slow reads 10 s'],
+  ['DEFAULT_RPC_LIMITER_MAX_WAIT_MS', DEFAULT_RPC_LIMITER_MAX_WAIT_MS, 3_000, 'latency', '3 s for a slot'],
+  ['RPC_FALLBACK_TIMEOUT_MS default', num(fromSource('server/solana/executionConfig.ts', /RPC_FALLBACK_TIMEOUT_MS \|\| '(\d+)'/)), 15_000, 'latency', '15 s (`RPC_FALLBACK_TIMEOUT_MS`)'],
+  ['confirm poll', num(fromSource('server/solana/transports.ts', /confirmPacing\.sleep\((\d+)\)/)), 400, 'latency', 'status poll every 400 ms'],
+  ['resend interval', num(fromSource('server/solana/transports.ts', /resendEveryMs \?\? ([\d_]+)/)), 1_500, 'latency', 'resent every 1.5 s'],
+  ['blockhash watch extension', num(fromSource('server/solana/transports.ts', /maxExtendMs \?\? ([\d_]+)/)), 60_000, 'latency', 'extended by up to 60 s'],
+  ['SELL_RATE_LIMIT_BACKOFF_MS', [...SELL_RATE_LIMIT_BACKOFF_MS], [500, 1_000, 2_000], 'latency', 'after 0.5 s, 1 s and 2 s'],
+  ['EXIT_RATE_LIMITED_WAIT_MS', EXIT_RATE_LIMITED_WAIT_MS, 6_000, 'latency', '6 s flat'],
+  ['exit pass interval', num(fromSource('server/execution/coordinator.ts', /autoTpSlInterval = setInterval\(async \(\) => \{[\s\S]*?\n {4}\}, (\d+)\);/)), 3_000, 'latency', 'every 3 s'],
+  ['EXIT_SELL_WAIT_MS', EXIT_SELL_WAIT_MS, 2_500, 'latency', 'at most 2.5 s'],
+  ['MARK_STALE_MS', MARK_STALE_MS, 15_000, 'latency', '15 s (`MARK_STALE_MS`)'],
+  ['MARK_RETRY_BASE_MS', MARK_RETRY_BASE_MS, 60_000, 'latency', '60 s doubling to 10 min'],
+  ['MARK_RETRY_MAX_MS', MARK_RETRY_MAX_MS, 600_000, 'latency', '60 s doubling to 10 min'],
+  ['MARK_ALERT_AFTER_MS', MARK_ALERT_AFTER_MS, 60_000, 'latency', '60 s without a mark'],
+  ['mark feed STALE', num(fromSource('server/execution/coordinator.ts', /markAge > (\d+)\) \{\s*\n\s*this\.positionMarkHealth = 'STALE'/)), 90_000, 'latency', 'STALE after 90 s'],
+  ['mark feed DEGRADED', num(fromSource('server/execution/coordinator.ts', /markAge > (\d+)\) \{\s*\n\s*this\.positionMarkHealth = 'DEGRADED'/)), 45_000, 'latency', 'DEGRADED after 45 s'],
+  ['EXIT_RETRY_BASE_MS', EXIT_RETRY_BASE_MS, 3_000, 'latency', '3 s doubling to 30 s'],
+  ['EXIT_RETRY_MAX_MS', EXIT_RETRY_MAX_MS, 30_000, 'latency', '3 s doubling to 30 s'],
+  ['SELL_SLIPPAGE_LADDER_BPS', [...SELL_SLIPPAGE_LADDER_BPS], [800, 1_500, 2_500, 4_000], 'latency', 'slippage 800, 1500, 2500, 4000 bps'],
+  ['PENDING_SELL_WINDOW_MS', num(fromSource('server/execution/coordinator.ts', /const PENDING_SELL_WINDOW_MS = ([\d_]+)/)), 100_000, 'latency', '100 s after the confirm gave up'],
+  ['EXIT_CLAIM_STALE_MS', num(fromSource('server/execution/coordinator.ts', /const EXIT_CLAIM_STALE_MS = (\d+) \* PENDING_SELL_WINDOW_MS/)) * 100_000, 200_000, 'latency', 'stale after 200 s'],
+  ['RPC heartbeat', num(fromSource('server/execution/coordinator.ts', /setInterval\(checkFeed, (\d+)\)/)), 10_000, 'latency', 'every 10 s a `getSlot`'],
+  ['RPC DEGRADED above', num(fromSource('server/execution/coordinator.ts', /this\.rpcLatencyMs > (\d+) \? 'DEGRADED'/)), 800, 'latency', 'over 800 ms is `DEGRADED`'],
+  ['READINESS_RED_LIMIT_MS', READINESS_RED_LIMIT_MS, 10_000, 'latency', '10 s (`READINESS_RED_LIMIT_MS`)'],
+  ['orphanRecoveryDelaysMs', JSON.parse(`[${fromSource('server/execution/coordinator.ts', /orphanRecoveryDelaysMs: number\[\] = \[([\d_, ]+)\]/).replace(/_/g, '')}]`), [5_000, 15_000, 45_000, 120_000, 300_000], 'latency', 'after 5, 15, 45, 120 and 300 s'],
+  ['ORPHAN_MAX_AGE_MS', num(fromSource('server/execution/coordinator.ts', /const ORPHAN_MAX_AGE_MS = (\d+) \* 60_000/)) * 60_000, 15 * 60_000, 'latency', 'the row is 15 min old (`ORPHAN_MAX_AGE_MS`)'],
+  ['reconcileTimeoutMs', num(fromSource('server/execution/coordinator.ts', /private reconcileTimeoutMs = ([\d_]+)/)), 90_000, 'latency', '90 s (`reconcileTimeoutMs`)'],
+  ['reconcile retry', num(fromSource('server/execution/coordinator.ts', /scheduleReconcileRetry\(delayMs = ([\d_]+)\)/)), 15_000, 'latency', 'retried after 15 s'],
+  ['PumpSwap CACHE_TTL_MS', num(fromSource('server/solana/pumpSwapService.ts', /CACHE_TTL_MS = (\d+)/)), 15_000, 'latency', '15 s (`CACHE_TTL_MS`)'],
+  ['PANIC_BUY_SETTLE_WAIT_MS', PANIC_BUY_SETTLE_WAIT_MS.value, 30_000, 'latency', '30 s (`PANIC_BUY_SETTLE_WAIT_MS`)'],
+  ['PANIC_BUY_SETTLE_WAIT_MS (runbook)', PANIC_BUY_SETTLE_WAIT_MS.value, 30_000, 'runbook', 'up to 30 s (`PANIC_BUY_SETTLE_WAIT_MS`)'],
+  ['pending sell (runbook)', num(fromSource('server/execution/coordinator.ts', /const PENDING_SELL_WINDOW_MS = ([\d_]+)/)), 100_000, 'runbook', 'up to 100 s for a pending sell'],
+  ['WALLET_AUDIT_BASE_TOLERANCE_SOL', WALLET_AUDIT_BASE_TOLERANCE_SOL, 0.0005, 'runbook', 'A difference above 0.0005 SOL'],
+  ['LOGIN_RATE_LIMIT attempts', LOGIN_RATE_LIMIT.maxTokens, 5, 'env', '5 attempts, then one every 12 s'],
+  ['LOGIN_RATE_LIMIT refill', Math.round(1 / LOGIN_RATE_LIMIT.refillRatePerSec), 12, 'env', 'one every 12 s'],
+  ['CONFLUENCE_DEVNET_LIVE_FLOOR', CONFLUENCE_DEVNET_LIVE_FLOOR, 50, 'arch', '`CONFLUENCE_DEVNET_LIVE_FLOOR` (50)'],
+  ['DEVNET_MAX_OPEN_POSITIONS', DEVNET_MAX_OPEN_POSITIONS, 1, 'arch', 'one open position (`DEVNET_MAX_OPEN_POSITIONS`)'],
+];
+
+describe('constants named in the docs have the value the docs state', () => {
+  it('has a useful number of rows (so a broken extraction cannot pass by matching nothing)', () => {
+    expect(rows.length).toBeGreaterThan(50);
+  });
+
+  const byName = (name: string): Row => rows.find((r) => r[0] === name)!;
+
+  it.each(rows.map((r) => r[0]))('%s in the code is the value the document states', (name) => {
+    const [, actual, expected] = byName(name);
+    expect(actual).toEqual(expected);
+  });
+
+  it.each(rows.map((r) => r[0]))('%s: the document still says it', (name) => {
+    const [, , , which, phrase] = byName(name);
+    expect(doc[which], `${which} should contain: ${phrase}`).toContain(phrase);
+  });
+});
+
+describe('3B and A3 statements in the documents', () => {
+  it('the journal row name ARCHITECTURE states is the one the code writes', () => {
+    expect(LIVE_BUY_FILLED).toBe('LIVE_BUY_FILLED');
+    expect(doc.arch).toContain("`outcome = 'LIVE_BUY_FILLED'`");
+    expect(doc.arch).toContain('journalLiveBuySolDelta');
+    expect(read('server/execution/coordinator.ts')).toContain('private journalLiveBuySolDelta(');
+  });
+  it('the unresolved-buy count and its refusal text exist in the code as documented', () => {
+    const coordinator = read('server/execution/coordinator.ts');
+    expect(coordinator).toContain('public getUnresolvedLiveBuys(');
+    expect(coordinator).toContain('UNRESOLVED_BUY: the ledger of unresolved LIVE buys could not be read');
+    expect(doc.arch).toContain('UNRESOLVED_BUY: the ledger of unresolved LIVE buys could not be read');
+    expect(doc.arch).toContain('`DEVNET_MAX_OPEN_POSITIONS`');
+    expect(DEVNET_MAX_OPEN_POSITIONS).toBeGreaterThan(0);
+  });
+  it('the failed-sell wait runs down on the monotonic clock, as ARCHITECTURE and KNOWN_RISKS say', () => {
+    expect(String(ExecutionCoordinator.prototype.exitRetryWaitMs)).toContain('performance.now()'); // the wait runs down on the monotonic clock
+    expect(doc.arch).toContain('`setAtMono`');
+    expect(read('KNOWN_RISKS.md')).toContain('Failed-sell retry waits (A3)');
+  });
+});
+
+describe('3E statements in the documents (the code is in the 3E patches)', () => {
+  it('state the figures 3E fixes: 20 trades, 10 s of unknown balance, the refusal and the request field', () => {
+    expect(READINESS_RED_LIMIT_MS).toBe(10_000);
+    for (const phrase of ['last 20', 'LOSS_TRIGGERS_NEED_ACK', 'ackLossTriggers', '10 s']) expect(doc.runbook).toContain(phrase);
+    for (const phrase of ['LOSS_TRIGGER_TRADES', 'auto.lossTriggerAck', 'auto.kill']) expect(doc.arch).toContain(phrase);
+  });
+});
+
+describe('5A and 3H statements in the documents', () => {
+  it('the replay delays LATENCY.md states are the ones the replay uses', () => {
+    expect(REPLAY_DEFAULTS.entryDelayMs).toBe(1_500);
+    expect(REPLAY_DEFAULTS.exitDelayMs).toBe(1_500);
+    expect(doc.latency).toContain('Replay entry delay 1.5 s after release');
+    expect(doc.latency).toContain('replay sell delay 1.5 s after the exit decision');
+  });
+  it('the feed-online window ARCHITECTURE states is the one the callouts feed status uses', () => {
+    expect(PUMP_FEED_ONLINE_WINDOW_MS).toBe(60_000);
+    expect(doc.arch).toContain('`PUMP_FEED_ONLINE_WINDOW_MS` (60 s');
+    for (const status of ['NO_DATA', 'ONLINE', 'STALE']) expect(doc.arch).toContain(`\`${status}\``);
+  });
+});
+
+describe('3E: auto starts OFF at every start, and the documents say so', () => {
+  it('the controller starts OFF, restorePersisted returns the note the docs describe, and no document says a saved mode comes back', async () => {
+    const { autoSnipeController } = await import('../server/auto/controller');
+    const { workstationDb } = await import('../server/db/database');
+    const readme = read('README.md');
+    expect(autoSnipeController.getMode()).toBe('OFF');
+    workstationDb.setSetting('auto.mode', 'PAPER');
+    workstationDb.setSetting('auto.kill', null);
+    const r = await autoSnipeController.restorePersisted();
+    expect(r.mode).toBe('OFF');
+    expect(r.note).toContain('auto starts OFF at every start');
+    expect(workstationDb.getSetting('auto.mode')).toBe('OFF');
+    expect(readme).toContain('OFF at every start');
+    expect(doc.arch).toContain('Auto starts OFF at every start');
+    expect(doc.runbook).toContain('auto starts OFF at every start');
+    const stale = [/back up to PAPER/i, /comes back as SHADOW/i, /last mode and the confluence threshold come back/i, /restorePersisted, saved/];
+    for (const [name, text] of Object.entries({ readme, arch: doc.arch, runbook: doc.runbook })) {
+      for (const re of stale) expect(re.test(text), `${name}: ${re}`).toBe(false);
+    }
+    // the startup restore no longer exists, so it cannot be refused for loss triggers
+    expect(doc.runbook).not.toContain('The restore of a saved mode at startup is refused');
+    expect(doc.arch).not.toContain('and the startup restore are refused');
+  });
+});

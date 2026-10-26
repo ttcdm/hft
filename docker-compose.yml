@@ -1,0 +1,64 @@
+services:
+  apex-trading-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: apex-quant-engine
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:3000:3000' # host loopback only; put an authenticated reverse proxy in front for anything wider
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - OPERATOR_AUTH_TOKEN=${OPERATOR_AUTH_TOKEN:?set OPERATOR_AUTH_TOKEN (16+ chars) in your shell or an .env next to this file}
+      - ALLOWED_CLUSTER=${ALLOWED_CLUSTER:-devnet}
+      - SOLANA_RPC_URL=${SOLANA_RPC_URL:-https://api.devnet.solana.com}
+      - JITO_BLOCK_ENGINE_URL=${JITO_BLOCK_ENGINE_URL:-}
+      - DEFAULT_JITO_TIP_SOL=${DEFAULT_JITO_TIP_SOL:-0.005}
+      - MEMECOIN_SNIPER_ENABLED=${MEMECOIN_SNIPER_ENABLED:-false}
+      - CAPITAL_TIER=${CAPITAL_TIER:-MICRO_10}
+      - BINANCE_API_KEY=${BINANCE_API_KEY:-}
+      - BINANCE_API_SECRET=${BINANCE_API_SECRET:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - APEX_TRACING=${APEX_TRACING:-false} # true sends spans to the jaeger service below; see docs/TRACING.md
+      - APEX_TRACING_OTLP_ENDPOINT=http://jaeger:4318/v1/traces
+      # No signing key is passed in: OPERATOR_PRIVATE_KEY, SOLANA_PRIVATE_KEY and SIGNER_KEYPAIR_PATH are deliberately not listed,
+      # and there is no env_file, so a key in your shell or .env never reaches the container. It starts with no signer (PAPER) unless a
+      # key is generated or imported in the UI, which then lands in the apex-data volume.
+    volumes:
+      - apex-data:/app/data # database and any key made in the UI; survives down and rebuilds (`docker compose down -v` deletes it)
+    healthcheck:
+      test: ['CMD', 'wget', '--spider', '-q', 'http://localhost:3000/api/health']
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: 'json-file'
+      options:
+        max-size: '50m'
+        max-file: '5'
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2048M
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # Optional trace viewer for APEX_TRACING=true. Start it alone with `docker compose up jaeger`, or with the app. Host loopback only.
+  jaeger:
+    image: jaegertracing/all-in-one:1.62.0
+    container_name: apex-jaeger
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:16686:16686' # UI
+      - '127.0.0.1:4318:4318' # OTLP over http: the app, when run outside docker, sends here
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
+volumes:
+  apex-data:

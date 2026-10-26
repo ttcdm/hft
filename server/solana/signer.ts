@@ -1,0 +1,214 @@
+import { Keypair, PublicKey, VersionedTransaction } from '@solana/web3.js';
+import { isReadOnly, assertNotReadOnly } from './readOnly';
+import fs from 'fs';
+import path from 'path';
+import bs58 from 'bs58';
+import { parseSecretKey } from './parseSecretKey';
+import crypto from 'crypto';
+import { SignerStatus } from '../core/types';
+import { Logger } from '../middleware/enterprise';
+import { acquireLock, signerLockPath } from '../system/instanceLock';
+
+export interface TransactionSigner {
+  getPublicKey(): PublicKey;
+  getStatus(): SignerStatus;
+  signTransaction(transaction: VersionedTransaction): Promise<VersionedTransaction>;
+  signMessage(message: Uint8Array): Promise<Uint8Array>;
+}
+
+// Ed25519 PKCS#8 DER header (16 bytes)
+// RFC 8410: id-Ed25519 is 1.3.101.112 -> 06 03 2B 65 70
+const ED25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
+
+export class LocalKeypairSigner implements TransactionSigner {
+  private keypair: Keypair | null = null;
+  private status: SignerStatus = 'NOT_CONFIGURED';
+  private keypairPath: string = '';
+  private nodePrivateKey: crypto.KeyObject | null = null;
+
+  constructor() {
+    this.initializeSigner();
+  }
+
+  private initializeSigner() {
+    // S185: read-only mode loads no key at all: not from the environment, not from a file. The status stays NOT_CONFIGURED.
+    if (isReadOnly()) {
+      this.keypairPath = '';
+      this.status = 'NOT_CONFIGURED';
+      return;
+    }
+    // Q5: the file this signer would write to is known up front, also when the key itself came from the environment.
+    this.keypairPath = process.env.SIGNER_KEYPAIR_PATH || path.join(process.cwd(), '.apex_trading_keypair.json');
+    const envPrivateKey = process.env.OPERATOR_PRIVATE_KEY || process.env.SOLANA_PRIVATE_KEY;
+    if (envPrivateKey) {
+      try {
+        const raw = envPrivateKey.trim();
+        const secretKeyBytes = parseSecretKey(raw);
+        if (secretKeyBytes.length === 64) {
+          this.setKeypair(Keypair.fromSecretKey(secretKeyBytes));
+          Logger.info(`Local hot signer loaded securely from environment: ${this.keypair!.publicKey.toBase58().slice(0, 4)}...${this.keypair!.publicKey.toBase58().slice(-4)}`);
+          return;
+        } else {
+          Logger.warn(`Invalid environment private key byte length (${secretKeyBytes.length}). Expected 64.`);
+        }
+      } catch (err: any) {
+        Logger.error(`Failed to load keypair from OPERATOR_PRIVATE_KEY: ${err.message}`);
+      }
+    }
+
+    const envPath = process.env.SIGNER_KEYPAIR_PATH;
+    const defaultPath = path.join(process.cwd(), '.apex_trading_keypair.json');
+    const targetPath = envPath || defaultPath;
+    this.keypairPath = targetPath;
+
+    try {
+      if (fs.existsSync(targetPath)) {
+        const raw = fs.readFileSync(targetPath, 'utf8').trim();
+        const secretKeyBytes = parseSecretKey(raw);
+
+        if (secretKeyBytes.length === 64) {
+          this.setKeypair(Keypair.fromSecretKey(secretKeyBytes));
+          Logger.info(`Local hot signer loaded securely: ${this.keypair!.publicKey.toBase58().slice(0, 4)}...${this.keypair!.publicKey.toBase58().slice(-4)}`);
+        } else {
+          Logger.warn(`Invalid secret key length at ${targetPath}. Expected 64 bytes, got ${secretKeyBytes.length}. Signer locked.`);
+          this.status = 'LOCKED';
+        }
+      } else {
+        this.status = 'NOT_CONFIGURED';
+      }
+    } catch (err: any) {
+      Logger.error(`Failed to load keypair from ${targetPath}: ${err.message}`);
+      this.status = 'LOCKED';
+    }
+  }
+
+  private setKeypair(kp: Keypair) {
+    this.keypair = kp;
+    this.status = 'READY';
+
+    // Derive Node crypto.KeyObject for Ed25519 message signing
+    try {
+      const seed = Buffer.from(kp.secretKey.slice(0, 32));
+      const der = Buffer.concat([ED25519_PKCS8_PREFIX, seed]);
+      this.nodePrivateKey = crypto.createPrivateKey({ key: der, format: 'der', type: 'pkcs8' });
+    } catch (err: any) {
+      Logger.error(`Failed to construct Ed25519 crypto KeyObject: ${err.message}`);
+      this.nodePrivateKey = null;
+    }
+  }
+
+  public hasExistingFile(): boolean {
+    const targetPath = this.keypairPath || path.join(process.cwd(), '.apex_trading_keypair.json');
+    return fs.existsSync(targetPath);
+  }
+
+  // Generates a dedicated local low-balance trading keypair file with restricted permissions (0600)
+  // Protected against accidental overwriting of existing keypairs with funds
+  public generateDedicatedTradingKeypair(forceOverwrite = false): { publicKey: string; path: string } {
+    assertNotReadOnly('generating a signing key'); // S186
+    const targetPath = this.keypairPath || path.join(process.cwd(), '.apex_trading_keypair.json');
+
+    // Q5: a key that is already loaded (from OPERATOR_PRIVATE_KEY, SIGNER_KEYPAIR_PATH or the default file) is never swapped at runtime:
+    // open positions are sold with the key that bought them, and after a restart the environment key would win over a new file anyway.
+    if (this.keypair && !forceOverwrite) {
+      throw new Error(
+        `A signing key already exists in this process (${this.keypair.publicKey.toBase58().slice(0, 4)}...). It is not replaced at runtime; set up a new key with: npm run signer:import, then restart.`
+      );
+    }
+
+    if (fs.existsSync(targetPath) && !forceOverwrite) {
+      throw new Error(
+        `A keypair file already exists at ${targetPath}. Explicit forceOverwrite: true confirmation required to prevent permanent loss of funds.`
+      );
+    }
+
+    const newKeypair = Keypair.generate();
+    const secretArray = Array.from(newKeypair.secretKey);
+
+    fs.writeFileSync(targetPath, JSON.stringify(secretArray), { mode: 0o600 });
+    this.setKeypair(newKeypair);
+
+    Logger.info(`Generated new dedicated trading keypair: ${newKeypair.publicKey.toBase58()} at ${targetPath} (mode 0600)`);
+    return {
+      publicKey: newKeypair.publicKey.toBase58(),
+      path: targetPath,
+    };
+  }
+
+  public importKeypair(secretKeyInput: string, forceOverwrite = false): { publicKey: string; path: string } {
+    assertNotReadOnly('importing a signing key'); // S186
+    const targetPath = this.keypairPath || path.join(process.cwd(), '.apex_trading_keypair.json');
+
+    if (fs.existsSync(targetPath) && !forceOverwrite) {
+      throw new Error(
+        `A keypair file already exists at ${targetPath}. Explicit forceOverwrite: true required.`
+      );
+    }
+
+    const secretKeyBytes = parseSecretKey(secretKeyInput);
+
+    if (secretKeyBytes.length !== 64) {
+      throw new Error(`Invalid secret key length. Expected 64 bytes, got ${secretKeyBytes.length}.`);
+    }
+
+    const kp = Keypair.fromSecretKey(secretKeyBytes);
+    fs.writeFileSync(targetPath, JSON.stringify(Array.from(kp.secretKey)), { mode: 0o600 });
+    this.setKeypair(kp);
+
+    Logger.info(`Successfully imported keypair: ${kp.publicKey.toBase58()} (mode 0600)`);
+    return {
+      publicKey: kp.publicKey.toBase58(),
+      path: targetPath,
+    };
+  }
+
+  public generateNewKeypair(forceOverwrite = false): string {
+    assertNotReadOnly('generating a signing key'); // S186
+    return this.generateDedicatedTradingKeypair(forceOverwrite).publicKey;
+  }
+
+  public importSecretKey(secretKeyInput: string, forceOverwrite = false): string {
+    assertNotReadOnly('importing a signing key'); // S186
+    return this.importKeypair(secretKeyInput, forceOverwrite).publicKey;
+  }
+
+  public exportKeypair(): Keypair | null {
+    return this.keypair;
+  }
+
+  public getPublicKey(): PublicKey {
+    if (!this.keypair) {
+      throw new Error('Signer not configured or locked. Cannot retrieve public key.');
+    }
+    return this.keypair.publicKey;
+  }
+
+  public getStatus(): SignerStatus {
+    return this.status;
+  }
+
+  public async signTransaction(transaction: VersionedTransaction): Promise<VersionedTransaction> {
+    assertNotReadOnly('signing a transaction');
+    if (!this.keypair || this.status !== 'READY') {
+      throw new Error('Local signer is not ready to sign transactions');
+    }
+    // P1.1 (N-52, N-57): one process per signing key. The first signature takes `<APEX_LOCK_DIR>/<pubkey>.lock` (re-entrant for this
+    // process); another live process holding it makes this throw INSTANCE_LOCKED before anything is signed.
+    const pub = this.keypair.publicKey.toBase58();
+    acquireLock(signerLockPath(pub), { walletPubkey: pub });
+    transaction.sign([this.keypair]);
+    return transaction;
+  }
+
+  public async signMessage(message: Uint8Array): Promise<Uint8Array> {
+    assertNotReadOnly('signing a message');
+    if (!this.keypair || this.status !== 'READY' || !this.nodePrivateKey) {
+      throw new Error('Local signer is not ready to sign messages');
+    }
+    // Real Ed25519 cryptographic message signature via Node crypto.sign
+    const sig = crypto.sign(null, Buffer.from(message), this.nodePrivateKey);
+    return new Uint8Array(sig);
+  }
+}
+
+export const localSigner = new LocalKeypairSigner();

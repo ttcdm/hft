@@ -1,0 +1,1 @@
+{"name":"Apex Quant HFT — Workstation","description":"Low-latency Solana memecoin trading research and execution workstation featuring event-driven market ingestion, pre-trade risk controls, Solana transaction builder, Jito bundle transport, verifiable paper trading, and telemetry.","requestFramePermissions":[],"majorCapabilities":["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]}

@@ -1,0 +1,23 @@
+import net from 'node:net';
+import { describe, it, expect } from 'vitest';
+import { executionCoordinator } from '../server/execution/coordinator';
+import { resolveRpcUrl } from '../server/solana/clusterGuard';
+
+describe('K1b: tests never reach a real cluster', () => {
+  it('the default RPC and the coordinator singleton point at loopback under vitest', () => {
+    expect(resolveRpcUrl()).toBe('http://127.0.0.1:9');
+    expect(new URL(executionCoordinator.getConnection().rpcEndpoint).hostname).toBe('127.0.0.1');
+  });
+
+  it('a connection to a public host is refused and recorded', () => {
+    const sock = new net.Socket();
+    (globalThis as any).__expectNetworkGuardHits = true; // deliberate probe: marked so an audit log can tell it from a leak
+    try {
+      expect(() => sock.connect(443, 'api.devnet.solana.com')).toThrow(/TEST_NETWORK_GUARD/);
+      expect(() => sock.connect({ port: 443, host: 'api.mainnet-beta.solana.com' })).toThrow(/TEST_NETWORK_GUARD/);
+    } finally { (globalThis as any).__expectNetworkGuardHits = false; }
+    const hits = (globalThis as any).__networkGuardHits as string[];
+    expect(hits.length).toBe(2);
+    hits.length = 0; // consumed: the setup file's afterEach fails any test that leaves hits behind
+  });
+});

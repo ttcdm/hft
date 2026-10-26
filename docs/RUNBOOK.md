@@ -16,9 +16,10 @@ Where to look:
 
 | Route | Shows |
 |---|---|
-| `GET /api/system/checks` | cluster, signer, RPC, reconciliation, halt, kill switch and circuit breaker, feed, marks, database, and the open operator alerts (`TRADING_HALTED`, `EXIT_FAILING`, `EXIT_QUOTE_FAILING`, `EXIT_RATE_LIMITED`, `POSITION_MARK_UNAVAILABLE`, ...) |
+| `GET /api/system/checks` | cluster, signer, RPC, reconciliation, halt, kill switch and circuit breaker, feed, marks, database, and the open operator alerts (`TRADING_HALTED`, `HALT_NOT_PERSISTED`, `KILL_SWITCH_WAS_ON`, `EXIT_FAILING`, `EXIT_QUOTE_FAILING`, `EXIT_RATE_LIMITED`, `EXIT_NO_SIGNER`, `SELL_ADOPTED`, `UNTRACKED_TOKEN_BALANCE`, `POSITION_NOT_PERSISTED`, `POSITION_MARK_UNAVAILABLE`, ...). The capacity row also shows how many seller funder lookups ended unread |
 | `GET /api/execution/can-arm` | `allowed`, plus every reason arming would fail |
 | `GET /api/execution/mode` | coordinator mode and `isLiveArmed` |
+| `GET /api/execution/readiness` | every readiness component, the same list `can-arm` is built from |
 | `GET /api/auto/status` | auto mode, session, budgets, kill triggers |
 | `GET /api/diagnostics/system` | `systemAudit.killSwitchActive`, `riskControls.circuitBreakerState`, wallet balance, RPC host and latency |
 | `GET /api/workstation/positions` | positions; add `?status=ACTIVE` and `&mode=LIVE` to filter |
@@ -58,9 +59,9 @@ The kill switch runs the shared emergency stop without the sells: kill switch on
 api -X POST $APEX/api/wallet/panic-liquidate
 ```
 
-What it does, in this order: kill switch on; auto killed (it waits for a buy auto already had in flight, so that position is sold too) and OFF; LIVE disarmed; then a 100% sell of every active position of every mode, RECOVERED balances included, one at a time, with the protective reason `EMERGENCY_PANIC_LIQUIDATION` (it runs during a halt and the dust check does not refuse it). A position whose exit was already in flight (for example a take-profit partial) is waited for, then re-read and the rest of it sold. The active positions are read once more after the loop and any new one is sold too.
+What it does, in this order: kill switch on; auto killed (it waits for a buy auto already had in flight, so that position is sold too) and OFF; LIVE disarmed; then it waits up to 30 s (`PANIC_BUY_SETTLE_WAIT_MS`) for every other LIVE buy already past the risk gate (a manual buy, a callout or Telegram snipe), so the position that buy opens is sold too; then a 100% sell of every active position of every mode, RECOVERED balances included, one at a time, with the protective reason `EMERGENCY_PANIC_LIQUIDATION` (it runs during a halt and the dust check does not refuse it). A position whose exit was already in flight (for example a take-profit partial) is waited for, then re-read and the rest of it sold. The active positions are read once more after the loop and any new one is sold too.
 
-Read the reply: `Failed` lists the positions still open, for example one with a sell still being verified (`SELL_PENDING_VERIFICATION`) or one another process is selling (`EXIT_IN_PROGRESS`). Wait a few seconds (up to 100 s for a pending sell) and run panic again until nothing fails. The message also says whether auto was confirmed stopped.
+Read the reply: `Failed` lists the positions still open, for example one with a sell still being verified (`SELL_PENDING_VERIFICATION`) or one another process is selling (`EXIT_IN_PROGRESS`), and a LIVE buy still being sent or confirmed when the panic ended (`BUY_IN_FLIGHT`, listed as `buy-<mint>`; it may open a position after the reply, so run the panic again). Wait a few seconds (up to 100 s for a pending sell) and run panic again until nothing fails. The message also says whether auto was confirmed stopped.
 
 The WebSocket `PANIC_LIQUIDATE` action and Telegram `/panic_sell` run the same stop. Do not rely on Telegram for it: Telegram cannot deliver the command (no webhook is registered with Telegram and nothing polls for updates); it runs only when something posts it to `POST /api/telegram/webhook` with the operator token.
 
@@ -69,7 +70,7 @@ The WebSocket `PANIC_LIQUIDATE` action and Telegram `/panic_sell` run the same s
 1. Do 1.1 (or 1.2 if you want to be flat).
 2. Check what is open, and accept that it will have no stop-loss once the process is down: `api "$APEX/api/workstation/positions?status=ACTIVE&mode=LIVE"`.
 3. Stop the process (Ctrl-C, or `docker compose down`).
-4. Before starting it again, decide whether it may send. On a restart LIVE is disarmed and no buy can happen until someone arms, but exits of open LIVE positions resume at once with the loaded key. To keep it from sending at all, start it without a signer (no `OPERATOR_PRIVATE_KEY`, `SOLANA_PRIVATE_KEY`, or keypair file at `SIGNER_KEYPAIR_PATH` / `./.apex_trading_keypair.json`); keep the throwaway key file somewhere safe rather than deleting it. With no signer, LIVE exits fail with `Signer is not configured or locked`.
+4. Before starting it again, decide whether it may send. On a restart LIVE is disarmed and no buy can happen until someone arms, but exits of open LIVE positions resume at once with the loaded key. A sell claim left by the process that was stopped does not hold the stop-loss up: the claim owner carries a per-run id, so a claim from another run of the same pid (PID 1 in Docker) counts as dead. To keep it from sending at all, start it without a signer (no `OPERATOR_PRIVATE_KEY`, `SOLANA_PRIVATE_KEY`, or keypair file at `SIGNER_KEYPAIR_PATH` / `./.apex_trading_keypair.json`); keep the throwaway key file somewhere safe rather than deleting it. With no signer, LIVE exits fail with `Signer is not configured or locked` and the `EXIT_NO_SIGNER` alert is raised for each LIVE position (it names read-only mode when that is the cause, and clears on a fill).
 
 ### 1.4 Move devnet SOL off the throwaway key
 
@@ -95,7 +96,7 @@ Facts to keep in mind:
 To recover:
 1. Fix the cause (RPC, wallet balance, losses).
 2. `api -X POST $APEX/api/execution/kill-switch -d '{"activate":false}'`.
-3. If the breaker is `OPEN`, restart the server.
+3. If the reply says `circuitBreakerReset` did not close the breaker, wait for a wallet-balance read to succeed (System checks shows when the latest one did) and send the reset again. A restart also closes it, because the breaker is held in memory only.
 4. Re-arm only when `can-arm` is clean: `api -X POST $APEX/api/execution/arm -d '{"arm":true,"confirmationCode":"CONFIRM_LIVE_TRADING_RISK"}'`.
 5. Set the auto mode yourself: `api -X POST $APEX/api/auto/mode -d '{"mode":"DEVNET_LIVE","confirmationCode":"CONFIRM_AUTO_DEVNET"}'` (or `SHADOW` / `PAPER`).
 
@@ -110,3 +111,34 @@ To recover:
 2. Compare the wallet's history on a devnet explorer (`?cluster=devnet`) with what the app recorded. Explain every move.
 3. If every move is explained: `api -X POST $APEX/api/auto/resume -d '{"clearHalt":true}'`. It clears the halt only and never turns auto back on. Then arm and set the mode (section 2 steps 4-5).
 4. If a move is not explained, treat the key as compromised: panic (1.2), stop the process (1.3), move what is left (1.4) and generate a new throwaway devnet key.
+
+## 4. Buys refused with DAILY_LOSS_LIMIT (the net daily PnL floor)
+
+The risk engine refuses a buy as `DAILY_LOSS_LIMIT` when the net PnL of the last 24 hours (realized, plus open unrealized, minus unbooked fees; not since UTC midnight) has reached the floor, or when the new order plus every open position going to zero would break it. The floor is `MAX_DAILY_LOSS_USD` converted at the SOL price (see [`ENV.md`](ENV.md) for the stale-price rule). It is a separate control from the halt in section 3 and from the auto kill trigger of the same name (which drops auto to SHADOW; section 2).
+
+Two different refusals:
+- **Latched.** The message starts `Net daily PnL floor latched at ...` or says `latched until an operator clears it`. The refusal holds for that mode (LIVE and PAPER are latched separately) even after the losses leave the 24 h window, until you clear it. The message ends with when the oldest loss in the window leaves it.
+- **Worst case.** The message says `if this order and the open positions (... SOL at risk) went to zero, net PnL over 24 h would be ...`. Nothing is latched; the buy passes again once an open position closes or the window moves. If it says `MAX_DAILY_LOSS_USD (... SOL) is smaller than this ... SOL order with its costs`, no buy of that size can ever pass: raise `MAX_DAILY_LOSS_USD` or lower the order size, and restart (the floor comes from the environment, not from `POST /api/wallet/config`, which refuses `riskLimits.maxDailyLossUsd`).
+
+To resume:
+1. Find out why the losses happened (`api "$APEX/api/workstation/positions?status=CLOSED"`, the decision journal). Do not clear the latch to get around a losing strategy.
+2. `api -X POST $APEX/api/auto/resume -d '{"clearDailyLossLatch":true}'`. This clears the latch only; `clearHalt` does not clear it, and this flag does not clear a halt. Send both flags in one request to clear both.
+3. If the 24 h window still holds net losses at or beyond the floor, the next buy is refused and latches again. Wait for the window to move (the message says when), or raise `MAX_DAILY_LOSS_USD` in the environment and restart.
+
+The latch is held in memory. After a restart it is gone, but the 24 h window still holds the losses, so the next buy latches again; a restart more than 24 h after the losses starts clean.
+
+## 5. A buy is refused as LIVE_NOT_READY (or ENTRY_REVOKED)
+
+Every LIVE buy re-reads a short readiness list (section 3 of [`ARCHITECTURE.md`](ARCHITECTURE.md)), not only the arm. The reply names each failing item:
+
+| Message says | Meaning | What to do |
+|---|---|---|
+| `the RPC is not on the allowed cluster (...)` | the heartbeat saw a wrong or unreadable genesis hash, or the database's cluster stamp is unreadable (`DB_CLUSTER_STAMP_UNREADABLE`) | fix the endpoint; the heartbeat clears it on its next passing check (10 s) |
+| `Solana RPC is DISCONNECTED` | no working connection (`DEGRADED`, over 800 ms, does not refuse a buy) | fix the RPC |
+| `the workstation database is not writable` | a real test write failed, or less than 16 MiB is free on the database's disk | free disk space or fix the database; a pass is cached for 1 s |
+| `startup reconciliation is ...` | not `EXECUTION_READY`: `RECONCILIATION_MISMATCH`, or not finished | resolve the rows it names, then `api -X POST $APEX/api/execution/reconcile`; this blocks buys only, exits keep running |
+| `the risk circuit breaker is OPEN` | three failed wallet-balance reads | section 2 |
+| `the position mark feed is STALE` | no fresh position marks | check the RPC; open positions have no price meanwhile |
+| `DEMO_MODE=true (...)` | the demo switch is on | unset `DEMO_MODE` and restart; LIVE cannot be armed while it is on |
+
+`ENTRY_REVOKED: ... after the order was approved; nothing was sent` means one of these (or a disarm, a halt or the kill switch) happened between approval and the send; the signed transaction was dropped unsent. Sells are never refused for these reasons.

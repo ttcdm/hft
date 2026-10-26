@@ -14,7 +14,8 @@ afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
 describe('S190 recorder limits are configurable, with sized defaults', () => {
   it('normal server: 30 min, 2,000 trades, 14 days, 3,000,000 rows', () => {
-    expect(recorderConfig({})).toEqual({ mintMs: 30 * 60_000, maxTradesPerMint: 2_000, retentionDays: 14, maxRows: RECORD_DEFAULT_MAX_ROWS });
+    // 5A: 35 minutes, and the trade cap scales with the window (two 30-minute steps)
+    expect(recorderConfig({})).toEqual({ mintMs: 35 * 60_000, maxTradesPerMint: 4_000, retentionDays: 14, maxRows: RECORD_DEFAULT_MAX_ROWS });
     expect(RECORD_DEFAULT_MAX_ROWS).toBeGreaterThanOrEqual(3_000_000);
   });
   it('read-only (the paper copy): 180 min, trades scaled to the window, 6,000,000 rows', () => {

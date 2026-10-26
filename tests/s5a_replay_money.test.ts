@@ -300,3 +300,16 @@ describe('5A: what the recording window may assume', () => {
     expect(replayLaunch(rec, [], 150, { ...GATE, ...W }).outcome).toBe('OPEN_AT_END');
   });
 });
+
+
+// ---- the recorder window (its own commit, so it can be dropped or moved to 5B) -------------------------------------------------------
+import { recorderConfig } from '../server/backtest/recorderConfig';
+import { ExitEngine } from '../server/exits/exitEngine';
+
+describe('5A (R1-101): the default recording window is long enough to see a stale exit', () => {
+  it('35 minutes covers the watch window maximum, the entry delay and the stale timeout', () => {
+    const { mintMs } = recorderConfig({});
+    expect(mintMs).toBe(35 * 60_000);
+    expect(mintMs).toBeGreaterThan(WATCH_MAX_MS + REPLAY_DEFAULTS.entryDelayMs + ExitEngine.STALE_POSITION_HOLD_MS + REPLAY_DEFAULTS.exitDelayMs);
+  });
+});

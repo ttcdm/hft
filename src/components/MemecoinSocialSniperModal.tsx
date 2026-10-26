@@ -123,6 +123,15 @@ export function ExitRulesNote({ rules }: { rules: ExitRulesData | null }) {
   );
 }
 
+/** What the Telegram "Save Config" click reports, from the server's answer (it used to say "saved securely" without waiting for one). */
+export function telegramSaveOutcome(res: any): { level: 'INFO' | 'WARNING'; title: string; message: string } {
+  if (res?.status === 'OK') {
+    const tokenNote = res.config?.botTokenSet ? 'a bot token is set' : 'no bot token is set';
+    return { level: 'INFO', title: 'TELEGRAM SETTINGS SAVED', message: `Saved in server memory until the next restart; ${tokenNote}. No alerts are sent automatically.` };
+  }
+  return { level: 'WARNING', title: 'TELEGRAM SETTINGS NOT SAVED', message: `The server did not confirm the save${res?.error ? `: ${res.error}` : ''}.` };
+}
+
 interface MemecoinSocialSniperModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -175,7 +184,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const [terminalHistory, setTerminalHistory] = useState<Array<{ sender: 'USER' | 'BOT'; text: string; time: string }>>([
     {
       sender: 'BOT',
-      text: '🤖 APEX QUANT TELEGRAM BOT ENGINE ONLINE\nListening to alpha channels and market maker bots on Telegram & X.com.\nType /help or /signals to view intelligence stream.',
+      text: '🤖 Local command console for the Telegram command handler. It does not read Telegram or X.com; commands typed here run on this server.\nType /help or /signals.',
       time: new Date().toLocaleTimeString(),
     },
   ]);
@@ -1397,7 +1406,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                     <span>Telegram API Credentials</span>
                   </h4>
                   <p className="text-slate-400 text-[11px]">
-                    Connect your private BotFather token to broadcast instant pump and migration alerts to your private channel.
+                    A bot token lets you test the connection and send one ping. Nothing is sent to Telegram automatically: alert forwarding is not built, and commands run only when something posts to /api/telegram/webhook.
                   </p>
 
                   <div>
@@ -1428,12 +1437,13 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
                   <div className="flex items-center space-x-2 pt-1">
                     <button
-                      onClick={() => {
-                        engineClient.updateTelegramConfig({
+                      onClick={async () => {
+                        const res = await engineClient.updateTelegramConfig({
                           botToken: sniperConfig.telegramBotToken,
                           chatId: sniperConfig.telegramChatId,
                         });
-                        onAlertTrigger?.('INFO', 'CONFIG SAVED', 'Telegram credentials saved securely.');
+                        const out = telegramSaveOutcome(res);
+                        onAlertTrigger?.(out.level, out.title, out.message);
                       }}
                       className="flex-1 py-2 rounded bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700 font-bold text-xs transition"
                     >

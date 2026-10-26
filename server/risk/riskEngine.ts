@@ -136,11 +136,15 @@ export class HardenedRiskEngine {
     return `the oldest loss in the 24 h window leaves it at ${new Date(oldest + DAILY_LOSS_WINDOW_MS).toISOString()}`;
   }
 
+  /** The last wallet-balance read the coordinator reported (recordRpcSuccess / recordRpcFailure); null before the first one. */
+  private lastBalanceRead: { ok: boolean; at: number } | null = null;
+
   public recordRpcFailure(): boolean {
     this.consecutiveRpcFailures++;
+    this.lastBalanceRead = { ok: false, at: Date.now() };
     if (this.consecutiveRpcFailures >= this.maxConsecutiveRpcFailures) {
       this.setCircuitBreaker('OPEN');
-      this.setKillSwitch(true);
+      this.setKillSwitch(true, `circuit breaker: ${this.consecutiveRpcFailures} wallet balance reads failed in a row`);
       Logger.error(
         `CIRCUIT BREAKER AUTO-TRIPPED: ${this.consecutiveRpcFailures} consecutive RPC failures detected. Emergency halt activated.`
       );
@@ -151,6 +155,29 @@ export class HardenedRiskEngine {
 
   public recordRpcSuccess() {
     this.consecutiveRpcFailures = 0;
+    this.lastBalanceRead = { ok: true, at: Date.now() };
+  }
+
+  public getLastBalanceRead(): { ok: boolean; at: number } | null {
+    return this.lastBalanceRead ? { ...this.lastBalanceRead } : null;
+  }
+
+  /**
+   * The operator's way to close an open breaker (Mike's choice: a manual reset, never an automatic one). It closes only when the
+   * latest wallet-balance read succeeded, so a reset while the RPC is still failing leaves it OPEN and says why. Called by the
+   * kill-switch reset (POST /api/execution/kill-switch {activate:false}). Before this, nothing ever closed the breaker short of a restart.
+   */
+  public resetCircuitBreaker(): { state: CircuitBreakerState; closed: boolean; reason: string } {
+    if (this.circuitBreakerState === 'CLOSED') return { state: 'CLOSED', closed: true, reason: 'the circuit breaker was not open' };
+    const last = this.lastBalanceRead;
+    if (!last || !last.ok) {
+      const reason = !last
+        ? 'no wallet balance read has been made since it opened'
+        : `the latest wallet balance read failed (${this.consecutiveRpcFailures} in a row); it closes on a reset after a read succeeds`;
+      return { state: this.circuitBreakerState, closed: false, reason };
+    }
+    this.setCircuitBreaker('CLOSED');
+    return { state: 'CLOSED', closed: true, reason: `closed: the latest wallet balance read succeeded ${Math.round((Date.now() - last.at) / 1000)}s ago` };
   }
 
   public getRpcFailureCount(): number {

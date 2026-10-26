@@ -74,7 +74,8 @@ describe('Accounting & Reconciliation — Curve Math and PnL', () => {
     expect(quote.side).toBe('BUY');
     expect(quote.mint).toBe(dummyMint.toBase58());
     expect(quote.expectedSolAmountLamports).toBe(100_000_000); // 0.1 SOL
-    expect(quote.protocolFeeLamports).toBe(1_000_000);        // 1% of 0.1 SOL = 0.001 SOL
+    // 5A (N-41): the fee is on the curve input, not the gross: 0.1 SOL - floor((0.1 SOL - 1) x 1e4 / 10100) = 990,100 lamports
+    expect(quote.protocolFeeLamports).toBe(990_100);
     expect(BigInt(quote.tokenAmountRaw)).toBeGreaterThan(0n);
     expect(quote.spotPriceSol).toBeGreaterThan(0);
     expect(quote.executionPriceSol).toBeGreaterThanOrEqual(quote.spotPriceSol);

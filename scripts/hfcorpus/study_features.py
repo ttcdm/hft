@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """S197c step 4: which first-2-minute facts separate launches that reach 2x within the next 10 minutes (from the 2-minute price) from those that do not?
-   python3 scripts/hfcorpus/study_features.py --db clean.duckdb --tokens tokens.parquet --scores scores.csv --out DIR"""
+   python3 scripts/hfcorpus/study_features.py --db clean.duckdb --tokens tokens.parquet --scores scores.csv --out DIR
+5C (R1-109): the population is every launch a buyer could have bought at the 2-minute mark: a trade in the first 2 minutes and not graduated
+by then. A launch with no later trade stays in as a non-hit; keeping only launches that trade later used the future and overstated every rate."""
 import argparse, duckdb, pandas as pd, numpy as np, os
 ap = argparse.ArgumentParser(); ap.add_argument('--db', required=True); ap.add_argument('--tokens', required=True); ap.add_argument('--scores', required=True); ap.add_argument('--out', required=True); a = ap.parse_args()
 os.makedirs(a.out, exist_ok=True)
@@ -32,11 +34,12 @@ with f as (
 top as (select mint, max(s) top_buyer_sol from (select mint, w, sum(sol) s from tr where tmin < 2 and is_buy group by mint, w) group by mint)
 select f.*, top.top_buyer_sol, l.ref_price from f join launch l using (mint) left join top using (mint)"""
 d = c.execute(q).df()
-t = duckdb.connect().execute(f"select mint, detected_at, dev_buy_pct_corrected dev_buy_pct, initial_buy_sol, creator_past_tokens, creator_past_rugs, is_mayhem_mode::int mayhem, initial_holder_count from read_parquet('{a.tokens}')").df()
+t = duckdb.connect().execute(f"select mint, detected_at, epoch_ms(graduated_at) - epoch_ms(detected_at) graduated_after_ms, dev_buy_pct_corrected dev_buy_pct, initial_buy_sol, creator_past_tokens, creator_past_rugs, is_mayhem_mode::int mayhem, initial_holder_count from read_parquet('{a.tokens}')").df()
 d = d.merge(t, on='mint', how='left')
 s = pd.read_csv(a.scores); d = d.merge(s[['mint', 'verdict', 'score']], on='mint', how='left')
-d = d[d.n_after > 0].copy()          # a later trade exists, so a fill after the 2-minute mark was possible
-d['hit'] = (d.fwd_peak / d.px2 >= 2).astype(int)
+# 5C (R1-109): known at the 2-minute mark: it traded, and it has not graduated (a graduated curve cannot be bought). Whether it trades again is not known then.
+d = d[~(d.graduated_after_ms <= 120_000).fillna(False).astype(bool)].copy()
+d['hit'] = (d.fwd_peak / d.px2 >= 2).fillna(False).astype(int)   # no later trade: no 2x, a non-hit
 d['buy_ratio'] = d.n_buys / d.n_trades
 d['top_buyer_share'] = d.top_buyer_sol / d.buy_sol.replace(0, np.nan)
 d['net_flow'] = d.buy_sol - d.sell_sol
@@ -44,8 +47,8 @@ d['px_mult_2m'] = d.px2 / d.ref_price
 d['flow_rising'] = (d.net_last30s - d.net_prev30s)
 d['creator_sold'] = d.creator_sold.astype(float)
 base = d.hit.mean()
-emit('Population', pd.DataFrame([dict(launches=len(d), reached_2x_in_10min=int(d.hit.sum()), base_rate=base, with_confluence_score=int(d.score.notna().sum()), hit_rate_with_score=d[d.score.notna()].hit.mean())]),
-     'Launches with a trade in the first 2 min and a later trade. Hit = highest price in minutes 2-12 >= 2x the price at the 2-minute mark.')
+emit('Population', pd.DataFrame([dict(launches=len(d), no_trade_after_2min=int((d.n_after == 0).sum()), reached_2x_in_10min=int(d.hit.sum()), base_rate=base, with_confluence_score=int(d.score.notna().sum()), hit_rate_with_score=d[d.score.notna()].hit.mean())]),
+     'Launches with a trade in the first 2 min, not graduated by then, whether or not they trade again (5C). Hit = highest price in minutes 2-12 >= 2x the price at the 2-minute mark; a launch with no later trade is a non-hit.')
 
 feats = ['n_trades', 'n_buys', 'buy_ratio', 'uniq_buyers', 'buy_sol', 'sell_sol', 'net_flow', 'top_buyer_share', 'creator_sold', 'first_trade_s', 'curve2', 'px_mult_2m', 'net_last30s', 'flow_rising',
          'dev_buy_pct', 'initial_buy_sol', 'creator_past_tokens', 'creator_past_rugs', 'mayhem', 'initial_holder_count', 'score']

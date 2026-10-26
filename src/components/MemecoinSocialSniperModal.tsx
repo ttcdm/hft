@@ -13,7 +13,8 @@
  */
 import { signalFeedBadge } from '../utils/signalBadge';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
-import { probeBadge, probeLatency, hostOfService } from '../utils/probeBadge';
+import { usePolled } from '../utils/usePolled';
+import { probeBadge, probeBadgeClass, probeLatency, hostOfService, connectivityAuditSummary } from '../utils/probeBadge';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
 import { useAutoStatus, AutoModeBadge, type AutoMode } from './AutoPanel';
 import { buildPoolSnipeRequest } from '../utils/poolSnipe';
@@ -42,7 +43,6 @@ import {
   Terminal,
   Crosshair,
   RefreshCw,
-  Coins,
   CheckCircle2,
   XCircle,
   Clock,
@@ -67,6 +67,7 @@ import { engineClient } from '../services/engineClient';
 import { hftAudio } from '../utils/audio';
 import { PumpFunHotCalloutsView } from './PumpFunHotCalloutsView';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
+import { BELOW_HEADER_TOP } from '../utils/headerOffset';
 
 /**
  * P1.4 (N-12): the sniper tab's header. The auto mode shown is the auto controller's own (GET /api/auto/status), read-only: the
@@ -121,6 +122,16 @@ export function ExitRulesNote({ rules }: { rules: ExitRulesData | null }) {
       {rules ? formatExitRules(rules) : 'Exit rules not loaded from the server'}
     </span>
   );
+}
+
+/**
+ * 3H (A3): what the Jito card and the tip field say, from the Jito status readiness reports. With no block engine (the devnet and localnet
+ * default) the coordinator forces the LIVE tip to 0 (resolveLiveTip), so the tip typed here is not paid on LIVE.
+ */
+export function jitoUseText(jitoStatus: string | null | undefined): { card: string; tipLabel: string } {
+  if (!jitoStatus) return { card: 'status not loaded', tipLabel: 'Jito Tip (SOL) (Jito status not loaded)' };
+  if (jitoStatus === 'NOT_CONFIGURED') return { card: 'off: no block engine, LIVE tip is 0', tipLabel: 'Jito Tip (SOL) (not paid on LIVE: Jito is off)' };
+  return { card: `block engine ${jitoStatus}`, tipLabel: 'Jito Tip (SOL)' };
 }
 
 /** What the Telegram "Save Config" click reports, from the server's answer (it used to say "saved securely" without waiting for one). */
@@ -196,6 +207,11 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const [isTestingDiagnostics, setIsTestingDiagnostics] = useState(false);
   const tradingMode = useTradingMode();
   const autoStatus = useAutoStatus(); // P1.4 (N-12): the sniper tab mirrors the auto controller's mode; it does not set it
+  // 3H (A3): the Jito card and tip label say what the transport does, from GET /api/execution/readiness
+  const readiness = usePolled<{ components?: { jito?: { status?: string } } }>('/api/execution/readiness', 15_000, isOpen);
+  const jitoStatus = readiness.data?.components?.jito?.status ?? null;
+  // 3H: the Telegram fields have their own state. In sniperConfig they were wiped by every config snapshot (the server never sends the token back).
+  const [telegramDraft, setTelegramDraft] = useState({ botToken: '', chatId: '' });
   const [diagnosticsResult, setDiagnosticsResult] = useState<any | null>(null);
   const [showDiagnosticsModal, setShowDiagnosticsModal] = useState(false);
 
@@ -203,8 +219,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     setIsTestingTelegram(true);
     try {
       const res = await engineClient.testTelegramConnection(
-        sniperConfig.telegramBotToken,
-        sniperConfig.telegramChatId,
+        telegramDraft.botToken,
+        telegramDraft.chatId,
         sendPingMsg
       );
       setTelegramTestResult(res);
@@ -233,11 +249,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
       setDiagnosticsResult(res);
       setShowDiagnosticsModal(true);
       hftAudio.playTradeFill(true);
-      onAlertTrigger?.(
-        'INFO',
-        'CONNECTIVITY AUDIT COMPLETE',
-        `Verified ${Object.keys(res?.connections || {}).length} external services & ${res?.marketMakerProfiles?.totalProfiles || 0} market maker profiles.`
-      );
+      const summary = connectivityAuditSummary(res);
+      onAlertTrigger?.(summary.level, summary.title, summary.message);
     } catch (e: any) {
       onAlertTrigger?.('CRITICAL', 'DIAGNOSTICS ERROR', e.message);
     } finally {
@@ -457,7 +470,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   });
 
   return (
-    <div className="fixed top-16 inset-x-0 bottom-0 z-40 flex items-start justify-center bg-black/85 backdrop-blur-md p-2 sm:p-4 overflow-y-auto">
+    <div className={`fixed ${BELOW_HEADER_TOP} inset-x-0 bottom-0 z-40 flex items-start justify-center bg-black/85 backdrop-blur-md p-2 sm:p-4 overflow-y-auto`}>
       <div className="relative w-full max-w-7xl bg-[#0B101D] border border-[#1E293B] rounded-2xl shadow-2xl flex flex-col my-2 sm:my-3 text-slate-200">
         {/* HEADER BAR */}
         <div className="px-5 py-4 border-b border-[#1E293B] bg-[#0E1526] flex flex-wrap items-center justify-between gap-3">
@@ -468,7 +481,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
             <div>
               <div className="flex items-center space-x-2">
                 <h2 className="text-base sm:text-lg font-bold text-white tracking-wide">
-                  Telegram & X Market Maker Intelligence & Memecoin Sniper Swarm
+                  Telegram & X Signals and Memecoin Sniper
                 </h2>
                 {isWsLive && (
                   <span className="px-2 py-0.5 rounded-full text-[10px] font-mono bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 flex items-center space-x-1">
@@ -486,11 +499,6 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
           <div className="flex items-center space-x-2">
             <SnipeAmountControl compact />
 
-            {/* Capital Tier Pill */}
-            <div className="px-2.5 py-1 rounded-lg bg-amber-950/60 border border-amber-500/40 text-amber-300 text-xs font-mono flex items-center space-x-1.5">
-              <Coins className="w-3.5 h-3.5" />
-              <span>{capitalTier === 'MICRO_10' ? '$10 Micro Account' : '$500k Inst Tier'}</span>
-            </div>
 
             {/* Run Outside World Diagnostics Button */}
             <button
@@ -559,9 +567,11 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
           <div className="p-3 flex items-center justify-between">
             <span className="text-slate-400 flex items-center space-x-1.5">
               <ShieldCheck className="w-3.5 h-3.5 text-purple-400" />
-              <span>Jito MEV Protection</span>
+              <span>Jito bundles</span>
             </span>
-            <span className="font-bold text-purple-300">0.005 SOL Tip (Direct Slot)</span>
+            {/* UI-7: this card used to read "Jito MEV Protection 0.005 SOL Tip (Direct Slot)" on every cluster. 3H: it then said Jito is used on
+                mainnet-beta only, which is not the rule; it now shows the transport readiness reports. */}
+            <span className="font-bold text-purple-300" data-testid="jito-card">{jitoUseText(jitoStatus).card}</span>
           </div>
         </div>
 
@@ -1095,24 +1105,11 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
                 {/* Configuration Inputs */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono">
+                  {/* 3H (A2): a "Snipe Amount (USD)" box was here. It edited local state only and nothing sent it; every buy on this screen
+                      takes its size from the shared snipe amount control (S181). */}
                   <div>
-                    <label className="block text-slate-400 text-[10px] mb-1">
-                      Snipe Amount (USD)
-                    </label>
-                    <input
-                      type="number"
-                      step="0.5"
-                      value={sniperConfig.defaultSnipeAmountUsd}
-                      onChange={(e) =>
-                        setSniperConfig({ ...sniperConfig, defaultSnipeAmountUsd: Number(e.target.value) })
-                      }
-                      className="w-full bg-[#141B2D] border border-[#1E293B] rounded p-2 text-white font-mono outline-none focus:border-cyan-400"
-                    />
-                  </div>
-
-                  <div>
-                    <label className="block text-slate-400 text-[10px] mb-1">
-                      Jito MEV Tip (SOL)
+                    <label className="block text-slate-400 text-[10px] mb-1" data-testid="jito-tip-label">
+                      {jitoUseText(jitoStatus).tipLabel}
                     </label>
                     <input
                       type="number"
@@ -1414,10 +1411,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                     <input
                       type="password"
                       placeholder="Enter Bot Token from @BotFather..."
-                      value={sniperConfig.telegramBotToken}
-                      onChange={(e) =>
-                        setSniperConfig({ ...sniperConfig, telegramBotToken: e.target.value })
-                      }
+                      value={telegramDraft.botToken}
+                      onChange={(e) => setTelegramDraft((d) => ({ ...d, botToken: e.target.value }))}
                       className="w-full bg-[#141B2D] border border-[#1E293B] rounded p-2 text-slate-300 text-xs font-mono outline-none focus:border-cyan-500/50"
                     />
                   </div>
@@ -1427,10 +1422,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                     <input
                       type="text"
                       placeholder="e.g. @apex_alpha_vip_snipers or chat ID"
-                      value={sniperConfig.telegramChatId}
-                      onChange={(e) =>
-                        setSniperConfig({ ...sniperConfig, telegramChatId: e.target.value })
-                      }
+                      value={telegramDraft.chatId}
+                      onChange={(e) => setTelegramDraft((d) => ({ ...d, chatId: e.target.value }))}
                       className="w-full bg-[#141B2D] border border-[#1E293B] rounded p-2 text-slate-300 text-xs font-mono outline-none focus:border-cyan-500/50"
                     />
                   </div>
@@ -1439,8 +1432,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                     <button
                       onClick={async () => {
                         const res = await engineClient.updateTelegramConfig({
-                          botToken: sniperConfig.telegramBotToken,
-                          chatId: sniperConfig.telegramChatId,
+                          botToken: telegramDraft.botToken,
+                          chatId: telegramDraft.chatId,
                         });
                         const out = telegramSaveOutcome(res);
                         onAlertTrigger?.(out.level, out.title, out.message);
@@ -1521,7 +1514,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                     <li><strong className="text-cyan-300">/signals</strong> - Show top 3 alpha signals</li>
                     <li><strong className="text-cyan-300">/snipe &lt;CA&gt; [$$]</strong> - Instant Jito snipe</li>
                     <li><strong className="text-cyan-300">/positions</strong> - View open PnL</li>
-                    <li><strong className="text-cyan-300">/panic_sell</strong> - Dump all memecoins</li>
+                    <li><strong className="text-cyan-300">/panic_sell</strong> - Dump all memecoins (not delivered from Telegram: no webhook is registered and nothing polls; use the panic button here)</li>
                   </ul>
                 </div>
               </div>
@@ -1582,21 +1575,13 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <Send className="w-3.5 h-3.5 text-blue-400" />
                         <span>Telegram Bot Gateway</span>
                       </span>
-                      <span
-                        className={`px-2 py-0.5 rounded text-[10px] ${
-                          diagnosticsResult.connections.telegram.testResult.reachable
-                            ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-                            : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
-                        }`}
-                      >
-                        {diagnosticsResult.connections.telegram.testResult.reachable ? 'REACHABLE' : 'UNREACHABLE'}
-                      </span>
+                      {(() => { const b = probeBadge(diagnosticsResult.connections.telegram.testResult, 'REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${probeBadgeClass(b)}`}>{b.text}</span>); })()}
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Endpoint: <code className="text-slate-300">https://api.telegram.org</code>
                     </div>
                     <div className="text-[11px] text-slate-300">
-                      Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.telegram.testResult.latencyMs}ms</strong> | Auth: {diagnosticsResult.connections.telegram.testResult.botAuthorized ? 'VALIDATED' : 'DEMO TOKEN (401)'}
+                      Latency: <strong className="text-cyan-400">{probeLatency(diagnosticsResult.connections.telegram.testResult.latencyMs)}</strong> | Auth: {diagnosticsResult.connections.telegram.testResult.botAuthorized ? 'VALIDATED' : diagnosticsResult.connections.telegram.testResult.reachable ? 'NOT AUTHORIZED' : 'not checked'}
                     </div>
                     <p className="text-slate-400 text-[10px] border-t border-slate-800 pt-1">
                       {diagnosticsResult.connections.telegram.testResult.diagnosis}
@@ -1610,15 +1595,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <span className="text-sky-400 font-bold text-sm">𝕏</span>
                         <span>X.com / Twitter Gateway</span>
                       </span>
-                      <span
-                        className={`px-2 py-0.5 rounded text-[10px] ${
-                          diagnosticsResult.connections.xTwitter?.testResult?.reachable
-                            ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-                            : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
-                        }`}
-                      >
-                        {probeBadge(diagnosticsResult.connections.xTwitter?.testResult, 'REACHABLE').text}
-                      </span>
+                      {(() => { const b = probeBadge(diagnosticsResult.connections.xTwitter?.testResult, 'REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${probeBadgeClass(b)}`}>{b.text}</span>); })()}
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Endpoint: <code className="text-slate-300">https://api.twitter.com</code>
@@ -1627,8 +1604,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                       Latency: <strong className="text-cyan-400">{probeLatency(diagnosticsResult.connections.xTwitter?.testResult?.latencyMs)}</strong> | Mode: {diagnosticsResult.connections.xTwitter?.testResult?.bearerAuthorized ? 'AUTHENTICATED' : 'NO BEARER TOKEN (public metadata only)'}
                     </div>
                     <p className="text-slate-400 text-[10px] border-t border-slate-800 pt-1">
-                      {diagnosticsResult.connections.xTwitter?.testResult?.diagnosis ||
-                        'Outbound HTTPS verified. Ingests live community links from Pump.fun and DexScreener.'}
+                      {diagnosticsResult.connections.xTwitter?.testResult?.diagnosis || 'The probe returned no detail.'}
                     </p>
                   </div>
 
@@ -1639,16 +1615,17 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <Flame className="w-3.5 h-3.5 text-emerald-400" />
                         <span>Pump.fun Live Coin Stream</span>
                       </span>
-                      {(() => { const b = probeBadge(diagnosticsResult.connections.pumpFun.testResult, 'REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${b.ok ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'}`}>{b.text}</span>); })()}
+                      {(() => { const b = probeBadge(diagnosticsResult.connections.pumpFun.testResult, 'REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${probeBadgeClass(b)}`}>{b.text}</span>); })()}
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Endpoint: <code className="text-slate-300">frontend-api-v3.pump.fun/coins</code>
                     </div>
                     <div className="text-[11px] text-slate-300">
-                      Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.pumpFun.testResult.latencyMs}ms</strong> | Newest: {diagnosticsResult.connections.pumpFun.testResult.newestToken || 'Active'}
+                      Latency: <strong className="text-cyan-400">{probeLatency(diagnosticsResult.connections.pumpFun.testResult.latencyMs)}</strong> | Newest: {diagnosticsResult.connections.pumpFun.testResult.newestToken || '—'}
                     </div>
                     <p className="text-slate-400 text-[10px] border-t border-slate-800 pt-1">
-                      Live Solana bonding curves streamed and processed every 5s.
+                      {diagnosticsResult.connections.pumpFun.testResult.diagnosis ||
+                        'A probe of the pump.fun HTTP API. The app polls it only on mainnet-beta; on other clusters the board fills from the on-chain log stream.'}
                     </p>
                   </div>
 
@@ -1659,16 +1636,17 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <TrendingUp className="w-3.5 h-3.5 text-cyan-400" />
                         <span>DexScreener Boosted Feed</span>
                       </span>
-                      {(() => { const b = probeBadge(diagnosticsResult.connections.dexScreener.testResult, 'REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${b.ok ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'}`}>{b.text}</span>); })()}
+                      {(() => { const b = probeBadge(diagnosticsResult.connections.dexScreener.testResult, 'REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${probeBadgeClass(b)}`}>{b.text}</span>); })()}
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Endpoint: <code className="text-slate-300">api.dexscreener.com/token-boosts</code>
                     </div>
                     <div className="text-[11px] text-slate-300">
-                      Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.dexScreener.testResult.latencyMs}ms</strong> | Boosted Queue: {diagnosticsResult.connections.dexScreener.testResult.boostedCount} Tokens
+                      Latency: <strong className="text-cyan-400">{probeLatency(diagnosticsResult.connections.dexScreener.testResult.latencyMs)}</strong> | Boosted list: {diagnosticsResult.connections.dexScreener.testResult.boostedCount ?? '—'} tokens
                     </div>
                     <p className="text-slate-400 text-[10px] border-t border-slate-800 pt-1">
-                      Pulls live community paid boosts used for multi-caller confluence trigger.
+                      {diagnosticsResult.connections.dexScreener.testResult.diagnosis ||
+                        'A probe of the DexScreener paid-boost list. It is mainnet data, so the confluence trigger can only use it on mainnet-beta.'}
                     </p>
                   </div>
 
@@ -1679,16 +1657,16 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <Server className="w-3.5 h-3.5 text-purple-400" />
                         <span>Solana Validator JSON-RPC</span>
                       </span>
-                      {(() => { const b = probeBadge(diagnosticsResult.connections.solanaRpc.testResult, 'RPC REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${b.ok ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'}`}>{b.text}</span>); })()}
+                      {(() => { const b = probeBadge(diagnosticsResult.connections.solanaRpc.testResult, 'RPC REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${probeBadgeClass(b)}`}>{b.text}</span>); })()}
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Endpoint: <code className="text-slate-300">{hostOfService(diagnosticsResult.connections.solanaRpc.service)}</code>{diagnosticsResult.cluster ? <span className="ml-2 text-amber-300">cluster: {diagnosticsResult.cluster}</span> : null}
                     </div>
                     <div className="text-[11px] text-slate-300">
-                      Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.solanaRpc.testResult.latencyMs}ms</strong> | Cluster Slot: #{diagnosticsResult.connections.solanaRpc.testResult.slot}
+                      Latency: <strong className="text-cyan-400">{probeLatency(diagnosticsResult.connections.solanaRpc.testResult.latencyMs)}</strong> | Cluster Slot: {diagnosticsResult.connections.solanaRpc.testResult.slot != null ? `#${diagnosticsResult.connections.solanaRpc.testResult.slot}` : '—'}
                     </div>
                     <p className="text-slate-400 text-[10px] border-t border-slate-800 pt-1">
-                      Direct JSON-RPC slot verification for block leader schedules.
+                      getHealth and getSlot on the configured cluster RPC.
                     </p>
                   </div>
                 </div>
@@ -1698,7 +1676,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
               <div>
                 <h4 className="font-bold text-slate-200 uppercase tracking-wider text-[11px] mb-2 flex items-center space-x-1.5">
                   <Crosshair className="w-3.5 h-3.5 text-amber-400" />
-                  <span>Market Maker & Caller Profiles Attribution</span>
+                  <span>Caller Profiles</span>
                 </h4>
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2">
                   {diagnosticsResult.marketMakerProfiles.profiles.map((p: any) => (

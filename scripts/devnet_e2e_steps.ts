@@ -9,7 +9,7 @@
  *       no position, and an immediate second buy refused by the 15 s failure cooldown with nothing sent. The wrapper is restored in `finally`.
  *  (e') two sequential `executeTrade` calls on one mint: the first is CONFIRMED and opens one position, the second is refused before
  *       anything is signed (POSITION_ALREADY_OPEN). The position is then closed so step (f) starts flat.
- *  (e''), (g), (h), (i), (j) and (k) are described at their functions below, and so are the Stage 3 steps (s), (t) and (u) (task 3I).
+ *  (e''), (g), (h), (i), (j) and (k) are described at their functions below, and so are the Stage 3 steps (l), (n), (s), (t) and (u) (task 3I).
  *
  *  (e''') P1.4: the emergency stop. One LIVE position is opened, auto is set to DEVNET_LIVE, then Telegram `/panic_sell` is driven
  *       through the app's `processTelegramCommand` (no bot): the LIVE position must be sold on chain and auto must end OFF. Then the
@@ -48,6 +48,8 @@ export interface HarnessSteps {
   mint: string;
   buildBuyRequest: () => Promise<ExecuteTradeRequest>;
   rec: (step: string, ok: boolean, detail: string) => void;
+  /** A check that could not be made for a reason outside the app under test (the RPC); printed as SKIP, neither a pass nor a FAIL. */
+  skip?: (step: string, detail: string) => void;
   link: (sig: string) => string;
   sleep: (ms: number) => Promise<unknown>;
   /** The coordinator's own Connection: (e'') wraps its `sendRawTransaction` for one call, (h) its `getMultipleAccountsInfo`. */
@@ -852,6 +854,11 @@ export async function feedGapThroughWsProxy(s: Pick<HarnessSteps, 'mint' | 'rec'
   } finally {
     await listener.stop();
     listener.destroy?.();
+    // Devnet run 25: this Connection's socket was down when the listener stopped, so web3.js never idle-closed it and its client redialed
+    // the closed proxy port once a second for the rest of the run (565 "ws error: connect ECONNREFUSED"). web3.js has no public close.
+    const ws = conn._rpcWebSocket;
+    ws?.setAutoReconnect?.(false);
+    ws?.close?.();
     await proxy.close();
   }
 
@@ -1405,4 +1412,816 @@ export async function sellerWhoNeverBought(
   } finally {
     await sellAndRefund(s, L, kit, [W, X, creator], coins, payer);
   }
+}
+
+const skipOf = (s: Pick<HarnessSteps, 'skip'>) => (step: string, detail: string) => (s.skip ? s.skip(step, detail) : console.log(`SKIP  ${step}: ${detail}`));
+
+/** The balance sync, retried after 0.5, 1, 2 and 4 s: ok once one read answered. Run 16: a 429 on the sync just before a buy left the
+ * balance unknown, and the buy was refused INSUFFICIENT_SPENDABLE_BANKROLL before it reached the gate the step was checking. */
+async function syncWithRetry(s: Pick<HarnessSteps, 'coordinator' | 'sleep'>): Promise<{ ok: boolean; failures: number }> {
+  let failures = 0;
+  for (const ms of [0, 500, 1_000, 2_000, 4_000]) {
+    if (ms) await s.sleep(ms);
+    if ((await s.coordinator.syncRealWalletBalance()) != null) return { ok: true, failures };
+    failures++;
+  }
+  return { ok: false, failures };
+}
+
+/**
+ * One `executeTrade` of the harness mint after a balance sync that answered (`syncWithRetry`). A refusal with nothing sent because the
+ * balance read was lost (INSUFFICIENT_SPENDABLE_BANKROLL) is re-synced and retried, up to 3 tries; it is never handed back as the answer.
+ * When the sync cannot recover, the bankroll refusal comes back on every try, or the failed reads disarmed LIVE (the kill switch), the
+ * check is a SKIP with the reason and this returns null: the RPC, not the app, kept the check from being made. Otherwise it returns the
+ * response, the BUY row count before it, and the try it took, and the caller records the strict check.
+ */
+async function tradeAfterSync(s: HarnessSteps, step: string): Promise<{ r: ExecutionResponse; before: number; attempt: number } | null> {
+  const skip = skipOf(s);
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const sync = await syncWithRetry(s);
+    if (sync.ok && sync.failures) console.log(`INFO  ${step}: the balance sync answered after ${sync.failures} failed read(s)`);
+    if (!sync.ok) { skip(step, `the wallet balance could not be read (5 tries, 0.5 to 4 s apart; attempt ${attempt} of 3); the check was not made`); return null; }
+    const before = buyRowsFor(s).length;
+    const r = await s.coordinator.executeTrade(await s.buildBuyRequest());
+    const unsent = !r.success && buyRowsFor(s).length === before && !(r.txSignature || r.signature);
+    if (unsent && /^INSUFFICIENT_SPENDABLE_BANKROLL/.test(r.error ?? '')) {
+      if (attempt < 3) { console.log(`INFO  ${step}: refused before the gate under test (${(r.error ?? '').slice(0, 120)}); balance re-synced, buy retried`); continue; }
+      skip(step, `refused INSUFFICIENT_SPENDABLE_BANKROLL on all 3 tries after a successful sync (the balance read keeps getting lost); the gate under test was not reached`);
+      return null;
+    }
+    if (unsent && sync.failures > 0 && /not armed/i.test(r.error ?? '')) {
+      skip(step, `${sync.failures} failed balance read(s) before this buy; LIVE was disarmed (consecutive RPC failures trip the kill switch): ${(r.error ?? '').slice(0, 120)}`);
+      return null;
+    }
+    return { r, before, attempt };
+  }
+  return null;
+}
+
+/** (l) what the readiness step needs from the app (passed in, so this file still imports nothing from server/). */
+export interface ReadinessGateDeps {
+  /** What POST /api/execution/reconcile runs: executionCoordinator.startupReconciliation({ fresh: true }). */
+  reconcile(): Promise<{ status: string; details: string }>;
+  isLiveArmed(): boolean;
+  /** Writes an unresolved LIVE BUY row (RECONCILIATION_REQUIRED, a fresh made-up signature, a mint the wallet never bought) into the app's
+   * database, the row a crash between send and confirm leaves, and returns its signature. */
+  plantUnresolvedBuy(): string;
+  /** Marks that row REVERTED (what reconciliation does once its blockhash expires). */
+  resolveRow(sig: string): void;
+}
+
+/**
+ * (l) 3A (R1-0), opt-in (DEVNET_READINESS_GATE=1), one buy and sell of the harness mint: every LIVE buy re-checks live readiness, not only
+ * the arm. With LIVE armed, an unresolved LIVE buy row is planted and Reconcile run: RECONCILIATION_MISMATCH naming that row, LIVE still
+ * armed. The next buy is refused `LIVE_NOT_READY: ... startup reconciliation is RECONCILIATION_MISMATCH`, nothing sent. The row is
+ * resolved (REVERTED), Reconcile reaches EXECUTION_READY, and a buy is CONFIRMED, then sold. Before 3A the refused buy went through.
+ * Each buy runs after a balance sync that answered (`tradeAfterSync`), and each Reconcile is retried (3 tries, 2 and 4 s apart) while the
+ * reason it is not at the expected status is not the planted row (an RPC read failed in the pass): a check the RPC kept from being made is
+ * a SKIP with the reason, never a PASS. `finally` resolves the row, reconciles until ready, and closes anything open on the mint, so the
+ * steps after this one start ready. Returns when the last trade settled.
+ */
+export async function readinessGateAfterMismatch(s: HarnessSteps, d: ReadinessGateDeps): Promise<number> {
+  const L = '(l) 3A: per-buy readiness';
+  const skip = skipOf(s);
+  let lastTradeAt = Date.now();
+  let planted: string | null = null;
+  let resolved = false;
+  /** Reconcile until `want(result)`. A miss that `appMiss` says is the app's own answer is final; any other miss (an RPC read failed in
+   * the pass: OFFLINE, a scan error, a timeout) is retried. */
+  type Recon = { status: string; details: string };
+  const reconcileUntil = async (want: (r: Recon) => boolean, appMiss: (r: Recon) => boolean) => {
+    let last: { status: string; details: string } = { status: 'not run', details: '' };
+    for (const [i, ms] of [0, 2_000, 4_000].entries()) {
+      if (ms) await s.sleep(ms);
+      try { last = await d.reconcile(); } catch (e: any) { last = { status: 'threw', details: String(e?.message ?? e) }; }
+      if (want(last)) return { ok: true, last, tries: i + 1, final: true };
+      if (appMiss(last)) return { ok: false, last, tries: i + 1, final: true };
+    }
+    return { ok: false, last, tries: 3, final: false };
+  };
+  const brief = (r: Recon) => `${r.status}: ${r.details}`.slice(0, 260);
+  try {
+    // 1. an unresolved LIVE buy, then Reconcile
+    planted = d.plantUnresolvedBuy();
+    const tag = planted.slice(0, 8);
+    // EXECUTION_READY with the row in the database is the app's own (wrong) answer; anything else short of a mismatch naming it is retried
+    const m = await reconcileUntil((r) => r.status === 'RECONCILIATION_MISMATCH' && r.details.includes(tag), (r) => r.status === 'EXECUTION_READY');
+    const step1 = `${L}: Reconcile with an unresolved LIVE buy row: RECONCILIATION_MISMATCH naming it, LIVE still armed`;
+    if (!m.ok && !m.final) { skip(step1, `3 Reconciles did not finish on the row (an RPC read failed in the pass); last ${brief(m.last)}`); return lastTradeAt; }
+    s.rec(step1, m.ok && d.isLiveArmed(), `row ${tag}...; ${brief(m.last)}; armed ${d.isLiveArmed()}${m.tries > 1 ? `; try ${m.tries}` : ''}`);
+    if (!m.ok || !d.isLiveArmed()) return lastTradeAt;
+
+    // 2. the next buy is refused by the per-buy gate
+    const step2 = `${L}: buy while reconciliation is at MISMATCH: refused LIVE_NOT_READY, nothing sent`;
+    const t = await tradeAfterSync(s, step2);
+    if (t) {
+      const sig = t.r.txSignature || t.r.signature || '';
+      s.rec(
+        step2,
+        !t.r.success && t.r.lifecycleState === 'RISK_REJECTED' && /^LIVE_NOT_READY: .*startup reconciliation is RECONCILIATION_MISMATCH/.test(t.r.error ?? '')
+          && buyRowsFor(s).length === t.before && !sig && openFor(s).length === 0,
+        `${t.r.lifecycleState} ${t.r.error ?? ''}; BUY rows ${t.before} -> ${buyRowsFor(s).length}; open positions ${openFor(s).length}${t.attempt > 1 ? `; try ${t.attempt}` : ''}`.slice(0, 400)
+      );
+      if (t.r.success) { lastTradeAt = Date.now(); return lastTradeAt; } // the gate let it through: `finally` sells it; the rest would say nothing new
+    }
+
+    // 3. the row resolved, Reconcile, buy again
+    d.resolveRow(planted);
+    resolved = true;
+    const step3 = `${L}: Reconcile after the row is resolved: EXECUTION_READY`;
+    const ready = await reconcileUntil((r) => r.status === 'EXECUTION_READY', (r) => r.details.includes(tag)); // the row still counted: the app's answer
+    if (!ready.ok && !ready.final) { skip(step3, `3 Reconciles did not reach EXECUTION_READY for a reason other than the row (an RPC read failed in the pass); last ${brief(ready.last)}`); return lastTradeAt; }
+    s.rec(step3, ready.ok, `${brief(ready.last)}${ready.tries > 1 ? `; try ${ready.tries}` : ''}`);
+    if (!ready.ok) return lastTradeAt;
+    const step4 = `${L}: buy after EXECUTION_READY: CONFIRMED`;
+    const b = await tradeAfterSync(s, step4);
+    if (b) {
+      if (b.r.success) lastTradeAt = Date.now();
+      s.rec(step4, b.r.success && b.r.lifecycleState === 'CONFIRMED', `${b.r.lifecycleState} ${b.r.error ?? ''}${b.attempt > 1 ? `; try ${b.attempt}` : ''}`.slice(0, 300));
+    }
+    for (const p of openFor(s)) {
+      const c = await s.coordinator.closePosition(p.id, 100, 'e2e (l) sell back');
+      lastTradeAt = Date.now();
+      s.rec(`${L}: sell back`, c.success, c.error || 'closed');
+    }
+  } catch (e: any) {
+    s.rec(L, false, String(e?.message ?? e).slice(0, 300));
+  } finally {
+    if (planted && !resolved) {
+      try { d.resolveRow(planted); } catch (e: any) { s.rec(`${L}: cleanup, planted row resolved`, false, String(e?.message ?? e).slice(0, 200)); }
+    }
+    if (planted) {
+      const r = await d.reconcile().catch((e: any) => ({ status: 'threw', details: String(e?.message ?? e) }));
+      if (r.status !== 'EXECUTION_READY') console.log(`INFO  ${L}: cleanup Reconcile ${brief(r)} (the app's background retries keep trying)`);
+    }
+    for (const p of openFor(s)) {
+      try {
+        const c = await s.coordinator.closePosition(p.id, 100, 'e2e (l) cleanup');
+        lastTradeAt = Date.now();
+        s.rec(`${L}: cleanup close 100%`, c.success, c.error || 'closed');
+      } catch (e: any) { s.rec(`${L}: cleanup close 100%`, false, String(e?.message ?? e).slice(0, 200)); }
+    }
+  }
+  return lastTradeAt;
+}
+
+/** (n) what the loss-floor step needs from the app (passed in, so this file still imports nothing from server/). */
+export interface LossFloorDeps {
+  /** executionConfig's MAX_DAILY_LOSS_USD as the floor reads it, and the in-process setter (`updateConfig`, which runs the same check as boot). */
+  floorUsd(): number;
+  setFloorUsd(usd: number): void;
+  /** The SOL/USD reading the floor converts with (solPriceService.getPrice). */
+  price(): { usd: number | null; source: string | null };
+  /** A real price read (solPriceService.refresh); under the jumped clock it is stamped with that clock, so LIVE does not refuse it as stale. */
+  refreshPrice(): Promise<unknown>;
+  /** riskEngine.getDailyTotalPnLSol('LIVE'): net PnL over the rolling 24 h (realized, open unrealized, minus unbooked fees). */
+  dailyPnlSol(): number;
+  /** riskEngine.getDailyLossLatch('LIVE') and clearDailyLossLatch (the harness's own cleanup). */
+  latch(): { at: number; message: string } | null;
+  clearLatch(): void;
+  /** What POST /api/auto/resume runs (autoSnipeController.resume). */
+  resume(opts: { clearHalt?: boolean; clearDailyLossLatch?: boolean }): unknown;
+  /** The harness buy size in SOL. */
+  orderSol: number;
+}
+
+/** Milliseconds from `now` to the next 00:00 UTC. */
+export function msToNextUtcMidnight(now: number): number {
+  const d = new Date(now);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1) - now;
+}
+
+/**
+ * (n) 3C (N-61, N-62, N-63, N-65), opt-in (DEVNET_LOSS_FLOOR=1), one buy and sell of the harness mint: the net daily PnL floor over a rolling
+ * 24 h, its latch, and the two resume flags, through the app's own executeTrade. The floor is MAX_DAILY_LOSS_USD, changed in-process with
+ * executionConfig.updateConfig (the env's own check runs; the USD-to-SOL conversion is the real one, nothing is pinned).
+ *  1. The floor is set generously above the 24 h window's net PnL plus three orders; one buy and a full sell lose their fees.
+ *  2. The floor is set to half the window's loss: the next buy is refused DAILY_LOSS_LIMIT, nothing is sent, and the latch is set.
+ *  3. The floor is raised back: still refused, "latched".
+ *  4. The clock jumps past the next 00:00 UTC (Date.now offset for one executeTrade, with a real SOL price read under that clock so LIVE
+ *     does not refuse a stale price first, and read again after): still refused, latched. Before 3C the window restarted at UTC midnight.
+ *  5. resume {clearHalt}: still refused. resume {clearDailyLossLatch} with the floor below the window's loss: refused again and latched
+ *     again (the window itself is below the floor).
+ * `finally` puts MAX_DAILY_LOSS_USD back, clears the latch, restores the clock, and closes anything open on the mint.
+ * Returns when the last trade settled (for the per-mint cooldown before the next step).
+ */
+export async function lossFloorLatch(s: HarnessSteps, d: LossFloorDeps): Promise<number> {
+  const L = '(n) 3C: net daily PnL floor';
+  const origUsd = d.floorUsd();
+  const realNow = Date.now;
+  let lastTradeAt = Date.now();
+  const buyRows = () => buyRowsFor(s).length;
+  /**
+   * A buy that must be refused by the floor: DAILY_LOSS_LIMIT, nothing sent, the latch set, after a balance sync that answered
+   * (`tradeAfterSync`: a refusal for a lost balance read is retried, and a check the RPC kept from being made is a SKIP). Null on a SKIP.
+   */
+  const refusedBuy = async (label: string, wantLatched: boolean) => {
+    const t = await tradeAfterSync(s, `${L}: ${label}`);
+    if (!t) return null;
+    const { r, before, attempt } = t;
+    const sig = r.txSignature || r.signature || '';
+    const latched = /latched/.test(r.error ?? '');
+    s.rec(
+      `${L}: ${label}`,
+      !r.success && /^DAILY_LOSS_LIMIT: Net daily PnL floor/.test(r.error ?? '') && (!wantLatched || latched) && buyRows() === before && !sig && d.latch() !== null,
+      `${r.lifecycleState} ${r.error ?? ''}; BUY rows ${before} -> ${buyRows()}; latch ${d.latch() ? 'set' : 'not set'}${attempt > 1 ? `; try ${attempt}` : ''}`.slice(0, 400)
+    );
+    return r;
+  };
+  try {
+    const usd = d.price().usd;
+    if (!usd) { s.rec(L, false, 'no SOL/USD reading; the floor cannot be converted'); return lastTradeAt; }
+    const pnl0 = d.dailyPnlSol();
+    const orderCost = d.orderSol + 0.003; // the order plus fee and the first buy's token-account rent, rounded up
+    const roomySol = Math.max(0, -pnl0) + 3 * orderCost + 0.003;
+    d.setFloorUsd(Math.ceil(roomySol * usd * 100) / 100);
+
+    // 1. one losing round trip
+    await s.coordinator.syncRealWalletBalance();
+    const buy = await s.coordinator.executeTrade(await s.buildBuyRequest());
+    lastTradeAt = Date.now();
+    s.rec(`${L}: buy under a roomy floor CONFIRMED`, buy.success && buy.lifecycleState === 'CONFIRMED', `floor $${d.floorUsd()} (${roomySol.toFixed(4)} SOL at $${usd}); window PnL before ${pnl0.toFixed(6)} SOL; ${buy.lifecycleState} ${buy.error ?? ''}`.slice(0, 300));
+    for (const p of openFor(s)) {
+      const c = await s.coordinator.closePosition(p.id, 100, "e2e (n) round trip");
+      lastTradeAt = Date.now();
+      s.rec(`${L}: full sell`, c.success, c.error || 'closed');
+    }
+    if (!buy.success) return lastTradeAt;
+    const pnl1 = d.dailyPnlSol();
+    s.rec(`${L}: the round trip lost its fees`, pnl1 < pnl0, `window net PnL ${pnl0.toFixed(6)} -> ${pnl1.toFixed(6)} SOL (loss ${(pnl0 - pnl1).toFixed(6)})`);
+    if (!(pnl1 < 0)) return lastTradeAt;
+    await waitPast(s, lastTradeAt, s.riskLimits().cooldownPerMintMs, 'per-mint cooldown from the (n) sell');
+
+    // 2. floor below the window's loss: refused, latched
+    const tightUsd = Math.max(0.01, Math.floor(((-pnl1) / 2) * usd * 100) / 100);
+    d.setFloorUsd(tightUsd);
+    await refusedBuy(`floor $${tightUsd} below the window's loss: refused DAILY_LOSS_LIMIT, nothing sent, latched`, false);
+    // 3. floor raised back: the latch still holds
+    d.setFloorUsd(Math.ceil(roomySol * usd * 100) / 100);
+    await refusedBuy('floor raised back: still refused, latched', true);
+    // 4. past the next 00:00 UTC
+    const jump = msToNextUtcMidnight(realNow()) + 60_000;
+    Date.now = () => realNow() + jump;
+    try {
+      await d.refreshPrice();
+      const r = await refusedBuy(`clock past the next 00:00 UTC (+${(jump / 3_600_000).toFixed(2)} h): still refused, latched`, true);
+      if (r) s.rec(`${L}: the refusal says when the oldest loss leaves the window`, /leaves it at|no realized loss is left/.test(r.error ?? ''), (r.error ?? '').slice(-160));
+    } finally {
+      Date.now = realNow;
+      await d.refreshPrice(); // stamped with the real clock again
+    }
+    // 5. the two resume flags
+    d.resume({ clearHalt: true });
+    await refusedBuy('resume {clearHalt}: still refused, latched', true);
+    d.setFloorUsd(tightUsd);
+    d.resume({ clearDailyLossLatch: true });
+    const cleared = d.latch() === null;
+    await refusedBuy('resume {clearDailyLossLatch} with the window below the floor: refused and latched again', false);
+    s.rec(`${L}: clearDailyLossLatch cleared the latch before that buy`, cleared, cleared ? 'cleared, then set again by the buy' : 'still set right after the resume');
+  } catch (e: any) {
+    s.rec(L, false, String(e?.message ?? e).slice(0, 300));
+  } finally {
+    Date.now = realNow;
+    try { d.setFloorUsd(origUsd); } catch (e: any) { s.rec(`${L}: MAX_DAILY_LOSS_USD put back`, false, String(e?.message ?? e).slice(0, 200)); }
+    d.clearLatch();
+    for (const p of openFor(s)) {
+      try {
+        const c = await s.coordinator.closePosition(p.id, 100, 'e2e (n) cleanup');
+        lastTradeAt = Date.now();
+        s.rec(`${L}: cleanup close 100%`, c.success, c.error || 'closed');
+      } catch (e: any) { s.rec(`${L}: cleanup close 100%`, false, String(e?.message ?? e).slice(0, 200)); }
+    }
+  }
+  return lastTradeAt;
+}
+
+/**
+ * (n) 3C (R1-8, R1-36), free, part of the same opt-in: the server refuses to start on MAX_POSITION_SIZE_SOL=abc before any network call.
+ * `boot` runs server.ts in a child process under the devnet guard (which logs every outbound attempt to stderr) with that value and a
+ * scratch DB path; expected: a non-zero exit, the startup message naming the variable, no `[devnet-guard] allow` line, no DB file.
+ */
+export function bootRefusesBadLimit(s: Pick<HarnessSteps, 'rec'>, boot: () => { status: number | null; stderr: string; stdout: string }, dbPath: string): void {
+  const L = '(n) 3C: boot with MAX_POSITION_SIZE_SOL=abc';
+  const r = boot();
+  const out = `${r.stdout}\n${r.stderr}`;
+  const attempts = out.split('\n').filter((l) => l.includes('[devnet-guard] allow'));
+  s.rec(
+    `${L} refuses before any RPC call`,
+    r.status !== 0 && r.status !== null && /MAX_POSITION_SIZE_SOL="abc" is not a number above 0/.test(out) && attempts.length === 0 && !fs.existsSync(dbPath),
+    `exit ${r.status}; message ${/is not a number above 0/.test(out) ? 'shown' : 'missing'}; outbound attempts ${attempts.length}; DB file ${fs.existsSync(dbPath) ? 'created' : 'not created'}`
+  );
+}
+
+// ---- Stage 3 steps (task 3K): (m) for 3B, (o) for 3E. ----
+
+/** 3K: a balance read retried after 0.5, 1 and 2 s; null when no read answered (the caller SKIPs the check that needed it). */
+async function readWithRetry<T>(read: () => Promise<T | null>, sleep: (ms: number) => Promise<unknown>): Promise<T | null> {
+  for (const ms of [0, 500, 1_000, 2_000]) {
+    if (ms) await sleep(ms);
+    try {
+      const v = await read();
+      if (v !== null && v !== undefined) return v;
+    } catch { /* rate-limited or unreachable: try again */ }
+  }
+  return null;
+}
+
+export interface SessionSpendDeps {
+  /** The app's auto controller (what /api/auto/* call). */
+  auto: {
+    setMode(mode: 'OFF' | 'DEVNET_LIVE', opts?: { confirmationCode?: string }): Promise<{ ok: boolean; mode: string; error?: string }>;
+    setBudget(b: { maxBuys: number; maxSpendSol: number }): { ok: boolean; reason?: string };
+    getStatus(): { mode: string; budgets: { maxBuys: number; maxSpendSol: number }; session: { buys: number; spentSol: number } | null };
+    orderSol(): number;
+    setOrderSol(sol: number): { ok: boolean; reason?: string };
+    submitCandidate(c: { mint: string; source: 'TEST'; provenance?: 'REAL_ONCHAIN' }): Promise<{ outcome: string; stage?: string; reason: string; positionId?: string }>;
+  };
+  /** The app's watch window: its `getVerdict` is wrapped for the step's own coins only, and put back in `finally`. */
+  watch: { getVerdict(mint: string): any };
+  /** The aggregator's confluence gate (the operator switch `setConfluenceGating`): off for the step, put back in `finally`. */
+  confluence: { getConfluenceGating(): boolean; setConfluenceGating(on: boolean): void };
+  /** The harness wallet's balance in lamports (one read; may throw or return null on a lost read). */
+  balanceLamports(): Promise<number | null>;
+  /** The app's halt reason (coordinator), null when not halted. */
+  haltReason(): string | null;
+  /** LIVE positions not CLOSED (any mint), as the DB has them. */
+  openLive(): Array<{ id: string; mint: string; status: string }>;
+  /** Makes the step's coins: `n` fresh pump coins from one throwaway creator (key on disk before funding). */
+  makeCoins(n: number): Promise<string[]>;
+  /** Sells and refunds the creator and anything else the coins needed. Always called, in `finally`. */
+  cleanupCoins(): Promise<void>;
+}
+
+/**
+ * (m) 3B, opt-in (DEVNET_SESSION_SPEND=1): a 5-buy DEVNET_LIVE auto session, its spentSol against the wallet. The harness makes five fresh
+ * pump coins (one throwaway creator, no dev buy), sets the session budget to five buys, and puts auto in DEVNET_LIVE. Each coin is handed to
+ * the auto controller as a candidate. The release gates and the confluence score are not what this step checks (fresh coins have no feed
+ * history to score), so for these five mints the watch window's verdict is a fresh HOT, and the aggregator's confluence gate is switched
+ * off for the step with its operator switch; both are put back in `finally`. Every other gate, the coordinator and the send are the app's own. The
+ * wallet is read right before and right after each auto buy, and the position is sold before the next one (DEVNET_MAX_OPEN_POSITIONS is 1),
+ * so the reads around a buy see that buy alone.
+ * Expected: five BOUGHT decisions, never more than one open LIVE position, `getStatus().session.spentSol` (what GET /api/auto/status
+ * returns) equal to the sum of the five wallet drops within 0.0002 SOL (the token account's rent is in both since 3B; before 3B spentSol
+ * left out about 0.00204 SOL of rent per buy), five buys counted, and no halt (the wallet audit explains every buy).
+ * A lost balance read makes the comparison a SKIP, never a FAIL.
+ */
+export async function sessionSpendMatchesWallet(s: Pick<HarnessSteps, 'rec' | 'skip' | 'sleep' | 'coordinator'>, d: SessionSpendDeps, opts: { buys?: number; orderSol?: number } = {}): Promise<number> {
+  const L = '(m) 3B: DEVNET_LIVE session spend';
+  const n = opts.buys ?? 5;
+  const TOLERANCE_SOL = 0.0002;
+  const skip = (step: string, detail: string) => (s.skip ? s.skip(step, detail) : console.log(`SKIP  ${step}: ${detail}`));
+  const prevAuto = process.env.AUTO_SNIPE_ENABLED;
+  const origVerdict = d.watch.getVerdict;
+  const prevGating = d.confluence.getConfluenceGating();
+  const prevBudget = { ...d.auto.getStatus().budgets };
+  const prevOrder = d.auto.orderSol();
+  let lastTradeAt = Date.now();
+  const coins = new Set<string>();
+  try {
+    process.env.AUTO_SNIPE_ENABLED = 'true';
+    for (const m of await d.makeCoins(n)) coins.add(m);
+    if (coins.size !== n) { s.rec(`${L}: ${n} coins made`, false, `${coins.size} made`); return lastTradeAt; }
+    // 0.008 SOL by default: the app refuses a 0.005 SOL first buy from a wallet that has not paid pump's one-time account rent yet
+    // (EXPECTED_EDGE_BELOW_EXECUTION_COST), and five buys with rent must fit the 3 x MAX_POSITION_SIZE_SOL session cap (0.06 by default)
+    const order = opts.orderSol ?? 0.008;
+    // the order plus fee, the token account's rent and a margin, per buy (budget first: the order size must fit inside it)
+    const budget = d.auto.setBudget({ maxBuys: n, maxSpendSol: Number((n * (order + 0.0035)).toFixed(4)) });
+    if (!budget.ok) { s.rec(`${L}: session budget of ${n} buys`, false, budget.reason ?? 'refused'); return lastTradeAt; }
+    const sized = d.auto.setOrderSol(order);
+    if (!sized.ok) { s.rec(`${L}: auto order size ${order} SOL`, false, sized.reason ?? 'refused'); return lastTradeAt; }
+    d.watch.getVerdict = function (mint: string) {
+      if (coins.has(mint)) return { state: 'HOT', reason: 'harness (m): release gates not under test', releasedAt: Date.now() - 200, score: null, passingSignals: 3, concentrationPass: true };
+      return origVerdict.call(this, mint);
+    };
+    d.confluence.setConfluenceGating(false);
+    const set = await d.auto.setMode('DEVNET_LIVE', { confirmationCode: 'CONFIRM_AUTO_DEVNET' });
+    if (!set.ok) { s.rec(`${L}: auto DEVNET_LIVE`, false, set.error ?? set.mode); return lastTradeAt; }
+    let measured = 0;
+    let unmeasured = 0;
+    let maxOpen = 0;
+    let bought = 0;
+    for (const mint of coins) {
+      await s.coordinator.syncRealWalletBalance();
+      const before = await readWithRetry(d.balanceLamports, s.sleep);
+      const dec = await d.auto.submitCandidate({ mint, source: 'TEST', provenance: 'REAL_ONCHAIN' });
+      lastTradeAt = Date.now();
+      const after = await readWithRetry(d.balanceLamports, s.sleep);
+      const open = d.openLive();
+      maxOpen = Math.max(maxOpen, open.length);
+      const drop = before !== null && after !== null ? (before - after) / 1e9 : null;
+      if (drop === null) unmeasured++; else measured += drop;
+      s.rec(`${L}: auto buy ${mint.slice(0, 6)} BOUGHT`, dec.outcome === 'BOUGHT', `${dec.outcome} ${dec.stage ?? ''} ${dec.reason}; wallet drop ${drop === null ? 'not read' : drop.toFixed(6)} SOL; spentSol ${d.auto.getStatus().session?.spentSol?.toFixed(6) ?? 'no session'}`.slice(0, 300));
+      for (const p of open) {
+        const c = await s.coordinator.closePosition(p.id, 100, 'e2e (m) sell before the next auto buy');
+        lastTradeAt = Date.now();
+        if (!c.success) s.rec(`${L}: sell ${p.mint.slice(0, 6)}`, false, c.error ?? 'not closed');
+      }
+      if (dec.outcome !== 'BOUGHT') break;
+      bought++;
+    }
+    const st = d.auto.getStatus();
+    const spent = st.session?.spentSol ?? null;
+    s.rec(`${L}: never more than one open LIVE position`, maxOpen <= 1, `at most ${maxOpen} open`);
+    s.rec(`${L}: ${n} buys counted in the session`, st.session?.buys === n, `session buys ${st.session?.buys ?? 'no session'}, mode ${st.mode}`);
+    if (bought < n) s.rec(`${L}: spentSol equals the wallet's drop`, false, `not compared: only ${bought} of ${n} auto buys went through`);
+    else if (unmeasured > 0) skip(`${L}: spentSol equals the wallet's drop`, `${unmeasured} of ${n} balance reads around a buy were lost; not compared (spentSol ${spent})`);
+    else {
+      s.rec(
+        `${L}: spentSol equals the wallet's drop over the ${n} buys (within ${TOLERANCE_SOL} SOL)`,
+        spent !== null && Math.abs(spent - measured) <= TOLERANCE_SOL,
+        `spentSol ${spent?.toFixed(6) ?? 'no session'}, wallet drop ${measured.toFixed(6)} SOL, gap ${spent === null ? '?' : (measured - spent).toFixed(6)}`
+      );
+    }
+    s.rec(`${L}: no halt (the wallet audit explains every buy)`, d.haltReason() === null, d.haltReason() ?? 'not halted');
+  } catch (e: any) {
+    s.rec(L, false, String(e?.message ?? e).slice(0, 300));
+  } finally {
+    d.watch.getVerdict = origVerdict;
+    d.confluence.setConfluenceGating(prevGating);
+    try { await d.auto.setMode('OFF'); } catch (e: any) { s.rec(`${L}: auto OFF after the step`, false, String(e?.message ?? e).slice(0, 200)); }
+    if (prevAuto === undefined) delete process.env.AUTO_SNIPE_ENABLED; else process.env.AUTO_SNIPE_ENABLED = prevAuto;
+    const back = d.auto.setBudget(prevBudget);
+    if (!back.ok) s.rec(`${L}: session budget put back`, false, back.reason ?? 'refused');
+    const backOrder = d.auto.setOrderSol(prevOrder);
+    if (!backOrder.ok) s.rec(`${L}: auto order size put back`, false, backOrder.reason ?? 'refused');
+    for (const p of d.openLive().filter((x) => coins.has(x.mint))) {
+      try {
+        const c = await s.coordinator.closePosition(p.id, 100, 'e2e (m) cleanup');
+        lastTradeAt = Date.now();
+        if (!c.success) s.rec(`${L}: cleanup close ${p.mint.slice(0, 6)}`, false, c.error ?? 'not closed');
+      } catch (e: any) { s.rec(`${L}: cleanup close ${p.mint.slice(0, 6)}`, false, String(e?.message ?? e).slice(0, 200)); }
+    }
+    await d.cleanupCoins();
+  }
+  return lastTradeAt;
+}
+
+/**
+ * 3K: the coins (m) buys, made by one throwaway creator (key on disk before it is funded; no dev buy), and its refund (sell out, then send
+ * the rest back; a failed refund is a FAIL line naming the key).
+ */
+export function stepCoins(s: Pick<HarnessSteps, 'rec'>, label: string, kit: ChainKit, payer: any, opts: { lendSol?: number } = {}) {
+  let creator: any = null;
+  const made: string[] = [];
+  return {
+    async make(n: number): Promise<string[]> {
+      creator = kit.newWallet();
+      await kit.transfer(payer, creator.publicKey, opts.lendSol ?? 0.03 * n);
+      for (let i = 0; i < n; i++) {
+        const c = await kit.create(creator, `M3K${i}`, '3K harness');
+        made.push(c.mint);
+      }
+      return [...made];
+    },
+    async cleanup(): Promise<void> {
+      if (!creator) return;
+      await sellAndRefund(s, label, kit, [creator], made, payer);
+    },
+  };
+}
+
+/**
+ * 3K (o): a loopback relay in front of `upstream` for a child server: HTTP on P, its websocket on P + 1 (web3.js's rule). `holdNextSend`
+ * arms it: the next `sendTransaction` is forwarded upstream at once (so it can land) but its reply is kept back, and the promise resolves
+ * when that request arrived. `release` lets every reply kept back go.
+ */
+export async function startSendHoldingRelay(upstream: string) {
+  for (let i = 0; i < 20; i++) {
+    let arm: (() => void) | null = null;
+    const held: Array<() => void> = [];
+    const server = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', async () => {
+        let method = '';
+        try { method = String(JSON.parse(body)?.method ?? ''); } catch { /* a batch or junk: forward it */ }
+        let up: Response;
+        try {
+          up = await fetch(upstream, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+        } catch {
+          res.writeHead(502).end();
+          return;
+        }
+        const text = await up.text();
+        const reply = () => { if (!res.writableEnded && !res.destroyed) res.writeHead(up.status, { 'content-type': up.headers.get('content-type') ?? 'application/json' }).end(text); };
+        if (method === 'sendTransaction' && arm) { const a = arm; arm = null; held.push(reply); a(); return; }
+        reply();
+      });
+    });
+    await listenOn(server, 0);
+    const port = (server.address() as AddressInfo).port;
+    try {
+      const ws = await startBlockingWsProxy(wsUrlFor(upstream), port + 1);
+      return {
+        url: `http://127.0.0.1:${port}`,
+        wsUrl: ws.url,
+        holdNextSend: () => new Promise<void>((r) => { arm = r; }),
+        release: () => { arm = null; for (const f of held.splice(0)) f(); },
+        close: async () => {
+          for (const f of held.splice(0)) f();
+          await ws.close();
+          await new Promise<void>((r) => { server.closeAllConnections(); server.close(() => r()); });
+        },
+      };
+    } catch {
+      await new Promise<void>((r) => { server.closeAllConnections(); server.close(() => r()); }); // P + 1 was taken: try another pair
+    }
+  }
+  throw new Error('no two adjacent free loopback ports for the send-holding relay');
+}
+
+/** 3K (o): one boot of server.ts in a child process (its own scratch DB and signer, behind the step's relay). */
+export interface ChildApp {
+  call(method: 'GET' | 'POST', route: string, body?: unknown): Promise<{ status: number; json: any }>;
+  /** A crash: SIGKILL, no shutdown hooks. */
+  kill(): Promise<void>;
+  /** A normal stop: SIGTERM (SIGKILL after 5 s). */
+  stop(): Promise<void>;
+}
+
+/**
+ * 3K (o): starts `node [--require <guard>] --import tsx server.ts` with exactly `env` (plus APP_PORT and OPERATOR_AUTH_TOKEN), logs appended
+ * to `logFile`, and waits for /api/health (up to 120 s). Node runs the server itself (not the tsx CLI), so SIGKILL reaches it.
+ */
+export async function spawnServer(o: { env: Record<string, string>; logFile: string; guard?: string; token: string }): Promise<ChildApp> {
+  const { spawn } = await import('node:child_process');
+  const net = await import('node:net');
+  const port = await new Promise<number>((res, rej) => { const srv = net.createServer(); srv.once('error', rej); srv.listen(0, '127.0.0.1', () => { const p = (srv.address() as AddressInfo).port; srv.close(() => res(p)); }); });
+  const args = [...(o.guard ? ['--require', o.guard] : []), '--import', 'tsx', 'server.ts'];
+  const child = spawn(process.execPath, args, { cwd: process.cwd(), env: { ...o.env, APP_PORT: String(port), OPERATOR_AUTH_TOKEN: o.token }, stdio: ['ignore', 'pipe', 'pipe'] });
+  child.stdout!.on('data', (c) => fs.appendFileSync(o.logFile, c));
+  child.stderr!.on('data', (c) => fs.appendFileSync(o.logFile, c));
+  const base = `http://127.0.0.1:${port}`;
+  const stopWith = (sig: NodeJS.Signals) => new Promise<void>((r) => {
+    if (child.exitCode !== null || child.signalCode !== null) return r();
+    child.once('exit', () => r());
+    child.kill(sig);
+    if (sig !== 'SIGKILL') setTimeout(() => child.kill('SIGKILL'), 5_000).unref();
+  });
+  let up = false;
+  for (let i = 0; i < 480 && !up; i++) {
+    if (child.exitCode !== null) throw new Error(`server.ts exited at boot (${child.exitCode}); log ${o.logFile}`);
+    try { up = (await fetch(`${base}/api/health`)).ok; } catch { /* not listening yet */ }
+    if (!up) await new Promise((r) => setTimeout(r, 250));
+  }
+  if (!up) { await stopWith('SIGKILL'); throw new Error(`server.ts did not answer /api/health in 120 s; log ${o.logFile}`); }
+  return {
+    async call(method, route, body) {
+      const res = await fetch(base + route, { method, headers: { 'content-type': 'application/json', authorization: `Bearer ${o.token}` }, body: body === undefined ? undefined : JSON.stringify(body) });
+      return { status: res.status, json: await res.json().catch(() => null) };
+    },
+    kill: () => stopWith('SIGKILL'),
+    stop: () => stopWith('SIGTERM'),
+  };
+}
+
+export interface KillRestartDeps {
+  /** Boots server.ts (AUTO_SNIPE_ENABLED=true) on the step's DB, signed by the step's own wallet, its RPC the relay below. Resolves when /api/health answers. */
+  boot(): Promise<ChildApp>;
+  relay: { holdNextSend(): Promise<void>; release(): void };
+  /** The coin the child buys by hand (POST /api/execution/trade body). */
+  buyBody: Record<string, unknown>;
+  /**
+   * Writes one BOUGHT auto decision naming `positionId` into the step's DB while no server runs on it, so the next server's
+   * `kill({exitAll})` counts the position as auto-owned and sells it (the child cannot be made to buy through auto here).
+   */
+  plantAutoOwned(positionId: string, mint: string): void;
+  /** Lends the step's wallet its SOL (the key is on disk before this runs). */
+  fund(): Promise<void>;
+  /** Sells what the step's wallet holds of the coin and refunds it; a failure is the caller's FAIL line. Always called, in `finally`. */
+  cleanup(): Promise<void>;
+}
+
+/**
+ * (o) 3E, opt-in (DEVNET_KILL_RESTART=1): the auto kill and the kill switch survive a restart. Runs server.ts itself, in child processes
+ * on a scratch DB of its own, signed by a throwaway wallet of its own (the harness's process holds the harness wallet's and DB's locks).
+ *  1. Boot, arm LIVE, buy the coin by hand (one LIVE position); stop. A BOUGHT auto decision naming that position is written into the DB.
+ *  2. Boot, arm, auto DEVNET_LIVE. The relay keeps back the reply to the next sendTransaction, and POST /api/auto/kill {exitAll:true} is sent:
+ *     the kill sells the auto-owned position, and while that sell's reply is kept back the server is killed (SIGKILL). Before 3E the mode
+ *     was saved only after the sells, so the saved mode was still DEVNET_LIVE.
+ *  3. Boot again: GET /api/auto/status says mode OFF, killed true and the kill reason (3E). Then POST /api/execution/kill-switch {activate:true}; stop.
+ *  4. Boot again: GET /api/execution/can-arm lists KILL_SWITCH_WAS_ON and auto is OFF; POST /api/auto/resume {clearHalt:true} clears it
+ *     from can-arm.
+ * `finally`: the relay lets everything go, any server still up is stopped, and the wallet is sold out and refunded.
+ */
+export async function killSurvivesRestart(s: Pick<HarnessSteps, 'rec' | 'sleep'>, d: KillRestartDeps): Promise<void> {
+  const L = '(o) 3E: kill survives a restart';
+  const ARM = { arm: true, confirmationCode: 'CONFIRM_LIVE_TRADING_RISK' };
+  const KILL_REASON = 'e2e (o) kill mid-sell';
+  let app: ChildApp | null = null;
+  const armWhenReady = async (a: ChildApp, label: string): Promise<boolean> => {
+    let last: any = null;
+    for (let i = 0; i < 120; i++) {
+      last = (await a.call('GET', '/api/execution/can-arm')).json;
+      if (last?.allowed === true) break;
+      await s.sleep(1_000);
+    }
+    const r = await a.call('POST', '/api/execution/arm', ARM);
+    s.rec(`${L}: ${label}: arm LIVE`, r.json?.success === true, r.json?.message ?? r.json?.error ?? JSON.stringify(last?.reasons ?? []).slice(0, 300));
+    return r.json?.success === true;
+  };
+  try {
+    await d.fund();
+    // 1. a LIVE position, made auto-owned
+    app = await d.boot();
+    if (!(await armWhenReady(app, 'boot 1'))) return;
+    const buy = await app.call('POST', '/api/execution/trade', d.buyBody);
+    const posId: string | undefined = buy.json?.positionId;
+    s.rec(`${L}: boot 1: a LIVE position`, buy.json?.success === true && !!posId, `${buy.status} ${buy.json?.lifecycleState ?? ''} ${buy.json?.error ?? ''} ${posId ?? 'no position id'}`.slice(0, 300));
+    await app.stop(); app = null;
+    if (!posId) return;
+    d.plantAutoOwned(posId, String(d.buyBody.mint));
+
+    // 2. kill with the sell's reply kept back, then crash
+    app = await d.boot();
+    if (!(await armWhenReady(app, 'boot 2'))) return;
+    const mode = await app.call('POST', '/api/auto/mode', { mode: 'DEVNET_LIVE', confirmationCode: 'CONFIRM_AUTO_DEVNET' });
+    s.rec(`${L}: boot 2: auto DEVNET_LIVE`, mode.json?.success === true, `${mode.status} ${mode.json?.mode ?? ''} ${mode.json?.error ?? ''}`.slice(0, 200));
+    if (mode.json?.success !== true) return;
+    const sent = d.relay.holdNextSend();
+    void app.call('POST', '/api/auto/kill', { exitAll: true, reason: KILL_REASON }).catch(() => null); // never answers: the server dies first
+    const reached = await Promise.race([sent.then(() => true), s.sleep(60_000).then(() => false)]);
+    s.rec(`${L}: boot 2: the kill reached its sell (reply kept back)`, reached, reached ? 'sendTransaction held; killing the server' : 'no sendTransaction within 60 s of POST /api/auto/kill {exitAll:true}');
+    await app.kill(); app = null;
+    d.relay.release();
+    if (!reached) return;
+
+    // 3. after the crash
+    app = await d.boot();
+    const st = (await app.call('GET', '/api/auto/status')).json;
+    s.rec(`${L}: boot 3 (after a crash mid-kill): auto is OFF`, st?.mode === 'OFF', `mode ${st?.mode}`);
+    s.rec(`${L}: boot 3: the status says it was killed, and why`, st?.killed === true && String(st?.killReason ?? '').includes(KILL_REASON), `killed ${st?.killed}, killReason ${JSON.stringify(st?.killReason ?? null)}`.slice(0, 200));
+    const trip = await app.call('POST', '/api/execution/kill-switch', { activate: true });
+    s.rec(`${L}: boot 3: kill switch tripped`, trip.json?.success === true && trip.json?.killSwitchActive === true, `${trip.status} killSwitchActive ${trip.json?.killSwitchActive}`);
+    await app.stop(); app = null;
+
+    // 4. after the kill switch
+    app = await d.boot();
+    const reasons = async (): Promise<string[]> => (await app!.call('GET', '/api/execution/can-arm')).json?.reasons ?? [];
+    const r4 = await reasons();
+    s.rec(`${L}: boot 4: can-arm lists KILL_SWITCH_WAS_ON`, r4.some((x) => x.includes('KILL_SWITCH_WAS_ON')), JSON.stringify(r4).slice(0, 300));
+    const st4 = (await app.call('GET', '/api/auto/status')).json;
+    s.rec(`${L}: boot 4: auto is OFF, killed by the kill switch`, st4?.mode === 'OFF' && st4?.killed === true, `mode ${st4?.mode}, killed ${st4?.killed}, killReason ${JSON.stringify(st4?.killReason ?? null)}`.slice(0, 200));
+    await app.call('POST', '/api/auto/resume', { clearHalt: true });
+    const r5 = await reasons();
+    s.rec(`${L}: boot 4: resume {clearHalt} takes KILL_SWITCH_WAS_ON off can-arm`, !r5.some((x) => x.includes('KILL_SWITCH_WAS_ON')), JSON.stringify(r5).slice(0, 300));
+  } catch (e: any) {
+    s.rec(L, false, String(e?.message ?? e).slice(0, 300));
+  } finally {
+    d.relay.release();
+    if (app) { try { await app.stop(); } catch { /* already gone */ } }
+    try { await d.cleanup(); } catch (e: any) { s.rec(`${L}: sell out and refund the step's wallet`, false, `${String(e?.message ?? e).slice(0, 160)}; key in <scratch>/temp-wallets/`); }
+  }
+}
+
+// ---- 3F (task 3K): a fresh harness coin for each step that buys after an exit. ----
+
+/** What `workstationDb.loadMintExits(mint, 'LIVE')` answers (3F): null when the positions table could not be read. */
+export type MintExits = { lastExit: unknown | null; loss: unknown | null } | null;
+
+/**
+ * 3F (R1-9): the app refuses a LIVE buy (MINT_RECENTLY_EXITED) of a mint with a closed LIVE position less than 24 h old, of a mint ever
+ * closed at a loss, and when it cannot read the positions. A harness round trip always loses its fees, so the harness does not tell these
+ * apart: any closed position on the mint in the scratch DB, or an unreadable answer, means the next buy needs another coin.
+ */
+export function mintNeedsReplacing(exits: MintExits): boolean {
+  return exits === null || exits.lastExit !== null || exits.loss !== null;
+}
+
+/**
+ * 3F (task 3K): a fresh pump coin with no dev buy, made by a throwaway creator (made once by `creator()`, key on disk before it is funded)
+ * lent `lendSol` and refunded right after the create. null (a FAIL line) when the coin could not be made; a failed refund is a FAIL line
+ * naming the key, and the coin is still returned.
+ */
+export async function makeHarnessCoin(
+  s: Pick<HarnessSteps, 'rec'>, label: string,
+  d: { kit: ChainKit; creator(): any; payer: any; lendSol?: number; failDetail?: string },
+): Promise<string | null> {
+  const creator = d.creator();
+  let fresh: string;
+  try {
+    await d.kit.transfer(d.payer, creator.publicKey, d.lendSol ?? 0.012);
+    fresh = (await d.kit.create(creator, 'F3K', '3K fresh harness coin')).mint;
+  } catch (e: any) {
+    s.rec(`${label}: a fresh harness coin (3F)`, false, `${d.failDetail ?? 'no coin was made'}: ${String(e?.message ?? e).slice(0, 160)}`);
+    await d.kit.refund(creator, d.payer.publicKey).catch(() => undefined);
+    return null;
+  }
+  try { await d.kit.refund(creator, d.payer.publicKey); } catch (e: any) {
+    s.rec(`${label}: refund ${creator.publicKey.toBase58()}`, false, `${String(e?.message ?? e).slice(0, 120)}; key in <scratch>/temp-wallets/`);
+  }
+  return fresh;
+}
+
+/**
+ * 3F (task 3K): called before each step that buys the harness mint. When the scratch DB holds a closed position on `mint` (an earlier step
+ * or an earlier run sold it), a throwaway creator (made once by `creator()`, key on disk before it is funded) is lent `lendSol`, creates a
+ * fresh pump coin with no dev buy, and is refunded at once. Returns the coin the step should buy: `mint` itself when it was never closed,
+ * the new coin otherwise, or null when no coin could be made (a FAIL line; the step then runs on the old mint and says why it is refused).
+ * A refund that fails is a FAIL line naming the key, and the new coin is still returned.
+ */
+export async function freshMintIfExited(
+  s: Pick<HarnessSteps, 'rec'>, label: string,
+  d: { mint: string; exits(mint: string): MintExits; kit: ChainKit; creator(): any; payer: any; lendSol?: number },
+): Promise<string | null> {
+  const exits = d.exits(d.mint);
+  if (!mintNeedsReplacing(exits)) return d.mint;
+  const why = exits === null ? 'its closed positions could not be read' : 'it has a closed LIVE position in this scratch DB';
+  const fresh = await makeHarnessCoin(s, label, { ...d, failDetail: `${d.mint.slice(0, 8)}... cannot be bought again (${why}) and no new coin was made` });
+  if (!fresh) return null;
+  console.log(`INFO  ${label}: ${d.mint.slice(0, 8)}... cannot be bought again (3F MINT_RECENTLY_EXITED: ${why}); this step buys a fresh harness coin ${fresh}`);
+  return fresh;
+}
+
+export interface ReentryBlockDeps {
+  /** A coin no step of this run has traded (makeHarnessCoin). null when none could be made (that line already FAILed). */
+  makeCoin(): Promise<string | null>;
+  /** A LIVE buy request for `mint` (fresh signal time; the harness coin's holder waiver applies). */
+  buildBuyRequestFor(mint: string): Promise<ExecuteTradeRequest>;
+  /** The position as the DB has it (status, realized PnL), or undefined. */
+  position(id: string): { status: string; realizedPnLSol?: number } | undefined;
+  /** The harness wallet's balance in lamports (one read; may throw). */
+  balanceLamports(): Promise<number | null>;
+  /** The app's auto controller (what POST /api/auto/mode runs). */
+  auto: { setMode(mode: 'OFF' | 'DEVNET_LIVE', opts?: { confirmationCode?: string }): Promise<{ ok: boolean; mode: string; error?: string }> };
+}
+
+/**
+ * (p) 3F (R1-9), task 3K, opt-in (DEVNET_REENTRY_BLOCK=1): no re-entry into a mint after an exit. On a fresh harness coin P (one no step
+ * of this run has traded): a LIVE buy of P is CONFIRMED and sold in full (the position CLOSED, its realized PnL recorded). After the per-mint
+ * cooldown, a second buy of P is refused RISK_REJECTED MINT_RECENTLY_EXITED: no new BUY row, no signature, the wallet balance unchanged.
+ * Auto is then set to DEVNET_LIVE and back to OFF (setMode clears the controller's per-session attempted set, the only re-entry guard before
+ * 3F), and a third buy of P is still refused. A lost balance read makes that one comparison a SKIP. `finally` turns auto OFF and sells
+ * anything open on P (before 3F the second buy went through: the cleanup sells it). Returns when its last trade settled.
+ */
+export async function reentryBlockedAfterExit(s: HarnessSteps, d: ReentryBlockDeps): Promise<number> {
+  const L = '(p) 3F: no re-entry after an exit';
+  const skip = (step: string, detail: string) => (s.skip ? s.skip(step, detail) : console.log(`SKIP  ${step}: ${detail}`));
+  let lastTradeAt = Date.now();
+  let mint: string | null = null;
+  const open = () => s.db.loadPositions().filter((p) => p.mint === mint && p.status !== 'CLOSED');
+  const buyRows = () => s.db.loadTransactions().filter((t) => t.mint === mint && t.direction === 'BUY').length;
+  const refused = async (label: string) => {
+    await s.coordinator.syncRealWalletBalance();
+    const rowsBefore = buyRows();
+    const balBefore = await readWithRetry(d.balanceLamports, s.sleep);
+    const r = await s.coordinator.executeTrade(await d.buildBuyRequestFor(mint!));
+    if (r.success) lastTradeAt = Date.now();
+    const balAfter = await readWithRetry(d.balanceLamports, s.sleep);
+    const sig = r.txSignature || r.signature || '';
+    s.rec(
+      `${L}: ${label}: refused MINT_RECENTLY_EXITED, nothing sent`,
+      !r.success && r.lifecycleState === 'RISK_REJECTED' && /^MINT_RECENTLY_EXITED/.test(r.error ?? '') && buyRows() === rowsBefore && !sig,
+      `${r.lifecycleState} ${r.error ?? ''}; BUY rows ${rowsBefore} -> ${buyRows()}${sig ? `; signature ${s.link(sig)}` : ''}`.slice(0, 400)
+    );
+    if (balBefore === null || balAfter === null) skip(`${L}: ${label}: wallet unchanged`, 'a balance read was lost (3 retries); not compared');
+    else s.rec(`${L}: ${label}: wallet unchanged`, balAfter === balBefore, `${balBefore} -> ${balAfter} lamports`);
+  };
+  try {
+    mint = await d.makeCoin();
+    if (!mint) return lastTradeAt;
+    // 1. one round trip on P
+    await s.coordinator.syncRealWalletBalance();
+    const buy = await s.coordinator.executeTrade(await d.buildBuyRequestFor(mint));
+    lastTradeAt = Date.now();
+    s.rec(`${L}: buy of a fresh coin CONFIRMED`, buy.success && buy.lifecycleState === 'CONFIRMED', `${mint.slice(0, 8)}... ${buy.lifecycleState} ${buy.error ?? ''}`.slice(0, 300));
+    if (!buy.success) return lastTradeAt;
+    for (const p of open()) {
+      const c = await s.coordinator.closePosition(p.id, 100, 'e2e (p)');
+      lastTradeAt = Date.now();
+      const row = d.position(p.id);
+      s.rec(`${L}: sold in full, position CLOSED`, c.success && row?.status === 'CLOSED', `${c.error ?? 'closed'}; status ${row?.status}; realized PnL ${row?.realizedPnLSol ?? '?'} SOL`);
+    }
+    if (open().length) return lastTradeAt;
+    // 2. after the per-mint cooldown, the same coin again
+    await waitPast(s, lastTradeAt, s.riskLimits().cooldownPerMintMs, 'per-mint cooldown from the (p) sell');
+    await refused('buy of the same coin after the cooldown');
+    // 3. setMode clears the auto controller's attempted set; the block is in the positions table, so it holds
+    const prevAuto = process.env.AUTO_SNIPE_ENABLED;
+    process.env.AUTO_SNIPE_ENABLED = 'true'; // for these two calls only, as (e''') and (m) do
+    let on: { ok: boolean; mode: string; error?: string };
+    let off: { ok: boolean; mode: string; error?: string };
+    try {
+      on = await d.auto.setMode('DEVNET_LIVE', { confirmationCode: 'CONFIRM_AUTO_DEVNET' });
+      off = await d.auto.setMode('OFF');
+    } finally {
+      if (prevAuto === undefined) delete process.env.AUTO_SNIPE_ENABLED; else process.env.AUTO_SNIPE_ENABLED = prevAuto;
+    }
+    s.rec(`${L}: auto DEVNET_LIVE then OFF`, on.ok && off.ok && off.mode === 'OFF', `${on.ok ? on.mode : on.error}; ${off.ok ? off.mode : off.error}`);
+    await refused('buy after auto DEVNET_LIVE and OFF');
+  } catch (e: any) {
+    s.rec(L, false, String(e?.message ?? e).slice(0, 300));
+  } finally {
+    try { await d.auto.setMode('OFF'); } catch (e: any) { s.rec(`${L}: auto OFF after the step`, false, String(e?.message ?? e).slice(0, 200)); }
+    if (mint) {
+      for (const p of open()) {
+        try {
+          const c = await s.coordinator.closePosition(p.id, 100, 'e2e (p) cleanup');
+          lastTradeAt = Date.now();
+          s.rec(`${L}: cleanup close 100%`, c.success, c.error || 'closed');
+        } catch (e: any) { s.rec(`${L}: cleanup close 100%`, false, String(e?.message ?? e).slice(0, 200)); }
+      }
+    }
+  }
+  return lastTradeAt;
 }

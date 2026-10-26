@@ -215,6 +215,8 @@ export const AutoKillSchema = z.object({
 export const AutoResumeSchema = z.object({
   clearHalt: z.boolean().optional(),
   clearDailyLossLatch: z.boolean().optional(),
+  /** 3E: acknowledge NEGATIVE_EXPECTANCY / LOSS_STREAK; auto trades closed until now stop counting, so a mode can be set again. */
+  ackLossTriggers: z.boolean().optional(),
 });
 
 

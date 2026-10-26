@@ -12,8 +12,9 @@
  *
  * Called by: `ExecutionCoordinator.closePositionImpl` (`resolveVenue`, `buildPumpSwapSellInstructions`: this is how a migrated position is
  * sold) and `RealMarkPriceService.queryOnChainMarkPrices` in `reconciliation.ts` (`getPoolState`, to price an open position whose curve has completed). Buys are never built here in the running app: a
- * LIVE buy of a migrated token is rejected with `BONDING_CURVE_MIGRATED`. `buildPumpSwapBuyInstructions` and the `quotePumpSwap*` helpers
- * have no production caller (only tests), so treat them as unexercised until a send path uses them.
+ * LIVE buy of a migrated token is rejected with `BONDING_CURVE_MIGRATED`. `buildPumpSwapBuyInstructions` throws
+ * (PUMPSWAP_BUY_NOT_SUPPORTED, 3H/A12) and the `quotePumpSwap*` helpers have no production caller (only tests), so treat them as unexercised
+ * until a send path uses them.
  */
 import {
   Connection,
@@ -62,7 +63,7 @@ export type PumpSwapPoolState = PumpSwapExecutionState;
 
 /** Static helpers around the PumpSwap pool of one mint. Pool state is cached per mint for 15 s, unless the caller asks for a fresh read. */
 export class PumpSwapVenueService {
-  private static poolCache: Map<string, { pool: PumpSwapExecutionState | null; timestamp: number }> = new Map();
+  private static poolCache: Map<string, { pool: PumpSwapExecutionState | null; timestamp: number }> = new Map(); // timestamp: performance.now(), so a wall clock set back cannot keep a stale pool fresh (S271 review)
   private static readonly CACHE_TTL_MS = 15000;
 
   /**
@@ -149,7 +150,7 @@ export class PumpSwapVenueService {
     }
     const mintStr = mint.toBase58();
     const cached = this.poolCache.get(mintStr);
-    if (!opts.fresh && cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
+    if (!opts.fresh && cached && performance.now() - cached.timestamp < this.CACHE_TTL_MS) {
       return cached.pool;
     }
 
@@ -160,7 +161,7 @@ export class PumpSwapVenueService {
         if (executionMode === 'LIVE') {
           Logger.error(`PUMPSWAP_POOL_NOT_FOUND in LIVE mode: Canonical pool ${poolKey.toBase58()} not found on-chain.`);
         }
-        this.poolCache.set(mintStr, { pool: null, timestamp: Date.now() });
+        this.poolCache.set(mintStr, { pool: null, timestamp: performance.now() });
         return null;
       }
 
@@ -227,7 +228,7 @@ export class PumpSwapVenueService {
         marketDataTimestamp: Date.now(),
       };
 
-      this.poolCache.set(mintStr, { pool: state, timestamp: Date.now() });
+      this.poolCache.set(mintStr, { pool: state, timestamp: performance.now() });
       return state;
     } catch (err: any) {
       Logger.warn(`Failed to fetch PumpSwap pool state for ${mintStr}: ${err.message}`);
@@ -314,78 +315,26 @@ export class PumpSwapVenueService {
     });
   }
 
-  // Build PumpSwap buy instructions using official SDK quoter and instruction builder
-  /** Instructions to buy `solAmountLamports` of a migrated token, with the minimum base output at `slippageBps`. No production caller (see the file header). */
+  /**
+   * 3H (A12, L6): not built. This used to call `PUMP_AMM_SDK.buyInstructions(swapState, maxQuoteCost, minBaseOut)`, but the SDK takes
+   * `(swapState, baseOut, maxQuoteIn)`, so the SOL amount went in as the token amount and the minimum token output as the SOL cap: a wrong
+   * instruction. It had no production caller (a LIVE buy of a migrated token is refused with BONDING_CURVE_MIGRATED), so it now throws
+   * before reading anything. Build it again, with a test against the SDK's argument order, when a send path needs PumpSwap buys.
+   */
   public static async buildPumpSwapBuyInstructions(
-    connection: Connection,
-    userPubkey: PublicKey,
-    mint: PublicKey,
-    solAmountLamports: bigint,
-    slippageBps: number,
-    executionMode: ExecutionMode
+    _connection: Connection,
+    _userPubkey: PublicKey,
+    _mint: PublicKey,
+    _solAmountLamports: bigint,
+    _slippageBps: number,
+    _executionMode: ExecutionMode
   ): Promise<{
     instructions: TransactionInstruction[];
     expectedBaseOutputRaw: bigint;
     minBaseOutputRaw: bigint;
     spotPriceSol: number;
   }> {
-    if (executionMode !== 'LIVE' && executionMode !== 'PAPER') {
-      throw new Error('CRITICAL_CONFIG_ERROR: executionMode ("LIVE" | "PAPER") is strictly required for buildPumpSwapBuyInstructions');
-    }
-    const poolKey = canonicalPumpPoolPda(mint);
-    const poolAccount = await connection.getAccountInfo(poolKey);
-    if (!poolAccount || !poolAccount.data || poolAccount.data.length === 0) {
-      throw new Error(`PUMPSWAP_POOL_NOT_FOUND: Canonical PumpSwap pool for mint ${mint.toBase58()} does not exist on-chain.`);
-    }
-
-    const onlineSdk = new OnlinePumpAmmSdk(connection);
-    const swapState = await onlineSdk.swapSolanaState(poolKey, userPubkey);
-
-    if (!swapState || !swapState.pool) {
-      throw new Error(`PUMPSWAP_POOL_NOT_FOUND: Canonical PumpSwap pool for mint ${mint.toBase58()} does not exist on-chain.`);
-    }
-
-    if (
-      !swapState.pool.quoteMint.equals(NATIVE_MINT) &&
-      !swapState.pool.quoteMint.equals(new PublicKey('So11111111111111111111111111111111111111112'))
-    ) {
-      throw new Error(`UNSUPPORTED_PUMPSWAP_QUOTE_MINT: Quote mint ${swapState.pool.quoteMint.toBase58()} is not native SOL.`);
-    }
-
-    if (swapState.poolBaseAmount.isZero() || swapState.poolQuoteAmount.isZero()) {
-      throw new Error(`PUMPSWAP_INSUFFICIENT_LIQUIDITY: Pool ${poolKey.toBase58()} has zero liquidity.`);
-    }
-
-    const quoteResult = this.quotePumpSwapBuyQuoteInput({
-      solAmountLamports,
-      slippageBps,
-      swapState,
-    });
-
-    const maxQuoteCost = new BN(solAmountLamports.toString());
-    const minBaseOut = quoteResult.minBase;
-
-    const instructions = await PUMP_AMM_SDK.buyInstructions(
-      swapState,
-      maxQuoteCost,
-      minBaseOut
-    );
-
-    let decimals = 6;
-    if (swapState.baseMintAccount && swapState.baseMintAccount.decimals != null) {
-      decimals = swapState.baseMintAccount.decimals;
-    }
-    const effectiveQuoteBN = swapState.poolQuoteAmount.add(swapState.pool.virtualQuoteReserves || new BN(0));
-    const baseHuman = Number(swapState.poolBaseAmount.toString()) / Math.pow(10, decimals);
-    const quoteSol = Number(effectiveQuoteBN.toString()) / 1e9;
-    const spotPriceSol = baseHuman > 0 ? quoteSol / baseHuman : 0;
-
-    return {
-      instructions,
-      expectedBaseOutputRaw: BigInt(quoteResult.uiBase.toString()),
-      minBaseOutputRaw: BigInt(quoteResult.minBase.toString()),
-      spotPriceSol,
-    };
+    throw new Error('PUMPSWAP_BUY_NOT_SUPPORTED: buying a migrated (PumpSwap) token is not built; the old builder passed the SOL amount as the token amount. Buys use the bonding curve only.');
   }
 
   // Build PumpSwap sell instructions using official SDK quoter and instruction builder

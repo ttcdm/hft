@@ -61,7 +61,9 @@ describe('S183 the size of one auto order is editable within the manual snipe ru
     const start = left();
     await c.submitCandidate(cand(newPumpPool('HOT').mint));
     expect(snipe.mock.calls[0][0].amountSolOverride).toBe(0.012);
-    expect(left()).toBeCloseTo(start - 0.012, 6); // the sent-but-unconfirmed buy is counted at the chosen size, not at 0.005
+    // the sent-but-unconfirmed buy is counted from the chosen size, not from 0.005; 3B: at its worst case (slippage headroom and rent on top)
+    expect(start - left()).toBeGreaterThan(0.012);
+    expect(start - left()).toBeLessThan(0.02);
     await c.setMode('OFF');
     for (const p of workstationDb.loadPositions('LIVE', 'ACTIVE')) await executionCoordinator.closePosition(p.id, 100, 'MANUAL').catch(() => undefined);
   });

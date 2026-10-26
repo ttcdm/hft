@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { authFetch } from '../services/engineClient';
+import { onAuthenticated } from './authEvents';
 
 /** The server's own answer to "what would a click do right now" (from /api/diagnostics/system). */
 export interface SystemAuditLite {
@@ -52,6 +53,7 @@ export function describeTradingMode(audit: SystemAuditLite | null | undefined, f
 let latest: { audit: SystemAuditLite; at: number } | null = null;
 const subscribers = new Set<() => void>();
 let timer: ReturnType<typeof setInterval> | null = null;
+let offAuth: (() => void) | null = null;
 
 async function poll(): Promise<void> {
   try {
@@ -75,10 +77,11 @@ export function subscribeTradingMode(fn: () => void): () => void {
   if (!timer) {
     void poll();
     timer = setInterval(() => { void poll(); subscribers.forEach((f) => f()); }, 5000);
+    offAuth = onAuthenticated(() => { void poll(); }); // UI-5: read at once after sign-in
   }
   return () => {
     subscribers.delete(fn);
-    if (subscribers.size === 0 && timer) { clearInterval(timer); timer = null; }
+    if (subscribers.size === 0 && timer) { clearInterval(timer); timer = null; offAuth?.(); offAuth = null; }
   };
 }
 

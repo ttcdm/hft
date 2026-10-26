@@ -165,6 +165,38 @@ describe('P1.5: an ambiguous send is unknown, never REVERTED', () => {
     expect(send).toHaveBeenCalledTimes(1);
   });
 
+  it('(b2) S271 review: a pending sell stamped under a clock later set back 18 h holds the exit one window from now, not 18 h', async () => {
+    const id = `p15_clock_${Math.random().toString(36).slice(2)}`;
+    workstationDb.savePosition({
+      id, mint: VALID_PUMP_MINT_1.toBase58(), symbol: 'P15', name: 'P15', tokenDecimals: 6, tokenQuantityRaw: '1000000000',
+      entryPriceSol: 0.0001, currentPriceSol: 0.0002, currentValueSol: 0.2, costBasisLamports: 100_000_000, realizedPnLSol: 0,
+      status: 'OPEN', venue: 'PUMP_BONDING_CURVE', executionMode: 'LIVE', entryTxSignature: `sig_${id}`, entryTimestamp: Date.now(),
+      lastMarkTimestamp: Date.now(), recordUpdatedAt: Date.now(), updatedAt: Date.now(),
+    } as any);
+    vi.spyOn(PumpSwapVenueService, 'resolveVenue').mockResolvedValue({ venue: 'PUMP_BONDING_CURVE' } as any);
+    vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockResolvedValue(createSimulatedBondingCurveState());
+    vi.spyOn(PumpCurveService, 'calculateSellQuote').mockReturnValue({ expectedJitoTipLamports: 0, minOutputLamports: 1 } as any);
+    vi.spyOn(txBuilder, 'buildSellTransaction').mockImplementation(async () => signedTx(conn));
+    vi.spyOn(TradeReconciler, 'capturePreTradeSnapshot').mockResolvedValue({ walletSolLamports: 1e9, tokenBalanceRaw: '1000000000', tokenDecimals: 6, timestamp: Date.now() });
+    vi.spyOn(conn, 'getTokenAccountBalance').mockResolvedValue({ context: { slot: 1 }, value: { amount: '1000000000', decimals: 6, uiAmount: 1000, uiAmountString: '1000' } } as any);
+    const send = vi.spyOn(conn, 'sendRawTransaction').mockRejectedValue(new Error('socket hang up'));
+    expect((await coordinator.closePosition(id, 33, 'TAKE_PROFIT_1')).error).toMatch(/SEND_OUTCOME_UNKNOWN/);
+    // as if the sell had been sent while the clock ran 18 h ahead, with no lastValidBlockHeight to prove it expired
+    const pending = (coordinator as any).pendingSells.get(id);
+    pending.ts = Date.now() + 18 * 3_600_000;
+    delete pending.lastValidBlockHeight;
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      expect((await coordinator.closePosition(id, 33, 'TAKE_PROFIT_1')).error).toMatch(/SELL_PENDING_VERIFICATION/); // the window restarts now
+      vi.setSystemTime(Date.now() + 101_000); // past PENDING_SELL_WINDOW_MS (100 s)
+      const later = await coordinator.closePosition(id, 33, 'TAKE_PROFIT_1');
+      expect(later.error ?? '').not.toMatch(/SELL_PENDING_VERIFICATION/); // was held until the clock caught up, 18 h
+      expect(send).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('(c) Jito: a status read that throws inside confirm keeps polling instead of escaping as CHAIN_ERROR', async () => {
     const jito = new MockJitoEngine();
     const url = await jito.start();

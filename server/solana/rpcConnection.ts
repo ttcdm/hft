@@ -85,7 +85,7 @@ export class RpcLimiterWaitError extends Error {
  */
 export class RpcRateLimiter {
   private readonly intervalMs: number;
-  private nextSlotAt = 0;
+  private nextSlotAt = 0; // on performance.now()
   private readonly waiting: { send: boolean; resolve: () => void; deadline: ReturnType<typeof setTimeout> | null }[] = [];
   private timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -121,7 +121,10 @@ export class RpcRateLimiter {
   private pump(): void {
     if (this.timer) return;
     while (this.waiting.length > 0) {
-      const now = Date.now();
+      // S271 (devnet run 15), then review: the limiter measures elapsed time on the monotonic clock. On Date.now, a wall clock set back (an NTP
+      // correction, or the harness restoring a shifted clock) left a slot booked under the later time, which held every request until the clock
+      // caught up; each one failed RPC_LIMITER_WAIT after 3 s, for hours. performance.now never moves back, so no slot can be booked ahead.
+      const now = performance.now();
       if (now >= this.nextSlotAt) {
         this.nextSlotAt = now + this.intervalMs;
         const w = this.waiting.shift()!;

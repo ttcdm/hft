@@ -360,33 +360,10 @@ class EngineClient {
     return null;
   }
 
-  public async updateSniperConfig(cfg: any) {
-    try {
-      const res = await authFetch('/api/memecoins/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(cfg),
-      });
-      return await res.json();
-    } catch (e) {
-      console.error(e);
-    }
-  }
-
   // ---------------- PUMP.FUN HOT CALLOUTS & LEADERBOARD ----------------
   public async getPumpFunCallouts() {
     try {
       const res = await authFetch('/api/pumpfun/callouts');
-      if (res.ok) return await res.json();
-    } catch (e) {
-      console.error(e);
-    }
-    return null;
-  }
-
-  public async getPumpFunLeaderboard() {
-    try {
-      const res = await authFetch('/api/pumpfun/leaderboard');
       if (res.ok) return await res.json();
     } catch (e) {
       console.error(e);
@@ -408,16 +385,6 @@ class EngineClient {
     }
   }
 
-  public async getPumpFunRules() {
-    try {
-      const res = await authFetch('/api/pumpfun/callouts/rules');
-      if (res.ok) return await res.json();
-    } catch (e) {
-      console.error(e);
-    }
-    return null;
-  }
-
   public async updatePumpFunRules(rules: any) {
     try {
       const res = await authFetch('/api/pumpfun/callouts/rules', {
@@ -434,16 +401,6 @@ class EngineClient {
   public async refreshPumpFunData() {
     try {
       const res = await authFetch('/api/pumpfun/refresh', { method: 'POST' });
-      if (res.ok) return await res.json();
-    } catch (e) {
-      console.error(e);
-    }
-    return null;
-  }
-
-  public async getPumpFunStatus() {
-    try {
-      const res = await authFetch('/api/pumpfun/status');
       if (res.ok) return await res.json();
     } catch (e) {
       console.error(e);

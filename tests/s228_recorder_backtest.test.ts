@@ -113,10 +113,10 @@ describe('S228 the recorded-launch adapters', () => {
 
 describe('S228 the train/test split', () => {
   const src = { createTimes: () => Array.from({ length: 100 }, (_, i) => 1000 + i) } as any;
-  it('--split-ts wins; otherwise the cut is the 75th percentile of create times', () => {
+  it('--split-ts wins; otherwise the cut is the 70th percentile of create times (5A: a 30% holdout)', () => {
     expect(resolveSplit('1234567', src).cut).toBe(1234567);
-    expect(resolveSplit(undefined, src).cut).toBe(1075);
-    expect(resolveSplit('', src).cut).toBe(1075);
+    expect(resolveSplit(undefined, src).cut).toBe(1070);
+    expect(resolveSplit('', src).cut).toBe(1070);
     expect(resolveSplit(undefined, { createTimes: () => [] } as any).cut).toBe(0);
   });
   it('refuses a split that is not a time in milliseconds', () => {

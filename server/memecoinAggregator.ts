@@ -131,7 +131,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     telegramChatId: '',
     telegramWebhookActive: false,
   };
-  // C2: on by default. Operators can still switch it off explicitly with setConfluenceGating(false).
+  // C2: on by default. 3H (A14): no route, screen or production code calls setConfluenceGating, so in the running app it is always on (the
+  // safe direction) and a caller's enforceConfluence makes no difference. Tests use the setter to switch it off; that is its only use.
   private isConfluenceGatingEnabled: boolean = true;
 
   constructor() {
@@ -936,8 +937,9 @@ export class MemecoinAggregatorService extends EventEmitter {
       // Isolate synthetic visualizer ticks from real live on-chain market feed freshness
       executionCoordinator.recordSyntheticMarketEvent('UI_PRICE_SIMULATOR');
 
-      // Demo pool variation for UI visualizer
+      // Demo pool variation for UI visualizer. P3.1 (N-20): only the built-in demo pools move; a pool ingested from the chain keeps its real price.
       this.pools.forEach((pool) => {
+        if (!DEMO_POOL_IDS.has(pool.id)) return;
         const deltaPct = (Math.random() - 0.5) * 1.2;
         pool.priceUsd = Math.max(0.000001, pool.priceUsd * (1 + deltaPct / 100));
         if (this.solPriceUsd > 0) pool.priceNative = pool.priceUsd / this.solPriceUsd;

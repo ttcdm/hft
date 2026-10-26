@@ -22,6 +22,11 @@ export const SELL_SLIPPAGE_LADDER_BPS = [800, 1500, 2500, 4000];
 /** Auto-exit retry backoff after a failed attempt: base * 2^(n-1), capped. Each failed LIVE send can pay fees. */
 export const EXIT_RETRY_BASE_MS = 3_000;
 export const EXIT_RETRY_MAX_MS = 30_000;
+/**
+ * T6: after a LIVE exit the RPC rate-limited past every resend, the exit pass waits this long before that position's next try. Flat and
+ * short: it neither counts as a failure nor widens slippage; it only stops each 3 s tick from spending four more sends on a throttled RPC.
+ */
+export const EXIT_RATE_LIMITED_WAIT_MS = 6_000;
 /** Consecutive failed exits before an operator alert is raised. */
 export const EXIT_FAILURE_ALERT_AFTER = 4;
 
@@ -141,6 +146,11 @@ export function exitStageAfterFill(reason: string | undefined, current: Normaliz
 }
 
 /** A balance found in the wallet that this app never bought (cost basis unknown): watched with a hard stop, not a trade the app chose. */
+/** E2: true when a token program (SPL Token or Token-2022) owns the account; an unknown owner counts as owned, so a read that cannot tell decides nothing. */
+const ownedByTokenProgram = (owner: PublicKey | undefined): boolean => !owner || typeof (owner as any).equals !== 'function' || owner.equals(TOKEN_PROGRAM_ID) || owner.equals(TOKEN_2022_PROGRAM_ID);
+
+/** 3B: the decision-journal outcome of a landed LIVE buy (any caller); its row carries the buy's wallet SOL delta. */
+export const LIVE_BUY_FILLED = 'LIVE_BUY_FILLED';
 export const isRecoveredPosition = (p: { entryTxSignature?: string }): boolean => !!p.entryTxSignature?.startsWith('RECOVERED:');
 
 // Q11: the reasons the operator routes actually pass ('Manual user order' from POST /api/wallet/close, 'Aggregator Close' from the WS
@@ -449,6 +459,11 @@ export class ExecutionCoordinator {
       reasons.push('Workstation SQLite database is not writable');
     }
 
+    // P3.1 (N-20): DEMO_MODE loads fake callers and random-walks the demo pools' prices; it never runs next to LIVE, so arming refuses.
+    if (process.env.DEMO_MODE === 'true') {
+      reasons.push('DEMO_MODE=true: demo prices and callers are loaded; LIVE cannot be armed while it is on');
+    }
+
     if (!this.lastStartupReconciliation || this.lastStartupReconciliation.status !== 'EXECUTION_READY') {
       reasons.push(
         this.lastStartupReconciliation
@@ -494,6 +509,11 @@ export class ExecutionCoordinator {
 
     if (riskEngine.isKillSwitchActive()) {
       reasons.push('Emergency risk kill switch is active');
+    }
+
+    // T1: the switch is off after a restart (by decision), but LIVE does not arm until the operator has cleared the boot alert that says it was on.
+    if (this.operatorAlerts.some((a) => a.code === 'KILL_SWITCH_WAS_ON' && !a.cleared)) {
+      reasons.push('The kill switch was on before the restart; clear KILL_SWITCH_WAS_ON with POST /api/auto/resume {clearHalt:true} before arming');
     }
 
     if (riskEngine.getCircuitBreakerState() !== 'CLOSED') {
@@ -565,6 +585,27 @@ export class ExecutionCoordinator {
       reasons: readiness.reasons,
       readiness,
     };
+  }
+
+  /**
+   * P3.1 (R1-0): the cheap readiness checks every LIVE buy runs, not only the arm. canExecuteLive runs once, when LIVE is armed; a database
+   * that turns read-only, a reconciliation mismatch, a tripped breaker or a stale mark feed after that must still stop the next buy. Direct
+   * reads, no cache (the plan leaves a 2 s cached canExecuteLive open; these are cheap enough to run on every buy). Sells never call this.
+   * Returns why the buy is refused; empty means it may go on.
+   */
+  private liveBuyReadinessProblems(): string[] {
+    const problems: string[] = [];
+    if (this.clusterProblem !== null) problems.push(`the RPC is not on the allowed cluster (${this.clusterProblem})`);
+    if (this.rpcHealth === 'DISCONNECTED') problems.push('Solana RPC is DISCONNECTED');
+    if (!workstationDb.isWritable()) problems.push('the workstation database is not writable');
+    if (!this.lastStartupReconciliation || this.lastStartupReconciliation.status !== 'EXECUTION_READY') {
+      problems.push(`startup reconciliation is ${this.lastStartupReconciliation?.status ?? 'not finished'}`);
+    }
+    const breaker = riskEngine.getCircuitBreakerState();
+    if (breaker !== 'CLOSED') problems.push(`the risk circuit breaker is ${breaker}`);
+    if (this.positionMarkHealth === 'STALE') problems.push('the position mark feed is STALE');
+    if (process.env.DEMO_MODE === 'true') problems.push('DEMO_MODE=true (demo prices and callers are loaded)');
+    return problems;
   }
 
   private connectionChangeListeners = new Set<(conn: Connection) => void>();
@@ -863,8 +904,10 @@ export class ExecutionCoordinator {
 
                 if (recovery.recovered && recovery.mint) {
                   if (recovery.type === 'BUY' && recovery.tokenQuantityRaw) {
-                    workstationDb.savePosition(this.positionFromRecoveredBuy(pTx, recovery, txDetails.slot));
+                    const adopted = this.positionFromRecoveredBuy(pTx, recovery, txDetails.slot);
+                    workstationDb.savePosition(adopted);
                     pTx.reconciliationState = 'RECONCILED';
+                    this.journalLiveBuySolDelta(adopted, recovery.solSpentLamports ?? 0, 'STARTUP_RECONCILIATION', 'RECOVERED'); // 3B (R1-38)
                     Logger.info(`Successfully recovered interrupted BUY position for ${recovery.mint} (${pTx.signature})`);
                   } else if (recovery.type === 'SELL') {
                     const targetPos = workstationDb
@@ -1051,6 +1094,28 @@ export class ExecutionCoordinator {
     this.reconcileRetryTimer.unref?.();
   }
 
+  /**
+   * 3B (P3.2, R1-38): one decision row per landed LIVE buy, carrying the SOL it took from the wallet (negative), so the DEVNET_LIVE wallet
+   * audit (sumDecisionSolDelta) explains it. Written once per buy: by the confirmed path when its position is saved, or by orphan recovery
+   * when it adopts a buy that returned UNCONFIRMED or with an unread fill (that path's idempotent branch, a position already saved, writes none).
+   * The auto controller's BOUGHT row carries no delta of its own, so an auto buy is not counted twice. PAPER buys never journal one.
+   */
+  private journalLiveBuySolDelta(pos: NormalizedPosition, walletDeltaLamports: number, source: string, how: 'CONFIRMED' | 'RECOVERED'): void {
+    if (pos.executionMode !== 'LIVE') return;
+    workstationDb.logDecision({
+      autoMode: 'n/a',
+      mint: pos.mint,
+      symbol: pos.symbol,
+      source,
+      stage: 'fill',
+      outcome: LIVE_BUY_FILLED,
+      reason: how === 'CONFIRMED' ? 'LIVE buy confirmed and reconciled' : 'LIVE buy adopted by orphan recovery',
+      inputs: { walletDeltaLamports, signature: pos.entryTxSignature },
+      positionId: pos.id,
+      solDelta: -walletDeltaLamports / 1e9,
+    });
+  }
+
   /** Position for a buy rebuilt from confirmed on-chain data. Entry price is the curve price paid; cost basis is the whole wallet delta. */
   private positionFromRecoveredBuy(
     pTx: { signature: string; mint: string; jitoTipLamports: number; executionMode: ExecutionMode },
@@ -1115,9 +1180,12 @@ export class ExecutionCoordinator {
         }
         const recovery = await TradeReconciler.recoverInterruptedTransaction(this.connection, t.signature, wallet, t.jitoTipLamports);
         if (recovery.recovered && recovery.type === 'BUY' && recovery.mint && recovery.tokenQuantityRaw) {
-          workstationDb.savePosition(this.positionFromRecoveredBuy(t, recovery, t.landingSlot ?? 0));
+          const adopted = this.positionFromRecoveredBuy(t, recovery, t.landingSlot ?? 0);
+          workstationDb.savePosition(adopted);
           t.reconciliationState = 'RECONCILED';
           workstationDb.saveTransaction(t);
+          // 3B (R1-38): the SOL this buy took left the wallet without a journal row (it returned UNCONFIRMED, or its fill was unread); journal it now.
+          this.journalLiveBuySolDelta(adopted, recovery.solSpentLamports ?? 0, 'ORPHAN_RECOVERY', 'RECOVERED');
           recovered.push(t.signature);
           Logger.warn(`Recovered orphaned LIVE buy ${t.signature} for ${recovery.mint}: position opened with stop-loss coverage`);
         } else if (recovery.error && /reverted/i.test(recovery.error)) {
@@ -2239,6 +2307,19 @@ export class ExecutionCoordinator {
     return { verdict, gates };
   }
 
+  /** 3F (R1-9): the MINT_RECENTLY_EXITED refusal for a buy of `mint` in the current mode, or null when it may be bought. Fails closed. */
+  private mintReentryRefusal(mint: string, now: number): string | null {
+    const exits = workstationDb.loadMintExits(mint, this.executionMode);
+    if (exits === null) return `MINT_RECENTLY_EXITED: the closed positions of ${mint} could not be read, so a re-entry after an exit cannot be ruled out; buy refused.`;
+    if (exits.loss) return `MINT_RECENTLY_EXITED: ${mint} was closed at a loss (position ${exits.loss.positionId}, ${(exits.loss.realizedLamports / 1e9).toFixed(6)} SOL); this mint is not bought again.`;
+    if (!exits.lastExit) return null;
+    const ageMs = now - exits.lastExit.exitedAt;
+    if (ageMs >= MINT_REENTRY_BLOCK_MS) return null; // a missing or future close time (NaN, negative age) stays blocked
+    const until = Number.isFinite(exits.lastExit.exitedAt) ? new Date(exits.lastExit.exitedAt + MINT_REENTRY_BLOCK_MS).toISOString() : 'an unknown time (the close time is unreadable)';
+    const ago = Number.isFinite(ageMs) ? `${(Math.max(0, ageMs) / 3_600_000).toFixed(1)} h ago` : 'at an unreadable time';
+    return `MINT_RECENTLY_EXITED: ${mint} was closed ${ago} (position ${exits.lastExit.positionId}); it can be bought again after ${until}, 24 h after the exit.`;
+  }
+
   // Authoritative Central Execution Entrypoint
   /** The one entry for every trade. S209: a span of its own (a child of the auto candidate's when auto started it, else the root of a manual trade's trace). */
   public executeTrade(req: ExecuteTradeRequest): Promise<ExecutionResponse> {
@@ -2324,6 +2405,12 @@ export class ExecutionCoordinator {
     if (this.executionMode === 'PAPER') {
       const evaluated = await this.evaluatePaperBuy(req, correlationId, now, openPositions, totalExposureSol);
       if ('rejection' in evaluated) return evaluated.rejection;
+      // 3F (R1-9): after the paper gates, so a halt, the kill switch or a loss limit still answers first
+      const paperReentry = this.mintReentryRefusal(req.mint, now);
+      if (paperReentry) {
+        workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'PAPER', { reason: 'MINT_RECENTLY_EXITED', mint: req.mint, message: paperReentry });
+        return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'PAPER', error: paperReentry, correlationId };
+      }
       const { quotePriceSol, paperEligibility, paperTip, maxPaperOrderSol, curveState } = evaluated;
 
       // Q7: quote the fill from the curve that was just read. A quote that cannot be made (curve nearly complete, order larger than the
@@ -2401,6 +2488,12 @@ export class ExecutionCoordinator {
       assertSendClusterAllowed();
     } catch (err: any) {
       return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'LIVE', error: err.message, correlationId };
+    }
+    const notReady = this.liveBuyReadinessProblems();
+    if (notReady.length > 0) {
+      const error = `LIVE_NOT_READY: ${notReady.join('; ')}; the buy is refused (exits are not affected)`;
+      workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'LIVE', { reason: 'LIVE_NOT_READY', problems: notReady });
+      return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'LIVE', error, correlationId };
     }
 
     let mintPubkey: PublicKey;
@@ -2580,24 +2673,44 @@ export class ExecutionCoordinator {
 
     // N13: reserve the worst case the transaction can spend, not the nominal order: the buy instruction may pull up to maxInputLamports
     // (the slippage headroom, about 8% over the order) and the first buy of a mint also pays rent for the new token account.
+    // S6: the wallet's first pump buy also pays the (never refunded) rent of its volume accumulator account; later buys do not.
+    // P3.1 (R1-14): read before requiredSol, so the reserve check and the reservation include it too.
+    const accumulatorRentLamports = await this.unrefundedFirstBuyRentLamports();
     const worstCaseOrderSol = Math.max(req.amountSol, Number(quote.maxInputLamports) / 1e9);
-    const requiredSol = worstCaseOrderSol + CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS / 1e9 + (quote.expectedJitoTipLamports + quote.expectedPriorityFeeLamports + 5000) / 1e9;
+    const requiredSol = worstCaseOrderSol + (CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS + accumulatorRentLamports) / 1e9 + (quote.expectedJitoTipLamports + quote.expectedPriorityFeeLamports + 5000) / 1e9;
 
-    // Check balance concurrency reservation
-    if (rawWalletBalance - this.inFlightReservedSol - requiredSol < 0.015) {
+    // Q51: count and exposure are read now, not from the snapshot taken before the awaits above. There is no await from here to the
+    // reservation below, so the reserve check, the risk check and the reservation all see the same rows.
+    const freshOpen = workstationDb.loadPositions(this.executionMode, 'ACTIVE');
+    // 3B (P3.2, R1-4): LIVE buys sent earlier and still unresolved (UNCONFIRMED, or landed with an unread fill) can become positions any
+    // moment. They hold a slot and their worst-case SOL like a buy in flight here does, until reconciliation or orphan recovery settles them.
+    const unresolved = this.getUnresolvedLiveBuys({ activeLive: freshOpen });
+    if (unresolved === null) {
+      workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'LIVE', { reason: 'UNRESOLVED_BUYS_UNREADABLE', mint: req.mint });
       return {
         success: false,
         lifecycleState: 'RISK_REJECTED',
         executionMode: 'LIVE',
-        error: `INSUFFICIENT_FUNDS_CONCURRENCY: Wallet balance (${rawWalletBalance.toFixed(4)} SOL) minus in-flight reservations (${this.inFlightReservedSol.toFixed(4)} SOL) cannot cover required ${requiredSol.toFixed(4)} SOL plus 0.015 SOL reserve.`,
+        error: 'UNRESOLVED_BUY: the ledger of unresolved LIVE buys could not be read, so their slots and SOL cannot be counted; buy refused.',
+        correlationId,
+      };
+    }
+    const reservedSol = this.inFlightReservedSol + unresolved.reservedSol;
+
+    // Check balance concurrency reservation
+    if (rawWalletBalance - reservedSol - requiredSol < 0.015) {
+      return {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'LIVE',
+        error: `INSUFFICIENT_FUNDS_CONCURRENCY: Wallet balance (${rawWalletBalance.toFixed(4)} SOL) minus in-flight reservations (${this.inFlightReservedSol.toFixed(4)} SOL) and unresolved buys (${unresolved.reservedSol.toFixed(4)} SOL) cannot cover required ${requiredSol.toFixed(4)} SOL plus 0.015 SOL reserve.`,
         correlationId,
       };
     }
 
     // C7b: an entry whose round-trip execution cost (both tips, both base+priority fees, pump fees both sides)
     // exceeds 20% of the order cannot realistically be profitable. The size is never rounded up to make it pass.
-    // S6: the wallet's first pump buy also pays the (never refunded) rent of its volume accumulator account; later buys do not.
-    const accumulatorRentLamports = await this.unrefundedFirstBuyRentLamports();
+    // S6: accumulatorRentLamports (read above) is part of the round trip too.
     const roundTripCostLamports = estimateRoundTripCostLamports({
       buyTipLamports: quote.expectedJitoTipLamports,
       sellTipLamports: resolvedTip.tipLamports,
@@ -2621,10 +2734,8 @@ export class ExecutionCoordinator {
       };
     }
 
-    // Q51: count and exposure are read now, not from the snapshot taken before the awaits above, and they include the buys of other mints
-    // that are in flight (not positions yet). There is no await between this read, the risk check and the reservation below.
-    const freshOpen = workstationDb.loadPositions(this.executionMode, 'ACTIVE');
-    const freshExposureSol = freshOpen.reduce((acc, p) => acc + p.costBasisLamports / 1e9, 0) + this.inFlightReservedSol;
+    // Q51: count and exposure include the buys of other mints that are in flight (not positions yet) and (3B) the unresolved ones.
+    const freshExposureSol = freshOpen.reduce((acc, p) => acc + p.costBasisLamports / 1e9, 0) + reservedSol;
     const riskDecision = traced('risk.evaluateOrder', () => riskEngine.evaluateOrder({
       mint: req.mint,
       orderSizeSol: req.amountSol,
@@ -2636,12 +2747,12 @@ export class ExecutionCoordinator {
       signalTimestamp: req.signalTimestamp as number,
       marketDataTimestamp: marketState.marketDataTimestamp,
       // R3: adopted wallet dust is not a position the app chose to open; it must not fill the position cap forever.
-      currentOpenPositionsCount: freshOpen.filter((p) => !isRecoveredPosition(p)).length + this.inFlightBuyMints.size,
+      currentOpenPositionsCount: freshOpen.filter((p) => !isRecoveredPosition(p)).length + this.inFlightBuyMints.size + unresolved.mints.length,
       currentTotalExposureSol: freshExposureSol,
-      // N12: the risk engine applies the minimum reserve itself, so it gets the balance net of in-flight orders only. `spendable` already
+      // N12: the risk engine applies the minimum reserve itself, so it gets the balance net of in-flight orders (3B: and unresolved buys) only. `spendable` already
       // has the reserve and the in-flight amount taken off; passing it (minus in-flight again) charged both twice. Rent held in token accounts
       // is not in getBalance, so it is not subtracted either.
-      walletSpendableSol: Math.max(0, rawWalletBalance - this.inFlightReservedSol),
+      walletSpendableSol: Math.max(0, rawWalletBalance - reservedSol),
       executionMode: 'LIVE',
     }));
 
@@ -2680,9 +2791,30 @@ export class ExecutionCoordinator {
         success: false,
         lifecycleState: 'RISK_REJECTED',
         executionMode: 'LIVE',
-        error: `UNRESOLVED_BUY: an earlier buy of ${req.mint} was sent and is not reconciled yet; waiting for it before buying again.`,
+        error: `UNRESOLVED_BUY: an earlier buy of ${req.mint} was sent and is not reconciled yet (or the check could not read the database); waiting for it before buying again.`,
         correlationId,
       };
+    }
+    // P3.1 (R1-7): the Q16 check above used the positions read before the awaits; orphan recovery (or another path) may have saved a row
+    // for this mint since. freshOpen was read with no await before this point, so this check and the reservation below see the same rows.
+    if (freshOpen.some((p) => p.mint === req.mint)) {
+      workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'LIVE', { reason: 'POSITION_ALREADY_OPEN', mint: req.mint, stage: 'reservation' });
+      return {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'LIVE',
+        error: `POSITION_ALREADY_OPEN: an open LIVE position in ${req.mint} exists; close it before buying the same mint again.`,
+        correlationId,
+      };
+    }
+    // 3F (R1-9): no re-entry into a mint closed in the last 24 h, and none ever after a loss. Read from the positions table, for manual
+    // and auto buys alike, so the auto controller's setMode (which clears its per-session attempted set), a re-arm or a restart cannot clear
+    // it. Here, after the risk check (a halt, the kill switch or the loss latch answers first) and with no await before the reservation, so a
+    // close written during the awaits above is seen.
+    const reentry = this.mintReentryRefusal(req.mint, Date.now());
+    if (reentry) {
+      workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'LIVE', { reason: 'MINT_RECENTLY_EXITED', mint: req.mint, message: reentry });
+      return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'LIVE', error: reentry, correlationId };
     }
     this.inFlightBuyMints.add(req.mint);
     let buySettled!: () => void;
@@ -2739,8 +2871,10 @@ export class ExecutionCoordinator {
 
       // Q17: risk approval was several awaits ago (curve read, holder lookup, tip floor, blockhash, snapshot, sign). Disarm, a halt or the
       // kill switch may have happened in between; nothing is sent after any of them.
-      if (!this.isLiveTradingArmed || this.executionMode !== 'LIVE' || this.haltReason || riskEngine.isKillSwitchActive()) {
-        const why = !this.isLiveTradingArmed || this.executionMode !== 'LIVE' ? 'live trading was disarmed' : this.haltReason ? `trading was halted (${this.haltReason})` : 'the kill switch was activated';
+      // P3.1 (R1-0): the per-buy readiness checks run again here, for the same reason.
+      const notReadyAtSend = this.liveBuyReadinessProblems();
+      if (!this.isLiveTradingArmed || this.executionMode !== 'LIVE' || this.haltReason || riskEngine.isKillSwitchActive() || notReadyAtSend.length > 0) {
+        const why = !this.isLiveTradingArmed || this.executionMode !== 'LIVE' ? 'live trading was disarmed' : this.haltReason ? `trading was halted (${this.haltReason})` : riskEngine.isKillSwitchActive() ? 'the kill switch was activated' : `live readiness failed (${notReadyAtSend.join('; ')})`;
         workstationDb.logJournal('TRADE_REVOKED_BEFORE_SEND', correlationId, 'LIVE', { mint: req.mint, reason: why });
         return {
           success: false,
@@ -2956,6 +3090,10 @@ export class ExecutionCoordinator {
         jitoTipLamports: resolvedTip.tipLamports,
         executionMode: 'LIVE',
       });
+      // 3B (P3.2, R1-38): every LIVE buy journals what it took from the wallet, whoever placed it (auto, a manual route, Telegram), so the
+      // DEVNET_LIVE wallet audit can explain it. The whole wallet delta: curve spend, tip, fees, and the rent of the token account and (first
+      // buy) the volume accumulator. A position the database refused is journaled by orphan recovery when it rebuilds it, not here.
+      if (positionPersisted) this.journalLiveBuySolDelta(livePosition, reconciliation.actualSolSpentLamports, req.source, 'CONFIRMED');
       if (!ledgerWritten) {
         this.raiseOperatorAlert('LEDGER_WRITE_FAILED', `The transaction row for a landed buy (${subRes.signature.slice(0, 8)}) could not be written; the position ${positionPersisted ? 'was saved' : 'was NOT saved either'}.`, subRes.signature);
       }
@@ -3043,9 +3181,9 @@ export class ExecutionCoordinator {
    * with the mints still in flight. Never rejects.
    */
   public async waitForBuysInFlight(timeoutMs: number): Promise<string[]> {
-    const deadline = Date.now() + timeoutMs;
+    const deadline = performance.now() + timeoutMs; // monotonic: a wall clock set back cannot hold the emergency stop (S271 review)
     while (this.liveBuysInFlight.size > 0) {
-      const left = deadline - Date.now();
+      const left = deadline - performance.now();
       if (left <= 0) break;
       let timer: NodeJS.Timeout | undefined;
       await Promise.race([Promise.allSettled([...this.liveBuysInFlight.values()]), new Promise<void>((r) => { timer = setTimeout(r, left); })]);
@@ -3063,18 +3201,63 @@ export class ExecutionCoordinator {
     return this.haltReason;
   }
 
-  private exitFailures = new Map<string, { count: number; nextAttemptAt: number; lastError: string }>();
+  /**
+   * 3B (P3.2, R1-4): LIVE buys that were sent and are not resolved (PENDING or RECONCILIATION_REQUIRED in the ledger), each priced at the
+   * worst case it can still take from the wallet. Such a buy can land any moment (orphan recovery then opens its position), so it fills a
+   * position slot and holds its SOL until it is resolved; before, an UNCONFIRMED buy stopped counting the moment executeTrade returned.
+   * Left out: a row whose buy already has an ACTIVE position (a landed buy whose ledger write failed; the position counts already), and,
+   * unless `includeOwnInFlight`, this process's own buys still in executeTrade (they count through inFlightBuyMints and inFlightReservedSol).
+   * The worst case is the order's quoted maxInputLamports (or the order amount) plus token-account rent, tip, priority and base fee; a row
+   * without a readable quote is priced at the largest order the risk limits allow. It may double-count a buy that landed and already left
+   * the wallet; that refuses a buy too many, never one too few. null when the ledger cannot be read: callers refuse (fail closed).
+   */
+  public getUnresolvedLiveBuys(opts: { includeOwnInFlight?: boolean; activeLive?: Array<{ entryTxSignature?: string }> } = {}): { mints: string[]; reservedSol: number } | null {
+    const rows = workstationDb.loadUnresolvedLiveBuys();
+    if (rows === null) return null;
+    const active = opts.activeLive ?? workstationDb.loadPositions('LIVE', 'ACTIVE');
+    const positionSigs = new Set(active.map((p) => p.entryTxSignature));
+    const limits = riskEngine.getLimits();
+    const mints = new Set<string>();
+    let reservedLamports = 0;
+    for (const r of rows) {
+      if (positionSigs.has(r.signature)) continue;
+      if (!opts.includeOwnInFlight && this.inFlightBuyMints.has(r.mint)) continue;
+      let quote: { maxInputLamports?: unknown; expectedJitoTipLamports?: unknown; expectedPriorityFeeLamports?: unknown } | null;
+      try { quote = r.quoteJson ? JSON.parse(r.quoteJson) : null; } catch { quote = null; }
+      const maxInput = Number(quote?.maxInputLamports);
+      const worst = quote && Number.isFinite(maxInput) && maxInput > 0
+        ? Math.max(maxInput, r.amountLamports ?? 0) + Math.max(Number(quote.expectedJitoTipLamports) || 0, r.jitoTipLamports) + (Number(quote.expectedPriorityFeeLamports) || 0) + 5000
+        : Math.max(r.amountLamports ?? 0, limits.maxPositionSol * 1e9) * (1 + limits.maxSlippageBps / 10_000) + limits.maxExecutionCostLamports;
+      reservedLamports += worst + CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS;
+      mints.add(r.mint);
+    }
+    return { mints: [...mints], reservedSol: reservedLamports / 1e9 };
+  }
 
-  /** Sell slippage for the next attempt on this position: starts at 800 bps and widens after each consecutive failure. */
+  private exitFailures = new Map<string, { count: number; nextAttemptAt: number; lastError: string; waitMs?: number; setAtMono?: number }>();
+
+  /**
+   * Sell slippage for the next attempt on this position: starts at 800 bps and widens after each consecutive failure.
+   * T2: never above MAX_SELL_SLIPPAGE_BPS (default 4000, the last step), so an operator can keep a stop-loss from accepting 40% less.
+   */
   public exitSlippageBps(positionId: string): number {
     const n = this.exitFailures.get(positionId)?.count ?? 0;
-    return SELL_SLIPPAGE_LADDER_BPS[Math.min(n, SELL_SLIPPAGE_LADDER_BPS.length - 1)];
+    const step = SELL_SLIPPAGE_LADDER_BPS[Math.min(n, SELL_SLIPPAGE_LADDER_BPS.length - 1)];
+    return Math.min(step, executionConfig.getConfig().maxSellSlippageBps);
   }
 
   /** ms until the auto-exit loop may try this position again (0 when free). */
   public exitRetryWaitMs(positionId: string, now: number = Date.now()): number {
     const f = this.exitFailures.get(positionId);
-    return f ? Math.max(0, f.nextAttemptAt - now) : 0;
+    if (!f) return 0;
+    // S271 review: never more than the backoff that was set. nextAttemptAt is wall-clock time; set under a clock that was later set back
+    // (devnet harness, NTP), it would hold this position's exits, its stop-loss included, for the size of the jump.
+    // A3: and a wall clock set back after that never stretches it either: the wait also runs down on the monotonic clock, which ignores
+    // wall-clock steps, so the cap alone (which left the full wait on every poll) cannot hold the position past waitMs of real time.
+    const left = f.nextAttemptAt - now;
+    if (f.waitMs === undefined) return Math.max(0, left);
+    const monoLeft = f.setAtMono === undefined ? f.waitMs : Math.ceil(f.waitMs - (performance.now() - f.setAtMono));
+    return Math.max(0, Math.min(left, f.waitMs, monoLeft));
   }
 
   public getExitFailureCount(positionId: string): number {
@@ -3118,7 +3301,11 @@ export class ExecutionCoordinator {
     const quoteFailure = ExecutionCoordinator.isQuoteFailure(res.error);
     if (mode === 'LIVE' && /^RPC_RATE_LIMITED/.test(res.error || '')) {
       // S245: no fee was spent and wider slippage cannot help, but an exit the RPC keeps refusing is something an operator must hear about.
-      this.raiseOperatorAlert('EXIT_RATE_LIMITED', `Exit for position ${positionId.slice(0, 8)} was refused by the RPC's rate limit after ${SELL_RATE_LIMIT_BACKOFF_MS.length} resends; nothing was sent. Retrying on the next exit pass; use a private RPC if this persists.`, positionId);
+      this.raiseOperatorAlert('EXIT_RATE_LIMITED', `Exit for position ${positionId.slice(0, 8)} was refused by the RPC's rate limit after ${SELL_RATE_LIMIT_BACKOFF_MS.length} resends; nothing was sent. Retrying in ${EXIT_RATE_LIMITED_WAIT_MS / 1000}s; set RPC_MAX_REQUESTS_PER_SEC or use a private RPC if this persists.`, positionId);
+      // T6: wait before the next try, keeping the failure count (and so the slippage step) as it was. waitMs caps it as A2 caps every
+      // exit wait, so a wall clock set back cannot stretch it.
+      const prev = this.exitFailures.get(positionId);
+      this.exitFailures.set(positionId, { count: prev?.count ?? 0, nextAttemptAt: Date.now() + EXIT_RATE_LIMITED_WAIT_MS, lastError: res.error || 'RPC_RATE_LIMITED', waitMs: EXIT_RATE_LIMITED_WAIT_MS, setAtMono: performance.now() });
     }
     if (mode === 'LIVE' && (quoteFailure || (res.notSent && !ExecutionCoordinator.isNonAttemptExitError(res.error)))) {
       // No fee was spent and the ladder must not advance, but a stop-loss that cannot be priced or built is exactly what an operator must hear about.
@@ -3127,7 +3314,7 @@ export class ExecutionCoordinator {
     if (mode !== 'LIVE' || res.notSent || ExecutionCoordinator.isNonAttemptExitError(res.error)) return;
     const count = (this.exitFailures.get(positionId)?.count ?? 0) + 1;
     const wait = Math.min(EXIT_RETRY_MAX_MS, EXIT_RETRY_BASE_MS * 2 ** (count - 1));
-    this.exitFailures.set(positionId, { count, nextAttemptAt: Date.now() + wait, lastError: res.error || 'unknown' });
+    this.exitFailures.set(positionId, { count, nextAttemptAt: Date.now() + wait, lastError: res.error || 'unknown', waitMs: wait, setAtMono: performance.now() });
     if (count >= EXIT_FAILURE_ALERT_AFTER) {
       this.raiseOperatorAlert('EXIT_FAILING', `Exit for position ${positionId.slice(0, 8)} failed ${count} times in a row (last: ${res.error}). Retrying every ${Math.round(wait / 1000)}s with wider slippage; consider closing manually.`, positionId);
     }
@@ -3361,6 +3548,9 @@ export class ExecutionCoordinator {
         }
         // P2.1: the window is only an upper bound. Once the blockhash has expired and the signature has no status, the sell can never land,
         // so the next pass (a stop-loss included) may sell at once instead of waiting out the rest of the 100 s.
+        // S271 review: a send time ahead of now means the wall clock was set back since; the window restarts from now (bounded), rather
+        // than holding the position until the clock catches up (hours, for a sell with no lastValidBlockHeight to prove it expired).
+        if (pendingSell.ts > Date.now()) pendingSell.ts = Date.now();
         if (Date.now() - pendingSell.ts < PENDING_SELL_WINDOW_MS && !(await this.pendingSellCannotLand(pendingSell))) {
           return { success: false, pnlSol: 0, error: `SELL_PENDING_VERIFICATION: sell ${pendingSell.signature.slice(0, 8)} was sent and is not confirmed or expired yet; not selling again` };
         }
@@ -3662,9 +3852,24 @@ export class ExecutionCoordinator {
       held = BigInt(bal?.value?.amount ?? '0');
       slot = bal?.context?.slot;
     } catch (e: any) {
-      // S259: only "could not find account" means the account is absent. Another "Invalid param" (an account that is not a token
-      // account of this program, say) says nothing about the balance, and a 0 here closes the row as an assumed loss.
-      if (!/could not find account/i.test(String(e?.message))) return { held: null, error: String(e?.message ?? e) };
+      // S259: "could not find account" means the account is absent. E2 (devnet run 12): an ATA closed by a 100% sell reads as "not a Token
+      // account" on devnet, which is no tokens too, once the account read below shows no token program owns that address. Any other
+      // "Invalid param" (a mint that cannot be unpacked, say) says nothing about the balance, and a 0 here closes the row as an assumed loss.
+      const msg = String(e?.message ?? e);
+      if (/not a Token account/i.test(msg)) {
+        let r: Awaited<ReturnType<Connection['getAccountInfoAndContext']>> | null;
+        try {
+          r = await this.connection.getAccountInfoAndContext(ata, 'confirmed');
+        } catch (err: any) {
+          return { held: null, error: `${msg}; the account itself could not be read (${err?.message ?? err})` };
+        }
+        if (r?.value && ownedByTokenProgram(r.value.owner)) {
+          return { held: null, error: `${msg}, but the token program owns the account; the balance is unknown` };
+        }
+        slot = r?.context?.slot;
+      } else if (!/could not find account/i.test(msg)) {
+        return { held: null, error: msg };
+      }
       held = 0n;
       absent = true;
     }
@@ -3694,7 +3899,8 @@ export class ExecutionCoordinator {
         try {
           const r = await this.connection.getAccountInfoAndContext(ata, 'confirmed');
           slot = r?.context?.slot;
-          if (absent && r?.value) slot = undefined; // the account exists after all: the two reads disagree, so neither decides
+          // a token account exists after all: the two reads disagree, so neither decides (an account no token program owns holds no tokens)
+          if (absent && r?.value && ownedByTokenProgram(r.value.owner)) slot = undefined;
         } catch {
           slot = undefined;
         }
@@ -4190,5 +4396,8 @@ export class ExecutionCoordinator {
     }
   }
 }
+
+/** 3F (R1-9): a mint whose position (in the same execution mode) was closed less than this long ago is not bought again; after a loss, never. */
+export const MINT_REENTRY_BLOCK_MS = 24 * 60 * 60 * 1000;
 
 export const executionCoordinator = new ExecutionCoordinator(true);

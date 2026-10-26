@@ -1,7 +1,10 @@
 import { DatabaseSync } from 'node:sqlite';
+import { statfsSync } from 'node:fs';
+import path from 'node:path';
 import { resolveDbPath } from './dbPath';
 import { NormalizedPosition, ExecutionMode } from '../core/types';
 import { Logger } from '../middleware/enterprise';
+import { recordedCreatorReport, type RecordedCreatorReport } from '../backtest/launchRecorder';
 
 export interface PersistedOrder {
   id: string;
@@ -47,9 +50,26 @@ export interface PersistedTransaction {
   exitReason?: string;
 }
 
+/** 5B: the launch-recording kinds that belong to a launch (FUNDER rows have mint '' and are kept for good). */
+const LAUNCH_ROW_KINDS = ['CREATE', 'TRADE', 'END', 'CREATOR'] as const;
+interface LaunchRecordingCounts { byKind: Record<string, number>; dataVersion: number; oldestTs: number | null; newestTs: number | null; newestCreateTs: number | null }
+export interface LaunchRecordingStatus {
+  launches: number;
+  events: number;
+  launchRows: number;
+  funderRows: number;
+  endedLaunches: number;
+  oldestTs: number | null;
+  newestTs: number | null;
+  newestCreateTs: number | null;
+}
+
 export class WorkstationDatabase {
   private db: DatabaseSync;
   private dbPath: string;
+  /** 5B: the launch recording's counts, read once when the database opens and kept by recordLaunchEvent and pruneLaunchRecording, so the
+   *  status that System checks polls every 15 s runs no query. Null only if that first read failed (it is retried on the next status read). */
+  private recCounts: LaunchRecordingCounts | null = null;
 
   constructor(customDbPath?: string) {
     this.dbPath = resolveDbPath(customDbPath);
@@ -188,7 +208,8 @@ export class WorkstationDatabase {
       );
 
       -- S178: what the watch window saw, so the auto trader's rules can be replayed over real launches. One row per create event, trade,
-      -- or funder fact for a mint the watch window was scoring. kind: CREATE | TRADE | FUNDER (mint is '' for a funder fact).
+      -- or funder fact for a mint the watch window was scoring. kind: CREATE | TRADE | FUNDER (mint is '' for a funder fact) | END (5B: why
+      -- the launch's recording stopped, payload.reason TRADE_CAP | WINDOW | CURVE_COMPLETE; a launch with no END row is unresolved).
       CREATE TABLE IF NOT EXISTS launch_recording (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts INTEGER NOT NULL,
@@ -210,6 +231,13 @@ export class WorkstationDatabase {
         execution_mode TEXT NOT NULL,
         payload_json TEXT NOT NULL,
         created_at INTEGER NOT NULL
+      );
+
+      -- DBW: one row that isWritable() rewrites, so the writable check is a real committed write
+      CREATE TABLE IF NOT EXISTS db_health (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        probe_seq INTEGER NOT NULL,
+        probed_at INTEGER NOT NULL
       );
     `);
 
@@ -266,7 +294,12 @@ export class WorkstationDatabase {
       CREATE INDEX IF NOT EXISTS idx_risk_decisions_created ON risk_decisions(created_at);
       CREATE INDEX IF NOT EXISTS idx_launch_rec_mint ON launch_recording(mint, ts);
       CREATE INDEX IF NOT EXISTS idx_launch_rec_ts ON launch_recording(ts);
+      -- 5B (R1-93, R1-107): the journal is read by event_type (getUnverifiedFillIds every 5 s, the halt and kill-switch rows), and the
+      -- recorder's per-kind counts and oldest/newest reads go through (kind, ts) instead of scanning the table.
+      CREATE INDEX IF NOT EXISTS idx_journal_event_type ON system_journal(event_type);
+      CREATE INDEX IF NOT EXISTS idx_launch_rec_kind_ts ON launch_recording(kind, ts);
     `);
+    this.recCounts = this.countLaunchRecording();
     Logger.info(`SQLite persistence initialized at ${this.dbPath}`);
   }
 
@@ -675,8 +708,60 @@ export class WorkstationDatabase {
         .prepare(`SELECT 1 FROM transactions WHERE mint = ? AND direction = 'BUY' AND execution_mode = 'LIVE' AND reconciliation_state IN ('PENDING', 'RECONCILIATION_REQUIRED') LIMIT 1`)
         .get(mint);
       return !!row;
-    } catch {
-      return false;
+    } catch (err: any) {
+      // P3.1 (R1-15): fail closed. A query that cannot run cannot say there is no unresolved buy, so the caller refuses the buy.
+      Logger.error(`hasUnresolvedLiveBuy could not read the transactions table (${err?.message || err}); answering "unresolved" so the buy is refused`);
+      return true;
+    }
+  }
+
+  /**
+   * 3B (P3.2): every LIVE BUY that was sent and is not resolved (PENDING or RECONCILIATION_REQUIRED), with its order's amount and quote
+   * when the order row exists. Such a buy may still become a position, so callers count it as an open slot and as reserved SOL.
+   * null when the query cannot run: the caller cannot know nothing is unresolved, so it must refuse (fail closed).
+   */
+  public loadUnresolvedLiveBuys(): Array<{ signature: string; mint: string; orderId: string; submissionTime: number; jitoTipLamports: number; amountLamports: number | null; quoteJson: string | null }> | null {
+    try {
+      const rows = this.db
+        .prepare(
+          `SELECT t.signature, t.mint, t.order_id, t.submission_time, t.jito_tip_lamports, o.amount_lamports, o.quote_json
+             FROM transactions t LEFT JOIN orders o ON o.id = t.order_id
+            WHERE t.direction = 'BUY' AND t.execution_mode = 'LIVE' AND t.reconciliation_state IN ('PENDING', 'RECONCILIATION_REQUIRED')`
+        )
+        .all() as any[];
+      return rows.map((r) => ({
+        signature: r.signature,
+        mint: r.mint,
+        orderId: r.order_id,
+        submissionTime: r.submission_time,
+        jitoTipLamports: r.jito_tip_lamports ?? 0,
+        amountLamports: r.amount_lamports ?? null,
+        quoteJson: r.quote_json ?? null,
+      }));
+    } catch (err: any) {
+      Logger.error(`loadUnresolvedLiveBuys could not read the transactions table (${err?.message || err}); callers refuse buys`);
+      return null;
+    }
+  }
+
+  /**
+   * 3F (R1-9): the closed positions of `mint` in `mode`, for the re-entry block. `lastExit` is the most recently closed one (its
+   * `updated_at` is when the close was written); `loss` is the most recent one closed with a negative realized PnL, if any.
+   * null when the query cannot run: the caller cannot know the mint was never exited, so it must refuse (fail closed).
+   */
+  public loadMintExits(mint: string, mode: ExecutionMode): { lastExit: { positionId: string; exitedAt: number } | null; loss: { positionId: string; realizedLamports: number } | null } | null {
+    try {
+      const rows = this.db
+        .prepare(`SELECT id, realized_pnl_lamports, updated_at FROM positions WHERE mint = ? AND execution_mode = ? AND status = 'CLOSED' ORDER BY updated_at DESC`)
+        .all(mint, mode) as any[];
+      const loss = rows.find((r) => r.realized_pnl_lamports < 0);
+      return {
+        lastExit: rows.length > 0 ? { positionId: rows[0].id, exitedAt: Number(rows[0].updated_at) } : null,
+        loss: loss ? { positionId: loss.id, realizedLamports: loss.realized_pnl_lamports } : null,
+      };
+    } catch (err: any) {
+      Logger.error(`loadMintExits could not read the positions table (${err?.message || err}); the buy is refused`);
+      return null;
     }
   }
 
@@ -703,9 +788,15 @@ export class WorkstationDatabase {
   }
 
   /** S178: append one recorded event. Never throws: a recording failure must not touch trading. */
-  public recordLaunchEvent(ts: number, mint: string, kind: 'CREATE' | 'TRADE' | 'FUNDER', payload: Record<string, unknown>): boolean {
+  public recordLaunchEvent(ts: number, mint: string, kind: 'CREATE' | 'TRADE' | 'FUNDER' | 'END' | 'CREATOR', payload: Record<string, unknown>): boolean {
     try {
       this.db.prepare('INSERT INTO launch_recording (ts, mint, kind, payload_json) VALUES (?, ?, ?, ?)').run(ts, mint, kind, JSON.stringify(payload));
+      const c = this.recCounts;
+      if (c) {
+        c.byKind[kind] = (c.byKind[kind] ?? 0) + 1;
+        if (kind !== 'FUNDER') { c.oldestTs = c.oldestTs === null ? ts : Math.min(c.oldestTs, ts); c.newestTs = c.newestTs === null ? ts : Math.max(c.newestTs, ts); }
+        if (kind === 'CREATE') c.newestCreateTs = c.newestCreateTs === null ? ts : Math.max(c.newestCreateTs, ts);
+      }
       return true;
     } catch {
       return false;
@@ -713,14 +804,26 @@ export class WorkstationDatabase {
   }
 
   /** Recorded events of the `limit` most recently created launches, oldest event first, plus every funder fact. */
-  public loadLaunchRecording(limit = 500): { launches: Array<{ mint: string; events: Array<{ ts: number; kind: 'CREATE' | 'TRADE'; payload: any }> }>; funders: Array<{ ts: number; wallet: string; funder: string | null }> } {
+  /**
+   * 5B: a launch with an END row carries `endTs` (when its recording stopped) and `endReason` (TRADE_CAP, WINDOW or CURVE_COMPLETE); the
+   * replay's coverage then follows the recording that was really made, not the window the server runs with now. A launch without one is
+   * unresolved and has neither.
+   */
+  public loadLaunchRecording(limit = 500): { launches: Array<{ mint: string; events: Array<{ ts: number; kind: 'CREATE' | 'TRADE'; payload: any }>; endTs?: number; endReason?: string; creatorReports?: RecordedCreatorReport[] }>; funders: Array<{ ts: number; wallet: string; funder: string | null }> } {
     try {
       const mints = (this.db.prepare(`SELECT mint FROM launch_recording WHERE kind = 'CREATE' ORDER BY ts DESC LIMIT ?`).all(limit) as any[]).map((r) => r.mint as string).reverse();
-      const launches = mints.map((mint) => ({
-        mint,
-        events: (this.db.prepare(`SELECT ts, kind, payload_json FROM launch_recording WHERE mint = ? AND kind IN ('CREATE','TRADE') ORDER BY ts ASC, id ASC`).all(mint) as any[])
-          .map((r) => ({ ts: r.ts as number, kind: r.kind as 'CREATE' | 'TRADE', payload: JSON.parse(r.payload_json) })),
-      }));
+      const q = this.db.prepare(`SELECT ts, kind, payload_json FROM launch_recording WHERE mint = ? AND kind IN ('CREATE','TRADE','END','CREATOR') ORDER BY ts ASC, id ASC`);
+      const launches = mints.map((mint) => {
+        const rows = q.all(mint) as any[];
+        const end = rows.find((r) => r.kind === 'END');
+        const creatorReports = rows.filter((r) => r.kind === 'CREATOR').map((r) => recordedCreatorReport(r.ts, JSON.parse(r.payload_json)));
+        return {
+          mint,
+          events: rows.filter((r) => r.kind === 'CREATE' || r.kind === 'TRADE').map((r) => ({ ts: r.ts as number, kind: r.kind as 'CREATE' | 'TRADE', payload: JSON.parse(r.payload_json) })),
+          ...(end ? { endTs: end.ts as number, endReason: String(JSON.parse(end.payload_json).reason) } : {}),
+          ...(creatorReports.length ? { creatorReports } : {}),
+        };
+      });
       const funders = (this.db.prepare(`SELECT ts, payload_json FROM launch_recording WHERE kind = 'FUNDER' ORDER BY ts ASC, id ASC`).all() as any[])
         .map((r) => ({ ts: r.ts as number, ...JSON.parse(r.payload_json) }));
       return { launches, funders };
@@ -729,14 +832,52 @@ export class WorkstationDatabase {
     }
   }
 
-  public getLaunchRecordingStatus(): { launches: number; events: number; oldestTs: number | null; newestTs: number | null } {
+  /**
+   * The recording's size, from the in-memory counts (5B: no table is read unless another connection wrote to the file). `events` is every row; `launchRows` the CREATE, TRADE and END rows the
+   * row limit applies to; `funderRows` the FUNDER rows, which are never pruned; `endedLaunches` the END rows (a launch without one is
+   * unresolved). `oldestTs` / `newestTs` span the launch rows only, because funder rows are kept for good. `newestCreateTs` keys the replay cache.
+   */
+  public getLaunchRecordingStatus(): LaunchRecordingStatus {
     try {
-      const r = this.db.prepare(`SELECT COUNT(*) AS n, MIN(ts) AS lo, MAX(ts) AS hi FROM launch_recording`).get() as any;
-      const l = this.db.prepare(`SELECT COUNT(*) AS n FROM launch_recording WHERE kind = 'CREATE'`).get() as any;
-      return { launches: Number(l.n), events: Number(r.n), oldestTs: r.lo ?? null, newestTs: r.hi ?? null };
+      const c = this.launchCounts();
+      const k = (kind: string) => c.byKind[kind] ?? 0;
+      const events = Object.values(c.byKind).reduce((a, b) => a + b, 0);
+      return { launches: k('CREATE'), events, launchRows: events - k('FUNDER'), funderRows: k('FUNDER'), endedLaunches: k('END'), oldestTs: c.oldestTs, newestTs: c.newestTs, newestCreateTs: c.newestCreateTs };
     } catch {
-      return { launches: 0, events: 0, oldestTs: null, newestTs: null };
+      return { launches: 0, events: 0, launchRows: 0, funderRows: 0, endedLaunches: 0, oldestTs: null, newestTs: null, newestCreateTs: null };
     }
+  }
+
+  /** 5B: the kept counts, read again from the table first if another connection (a script, a test seeding the file) committed since. SQLite's
+   *  data_version does not change for this connection's own writes, which keep the counts themselves. */
+  private launchCounts(): LaunchRecordingCounts {
+    if (this.recCounts && this.dataVersion() !== this.recCounts.dataVersion) this.recCounts = null;
+    this.recCounts ??= this.countLaunchRecording();
+    return this.recCounts;
+  }
+
+  /** 5B: the counts read from the table: per kind through idx_launch_rec_kind_ts, and the launch rows' oldest, newest and newest CREATE ts as index probes. */
+  private countLaunchRecording(): LaunchRecordingCounts {
+    const dataVersion = this.dataVersion();
+    const byKind: Record<string, number> = {};
+    for (const r of this.db.prepare('SELECT kind, COUNT(*) AS n FROM launch_recording GROUP BY kind').all() as Array<{ kind: string; n: number }>) byKind[r.kind] = Number(r.n);
+    return { byKind, dataVersion, ...this.launchRecordingSpan() };
+  }
+
+  /** SQLite's PRAGMA data_version: changes when another connection commits to this database file (no table is read). */
+  private dataVersion(): number {
+    return Number((this.db.prepare('PRAGMA data_version').get() as any).data_version);
+  }
+
+  private launchRecordingSpan(): Pick<LaunchRecordingCounts, 'oldestTs' | 'newestTs' | 'newestCreateTs'> {
+    const lo = this.db.prepare('SELECT MIN(ts) AS v FROM launch_recording WHERE kind = ?');
+    const hi = this.db.prepare('SELECT MAX(ts) AS v FROM launch_recording WHERE kind = ?');
+    const pick = (st: typeof lo, f: (a: number, b: number) => number) => {
+      const vs = LAUNCH_ROW_KINDS.map((k) => (st.get(k) as any)?.v).filter((v): v is number => typeof v === 'number');
+      return vs.length ? vs.reduce((a, b) => f(a, b)) : null;
+    };
+    const createHi = (hi.get('CREATE') as any)?.v;
+    return { oldestTs: pick(lo, Math.min), newestTs: pick(hi, Math.max), newestCreateTs: typeof createHi === 'number' ? createHi : null };
   }
 
   /** S190: rows written in the last `windowMs` (uses the ts index). The recorder's measured rate, for System checks. */
@@ -748,14 +889,25 @@ export class WorkstationDatabase {
     }
   }
 
-  /** Keep the recording bounded: rows older than `retentionDays`, then the oldest rows beyond `maxRows`. Returns rows deleted. */
+  /**
+   * Keep the recording bounded: launch rows older than `retentionDays`, then the oldest launch rows beyond `maxRows`. Returns rows deleted.
+   * 5B (R1-92): FUNDER rows are never pruned and do not count against `maxRows`. A wallet's funder fact is written only the first time the
+   * window learns it, so a later launch that wallet buys relies on the old row; dropping it with the old launch made the survivors' buyers
+   * look independent (optimistic). Their number is reported apart in getLaunchRecordingStatus so their growth is visible.
+   */
   public pruneLaunchRecording(retentionDays: number, maxRows: number, now: number = Date.now()): number {
     try {
-      let n = Number((this.db.prepare('DELETE FROM launch_recording WHERE ts < ?').run(now - retentionDays * 86_400_000) as any).changes ?? 0);
-      const total = Number((this.db.prepare('SELECT COUNT(*) AS n FROM launch_recording').get() as any).n);
-      if (total > maxRows) n += Number((this.db.prepare('DELETE FROM launch_recording WHERE id IN (SELECT id FROM launch_recording ORDER BY id ASC LIMIT ?)').run(total - maxRows) as any).changes ?? 0);
+      const c = this.launchCounts();
+      // 5B: RETURNING kind keeps the in-memory counts exact without a COUNT(*) over the table
+      const drop = (rows: Array<{ kind: string }>) => { for (const r of rows) c.byKind[r.kind] = (c.byKind[r.kind] ?? 0) - 1; return rows.length; };
+      let n = drop(this.db.prepare(`DELETE FROM launch_recording WHERE ts < ? AND kind <> 'FUNDER' RETURNING kind`).all(now - retentionDays * 86_400_000) as any[]);
+      const total = Object.entries(c.byKind).reduce((a, [k, v]) => (k === 'FUNDER' ? a : a + v), 0);
+      if (total > maxRows) n += drop(this.db.prepare(`DELETE FROM launch_recording WHERE id IN (SELECT id FROM launch_recording WHERE kind <> 'FUNDER' ORDER BY id ASC LIMIT ?) RETURNING kind`).all(total - maxRows) as any[]);
+      if (n > 0) Object.assign(c, this.launchRecordingSpan());
       return n;
     } catch {
+      // the counts may be off after a failed delete: read them again from the table on the next status read
+      this.recCounts = null;
       return 0;
     }
   }
@@ -1188,13 +1340,41 @@ export class WorkstationDatabase {
     });
   }
 
+  /** DBW: below this much free space on the database's filesystem the database counts as not writable. */
+  public static readonly MIN_FREE_BYTES = 16 * 1024 * 1024;
+  /** DBW: a passed probe is reused this long, so a per-buy check does not commit (and fsync) on every call. A failure is never reused. */
+  public static readonly WRITABLE_CACHE_MS = 1000;
+  private lastWritableOkAt: number | null = null; // on performance.now()
+
+  /**
+   * DBW: true only when a real write commits and the filesystem has MIN_FREE_BYTES free. `BEGIN IMMEDIATE; ROLLBACK;` writes nothing, so it
+   * passed on a full disk and on read-only storage. The upsert alone is not enough either: on a full disk SQLite can still commit small
+   * writes into WAL frames and free pages it already holds, while the next larger write fails. Any error, including a failed free-space
+   * read, means not writable.
+   */
   public isWritable(): boolean {
+    const now = performance.now();
+    if (this.lastWritableOkAt !== null && now - this.lastWritableOkAt < WorkstationDatabase.WRITABLE_CACHE_MS) return true;
+    this.lastWritableOkAt = null;
     try {
-      this.db.exec('BEGIN IMMEDIATE; ROLLBACK;');
+      this.db
+        .prepare(
+          `INSERT INTO db_health (id, probe_seq, probed_at) VALUES (1, 1, ?)
+           ON CONFLICT(id) DO UPDATE SET probe_seq = probe_seq + 1, probed_at = excluded.probed_at`
+        )
+        .run(Date.now());
+      if (this.dbPath !== ':memory:' && this.freeBytes() < WorkstationDatabase.MIN_FREE_BYTES) return false;
+      this.lastWritableOkAt = performance.now();
       return true;
     } catch {
       return false;
     }
+  }
+
+  /** Free bytes on the filesystem holding the database file, as an unprivileged writer sees them. */
+  private freeBytes(): number {
+    const s = statfsSync(path.dirname(path.resolve(this.dbPath)));
+    return Number(s.bavail) * Number(s.bsize);
   }
 
   public getJournalMode(): string {

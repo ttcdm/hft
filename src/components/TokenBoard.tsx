@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { authFetch } from '../services/engineClient';
+import { onAuthenticated } from '../utils/authEvents';
 
 /** H1: the home page. Launches / Watching / Holding, all from GET /api/board. Unknown values render "—", never a number. */
 export interface BoardData {
@@ -161,7 +162,8 @@ export function TokenBoard({ onSelect, selected }: { onSelect?: (mint: string) =
     load();
     const t = setInterval(load, 3000);
     const tick = setInterval(() => setNow(Date.now()), 1000);
-    return () => { alive = false; clearInterval(t); clearInterval(tick); };
+    const off = onAuthenticated(load); // UI-5
+    return () => { alive = false; clearInterval(t); clearInterval(tick); off(); };
   }, []);
   return (
     <>

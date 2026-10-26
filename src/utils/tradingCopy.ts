@@ -14,3 +14,11 @@ export function panicOutcome(ok: boolean, status: number, data: PanicResponseLit
   if (data.success === false) return { text: data.message || 'Panic liquidate finished with failures. Some positions may still be open.', type: 'error' };
   return { text: data.message || 'Panic liquidate finished.', type: 'success' };
 }
+
+export interface ArmResponseLite { success?: boolean; message?: string; error?: string; reasons?: string[] }
+
+/** UI-4: a refused arm shows the server's own reason (it sends `message` and `reasons`, not `error`), never a bare "Failed to arm". */
+export function armRefusalText(status: number, data: ArmResponseLite | null | undefined): string {
+  const why = data?.message || data?.error || (data?.reasons?.length ? data.reasons.join('; ') : `the server answered HTTP ${status} with no reason`);
+  return `Arming refused: ${why.replace(/\.+$/, '')}. Live trading is NOT armed.`;
+}

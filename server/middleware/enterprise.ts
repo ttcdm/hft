@@ -121,6 +121,14 @@ export interface ApiErrorResponse {
   };
 }
 
+/**
+ * T4: the body of GET /api/health, which needs no token, so it says only that the server answers. It used to add the Node version,
+ * platform, pid, uptime and memory; nothing read them, and they told an outside caller what to attack and when the process last restarted.
+ */
+export function publicHealthBody(): { status: 'ONLINE' } {
+  return { status: 'ONLINE' };
+}
+
 export function errorHandler(err: any, req: Request, res: Response, next: NextFunction) {
   const correlationId = (req as any).correlationId || crypto.randomUUID();
   const statusCode = err.statusCode || (err instanceof z.ZodError ? 400 : 500);
@@ -148,12 +156,15 @@ export function errorHandler(err: any, req: Request, res: Response, next: NextFu
     details,
   });
 
+  // T4: in production an unclassified server error (500 with no code of its own) returns a generic message: a database, file or RPC
+  // error text can name paths, hosts or internals. The full message and details stay in the log under the same correlationId.
+  const hide = process.env.NODE_ENV === 'production' && statusCode >= 500 && !err.code && !(err instanceof z.ZodError);
   const response: ApiErrorResponse = {
     success: false,
     error: {
       code,
-      message,
-      details,
+      message: hide ? `An unexpected error occurred; see the server log for correlationId ${correlationId}` : message,
+      details: hide ? undefined : details,
       correlationId,
       timestamp: new Date().toISOString(),
     },
@@ -169,7 +180,12 @@ export function errorHandler(err: any, req: Request, res: Response, next: NextFu
 // Base58 Solana public key regex (32 to 44 base58 characters)
 const SOLANA_ADDRESS_REGEX = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
-// SSRF prevention: reject private network addresses, metadata endpoints, and non-standard schemes
+/**
+ * Rejects URLs the server must never call: cloud metadata services (169.254.0.0/16 and its IPv4-mapped IPv6 form, link-local and
+ * unique-local IPv6, metadata host names), embedded credentials, and schemes other than http(s) and ws(s).
+ * T5: loopback and private IPv4 ranges are allowed on purpose. A localnet validator runs on 127.0.0.1, and only a logged-in operator on a
+ * loopback-bound server can set these URLs; an RPC switch must also pass the cluster's genesis-hash check before it is used.
+ */
 export function isSafeExternalUrl(val: string): boolean {
   try {
     const u = new URL(val);
@@ -177,22 +193,45 @@ export function isSafeExternalUrl(val: string): boolean {
     if (proto !== 'http:' && proto !== 'https:' && proto !== 'ws:' && proto !== 'wss:') {
       return false;
     }
-    const host = u.hostname.toLowerCase();
-    // Block AWS / GCP / Azure / OpenStack metadata services
-    if (
-      host === '169.254.169.254' ||
-      host.startsWith('169.254.') ||
-      host === 'metadata.google.internal' ||
-      host === 'instance-data' ||
-      host === 'fd00::'
-    ) {
-      return false;
-    }
     // Block embedded credentials
     if (u.username || u.password) {
       return false;
     }
+    let host = u.hostname.toLowerCase();
+    if (host.startsWith('[') && host.endsWith(']')) {
+      // T5: URL keeps IPv6 hosts in brackets, so the old `host === 'fd00::'` never matched, and [::ffff:169.254.169.254] (which URL
+      // rewrites to [::ffff:a9fe:a9fe]) reached the metadata service.
+      host = host.slice(1, -1);
+      const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(host) || null;
+      if (mapped) {
+        const hi = parseInt(mapped[1], 16);
+        host = `${hi >> 8}.${hi & 0xff}.${parseInt(mapped[2], 16) >> 8}.${parseInt(mapped[2], 16) & 0xff}`;
+      } else if (/^::ffff:\d+\.\d+\.\d+\.\d+$/.test(host)) {
+        host = host.slice('::ffff:'.length);
+      } else if (/^fe[89ab][0-9a-f]?:/.test(host) || /^f[cd][0-9a-f]{0,2}:/.test(host)) {
+        return false; // link-local fe80::/10 and unique-local fc00::/7 (fd00:ec2::254 is the AWS IPv6 metadata address)
+      }
+    }
+    // Block AWS / GCP / Azure / OpenStack metadata services
+    if (
+      host.startsWith('169.254.') ||
+      host === 'metadata.google.internal' ||
+      host === 'metadata' ||
+      host === 'instance-data'
+    ) {
+      return false;
+    }
     return true;
+  } catch {
+    return false;
+  }
+}
+
+/** T5: the Solana RPC client takes only http(s); a ws(s) URL passed the schema and then failed later with a less clear error. */
+export function isHttpUrl(val: string): boolean {
+  try {
+    const proto = new URL(val).protocol.toLowerCase();
+    return proto === 'http:' || proto === 'https:';
   } catch {
     return false;
   }
@@ -202,6 +241,7 @@ export const WalletConfigSchema = z.object({
   rpcEndpoint: z
     .string()
     .url('RPC Endpoint must be a valid HTTP or HTTPS URL')
+    .refine(isHttpUrl, 'RPC Endpoint must be a valid HTTP or HTTPS URL')
     .refine(isSafeExternalUrl, 'RPC Endpoint cannot point to private metadata services or use embedded credentials')
     // Absent leaves the current endpoint alone. (A default here silently re-pointed the RPC at the public devnet URL on every
     // config save, which also fails the cluster check when running against a local validator.)

@@ -3,7 +3,8 @@ import { isReadOnly } from '../solana/readOnly';
 /**
  * S190: how much of each launch, and how many rows in all, the launch recorder keeps. Everything is env-configurable.
  *
- * Defaults. Normal server: the 30 minutes the auto trader's exits run for, 14 days, 3,000,000 rows. Read-only (the paper copy that watches
+ * Defaults. Normal server: 35 minutes (5A: the watch window's 2 minutes, the entry delay and the 30-minute stale exit, plus slack, so a
+ * replay can see a stale exit fire), 14 days, 3,000,000 rows. Read-only (the paper copy that watches
  * mainnet to collect data): 180 minutes per launch, so a coin that only moves 1 to 2 hours after launch can still be replayed, 14 days, and
  * 6,000,000 rows.
  *
@@ -19,7 +20,7 @@ export interface RecorderConfig {
   maxRows: number;
 }
 
-export const RECORD_DEFAULT_MINT_MINUTES = 30;
+export const RECORD_DEFAULT_MINT_MINUTES = 35;
 export const RECORD_READ_ONLY_MINT_MINUTES = 180;
 export const RECORD_DEFAULT_MAX_ROWS = 3_000_000;
 export const RECORD_READ_ONLY_MAX_ROWS = 6_000_000;
@@ -71,3 +72,13 @@ export interface RecorderRuntime {
 let runtime: RecorderRuntime | null = null;
 export function setRecorderRuntime(r: RecorderRuntime | null): void { runtime = r; }
 export function getRecorderRuntime(): RecorderRuntime | null { return runtime; }
+
+/**
+ * 5B (R1-107): the replay cache key. It used to include the row count and the newest row's ts, which change with every recorded trade, so
+ * the 30-second cache never hit and each Backtest poll reloaded up to 5,000 launches on the event loop. The key now changes when a launch
+ * is created in a later minute (or the threshold or cap changes); trades on the launches already recorded wait for the cache's 30 s.
+ */
+export function replayCacheKey(status: { newestCreateTs: number | null }, minScore: number, cap: number): string {
+  const minute = status.newestCreateTs === null ? 'none' : String(Math.floor(status.newestCreateTs / 60_000));
+  return `${minute}:${minScore}:${cap}`;
+}

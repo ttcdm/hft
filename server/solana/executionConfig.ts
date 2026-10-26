@@ -10,10 +10,11 @@ export interface AuthoritativeExecutionConfig {
   minJitoTipSol: number;
   priorityFeeMicrolamports: number;
   maxSlippageBps: number;
+  /** T2: MAX_SELL_SLIPPAGE_BPS, the widest step the LIVE sell retry ladder may reach (default 4000, the ladder's last step). */
+  maxSellSlippageBps: number;
   capitalTier: 'MICRO_10' | 'INSTITUTIONAL' | 'CUSTOM';
   maxDailyLossUsd: number;
   maxPositionSizeSol: number;
-  demoMode: boolean;
   // R0.5 & R0.6 Authoritative Execution, Retry & Fallback Configuration
   jitoMaxRetries: number;
   jitoRetryIntervalMs: number;
@@ -92,6 +93,19 @@ export function parsePositiveLimit(name: string, raw: string | undefined, fallba
   return value;
 }
 
+/**
+ * T2: MAX_SELL_SLIPPAGE_BPS caps the sell retry ladder (800, 1500, 2500, 4000 bps). A whole number from 100 to 4000, or startup stops
+ * (a typo must not leave the 40% step in place unnoticed). Unset or empty keeps 4000, so the ladder is unchanged.
+ */
+export function parseSellSlippageCap(raw: string | undefined): number {
+  if (raw === undefined || raw.trim() === '') return 4000;
+  const value = Number(raw.trim());
+  if (!Number.isInteger(value) || value < 100 || value > 4000) {
+    throw new Error(`MAX_SELL_SLIPPAGE_BPS=${JSON.stringify(raw)} is not a whole number from 100 to 4000. Fix it in the environment (for example MAX_SELL_SLIPPAGE_BPS=2500) or unset it to keep 4000.`);
+  }
+  return value;
+}
+
 function assertPositiveLimit(name: string, value: unknown) {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
     throw new Error(`${name} must be a finite number above 0 (got ${String(value)})`);
@@ -122,10 +136,10 @@ export class ExecutionConfigManager {
       minJitoTipSol: Number.isFinite(minTipSol) && minTipSol > 0 ? minTipSol : 0.00015,
       priorityFeeMicrolamports: parseInt(process.env.PRIORITY_FEE_MICROLAMPORTS || '25000', 10) || 25000,
       maxSlippageBps: parseInt(process.env.MAX_SLIPPAGE_BPS || '800', 10) || 800,
+      maxSellSlippageBps: parseSellSlippageCap(process.env.MAX_SELL_SLIPPAGE_BPS),
       capitalTier,
       maxDailyLossUsd: parsePositiveLimit('MAX_DAILY_LOSS_USD', process.env.MAX_DAILY_LOSS_USD, capitalTier === 'MICRO_10' ? 7 : 250),
       maxPositionSizeSol: parsePositiveLimit('MAX_POSITION_SIZE_SOL', process.env.MAX_POSITION_SIZE_SOL, capitalTier === 'MICRO_10' ? 0.02 : 1.5),
-      demoMode: process.env.DEMO_MODE === 'true',
       jitoMaxRetries: parseInt(process.env.JITO_MAX_RETRIES || '2', 10) || 2,
       jitoRetryIntervalMs: parseInt(process.env.JITO_RETRY_INTERVAL_MS || '1000', 10) || 1000,
       enableRpcFallback: process.env.ENABLE_RPC_FALLBACK === 'true',

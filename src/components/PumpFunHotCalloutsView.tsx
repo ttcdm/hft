@@ -13,10 +13,10 @@
  */
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { SnipeAmountControl } from './SnipeAmountControl';
-import { CONFLUENCE_RULE_LABEL, CONFLUENCE_RULE_NOTE } from '../utils/calloutRuleText';
+import { CONFLUENCE_RULE_LABEL, CONFLUENCE_RULE_NOTE, CALLOUT_RULES_SCOPE_NOTE } from '../utils/calloutRuleText';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
 import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Flame,
   Award,
@@ -68,6 +68,34 @@ interface PumpFunHotCalloutsViewProps {
   onRefreshParent?: () => void;
 }
 
+/** 3H: what the rules form holds after a poll. While the operator has unsaved edits, the poll leaves them alone (it used to replace them every 6 s). */
+export function rulesAfterPoll<T>(current: T, fromServer: T, dirty: boolean): T {
+  return dirty ? current : fromServer;
+}
+
+/** 3H: the coin's own image, or an empty tile with its first letters. A missing or broken image used to show a stock photo as if it were the coin's. */
+export function TokenImage({ uri, symbol }: { uri: string; symbol: string }) {
+  const [broken, setBroken] = useState(false);
+  if (!uri || broken) {
+    return (
+      <div data-testid="token-image-missing" className="w-11 h-11 rounded-lg border border-slate-700 bg-slate-800 flex items-center justify-center flex-shrink-0 text-[10px] font-mono text-slate-400">
+        {symbol.slice(0, 3)}
+      </div>
+    );
+  }
+  return <img src={uri} alt={symbol} className="w-11 h-11 rounded-lg border border-slate-700 object-cover flex-shrink-0" onError={() => setBroken(true)} />;
+}
+
+/** 3H (P3.7): the feed status as the server measures it. It used to be implied by fixed "Live ingest" text whether or not anything arrived. */
+export function FeedStatusPill({ status }: { status: string | null }) {
+  const tone =
+    status === 'ONLINE' ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+      : status === 'STALE' ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+        : 'bg-slate-700/40 text-slate-300 border-slate-600/50';
+  const text = status === 'ONLINE' ? 'FEED ONLINE' : status === 'STALE' ? 'FEED STALE (nothing in the last minute)' : status === 'NO_DATA' ? 'NO FEED DATA YET' : 'FEED STATUS UNKNOWN';
+  return <span data-testid="feed-status-pill" className={`px-1.5 py-0.5 rounded text-[9px] font-mono border ${tone}`}>{text}</span>;
+}
+
 export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   capitalTier = 'MICRO_10',
   onAlertTrigger,
@@ -79,16 +107,19 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   const [callouts, setCallouts] = useState<PumpFunHotCallout[]>([]);
   const [leaderboard, setLeaderboard] = useState<PumpFunCaller[]>([]);
   const [statusInfo, setStatusInfo] = useState<{
+    /** 3H: from the server's real feed activity (NO_DATA / ONLINE / STALE); null until it has answered */
+    feedStatus: string | null;
     liveSource: string;
     syncLatencyMs: number;
     tokensTrackedCount: number;
     /** null until the server has reported a sync time; never invented from the browser clock (S19) */
     lastUpdated: number | null;
   }>({
+    feedStatus: null,
     liveSource: '—',
     syncLatencyMs: 0,
     tokensTrackedCount: 0,
-    lastUpdated: Date.now(),
+    lastUpdated: null,
   });
 
   const [rules, setRules] = useState({
@@ -100,6 +131,12 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
     snipeAmountUsd: capitalTier === 'MICRO_10' ? 5.0 : 25.0,
     jitoPriorityTipSol: 0.00018,
   });
+
+  const rulesDirty = useRef(false); // true from the first edit until the server confirms a save
+  const editRules = (patch: Partial<typeof rules>) => {
+    rulesDirty.current = true;
+    setRules((r) => ({ ...r, ...patch }));
+  };
 
   const [activeFilter, setActiveFilter] = useState<'ALL' | 'CONFLUENCE' | 'TOP_WHALES' | 'FRESH' | 'MIGRATING'>('ALL');
   const [searchQuery, setSearchQuery] = useState('');
@@ -118,14 +155,14 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
         setCallouts(data.callouts);
         setLeaderboard(data.leaderboard || []);
         setStatusInfo({
+          feedStatus: data.feedStatus ?? null,
           liveSource: data.liveSource || '—',
           syncLatencyMs: data.syncLatencyMs ?? 0,
           tokensTrackedCount: data.tokensTrackedCount ?? 0,
           lastUpdated: data.lastUpdated || null,
         });
-        if (data.autoSnipeRules) {
-          setRules(data.autoSnipeRules);
-        }
+        // 3H: the 6 s poll no longer overwrites a rule the operator is editing; the server copy is taken again after a save
+        if (data.autoSnipeRules) setRules((current) => rulesAfterPoll(current, data.autoSnipeRules, rulesDirty.current));
       }
     } catch (e) {
       console.error(e);
@@ -142,6 +179,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
       if (data.leaderboard) setLeaderboard(data.leaderboard);
       if (data.status) {
         setStatusInfo({
+          feedStatus: data.status.status ?? null,
           liveSource: data.status.liveSource || '—',
           syncLatencyMs: data.status.syncLatencyMs ?? 0,
           tokensTrackedCount: data.status.tokensTrackedCount ?? 0,
@@ -239,7 +277,11 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
     hftAudio.playClick();
     const res = await engineClient.updatePumpFunRules(rules);
     if (res?.status === 'OK') {
-      onAlertTrigger?.('INFO', 'AUTO-SNIPE RULES UPDATED', 'Pump.fun HFT callout parameters saved');
+      rulesDirty.current = false;
+      if (res.rules) setRules(res.rules);
+      onAlertTrigger?.('INFO', 'AUTO-SNIPE RULES SAVED', 'Saved in server memory until the next restart.');
+    } else {
+      onAlertTrigger?.('WARNING', 'AUTO-SNIPE RULES NOT SAVED', `The server did not confirm the save${res?.error ? `: ${res.error}` : ''}; your edits are still on screen.`);
     }
   };
 
@@ -275,18 +317,15 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <span className="text-xs font-bold text-white uppercase tracking-wider font-mono">
                 Pump.fun Hot Callouts & Caller Reputation Engine
               </span>
-              <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-slate-700/40 text-slate-300 border border-slate-600/50">
-                <span>pump.fun API v3</span>
-              </span>
               {isWsLive && (
                 <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 flex items-center space-x-1">
                   <Radio className="w-2.5 h-2.5 text-cyan-400 animate-pulse" />
-                  <span>WS STREAMING</span>
+                  <span>SCREEN UPDATES LIVE</span>
                 </span>
               )}
             </div>
             <p className="text-[11px] text-slate-300 mt-0.5">
-              Live ingest: <span className="font-mono text-cyan-300">{statusInfo.liveSource}</span> • {statusInfo.tokensTrackedCount} on-chain tokens monitored • Latency: <span className="font-mono text-emerald-400">{statusInfo.syncLatencyMs > 0 ? `${statusInfo.syncLatencyMs}ms` : '—'}</span>
+              <FeedStatusPill status={statusInfo.feedStatus} /> Ingest: <span className="font-mono text-cyan-300">{statusInfo.liveSource}</span> • {statusInfo.tokensTrackedCount} on-chain tokens monitored • Latency: <span className="font-mono text-emerald-400">{statusInfo.syncLatencyMs > 0 ? `${statusInfo.syncLatencyMs}ms` : '—'}</span>
             </p>
           </div>
         </div>
@@ -598,15 +637,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                     <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-center">
                       {/* TOKEN IDENTITY (Cols 1-4) */}
                       <div className="lg:col-span-4 flex items-start space-x-3">
-                        <img
-                          src={c.token.imageUri}
-                          alt={c.token.symbol}
-                          className="w-11 h-11 rounded-lg border border-slate-700 object-cover flex-shrink-0"
-                          onError={(e) => {
-                            (e.target as HTMLImageElement).src =
-                              'https://images.unsplash.com/photo-1622979135225-d2ba269bc1df?w=120&auto=format&fit=crop&q=80';
-                          }}
-                        />
+                        <TokenImage uri={c.token.imageUri} symbol={c.token.symbol} />
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center space-x-2">
                             <span className="font-extrabold text-white text-sm tracking-wide font-sans">
@@ -994,7 +1025,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 Autonomous Pump.fun Callout Sniper Parameters
               </h3>
               <p className="text-xs text-slate-400 mt-0.5">
-                These rules are stored and shown here; no code acts on them. Auto trading is controlled in the Auto panel (a real transaction only when LIVE is armed; PAPER sends nothing).
+                {CALLOUT_RULES_SCOPE_NOTE}
               </p>
             </div>
 
@@ -1017,7 +1048,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 type="number"
                 value={rules.minCallerWinRate2x}
                 onChange={(e) =>
-                  setRules({ ...rules, minCallerWinRate2x: parseFloat(e.target.value) || 0 })
+                  editRules({ minCallerWinRate2x: parseFloat(e.target.value) || 0 })
                 }
                 step="1"
                 min="10"
@@ -1038,7 +1069,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 type="number"
                 value={rules.minAvgMultiple}
                 onChange={(e) =>
-                  setRules({ ...rules, minAvgMultiple: parseFloat(e.target.value) || 0 })
+                  editRules({ minAvgMultiple: parseFloat(e.target.value) || 0 })
                 }
                 step="0.5"
                 min="1.5"
@@ -1059,7 +1090,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 type="number"
                 value={rules.maxEntryMultiple}
                 onChange={(e) =>
-                  setRules({ ...rules, maxEntryMultiple: parseFloat(e.target.value) || 1 })
+                  editRules({ maxEntryMultiple: parseFloat(e.target.value) || 1 })
                 }
                 step="0.05"
                 min="1.05"
@@ -1080,7 +1111,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 type="number"
                 value={rules.maxElapsedSeconds}
                 onChange={(e) =>
-                  setRules({ ...rules, maxElapsedSeconds: parseInt(e.target.value) || 30 })
+                  editRules({ maxElapsedSeconds: parseInt(e.target.value) || 30 })
                 }
                 step="10"
                 min="15"
@@ -1102,7 +1133,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                   type="checkbox"
                   checked={rules.autoSnipeOnConfluence}
                   onChange={(e) =>
-                    setRules({ ...rules, autoSnipeOnConfluence: e.target.checked })
+                    editRules({ autoSnipeOnConfluence: e.target.checked })
                   }
                   className="w-4 h-4 rounded text-rose-600 bg-slate-800 border-slate-700"
                 />
@@ -1121,7 +1152,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 type="number"
                 value={rules.jitoPriorityTipSol}
                 onChange={(e) =>
-                  setRules({ ...rules, jitoPriorityTipSol: parseFloat(e.target.value) || 0.00018 })
+                  editRules({ jitoPriorityTipSol: parseFloat(e.target.value) || 0.00018 })
                 }
                 step="0.0001"
                 min="0.00015"

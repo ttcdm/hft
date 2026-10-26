@@ -1,5 +1,5 @@
 /**
- * Localnet dry run of the devnet harness's Stage 3 steps (task 3I): (s), (t) and (u) in scripts/devnet_e2e_steps.ts, the same functions
+ * Localnet dry run of the devnet harness's Stage 3 steps (task 3I): (s), (t), (u) and (n) in scripts/devnet_e2e_steps.ts, the same functions
  * `npm run devnet:e2e` runs, against the LiteSVM local validator (real pump.fun program binaries, scripts/localnet/validator.ts).
  *
  *   npx tsx scripts/localnet/harness_steps.ts            (prints PASS/FAIL lines, exits 1 on any FAIL)
@@ -15,7 +15,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import net from 'node:net';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
+import bs58 from 'bs58';
+import { spawn, spawnSync } from 'node:child_process';
 
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'apex-3i-steps-'));
 const tempWalletDir = path.join(scratch, 'temp-wallets');
@@ -111,7 +113,9 @@ async function run(info: { url: string; genesisHash: string }) {
   const steps: import('../devnet_e2e_steps').HarnessSteps = {
     coordinator, curve: PumpCurveService, db: workstationDb as any, riskLimits: () => riskEngine.getLimits(), mint: coin.mint,
     chainErr: async () => undefined, buildBuyRequest: async () => liveBuyRequest(coin.mint, 0.01, Date.now()),
-    rec, link: (sig) => sig.slice(0, 16), sleep, rpcUrl: info.url,
+    rec, link: (sig) => sig.slice(0, 16),
+    // the dry run injects only what the steps must ride out, so a SKIP here is a failure
+    skip: (step, detail) => rec(`${step} (a SKIP in the dry run)`, false, detail), sleep, rpcUrl: info.url,
     get connection() { return coordinator.getConnection() as any; },
   };
 
@@ -147,6 +151,115 @@ async function run(info: { url: string; genesisHash: string }) {
   console.log(`INFO  (u) cost the harness wallet ${(b1 - b2).toFixed(5)} SOL`);
   watchWindow.stop();
   await pumpFeedListener.stop();
+
+  // (n) 3C: a coin the app's own filters accept (a creator buy and 14 buyers, funded by the local airdrop: market setup, not harness
+  // wallets), then the loss-floor step through executeTrade, then the child boot with MAX_POSITION_SIZE_SOL=abc.
+  {
+    const { executionConfig } = await import('../../server/solana/executionConfig');
+    const { autoSnipeController } = await import('../../server/auto/controller');
+    const seedCoin = async (symbol: string, name: string) => {
+      const mkt = Keypair.generate();
+      await conn.requestAirdrop(mkt.publicKey, 2 * LAMPORTS_PER_SOL);
+      const c = await kit.create(mkt, symbol, name);
+      await kit.buy(mkt, c.mint, 0.2);
+      for (let i = 0; i < 14; i++) {
+        const w = Keypair.generate();
+        await conn.requestAirdrop(w.publicKey, 2 * LAMPORTS_PER_SOL);
+        await kit.buy(w, c.mint, 0.6);
+      }
+      return c;
+    };
+    const seeded = await seedCoin('N3CL', 'S3C harness');
+    // Run 16 on devnet: a 429 on the balance sync right before the clearDailyLossLatch buy. The resume below has the validator answer the
+    // next two getBalance reads with HTTP 429 (under the kill switch's 3), and the step's next sync waits until the validator took that.
+    let failReads: Promise<unknown> | null = null;
+    const nSync = async () => { if (failReads) { await failReads; failReads = null; } return coordinator.syncRealWalletBalance(); };
+    const nCoordinator = new Proxy(coordinator, {
+      get: (t, k) => (k === 'syncRealWalletBalance' ? nSync : typeof (t as any)[k] === 'function' ? (t as any)[k].bind(t) : (t as any)[k]),
+    });
+    const nSteps = { ...steps, coordinator: nCoordinator, mint: seeded.mint, buildBuyRequest: async () => liveBuyRequest(seeded.mint, 0.01, Date.now()) } as typeof steps;
+    for (let i = 0; i < 30 && !coordinator.isLiveArmed(); i++) { coordinator.armLiveTrading(true, 'CONFIRM_LIVE_TRADING_RISK'); if (!coordinator.isLiveArmed()) await sleep(1000); }
+    let nDoneAt = Date.now();
+    if (await S.hasBudget(nSteps, '(n) 3C: net daily PnL floor', bal, 0.05, 'DEVNET_LOSS_FLOOR')) {
+      const bn = await bal();
+      nDoneAt = await S.lossFloorLatch(nSteps, {
+        floorUsd: () => executionConfig.getConfig().maxDailyLossUsd,
+        setFloorUsd: (usd) => { executionConfig.updateConfig({ maxDailyLossUsd: usd }); },
+        price: () => solPriceService.getPrice(),
+        refreshPrice: () => solPriceService.refresh(),
+        dailyPnlSol: () => riskEngine.getDailyTotalPnLSol('LIVE'),
+        latch: () => riskEngine.getDailyLossLatch('LIVE'),
+        clearLatch: () => riskEngine.clearDailyLossLatch(),
+        resume: (o) => {
+          if (o.clearDailyLossLatch) {
+            failReads = fetch(info.url, { method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'localnet_failNextReads', params: [2, 'getBalance', null, 'http429'] }) }).then((r) => r.json());
+          }
+          return autoSnipeController.resume(o);
+        },
+        orderSol: 0.01,
+      });
+      console.log(`INFO  (n) cost the harness wallet ${(bn - (await bal())).toFixed(5)} SOL`);
+      rec('(n) cleanup: MAX_DAILY_LOSS_USD back to the tier default, latch clear', executionConfig.getConfig().maxDailyLossUsd === 7 && riskEngine.getDailyLossLatch('LIVE') === null, `MAX_DAILY_LOSS_USD ${executionConfig.getConfig().maxDailyLossUsd}`);
+    }
+
+    // (l) 3A on a coin of its own (3F: (n) sold its coin at a loss, and a mint closed at a loss is never bought again, MINT_RECENTLY_EXITED),
+    // wired as devnet_e2e.ts's readinessGateStep. What the step must ride out is injected: two HTTP 429s on
+    // getBalance at the first balance sync after the MISMATCH Reconcile (run 16's shape), and one JSON-RPC error on the wallet token scan
+    // (getParsedTokenAccountsByOwner, sent as getTokenAccountsByOwner, of the harness wallet) in the first Reconcile after the row is resolved, which leaves that pass at MISMATCH for a reason
+    // other than the row, so the step must Reconcile again (4 Reconciles in all, with the cleanup's).
+    const inject = (count: number, method: string, mode: 'http429' | 'jsonrpc' = 'http429', address: string | null = null) => fetch(info.url, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'localnet_failNextReads', params: [count, method, address, mode] }) }).then((r) => r.json());
+    let reconciles = 0;
+    let rowResolved = false;
+    let scanFailed = false;
+    const lDeps = {
+      reconcile: async () => {
+        reconciles++;
+        if (rowResolved && !scanFailed) { scanFailed = true; await inject(1, 'getTokenAccountsByOwner', 'jsonrpc', kp.publicKey.toBase58()); }
+        const r = await coordinator.startupReconciliation({ fresh: true });
+        if (reconciles === 1 && r.status === 'RECONCILIATION_MISMATCH') failReads = inject(2, 'getBalance');
+        return r;
+      },
+      isLiveArmed: () => coordinator.isLiveArmed(),
+      plantUnresolvedBuy: () => {
+        const signature = bs58.encode(crypto.randomBytes(64));
+        if (!workstationDb.saveTransaction({
+          signature, orderId: `e2e-l-${signature.slice(0, 8)}`, correlationId: 'e2e-l', mint: Keypair.generate().publicKey.toBase58(), direction: 'BUY',
+          submissionTransport: 'SOLANA_RPC', submissionTime: Date.now(), reconciliationState: 'RECONCILIATION_REQUIRED', networkFeeLamports: 5000,
+          jitoTipLamports: 0, executionMode: 'LIVE',
+        })) throw new Error('the unresolved buy row could not be written');
+        return signature;
+      },
+      resolveRow: (sig: string) => {
+        const row = workstationDb.loadTransactions().find((t) => t.signature === sig);
+        if (!row) throw new Error(`row ${sig.slice(0, 8)} not found`);
+        workstationDb.saveTransaction({ ...row, reconciliationState: 'REVERTED', error: 'e2e (l): resolved by the harness' });
+        rowResolved = true;
+      },
+    };
+    await S.waitPast(nSteps, nDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (n) trades');
+    const lSeeded = await seedCoin('L3AL', 'S3A harness');
+    const lSteps = { ...nSteps, mint: lSeeded.mint, buildBuyRequest: async () => liveBuyRequest(lSeeded.mint, 0.01, Date.now()) } as typeof steps;
+    if (await S.hasBudget(lSteps, '(l) 3A: per-buy readiness', bal, 0.05, 'DEVNET_READINESS_GATE')) {
+      const bl = await bal();
+      await S.readinessGateAfterMismatch(lSteps, lDeps);
+      console.log(`INFO  (l) cost the harness wallet ${(bl - (await bal())).toFixed(5)} SOL; ${reconciles} Reconcile(s)`);
+      rec('(l) the injected faults were met: two getBalance 429s after the MISMATCH Reconcile, one failed wallet scan after the row was resolved', failReads === null && scanFailed && reconciles === 4, `${reconciles} Reconciles; balance faults ${failReads === null ? 'taken' : 'not taken'}; scan fault ${scanFailed ? 'armed' : 'not armed'}`);
+      const rr = coordinator.getLiveReadiness().reasons.filter((x) => /reconcil/i.test(x));
+      rec('(l) cleanup: readiness names no reconciliation problem, nothing open on the coin', rr.length === 0 && workstationDb.loadPositions().every((p) => p.mint !== lSeeded.mint || p.status === 'CLOSED'), rr.join('; ').slice(0, 200) || 'reconciliation clear');
+    }
+    coordinator.armLiveTrading(false);
+    const bootDb = path.join(scratch, 'boot-check-abc.db');
+    S.bootRefusesBadLimit(steps, () => spawnSync(process.execPath, ['--require', path.resolve('scripts/devnet_guard.cjs'), '--import', 'tsx', 'server.ts'], {
+      encoding: 'utf8', timeout: 60_000,
+      env: {
+        PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? scratch, APEX_ENV_FILE: '', NODE_ENV: 'production', APP_PORT: '0',
+        ALLOWED_CLUSTER: 'localnet', LOCALNET_GENESIS_HASH: info.genesisHash, SOLANA_RPC_URL: info.url, APEX_DB_PATH: bootDb,
+        SIGNER_KEYPAIR_PATH: path.join(scratch, 'no-such-key.json'), APEX_DISABLE_EXTERNAL_FEEDS: 'true', MAX_POSITION_SIZE_SOL: 'abc',
+      },
+    }), bootDb);
+  }
 
   // Underfunded: the budget check refuses and no wallet is made.
   const before = fs.readdirSync(tempWalletDir).length;

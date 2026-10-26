@@ -57,6 +57,30 @@ const median = (v: number[]) => { if (!v.length) return null; const s = [...v].s
 
 interface Agg { rows: ReplayedLaunch[]; }
 
+/**
+ * One threshold's figures. Realized (closed) and open-at-end are apart; 5A (R1-98): an open position's mark is the replay's openNetPnlSol, which
+ * keeps the take-profit sells that did land and charges the open part its sell (it used to be openValueSol - 0.005, dropping those proceeds).
+ */
+export function thresholdSummary(rows: ReplayedLaunch[]) {
+  const entered = rows.filter((r) => r.entered);
+  const closed = entered.filter((r) => r.outcome === 'CLOSED');
+  const open = entered.filter((r) => r.outcome === 'OPEN_AT_END');
+  const realized = closed.reduce((a, r) => a + (r.netPnlSol ?? 0), 0);
+  const openMark = open.reduce((a, r) => a + (r.openNetPnlSol ?? 0), 0);
+  const verdicts: Record<string, number> = {}; for (const r of rows) verdicts[r.verdict] = (verdicts[r.verdict] ?? 0) + 1;
+  const exits: Record<string, number> = {}; for (const r of entered) for (const e of r.exits) exits[e.reason] = (exits[e.reason] ?? 0) + 1;
+  const wins = closed.filter((r) => (r.netPnlSol ?? 0) > 0).length;
+  const pnl = closed.map((r) => r.netPnlSol ?? 0).sort((a, b) => a - b);
+  return {
+    verdicts, entries: entered.length, closed: closed.length, openAtEnd: open.length, winRate: closed.length ? wins / closed.length : null,
+    realizedNetSol: realized, openMarkSol: openMark, totalSol: realized + openMark, avgPerEntrySol: entered.length ? (realized + openMark) / entered.length : null,
+    medianClosedPnlSol: median(pnl), bestSol: pnl[pnl.length - 1] ?? null, worstSol: pnl[0] ?? null, exits,
+    // concentration: how much of the realized profit the top 1% / 10 closed trades supply
+    top10ClosedSol: pnl.slice(-10).reduce((a, b) => a + b, 0),
+    peakAnalysis: analysePeaks(rows),
+  };
+}
+
 async function main() {
   const args = process.argv.slice(2);
   const file = args.find((a) => !a.startsWith('--') && !/^\d/.test(a)) as string;
@@ -86,26 +110,7 @@ async function main() {
   }
 
   const report: any = { launches: n, solUsd, thresholds: {}, launchPeak: null };
-  for (const th of thresholds) {
-    const rows = aggs.get(th)!.rows;
-    const entered = rows.filter((r) => r.entered);
-    const closed = entered.filter((r) => r.outcome === 'CLOSED');
-    const open = entered.filter((r) => r.outcome === 'OPEN_AT_END');
-    const realized = closed.reduce((a, r) => a + (r.netPnlSol ?? 0), 0);
-    const openMark = open.reduce((a, r) => a + ((r.openValueSol ?? 0) - 0.005), 0);
-    const verdicts: Record<string, number> = {}; for (const r of rows) verdicts[r.verdict] = (verdicts[r.verdict] ?? 0) + 1;
-    const exits: Record<string, number> = {}; for (const r of entered) for (const e of r.exits) exits[e.reason] = (exits[e.reason] ?? 0) + 1;
-    const wins = closed.filter((r) => (r.netPnlSol ?? 0) > 0).length;
-    const pnl = closed.map((r) => r.netPnlSol ?? 0).sort((a, b) => a - b);
-    report.thresholds[th] = {
-      verdicts, entries: entered.length, closed: closed.length, openAtEnd: open.length, winRate: closed.length ? wins / closed.length : null,
-      realizedNetSol: realized, openMarkSol: openMark, totalSol: realized + openMark, avgPerEntrySol: entered.length ? (realized + openMark) / entered.length : null,
-      medianClosedPnlSol: median(pnl), bestSol: pnl[pnl.length - 1] ?? null, worstSol: pnl[0] ?? null, exits,
-      // concentration: how much of the realized profit the top 1% / 10 closed trades supply
-      top10ClosedSol: pnl.slice(-10).reduce((a, b) => a + b, 0),
-      peakAnalysis: analysePeaks(rows),
-    };
-  }
+  for (const th of thresholds) report.thresholds[th] = thresholdSummary(aggs.get(th)!.rows);
   const bucket = (b: { fromMin: number; toMin: number }) => peaks.filter((p) => p.atMin >= b.fromMin && p.atMin < b.toMin);
   report.launchPeak = {
     basis: 'first valid trade price vs the highest later valid trade price, time measured from launch (not from the watch window release)',

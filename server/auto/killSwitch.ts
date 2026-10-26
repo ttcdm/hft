@@ -34,8 +34,13 @@ export interface KillContext {
   maxDailyLossSol: number;
   slippageBreaches: number;
   readinessRed: Array<{ name: string; redForMs: number }>;
-  /** Wallet checks apply to DEVNET_LIVE only. null balance there counts as red. */
+  /** Wallet checks apply to DEVNET_LIVE only. null balance there counts as red once it has lasted (see walletUnknownForMs). */
   walletSol: number | null;
+  /**
+   * 3E: how long the balance has been unknown (no good read), in ms. WALLET_UNKNOWN fires only past READINESS_RED_LIMIT_MS, so one failed
+   * read does not stop a session. Left out, the caller does not track it and a null balance fires at once (fail-closed).
+   */
+  walletUnknownForMs?: number;
   reserveSol: number;
   maxTradeSol: number;
 }
@@ -82,7 +87,10 @@ export function evaluateKillTriggers(ctx: KillContext): KillTrigger[] {
 
   if (ctx.mode === 'DEVNET_LIVE') {
     if (ctx.walletSol === null) {
-      out.push({ code: 'WALLET_UNKNOWN', message: 'wallet balance is unknown' });
+      const forMs = ctx.walletUnknownForMs ?? Number.POSITIVE_INFINITY;
+      if (!(forMs <= READINESS_RED_LIMIT_MS)) {
+        out.push({ code: 'WALLET_UNKNOWN', message: Number.isFinite(forMs) ? `no good wallet balance read for ${Math.round(forMs / 1000)}s` : 'wallet balance is unknown' });
+      }
     } else if (ctx.walletSol < ctx.reserveSol + ctx.maxTradeSol) {
       out.push({ code: 'WALLET_LOW', message: `wallet ${ctx.walletSol.toFixed(4)} SOL is below reserve ${ctx.reserveSol} + one max trade ${ctx.maxTradeSol}` });
     }
@@ -94,13 +102,22 @@ export function evaluateKillTriggers(ctx: KillContext): KillTrigger[] {
 /**
  * Compare a real balance change with what the journal says moved. Returns the part that no journaled fill explains.
  * A change with no fills at all is entirely unexplained, in either direction.
+ *
+ * 3B (P3.2, R1-62): `unresolved` is the LIVE buys that were sent and are not resolved yet (UNCONFIRMED, or landed with an unread fill),
+ * at the worst case each can still take. Such a buy may have landed with no journal row yet, so a DROP no larger than that worst case plus
+ * one rent allowance per buy (the first-buy accumulator rent is not in the worst case) is held as theirs: explained, with `heldByUnresolved`
+ * set so the caller keeps its old mark and the next look, after recovery journals the buy, spans both. A rise, or a larger drop, still is not.
  */
 export function auditWalletChange(
   prevSol: number,
   nowSol: number,
-  journal: { delta: number; gross: number; count?: number }
-): { explained: boolean; unexplainedSol: number; toleranceSol: number } {
+  journal: { delta: number; gross: number; count?: number },
+  unresolved: { worstCaseSol: number; count: number } = { worstCaseSol: 0, count: 0 }
+): { explained: boolean; unexplainedSol: number; toleranceSol: number; heldByUnresolved: boolean } {
   const toleranceSol = WALLET_AUDIT_BASE_TOLERANCE_SOL + WALLET_AUDIT_GROSS_TOLERANCE * journal.gross + WALLET_AUDIT_RENT_ALLOWANCE_SOL * (journal.count ?? 0);
   const unexplainedSol = nowSol - prevSol - journal.delta;
-  return { explained: Math.abs(unexplainedSol) <= toleranceSol, unexplainedSol, toleranceSol };
+  if (Math.abs(unexplainedSol) <= toleranceSol) return { explained: true, unexplainedSol, toleranceSol, heldByUnresolved: false };
+  const pendingSol = unresolved.count > 0 ? unresolved.worstCaseSol + WALLET_AUDIT_RENT_ALLOWANCE_SOL * unresolved.count : 0;
+  const held = pendingSol > 0 && unexplainedSol < 0 && -unexplainedSol <= pendingSol + toleranceSol;
+  return { explained: held, unexplainedSol, toleranceSol, heldByUnresolved: held };
 }

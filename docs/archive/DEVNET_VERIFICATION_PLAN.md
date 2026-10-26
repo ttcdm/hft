@@ -1,5 +1,7 @@
 # Devnet Verification Plan — APEX Quant HFT Workstation
 
+> **Archived (3J, 2026-10-26). History only; not maintained.** This plan was written on 2026-10-09 against an install of hand-written stubs, and its own note says several findings have been fixed since. Its recipe sets `JITO_BLOCK_ENGINE_URL=http://127.0.0.1:9`; a non-mainnet block engine URL makes Jito enabled, and an enabled Jito that has not probed `HEALTHY` makes arming fail closed (`KNOWN_RISKS.md` 1.2), so do not copy that line. The findings table and the "Decision needed from Mike" section were not re-checked. For the devnet harness as it is now, read [`scripts/DEVNET_E2E_README.md`](../../scripts/DEVNET_E2E_README.md).
+
 Date: 2026-10-09
 Scope: verify that the trade paths (buy, partial exit, full exit with rent reclaim, failures and retries) actually land on-chain and reconcile, using **Solana devnet only**.
 

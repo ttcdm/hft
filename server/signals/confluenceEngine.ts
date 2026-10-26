@@ -41,7 +41,8 @@ export interface ConfluenceFactorsInput {
   mint?: string;
   creatorAddress?: string;
   curveVelocityMetrics?: CurveVelocityMetrics;
-  creatorRiskReport?: CreatorRiskReport;
+  /** 5C: null = the caller knows there is no report (the replay), so the live creator cache is not read; the creator then scores as live without a report */
+  creatorRiskReport?: CreatorRiskReport | null;
   slotAcceleration?: number;
   volume10sSol?: number;
   volume30sSol?: number;
@@ -126,8 +127,9 @@ export class ConfluenceEngine {
     // 6. Creator Risk Score (0 - 5)
     // Priority: Real on-chain creator transaction history & burner wallet detection
     let creatorRiskScore = 0;
-    const creatorReport =
-      input.creatorRiskReport ?? (input.creatorAddress ? creatorRiskScorer.getCachedReport(input.creatorAddress) : undefined);
+    const creatorReport = input.creatorRiskReport === null
+      ? undefined
+      : input.creatorRiskReport ?? (input.creatorAddress ? creatorRiskScorer.getCachedReport(input.creatorAddress) : undefined);
     if (creatorReport) {
       creatorRiskScore = creatorReport.confluenceScore;
       if (creatorReport.riskFlags.includes(CREATOR_LOOKUP_FAILED_FLAG)) missing.push('creator'); // a failed lookup is 0 points of missing data
@@ -144,7 +146,7 @@ export class ConfluenceEngine {
       // with no dev buy holds 0% and used to get the full 5 points here once its 0-point report expired.
       missing.push('creator');
     } else {
-      // No creator known at all (replay, a feed without it): fall back to dev holding. 0% dev holding = 5 points
+      // No creator known at all (a feed without it; 5C: the replay passes its recorded creator): fall back to dev holding. 0% dev holding = 5 points
       if (!known(input.devHoldingPct)) {
         missing.push('creator');
       } else if (input.devHoldingPct <= 0.1) {

@@ -98,7 +98,8 @@ export const sendBackoff = {
 
 /** P2.1: the clock `SolanaRpcTransport.confirm` reads. Tests replace both with a virtual clock (sleep advances now), so no test waits for real. */
 export const confirmPacing = {
-  now: (): number => Date.now(),
+  // S271 review: the monotonic clock. On Date.now a wall clock set back mid-watch stretched the watch (and the sell it holds) by the jump.
+  now: (): number => performance.now(),
   sleep: (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)),
 };
 
@@ -725,13 +726,13 @@ export class JitoTransport implements ExecutionTransport {
     bundleId?: string
   ): Promise<ConfirmationResult> {
     const t0 = performance.now();
-    const startTime = Date.now();
+    const startTime = performance.now(); // monotonic: a wall clock set back cannot stretch this wait (S271 review)
 
     // If bundleId is present, check bundle statuses periodically
     let bundleLandedSlot: number | undefined;
     let lastPollError: string | null = null;
 
-    while (Date.now() - startTime < maxWaitMs) {
+    while (performance.now() - startTime < maxWaitMs) {
       if (bundleId && !bundleLandedSlot) {
         // Tier 1: Check inflight status first
         const inflightInfo = await this.getInflightBundleStatus(bundleId);

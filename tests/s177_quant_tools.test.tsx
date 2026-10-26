@@ -155,7 +155,7 @@ describe('S177: Quant AI Diagnostics reads real state and says so', () => {
     expect(html).toMatch(/GEMINI_API_KEY/);
     expect(html).not.toMatch(/gamma|jitter|market making/i);
     const src = fs.readFileSync('server.ts', 'utf8');
-    const route = src.slice(src.indexOf("'/api/ai/diagnostics'"), src.indexOf("'/api/export/packets'"));
+    const route = src.slice(src.indexOf("'/api/ai/diagnostics'"), src.indexOf('(removed, 3H/B2)'));
     expect(route).toContain('buildDiagnosticsContext()');
     expect(route).not.toMatch(/strategyConfig|telemetry/);
   });

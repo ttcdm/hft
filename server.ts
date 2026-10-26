@@ -19,7 +19,7 @@ import { creatorRiskScorer } from './server/signals/creatorRiskScorer';
 import { buildSystemChecks } from './server/system/systemChecks';
 import { isReadOnly, assertReadOnlyStartup } from './server/solana/readOnly';
 import { LaunchRecorder } from './server/backtest/launchRecorder';
-import { recorderConfigProblems } from './server/backtest/recorderConfig';
+import { recorderConfig, recorderConfigProblems, replayCacheKey } from './server/backtest/recorderConfig';
 import { replayLaunchesAsync } from './server/backtest/replay';
 import { checkConfluenceThreshold, getConfluenceThreshold, envConfluenceProblem } from './server/signals/confluenceThreshold';
 import { maxCurveProgressProblem } from './server/signals/curveProgressCap';
@@ -38,7 +38,6 @@ import { checkSnipeAmountSol, getSnipeLimits } from './server/execution/snipeAmo
 import { PumpCurveService } from './server/solana/pumpCurve';
 import { buildCurveDepth } from './server/market/curveDepth';
 import { TradeTape } from './server/market/tradeTape';
-import { registerMarketRoutes } from './server/market/marketRoutes';
 import { exitRulesSummary } from './server/exits/exitEngine';
 import { walletTrader } from './server/walletTrader';
 import { emergencyStop } from './server/execution/emergencyStop';
@@ -95,8 +94,7 @@ import {
   validateBody,
   WalletConfigSchema,
   LiveSnipeOrderSchema,
-  ClosePositionSchema,
-} from './server/middleware/enterprise';
+  ClosePositionSchema, publicHealthBody } from './server/middleware/enterprise';
 
 
 const app = express();
@@ -361,7 +359,7 @@ pumpFeedListener.follow(executionCoordinator); // P4.2 (R1-63): a successful RPC
 // S178: save what the window sees (launches it scores, their trades, the funder facts) so the auto rules can be replayed over real launches
 for (const p of recorderConfigProblems()) console.warn(`[APEX QUANT HFT] ${p}`); // S190
 const launchRecorder = new LaunchRecorder(workstationDb, watchWindow, () => solPriceService.lastKnownPrice());
-launchRecorder.attach(pumpFeedListener);
+launchRecorder.attach(pumpFeedListener, creatorRiskScorer); // 5B-2: each launch's live creator report is saved with it
 wireWatchPins(watchWindow, memecoinAggregator, onChainPoolStats, curveVelocityEvaluator); // S4: a watched mint keeps its pool, its trade stats and (P4.3) its velocity data until the verdict
 wireCreatorReportPins(watchWindow, creatorRiskScorer); // P4.1: a watched launch's creator report lives until 60 s after its verdict
 wireFunderLookup(watchWindow, new FunderLookup(() => executionCoordinator.getConnection())); // Q6b
@@ -471,7 +469,7 @@ app.get('/api/auth/session', (req, res) => {
     return res.json({
       success: true,
       token: provided,
-      role: 'OPERATOR',
+      role: authManager.isOperatorToken(String(provided)) ? 'OPERATOR' : 'READONLY', // T3: the session's own role, not a constant
     });
   }
 
@@ -519,24 +517,12 @@ function getGenAI(): GoogleGenAI | null {
 
 // 1. Health check & Honest System Telemetry
 app.get('/api/health', (req, res) => {
-  const mem = process.memoryUsage();
-  res.json({
-    status: 'ONLINE',
-    runtime: 'Node.js',
-    nodeVersion: process.version,
-    platform: process.platform,
-    pid: process.pid,
-    engineUptimeSeconds: Math.floor(process.uptime()),
-    memoryHeapUsedMB: Number((mem.heapUsed / 1024 / 1024).toFixed(2)),
-    memoryHeapTotalMB: Number((mem.heapTotal / 1024 / 1024).toFixed(2)),
-    memoryRssMB: Number((mem.rss / 1024 / 1024).toFixed(2)),
-    telemetryMode: 'AUTHENTIC_LOCAL_NODE',
-  });
+  res.json(publicHealthBody());
 });
 
-// 3. Market data proxy routes (orderbook, trades, ticker) live in server/market/marketRoutes.ts (B2).
-registerMarketRoutes(app);
 
+// 3. (removed, 3H/B1) /api/market/orderbook, /api/market/trades and /api/market/ticker proxied Binance (BTCUSDT by default), left over from
+// the BTC market maker; no screen called them. The curve panel's /api/market/curve/:mint and /api/market/trades/:mint are separate and stay.
 // 3h. (removed, Q57) /api/account/balance was a Binance-testnet route with invented "institutional" balances and hardcoded BTC/ETH prices; nothing in src/ called it.
 
 // 4. (removed) /api/unit-tests ran 700 arithmetic self-checks on toy numbers; System checks (/api/system/checks) reads live state instead.
@@ -583,28 +569,7 @@ Answer with: 1. What the state shows (cite the check or counter), 2. What looks 
   }
 }));
 
-// 6. Raw Packet Logs Exporter (PCAP-JSON formatted)
-app.post('/api/export/packets', requireOperatorAuth, (req, res) => {
-  const { logs } = req.body;
-  const rawData = {
-    pcapHeader: {
-      magicNumber: '0xa1b2c3d4',
-      versionMajor: 2,
-      versionMinor: 4,
-      thisZone: 0,
-      sigFigs: 0,
-      snapLen: 65535,
-      network: 1, // Ethernet
-    },
-    exportTimestamp: new Date().toISOString(),
-    packetsCount: logs?.length || 0,
-    packets: logs || [],
-  };
-
-  res.setHeader('Content-Type', 'application/json');
-  res.setHeader('Content-Disposition', 'attachment; filename="apex_hft_packet_stream.json"');
-  res.send(JSON.stringify(rawData, null, 2));
-});
+// 6. (removed, 3H/B2) /api/export/packets wrapped whatever the client posted in made-up PCAP header fields; no screen called it.
 
 // ============================================================================
 // 12. SOCIAL SCANNER (TELEGRAM & X.COM) ALPHA INTELLIGENCE ENDPOINTS
@@ -713,62 +678,95 @@ app.post('/api/social/test-twitter', requireOperatorAuth, asyncHandler(async (re
   res.json(testResult);
 }));
 
-// Full External Connectivity Diagnostics & Simulation Scope Audit
+/**
+ * 3H (P3.7): a probe of an outside host that was not run because APEX_DISABLE_EXTERNAL_FEEDS=true. It is never shown as reachable, and the
+ * audit counts it as skipped, not as down. Only the cluster RPC probe (the configured RPC, not an outside feed) runs with feeds off.
+ */
+function skippedProbe(host: string) {
+  return { skipped: true, reachable: false, latencyMs: 0, status: null, diagnosis: `SKIPPED: APEX_DISABLE_EXTERNAL_FEEDS=true, so ${host} was not contacted.` };
+}
+
+/**
+ * 3H: the Jito row of the audit, from the transport this server really has. It used to say bundles go to Jito "only on mainnet-beta",
+ * which is not the rule: a non-mainnet block engine URL is used on devnet (resolveJitoUrl), localnet never uses one, and with none the
+ * coordinator forces the LIVE tip to 0 (resolveLiveTip).
+ */
+function jitoScopeEntry(jito: { enabled: boolean; status: string; reason?: string }, readOnly: boolean) {
+  if (!jito.enabled) {
+    return {
+      subsystem: 'Jito Bundles & Tips',
+      nature: 'NOT_CONFIGURED',
+      details: `No Jito block engine is in use (JITO_BLOCK_ENGINE_URL is unset, or was refused for ${allowedCluster()}). LIVE transactions go to the cluster RPC with a priority fee, and the Jito tip is forced to 0, so a tip typed on a screen is not paid on LIVE.${readOnly ? ' Read-only: nothing is signed or sent.' : ''}`,
+    };
+  }
+  return {
+    subsystem: 'Jito Bundles & Tips',
+    nature: jito.status === 'HEALTHY' ? 'CONFIGURED' : 'CONFIGURED_NOT_HEALTHY',
+    details: `A non-mainnet Jito block engine is configured; its last probe says ${jito.status}${jito.reason ? ` (${jito.reason})` : ''}. LIVE transactions are submitted through the block engine, with a tip from the tip policy.${readOnly ? ' Read-only: nothing is signed or sent.' : ''}`,
+  };
+}
+
+// External connectivity diagnostics and what each subsystem really does on this cluster
 app.get('/api/connectivity/diagnostics', requireOperatorAuth, asyncHandler(async (req, res) => {
-  const tStart = Date.now();
+  const tStart = performance.now();
+  const feedsOff = process.env.APEX_DISABLE_EXTERNAL_FEEDS === 'true';
 
   // 1. Telegram
-  const telegramTest = await socialScanner.testTelegramConnection();
+  const telegramTest: any = feedsOff ? skippedProbe('api.telegram.org') : await socialScanner.testTelegramConnection();
 
   // 1b. X.com / Twitter Probe
-  const xTwitterTest = await socialScanner.testXTwitterConnection();
+  const xTwitterTest: any = feedsOff ? { ...skippedProbe('api.twitter.com'), httpStatus: null, bearerAuthorized: false } : await socialScanner.testXTwitterConnection();
 
   // 2. Pump.fun Live Feed Probe
   const tPump = performance.now();
-  const pumpTest: any = { reachable: false, latencyMs: 0, status: null, tokensCount: 0, sampleMint: null };
-  try {
-    const pumpRes = await fetch(
-      'https://frontend-api-v3.pump.fun/coins?offset=0&limit=5&sort=last_trade_timestamp&order=DESC&includeNsfw=false',
-      {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          Accept: 'application/json',
-        },
+  const pumpTest: any = feedsOff ? skippedProbe('frontend-api-v3.pump.fun') : { reachable: false, latencyMs: 0, status: null, tokensCount: 0, sampleMint: null };
+  if (!feedsOff) {
+    try {
+      const pumpRes = await fetch(
+        'https://frontend-api-v3.pump.fun/coins?offset=0&limit=5&sort=last_trade_timestamp&order=DESC&includeNsfw=false',
+        {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            Accept: 'application/json',
+          },
+        }
+      );
+      pumpTest.latencyMs = Math.round(performance.now() - tPump);
+      pumpTest.status = pumpRes.status;
+      if (pumpRes.ok) {
+        const coins = await pumpRes.json();
+        pumpTest.reachable = true;
+        pumpTest.tokensCount = coins.length;
+        pumpTest.sampleMint = coins[0]?.mint || null;
+        pumpTest.newestToken = coins[0]?.name ? `${coins[0].name} (${coins[0].symbol})` : null;
       }
-    );
-    pumpTest.latencyMs = Math.round(performance.now() - tPump);
-    pumpTest.status = pumpRes.status;
-    if (pumpRes.ok) {
-      const coins = await pumpRes.json();
-      pumpTest.reachable = true;
-      pumpTest.tokensCount = coins.length;
-      pumpTest.sampleMint = coins[0]?.mint || null;
-      pumpTest.newestToken = coins[0]?.name ? `${coins[0].name} (${coins[0].symbol})` : null;
+    } catch (e: any) {
+      pumpTest.error = e.message;
+      pumpTest.latencyMs = Math.round(performance.now() - tPump);
     }
-  } catch (e: any) {
-    pumpTest.error = e.message;
-    pumpTest.latencyMs = Math.round(performance.now() - tPump);
   }
 
   // 3. DexScreener Live Boosted Probe
   const tDex = performance.now();
-  const dexTest: any = { reachable: false, latencyMs: 0, status: null, boostedCount: 0 };
-  try {
-    const dexRes = await fetch('https://api.dexscreener.com/token-boosts/top/v1');
-    dexTest.latencyMs = Math.round(performance.now() - tDex);
-    dexTest.status = dexRes.status;
-    if (dexRes.ok) {
-      const boosts = await dexRes.json();
-      dexTest.reachable = true;
-      dexTest.boostedCount = Array.isArray(boosts) ? boosts.length : 0;
-      dexTest.sampleToken = boosts[0]?.tokenAddress || null;
+  const dexTest: any = feedsOff ? skippedProbe('api.dexscreener.com') : { reachable: false, latencyMs: 0, status: null, boostedCount: 0 };
+  if (!feedsOff) {
+    try {
+      const dexRes = await fetch('https://api.dexscreener.com/token-boosts/top/v1');
+      dexTest.latencyMs = Math.round(performance.now() - tDex);
+      dexTest.status = dexRes.status;
+      if (dexRes.ok) {
+        const boosts = await dexRes.json();
+        dexTest.reachable = true;
+        dexTest.boostedCount = Array.isArray(boosts) ? boosts.length : 0;
+        dexTest.sampleToken = boosts[0]?.tokenAddress || null;
+      }
+    } catch (e: any) {
+      dexTest.error = e.message;
+      dexTest.latencyMs = Math.round(performance.now() - tDex);
     }
-  } catch (e: any) {
-    dexTest.error = e.message;
-    dexTest.latencyMs = Math.round(performance.now() - tDex);
   }
 
-  // 4. Solana Mainnet Validator RPC Probe
+  // 4. Cluster RPC probe (the configured RPC; it runs with external feeds off too)
   const tSol = performance.now();
   const solanaTest: any = { reachable: false, latencyMs: 0, health: null, slot: null };
   try {
@@ -792,30 +790,18 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, asyncHandler(async
     solanaTest.latencyMs = Math.round(performance.now() - tSol);
   }
 
-  // 5. Coinbase Institutional Spot Feed Probe
-  const tCb = performance.now();
-  const coinbaseTest: any = { reachable: false, latencyMs: 0, btcPriceUsd: null };
-  try {
-    const cbRes = await fetch('https://api.coinbase.com/v2/prices/BTC-USD/spot');
-    coinbaseTest.latencyMs = Math.round(performance.now() - tCb);
-    if (cbRes.ok) {
-      const cbData = await cbRes.json();
-      coinbaseTest.reachable = true;
-      coinbaseTest.btcPriceUsd = parseFloat(cbData?.data?.amount || '0');
-    }
-  } catch (e: any) {
-    coinbaseTest.error = e.message;
-    coinbaseTest.latencyMs = Math.round(performance.now() - tCb);
-  }
+  // 5. (removed, 3H) the Coinbase BTC-USD spot probe: nothing in the app reads a BTC price.
 
   // 6. Market Maker & Caller Profiles State
   const leaderboard = pumpFunService.getLeaderboard();
   const hotCallouts = pumpFunService.getHotCallouts();
   const confluenceCallouts = hotCallouts.filter((c) => c.confluenceCount >= 2);
+  const jito = executionCoordinator.getJitoReadiness();
 
   res.json({
     timestamp: Date.now(),
-    totalAuditTimeMs: Date.now() - tStart,
+    totalAuditTimeMs: Math.round(performance.now() - tStart),
+    externalFeedsDisabled: feedsOff,
     cluster: allowedCluster(), // Q10a: the cluster this server is configured for, shown next to the RPC probe
     connections: {
       xTwitter: {
@@ -842,11 +828,6 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, asyncHandler(async
         service: `Solana RPC (${new URL(resolveRpcUrl()).host})`,
         isLiveExternal: true,
         testResult: solanaTest,
-      },
-      coinbase: {
-        service: 'Coinbase Institutional Spot Price Feed (api.coinbase.com)',
-        isLiveExternal: true,
-        testResult: coinbaseTest,
       },
     },
     marketMakerProfiles: {
@@ -907,11 +888,6 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, asyncHandler(async
       },
       xTwitterScopeEntry(xTwitterTest, allowedCluster()),
       {
-        subsystem: 'Coinbase Spot Reference',
-        nature: 'LIVE',
-        details: 'Queries live BTC-USD spot price directly from api.coinbase.com.',
-      },
-      {
         subsystem: 'Order Execution & Paper Trading',
         nature: executionCoordinator.isLiveArmed() ? 'LIVE_ARMED' : 'PAPER_BY_DEFAULT',
         details: executionCoordinator.isLiveArmed()
@@ -920,24 +896,12 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, asyncHandler(async
             ? 'READ-ONLY: this server has no signer and cannot arm LIVE. Snipes are paper-traded against the real curve quote; no transaction is signed or sent.'
             : 'LIVE is not armed: snipes are paper-traded in memory against the curve quote. No transaction is signed or sent.',
       },
-      {
-        subsystem: 'Jito MEV Bundles & Priority Tips',
-        nature: executionCoordinator.isLiveArmed() ? 'LIVE_CLUSTER_DEPENDENT' : 'PAPER_ONLY',
-        details: isReadOnly()
-          ? 'Read-only mode: nothing is signed or sent, so no tip is ever paid. Paper fills still model the priority tip from the tip policy (on mainnet it follows the public Jito tip floor) so their cost is what a real send would pay.'
-          : 'Priority tips follow the executionConfig tip policy. Bundles go to Jito only on mainnet-beta (never enabled by default); on devnet or localnet the transaction goes to the cluster RPC with a priority fee and no bundle. In paper mode nothing is sent.',
-      },
+      jitoScopeEntry(jito, isReadOnly()),
       {
         subsystem: 'Caller Persona Historical Track Records',
         nature: 'NOT_VERIFIED',
         details:
           'Caller personas and their win rates are static configuration, not measured track records. Do not treat them as evidence about a caller.',
-      },
-      {
-        subsystem: 'Microstructure & Latency Stress',
-        nature: 'MATHEMATICAL_MODEL',
-        details:
-          'Standalone formula calculators (Avellaneda-Stoikov, square-root impact). Their latency inputs are assumptions, not measurements, and they do not drive live order routing.',
       },
     ],
   });
@@ -981,15 +945,13 @@ app.post('/api/memecoins/close', requireOperatorAuth, validateTradeBody(Operator
   });
 }));
 
-/** The bot token is write-only: it never leaves the server once stored. */
-function redactSniperConfig<T extends { telegramBotToken?: string }>(c: T) {
-  return { ...c, telegramBotToken: '', telegramBotTokenSet: Boolean(c.telegramBotToken) };
-}
+// The bot token is write-only: memecoinAggregator.getConfig() and updateConfig() never return it, only telegramBotTokenSet. (3H: a second
+// redaction here, redactSniperConfig, re-derived telegramBotTokenSet from the already-blanked token, so the API always said no token was set.)
 
 app.get('/api/memecoins/config', requireOperatorAuth, (req, res) => {
   res.json({
     status: 'OK',
-    config: redactSniperConfig(memecoinAggregator.getConfig()),
+    config: memecoinAggregator.getConfig(),
     exitRules: exitRulesSummary(), // the fixed ExitEngine rules; config.takeProfitPct / stopLossPct do not drive exits
   });
 });
@@ -1001,7 +963,7 @@ app.post('/api/memecoins/config', requireOperatorAuth, validateTradeBody(SniperC
   const updated = memecoinAggregator.updateConfig(patch);
   res.json({
     status: 'OK',
-    config: redactSniperConfig(updated),
+    config: updated,
   });
 });
 
@@ -1012,6 +974,7 @@ app.get('/api/pumpfun/callouts', requireOperatorAuth, (req, res) => {
   const status = pumpFunService.getStatus();
   res.json({
     status: 'OK',
+    feedStatus: status.status, // 3H: NO_DATA / ONLINE / STALE from real feed activity
     liveSource: status.liveSource,
     syncLatencyMs: status.syncLatencyMs,
     lastUpdated: status.lastSyncTimestamp,
@@ -1243,7 +1206,9 @@ app.get('/api/backtest/replay', requireOperatorAuth, asyncHandler(async (req, re
     return res.json({ success: true, recorded: status, report: null, message: 'No launch has been recorded yet, so there is nothing to replay. The recorder saves every launch the watch window scores while the app runs against a pump.fun feed.' });
   }
   const cap = replayLaunchCap();
-  const key = `${status.events}:${status.newestTs}:${minScore ?? getConfluenceThreshold()}:${cap}`;
+  // 5C (R1-105): the replay applies the dev-holding limit in force, so a changed limit is a different report
+  const maxDevHoldingPct = memecoinAggregator.getConfig().maxDevHoldingPct;
+  const key = `${replayCacheKey(status, minScore ?? getConfluenceThreshold(), cap)}:dev${maxDevHoldingPct}`;
   if (replayCache && replayCache.key === key && Date.now() - replayCache.at < 30_000) return res.json(replayCache.body);
   try {
     // S189: one replay per key at a time (the screen polls), time-sliced so a long replay never stalls the live feed or the auto controller
@@ -1251,7 +1216,9 @@ app.get('/api/backtest/replay', requireOperatorAuth, asyncHandler(async (req, re
     if (!running) {
       running = (async () => {
         const { launches, funders } = workstationDb.loadLaunchRecording(cap);
-        const report = await replayLaunchesAsync(launches, funders, solPriceService.lastKnownPrice(), minScore === undefined ? {} : { minScore });
+        // 5A: the recorder's window and trade cap tell the replay how far each recording reaches (a quiet coin's stale exit is then visible)
+        const rc = recorderConfig();
+        const report = await replayLaunchesAsync(launches, funders, solPriceService.lastKnownPrice(), { ...(minScore === undefined ? {} : { minScore }), recordedForMs: rc.mintMs, recordedMaxTrades: rc.maxTradesPerMint, maxDevHoldingPct, readAtTs: Date.now() });
         // S188: the replay covers the newest `cap` launches; the response says so, so a count below the recorder's is explained
         const body = { success: true, recorded: status, report, message: null, replayedLaunches: launches.length, replayCap: cap };
         replayCache = { key, at: Date.now(), body };
@@ -1374,7 +1341,7 @@ app.get('/api/watch', requireOperatorAuth, (req, res) => {
 });
 
 app.post('/api/auto/resume', requireOperatorAuth, validateTradeBody(AutoResumeSchema), (req, res) => {
-  res.json({ success: true, ...autoSnipeController.resume({ clearHalt: req.body.clearHalt, clearDailyLossLatch: req.body.clearDailyLossLatch }), status: autoSnipeController.getStatus() });
+  res.json({ success: true, ...autoSnipeController.resume({ clearHalt: req.body.clearHalt, clearDailyLossLatch: req.body.clearDailyLossLatch, ackLossTriggers: req.body.ackLossTriggers }), status: autoSnipeController.getStatus() });
 });
 
 autoSnipeController.on('decision', (d) => broadcastWs({ type: 'AUTO_DECISION', data: d }));
@@ -1400,13 +1367,20 @@ app.post('/api/execution/kill-switch', requireOperatorAuth, asyncHandler(async (
   const { activate } = parsed.data;
   // P1.4 (N-0): tripping the switch is the shared emergency stop without the sells: kill switch, auto killed (OFF, after its buy in
   // flight) and LIVE disarmed. It used to leave auto in DEVNET_LIVE, which bought again once the switch was reset and LIVE re-armed.
+  // F2: a reset also closes an open circuit breaker, but only when the latest wallet-balance read succeeded (resetCircuitBreaker).
+  let breaker: ReturnType<typeof riskEngine.resetCircuitBreaker> | null = null;
   if (activate) await emergencyStop({ exitAll: false, reason: 'operator kill switch' });
-  else riskEngine.setKillSwitch(false);
+  else {
+    // The journal row says what the reset did to the breaker, next to G's KILL_SWITCH_TRIPPED reason.
+    breaker = riskEngine.resetCircuitBreaker();
+    riskEngine.setKillSwitch(false, `operator reset; circuit breaker ${breaker.state === 'CLOSED' ? 'closed' : `still open: ${breaker.reason}`}`);
+  }
   res.json({
     success: true,
     killSwitchActive: riskEngine.isKillSwitchActive(),
-    // R26: resetting the switch does not lift an open circuit breaker or an all-trading halt; say so, so the UI cannot claim "allowed again"
+    // R26: a reset does not lift an all-trading halt, and lifts an open circuit breaker only after a good balance read; say so, so the UI cannot claim "allowed again"
     circuitBreaker: riskEngine.getCircuitBreakerState(),
+    ...(breaker ? { circuitBreakerReset: breaker } : {}),
     haltReason: executionCoordinator.getHaltReason(),
     autoMode: autoSnipeController.getMode(),
     message: activate ? 'EMERGENCY KILL SWITCH TRIPPED. All trading halted, auto OFF, LIVE disarmed.' : 'Kill switch reset. Auto stays OFF and LIVE stays disarmed until an operator turns them on.',

@@ -25,6 +25,7 @@ import { authFetch } from '../services/engineClient';
 import { AutoHeaderBadge, useAutoStatus } from './AutoPanel';
 import { usePolled } from '../utils/usePolled';
 import { ReadOnlyPill } from './TradingModeBanner';
+import { publishHeaderHeight } from '../utils/headerOffset';
 
 /** Facts, not adjectives: how many of the live checks are not OK. */
 export function checksBadgeFor(checks: Array<{ status: string }> | null): { text: string; tone: string } {
@@ -81,6 +82,9 @@ export const Header: React.FC<HeaderProps> = ({
   const checksBadge = checksBadgeFor(checks.data?.checks ?? null);
   const recording = usePolled<{ launches: number }>('/api/backtest/recording', 60000, isOperatorAuthenticated !== false).data;
   const toolsMenuRef = useRef<HTMLDivElement | null>(null);
+  const headerRef = useRef<HTMLElement | null>(null);
+  // The modals start below the header, which is taller when it wraps on narrow screens
+  useEffect(() => (headerRef.current ? publishHeaderHeight(headerRef.current) : undefined), []);
 
   // Live Auto-Profit Ticker State (fetched from walletTrader) - Clean initial state (B22)
   const [profitSummary, setProfitSummary] = useState<PillState | null>(null);
@@ -137,10 +141,12 @@ export const Header: React.FC<HeaderProps> = ({
     }
   };
 
+  // UI-6: below 1024 px the header wraps onto more rows instead of running off the right edge, so the nav and KILL SWITCH stay reachable
   return (
     <header
+      ref={headerRef}
       id="apex-header"
-      className="h-16 border-b border-[#1E293B] bg-[#0A0E17]/98 backdrop-blur px-3 sm:px-4 lg:px-6 flex items-center justify-between sticky top-0 z-50 w-full"
+      className="min-h-16 lg:h-16 border-b border-[#1E293B] bg-[#0A0E17]/98 backdrop-blur px-3 sm:px-4 lg:px-6 py-2 lg:py-0 flex flex-wrap lg:flex-nowrap gap-y-2 items-center justify-between sticky top-0 z-50 w-full"
     >
       {/* 1. BRAND & FEED SELECTOR */}
       <div className="flex items-center space-x-2.5 sm:space-x-3 flex-shrink-0">

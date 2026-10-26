@@ -1,41 +1,5 @@
-export type OrderSide = 'BUY' | 'SELL';
-export type OrderStatus = 'FILLED' | 'PARTIALLY_FILLED' | 'CANCELLED' | 'REJECTED';
-
-export interface OrderBookEntry {
-  price: number;
-  size: number;
-  total: number;
-  depthPct: number;
-}
-
-export interface OrderBook {
-  symbol: string;
-  midPrice: number;
-  spread: number;
-  microPrice: number;
-  asks: OrderBookEntry[];
-  bids: OrderBookEntry[];
-  imbalanceRatio: number; // -1.0 to +1.0
-  lastTradedPrice: number;
-  lastTradedSide?: OrderSide;
-}
-
-export interface ExecutedTrade {
-  id: string;
-  timestamp: number;
-  microsecondTime: string;
-  botId: string;
-  botName: string;
-  symbol: string;
-  side: OrderSide;
-  status: OrderStatus;
-  price: number;
-  size: number;
-  pnlDelta: number;
-  slippageBps: number;
-  executionLatencyMs: number;
-  rejectionReason?: string;
-}
+// 3H (B3): the exchange-era types (OrderBook, ExecutedTrade, ActiveOrder, AccountBalance, ExchangeGatewayConfig, MarketTickerStats and
+// the rest of the BTC market-maker shapes) were removed; nothing imported them.
 
 export interface PerformanceKPIs {
   dailyPnL: number;
@@ -63,71 +27,6 @@ export interface AlertEvent {
   title: string;
   message: string;
   acknowledged: boolean;
-}
-
-export interface LatencyTestSample {
-  timestamp: number;
-  latencyMs: number;
-  dropped: boolean;
-  status: 'SUCCESS' | 'DROPPED' | 'SPIKE';
-}
-
-export interface PublicMarketTrade {
-  id: string | number;
-  timestamp: number;
-  timeStr: string;
-  microsecondTime: string;
-  symbol: string;
-  price: number;
-  size: number;
-  notionalUsd: number;
-  isBuyerMaker: boolean; // true = Sell order hit bid (seller aggressive), false = Buy order hit ask (buyer aggressive)
-  side: OrderSide;
-}
-
-export interface ActiveOrder {
-  orderId: string;
-  symbol: string;
-  side: OrderSide;
-  type: 'LIMIT' | 'MARKET';
-  price: number;
-  quantity: number;
-  executedQty: number;
-  status: OrderStatus;
-  createdAt: number;
-  botId?: string;
-  botName?: string;
-}
-
-export interface AccountBalance {
-  asset: string;
-  free: number;
-  locked: number;
-  totalUsd: number;
-}
-
-export interface ExchangeGatewayConfig {
-  mode: 'REAL_TAPE_PAPER_MATCHING' | 'BINANCE_TESTNET' | 'BINANCE_LIVE';
-  apiKey: string;
-  apiSecret: string;
-  maxOrderNotional: number;
-  maxDailyLoss: number;
-  fatFingerBandPct: number;
-  isConnected: boolean;
-  accountBalances: AccountBalance[];
-  exchangePingMs: number;
-  atomicClockDriftMs: number;
-}
-
-export interface MarketTickerStats {
-  symbol: string;
-  lastPrice: number;
-  priceChange24h: number;
-  priceChangePercent24h: number;
-  high24h: number;
-  low24h: number;
-  volume24h: number;
-  quoteVolume24h: number;
 }
 
 // ---------------- SOCIAL SCANNER & ALPHA INTELLIGENCE ----------------
@@ -379,6 +278,8 @@ export interface PumpFunHotCallout {
 
 export interface PumpFunHotCalloutsResponse {
   status: string;
+  /** 3H: NO_DATA / ONLINE / STALE, from real feed activity on the server */
+  feedStatus?: 'NO_DATA' | 'ONLINE' | 'STALE';
   liveSource: string;
   syncLatencyMs: number;
   lastUpdated: number;

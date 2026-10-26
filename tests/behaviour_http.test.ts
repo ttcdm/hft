@@ -411,14 +411,14 @@ describe('deny-by-default on the real server: no route is reachable without a to
     try {
       // a huge burst so the limiter never answers: a 429 would say nothing about the auth gate
       const app = await startApp(dir(), { SOLANA_RPC_URL: rpc.url, ALLOWED_CLUSTER: 'localnet', LOCALNET_GENESIS_HASH: LOCALNET_STUB_GENESIS, APEX_RATE_LIMIT_BURST: '100000' }); handles.push(app);
-      const src = fs.readFileSync('server.ts', 'utf8') + fs.readFileSync('server/market/marketRoutes.ts', 'utf8');
+      const src = fs.readFileSync('server.ts', 'utf8');
       const routes = [...src.matchAll(/app\.(get|post|put|patch|delete)\(\s*'(\/api\/[^']*)'/g)].map((m) => ({ method: m[1].toUpperCase(), path: m[2].replace(/:[A-Za-z]+/g, 'x') }));
       expect(routes.length).toBeGreaterThan(50);
       expect((await app.call('POST', '/api/signer/generate', { forceOverwrite: true })).status).toBe(403);
       expect((await fetch(`${app.base}/api/auth/session`)).status).toBe(401);
       const PUBLIC = new Set(['GET /api/health', 'POST /api/auth/login']);
-      // the route list must include the market routes registered outside server.ts, or the walk would not cover them
-      expect(routes.some((r) => r.path === '/api/market/orderbook')).toBe(true);
+      // 3H (B1): the Binance market routes that were registered outside server.ts are gone, so server.ts holds every /api route
+      expect(fs.existsSync('server/market/marketRoutes.ts')).toBe(false);
       const leaks: string[] = [];
       for (const r of routes) {
         if (PUBLIC.has(`${r.method} ${r.path}`)) continue;
@@ -452,10 +452,13 @@ describe('R1/R2/R3s: the server survives hostile requests and the gate cannot be
       }
       expect(await raw('http://x/api/wallet/state', `Authorization: Bearer ${app.token}\r\n`)).toBe(200);
 
-      // the crash: ?symbol=a&symbol=b used to call .replace on an array inside an async handler and kill the process
+      // the crash: ?symbol=a&symbol=b used to call .replace on an array inside the Binance ticker route and kill the process. 3H (B1)
+      // removed those routes, so the same requests reach the unknown-route 404 and the process stays up.
       for (const q of ['symbol=a&symbol=b', 'symbol[x]=1', 'symbol[]=1']) {
-        const r = await app.call('GET', `/api/market/ticker?${q}`);
-        expect(r.status, q).toBe(400);
+        for (const route of ['ticker', 'orderbook', 'trades', 'depth']) {
+          const r = await app.call('GET', `/api/market/${route}?${q}`);
+          expect(r.status, `${route}?${q}`).toBe(404);
+        }
       }
       expect((await app.call('GET', '/api/health')).status).toBe(200); // still alive
 

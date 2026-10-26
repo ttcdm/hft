@@ -4,7 +4,8 @@ import { PerformanceKPIs, AlertEvent } from './types';
 import { hftAudio } from './utils/audio';
 
 import { Header } from './components/Header';
-import { AlertSystem } from './components/AlertSystem';
+import { AlertSystem, isAlertExpired } from './components/AlertSystem';
+import { announceAuthenticated } from './utils/authEvents';
 import { AiDiagnosticsModal } from './components/AiDiagnosticsModal';
 import { SystemChecksModal } from './components/SystemChecksModal';
 import { ExecutionLatencyModal } from './components/ExecutionLatencyModal';
@@ -107,6 +108,7 @@ export default function App() {
     setIsAuthModalOpen(false);
     triggerAlert('INFO', 'OPERATOR AUTHENTICATED', 'Operator session successfully established.');
     engineClient.authenticate();
+    announceAuthenticated(); // UI-5: the mode banner, auto panel and board read now, not at their next tick
   };
 
   // Helper to add an alert
@@ -126,6 +128,15 @@ export default function App() {
     },
     []
   );
+
+  // UI-2: INFO and WARNING alerts expire on their own so the stack does not sit on the Plug & Play footer; CRITICAL stays.
+  useEffect(() => {
+    const t = setInterval(() => {
+      const now = Date.now();
+      setAlerts((prev) => (prev.some((a) => isAlertExpired(a, now)) ? prev.filter((a) => !isAlertExpired(a, now)) : prev));
+    }, 1000);
+    return () => clearInterval(t);
+  }, []);
 
   // Q36: a refused WebSocket command is shown, not dropped.
   useEffect(() => {
@@ -177,7 +188,7 @@ export default function App() {
       } else {
         // R26: the reset lifts only the kill switch. An open circuit breaker or an all-trading halt still refuses orders.
         const blockers: string[] = [];
-        if (body.circuitBreaker === 'OPEN') blockers.push('the circuit breaker is still OPEN');
+        if (body.circuitBreaker === 'OPEN') blockers.push(`the circuit breaker is still OPEN${body.circuitBreakerReset?.reason ? ` (${body.circuitBreakerReset.reason})` : ''}`);
         if (body.haltReason) blockers.push(`all trading is still halted (${body.haltReason})`);
         triggerAlert(
           blockers.length ? 'WARNING' : 'INFO',

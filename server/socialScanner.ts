@@ -275,7 +275,7 @@ export class SocialAlphaScanner {
     const trimmed = commandText.trim();
     if (trimmed.startsWith('/start') || trimmed.startsWith('/help')) {
       return {
-        reply: `⚡ APEX QUANT TELEGRAM BOT ONLINE\nAvailable Commands:\n/snipe <CA> [amount_usd] - Buys the token (paper or live, whichever mode is active)\n/signals - Lists top 3 high-confidence market maker signals\n/positions - View open memecoin positions and PnL\n/status - Check bot connection & execution telemetry\n/panic_sell - Liquidate all open positions immediately`,
+        reply: `⚡ APEX QUANT TELEGRAM BOT ONLINE\nAvailable Commands:\n/snipe <CA> [amount_usd] - Buys the token (paper or live, whichever mode is active)\n/signals - Lists top 3 high-confidence market maker signals\n/positions - View open memecoin positions and PnL\n/status - Check bot connection & execution telemetry\n/panic_sell - Liquidate all open positions (runs only when posted to the workstation's webhook with the operator token; Telegram does not deliver it, so use the workstation's panic button)`,
       };
     }
 

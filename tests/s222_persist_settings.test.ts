@@ -21,6 +21,7 @@ afterEach(async () => {
   resetConfluenceThreshold();
   workstationDb.setSetting('auto.confluenceThreshold', null);
   workstationDb.setSetting('auto.mode', null);
+  workstationDb.setSetting('auto.kill', null); // 3E: a kill is saved too, and keeps auto OFF across the next restore
 });
 
 describe('S222: the operator\'s threshold and auto mode survive a restart', () => {

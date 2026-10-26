@@ -164,12 +164,13 @@ describe('G: the sell path (take-profit stage, stale claims, no signer, buys in 
     (coordinator as any).realWalletBalanceSol = 1;
     (coordinator as any).executionMode = 'LIVE';
     (coordinator as any).isLiveTradingArmed = true;
+    const d3Mint = Keypair.generate().publicKey.toBase58(); // 3F: the sell cases above close `mint` at a loss, so it is not bought again
     await coordinator.executeTrade({
-      signalTimestamp: Date.now(), mint, symbol: 'D3', name: 'D3', amountSol: 0.005, source: 'MANUAL', provenance: 'MANUAL_OPERATOR',
-      eligibilityReport: createPassingEligibilityReport(mint),
+      signalTimestamp: Date.now(), mint: d3Mint, symbol: 'D3', name: 'D3', amountSol: 0.005, source: 'MANUAL', provenance: 'MANUAL_OPERATOR',
+      eligibilityReport: createPassingEligibilityReport(d3Mint),
     } as any);
     expect(submit).toHaveBeenCalled();
-    expect(seenInFlight).toEqual([mint]);
+    expect(seenInFlight).toEqual([d3Mint]);
     expect(await coordinator.waitForBuysInFlight(0)).toEqual([]);
   });
 });

@@ -126,6 +126,15 @@ export class AuthManager {
     return true;
   }
 
+  /**
+   * T3: a valid token whose session has the OPERATOR role. Only OPERATOR sessions are issued today, so this changes nothing yet; it stops
+   * a READONLY session (createSession('READONLY')) from ever trading, changing config or holding a trading WebSocket.
+   */
+  public isOperatorToken(token?: string | null): boolean {
+    if (!this.validateToken(token)) return false;
+    return this.sessions.get(token as string)?.role === 'OPERATOR';
+  }
+
   public createSession(role: 'OPERATOR' | 'READONLY' = 'OPERATOR'): OperatorSession {
     const token = crypto.randomBytes(32).toString('hex');
     const session: OperatorSession = {
@@ -211,7 +220,7 @@ function sendUnauthorized(req: Request, res: Response) {
 export function requireOperatorAuth(req: Request, res: Response, next: NextFunction) {
   const token = extractOperatorToken(req);
 
-  if (!token || !authManager.validateToken(token)) {
+  if (!token || !authManager.isOperatorToken(token)) {
     Logger.warn(`Unauthorized mutation attempt blocked on ${req.method} ${redactUrl(req.originalUrl)} from ${req.ip}`);
     return sendUnauthorized(req, res);
   }
@@ -262,7 +271,9 @@ export function apiAuthGate(req: Request, res: Response, next: NextFunction) {
   if (!pathname.startsWith('/api')) return next();
   if (isPublicApiRoute(req.method, pathname)) return next();
   const token = extractOperatorToken(req);
-  if (!token || !authManager.validateToken(token)) {
+  // T3: any valid session may read (GET/HEAD); everything else needs the OPERATOR role, whether or not the route adds requireOperatorAuth.
+  const readOnly = req.method === 'GET' || req.method === 'HEAD';
+  if (!token || !(readOnly ? authManager.validateToken(token) : authManager.isOperatorToken(token))) {
     Logger.warn(`Unauthenticated API request blocked: ${req.method} ${pathname} from ${req.ip}`);
     return sendUnauthorized(req, res);
   }
@@ -291,7 +302,7 @@ export function resolveBindHost(env: NodeJS.ProcessEnv = process.env): { host: s
 // WebSocket token check: server.ts uses it for the AUTHENTICATE handshake and for every mutating WebSocket command
 export function verifyWsAuth(token?: string | null): boolean {
   if (!token) return false;
-  return authManager.validateToken(token);
+  return authManager.isOperatorToken(token); // T3: the trading socket is operator-only
 }
 
 // Helper function: strictly validate client origin against the server's own origin, loopback,

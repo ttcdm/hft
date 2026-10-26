@@ -15,13 +15,14 @@ const stop20: Variant = STOCK_VARIANT;
 const lat = (entryMs: number, exitMs: number) => ({ entryMs, exitMs });
 
 describe('S229 exit polling and fill latency', () => {
-  it('decides on the last price at the 3 s tick and fills at the first trade after decision + exit delay, where the old replay sold at the print', () => {
+  // 5A: fills are at the curve state when the transaction lands (the last print at or before it), no longer at the next print after it
+  it('decides on the last price at the 3 s tick and fills at the curve state at decision + exit delay, where the old replay sold at the print', () => {
     const t = [row(1000, 1e-8), row(2000, 1e-8), row(3500, 0.7e-8), row(5000, 0.5e-8), row(9000, 0.4e-8)];
     const p = simulatePath(t, 0, lat(500, 500), stop20)!;
     expect(p.entryIdx).toBe(0);
     expect(p.sells).toHaveLength(1);
     expect(p.sells[0]).toMatchObject({ reason: 'STOP_LOSS', decideTs: 1000 + TICK_MS, frac: 1 });
-    expect(p.sells[0].fillIdx).toBe(3); // first row at/after 4000 + 500
+    expect(p.sells[0]).toMatchObject({ fillIdx: 2, fillTs: 4000 + 500 }); // the last print at or before 4000 + 500
     expect(p.open).toBeNull();
     const legacy = simulatePath(t, 0, lat(500, 500), stop20, { legacy: true })!;
     expect(legacy.sells[0].fillIdx).toBe(2); // the print that crossed -20%
@@ -36,13 +37,14 @@ describe('S229 exit polling and fill latency', () => {
   });
   it('a longer exit delay fills later and so at the later price', () => {
     const t = [row(1000, 1e-8), row(3500, 0.7e-8), row(4400, 0.6e-8), row(6000, 0.3e-8)];
-    expect(simulatePath(t, 0, lat(500, 300), stop20)!.sells[0].fillIdx).toBe(2); // first row at/after 4000 + 300 is the one at 4400
-    expect(simulatePath(t, 0, lat(500, 500), stop20)!.sells[0].fillIdx).toBe(3); // at/after 4500 it is the one at 6000, a lower price
+    expect(simulatePath(t, 0, lat(500, 300), stop20)!.sells[0].fillIdx).toBe(1); // the curve at 4000 + 300 is the print at 3500
+    expect(simulatePath(t, 0, lat(500, 500), stop20)!.sells[0].fillIdx).toBe(2); // at 4500 it is the one at 4400, a lower price
   });
-  it('entry fill = first trade at/after release + entry delay; no trade after it means no entry', () => {
+  it('5A: entry fill = the curve state when the buy lands (release + entry delay); a launch with no trade after it still enters', () => {
     const t = [row(1000, 1e-8), row(2600, 1e-8), row(4000, 1e-8)];
-    expect(simulatePath(t, 1000, lat(1500, 500), stop20)!.entryIdx).toBe(1);
-    expect(simulatePath(t, 1000, lat(5000, 500), stop20)).toBeNull();
+    expect(simulatePath(t, 1000, lat(1500, 500), stop20)).toMatchObject({ entryIdx: 0, entryTs: 2500 });
+    expect(simulatePath(t, 1000, lat(5000, 500), stop20)).toMatchObject({ entryIdx: 2, entryTs: 6000, sells: [], open: { lastIdx: 2 } });
+    expect(simulatePath(t, 1000, lat(1500, 500), stop20, { legacy: true })!.entryIdx).toBe(1); // the pre-5A rule: the next print
     expect(firstAtOrAfter(t, 4001)).toBe(-1);
   });
   it('the stale exit fires on the tick at the stale time, with the price the engine last saw', () => {
@@ -50,7 +52,7 @@ describe('S229 exit polling and fill latency', () => {
     const v = VARIANTS.find((x) => x.staleMin === 5 && x.stop === 20 && x.tp1 === 30)!;
     const p = simulatePath(t, 0, lat(500, 500), v)!;
     expect(p.sells[0]).toMatchObject({ reason: 'STALE_POSITION', decideTs: 1000 + 300_000 });
-    expect(p.sells[0].fillIdx).toBe(2);
+    expect(p.sells[0].fillIdx).toBe(1); // 5A: the curve state at 301,500 is still the print at 2,000
   });
   it('a decision with no later trade cannot be filled: the position stays open', () => {
     const t = [row(1000, 1e-8), row(3500, 0.5e-8)];
@@ -157,7 +159,7 @@ const asStudy = (c: CorpusLaunch): StudyLaunch => ({ rec: toRecordedLaunch(c, 15
 const OPTS: StudyOptions = { thresholds: [50], sizes: [0.01], splitTs: 0, solUsd: 150, minTrainEntries: 1, bootstrapResamples: 100, seed: 7 };
 
 describe('S229 the study loop', () => {
-  it('legacy path + stock cost equals replayLaunch exactly on closed entries (the built-in check)', () => {
+  it('5A: the model at the replay\'s latency and costs equals replayLaunch exactly (the built-in check)', () => {
     const ls = [asStudy(corpusLaunch(1_000_000, 'A', true)), asStudy(corpusLaunch(5_000_000, 'B', true))];
     const v = validateLegacy(ls, OPTS, 50);
     expect(v.checked).toBeGreaterThan(0);

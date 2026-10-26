@@ -155,7 +155,7 @@ describe('S178: replay runs the real rules over what was recorded', () => {
     }
     const m = stats.get(launches[0].mint, releasedAt)!;
     const by = ConfluenceEngine.calculate({
-      mint: launches[0].mint, priceChange5mPct: m.priceChange5mPct, liquidityUsd: m.realSolReserves * 150 * 2, top10HoldersPct: m.top10HoldersPct, bondingCurveProgress: m.curveProgressPct,
+      mint: launches[0].mint, creatorAddress: create.creator, creatorRiskReport: null, priceChange5mPct: m.priceChange5mPct, liquidityUsd: m.realSolReserves * 150 * 2, top10HoldersPct: m.top10HoldersPct, bondingCurveProgress: m.curveProgressPct,
       buys5m: m.buys5m, sells5m: m.sells5m, devHoldingPct: m.devHoldingPct, hasVerifiedSocialCall: false, socialCallCount: 0, curveVelocityMetrics: vel.getMetrics(launches[0].mint, releasedAt),
     }).compositeScore;
     if (r.score !== null) expect(r.score).toBe(by);
@@ -194,7 +194,7 @@ describe('S178: exits come from the real ExitEngine over the recorded prices', (
     expect(rep.summary.launches).toBe(0);
     expect(rep.summary.winRate).toBeNull();
     expect(rep.summary.netPnlSol).toBeNull();
-    expect(rep.notReplayed.join(' ')).toMatch(/Eligibility filter/);
+    expect(rep.notReplayed.join(' ')).toMatch(/eligibility filter/i);
     expect(rep.assumptions.entryDelayMs).toBeGreaterThan(0);
   });
 });
@@ -241,7 +241,9 @@ describe('S190: the replay measures time to peak from the release over recorded 
     const b = Object.fromEntries(rep.peakAnalysis.buckets.map((x) => [x.label, x]));
     expect(b['60 to 180 min'].launches).toBe(1);
     expect(b['60 to 180 min'].peakAtLeast2x).toBe(1);
-    expect(rep.peakAnalysis.late.peakAfter60MinAtLeast2x).toBe(1);
+    // 5C (R1-108): 75 min of data is in the 60-minute denominator, not the 180-minute one, and each count follows its denominator
+    expect(rep.peakAnalysis.late.peakAfter30MinAtLeast2x).toBe(1);
+    expect(rep.peakAnalysis.late.peakAfter60MinAtLeast2x).toBe(0);
     expect(mint).toBe(withLate.mint);
   });
   it('a launch with nothing recorded after the release has no peak', () => {

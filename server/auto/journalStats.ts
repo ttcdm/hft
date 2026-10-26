@@ -52,3 +52,19 @@ export function computeJournalStats(rows: DecisionRow[], positionStatus: (id: st
   }
   return { seen, rejectedByStage, wouldBuy, bought, open, closed, netPnlSol: net, feesPaidSol: fees, winRate: closed > 0 ? wins / closed : null };
 }
+
+/**
+ * 3E (R1-44, R1-124): the trades NEGATIVE_EXPECTANCY and LOSS_STREAK judge. The last `n` closed trades the auto trader owns, across
+ * sessions and restarts, that closed after the operator's last acknowledgement (`afterTs`, null when there is none). Net PnL, oldest first.
+ * `closed` must be oldest first (loadEvidenceClosedTrades is), so evidence the operator has not looked at carries into a new session.
+ */
+export function autoEvidencePnl(
+  closed: Array<{ id: string; realizedPnLSol?: number; lastUpdatedTimestamp?: number }>,
+  owned: Set<string>,
+  opts: { afterTs: number | null; n: number }
+): number[] {
+  return closed
+    .filter((p) => owned.has(p.id) && (opts.afterTs === null || (p.lastUpdatedTimestamp ?? 0) > opts.afterTs))
+    .slice(-opts.n)
+    .map((p) => p.realizedPnLSol ?? 0);
+}

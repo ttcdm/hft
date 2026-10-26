@@ -541,7 +541,7 @@ describe('Tier 2: Boundary & Corner Cases (Features 6 - 10)', () => {
   describe('Feature 10 Boundaries: Synthetic Data Isolation', () => {
     it('B10.1: DEMO_MODE=false enforces production defaults', () => {
       const cfg = executionConfig.getConfig();
-      expect(cfg.demoMode).toBe(false);
+      expect((cfg as any).demoMode).toBeUndefined(); // P3.1: stored and never read, removed; DEMO_MODE is read where it acts
       expect((cfg as any).enableSyntheticSocial).toBeUndefined(); // S215: ENABLE_SYNTHETIC_SOCIAL was read and never used
     });
 

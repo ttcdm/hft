@@ -1002,8 +1002,6 @@ export class PumpCurveService {
 
     // Calculate dynamic fee and token output
     let tokensToReceiveRaw: bigint;
-    let protocolFeeLamports: bigint;
-    let creatorFeeLamports: bigint;
 
     const protocolFeeBps = state.protocolFeeBps;
     const creatorFeeBps = state.creatorFeeBps;
@@ -1086,10 +1084,6 @@ export class PumpCurveService {
         });
 
         tokensToReceiveRaw = BigInt(tokensOut.toString());
-        const totalFeeBps = BigInt(protocolFeeBps + creatorFeeBps);
-        const totalFeeLamports = (solInputLamports * totalFeeBps) / 10000n;
-        protocolFeeLamports = totalFeeBps > 0n ? (totalFeeLamports * BigInt(protocolFeeBps)) / totalFeeBps : 0n;
-        creatorFeeLamports = totalFeeLamports - protocolFeeLamports;
         sdkQuoteSucceeded = true;
       } catch (err: any) {
         if (isLiveMode) {
@@ -1104,12 +1098,16 @@ export class PumpCurveService {
 
     // Mathematical constant-product model (used for cross-check and fallback in paper mode)
     const totalFeeBps = BigInt(protocolFeeBps + creatorFeeBps);
-    protocolFeeLamports = (solInputLamports * BigInt(protocolFeeBps)) / 10000n;
-    creatorFeeLamports = (solInputLamports * BigInt(creatorFeeBps)) / 10000n;
-    const totalFeeLamports = protocolFeeLamports + creatorFeeLamports;
     const netSolForCurve = (totalFeeBps > 0n && solInputLamports > 1n)
       ? ((solInputLamports - 1n) * 10000n) / (10000n + totalFeeBps)
       : solInputLamports;
+    // 5A (N-41): the program charges ceil(curve input x bps / 1e4) per fee, on the curve input, not the gross. Both branches report the fee
+    // as gross - netSolForCurve (what postBuySpot and the round-trip gate subtract), split by bps: the creator share ceil(net x bps / 1e4) as the
+    // SDK's getFee, the protocol the rest (so a 0 bps creator gets nothing and the sum is always the total).
+    const totalFeeLamports = solInputLamports - netSolForCurve;
+    const creatorCeil = creatorFeeBps > 0 ? (netSolForCurve * BigInt(creatorFeeBps) + 9999n) / 10000n : 0n;
+    const creatorFeeLamports = creatorCeil < totalFeeLamports ? creatorCeil : totalFeeLamports;
+    const protocolFeeLamports = totalFeeLamports - creatorFeeLamports;
 
     const k = state.virtualSolReserves * state.virtualTokenReserves;
     const newVirtualSol = state.virtualSolReserves + netSolForCurve;
@@ -1179,8 +1177,8 @@ export class PumpCurveService {
       expectedSolAmountLamports: Number(solInputLamports),
       maxInputLamports,
       minOutputLamports: 0,
-      protocolFeeLamports: Number(protocolFeeLamports!),
-      creatorFeeLamports: Number(creatorFeeLamports!),
+      protocolFeeLamports: Number(protocolFeeLamports),
+      creatorFeeLamports: Number(creatorFeeLamports),
       expectedPriorityFeeLamports: priorityFeeLamports,
       expectedJitoTipLamports: Math.round(jitoTipSol * 1e9),
       estimatedPriceImpactBps: impactBps,

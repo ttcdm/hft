@@ -2,7 +2,8 @@ import { EventEmitter } from 'events';
 import { isReadOnly } from '../solana/readOnly';
 import { workstationDb } from '../db/database';
 import { traced } from '../observability/tracing';
-import { executionCoordinator, isRecoveredPosition } from '../execution/coordinator';
+import { executionCoordinator, isRecoveredPosition, LIVE_BUY_FILLED } from '../execution/coordinator';
+import { CapitalSizer } from '../capital/capitalSizer';
 import { memecoinAggregator } from '../memecoinAggregator';
 import { solPriceService } from '../market/solPriceService';
 import { executionConfig } from '../solana/executionConfig';
@@ -10,9 +11,9 @@ import { checkSnipeAmountSol, SNIPE_AMOUNT_MIN_SOL } from '../execution/snipeAmo
 import { allowedCluster, assertClusterAllowed } from '../solana/clusterGuard';
 import { Logger } from '../middleware/enterprise';
 import type { SignalProvenance } from '../core/types';
-import { computeJournalStats, type JournalStats } from './journalStats';
-import { evaluateKillTriggers, auditWalletChange, type KillTrigger } from './killSwitch';
-import { riskEngine } from '../risk/riskEngine';
+import { computeJournalStats, autoEvidencePnl, type JournalStats } from './journalStats';
+import { evaluateKillTriggers, auditWalletChange, EXPECTANCY_WINDOW, MAX_CONSECUTIVE_LOSSES, type KillTrigger } from './killSwitch';
+import { riskEngine, PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS } from '../risk/riskEngine';
 import { watchWindow, readyGate, type WatchResult, type WatchVerdict } from '../signals/watchWindow';
 import { checkConfluenceThreshold, getConfluenceThreshold, setConfluenceThreshold, confluenceThresholdInfo, CONFLUENCE_DEVNET_LIVE_FLOOR, type ConfluenceThresholdInfo } from '../signals/confluenceThreshold';
 import { isCurveTooFar, curveTooFarReason } from '../signals/curveProgressCap';
@@ -159,6 +160,14 @@ const MONITOR_INTERVAL_MS = 5_000;
 /** S222: keys in `app_settings`. */
 const SETTING_THRESHOLD = 'auto.confluenceThreshold';
 const SETTING_MODE = 'auto.mode';
+/** 3E: the last kill, `{ reason, ts }`, or null once an operator has set a trading mode again. Read back by `restorePersisted`. */
+const SETTING_KILL = 'auto.kill';
+/** 3E: `{ ts }` of the operator's last acknowledgement of the loss triggers; trades closed at or before it no longer count. */
+const SETTING_LOSS_ACK = 'auto.lossTriggerAck';
+/** 3E: how many of the latest auto-owned closed trades the expectancy and loss-streak triggers look at, across sessions. */
+export const LOSS_TRIGGER_TRADES = Math.max(EXPECTANCY_WINDOW, MAX_CONSECUTIVE_LOSSES);
+/** 3E: the triggers that judge trade results, and so need an operator acknowledgement before auto may buy again. */
+const LOSS_TRIGGER_CODES = new Set(['NEGATIVE_EXPECTANCY', 'LOSS_STREAK']);
 /** S189: how long readiness must stay green before a PAPER session downgraded by READINESS_RED is put back. */
 export const READINESS_RESTORE_GREEN_MS = 60_000;
 
@@ -169,7 +178,7 @@ export function classifyRejection(message: string): string {
   if (/^(REJECTED: )?(ELIGIBILITY|UNSUPPORTED_TOKEN|SAFETY_CHECK|Freeze authority|Creator holds)/.test(m)) return 'eligibility';
   if (/Confluence score/.test(m)) return 'score';
   if (/^(REJECTED: )?(Capital sizing|WALLET_BALANCE_UNKNOWN|SOL_PRICE_UNAVAILABLE)|^(EXCEEDS_CAPITAL_CEILING|INSUFFICIENT_|EXPECTED_EDGE_BELOW|MARKET_DATA_UNAVAILABLE)/.test(m)) return 'size';
-  if (/^(CIRCUIT_BREAKER_OPEN|DAILY_LOSS_LIMIT|DUPLICATE_MINT|EXECUTION_DISABLED|FEE_TOO_HIGH|INSUFFICIENT_BALANCE|KILL_SWITCH_ACTIVE|MAX_EXPOSURE|MAX_POSITION_SIZE|PRICE_IMPACT_TOO_HIGH|SLIPPAGE_TOO_HIGH|STALE_MARKET_DATA|STALE_SIGNAL|TRADING_HALTED)/.test(m)) return 'risk';
+  if (/^(CIRCUIT_BREAKER_OPEN|DAILY_LOSS_LIMIT|DUPLICATE_MINT|EXECUTION_DISABLED|FEE_TOO_HIGH|INSUFFICIENT_BALANCE|KILL_SWITCH_ACTIVE|MAX_EXPOSURE|MAX_POSITION_SIZE|MINT_RECENTLY_EXITED|PRICE_IMPACT_TOO_HIGH|SLIPPAGE_TOO_HIGH|STALE_MARKET_DATA|STALE_SIGNAL|TRADING_HALTED)/.test(m)) return 'risk';
   return 'execute';
 }
 
@@ -196,6 +205,8 @@ export class AutoSnipeController extends EventEmitter {
   private redSince = new Map<string, number>();
   private monitorTimer: NodeJS.Timeout | null = null;
   private walletMark: { sol: number; ts: number } | null = null;
+  /** 3E: performance.now() of the first trigger check that found the wallet balance unknown; null while reads succeed. */
+  private walletUnknownSince: number | null = null;
 
   public getMode(): AutoMode {
     return this.mode;
@@ -231,8 +242,9 @@ export class AutoSnipeController extends EventEmitter {
     const d: AutoDecision = { ts: Date.now(), mode: this.mode, mint: c.mint, symbol: c.symbol, source: c.source, outcome, stage, reason, ...pub };
     this.decisions.push(d);
     if (this.decisions.length > MAX_DECISIONS) this.decisions.shift();
-    // Q8: only DEVNET_LIVE fills move the wallet; a PAPER fill's delta must not enter the wallet audit
-    const solDelta = outcome === 'BOUGHT' && d.mode === 'DEVNET_LIVE' && extra.amountSol !== undefined ? -(extra.amountSol + (extra.feesSol ?? 0)) : undefined;
+    // 3B (R1-38): a BOUGHT row carries no wallet delta. The coordinator journals every landed LIVE buy (LIVE_BUY_FILLED, the whole wallet
+    // delta with rent, keyed by the same positionId), whoever placed it; a delta here as well would count an auto buy twice in the audit.
+    // (Q8: a PAPER fill never had one.)
     workstationDb.logDecision({
       ts: d.ts,
       autoMode: d.mode,
@@ -244,7 +256,6 @@ export class AutoSnipeController extends EventEmitter {
       reason: d.reason,
       inputs: extra.inputs,
       positionId: d.positionId,
-      solDelta,
       unverified: extra.unverified,
     });
     this.emit('decision', d);
@@ -342,6 +353,7 @@ export class AutoSnipeController extends EventEmitter {
    * S222: bring back what the operator had set before a restart. The confluence threshold always. The mode only up to PAPER: a saved
    * DEVNET_LIVE comes back as SHADOW (nothing is sent) and needs a fresh arm and confirmation code, so a restart never resumes live
    * sending by itself. A mode that cannot be restored (AUTO_SNIPE_ENABLED not true, coordinator not in PAPER) leaves auto OFF.
+   * 3E: a kill saved by the last run (`auto.kill`) keeps auto OFF and `killed` with its reason, until an operator sets a mode.
    * Call once at startup, before `startMonitor`.
    */
   public async restorePersisted(): Promise<{ threshold: number | null; mode: AutoMode; note: string | null }> {
@@ -359,6 +371,18 @@ export class AutoSnipeController extends EventEmitter {
     if (holder && holder.pid !== process.pid) {
       note = `restart: auto mode not restored: process ${holder.pid} holds ${lock}; auto stays OFF and the saved mode is left as it is`;
       Logger.warn(`[AUTO] ${note}`);
+      return { threshold, mode: this.mode, note };
+    }
+    // 3E: a kill saved by the last run keeps auto OFF and killed, whatever mode is saved (a kill that saved OFF but crashed mid-way, or an
+    // older build that saved the mode only at the end of the kill). Only an operator setting a mode again clears it.
+    const savedKill = workstationDb.getSetting<{ reason?: unknown; ts?: unknown }>(SETTING_KILL);
+    if (savedKill && typeof savedKill === 'object') {
+      this.killed = true;
+      this.killReason = typeof savedKill.reason === 'string' && savedKill.reason ? savedKill.reason : 'kill before the restart (no reason saved)';
+      note = `restart: auto was killed before the restart (${this.killReason}); auto stays OFF until an operator sets a mode`;
+      if (workstationDb.getSetting<unknown>(SETTING_MODE) !== 'OFF') workstationDb.setSetting(SETTING_MODE, 'OFF');
+      Logger.warn(`[AUTO] ${note}`);
+      workstationDb.logDecision({ autoMode: this.mode, mint: '-', stage: 'auto', outcome: 'INFO', reason: note });
       return { threshold, mode: this.mode, note };
     }
     const saved = workstationDb.getSetting<unknown>(SETTING_MODE);
@@ -383,7 +407,15 @@ export class AutoSnipeController extends EventEmitter {
   /** S222: every mode change is saved, so `restorePersisted` can bring it back. */
   private persistMode = (): void => { workstationDb.setSetting(SETTING_MODE, this.mode); };
 
+  /** 3E: save OFF and the kill reason now, synchronously. A failed write is logged; the in-memory kill still holds for this process. */
+  private persistKill(): void {
+    const modeSaved = workstationDb.setSetting(SETTING_MODE, 'OFF');
+    const killSaved = workstationDb.setSetting(SETTING_KILL, { reason: this.killReason, ts: Date.now() });
+    if (!modeSaved || !killSaved) Logger.error(`[AUTO] kill: could not save auto OFF and the kill reason; a restart may not know auto was killed (${this.killReason})`);
+  }
+
   public getStatus(): AutoStatus {
+    this.settleUnresolvedSpend();
     this.enforceBudgets();
     this.dropDevnetLiveIfUnarmed(); // P1.4: the status never shows a DEVNET_LIVE session that can no longer trade
     let session: AutoStatus['session'] = null;
@@ -487,13 +519,23 @@ export class AutoSnipeController extends EventEmitter {
         return { ok: false, mode: this.mode, error: `cluster check failed: ${e.message}` };
       }
     }
+    if (next === 'PAPER' || next === 'DEVNET_LIVE') {
+      // 3E: the expectancy and streak triggers read the last auto trades across sessions, so a session the triggers stopped cannot simply be
+      // started again: the operator looks at the losses and acknowledges them first, and the count starts afresh from then.
+      const pending = this.pendingLossTriggers(next === 'DEVNET_LIVE' ? 'LIVE' : 'PAPER');
+      if (pending.length > 0) {
+        return { ok: false, mode: this.mode, error: `LOSS_TRIGGERS_NEED_ACK: ${pending.map((h) => `${h.code} (${h.message})`).join('; ')}, over the last auto trades across sessions. Check them, then acknowledge with POST /api/auto/resume {ackLossTriggers:true}; trades closed before that no longer count.` };
+      }
+    }
     this.killed = false;
     this.killReason = null;
+    workstationDb.setSetting(SETTING_KILL, null); // 3E: an operator setting a mode again is what clears a kill, here and after a restart
     this.downgradeReason = null;
     this.triggers = [];
     this.slippageBreaches = 0;
     this.redSince.clear();
     this.walletMark = null;
+    this.walletUnknownSince = null;
     this.attempted.clear();
     this.clearPendingReleases();
     this.mode = next;
@@ -521,6 +563,9 @@ export class AutoSnipeController extends EventEmitter {
     this.autoRestore = null;
     this.killed = true;
     this.killReason = opts.reason || 'operator kill';
+    // 3E (R1-43): saved before the first await. The `mode` event below comes only after the wait and the closes, so a crash or a close that
+    // never returns used to leave the old mode saved, and restorePersisted brought it back on the next boot.
+    this.persistKill();
     this.clearPendingReleases(); // P1.4: a release queued behind the buy in flight is not bought after a kill
     // Q29: a buy already past the gates finishes (its position exists once it does); wait for it so its position is in the owned set below
     // and is sold by exitAll. Mode OFF already stops any new candidate.
@@ -563,14 +608,20 @@ export class AutoSnipeController extends EventEmitter {
       else if (!this.redSince.has(name)) this.redSince.set(name, now);
     }
 
+    // 3E: WALLET_UNKNOWN needs the balance unknown for longer than READINESS_RED_LIMIT_MS (monotonic clock), not one failed read
+    const walletSol = executionCoordinator.getRealWalletBalanceSol() ?? null;
+    const mono = performance.now();
+    if (walletSol === null) { if (this.walletUnknownSince === null) this.walletUnknownSince = mono; } else this.walletUnknownSince = null;
+
     const ctx = {
       mode: this.mode,
-      closedNetPnlSol: this.sessionEvidencePnl(execMode),
+      closedNetPnlSol: this.lossEvidencePnl(execMode),
       dailyTotalPnlSol: riskEngine.getDailyTotalPnLSol(execMode),
       maxDailyLossSol: riskEngine.effectiveMaxDailyLossSol(),
       slippageBreaches: this.slippageBreaches,
       readinessRed: [...this.redSince.entries()].map(([name, since]) => ({ name, redForMs: now - since })),
-      walletSol: executionCoordinator.getRealWalletBalanceSol(),
+      walletSol,
+      walletUnknownForMs: this.walletUnknownSince === null ? 0 : mono - this.walletUnknownSince,
       reserveSol: 0.015,
       maxTradeSol: this.orderSol(),
     };
@@ -659,10 +710,15 @@ export class AutoSnipeController extends EventEmitter {
     if (this.busy || executionCoordinator.hasTradeInFlight()) return null; // a trade started during the balance read
     const bal = executionCoordinator.getRealWalletBalanceSol();
     if (bal === null || bal === undefined) return null;
+    // 3B (P3.2, R1-62): LIVE buys sent and still unresolved are in flight too, for as long as they stay unresolved (a buy that returned
+    // UNCONFIRMED, any caller, any process). A drop up to their worst case is held as theirs and the old mark is kept, so the look after
+    // orphan recovery journals the buy spans both. Unreadable: skip this look, keep the mark.
+    const unresolved = executionCoordinator.getUnresolvedLiveBuys({ includeOwnInFlight: true });
+    if (unresolved === null) return null;
     const prev = this.walletMark;
-    this.walletMark = { sol: bal, ts: now };
+    if (!prev || unresolved.mints.length === 0) this.walletMark = { sol: bal, ts: now };
     if (!prev) return null;
-    const audit = auditWalletChange(prev.sol, bal, workstationDb.sumDecisionSolDelta(prev.ts, now));
+    const audit = auditWalletChange(prev.sol, bal, workstationDb.sumDecisionSolDelta(prev.ts, now), { worstCaseSol: unresolved.reservedSol, count: unresolved.mints.length });
     if (!audit.explained) {
       const reason = `wallet changed by an unexplained ${audit.unexplainedSol.toFixed(6)} SOL (tolerance ${audit.toleranceSol.toFixed(6)})`;
       executionCoordinator.haltAll(reason);
@@ -678,24 +734,49 @@ export class AutoSnipeController extends EventEmitter {
   }
 
   /**
-   * Q30: the trades the expectancy and loss-streak triggers judge. Only positions the auto trader opened (this session's, or recorded as
-   * BOUGHT in the journal) that closed since this session started, in this execution mode. Before, every closed trade of every mode and
-   * every origin counted, so the old losses that tripped a trigger re-tripped it within seconds of the operator turning auto back on.
+   * 3E (R1-44, R1-124): the trades the expectancy and loss-streak triggers judge: the last LOSS_TRIGGER_TRADES closed positions the auto trader
+   * opened (this session's, or recorded as BOUGHT in the journal), in this execution mode, across sessions and restarts, that closed after the
+   * operator's last acknowledgement. Q30 limited this to the current session, so a restart or a new session wiped the evidence; the
+   * acknowledgement now does what that did (old losses stop re-tripping), but only on purpose. Positions the operator opened by hand never count.
    */
-  private sessionEvidencePnl(execMode: 'PAPER' | 'LIVE'): number[] {
-    const since = this.session?.startedAt ?? 0;
+  private lossEvidencePnl(execMode: 'PAPER' | 'LIVE'): number[] {
     const owned = new Set<string>(this.session?.positionIds ?? []);
     for (const d of workstationDb.loadDecisions({ outcome: 'BOUGHT', limit: 5000 })) if (d.positionId) owned.add(d.positionId);
-    return workstationDb.loadEvidenceClosedTrades(execMode)
-      .filter((p) => owned.has(p.id) && (p.lastUpdatedTimestamp ?? 0) >= since)
-      .map((p) => p.realizedPnLSol ?? 0);
+    return autoEvidencePnl(workstationDb.loadEvidenceClosedTrades(execMode), owned, { afterTs: this.lossTriggerAckTs(), n: LOSS_TRIGGER_TRADES });
   }
 
-  /** Clear an all-trading halt and/or the daily-loss latch (3C: separate flags). Does not turn auto trading back on. */
-  public resume(opts: { clearHalt?: boolean; clearDailyLossLatch?: boolean } = {}): { halted: boolean; mode: AutoMode } {
+  /** 3E: the last acknowledgement, or null. An unreadable or malformed value is null, so every auto trade counts (fail-closed). */
+  private lossTriggerAckTs(): number | null {
+    const ack = workstationDb.getSetting<{ ts?: unknown }>(SETTING_LOSS_ACK);
+    return ack && typeof ack === 'object' && typeof ack.ts === 'number' && Number.isFinite(ack.ts) ? ack.ts : null;
+  }
+
+  /** 3E: the loss triggers the evidence trips right now, before any session starts. */
+  private pendingLossTriggers(execMode: 'PAPER' | 'LIVE'): KillTrigger[] {
+    return evaluateKillTriggers({
+      mode: 'PAPER', closedNetPnlSol: this.lossEvidencePnl(execMode), dailyTotalPnlSol: 0, maxDailyLossSol: 0, slippageBreaches: 0,
+      readinessRed: [], walletSol: null, reserveSol: 0, maxTradeSol: 0,
+    }).filter((h) => LOSS_TRIGGER_CODES.has(h.code));
+  }
+
+  /**
+   * Clear an all-trading halt and/or the daily-loss latch (3C: separate flags). Does not turn auto trading back on.
+   * 3E: `ackLossTriggers` records the operator's acknowledgement of NEGATIVE_EXPECTANCY / LOSS_STREAK: auto trades closed until now stop
+   * counting, so a mode can be set again. `lossTriggersAcked` is false when it could not be saved (nothing changes then).
+   */
+  public resume(opts: { clearHalt?: boolean; clearDailyLossLatch?: boolean; ackLossTriggers?: boolean } = {}): { halted: boolean; mode: AutoMode; lossTriggersAcked?: boolean } {
     if (opts.clearHalt) executionCoordinator.clearHalt();
     if (opts.clearDailyLossLatch) riskEngine.clearDailyLossLatch();
-    return { halted: executionCoordinator.getHaltReason() !== null, mode: this.mode };
+    let lossTriggersAcked: boolean | undefined;
+    if (opts.ackLossTriggers) {
+      const ts = Date.now();
+      lossTriggersAcked = workstationDb.setSetting(SETTING_LOSS_ACK, { ts });
+      const reason = lossTriggersAcked
+        ? 'operator acknowledged the loss triggers (NEGATIVE_EXPECTANCY, LOSS_STREAK): auto trades closed before now no longer count'
+        : 'operator acknowledgement of the loss triggers could not be saved; nothing changed';
+      workstationDb.logDecision({ ts, autoMode: this.mode, mint: '-', stage: 'risk', outcome: 'INFO', reason });
+    }
+    return { halted: executionCoordinator.getHaltReason() !== null, mode: this.mode, ...(lossTriggersAcked !== undefined ? { lossTriggersAcked } : {}) };
   }
 
   private watchListener: ((r: WatchResult) => void) | null = null;
@@ -849,8 +930,15 @@ export class AutoSnipeController extends EventEmitter {
       const dropped = this.dropDevnetLiveIfUnarmed();
       if (dropped) return rec('REJECTED', 'mode', `DEVNET_LIVE auto refused and turned OFF: ${dropped}`, { mode: 'DEVNET_LIVE' });
     }
-    if (mode === 'DEVNET_LIVE' && open.filter((p) => !isRecoveredPosition(p)).length >= DEVNET_MAX_OPEN_POSITIONS) { // R3: adopted dust does not take the slot
-      return rec('DROPPED', 'budget', `DEVNET_MAX_OPEN_POSITIONS (${DEVNET_MAX_OPEN_POSITIONS}) reached`);
+    if (mode === 'DEVNET_LIVE') {
+      // 3B (P3.2, R1-35, R1-47): the slot is real SOL, so only LIVE positions count (an ACTIVE PAPER row no longer blocks it), and not adopted
+      // dust (R3). A LIVE buy that was sent and is unresolved (UNCONFIRMED, or landed with an unread fill) counts too: it can land any moment.
+      const unresolved = executionCoordinator.getUnresolvedLiveBuys({ includeOwnInFlight: true });
+      if (unresolved === null) return rec('DROPPED', 'budget', 'DEVNET_MAX_OPEN_POSITIONS: the unresolved LIVE buys could not be read, so the open count is unknown');
+      const liveOpen = open.filter((p) => p.executionMode === 'LIVE' && !isRecoveredPosition(p)).length;
+      if (liveOpen + unresolved.mints.length >= DEVNET_MAX_OPEN_POSITIONS) {
+        return rec('DROPPED', 'budget', `DEVNET_MAX_OPEN_POSITIONS (${DEVNET_MAX_OPEN_POSITIONS}) reached: ${liveOpen} open LIVE position(s), ${unresolved.mints.length} unresolved LIVE buy(s)`);
+      }
     }
     if (downgraded) {
       // already moved to SHADOW by enforceBudgets; carry on as a shadow run
@@ -860,6 +948,7 @@ export class AutoSnipeController extends EventEmitter {
     // and then noticed on the next candidate.
     // DEVNET_LIVE only: the cap is a real-SOL cap (0.02), a paper $5 order (~0.033 SOL) would never fit it.
     if (this.session && mode === 'DEVNET_LIVE') {
+      this.settleUnresolvedSpend();
       const plannedSol = this.orderSol();
       if (this.session.spentSol + plannedSol > this.session.budgets.maxSpendSol) {
         return rec('REJECTED', 'budget', `would exceed the session spend limit (${this.session.spentSol.toFixed(4)} + ${plannedSol.toFixed(4)} > ${this.session.budgets.maxSpendSol} SOL)`);
@@ -874,6 +963,7 @@ export class AutoSnipeController extends EventEmitter {
     // belong to the mode and the session it started in.
     const startMode = this.mode;
     const startSession = this.session;
+    const startTs = Date.now();
     let retryable = false;
     try {
       const shadow = startMode === 'SHADOW';
@@ -911,8 +1001,12 @@ export class AutoSnipeController extends EventEmitter {
       if (!res.success) {
         // R6: a buy that was sent and may have landed (unconfirmed, or landed with an unreadable fill) spent real SOL the cap must count.
         if (startSession && !shadow && /^(UNCONFIRMED|RECONCILIATION FAILED)/.test(res.message)) {
-          startSession.spentSol += startOrderSol;
-          workstationDb.logDecision({ autoMode: startMode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'budget', outcome: 'INFO', reason: `counted ${startOrderSol} SOL against the session cap: the buy was sent and may have landed`, inputs: watchInputs });
+          // 3B (R1-127): counted at its worst case (slippage headroom, token-account and first-buy accumulator rent) until orphan recovery
+          // journals what it really took; settleUnresolvedSpend then swaps in that figure.
+          const countedSol = startOrderSol * (1 + (params.slippagePct ?? 0) / 100) + (CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS + PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS) / 1e9;
+          startSession.spentSol += countedSol;
+          if (startMode === 'DEVNET_LIVE') this.unsettledBuys.push({ session: startSession, mint: c.mint, sinceTs: startTs, countedSol });
+          workstationDb.logDecision({ autoMode: startMode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'budget', outcome: 'INFO', reason: `counted ${countedSol.toFixed(6)} SOL against the session cap: the buy was sent and may have landed`, inputs: watchInputs });
         }
         retryable = RETRYABLE_REJECTION.test(res.message || '');
         return rec('REJECTED', classifyRejection(res.message), res.message, { mode: startMode, inputs: { confluenceScore: res.confluenceScore, dryRun: shadow, retryable } });
@@ -920,7 +1014,12 @@ export class AutoSnipeController extends EventEmitter {
       if (shadow) return rec('WOULD_BUY', 'fill', res.message, { mode: startMode, amountSol: res.amountSol, inputs: { dryRun: true, confluenceScore: res.confluenceScore, gates: res.gates } });
       if (startSession) {
         startSession.buys += 1;
-        startSession.spentSol += (res.amountSol ?? 0) + (res.feesPaidLamports ?? 0) / 1e9;
+        // 3B (R1-127): a DEVNET_LIVE buy counts what it took from the wallet (its LIVE_BUY_FILLED row: curve spend, tip, fees and the
+        // token-account and accumulator rent). Without that row (the position was not saved; recovery journals it later) the order, fees
+        // and both rents are counted, which is never less than the buy took.
+        const journaled = startMode === 'DEVNET_LIVE' ? this.journaledBuySpendSol(c.mint, startTs, res.positionId) : null;
+        startSession.spentSol += journaled ?? (res.amountSol ?? 0) + (res.feesPaidLamports ?? 0) / 1e9
+          + (startMode === 'DEVNET_LIVE' ? (CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS + PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS) / 1e9 : 0);
         if (res.positionId) startSession.positionIds.push(res.positionId);
       }
       const feesSol = (res.feesPaidLamports ?? 0) / 1e9;
@@ -946,6 +1045,34 @@ export class AutoSnipeController extends EventEmitter {
       settle();
       this.scheduleReleaseDrain();
     }
+  }
+
+  /** 3B: auto buys counted at their worst case because they returned unresolved; settled once orphan recovery journals the real spend. */
+  private unsettledBuys: Array<{ session: AutoSession; mint: string; sinceTs: number; countedSol: number }> = [];
+
+  /** 3B: SOL the LIVE buy of `mint` took from the wallet, from its LIVE_BUY_FILLED row journaled at or after `sinceTs`. null without one. */
+  private journaledBuySpendSol(mint: string, sinceTs: number, positionId?: string): number | null {
+    try {
+      const rows = workstationDb.loadDecisions({ mint, outcome: LIVE_BUY_FILLED, sinceTs, limit: 20 })
+        .filter((r) => r.solDelta !== null && (positionId === undefined || r.positionId === positionId));
+      return rows.length > 0 ? -(rows[0].solDelta as number) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 3B (R1-127): swap the worst-case figure of an auto buy that returned unresolved for what it really took, once orphan recovery has adopted
+   * it and journaled LIVE_BUY_FILLED. A buy that never lands keeps its worst-case figure for the session (the cap errs high, never low).
+   */
+  private settleUnresolvedSpend(): void {
+    this.unsettledBuys = this.unsettledBuys.filter((u) => {
+      if (u.session !== this.session) return false; // a later session starts from 0
+      const spent = this.journaledBuySpendSol(u.mint, u.sinceTs);
+      if (spent === null) return true;
+      u.session.spentSol += spent - u.countedSol;
+      return false;
+    });
   }
 
   private queueRelease(c: AutoCandidate, notBefore = 0): boolean {

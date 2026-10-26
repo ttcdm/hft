@@ -152,7 +152,7 @@ export class TradeReconciler {
       // says nothing about the balance. In LIVE (the buy path) it throws: a 0 taken for a wallet that already holds the token would make the
       // landed check read the old balance as this buy's fill. A sell (called without 'LIVE') keeps 0, so a stop-loss is never blocked on it;
       // its fill comes from the transaction's own token balances, and a 0 baseline can only make its landed check say "not landed".
-      // S260/S259: only "could not find account" is an absent account; any other "Invalid param" says nothing about the balance.
+      // S260/S259: "could not find account" is an absent account; any other "Invalid param" (except S269's below) says nothing about the balance.
       // S269 (devnet run 12): "not a Token account" is a definite 0 too. The address this buy's landed check reads holds no token account,
       // which is what an ATA closed by an earlier 100% sell reads as on devnet; refusing it blocked every re-buy of a mint after a close.
       if (executionMode === 'LIVE' && !/could not find account|not a Token account/i.test(String(e?.message ?? e))) {

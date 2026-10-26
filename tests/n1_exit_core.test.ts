@@ -128,6 +128,7 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
       workstationDb.savePosition({ ...p, status: 'CLOSED', tokenQuantityRaw: '0', costBasisLamports: 0, currentValueSol: 0, currentPriceSol: p.entryPriceSol, realizedPnLSol: 0 } as any);
     }
     vi.spyOn(workstationDb, 'getDailyTotalPnLSol').mockReturnValue(0); // the N1/N3 cases above leave losses in the shared day total
+    vi.spyOn(workstationDb, 'loadMintExits').mockReturnValue({ lastExit: null, loss: null }); // 3F: earlier cases in this file close this mint at a loss, which would refuse the re-entry
     (coordinator as any).executionMode = 'LIVE';
     (coordinator as any).isLiveTradingArmed = true;
     const res = await coordinator.executeTrade({
@@ -372,6 +373,7 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
       (coordinator as any).isLiveTradingArmed = true;
       vi.spyOn(workstationDb, 'getDailyTotalPnLSol').mockReturnValue(0);
       vi.spyOn(workstationDb, 'hasUnresolvedLiveBuy').mockReturnValue(false); // the N2 case above leaves an unresolved buy of this mint
+      vi.spyOn(workstationDb, 'loadMintExits').mockReturnValue({ lastExit: null, loss: null }); // 3F: earlier cases in this file close this mint at a loss, which would refuse the re-entry
       (riskEngine as any).lastTradeFailureTimestamp = 0;
       (riskEngine as any).mintLastTradedMap?.clear?.();
     };
@@ -562,6 +564,7 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
     (coordinator as any).executionMode = 'LIVE';
     (coordinator as any).isLiveTradingArmed = true;
     vi.spyOn(workstationDb, 'hasUnresolvedLiveBuy').mockReturnValue(false); // the N2 case above leaves an unresolved buy of this mint
+    vi.spyOn(workstationDb, 'loadMintExits').mockReturnValue({ lastExit: null, loss: null }); // 3F: earlier cases in this file close this mint at a loss, which would refuse the re-entry
     const sig = `n11_${uid()}`;
     submit.mockResolvedValue({ success: true, signature: sig, transport: 'SOLANA_RPC', slot: 9, lifecycleState: 'CONFIRMED' });
     vi.spyOn(TradeReconciler, 'reconcileBuyTransaction').mockResolvedValue({
@@ -593,6 +596,7 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
     vi.spyOn(workstationDb, 'hasUnresolvedLiveBuy').mockReturnValue(false);
     (riskEngine as any).lastTradeFailureTimestamp = 0;
     (riskEngine as any).mintLastTradedMap.clear(); // the N11 case above bought this mint
+    vi.spyOn(workstationDb, 'loadMintExits').mockReturnValue({ lastExit: null, loss: null }); // 3F: earlier cases in this file close this mint at a loss, which would refuse the re-entry
     (coordinator as any).realWalletBalanceSol = 1;
     (coordinator as any).executionMode = 'LIVE';
     (coordinator as any).isLiveTradingArmed = true;

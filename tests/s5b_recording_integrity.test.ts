@@ -7,6 +7,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { Keypair } from '@solana/web3.js';
 import { LaunchRecorder } from '../server/backtest/launchRecorder';
 import { WorkstationDatabase } from '../server/db/database';
+import { WatchWindow } from '../server/signals/watchWindow';
+import { tradeFromJson } from '../server/backtest/replay';
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -92,5 +94,56 @@ describe('5B: every recorded launch says when and why its recording ended (R1-10
     expect(r.ends()).toEqual([expect.objectContaining({ mint: quiet, reason: 'WINDOW', ts: t0 + 10 * 60_000 })]);
     // the busy launch is still inside its window: no END row, so a reader sees it as unresolved
     expect(r.ends().some((e) => e.mint === busy)).toBe(false);
+  });
+});
+
+/** The launch's funder-collapsed buyer count, from what is recorded now: the REAL WatchWindow fed the recorded funder facts and trades. */
+function collapsedBuyers(db: WorkstationDatabase, mint: string): number {
+  const { launches, funders } = db.loadLaunchRecording();
+  const l = launches.find((x) => x.mint === mint)!;
+  const create = l.events.find((e) => e.kind === 'CREATE')!;
+  const trades = l.events.filter((e) => e.kind === 'TRADE');
+  const ww = new WatchWindow({ publicFunders: [] });
+  ww.watch(mint, create.payload.creator, create.ts, [create.payload.user]);
+  for (const f of funders) { if (f.funder) ww.setFunder(f.wallet, f.funder, f.ts); else ww.setNoFunder(f.wallet); }
+  for (const t of trades) ww.onTrade(tradeFromJson(t.payload), t.ts);
+  return ww.evaluate(mint, trades[trades.length - 1].ts)!.metrics.uniqueBuyers;
+}
+
+describe('5B: pruning keeps the funder facts surviving launches need (R1-92)', () => {
+  /** Two launches bought by the same four wallets, all funded by one funder. The window learns the funders during the first launch only. */
+  function twoLaunches(firstAt: number, secondAt: number) {
+    const s = scratchDb();
+    let now = firstAt;
+    const win: any = Object.assign(new EventEmitter(), { isWatching: () => true });
+    const rec = new LaunchRecorder(s.db, win, () => 150, () => now, { mintMs: 30 * 60_000, maxTradesPerMint: 2_000, retentionDays: 14, maxRows: 1_000_000 });
+    vi.spyOn(s.db, 'pruneLaunchRecording').mockReturnValue(0); // the recorder's own hourly prune is driven by hand below
+    const buyers = Array.from({ length: 4 }, wallet); const funder = wallet();
+    const first = wallet(); const second = wallet();
+    rec.onCreate(createEvent(first) as any);
+    buyers.forEach((b, i) => { now = firstAt + 1000 * (i + 1); rec.onTrade({ ...trade(first, i), user: b } as any); rec.onFunder({ wallet: b, funder }); });
+    now = secondAt;
+    rec.onCreate(createEvent(second) as any);
+    buyers.forEach((b, i) => { now = secondAt + 1000 * (i + 1); rec.onTrade({ ...trade(second, 10 + i), user: b } as any); });
+    vi.mocked(s.db.pruneLaunchRecording).mockRestore();
+    return { ...s, first, second };
+  }
+
+  it('pruning the first launch by the row limit leaves the second launch\'s funder-collapsed buyer count unchanged', () => {
+    const r = twoLaunches(t0, t0 + 3_600_000);
+    expect(collapsedBuyers(r.db, r.second)).toBe(1);
+    // the first launch has 6 launch rows (CREATE, 4 TRADE, its END/WINDOW), the second 5, plus 4 FUNDER rows; a limit of 5 launch rows drops the first launch
+    expect(r.db.pruneLaunchRecording(14, 5, t0 + 3_700_000)).toBe(6);
+    expect(r.rows(`SELECT COUNT(*) AS n FROM launch_recording WHERE mint = ?`, r.first)[0].n).toBe(0);
+    expect(r.rows(`SELECT COUNT(*) AS n FROM launch_recording WHERE kind = 'FUNDER'`)[0].n).toBe(4);
+    expect(collapsedBuyers(r.db, r.second)).toBe(1);
+  });
+
+  it('pruning the first launch by age keeps its funder facts too', () => {
+    const now = t0 + 20 * 86_400_000;
+    const r = twoLaunches(t0, now - 3_600_000);
+    expect(r.db.pruneLaunchRecording(14, 1_000_000, now)).toBe(6);
+    expect(r.rows(`SELECT COUNT(*) AS n FROM launch_recording WHERE kind = 'FUNDER'`)[0].n).toBe(4);
+    expect(collapsedBuyers(r.db, r.second)).toBe(1);
   });
 });

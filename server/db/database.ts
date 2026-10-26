@@ -789,12 +789,17 @@ export class WorkstationDatabase {
     }
   }
 
-  /** Keep the recording bounded: rows older than `retentionDays`, then the oldest rows beyond `maxRows`. Returns rows deleted. */
+  /**
+   * Keep the recording bounded: launch rows older than `retentionDays`, then the oldest launch rows beyond `maxRows`. Returns rows deleted.
+   * 5B (R1-92): FUNDER rows are never pruned and do not count against `maxRows`. A wallet's funder fact is written only the first time the
+   * window learns it, so a later launch that wallet buys relies on the old row; dropping it with the old launch made the survivors' buyers
+   * look independent (optimistic). Their number is reported apart in getLaunchRecordingStatus so their growth is visible.
+   */
   public pruneLaunchRecording(retentionDays: number, maxRows: number, now: number = Date.now()): number {
     try {
-      let n = Number((this.db.prepare('DELETE FROM launch_recording WHERE ts < ?').run(now - retentionDays * 86_400_000) as any).changes ?? 0);
-      const total = Number((this.db.prepare('SELECT COUNT(*) AS n FROM launch_recording').get() as any).n);
-      if (total > maxRows) n += Number((this.db.prepare('DELETE FROM launch_recording WHERE id IN (SELECT id FROM launch_recording ORDER BY id ASC LIMIT ?)').run(total - maxRows) as any).changes ?? 0);
+      let n = Number((this.db.prepare(`DELETE FROM launch_recording WHERE ts < ? AND kind <> 'FUNDER'`).run(now - retentionDays * 86_400_000) as any).changes ?? 0);
+      const total = Number((this.db.prepare(`SELECT COUNT(*) AS n FROM launch_recording WHERE kind <> 'FUNDER'`).get() as any).n);
+      if (total > maxRows) n += Number((this.db.prepare(`DELETE FROM launch_recording WHERE id IN (SELECT id FROM launch_recording WHERE kind <> 'FUNDER' ORDER BY id ASC LIMIT ?)`).run(total - maxRows) as any).changes ?? 0);
       return n;
     } catch {
       return 0;

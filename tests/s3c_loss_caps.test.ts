@@ -2,17 +2,18 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { Keypair } from '@solana/web3.js';
 import { ExecutionConfigManager, executionConfig } from '../server/solana/executionConfig';
 import { HardenedRiskEngine, RiskEvaluationRequest, riskEngine } from '../server/risk/riskEngine';
-import { solPriceService } from '../server/market/solPriceService';
+import { SolPriceService, solPriceService } from '../server/market/solPriceService';
 import { workstationDb } from '../server/db/database';
 import { autoSnipeController } from '../server/auto/controller';
 import { AutoResumeSchema } from '../server/execution/tradeInputs';
 
 /**
  * 3C (P3.3: R1-8, R1-36, N-61..N-65, N-69): loss caps that cannot be switched off or outrun. Real ExecutionConfigManager,
- * HardenedRiskEngine and the in-memory workstationDb. vi.setSystemTime is the clock.
+ * HardenedRiskEngine, SolPriceService and the in-memory workstationDb; fetch is the only double. vi.setSystemTime is the clock.
  * Each test runs on its own calendar day, so realized events of one never fall in another's 24 h window.
  */
 const mint = () => Keypair.generate().publicKey.toBase58();
+const json = (b: unknown) => new Response(JSON.stringify(b), { status: 200 });
 
 const order = (over: Partial<RiskEvaluationRequest> = {}): RiskEvaluationRequest => ({
   mint: mint(), orderSizeSol: 0.005, expectedPriceSol: 0.00001, slippageBps: 300, estimatedFeeLamports: 5_000, jitoTipLamports: 150_000,
@@ -175,6 +176,47 @@ describe('3C N-62: the order and the open positions must fit above the floor at 
     } finally {
       workstationDb.savePosition({ ...open, status: 'CLOSED', tokenQuantityRaw: '0' });
     }
+  });
+});
+
+describe('3C N-64: a new SOL price needs two sources that agree', () => {
+  const stub = (prices: { coinbase?: number; coingecko?: number; binance?: number }) =>
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (u: any) => {
+      const url = String(u);
+      if (url.includes('coinbase')) return prices.coinbase === undefined ? new Response('', { status: 503 }) : json({ data: { amount: String(prices.coinbase) } });
+      if (url.includes('coingecko')) return prices.coingecko === undefined ? new Response('', { status: 503 }) : json({ solana: { usd: prices.coingecko } });
+      return prices.binance === undefined ? new Response('', { status: 503 }) : json({ price: String(prices.binance) });
+    });
+
+  it('fresh service, Coinbase 15 and the others 150: 15 is not taken, 150 is, and the disagreement is reported', async () => {
+    stub({ coinbase: 15, coingecko: 150, binance: 150 });
+    const r = await new SolPriceService().refresh();
+    expect(r.usd).toBe(150);
+    expect(r.source).toBe('COINGECKO+BINANCE');
+    expect(r.disagreement).toContain('COINBASE 15');
+  });
+
+  it('a fresh anchor of 70 and every source at 150: 150 replaces the anchor at once', async () => {
+    stub({ coinbase: 150, coingecko: 150, binance: 150 });
+    const s = new SolPriceService();
+    s.setPrice(70, 'TEST');
+    expect((await s.refresh()).usd).toBe(150);
+  });
+
+  it('one source alone on a fresh service sets no price', async () => {
+    stub({ coinbase: 150 });
+    const r = await new SolPriceService().refresh();
+    expect(r.usd).toBeNull();
+    expect(r.disagreement).toMatch(/no two sources agree/);
+  });
+
+  it('with a fresh anchor one source inside the band is enough (one request)', async () => {
+    const spy = stub({ coinbase: 152 });
+    const s = new SolPriceService();
+    s.setPrice(150, 'TEST');
+    const r = await s.refresh();
+    expect(r).toMatchObject({ usd: 152, source: 'COINBASE' });
+    expect(spy).toHaveBeenCalledTimes(1);
   });
 });
 

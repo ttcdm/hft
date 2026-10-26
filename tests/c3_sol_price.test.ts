@@ -32,19 +32,25 @@ describe('C3: single SOL/USD price service', () => {
 
   it('refresh cascades Coinbase -> CoinGecko -> Binance (Binance last: it refuses US IPs) and rejects non-positive or junk values', async () => {
     const calls: string[] = [];
+    let binance = '0';
     vi.spyOn(globalThis, 'fetch').mockImplementation(async (u: any) => {
       const url = String(u);
       calls.push(url);
-      if (url.includes('binance')) return json({ price: '0' });
+      if (url.includes('binance')) return json({ price: binance });
       if (url.includes('coinbase')) return json({ data: { amount: 'abc' } });
       return json({ solana: { usd: 171.5 } });
     });
     const s = new SolPriceService();
+    // 3C: a first price needs two sources; with Coinbase junk and Binance 0, CoinGecko alone sets nothing
+    expect((await s.refresh()).usd).toBeNull();
+    expect(calls.map((c) => new URL(c).hostname)).toEqual(['api.coinbase.com', 'api.coingecko.com', 'api.binance.com']);
+    binance = '171.9';
     const r = await s.refresh();
-    expect(r.usd).toBe(171.5);
-    expect(r.source).toBe('COINGECKO');
-    expect(calls).toHaveLength(2);
-    expect(calls[0]).toContain('coinbase');
+    expect(r.usd).toBeCloseTo(171.7, 9);
+    expect(r.source).toBe('COINGECKO+BINANCE');
+    // once anchored, the first good source in order is enough: Coinbase is junk, CoinGecko answers, Binance is not asked
+    calls.length = 0;
+    expect((await s.refresh()).source).toBe('COINGECKO');
     expect(calls.some((c) => c.includes('binance'))).toBe(false);
   });
 
@@ -56,10 +62,11 @@ describe('C3: single SOL/USD price service', () => {
   });
 
   it('concurrent refreshes share one request set', async () => {
-    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async () => json({ data: { amount: '160' } }));
+    const spy = vi.spyOn(globalThis, 'fetch').mockImplementation(async (u: any) =>
+      String(u).includes('coingecko') ? json({ solana: { usd: 160 } }) : json({ data: { amount: '160' } }));
     const s = new SolPriceService();
     await Promise.all([s.refresh(), s.refresh(), s.refresh()]);
-    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledTimes(2); // one set: Coinbase and CoinGecko agree on the first price (3C)
   });
 
   it('a stale or missing price rejects a LIVE snipe (fail closed) and a missing one rejects a PAPER snipe', async () => {

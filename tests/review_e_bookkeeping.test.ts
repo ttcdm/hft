@@ -264,7 +264,8 @@ describe('Review E: wallet balance reads that close a position (S259, S260)', ()
   });
 
   it('S260: the LIVE buy baseline throws on an "Invalid param" other than a missing account', async () => {
-    const c = { getBalance: async () => 1e9, getTokenAccountBalance: async () => { throw new Error('failed to get token account balance: Invalid param: not a Token account'); } } as any;
+    // S269: "not a Token account" is now a definite 0 (an ATA closed by an earlier sell reads so on devnet); another Invalid param still throws
+    const c = { getBalance: async () => 1e9, getTokenAccountBalance: async () => { throw new Error('failed to get token account balance: Invalid param: Token mint could not be unpacked'); } } as any;
     await expect(TradeReconciler.capturePreTradeSnapshot(c, wallet, VALID_PUMP_MINT_1, TOKEN_PROGRAM_ID, 'LIVE')).rejects.toThrow(/PRE_TRADE_SNAPSHOT_FAILED/);
   });
 });

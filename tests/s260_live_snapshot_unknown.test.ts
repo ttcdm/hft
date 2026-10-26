@@ -32,4 +32,9 @@ describe('S260: an unreadable token balance is unknown, not 0, for a LIVE buy', 
     const s = await TradeReconciler.capturePreTradeSnapshot(conn('fetch failed'), wallet, mint, TOKEN_PROGRAM_ID);
     expect(s.tokenBalanceRaw).toBe('0');
   });
+
+  it('S269: LIVE, an address that holds no token account ("not a Token account", an ATA closed by an earlier sell) is a balance of 0', async () => {
+    const s = await TradeReconciler.capturePreTradeSnapshot(conn('failed to get token account balance: Invalid param: not a Token account'), wallet, mint, TOKEN_PROGRAM_ID, 'LIVE');
+    expect(s.tokenBalanceRaw).toBe('0');
+  });
 });

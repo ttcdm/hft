@@ -849,8 +849,15 @@ export class AutoSnipeController extends EventEmitter {
       const dropped = this.dropDevnetLiveIfUnarmed();
       if (dropped) return rec('REJECTED', 'mode', `DEVNET_LIVE auto refused and turned OFF: ${dropped}`, { mode: 'DEVNET_LIVE' });
     }
-    if (mode === 'DEVNET_LIVE' && open.filter((p) => !isRecoveredPosition(p)).length >= DEVNET_MAX_OPEN_POSITIONS) { // R3: adopted dust does not take the slot
-      return rec('DROPPED', 'budget', `DEVNET_MAX_OPEN_POSITIONS (${DEVNET_MAX_OPEN_POSITIONS}) reached`);
+    if (mode === 'DEVNET_LIVE') {
+      // 3B (P3.2, R1-35, R1-47): the slot is real SOL, so only LIVE positions count (an ACTIVE PAPER row no longer blocks it), and not adopted
+      // dust (R3). A LIVE buy that was sent and is unresolved (UNCONFIRMED, or landed with an unread fill) counts too: it can land any moment.
+      const unresolved = executionCoordinator.getUnresolvedLiveBuys({ includeOwnInFlight: true });
+      if (unresolved === null) return rec('DROPPED', 'budget', 'DEVNET_MAX_OPEN_POSITIONS: the unresolved LIVE buys could not be read, so the open count is unknown');
+      const liveOpen = open.filter((p) => p.executionMode === 'LIVE' && !isRecoveredPosition(p)).length;
+      if (liveOpen + unresolved.mints.length >= DEVNET_MAX_OPEN_POSITIONS) {
+        return rec('DROPPED', 'budget', `DEVNET_MAX_OPEN_POSITIONS (${DEVNET_MAX_OPEN_POSITIONS}) reached: ${liveOpen} open LIVE position(s), ${unresolved.mints.length} unresolved LIVE buy(s)`);
+      }
     }
     if (downgraded) {
       // already moved to SHADOW by enforceBudgets; carry on as a shadow run

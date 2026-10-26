@@ -206,6 +206,17 @@ describe('3B: unresolved LIVE buys count everywhere; the wallet audit knows them
     expect(send).toHaveBeenCalledTimes(1);
   });
 
+  it('R1-4, R1-47: an unresolved LIVE buy takes the DEVNET_LIVE slot: the controller drops the next candidate with DEVNET_MAX_OPEN_POSITIONS', async () => {
+    plantUnresolved(Keypair.generate().publicKey.toBase58(), 6_000_000, 'PENDING'); // another process's buy, still waiting for its confirmation
+    await armAuto();
+    const snipe = vi.spyOn(memecoinAggregator, 'executeSnipe');
+    const { mint } = newPumpPool('HOT');
+    const d = await autoSnipeController.submitCandidate({ mint, symbol: 'B', source: 'TEST' as any, amountUsd: 0.7, provenance: 'REAL_ONCHAIN' });
+    expect(d.outcome).toBe('DROPPED');
+    expect(d.reason).toMatch(/^DEVNET_MAX_OPEN_POSITIONS \(1\) reached: 0 open LIVE position\(s\), 1 unresolved LIVE buy\(s\)/);
+    expect(snipe).not.toHaveBeenCalled();
+  });
+
   it('R1-4: unresolved buys hold their worst-case SOL in the reserve check (INSUFFICIENT_FUNDS_CONCURRENCY)', async () => {
     // the wallet holds 1 SOL; an unresolved buy that may still take up to 0.98 SOL leaves too little for a 0.005 order plus the reserve
     plantUnresolved(Keypair.generate().publicKey.toBase58(), 980_000_000);
@@ -226,5 +237,21 @@ describe('3B: unresolved LIVE buys count everywhere; the wallet audit knows them
     expect(res.lifecycleState).toBe('RISK_REJECTED');
     expect(res.error).toMatch(/^UNRESOLVED_BUY: the ledger of unresolved LIVE buys could not be read/);
     expect(build).not.toHaveBeenCalled();
+  });
+
+  it('R1-35: one ACTIVE PAPER position does not take the DEVNET_LIVE slot', async () => {
+    await armAuto();
+    const id = `s3b_paper_${Math.random().toString(36).slice(2)}`;
+    workstationDb.savePosition({
+      id, mint: Keypair.generate().publicKey.toBase58(), symbol: 'P', name: 'P', tokenDecimals: 6, tokenQuantityRaw: '1', entryPriceSol: 1, currentPriceSol: 1,
+      currentValueSol: 0.03, costBasisLamports: 30_000_000, realizedPnLSol: 0, status: 'OPEN', venue: 'PUMP_BONDING_CURVE', executionMode: 'PAPER',
+      entryTxSignature: `PAPER:${id}`, entryTimestamp: Date.now(), recordUpdatedAt: Date.now(), updatedAt: Date.now(),
+    } as any);
+    const snipe = vi.spyOn(memecoinAggregator, 'executeSnipe').mockResolvedValue({ success: true, message: 'ok', txHash: 't', amountSol: AUTO_DEVNET_ORDER_SOL, positionId: 'dv-s3b', feesPaidLamports: 0 });
+    const { mint } = newPumpPool('HOT');
+    const d = await autoSnipeController.submitCandidate({ mint, symbol: 'L', source: 'TEST' as any, amountUsd: 0.7, provenance: 'REAL_ONCHAIN' });
+    expect(d.reason).not.toMatch(/DEVNET_MAX_OPEN_POSITIONS/);
+    expect(d.outcome, d.reason).toBe('BOUGHT');
+    expect(snipe).toHaveBeenCalledTimes(1);
   });
 });

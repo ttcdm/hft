@@ -11,8 +11,8 @@ import { checkSnipeAmountSol, SNIPE_AMOUNT_MIN_SOL } from '../execution/snipeAmo
 import { allowedCluster, assertClusterAllowed } from '../solana/clusterGuard';
 import { Logger } from '../middleware/enterprise';
 import type { SignalProvenance } from '../core/types';
-import { computeJournalStats, type JournalStats } from './journalStats';
-import { evaluateKillTriggers, auditWalletChange, type KillTrigger } from './killSwitch';
+import { computeJournalStats, autoEvidencePnl, type JournalStats } from './journalStats';
+import { evaluateKillTriggers, auditWalletChange, EXPECTANCY_WINDOW, MAX_CONSECUTIVE_LOSSES, type KillTrigger } from './killSwitch';
 import { riskEngine, PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS } from '../risk/riskEngine';
 import { watchWindow, readyGate, type WatchResult, type WatchVerdict } from '../signals/watchWindow';
 import { checkConfluenceThreshold, getConfluenceThreshold, setConfluenceThreshold, confluenceThresholdInfo, CONFLUENCE_DEVNET_LIVE_FLOOR, type ConfluenceThresholdInfo } from '../signals/confluenceThreshold';
@@ -162,6 +162,12 @@ const SETTING_THRESHOLD = 'auto.confluenceThreshold';
 const SETTING_MODE = 'auto.mode';
 /** 3E: the last kill, `{ reason, ts }`, or null once an operator has set a trading mode again. Read back by `restorePersisted`. */
 const SETTING_KILL = 'auto.kill';
+/** 3E: `{ ts }` of the operator's last acknowledgement of the loss triggers; trades closed at or before it no longer count. */
+const SETTING_LOSS_ACK = 'auto.lossTriggerAck';
+/** 3E: how many of the latest auto-owned closed trades the expectancy and loss-streak triggers look at, across sessions. */
+export const LOSS_TRIGGER_TRADES = Math.max(EXPECTANCY_WINDOW, MAX_CONSECUTIVE_LOSSES);
+/** 3E: the triggers that judge trade results, and so need an operator acknowledgement before auto may buy again. */
+const LOSS_TRIGGER_CODES = new Set(['NEGATIVE_EXPECTANCY', 'LOSS_STREAK']);
 /** S189: how long readiness must stay green before a PAPER session downgraded by READINESS_RED is put back. */
 export const READINESS_RESTORE_GREEN_MS = 60_000;
 
@@ -513,6 +519,14 @@ export class AutoSnipeController extends EventEmitter {
         return { ok: false, mode: this.mode, error: `cluster check failed: ${e.message}` };
       }
     }
+    if (next === 'PAPER' || next === 'DEVNET_LIVE') {
+      // 3E: the expectancy and streak triggers read the last auto trades across sessions, so a session the triggers stopped cannot simply be
+      // started again: the operator looks at the losses and acknowledges them first, and the count starts afresh from then.
+      const pending = this.pendingLossTriggers(next === 'DEVNET_LIVE' ? 'LIVE' : 'PAPER');
+      if (pending.length > 0) {
+        return { ok: false, mode: this.mode, error: `LOSS_TRIGGERS_NEED_ACK: ${pending.map((h) => `${h.code} (${h.message})`).join('; ')}, over the last auto trades across sessions. Check them, then acknowledge with POST /api/auto/resume {ackLossTriggers:true}; trades closed before that no longer count.` };
+      }
+    }
     this.killed = false;
     this.killReason = null;
     workstationDb.setSetting(SETTING_KILL, null); // 3E: an operator setting a mode again is what clears a kill, here and after a restart
@@ -601,7 +615,7 @@ export class AutoSnipeController extends EventEmitter {
 
     const ctx = {
       mode: this.mode,
-      closedNetPnlSol: this.sessionEvidencePnl(execMode),
+      closedNetPnlSol: this.lossEvidencePnl(execMode),
       dailyTotalPnlSol: riskEngine.getDailyTotalPnLSol(execMode),
       maxDailyLossSol: riskEngine.effectiveMaxDailyLossSol(),
       slippageBreaches: this.slippageBreaches,
@@ -720,24 +734,49 @@ export class AutoSnipeController extends EventEmitter {
   }
 
   /**
-   * Q30: the trades the expectancy and loss-streak triggers judge. Only positions the auto trader opened (this session's, or recorded as
-   * BOUGHT in the journal) that closed since this session started, in this execution mode. Before, every closed trade of every mode and
-   * every origin counted, so the old losses that tripped a trigger re-tripped it within seconds of the operator turning auto back on.
+   * 3E (R1-44, R1-124): the trades the expectancy and loss-streak triggers judge: the last LOSS_TRIGGER_TRADES closed positions the auto trader
+   * opened (this session's, or recorded as BOUGHT in the journal), in this execution mode, across sessions and restarts, that closed after the
+   * operator's last acknowledgement. Q30 limited this to the current session, so a restart or a new session wiped the evidence; the
+   * acknowledgement now does what that did (old losses stop re-tripping), but only on purpose. Positions the operator opened by hand never count.
    */
-  private sessionEvidencePnl(execMode: 'PAPER' | 'LIVE'): number[] {
-    const since = this.session?.startedAt ?? 0;
+  private lossEvidencePnl(execMode: 'PAPER' | 'LIVE'): number[] {
     const owned = new Set<string>(this.session?.positionIds ?? []);
     for (const d of workstationDb.loadDecisions({ outcome: 'BOUGHT', limit: 5000 })) if (d.positionId) owned.add(d.positionId);
-    return workstationDb.loadEvidenceClosedTrades(execMode)
-      .filter((p) => owned.has(p.id) && (p.lastUpdatedTimestamp ?? 0) >= since)
-      .map((p) => p.realizedPnLSol ?? 0);
+    return autoEvidencePnl(workstationDb.loadEvidenceClosedTrades(execMode), owned, { afterTs: this.lossTriggerAckTs(), n: LOSS_TRIGGER_TRADES });
   }
 
-  /** Clear an all-trading halt and/or the daily-loss latch (3C: separate flags). Does not turn auto trading back on. */
-  public resume(opts: { clearHalt?: boolean; clearDailyLossLatch?: boolean } = {}): { halted: boolean; mode: AutoMode } {
+  /** 3E: the last acknowledgement, or null. An unreadable or malformed value is null, so every auto trade counts (fail-closed). */
+  private lossTriggerAckTs(): number | null {
+    const ack = workstationDb.getSetting<{ ts?: unknown }>(SETTING_LOSS_ACK);
+    return ack && typeof ack === 'object' && typeof ack.ts === 'number' && Number.isFinite(ack.ts) ? ack.ts : null;
+  }
+
+  /** 3E: the loss triggers the evidence trips right now, before any session starts. */
+  private pendingLossTriggers(execMode: 'PAPER' | 'LIVE'): KillTrigger[] {
+    return evaluateKillTriggers({
+      mode: 'PAPER', closedNetPnlSol: this.lossEvidencePnl(execMode), dailyTotalPnlSol: 0, maxDailyLossSol: 0, slippageBreaches: 0,
+      readinessRed: [], walletSol: null, reserveSol: 0, maxTradeSol: 0,
+    }).filter((h) => LOSS_TRIGGER_CODES.has(h.code));
+  }
+
+  /**
+   * Clear an all-trading halt and/or the daily-loss latch (3C: separate flags). Does not turn auto trading back on.
+   * 3E: `ackLossTriggers` records the operator's acknowledgement of NEGATIVE_EXPECTANCY / LOSS_STREAK: auto trades closed until now stop
+   * counting, so a mode can be set again. `lossTriggersAcked` is false when it could not be saved (nothing changes then).
+   */
+  public resume(opts: { clearHalt?: boolean; clearDailyLossLatch?: boolean; ackLossTriggers?: boolean } = {}): { halted: boolean; mode: AutoMode; lossTriggersAcked?: boolean } {
     if (opts.clearHalt) executionCoordinator.clearHalt();
     if (opts.clearDailyLossLatch) riskEngine.clearDailyLossLatch();
-    return { halted: executionCoordinator.getHaltReason() !== null, mode: this.mode };
+    let lossTriggersAcked: boolean | undefined;
+    if (opts.ackLossTriggers) {
+      const ts = Date.now();
+      lossTriggersAcked = workstationDb.setSetting(SETTING_LOSS_ACK, { ts });
+      const reason = lossTriggersAcked
+        ? 'operator acknowledged the loss triggers (NEGATIVE_EXPECTANCY, LOSS_STREAK): auto trades closed before now no longer count'
+        : 'operator acknowledgement of the loss triggers could not be saved; nothing changed';
+      workstationDb.logDecision({ ts, autoMode: this.mode, mint: '-', stage: 'risk', outcome: 'INFO', reason });
+    }
+    return { halted: executionCoordinator.getHaltReason() !== null, mode: this.mode, ...(lossTriggersAcked !== undefined ? { lossTriggersAcked } : {}) };
   }
 
   private watchListener: ((r: WatchResult) => void) | null = null;

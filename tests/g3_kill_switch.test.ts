@@ -227,13 +227,15 @@ describe('G3: decision journal and kill switch on the real controller', () => {
     expect(exec).not.toHaveBeenCalled();
   });
 
-  it('Q30: losses the operator closed by hand, or that closed before this session, do not re-trip the trigger', async () => {
+  it('Q30 / 3E: losses the operator closed by hand, or that closed before the operator acknowledged the loss triggers, do not re-trip the trigger', async () => {
     await setAutoMode('PAPER');
     for (let i = 0; i < EXPECTANCY_WINDOW; i++) closedPaper(300 + i, lose(i), false); // not opened by auto
     expect((await autoSnipeController.checkTriggers()).map((h) => h.code)).not.toContain('NEGATIVE_EXPECTANCY');
     const before = Array.from({ length: EXPECTANCY_WINDOW }, (_, i) => closedPaper(400 + i, lose(i), false));
     (autoSnipeController as any).session.positionIds.push(...before);
-    (autoSnipeController as any).session.startedAt = Date.now() + 60_000; // a session that started after those trades closed
+    // 3E: trades from before this session count now (across sessions); only the operator's acknowledgement stops them counting
+    await new Promise((r) => setTimeout(r, 2));
+    expect(autoSnipeController.resume({ ackLossTriggers: true }).lossTriggersAcked).toBe(true);
     expect((await autoSnipeController.checkTriggers()).map((h) => h.code)).not.toContain('NEGATIVE_EXPECTANCY');
   });
 

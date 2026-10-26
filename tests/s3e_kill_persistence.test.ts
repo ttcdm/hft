@@ -9,7 +9,9 @@ import { memecoinAggregator } from '../server/memecoinAggregator';
 import { solPriceService } from '../server/market/solPriceService';
 import { setAutoMode, resetAuto, newPumpPool } from './fixtures/auto';
 import { evaluateKillTriggers, READINESS_RED_LIMIT_MS, type KillContext } from '../server/auto/killSwitch';
-import { DEVNET_CONFIRMATION_CODE } from '../server/auto/controller';
+import { DEVNET_CONFIRMATION_CODE, LOSS_TRIGGER_TRADES } from '../server/auto/controller';
+import { EXPECTANCY_WINDOW, MAX_CONSECUTIVE_LOSSES } from '../server/auto/killSwitch';
+import { autoEvidencePnl } from '../server/auto/journalStats';
 
 /**
  * 3E (R1-43, R1-118): a kill is saved before its first await, so a crash or a close that never returns cannot leave the old mode saved
@@ -54,6 +56,9 @@ afterEach(async () => {
   executionCoordinator.clearHalt();
   workstationDb.setSetting('auto.mode', null);
   workstationDb.setSetting('auto.kill', null);
+  // 3E: losing auto trades a test seeded would count in every later test; acknowledge them, and let the clock move past the acknowledgement
+  workstationDb.setSetting('auto.lossTriggerAck', { ts: Date.now() });
+  await new Promise((r) => setTimeout(r, 5));
   for (const p of workstationDb.loadPositions(undefined, 'ACTIVE')) workstationDb.savePosition({ ...p, status: 'CLOSED', tokenQuantityRaw: '0' } as any);
 });
 
@@ -183,5 +188,85 @@ describe('3E: WALLET_UNKNOWN only after the balance has been unknown for longer 
     expect(hits.map((h) => h.code)).toEqual(['WALLET_UNKNOWN']);
     expect(autoSnipeController.getMode()).toBe('SHADOW');
     expect(arm).toHaveBeenCalledWith(false);
+  });
+});
+
+/** A closed PAPER trade the auto trader bought (a BOUGHT journal row names it), as an earlier session leaves behind. */
+function seedClosedAutoTrade(pnl: number): string {
+  const id = `s3e-c-${Math.random().toString(36).slice(2, 10)}`;
+  const now = Date.now();
+  workstationDb.savePosition({
+    id, mint: Keypair.generate().publicKey.toBase58(), symbol: 'S3E', name: 'S3E', tokenDecimals: 6, tokenQuantityRaw: '0', entryPriceSol: 1,
+    currentPriceSol: 1, currentValueSol: 0, costBasisLamports: 1e6, realizedPnLSol: pnl, status: 'CLOSED', venue: 'PUMP_BONDING_CURVE',
+    executionMode: 'PAPER', entryTxSignature: id, entryTimestamp: now - 1000, recordUpdatedAt: now, updatedAt: now,
+  } as any);
+  workstationDb.logDecision({ autoMode: 'PAPER', mint: 'm', stage: 'fill', outcome: 'BOUGHT', reason: 's3e earlier session', positionId: id });
+  return id;
+}
+const lose = (i: number) => (i % 2 ? -0.00012 : -0.00008);
+
+describe('3E: NEGATIVE_EXPECTANCY and LOSS_STREAK over the last auto trades across sessions, with an operator acknowledgement', () => {
+  beforeEach(() => { healthyReadiness(); });
+
+  it('autoEvidencePnl: owned trades only, after the acknowledgement, the last n, oldest first', () => {
+    const rows = [
+      { id: 'a', realizedPnLSol: -1, lastUpdatedTimestamp: 10 },
+      { id: 'manual', realizedPnLSol: -9, lastUpdatedTimestamp: 20 },
+      { id: 'b', realizedPnLSol: -2, lastUpdatedTimestamp: 30 },
+      { id: 'c', realizedPnLSol: 3, lastUpdatedTimestamp: 40 },
+    ];
+    const owned = new Set(['a', 'b', 'c']);
+    expect(autoEvidencePnl(rows, owned, { afterTs: null, n: 20 })).toEqual([-1, -2, 3]);
+    expect(autoEvidencePnl(rows, owned, { afterTs: 10, n: 20 })).toEqual([-2, 3]); // closed at the acknowledgement: no longer counts
+    expect(autoEvidencePnl(rows, owned, { afterTs: null, n: 2 })).toEqual([-2, 3]);
+    expect(LOSS_TRIGGER_TRADES).toBe(Math.max(EXPECTANCY_WINDOW, MAX_CONSECUTIVE_LOSSES));
+  });
+
+  it('20 losing auto trades from earlier sessions give NEGATIVE_EXPECTANCY in a new session, and it drops to SHADOW', async () => {
+    await setAutoMode('PAPER');
+    for (let i = 0; i < EXPECTANCY_WINDOW; i++) seedClosedAutoTrade(lose(i) + (i === 5 ? 0.0002 : 0)); // one win: no streak of 20
+    (autoSnipeController as any).session.startedAt = Date.now() + 60_000; // the session started after those trades closed
+    const hits = await autoSnipeController.checkTriggers();
+    expect(hits.map((h) => h.code)).toContain('NEGATIVE_EXPECTANCY');
+    expect(autoSnipeController.getMode()).toBe('SHADOW');
+  });
+
+  it('a new session (also after a restart) is refused while the losses are unacknowledged; the acknowledgement lets it start, and the count starts afresh', async () => {
+    vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
+    for (let i = 0; i < MAX_CONSECUTIVE_LOSSES; i++) seedClosedAutoTrade(-0.0001);
+    const refused = await autoSnipeController.setMode('PAPER');
+    expect(refused.ok).toBe(false);
+    expect(refused.error).toMatch(/^LOSS_TRIGGERS_NEED_ACK: LOSS_STREAK/);
+    expect(refused.error).toMatch(/ackLossTriggers/);
+    expect(autoSnipeController.getMode()).toBe('OFF');
+
+    // a restart that would bring PAPER back is refused the same way
+    workstationDb.setSetting('auto.mode', 'PAPER');
+    const r = await autoSnipeController.restorePersisted();
+    expect(r.mode).toBe('OFF');
+    expect(r.note).toMatch(/LOSS_TRIGGERS_NEED_ACK/);
+
+    await new Promise((res) => setTimeout(res, 2));
+    expect(autoSnipeController.resume({ ackLossTriggers: true })).toMatchObject({ lossTriggersAcked: true });
+    expect(workstationDb.loadDecisions({ stage: 'risk', limit: 5 }).some((d) => /acknowledged the loss triggers/.test(d.reason))).toBe(true);
+    const ok = await autoSnipeController.setMode('PAPER');
+    expect(ok.ok, ok.error).toBe(true);
+    expect(await autoSnipeController.checkTriggers()).toEqual([]);
+  });
+
+  it('losing trades the operator opened by hand never count', async () => {
+    vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
+    for (let i = 0; i < EXPECTANCY_WINDOW; i++) {
+      const id = `s3e-m-${i}-${Math.random().toString(36).slice(2, 8)}`;
+      const now = Date.now();
+      workstationDb.savePosition({
+        id, mint: Keypair.generate().publicKey.toBase58(), symbol: 'M', name: 'M', tokenDecimals: 6, tokenQuantityRaw: '0', entryPriceSol: 1,
+        currentPriceSol: 1, currentValueSol: 0, costBasisLamports: 1e6, realizedPnLSol: lose(i), status: 'CLOSED', venue: 'PUMP_BONDING_CURVE',
+        executionMode: 'PAPER', entryTxSignature: id, entryTimestamp: now - 1000, recordUpdatedAt: now, updatedAt: now,
+      } as any);
+    }
+    const ok = await autoSnipeController.setMode('PAPER');
+    expect(ok.ok, ok.error).toBe(true);
+    expect(await autoSnipeController.checkTriggers()).toEqual([]);
   });
 });

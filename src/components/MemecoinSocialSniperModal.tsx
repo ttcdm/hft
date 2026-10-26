@@ -13,7 +13,7 @@
  */
 import { signalFeedBadge } from '../utils/signalBadge';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
-import { probeBadge, probeLatency, hostOfService, connectivityAuditSummary } from '../utils/probeBadge';
+import { probeBadge, probeBadgeClass, probeLatency, hostOfService, connectivityAuditSummary } from '../utils/probeBadge';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
 import { useAutoStatus, AutoModeBadge, type AutoMode } from './AutoPanel';
 import { buildPoolSnipeRequest } from '../utils/poolSnipe';
@@ -1575,21 +1575,13 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <Send className="w-3.5 h-3.5 text-blue-400" />
                         <span>Telegram Bot Gateway</span>
                       </span>
-                      <span
-                        className={`px-2 py-0.5 rounded text-[10px] ${
-                          diagnosticsResult.connections.telegram.testResult.reachable
-                            ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-                            : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
-                        }`}
-                      >
-                        {diagnosticsResult.connections.telegram.testResult.reachable ? 'REACHABLE' : 'UNREACHABLE'}
-                      </span>
+                      {(() => { const b = probeBadge(diagnosticsResult.connections.telegram.testResult, 'REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${probeBadgeClass(b)}`}>{b.text}</span>); })()}
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Endpoint: <code className="text-slate-300">https://api.telegram.org</code>
                     </div>
                     <div className="text-[11px] text-slate-300">
-                      Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.telegram.testResult.latencyMs}ms</strong> | Auth: {diagnosticsResult.connections.telegram.testResult.botAuthorized ? 'VALIDATED' : diagnosticsResult.connections.telegram.testResult.reachable ? 'NOT AUTHORIZED' : 'not checked'}
+                      Latency: <strong className="text-cyan-400">{probeLatency(diagnosticsResult.connections.telegram.testResult.latencyMs)}</strong> | Auth: {diagnosticsResult.connections.telegram.testResult.botAuthorized ? 'VALIDATED' : diagnosticsResult.connections.telegram.testResult.reachable ? 'NOT AUTHORIZED' : 'not checked'}
                     </div>
                     <p className="text-slate-400 text-[10px] border-t border-slate-800 pt-1">
                       {diagnosticsResult.connections.telegram.testResult.diagnosis}
@@ -1603,15 +1595,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <span className="text-sky-400 font-bold text-sm">𝕏</span>
                         <span>X.com / Twitter Gateway</span>
                       </span>
-                      <span
-                        className={`px-2 py-0.5 rounded text-[10px] ${
-                          diagnosticsResult.connections.xTwitter?.testResult?.reachable
-                            ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-                            : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'
-                        }`}
-                      >
-                        {probeBadge(diagnosticsResult.connections.xTwitter?.testResult, 'REACHABLE').text}
-                      </span>
+                      {(() => { const b = probeBadge(diagnosticsResult.connections.xTwitter?.testResult, 'REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${probeBadgeClass(b)}`}>{b.text}</span>); })()}
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Endpoint: <code className="text-slate-300">https://api.twitter.com</code>
@@ -1620,8 +1604,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                       Latency: <strong className="text-cyan-400">{probeLatency(diagnosticsResult.connections.xTwitter?.testResult?.latencyMs)}</strong> | Mode: {diagnosticsResult.connections.xTwitter?.testResult?.bearerAuthorized ? 'AUTHENTICATED' : 'NO BEARER TOKEN (public metadata only)'}
                     </div>
                     <p className="text-slate-400 text-[10px] border-t border-slate-800 pt-1">
-                      {diagnosticsResult.connections.xTwitter?.testResult?.diagnosis ||
-                        'Outbound HTTPS verified. Ingests live community links from Pump.fun and DexScreener.'}
+                      {diagnosticsResult.connections.xTwitter?.testResult?.diagnosis || 'The probe returned no detail.'}
                     </p>
                   </div>
 
@@ -1632,16 +1615,17 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <Flame className="w-3.5 h-3.5 text-emerald-400" />
                         <span>Pump.fun Live Coin Stream</span>
                       </span>
-                      {(() => { const b = probeBadge(diagnosticsResult.connections.pumpFun.testResult, 'REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${b.ok ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'}`}>{b.text}</span>); })()}
+                      {(() => { const b = probeBadge(diagnosticsResult.connections.pumpFun.testResult, 'REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${probeBadgeClass(b)}`}>{b.text}</span>); })()}
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Endpoint: <code className="text-slate-300">frontend-api-v3.pump.fun/coins</code>
                     </div>
                     <div className="text-[11px] text-slate-300">
-                      Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.pumpFun.testResult.latencyMs}ms</strong> | Newest: {diagnosticsResult.connections.pumpFun.testResult.newestToken || '—'}
+                      Latency: <strong className="text-cyan-400">{probeLatency(diagnosticsResult.connections.pumpFun.testResult.latencyMs)}</strong> | Newest: {diagnosticsResult.connections.pumpFun.testResult.newestToken || '—'}
                     </div>
                     <p className="text-slate-400 text-[10px] border-t border-slate-800 pt-1">
-                      Live Solana bonding curves streamed and processed every 5s.
+                      {diagnosticsResult.connections.pumpFun.testResult.diagnosis ||
+                        'A probe of the pump.fun HTTP API. The app polls it only on mainnet-beta; on other clusters the board fills from the on-chain log stream.'}
                     </p>
                   </div>
 
@@ -1652,16 +1636,17 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <TrendingUp className="w-3.5 h-3.5 text-cyan-400" />
                         <span>DexScreener Boosted Feed</span>
                       </span>
-                      {(() => { const b = probeBadge(diagnosticsResult.connections.dexScreener.testResult, 'REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${b.ok ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'}`}>{b.text}</span>); })()}
+                      {(() => { const b = probeBadge(diagnosticsResult.connections.dexScreener.testResult, 'REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${probeBadgeClass(b)}`}>{b.text}</span>); })()}
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Endpoint: <code className="text-slate-300">api.dexscreener.com/token-boosts</code>
                     </div>
                     <div className="text-[11px] text-slate-300">
-                      Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.dexScreener.testResult.latencyMs}ms</strong> | Boosted Queue: {diagnosticsResult.connections.dexScreener.testResult.boostedCount} Tokens
+                      Latency: <strong className="text-cyan-400">{probeLatency(diagnosticsResult.connections.dexScreener.testResult.latencyMs)}</strong> | Boosted list: {diagnosticsResult.connections.dexScreener.testResult.boostedCount ?? '—'} tokens
                     </div>
                     <p className="text-slate-400 text-[10px] border-t border-slate-800 pt-1">
-                      Pulls live community paid boosts used for multi-caller confluence trigger.
+                      {diagnosticsResult.connections.dexScreener.testResult.diagnosis ||
+                        'A probe of the DexScreener paid-boost list. It is mainnet data, so the confluence trigger can only use it on mainnet-beta.'}
                     </p>
                   </div>
 
@@ -1672,16 +1657,16 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <Server className="w-3.5 h-3.5 text-purple-400" />
                         <span>Solana Validator JSON-RPC</span>
                       </span>
-                      {(() => { const b = probeBadge(diagnosticsResult.connections.solanaRpc.testResult, 'RPC REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${b.ok ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40' : 'bg-rose-500/20 text-rose-300 border border-rose-500/40'}`}>{b.text}</span>); })()}
+                      {(() => { const b = probeBadge(diagnosticsResult.connections.solanaRpc.testResult, 'RPC REACHABLE'); return (<span className={`px-2 py-0.5 rounded text-[10px] ${probeBadgeClass(b)}`}>{b.text}</span>); })()}
                     </div>
                     <div className="text-slate-400 text-[11px]">
                       Endpoint: <code className="text-slate-300">{hostOfService(diagnosticsResult.connections.solanaRpc.service)}</code>{diagnosticsResult.cluster ? <span className="ml-2 text-amber-300">cluster: {diagnosticsResult.cluster}</span> : null}
                     </div>
                     <div className="text-[11px] text-slate-300">
-                      Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.solanaRpc.testResult.latencyMs}ms</strong> | Cluster Slot: {diagnosticsResult.connections.solanaRpc.testResult.slot != null ? `#${diagnosticsResult.connections.solanaRpc.testResult.slot}` : '—'}
+                      Latency: <strong className="text-cyan-400">{probeLatency(diagnosticsResult.connections.solanaRpc.testResult.latencyMs)}</strong> | Cluster Slot: {diagnosticsResult.connections.solanaRpc.testResult.slot != null ? `#${diagnosticsResult.connections.solanaRpc.testResult.slot}` : '—'}
                     </div>
                     <p className="text-slate-400 text-[10px] border-t border-slate-800 pt-1">
-                      Direct JSON-RPC slot verification for block leader schedules.
+                      getHealth and getSlot on the configured cluster RPC.
                     </p>
                   </div>
                 </div>

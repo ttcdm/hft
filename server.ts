@@ -678,62 +678,95 @@ app.post('/api/social/test-twitter', requireOperatorAuth, asyncHandler(async (re
   res.json(testResult);
 }));
 
-// Full External Connectivity Diagnostics & Simulation Scope Audit
+/**
+ * 3H (P3.7): a probe of an outside host that was not run because APEX_DISABLE_EXTERNAL_FEEDS=true. It is never shown as reachable, and the
+ * audit counts it as skipped, not as down. Only the cluster RPC probe (the configured RPC, not an outside feed) runs with feeds off.
+ */
+function skippedProbe(host: string) {
+  return { skipped: true, reachable: false, latencyMs: 0, status: null, diagnosis: `SKIPPED: APEX_DISABLE_EXTERNAL_FEEDS=true, so ${host} was not contacted.` };
+}
+
+/**
+ * 3H: the Jito row of the audit, from the transport this server really has. It used to say bundles go to Jito "only on mainnet-beta",
+ * which is not the rule: a non-mainnet block engine URL is used on devnet (resolveJitoUrl), localnet never uses one, and with none the
+ * coordinator forces the LIVE tip to 0 (resolveLiveTip).
+ */
+function jitoScopeEntry(jito: { enabled: boolean; status: string; reason?: string }, readOnly: boolean) {
+  if (!jito.enabled) {
+    return {
+      subsystem: 'Jito Bundles & Tips',
+      nature: 'NOT_CONFIGURED',
+      details: `No Jito block engine is in use (JITO_BLOCK_ENGINE_URL is unset, or was refused for ${allowedCluster()}). LIVE transactions go to the cluster RPC with a priority fee, and the Jito tip is forced to 0, so a tip typed on a screen is not paid on LIVE.${readOnly ? ' Read-only: nothing is signed or sent.' : ''}`,
+    };
+  }
+  return {
+    subsystem: 'Jito Bundles & Tips',
+    nature: jito.status === 'HEALTHY' ? 'CONFIGURED' : 'CONFIGURED_NOT_HEALTHY',
+    details: `A non-mainnet Jito block engine is configured; its last probe says ${jito.status}${jito.reason ? ` (${jito.reason})` : ''}. LIVE transactions are submitted through the block engine, with a tip from the tip policy.${readOnly ? ' Read-only: nothing is signed or sent.' : ''}`,
+  };
+}
+
+// External connectivity diagnostics and what each subsystem really does on this cluster
 app.get('/api/connectivity/diagnostics', requireOperatorAuth, asyncHandler(async (req, res) => {
-  const tStart = Date.now();
+  const tStart = performance.now();
+  const feedsOff = process.env.APEX_DISABLE_EXTERNAL_FEEDS === 'true';
 
   // 1. Telegram
-  const telegramTest = await socialScanner.testTelegramConnection();
+  const telegramTest: any = feedsOff ? skippedProbe('api.telegram.org') : await socialScanner.testTelegramConnection();
 
   // 1b. X.com / Twitter Probe
-  const xTwitterTest = await socialScanner.testXTwitterConnection();
+  const xTwitterTest: any = feedsOff ? { ...skippedProbe('api.twitter.com'), httpStatus: null, bearerAuthorized: false } : await socialScanner.testXTwitterConnection();
 
   // 2. Pump.fun Live Feed Probe
   const tPump = performance.now();
-  const pumpTest: any = { reachable: false, latencyMs: 0, status: null, tokensCount: 0, sampleMint: null };
-  try {
-    const pumpRes = await fetch(
-      'https://frontend-api-v3.pump.fun/coins?offset=0&limit=5&sort=last_trade_timestamp&order=DESC&includeNsfw=false',
-      {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          Accept: 'application/json',
-        },
+  const pumpTest: any = feedsOff ? skippedProbe('frontend-api-v3.pump.fun') : { reachable: false, latencyMs: 0, status: null, tokensCount: 0, sampleMint: null };
+  if (!feedsOff) {
+    try {
+      const pumpRes = await fetch(
+        'https://frontend-api-v3.pump.fun/coins?offset=0&limit=5&sort=last_trade_timestamp&order=DESC&includeNsfw=false',
+        {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            Accept: 'application/json',
+          },
+        }
+      );
+      pumpTest.latencyMs = Math.round(performance.now() - tPump);
+      pumpTest.status = pumpRes.status;
+      if (pumpRes.ok) {
+        const coins = await pumpRes.json();
+        pumpTest.reachable = true;
+        pumpTest.tokensCount = coins.length;
+        pumpTest.sampleMint = coins[0]?.mint || null;
+        pumpTest.newestToken = coins[0]?.name ? `${coins[0].name} (${coins[0].symbol})` : null;
       }
-    );
-    pumpTest.latencyMs = Math.round(performance.now() - tPump);
-    pumpTest.status = pumpRes.status;
-    if (pumpRes.ok) {
-      const coins = await pumpRes.json();
-      pumpTest.reachable = true;
-      pumpTest.tokensCount = coins.length;
-      pumpTest.sampleMint = coins[0]?.mint || null;
-      pumpTest.newestToken = coins[0]?.name ? `${coins[0].name} (${coins[0].symbol})` : null;
+    } catch (e: any) {
+      pumpTest.error = e.message;
+      pumpTest.latencyMs = Math.round(performance.now() - tPump);
     }
-  } catch (e: any) {
-    pumpTest.error = e.message;
-    pumpTest.latencyMs = Math.round(performance.now() - tPump);
   }
 
   // 3. DexScreener Live Boosted Probe
   const tDex = performance.now();
-  const dexTest: any = { reachable: false, latencyMs: 0, status: null, boostedCount: 0 };
-  try {
-    const dexRes = await fetch('https://api.dexscreener.com/token-boosts/top/v1');
-    dexTest.latencyMs = Math.round(performance.now() - tDex);
-    dexTest.status = dexRes.status;
-    if (dexRes.ok) {
-      const boosts = await dexRes.json();
-      dexTest.reachable = true;
-      dexTest.boostedCount = Array.isArray(boosts) ? boosts.length : 0;
-      dexTest.sampleToken = boosts[0]?.tokenAddress || null;
+  const dexTest: any = feedsOff ? skippedProbe('api.dexscreener.com') : { reachable: false, latencyMs: 0, status: null, boostedCount: 0 };
+  if (!feedsOff) {
+    try {
+      const dexRes = await fetch('https://api.dexscreener.com/token-boosts/top/v1');
+      dexTest.latencyMs = Math.round(performance.now() - tDex);
+      dexTest.status = dexRes.status;
+      if (dexRes.ok) {
+        const boosts = await dexRes.json();
+        dexTest.reachable = true;
+        dexTest.boostedCount = Array.isArray(boosts) ? boosts.length : 0;
+        dexTest.sampleToken = boosts[0]?.tokenAddress || null;
+      }
+    } catch (e: any) {
+      dexTest.error = e.message;
+      dexTest.latencyMs = Math.round(performance.now() - tDex);
     }
-  } catch (e: any) {
-    dexTest.error = e.message;
-    dexTest.latencyMs = Math.round(performance.now() - tDex);
   }
 
-  // 4. Solana Mainnet Validator RPC Probe
+  // 4. Cluster RPC probe (the configured RPC; it runs with external feeds off too)
   const tSol = performance.now();
   const solanaTest: any = { reachable: false, latencyMs: 0, health: null, slot: null };
   try {
@@ -757,30 +790,18 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, asyncHandler(async
     solanaTest.latencyMs = Math.round(performance.now() - tSol);
   }
 
-  // 5. Coinbase Institutional Spot Feed Probe
-  const tCb = performance.now();
-  const coinbaseTest: any = { reachable: false, latencyMs: 0, btcPriceUsd: null };
-  try {
-    const cbRes = await fetch('https://api.coinbase.com/v2/prices/BTC-USD/spot');
-    coinbaseTest.latencyMs = Math.round(performance.now() - tCb);
-    if (cbRes.ok) {
-      const cbData = await cbRes.json();
-      coinbaseTest.reachable = true;
-      coinbaseTest.btcPriceUsd = parseFloat(cbData?.data?.amount || '0');
-    }
-  } catch (e: any) {
-    coinbaseTest.error = e.message;
-    coinbaseTest.latencyMs = Math.round(performance.now() - tCb);
-  }
+  // 5. (removed, 3H) the Coinbase BTC-USD spot probe: nothing in the app reads a BTC price.
 
   // 6. Market Maker & Caller Profiles State
   const leaderboard = pumpFunService.getLeaderboard();
   const hotCallouts = pumpFunService.getHotCallouts();
   const confluenceCallouts = hotCallouts.filter((c) => c.confluenceCount >= 2);
+  const jito = executionCoordinator.getJitoReadiness();
 
   res.json({
     timestamp: Date.now(),
-    totalAuditTimeMs: Date.now() - tStart,
+    totalAuditTimeMs: Math.round(performance.now() - tStart),
+    externalFeedsDisabled: feedsOff,
     cluster: allowedCluster(), // Q10a: the cluster this server is configured for, shown next to the RPC probe
     connections: {
       xTwitter: {
@@ -807,11 +828,6 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, asyncHandler(async
         service: `Solana RPC (${new URL(resolveRpcUrl()).host})`,
         isLiveExternal: true,
         testResult: solanaTest,
-      },
-      coinbase: {
-        service: 'Coinbase Institutional Spot Price Feed (api.coinbase.com)',
-        isLiveExternal: true,
-        testResult: coinbaseTest,
       },
     },
     marketMakerProfiles: {
@@ -872,11 +888,6 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, asyncHandler(async
       },
       xTwitterScopeEntry(xTwitterTest, allowedCluster()),
       {
-        subsystem: 'Coinbase Spot Reference',
-        nature: 'LIVE',
-        details: 'Queries live BTC-USD spot price directly from api.coinbase.com.',
-      },
-      {
         subsystem: 'Order Execution & Paper Trading',
         nature: executionCoordinator.isLiveArmed() ? 'LIVE_ARMED' : 'PAPER_BY_DEFAULT',
         details: executionCoordinator.isLiveArmed()
@@ -885,24 +896,12 @@ app.get('/api/connectivity/diagnostics', requireOperatorAuth, asyncHandler(async
             ? 'READ-ONLY: this server has no signer and cannot arm LIVE. Snipes are paper-traded against the real curve quote; no transaction is signed or sent.'
             : 'LIVE is not armed: snipes are paper-traded in memory against the curve quote. No transaction is signed or sent.',
       },
-      {
-        subsystem: 'Jito MEV Bundles & Priority Tips',
-        nature: executionCoordinator.isLiveArmed() ? 'LIVE_CLUSTER_DEPENDENT' : 'PAPER_ONLY',
-        details: isReadOnly()
-          ? 'Read-only mode: nothing is signed or sent, so no tip is ever paid. Paper fills still model the priority tip from the tip policy (on mainnet it follows the public Jito tip floor) so their cost is what a real send would pay.'
-          : 'Priority tips follow the executionConfig tip policy. Bundles go to Jito only on mainnet-beta (never enabled by default); on devnet or localnet the transaction goes to the cluster RPC with a priority fee and no bundle. In paper mode nothing is sent.',
-      },
+      jitoScopeEntry(jito, isReadOnly()),
       {
         subsystem: 'Caller Persona Historical Track Records',
         nature: 'NOT_VERIFIED',
         details:
           'Caller personas and their win rates are static configuration, not measured track records. Do not treat them as evidence about a caller.',
-      },
-      {
-        subsystem: 'Microstructure & Latency Stress',
-        nature: 'MATHEMATICAL_MODEL',
-        details:
-          'Standalone formula calculators (Avellaneda-Stoikov, square-root impact). Their latency inputs are assumptions, not measurements, and they do not drive live order routing.',
       },
     ],
   });

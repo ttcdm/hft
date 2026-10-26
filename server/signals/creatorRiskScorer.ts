@@ -80,7 +80,16 @@ export class CreatorRiskScorer {
     return e.expiresAt > now || (!e.failed && !!this.pinned?.(k));
   }
 
+  /** 5B-2: listeners told of every report the scorer stores (a fresh lookup or a failed one), so the launch recorder can save it. */
+  private reportListeners = new Set<(creatorAddress: string, report: CreatorRiskReport, failed: boolean) => void>();
+  public onReport(fn: (creatorAddress: string, report: CreatorRiskReport, failed: boolean) => void): () => void {
+    this.reportListeners.add(fn);
+    return () => { this.reportListeners.delete(fn); };
+  }
+
   private storeInCache(creatorAddress: string, report: CreatorRiskReport, failed = false): void {
+    // a listener's failure (the recorder) must never touch scoring
+    for (const fn of this.reportListeners) { try { fn(creatorAddress, report, failed); } catch { /* ignored */ } }
     const now = Date.now();
     this.cache.set(creatorAddress, { report, expiresAt: now + (failed ? CREATOR_FAILURE_CACHE_TTL_MS : this.defaultCacheTtlMs), failed });
     if (this.cache.size > this.maxCacheEntries) {

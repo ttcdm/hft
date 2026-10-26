@@ -359,7 +359,7 @@ pumpFeedListener.follow(executionCoordinator); // P4.2 (R1-63): a successful RPC
 // S178: save what the window sees (launches it scores, their trades, the funder facts) so the auto rules can be replayed over real launches
 for (const p of recorderConfigProblems()) console.warn(`[APEX QUANT HFT] ${p}`); // S190
 const launchRecorder = new LaunchRecorder(workstationDb, watchWindow, () => solPriceService.lastKnownPrice());
-launchRecorder.attach(pumpFeedListener);
+launchRecorder.attach(pumpFeedListener, creatorRiskScorer); // 5B-2: each launch's live creator report is saved with it
 wireWatchPins(watchWindow, memecoinAggregator, onChainPoolStats, curveVelocityEvaluator); // S4: a watched mint keeps its pool, its trade stats and (P4.3) its velocity data until the verdict
 wireCreatorReportPins(watchWindow, creatorRiskScorer); // P4.1: a watched launch's creator report lives until 60 s after its verdict
 wireFunderLookup(watchWindow, new FunderLookup(() => executionCoordinator.getConnection())); // Q6b

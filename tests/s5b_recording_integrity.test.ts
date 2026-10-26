@@ -252,3 +252,83 @@ describe('5B: the replay loader hands each launch its END time, so coverage foll
     expect(l.endReason).toBeUndefined();
   });
 });
+
+describe('5B-2 (A119): each recorded launch carries the live creator report, so the replay need not score every creator 0', () => {
+  /** The REAL CreatorRiskScorer; the RPC boundary (getSignaturesForAddress) is a stub. 50 signatures over ~400 days: an established wallet. */
+  const established = { getSignaturesForAddress: async () => Array.from({ length: 50 }, (_, i) => ({ signature: `sig${i}`, slot: i, err: null, memo: null, blockTime: Math.floor(t0 / 1000) - 400 * 86_400 + i * 86_400 })) };
+  const failing = { getSignaturesForAddress: async () => { throw new Error('429 Too Many Requests'); } };
+
+  async function setup() {
+    const { CreatorRiskScorer } = await import('../server/signals/creatorRiskScorer');
+    const s = scratchDb();
+    let now = t0;
+    const feed = new EventEmitter();
+    const win: any = Object.assign(new EventEmitter(), { isWatching: () => true });
+    const scorer = new CreatorRiskScorer();
+    const rec = new LaunchRecorder(s.db, win, () => 150, () => now, { mintMs: 30 * 60_000, maxTradesPerMint: 2_000, retentionDays: 14, maxRows: 1_000_000 });
+    rec.attach(feed, scorer);
+    const launch = (creator: string) => { const m = wallet(); feed.emit('create_event', { ...createEvent(m), creator }); return m; };
+    const tradeAt = (m: string, ms: number, i: number) => { now = t0 + ms; feed.emit('trade_event', trade(m, i)); };
+    const reports = (m: string) => s.db.loadLaunchRecording().launches.find((l) => l.mint === m)?.creatorReports;
+    return { ...s, scorer, rec, launch, tradeAt, reports, at: (ms: number) => { now = t0 + ms; } };
+  }
+
+  it('a report that lands before the first trade is saved at the time it landed, with the score live reads from it', async () => {
+    const r = await setup();
+    const creator = wallet();
+    const m = r.launch(creator);
+    r.at(800);
+    const live = await r.scorer.evaluateCreator(established as any, creator, { nowSec: Math.floor(t0 / 1000) });
+    expect(live.confluenceScore).toBeGreaterThan(0); // the fixture is a wallet live gives points to
+    r.tradeAt(m, 2000, 1);
+    expect(r.reports(m)).toEqual([expect.objectContaining({ ts: t0 + 800, confluenceScore: live.confluenceScore, failed: false })]);
+  });
+
+  it('a report that lands after the first trade is saved then; a second launch of the same creator gets the cached report from its create', async () => {
+    const r = await setup();
+    const creator = wallet();
+    const a = r.launch(creator);
+    r.tradeAt(a, 1000, 1);
+    r.at(3000);
+    const live = await r.scorer.evaluateCreator(established as any, creator, { nowSec: Math.floor(t0 / 1000) });
+    expect(r.reports(a)).toEqual([expect.objectContaining({ ts: t0 + 3000, confluenceScore: live.confluenceScore })]);
+    r.at(10_000);
+    const b = r.launch(creator); // the scorer serves this creator from its cache: no new report event
+    r.tradeAt(b, 11_000, 2);
+    expect(r.reports(b)).toEqual([expect.objectContaining({ ts: t0 + 10_000, confluenceScore: live.confluenceScore })]);
+  });
+
+  it('a failed lookup is saved as failed with 0 points; a creator never scored has no report (the replay keeps 0)', async () => {
+    const r = await setup();
+    const bad = wallet();
+    const m = r.launch(bad);
+    await r.scorer.evaluateCreator(failing as any, bad);
+    r.tradeAt(m, 1000, 1);
+    expect(r.reports(m)).toEqual([expect.objectContaining({ confluenceScore: 0, failed: true })]);
+    const quiet = r.launch(wallet());
+    r.tradeAt(quiet, 2000, 2);
+    expect(r.reports(quiet)).toBeUndefined();
+  });
+});
+
+describe('5B-2: the own-recordings readers (SQLite and JSONL) give the same creator reports as the loader', () => {
+  it('a CREATOR row reaches creatorReports through the database loader, openSqlite and openJsonl alike', async () => {
+    const { openSqlite, openJsonl } = await import('../scripts/recorder_backtest/recorded');
+    const s = scratchDb();
+    const m = wallet();
+    s.db.recordLaunchEvent(t0, m, 'CREATE', { mint: m, symbol: 'X' });
+    s.db.recordLaunchEvent(t0 + 500, m, 'CREATOR', { creator: 'c', confluenceScore: 4, riskScore: 80, isBurner: false, failed: false, riskFlags: [] });
+    s.db.recordLaunchEvent(t0 + 1000, m, 'TRADE', { mint: m });
+    const fromDb = s.db.loadLaunchRecording().launches[0].creatorReports;
+    expect(fromDb).toEqual([{ ts: t0 + 500, confluenceScore: 4, failed: false, riskScore: 80, isBurner: false, riskFlags: [] }]);
+    const sq = openSqlite(s.file);
+    expect([...sq.launches()][0].creatorReports).toEqual(fromDb);
+    sq.close();
+    const jsonl = path.join(path.dirname(s.file), 'snap.jsonl');
+    fs.writeFileSync(jsonl, s.rows('SELECT ts, mint, kind, payload_json FROM launch_recording ORDER BY id').map((r) => JSON.stringify({ ts: r.ts, mint: r.mint, kind: r.kind, payload: JSON.parse(r.payload_json) })).join('\n'));
+    const err = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const js = await openJsonl(jsonl);
+    expect([...js.launches()][0].creatorReports).toEqual(fromDb);
+    expect(err).not.toHaveBeenCalled(); // no CREATOR line is "skipped"
+  });
+});

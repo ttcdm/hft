@@ -4,6 +4,7 @@ import path from 'node:path';
 import { resolveDbPath } from './dbPath';
 import { NormalizedPosition, ExecutionMode } from '../core/types';
 import { Logger } from '../middleware/enterprise';
+import { recordedCreatorReport, type RecordedCreatorReport } from '../backtest/launchRecorder';
 
 export interface PersistedOrder {
   id: string;
@@ -50,7 +51,7 @@ export interface PersistedTransaction {
 }
 
 /** 5B: the launch-recording kinds that belong to a launch (FUNDER rows have mint '' and are kept for good). */
-const LAUNCH_ROW_KINDS = ['CREATE', 'TRADE', 'END'] as const;
+const LAUNCH_ROW_KINDS = ['CREATE', 'TRADE', 'END', 'CREATOR'] as const;
 interface LaunchRecordingCounts { byKind: Record<string, number>; dataVersion: number; oldestTs: number | null; newestTs: number | null; newestCreateTs: number | null }
 export interface LaunchRecordingStatus {
   launches: number;
@@ -787,7 +788,7 @@ export class WorkstationDatabase {
   }
 
   /** S178: append one recorded event. Never throws: a recording failure must not touch trading. */
-  public recordLaunchEvent(ts: number, mint: string, kind: 'CREATE' | 'TRADE' | 'FUNDER' | 'END', payload: Record<string, unknown>): boolean {
+  public recordLaunchEvent(ts: number, mint: string, kind: 'CREATE' | 'TRADE' | 'FUNDER' | 'END' | 'CREATOR', payload: Record<string, unknown>): boolean {
     try {
       this.db.prepare('INSERT INTO launch_recording (ts, mint, kind, payload_json) VALUES (?, ?, ?, ?)').run(ts, mint, kind, JSON.stringify(payload));
       const c = this.recCounts;
@@ -808,17 +809,19 @@ export class WorkstationDatabase {
    * replay's coverage then follows the recording that was really made, not the window the server runs with now. A launch without one is
    * unresolved and has neither.
    */
-  public loadLaunchRecording(limit = 500): { launches: Array<{ mint: string; events: Array<{ ts: number; kind: 'CREATE' | 'TRADE'; payload: any }>; endTs?: number; endReason?: string }>; funders: Array<{ ts: number; wallet: string; funder: string | null }> } {
+  public loadLaunchRecording(limit = 500): { launches: Array<{ mint: string; events: Array<{ ts: number; kind: 'CREATE' | 'TRADE'; payload: any }>; endTs?: number; endReason?: string; creatorReports?: RecordedCreatorReport[] }>; funders: Array<{ ts: number; wallet: string; funder: string | null }> } {
     try {
       const mints = (this.db.prepare(`SELECT mint FROM launch_recording WHERE kind = 'CREATE' ORDER BY ts DESC LIMIT ?`).all(limit) as any[]).map((r) => r.mint as string).reverse();
-      const q = this.db.prepare(`SELECT ts, kind, payload_json FROM launch_recording WHERE mint = ? AND kind IN ('CREATE','TRADE','END') ORDER BY ts ASC, id ASC`);
+      const q = this.db.prepare(`SELECT ts, kind, payload_json FROM launch_recording WHERE mint = ? AND kind IN ('CREATE','TRADE','END','CREATOR') ORDER BY ts ASC, id ASC`);
       const launches = mints.map((mint) => {
         const rows = q.all(mint) as any[];
         const end = rows.find((r) => r.kind === 'END');
+        const creatorReports = rows.filter((r) => r.kind === 'CREATOR').map((r) => recordedCreatorReport(r.ts, JSON.parse(r.payload_json)));
         return {
           mint,
-          events: rows.filter((r) => r.kind !== 'END').map((r) => ({ ts: r.ts as number, kind: r.kind as 'CREATE' | 'TRADE', payload: JSON.parse(r.payload_json) })),
+          events: rows.filter((r) => r.kind === 'CREATE' || r.kind === 'TRADE').map((r) => ({ ts: r.ts as number, kind: r.kind as 'CREATE' | 'TRADE', payload: JSON.parse(r.payload_json) })),
           ...(end ? { endTs: end.ts as number, endReason: String(JSON.parse(end.payload_json).reason) } : {}),
+          ...(creatorReports.length ? { creatorReports } : {}),
         };
       });
       const funders = (this.db.prepare(`SELECT ts, payload_json FROM launch_recording WHERE kind = 'FUNDER' ORDER BY ts ASC, id ASC`).all() as any[])

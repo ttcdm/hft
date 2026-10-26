@@ -2,6 +2,7 @@ import { EventEmitter } from 'events';
 import type { PumpCreateEvent, PumpTradeEvent } from '../solana/pumpFeedListener';
 import type { WatchWindow } from '../signals/watchWindow';
 import type { WorkstationDatabase } from '../db/database';
+import { CREATOR_LOOKUP_FAILED_FLAG, type CreatorRiskReport } from '../signals/creatorRiskScorer';
 import { Logger } from '../middleware/enterprise';
 import { recorderConfig, setRecorderRuntime, RECORD_DEFAULT_MINT_MINUTES, RECORD_TRADES_PER_30_MIN, RECORD_DEFAULT_RETENTION_DAYS, RECORD_DEFAULT_MAX_ROWS, type RecorderConfig, type RecorderRuntime } from './recorderConfig';
 
@@ -38,16 +39,50 @@ export function eventToJson(e: object): Record<string, unknown> {
 }
 
 /**
+ * 5B-2 (A119): a creator report as the recorder saved it (a CREATOR row): from `ts` on, live scored the launch's creator `confluenceScore`
+ * points (0 to 5); `failed` is a failed history lookup (0 points, and the creator counts as missing data). Oldest first.
+ */
+export interface RecordedCreatorReport { ts: number; confluenceScore: number; failed: boolean; riskScore: number | null; isBurner: boolean | null; riskFlags: string[] }
+export function recordedCreatorReport(ts: number, p: any): RecordedCreatorReport {
+  const score = Number(p?.confluenceScore);
+  return {
+    ts,
+    // an unreadable score is worth nothing, as no report is
+    confluenceScore: Number.isFinite(score) ? Math.max(0, Math.min(5, score)) : 0,
+    failed: p?.failed === true,
+    riskScore: Number.isFinite(Number(p?.riskScore)) ? Number(p.riskScore) : null,
+    isBurner: typeof p?.isBurner === 'boolean' ? p.isBurner : null,
+    riskFlags: Array.isArray(p?.riskFlags) ? p.riskFlags.map(String) : [],
+  };
+}
+
+/** 5B-2: where the recorder hears of creator reports: the live CreatorRiskScorer. */
+export interface CreatorReportSource {
+  onReport(fn: (creator: string, report: CreatorRiskReport, failed: boolean) => void): () => void;
+  getCachedReport(creator: string): CreatorRiskReport | undefined;
+}
+
+/** A CREATOR row's payload: what the confluence engine reads from the report (its 0-5 score, the failed-lookup flag) plus the inputs, for study. */
+function creatorPayload(creator: string, report: CreatorRiskReport): Record<string, unknown> {
+  return {
+    creator, confluenceScore: report.confluenceScore, riskScore: report.riskScore, isBurner: report.isBurner,
+    failed: report.riskFlags.includes(CREATOR_LOOKUP_FAILED_FLAG), riskFlags: report.riskFlags, signatureCount: report.signatureCount,
+    walletAgeSeconds: report.walletAgeSeconds, evaluatedAt: report.evaluatedAt,
+  };
+}
+
+/**
  * Saves what the watch window sees, so the same rules can be replayed later over real launches. It records only launches the window
  * is scoring (so the volume is the window's: at most WATCH_MAX_CANDIDATES live at a time), their trades for RECORD_MINT_MS, and the
  * funder facts the window learns. A write failure is swallowed: recording must never affect trading.
  */
 export class LaunchRecorder {
-  private pending = new Map<string, { ts: number; event: PumpCreateEvent; solUsd: number | null }>();
-  private recorded = new Map<string, { createdAt: number; trades: number; ended: boolean }>();
+  private pending = new Map<string, { ts: number; event: PumpCreateEvent; solUsd: number | null; creatorReports: Array<{ ts: number; payload: Record<string, unknown> }> }>();
+  private recorded = new Map<string, { createdAt: number; trades: number; ended: boolean; creator?: string }>();
   private attachedTo: Array<{ off: () => void }> = [];
   private lastPrune = 0;
   private lastEndSweep = 0;
+  private creatorReports: CreatorReportSource | null = null;
   private runtime: RecorderRuntime;
 
   constructor(private db: Db, private window: Pick<WatchWindow, 'isWatching'> & EventEmitter, private solUsd: () => number | null = () => null, private now: () => number = Date.now, private config: RecorderConfig = recorderConfig()) {
@@ -57,14 +92,17 @@ export class LaunchRecorder {
 
   public getRuntime(): RecorderRuntime { return this.runtime; }
 
-  public attach(feed: EventEmitter): void {
+  /** `creatorReports` (5B-2): the creator scorer, so each launch's live creator report is saved with it (CREATOR rows). */
+  public attach(feed: EventEmitter, creatorReports?: CreatorReportSource): void {
+    this.creatorReports = creatorReports ?? null;
     const onCreate = (e: PumpCreateEvent) => this.onCreate(e);
     const onTrade = (t: PumpTradeEvent) => this.onTrade(t);
     const onFunder = (f: { wallet: string; funder: string | null }) => this.onFunder(f);
     feed.on('create_event', onCreate);
     feed.on('trade_event', onTrade);
     this.window.on('funder', onFunder);
-    this.attachedTo.push({ off: () => { feed.off('create_event', onCreate); feed.off('trade_event', onTrade); this.window.off('funder', onFunder); } });
+    const offReports = creatorReports?.onReport((c, r) => this.onCreatorReport(c, r));
+    this.attachedTo.push({ off: () => { feed.off('create_event', onCreate); feed.off('trade_event', onTrade); this.window.off('funder', onFunder); offReports?.(); } });
   }
 
   public detach(): void {
@@ -73,7 +111,11 @@ export class LaunchRecorder {
   }
 
   public onCreate(e: PumpCreateEvent): void {
-    this.pending.set(e.mint, { ts: this.now(), event: e, solUsd: this.solUsd() });
+    const ts = this.now();
+    this.pending.set(e.mint, { ts, event: e, solUsd: this.solUsd(), creatorReports: [] });
+    // 5B-2: a report the scorer already holds for this creator (a cache hit stores nothing, so no report event follows) applies from the create
+    const cached = e.creator ? this.creatorReports?.getCachedReport(e.creator) : undefined;
+    if (cached) this.pending.get(e.mint)!.creatorReports.push({ ts, payload: creatorPayload(e.creator, cached) });
     if (this.pending.size > PENDING_CREATES_MAX) this.pending.delete(this.pending.keys().next().value as string);
   }
 
@@ -87,7 +129,9 @@ export class LaunchRecorder {
       if (!p || !this.window.isWatching(t.mint)) return;
       if (!this.db.recordLaunchEvent(p.ts, t.mint, 'CREATE', { ...eventToJson(p.event), solUsd: p.solUsd })) return;
       this.pending.delete(t.mint);
-      rec = { createdAt: p.ts, trades: 0, ended: false };
+      // reports that arrived before the first trade, at the time they arrived
+      for (const r of p.creatorReports) this.db.recordLaunchEvent(r.ts, t.mint, 'CREATOR', r.payload);
+      rec = { createdAt: p.ts, trades: 0, ended: false, creator: p.event.creator };
       this.recorded.set(t.mint, rec);
       this.trimTracked(at);
     }
@@ -112,6 +156,18 @@ export class LaunchRecorder {
     if (now - this.lastEndSweep < END_SWEEP_EVERY_MS) return;
     this.lastEndSweep = now;
     for (const [mint, r] of this.recorded) if (!r.ended && now - r.createdAt > this.config.mintMs) this.end(mint, r, 'WINDOW', r.createdAt + this.config.mintMs);
+  }
+
+  /**
+   * 5B-2 (A119): the live creator report, as the confluence engine would read it from this moment on, for every launch of that creator the
+   * recorder has pending or is recording. `failed` marks a failed history lookup (0 points, missing data). A launch whose creator never got a
+   * report has no CREATOR row, and the replay scores it 0 as live does without a report.
+   */
+  public onCreatorReport(creator: string, report: CreatorRiskReport): void {
+    const at = this.now();
+    const payload = creatorPayload(creator, report);
+    for (const p of this.pending.values()) if (p.event.creator === creator) p.creatorReports.push({ ts: at, payload });
+    for (const [mint, r] of this.recorded) if (r.creator === creator && !r.ended) this.db.recordLaunchEvent(at, mint, 'CREATOR', payload);
   }
 
   public onFunder(f: { wallet: string; funder: string | null }): void {

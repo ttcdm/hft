@@ -3,6 +3,7 @@ import path from 'path';
 import readline from 'readline';
 import { DatabaseSync } from 'node:sqlite';
 import type { RecordedLaunch, FunderFact } from '../../server/backtest/replay';
+import { recordedCreatorReport } from '../../server/backtest/launchRecorder';
 
 /**
  * S228: reads the app's OWN launch recordings for the studies in this folder (`--recorded <path>`). Nothing here reads or writes the public 39-day corpus, and the results are for the recordings only: they are never merged with the corpus results.
@@ -29,7 +30,7 @@ export interface RecordedSource {
 
 const SQLITE_MAGIC = 'SQLite format 3\u0000';
 const median = (v: number[]) => { if (!v.length) return null; const s = [...v].sort((a, b) => a - b); const m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; };
-const isRow = (r: any): boolean => r && typeof r.ts === 'number' && typeof r.mint === 'string' && (r.kind === 'CREATE' || r.kind === 'TRADE' || r.kind === 'FUNDER' || r.kind === 'END') && r.payload && typeof r.payload === 'object';
+const isRow = (r: any): boolean => r && typeof r.ts === 'number' && typeof r.mint === 'string' && (r.kind === 'CREATE' || r.kind === 'TRADE' || r.kind === 'FUNDER' || r.kind === 'END' || r.kind === 'CREATOR') && r.payload && typeof r.payload === 'object';
 
 function looksLikeSqlite(file: string): boolean {
   const fd = fs.openSync(file, 'r');
@@ -54,14 +55,16 @@ export function openSqlite(file: string): RecordedSource {
     },
     *launches() {
       const mints = (db.prepare(`SELECT mint FROM launch_recording WHERE kind = 'CREATE' GROUP BY mint ORDER BY MIN(ts) ASC, MIN(id) ASC`).all() as any[]).map((r) => r.mint as string);
-      const q = db.prepare(`SELECT ts, kind, payload_json FROM launch_recording WHERE mint = ? AND kind IN ('CREATE','TRADE','END') ORDER BY ts ASC, id ASC`);
+      const q = db.prepare(`SELECT ts, kind, payload_json FROM launch_recording WHERE mint = ? AND kind IN ('CREATE','TRADE','END','CREATOR') ORDER BY ts ASC, id ASC`);
       for (const mint of mints) {
         const rows = q.all(mint) as any[];
         const end = rows.find((r) => r.kind === 'END');
+        const creatorReports = rows.filter((r) => r.kind === 'CREATOR').map((r) => recordedCreatorReport(r.ts, JSON.parse(r.payload_json)));
         yield {
           mint,
-          events: rows.filter((r) => r.kind !== 'END').map((r) => ({ ts: r.ts as number, kind: r.kind as 'CREATE' | 'TRADE', payload: JSON.parse(r.payload_json) })),
+          events: rows.filter((r) => r.kind === 'CREATE' || r.kind === 'TRADE').map((r) => ({ ts: r.ts as number, kind: r.kind as 'CREATE' | 'TRADE', payload: JSON.parse(r.payload_json) })),
           ...(end ? { endTs: end.ts as number, endReason: String(JSON.parse(end.payload_json).reason) } : {}),
+          ...(creatorReports.length ? { creatorReports } : {}),
         };
       }
     },
@@ -83,10 +86,13 @@ export async function openJsonl(file: string): Promise<RecordedSource> {
     let l = byMint.get(r.mint); if (!l) byMint.set(r.mint, (l = { mint: r.mint, events: [] }));
     // 5C: one END row per launch (5B); the earliest wins, as the first by id does in SQLite
     if (r.kind === 'END') { if (l.endTs === undefined || r.ts < l.endTs) { l.endTs = r.ts; l.endReason = String(r.payload.reason); } continue; }
+    // 5B-2: the live creator report(s), oldest first (sorted below with the events)
+    if (r.kind === 'CREATOR') { (l.creatorReports ??= []).push(recordedCreatorReport(r.ts, r.payload)); continue; }
     l.events.push({ ts: r.ts, kind: r.kind, payload: r.payload });
   }
   if (bad > 0) console.error(`recorded snapshot: ${bad} line(s) skipped (not JSON or not {ts, mint, kind, payload})`);
   const launches = [...byMint.values()].filter((l) => l.events.some((e) => e.kind === 'CREATE'));
+  for (const l of launches) l.creatorReports?.sort((a, b) => a.ts - b.ts);
   for (const l of launches) l.events.sort((a, b) => a.ts - b.ts); // stable: file order breaks ties, as the id does in SQLite
   const createTs = (l: RecordedLaunch) => Math.min(...l.events.filter((e) => e.kind === 'CREATE').map((e) => e.ts));
   launches.sort((a, b) => createTs(a) - createTs(b));

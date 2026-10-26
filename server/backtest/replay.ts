@@ -4,6 +4,7 @@ import { ConfluenceEngine, isConfluencePassed } from '../signals/confluenceEngin
 import { CurveVelocityEvaluator } from '../signals/curveVelocityEvaluator';
 import { OnChainPoolStats, tradePriceSol } from '../market/poolStats';
 import type { PumpTradeEvent } from '../solana/pumpFeedListener';
+import type { RecordedCreatorReport } from './launchRecorder';
 import { simulatePath, priceEntryParts, px, BASE_FEE_SOL, PRIORITY_BUY_SOL, PRIORITY_SELL_SOL, PUMP_FEE_SDK_PCT, type CostCase, type TradeRow } from './costModel';
 
 /**
@@ -87,8 +88,9 @@ export interface RecordedEvent { ts: number; kind: 'CREATE' | 'TRADE'; payload: 
 /**
  * `endTs` (optional): when the recording of this launch is known to have ended (an END row). When present it decides the coverage, not ReplayOptions.recordedForMs.
  * `endReason` (5B): the END row's reason, TRADE_CAP, WINDOW or CURVE_COMPLETE.
+ * `creatorReports` (5B-2): the live creator report(s) the recorder saved for this launch (CREATOR rows), oldest first; none recorded = absent.
  */
-export interface RecordedLaunch { mint: string; events: RecordedEvent[]; endTs?: number; endReason?: string }
+export interface RecordedLaunch { mint: string; events: RecordedEvent[]; endTs?: number; endReason?: string; creatorReports?: RecordedCreatorReport[] }
 
 /**
  * 5C (R1-106): how the recording of a launch ended, from its END row. COMPLETE: recorded for the whole window. TRUNCATED: the recorder's

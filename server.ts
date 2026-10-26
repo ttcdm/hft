@@ -19,7 +19,7 @@ import { creatorRiskScorer } from './server/signals/creatorRiskScorer';
 import { buildSystemChecks } from './server/system/systemChecks';
 import { isReadOnly, assertReadOnlyStartup } from './server/solana/readOnly';
 import { LaunchRecorder } from './server/backtest/launchRecorder';
-import { recorderConfigProblems } from './server/backtest/recorderConfig';
+import { recorderConfig, recorderConfigProblems } from './server/backtest/recorderConfig';
 import { replayLaunchesAsync } from './server/backtest/replay';
 import { checkConfluenceThreshold, getConfluenceThreshold, envConfluenceProblem } from './server/signals/confluenceThreshold';
 import { maxCurveProgressProblem } from './server/signals/curveProgressCap';
@@ -1238,7 +1238,9 @@ app.get('/api/backtest/replay', requireOperatorAuth, asyncHandler(async (req, re
     if (!running) {
       running = (async () => {
         const { launches, funders } = workstationDb.loadLaunchRecording(cap);
-        const report = await replayLaunchesAsync(launches, funders, solPriceService.lastKnownPrice(), minScore === undefined ? {} : { minScore });
+        // 5A: the recorder's window and trade cap tell the replay how far each recording reaches (a quiet coin's stale exit is then visible)
+        const rc = recorderConfig();
+        const report = await replayLaunchesAsync(launches, funders, solPriceService.lastKnownPrice(), { ...(minScore === undefined ? {} : { minScore }), recordedForMs: rc.mintMs, recordedMaxTrades: rc.maxTradesPerMint });
         // S188: the replay covers the newest `cap` launches; the response says so, so a count below the recorder's is explained
         const body = { success: true, recorded: status, report, message: null, replayedLaunches: launches.length, replayCap: cap };
         replayCache = { key, at: Date.now(), body };

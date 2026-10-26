@@ -20,9 +20,7 @@ const RUNBOOK_GET = new RegExp(`\\bapi\\s+"?\\$APEX(\\/api\\/${PATH_CHARS})`, 'g
 const REGISTERED = new RegExp(`\\.(get|post|put|delete|patch)\\(\\s*(['"\`])(\\/api\\/[^'"\`]+)\\2`, 'g');
 
 /** Routes a document names on purpose because they do NOT exist (it reports the mistake). Each entry must still be absent and still named. */
-const NAMED_AS_ABSENT: Array<{ file: string; route: string }> = [
-  { file: path.join('docs', 'DEVNET_VERIFICATION_PLAN.md'), route: 'POST /api/auth/session' },
-];
+const NAMED_AS_ABSENT: Array<{ file: string; route: string }> = [];
 
 const clean = (p: string) => p.replace(/[.,:;)]+$/, '').replace(/\/+$/, '');
 

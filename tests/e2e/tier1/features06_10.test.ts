@@ -676,21 +676,13 @@ describe('Tier 1: Feature Coverage (Features 6 - 10)', () => {
       expect(paperDailyPnl).toBe(0.01);
     });
 
-    it('F10.5: demo mode flag is false by default in production and CI', async () => {
-      vi.stubEnv('DEMO_MODE', undefined as any);
-      vi.resetModules();
-      const unset = await import('../../../server/solana/executionConfig');
-      expect(unset.executionConfig.getConfig().demoMode).toBe(false);
-
-      vi.stubEnv('DEMO_MODE', 'false');
-      vi.resetModules();
-      const off = await import('../../../server/solana/executionConfig');
-      expect(off.executionConfig.getConfig().demoMode).toBe(false);
-
-      vi.stubEnv('DEMO_MODE', 'true');
-      vi.resetModules();
-      const on = await import('../../../server/solana/executionConfig');
-      expect(on.executionConfig.getConfig().demoMode).toBe(true);
+    it('F10.5: executionConfig carries no demo mode flag; DEMO_MODE is read where it acts (P3.1: the old field was stored and never read)', async () => {
+      for (const value of [undefined, 'false', 'true']) {
+        vi.stubEnv('DEMO_MODE', value as any);
+        vi.resetModules();
+        const mod = await import('../../../server/solana/executionConfig');
+        expect('demoMode' in mod.executionConfig.getConfig()).toBe(false);
+      }
     });
   });
 });

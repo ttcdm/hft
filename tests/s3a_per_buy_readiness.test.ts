@@ -267,4 +267,45 @@ describe('3A: per-buy readiness and fail-closed buy checks (real coordinator, LI
     expect(reservedAtBuild[0] - reservedAtBuild[1]).toBeCloseTo(PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS / 1e9, 9);
   });
 
+  it('N-20: DEMO_MODE=true after the arm: the buy is refused LIVE_NOT_READY; disarmed, arming again is refused', async () => {
+    vi.stubEnv('DEMO_MODE', 'true');
+    const res = await coordinator.executeTrade(buyReq());
+    expect(res.error).toMatch(/^LIVE_NOT_READY: .*DEMO_MODE=true/);
+    expect(build).not.toHaveBeenCalled();
+    coordinator.armLiveTrading(false);
+    const arm = coordinator.armLiveTrading(true, 'CONFIRM_LIVE_TRADING_RISK');
+    expect(arm.success).toBe(false);
+    expect(arm.message).toMatch(/DEMO_MODE=true/);
+    expect(coordinator.canExecuteLive().allowed).toBe(false);
+  });
+});
+
+describe('3A N-20: the DEMO_MODE price simulator moves only the demo pools', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.unstubAllEnvs();
+  });
+
+  it('an on-chain pool keeps its price across simulator ticks; a demo pool moves', () => {
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'setTimeout', 'clearTimeout'] });
+    vi.stubEnv('DEMO_MODE', 'true');
+    vi.spyOn(solPriceService, 'lastKnownPrice').mockReturnValue(150);
+    vi.spyOn(Math, 'random').mockReturnValue(0.9); // a +0.48% step every tick, so a moved price is certain
+    const agg = new MemecoinAggregatorService();
+    const l = new PumpFeedListener();
+    const mint = Keypair.generate().publicKey.toBase58();
+    const ev = l.parseLogs({ err: null, signature: 's3a', logs: PumpFeedListener.asPumpInvocation(PumpFeedListener.encodeCreateEventLog({ name: 'S3A', symbol: 'S3A', uri: '', mint, creator: Keypair.generate().publicKey.toBase58() })) } as any, { slot: 9 })!;
+    l.destroy();
+    const onchain = agg.ingestOnChainCreateEvent(ev);
+    const demo = agg.getPools().find((p) => p.id !== onchain.id)!;
+    expect(demo).toBeDefined();
+    const onchainPrice = onchain.priceNative;
+    const onchainUsd = onchain.priceUsd;
+    const demoPrice = demo.priceUsd;
+    vi.advanceTimersByTime(6_000); // three simulator ticks
+    expect(onchain.priceNative).toBe(onchainPrice);
+    expect(onchain.priceUsd).toBe(onchainUsd);
+    expect(demo.priceUsd).not.toBe(demoPrice);
+  });
 });

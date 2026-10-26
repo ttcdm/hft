@@ -15,7 +15,6 @@ export interface AuthoritativeExecutionConfig {
   capitalTier: 'MICRO_10' | 'INSTITUTIONAL' | 'CUSTOM';
   maxDailyLossUsd: number;
   maxPositionSizeSol: number;
-  demoMode: boolean;
   // R0.5 & R0.6 Authoritative Execution, Retry & Fallback Configuration
   jitoMaxRetries: number;
   jitoRetryIntervalMs: number;
@@ -141,7 +140,6 @@ export class ExecutionConfigManager {
       capitalTier,
       maxDailyLossUsd: parsePositiveLimit('MAX_DAILY_LOSS_USD', process.env.MAX_DAILY_LOSS_USD, capitalTier === 'MICRO_10' ? 7 : 250),
       maxPositionSizeSol: parsePositiveLimit('MAX_POSITION_SIZE_SOL', process.env.MAX_POSITION_SIZE_SOL, capitalTier === 'MICRO_10' ? 0.02 : 1.5),
-      demoMode: process.env.DEMO_MODE === 'true',
       jitoMaxRetries: parseInt(process.env.JITO_MAX_RETRIES || '2', 10) || 2,
       jitoRetryIntervalMs: parseInt(process.env.JITO_RETRY_INTERVAL_MS || '1000', 10) || 1000,
       enableRpcFallback: process.env.ENABLE_RPC_FALLBACK === 'true',

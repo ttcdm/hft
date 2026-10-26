@@ -457,6 +457,11 @@ export class ExecutionCoordinator {
       reasons.push('Workstation SQLite database is not writable');
     }
 
+    // P3.1 (N-20): DEMO_MODE loads fake callers and random-walks the demo pools' prices; it never runs next to LIVE, so arming refuses.
+    if (process.env.DEMO_MODE === 'true') {
+      reasons.push('DEMO_MODE=true: demo prices and callers are loaded; LIVE cannot be armed while it is on');
+    }
+
     if (!this.lastStartupReconciliation || this.lastStartupReconciliation.status !== 'EXECUTION_READY') {
       reasons.push(
         this.lastStartupReconciliation
@@ -597,6 +602,7 @@ export class ExecutionCoordinator {
     const breaker = riskEngine.getCircuitBreakerState();
     if (breaker !== 'CLOSED') problems.push(`the risk circuit breaker is ${breaker}`);
     if (this.positionMarkHealth === 'STALE') problems.push('the position mark feed is STALE');
+    if (process.env.DEMO_MODE === 'true') problems.push('DEMO_MODE=true (demo prices and callers are loaded)');
     return problems;
   }
 

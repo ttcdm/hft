@@ -936,8 +936,9 @@ export class MemecoinAggregatorService extends EventEmitter {
       // Isolate synthetic visualizer ticks from real live on-chain market feed freshness
       executionCoordinator.recordSyntheticMarketEvent('UI_PRICE_SIMULATOR');
 
-      // Demo pool variation for UI visualizer
+      // Demo pool variation for UI visualizer. P3.1 (N-20): only the built-in demo pools move; a pool ingested from the chain keeps its real price.
       this.pools.forEach((pool) => {
+        if (!DEMO_POOL_IDS.has(pool.id)) return;
         const deltaPct = (Math.random() - 0.5) * 1.2;
         pool.priceUsd = Math.max(0.000001, pool.priceUsd * (1 + deltaPct / 100));
         if (this.solPriceUsd > 0) pool.priceNative = pool.priceUsd / this.solPriceUsd;

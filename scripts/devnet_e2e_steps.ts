@@ -2084,6 +2084,31 @@ export function mintNeedsReplacing(exits: MintExits): boolean {
 }
 
 /**
+ * 3F (task 3K): a fresh pump coin with no dev buy, made by a throwaway creator (made once by `creator()`, key on disk before it is funded)
+ * lent `lendSol` and refunded right after the create. null (a FAIL line) when the coin could not be made; a failed refund is a FAIL line
+ * naming the key, and the coin is still returned.
+ */
+export async function makeHarnessCoin(
+  s: Pick<HarnessSteps, 'rec'>, label: string,
+  d: { kit: ChainKit; creator(): any; payer: any; lendSol?: number; failDetail?: string },
+): Promise<string | null> {
+  const creator = d.creator();
+  let fresh: string;
+  try {
+    await d.kit.transfer(d.payer, creator.publicKey, d.lendSol ?? 0.012);
+    fresh = (await d.kit.create(creator, 'F3K', '3K fresh harness coin')).mint;
+  } catch (e: any) {
+    s.rec(`${label}: a fresh harness coin (3F)`, false, `${d.failDetail ?? 'no coin was made'}: ${String(e?.message ?? e).slice(0, 160)}`);
+    await d.kit.refund(creator, d.payer.publicKey).catch(() => undefined);
+    return null;
+  }
+  try { await d.kit.refund(creator, d.payer.publicKey); } catch (e: any) {
+    s.rec(`${label}: refund ${creator.publicKey.toBase58()}`, false, `${String(e?.message ?? e).slice(0, 120)}; key in <scratch>/temp-wallets/`);
+  }
+  return fresh;
+}
+
+/**
  * 3F (task 3K): called before each step that buys the harness mint. When the scratch DB holds a closed position on `mint` (an earlier step
  * or an earlier run sold it), a throwaway creator (made once by `creator()`, key on disk before it is funded) is lent `lendSol`, creates a
  * fresh pump coin with no dev buy, and is refunded at once. Returns the coin the step should buy: `mint` itself when it was never closed,
@@ -2097,19 +2122,101 @@ export async function freshMintIfExited(
   const exits = d.exits(d.mint);
   if (!mintNeedsReplacing(exits)) return d.mint;
   const why = exits === null ? 'its closed positions could not be read' : 'it has a closed LIVE position in this scratch DB';
-  const creator = d.creator();
-  let fresh: string;
-  try {
-    await d.kit.transfer(d.payer, creator.publicKey, d.lendSol ?? 0.012);
-    fresh = (await d.kit.create(creator, 'F3K', '3K fresh harness coin')).mint;
-  } catch (e: any) {
-    s.rec(`${label}: a fresh harness coin (3F)`, false, `${d.mint.slice(0, 8)}... cannot be bought again (${why}) and no new coin was made: ${String(e?.message ?? e).slice(0, 160)}`);
-    await d.kit.refund(creator, d.payer.publicKey).catch(() => undefined);
-    return null;
-  }
-  try { await d.kit.refund(creator, d.payer.publicKey); } catch (e: any) {
-    s.rec(`${label}: refund ${creator.publicKey.toBase58()}`, false, `${String(e?.message ?? e).slice(0, 120)}; key in <scratch>/temp-wallets/`);
-  }
+  const fresh = await makeHarnessCoin(s, label, { ...d, failDetail: `${d.mint.slice(0, 8)}... cannot be bought again (${why}) and no new coin was made` });
+  if (!fresh) return null;
   console.log(`INFO  ${label}: ${d.mint.slice(0, 8)}... cannot be bought again (3F MINT_RECENTLY_EXITED: ${why}); this step buys a fresh harness coin ${fresh}`);
   return fresh;
+}
+
+export interface ReentryBlockDeps {
+  /** A coin no step of this run has traded (makeHarnessCoin). null when none could be made (that line already FAILed). */
+  makeCoin(): Promise<string | null>;
+  /** A LIVE buy request for `mint` (fresh signal time; the harness coin's holder waiver applies). */
+  buildBuyRequestFor(mint: string): Promise<ExecuteTradeRequest>;
+  /** The position as the DB has it (status, realized PnL), or undefined. */
+  position(id: string): { status: string; realizedPnLSol?: number } | undefined;
+  /** The harness wallet's balance in lamports (one read; may throw). */
+  balanceLamports(): Promise<number | null>;
+  /** The app's auto controller (what POST /api/auto/mode runs). */
+  auto: { setMode(mode: 'OFF' | 'DEVNET_LIVE', opts?: { confirmationCode?: string }): Promise<{ ok: boolean; mode: string; error?: string }> };
+}
+
+/**
+ * (p) 3F (R1-9), task 3K, opt-in (DEVNET_REENTRY_BLOCK=1): no re-entry into a mint after an exit. On a fresh harness coin P (one no step
+ * of this run has traded): a LIVE buy of P is CONFIRMED and sold in full (the position CLOSED, its realized PnL recorded). After the per-mint
+ * cooldown, a second buy of P is refused RISK_REJECTED MINT_RECENTLY_EXITED: no new BUY row, no signature, the wallet balance unchanged.
+ * Auto is then set to DEVNET_LIVE and back to OFF (setMode clears the controller's per-session attempted set, the only re-entry guard before
+ * 3F), and a third buy of P is still refused. A lost balance read makes that one comparison a SKIP. `finally` turns auto OFF and sells
+ * anything open on P (before 3F the second buy went through: the cleanup sells it). Returns when its last trade settled.
+ */
+export async function reentryBlockedAfterExit(s: HarnessSteps, d: ReentryBlockDeps): Promise<number> {
+  const L = '(p) 3F: no re-entry after an exit';
+  const skip = (step: string, detail: string) => (s.skip ? s.skip(step, detail) : console.log(`SKIP  ${step}: ${detail}`));
+  let lastTradeAt = Date.now();
+  let mint: string | null = null;
+  const open = () => s.db.loadPositions().filter((p) => p.mint === mint && p.status !== 'CLOSED');
+  const buyRows = () => s.db.loadTransactions().filter((t) => t.mint === mint && t.direction === 'BUY').length;
+  const refused = async (label: string) => {
+    await s.coordinator.syncRealWalletBalance();
+    const rowsBefore = buyRows();
+    const balBefore = await readWithRetry(d.balanceLamports, s.sleep);
+    const r = await s.coordinator.executeTrade(await d.buildBuyRequestFor(mint!));
+    if (r.success) lastTradeAt = Date.now();
+    const balAfter = await readWithRetry(d.balanceLamports, s.sleep);
+    const sig = r.txSignature || r.signature || '';
+    s.rec(
+      `${L}: ${label}: refused MINT_RECENTLY_EXITED, nothing sent`,
+      !r.success && r.lifecycleState === 'RISK_REJECTED' && /^MINT_RECENTLY_EXITED/.test(r.error ?? '') && buyRows() === rowsBefore && !sig,
+      `${r.lifecycleState} ${r.error ?? ''}; BUY rows ${rowsBefore} -> ${buyRows()}${sig ? `; signature ${s.link(sig)}` : ''}`.slice(0, 400)
+    );
+    if (balBefore === null || balAfter === null) skip(`${L}: ${label}: wallet unchanged`, 'a balance read was lost (3 retries); not compared');
+    else s.rec(`${L}: ${label}: wallet unchanged`, balAfter === balBefore, `${balBefore} -> ${balAfter} lamports`);
+  };
+  try {
+    mint = await d.makeCoin();
+    if (!mint) return lastTradeAt;
+    // 1. one round trip on P
+    await s.coordinator.syncRealWalletBalance();
+    const buy = await s.coordinator.executeTrade(await d.buildBuyRequestFor(mint));
+    lastTradeAt = Date.now();
+    s.rec(`${L}: buy of a fresh coin CONFIRMED`, buy.success && buy.lifecycleState === 'CONFIRMED', `${mint.slice(0, 8)}... ${buy.lifecycleState} ${buy.error ?? ''}`.slice(0, 300));
+    if (!buy.success) return lastTradeAt;
+    for (const p of open()) {
+      const c = await s.coordinator.closePosition(p.id, 100, 'e2e (p)');
+      lastTradeAt = Date.now();
+      const row = d.position(p.id);
+      s.rec(`${L}: sold in full, position CLOSED`, c.success && row?.status === 'CLOSED', `${c.error ?? 'closed'}; status ${row?.status}; realized PnL ${row?.realizedPnLSol ?? '?'} SOL`);
+    }
+    if (open().length) return lastTradeAt;
+    // 2. after the per-mint cooldown, the same coin again
+    await waitPast(s, lastTradeAt, s.riskLimits().cooldownPerMintMs, 'per-mint cooldown from the (p) sell');
+    await refused('buy of the same coin after the cooldown');
+    // 3. setMode clears the auto controller's attempted set; the block is in the positions table, so it holds
+    const prevAuto = process.env.AUTO_SNIPE_ENABLED;
+    process.env.AUTO_SNIPE_ENABLED = 'true'; // for these two calls only, as (e''') and (m) do
+    let on: { ok: boolean; mode: string; error?: string };
+    let off: { ok: boolean; mode: string; error?: string };
+    try {
+      on = await d.auto.setMode('DEVNET_LIVE', { confirmationCode: 'CONFIRM_AUTO_DEVNET' });
+      off = await d.auto.setMode('OFF');
+    } finally {
+      if (prevAuto === undefined) delete process.env.AUTO_SNIPE_ENABLED; else process.env.AUTO_SNIPE_ENABLED = prevAuto;
+    }
+    s.rec(`${L}: auto DEVNET_LIVE then OFF`, on.ok && off.ok && off.mode === 'OFF', `${on.ok ? on.mode : on.error}; ${off.ok ? off.mode : off.error}`);
+    await refused('buy after auto DEVNET_LIVE and OFF');
+  } catch (e: any) {
+    s.rec(L, false, String(e?.message ?? e).slice(0, 300));
+  } finally {
+    try { await d.auto.setMode('OFF'); } catch (e: any) { s.rec(`${L}: auto OFF after the step`, false, String(e?.message ?? e).slice(0, 200)); }
+    if (mint) {
+      for (const p of open()) {
+        try {
+          const c = await s.coordinator.closePosition(p.id, 100, 'e2e (p) cleanup');
+          lastTradeAt = Date.now();
+          s.rec(`${L}: cleanup close 100%`, c.success, c.error || 'closed');
+        } catch (e: any) { s.rec(`${L}: cleanup close 100%`, false, String(e?.message ?? e).slice(0, 200)); }
+      }
+    }
+  }
+  return lastTradeAt;
 }

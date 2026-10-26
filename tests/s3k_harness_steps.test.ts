@@ -2,7 +2,8 @@ import { describe, it, expect } from 'vitest';
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
-  hasBudget, sessionSpendMatchesWallet, killSurvivesRestart, startSendHoldingRelay, freshMintIfExited, mintNeedsReplacing,
+  hasBudget, sessionSpendMatchesWallet, killSurvivesRestart, startSendHoldingRelay, freshMintIfExited, mintNeedsReplacing, reentryBlockedAfterExit,
+  type HarnessSteps,
   type SessionSpendDeps, type KillRestartDeps, type ChildApp, type ChainKit,
 } from '../scripts/devnet_e2e_steps';
 
@@ -296,5 +297,66 @@ describe('3K 3F: freshMintIfExited', () => {
     const r = recorder(); const k = fakeKit({ refundThrows: true });
     expect(await freshMintIfExited(r, '(l)', { mint: 'OLD', exits: () => ({ lastExit: null, loss: { positionId: 'p', realizedLamports: -5 } }), kit: k.kit, creator: () => k.kit.newWallet(), payer })).toBe('FRESH');
     expect(fails(r.recs)).toEqual([expect.objectContaining({ step: '(l): refund CREATOR', detail: expect.stringMatching(/temp-wallets/) })]);
+  });
+});
+
+describe('3K (p): no re-entry after an exit (3F)', () => {
+  const fakeApp = (o: { blocks: boolean; noCoin?: boolean }) => {
+    const r = recorder();
+    const positions: Array<{ id: string; mint: string; status: string; realizedPnLSol?: number }> = [];
+    const txs: Array<{ signature: string; orderId: string; direction: string; reconciliationState: string; mint: string }> = [];
+    let lamports = 1_000_000_000;
+    const modes: string[] = [];
+    const steps: HarnessSteps = {
+      coordinator: {
+        syncRealWalletBalance: async () => lamports,
+        executeTrade: async (req: any) => {
+          if (positions.some((p) => p.mint === req.mint && p.status !== 'CLOSED')) return { success: false, lifecycleState: 'RISK_REJECTED', error: 'POSITION_ALREADY_OPEN' } as any;
+          if (o.blocks && positions.some((p) => p.mint === req.mint)) return { success: false, lifecycleState: 'RISK_REJECTED', error: 'MINT_RECENTLY_EXITED: closed at a loss' } as any;
+          const n = txs.length;
+          txs.push({ signature: `sig${n}`, orderId: `o${n}`, direction: 'BUY', reconciliationState: 'CONFIRMED', mint: req.mint });
+          positions.push({ id: `p${n}`, mint: req.mint, status: 'OPEN' });
+          lamports -= 12_000_000;
+          return { success: true, lifecycleState: 'CONFIRMED', txSignature: `sig${n}` } as any;
+        },
+        closePosition: async (id: string) => { const p = positions.find((x) => x.id === id)!; p.status = 'CLOSED'; p.realizedPnLSol = -0.002; lamports += 9_000_000; return { success: true }; },
+      },
+      curve: { calculateBuyQuote: () => null },
+      db: { loadTransactions: () => txs, loadPositions: () => positions },
+      riskLimits: () => ({ cooldownAfterFailedTradeMs: 0, cooldownPerMintMs: 0 }),
+      chainErr: async () => null, mint: '', buildBuyRequest: async () => ({}) as any,
+      rec: r.rec, skip: r.skip, sleep: r.sleep, link: (x) => x,
+    };
+    const prevAuto = process.env.AUTO_SNIPE_ENABLED;
+    const deps = {
+      makeCoin: async () => (o.noCoin ? null : 'COINP'),
+      buildBuyRequestFor: async (m: string) => ({ mint: m }) as any,
+      position: (id: string) => positions.find((p) => p.id === id),
+      balanceLamports: async () => lamports,
+      auto: { setMode: async (m: 'OFF' | 'DEVNET_LIVE') => { modes.push(`${m}:${process.env.AUTO_SNIPE_ENABLED}`); return { ok: true, mode: m }; } },
+    };
+    return { r, steps, deps, positions, modes, prevAuto };
+  };
+  it('an app with 3F: every line passes; auto ends OFF and AUTO_SNIPE_ENABLED is put back', async () => {
+    const f = fakeApp({ blocks: true });
+    await reentryBlockedAfterExit(f.steps, f.deps);
+    expect(fails(f.r.recs), JSON.stringify(f.r.recs, null, 1)).toEqual([]);
+    expect(f.r.recs.filter((x) => x.step.includes('refused MINT_RECENTLY_EXITED'))).toHaveLength(2);
+    expect(f.modes).toEqual(['DEVNET_LIVE:true', 'OFF:true', `OFF:${f.prevAuto}`]);
+    expect(process.env.AUTO_SNIPE_ENABLED).toBe(f.prevAuto);
+  });
+  it('an app without 3F: the re-buy goes through, its lines FAIL, and the cleanup sells it', async () => {
+    const f = fakeApp({ blocks: false });
+    await reentryBlockedAfterExit(f.steps, f.deps);
+    expect(line(f.r.recs, 'after the cooldown: refused')?.ok).toBe(false);
+    expect(line(f.r.recs, 'after the cooldown: wallet unchanged')?.ok).toBe(false);
+    expect(f.positions.every((p) => p.status === 'CLOSED')).toBe(true);
+    expect(line(f.r.recs, 'cleanup close 100%')?.ok).toBe(true);
+  });
+  it('no coin could be made: no buy, nothing else recorded by the step', async () => {
+    const f = fakeApp({ blocks: true, noCoin: true });
+    await reentryBlockedAfterExit(f.steps, f.deps);
+    expect(f.positions).toEqual([]);
+    expect(f.r.recs).toEqual([]);
   });
 });

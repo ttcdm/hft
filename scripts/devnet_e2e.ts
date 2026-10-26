@@ -24,7 +24,7 @@ const DEFAULT_MINTS = [
 const phase = process.argv.includes('--phase=crash') ? 'crash' : process.argv.includes('--phase=recover') ? 'recover' : 'main';
 const scratch = process.env.APEX_E2E_SCRATCH || fs.mkdtempSync(path.join(os.tmpdir(), 'apex-e2e-'));
 const keyPath = path.join(scratch, 'throwaway-keypair.json');
-// Every throwaway wallet steps (i), (k), (t), (u), (m), (o) and the 3F fresh-coin creator create is written here before it is funded, and left here (Mike, 2026-10-24).
+// Every throwaway wallet steps (i), (k), (t), (u), (m), (o), (p) and the 3F fresh-coin creator create is written here before it is funded, and left here (Mike, 2026-10-24).
 const tempWalletDir = path.join(scratch, 'temp-wallets');
 // 3I: what the opt-in steps (t), (u) and (n) need free in the harness wallet before they start: what they lend, plus fees and a margin.
 const RPC_SWITCH_NEED_SOL = 0.1;
@@ -33,6 +33,8 @@ const SELLER_NEVER_BOUGHT_NEED_SOL = 0.15;
 const LOSS_FLOOR_NEED_SOL = 0.05;
 // (l): one harness buy and sell, the same as (n).
 const READINESS_GATE_NEED_SOL = 0.05;
+// 3K (p): one 0.01-sized harness buy under the 10% spendable ceiling and its fees, plus 0.012 lent to the coin creator, with a margin.
+const REENTRY_BLOCK_NEED_SOL = 0.05;
 // 3K (m): 0.15 lent to the coin creator, and enough left for five 0.008 SOL auto buys under the 10% spendable ceiling, with a margin.
 const SESSION_SPEND_NEED_SOL = 0.3;
 // 3K (o): 0.15 lent to the step's own server wallet (a 0.01 SOL buy under the 10% ceiling) and 0.03 to the coin creator, with a margin.
@@ -489,6 +491,8 @@ async function main() {
   if (process.env.DEVNET_READINESS_GATE === '1') await freshMintFor('(l)');
   const lDoneAt = await readinessGateStep(steps, S, { conn, kp, Keypair, coordinator, workstationDb });
   await S.waitPast(steps, lDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (l) trades');
+  const pDoneAt = await reentryBlockStep(steps, S, { conn, web3, kp, coordinator, workstationDb, PumpCurveService, txBuilder, buildBuyRequestFor }); // 3K (p): its own coin
+  await S.waitPast(steps, pDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (p) trades');
   await sessionSpendStep(steps, S, { conn, web3, kp, coordinator, workstationDb, PumpCurveService, txBuilder }); // 3K (m): its own coins
   await killRestartStep(steps, S, { conn, web3, kp, PumpCurveService, txBuilder }); // 3K (o): its own server, DB, wallet and coin
   await freshMintFor("(e''')");
@@ -695,6 +699,37 @@ async function sellerNeverBoughtStep(steps: import('./devnet_e2e_steps').Harness
     watchWindow.stop();
     await pumpFeedListener.stop();
   }
+}
+
+/**
+ * (p) 3F, task 3K, opt-in (DEVNET_REENTRY_BLOCK=1): no re-entry into a mint after an exit (S.reentryBlockedAfterExit), on a fresh harness coin
+ * no other step of this run trades, bought and sold by the harness wallet through the app's own executeTrade. Returns when its last trade settled.
+ */
+async function reentryBlockStep(steps: import('./devnet_e2e_steps').HarnessSteps, S: typeof import('./devnet_e2e_steps'), d: FeedStepDeps & {
+  workstationDb: any; buildBuyRequestFor: (m: string, st: any, allowWaive: boolean) => Promise<any>;
+}): Promise<number> {
+  const L = '(p) 3F: no re-entry after an exit';
+  if (process.env.DEVNET_REENTRY_BLOCK !== '1') {
+    console.log(`INFO  (p) skipped: set DEVNET_REENTRY_BLOCK=1 (needs ${REENTRY_BLOCK_NEED_SOL} SOL free, spends about 0.01: one coin's rent and one round trip) to run the no-re-entry-after-an-exit step (3F)`);
+    return 0;
+  }
+  const bal = async () => (await d.conn.getBalance(d.kp.publicKey)) / 1e9;
+  if (!(await S.hasBudget(steps, L, bal, REENTRY_BLOCK_NEED_SOL, 'DEVNET_REENTRY_BLOCK'))) return 0;
+  const { PUMP_SDK } = await import('@pump-fun/pump-sdk');
+  const { autoSnipeController } = await import('../server/auto/controller');
+  const kit = S.makeChainKit({ conn: d.conn, web3: d.web3, sdk: PUMP_SDK, curve: d.PumpCurveService, builder: d.txBuilder, keyDir: tempWalletDir });
+  let creator: any = null;
+  const b0 = await bal().catch(() => null);
+  const doneAt = await S.reentryBlockedAfterExit(steps, {
+    makeCoin: () => S.makeHarnessCoin(steps, L, { kit, creator: () => (creator ??= kit.newWallet()), payer: d.kp }),
+    buildBuyRequestFor: async (m) => d.buildBuyRequestFor(m, await d.PumpCurveService.fetchPumpMarketState({ connection: d.conn, mint: new d.web3.PublicKey(m), executionMode: 'LIVE' }), true),
+    position: (id) => d.workstationDb.loadPositions().find((p: any) => p.id === id),
+    balanceLamports: () => d.conn.getBalance(d.kp.publicKey),
+    auto: autoSnipeController as any,
+  });
+  const b1 = await bal().catch(() => null);
+  if (b0 !== null && b1 !== null) console.log(`INFO  (p) cost the harness wallet ${(b0 - b1).toFixed(5)} SOL`);
+  return doneAt;
 }
 
 /**

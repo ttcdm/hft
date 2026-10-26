@@ -1,9 +1,9 @@
 /**
- * Localnet dry run of the devnet harness's Stage 3 steps for task 3K: (m) for 3B and (o) for 3E in scripts/devnet_e2e_steps.ts, the same
+ * Localnet dry run of the devnet harness's Stage 3 steps for task 3K: (m) for 3B, (o) for 3E and (p) for 3F in scripts/devnet_e2e_steps.ts, the same
  * functions `npm run devnet:e2e` runs, against the LiteSVM local validator (real pump.fun program binaries, scripts/localnet/validator.ts).
  *
  *   npx tsx scripts/localnet/harness_steps_3k.ts            (prints PASS/FAIL/SKIP lines, exits 1 on any FAIL)
- *   APEX_3K_ONLY=m or APEX_3K_ONLY=o                                   (one step only)
+ *   APEX_3K_ONLY=m, o or p                                   (one step only)
  *
  * Built like scripts/localnet/harness_steps.ts (3I): the app's coordinator, auto controller and watch window run in this process for (m);
  * (o) boots server.ts in child processes on its own scratch DB and its own throwaway signer. Everything is loopback; ALLOWED_CLUSTER=localnet
@@ -119,6 +119,26 @@ async function run(info: { url: string; genesisHash: string }) {
         cleanupCoins: () => coins.cleanup(),
       });
       console.log(`INFO  (m) cost the harness wallet ${(b0 - (await bal())).toFixed(5)} SOL`);
+    }
+  }
+  if (!only || only === 'p') {
+    const L = '(p) 3F: no re-entry after an exit';
+    if (armed.success && (await S.hasBudget(steps, L, bal, 0.05, 'DEVNET_REENTRY_BLOCK'))) {
+      const { liveBuyRequest } = await import('../devnet_funding');
+      const { riskEngine } = await import('../../server/risk/riskEngine');
+      let creator: any = null;
+      const b0 = await bal();
+      await S.reentryBlockedAfterExit({
+        ...steps, curve: PumpCurveService, db: workstationDb as any, riskLimits: () => riskEngine.getLimits(), mint: '', chainErr: async () => undefined,
+        buildBuyRequest: async () => { throw new Error('unused'); }, link: (sig: string) => sig.slice(0, 16),
+      }, {
+        makeCoin: () => S.makeHarnessCoin(steps, L, { kit, creator: () => (creator ??= kit.newWallet()), payer: kp }),
+        buildBuyRequestFor: async (m) => liveBuyRequest(m, 0.01, Date.now()),
+        position: (id) => workstationDb.loadPositions().find((p) => p.id === id),
+        balanceLamports: () => conn.getBalance(kp.publicKey),
+        auto: autoSnipeController,
+      });
+      console.log(`INFO  (p) cost the harness wallet ${(b0 - (await bal())).toFixed(5)} SOL`);
     }
   }
   coordinator.armLiveTrading(false);

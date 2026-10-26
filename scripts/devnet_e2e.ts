@@ -24,8 +24,11 @@ const DEFAULT_MINTS = [
 const phase = process.argv.includes('--phase=crash') ? 'crash' : process.argv.includes('--phase=recover') ? 'recover' : 'main';
 const scratch = process.env.APEX_E2E_SCRATCH || fs.mkdtempSync(path.join(os.tmpdir(), 'apex-e2e-'));
 const keyPath = path.join(scratch, 'throwaway-keypair.json');
-// Every throwaway wallet steps (i) and (k) create is written here before it is funded, and left here (Mike, 2026-10-24).
+// Every throwaway wallet steps (i), (k), (t) and (u) create is written here before it is funded, and left here (Mike, 2026-10-24).
 const tempWalletDir = path.join(scratch, 'temp-wallets');
+// 3I: what the opt-in steps (t) and (u) need free in the harness wallet before they start: what they lend, plus fees and a margin.
+const RPC_SWITCH_NEED_SOL = 0.1;
+const SELLER_NEVER_BOUGHT_NEED_SOL = 0.15;
 
 // ---- sanitized environment: must be set before any server module is imported ----
 process.env.SOLANA_RPC_URL = process.env.DEVNET_RPC_URL || 'https://api.devnet.solana.com';
@@ -372,6 +375,7 @@ async function main() {
   // The (a) buy started the 30 s per-mint cooldown; (d') must reach the chain, so it waits that out first.
   await S.waitPast(steps, buyDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (a) buy');
   const revertedAt = await S.forcedRevertThroughApp(steps);
+  await S.unreadableReservesRefused(steps); // (s) 3I: free, nothing is sent, so it runs inside the (d') failure cooldown
   await S.waitPast(steps, revertedAt, riskEngine.getLimits().cooldownAfterFailedTradeMs, "failure cooldown from the (d') revert");
   const lastBuyAt = await S.sequentialBuysOneMint(steps);
   await S.waitPast(steps, lastBuyAt, riskEngine.getLimits().cooldownPerMintMs, "per-mint cooldown from the (e') buy");
@@ -379,6 +383,7 @@ async function main() {
   await S.waitPast(steps, Date.now(), riskEngine.getLimits().cooldownPerMintMs, "per-mint cooldown from the (e'') buy");
   await S.heldBlockhashStopLoss(steps); // P1.7
   const gDoneAt = Date.now();
+  await rpcSwitchStep(steps, S, { conn, web3, kp, coordinator, PumpCurveService, txBuilder });
 
   // (h) P1.6: opt-in (DEVNET_DUMP_SOL is the most the seed may take). The seed is sized from the coin's own curve (DEVNET_E2E_README.md).
   const dumpSol = Number(process.env.DEVNET_DUMP_SOL || 0);
@@ -428,6 +433,8 @@ async function main() {
   } else {
     console.log('INFO  (i) skipped: set DEVNET_CLUSTER_CHECK=1 (needs about 0.4 SOL free, spends about 0.03) to run the creator-cluster and one-funder-cluster step');
   }
+
+  await sellerNeverBoughtStep(steps, S, { conn, web3, kp, coordinator, PumpCurveService, txBuilder });
 
   await releaseGatesStep(steps, S, { conn, web3, kp, coordinator, workstationDb, PumpCurveService, txBuilder, buildBuyRequestFor });
 
@@ -503,6 +510,62 @@ async function releaseGatesStep(steps: import('./devnet_e2e_steps').HarnessSteps
   autoSnipeController.detachWatchWindow();
   watchWindow.stop();
   await pumpFeedListener.stop();
+}
+
+type FeedStepDeps = { conn: any; web3: any; kp: any; coordinator: any; PumpCurveService: any; txBuilder: any };
+
+/**
+ * (t) 3I, opt-in (DEVNET_FEED_SWITCH=1): two quick RPC switches move the app's pump feed and leave one log subscription (B7, B10). Wired as
+ * server.ts wires it: the listener follows the coordinator, and the watch window is attached so a launch after the switch can be seen.
+ */
+async function rpcSwitchStep(steps: import('./devnet_e2e_steps').HarnessSteps, S: typeof import('./devnet_e2e_steps'), d: FeedStepDeps): Promise<void> {
+  if (process.env.DEVNET_FEED_SWITCH !== '1') {
+    console.log(`INFO  (t) skipped: set DEVNET_FEED_SWITCH=1 (needs ${RPC_SWITCH_NEED_SOL} SOL free, spends about 0.02) to run the two-quick-RPC-switches step (B7/B10)`);
+    return;
+  }
+  if (!(await S.hasBudget(steps, '(t) B7/B10: two quick RPC switches', async () => (await d.conn.getBalance(d.kp.publicKey)) / 1e9, RPC_SWITCH_NEED_SOL, 'DEVNET_FEED_SWITCH'))) return;
+  const { PUMP_SDK } = await import('@pump-fun/pump-sdk');
+  const { watchWindow } = await import('../server/signals/watchWindow');
+  const { pumpFeedListener } = await import('../server/solana/pumpFeedListener');
+  const { PUMPFUN_PROGRAM_ID } = await import('../server/solana/programs');
+  watchWindow.attach(pumpFeedListener);
+  watchWindow.start();
+  try {
+    await S.rpcSwitchMovesFeed(steps, {
+      listener: pumpFeedListener as any, coordinator: d.coordinator, Connection: d.web3.Connection, pumpProgramId: PUMPFUN_PROGRAM_ID.toBase58(),
+      rpcUrl: process.env.SOLANA_RPC_URL!, feed: { snapshot: () => watchWindow.getSnapshot() },
+      kit: S.makeChainKit({ conn: d.conn, web3: d.web3, sdk: PUMP_SDK, curve: d.PumpCurveService, builder: d.txBuilder, keyDir: tempWalletDir }), payer: d.kp,
+    });
+  } finally {
+    watchWindow.stop();
+  }
+}
+
+/** (u) 3I, opt-in (DEVNET_SELLER_NEVER_BOUGHT=1): a seller that never bought is looked up and its sell is CREATOR_SOLD (B3). Wired as (i). */
+async function sellerNeverBoughtStep(steps: import('./devnet_e2e_steps').HarnessSteps, S: typeof import('./devnet_e2e_steps'), d: FeedStepDeps): Promise<void> {
+  if (process.env.DEVNET_SELLER_NEVER_BOUGHT !== '1') {
+    console.log(`INFO  (u) skipped: set DEVNET_SELLER_NEVER_BOUGHT=1 (needs ${SELLER_NEVER_BOUGHT_NEED_SOL} SOL free, spends about 0.03) to run the seller-that-never-bought step (B3)`);
+    return;
+  }
+  if (!(await S.hasBudget(steps, '(u) B3: a seller that never bought', async () => (await d.conn.getBalance(d.kp.publicKey)) / 1e9, SELLER_NEVER_BOUGHT_NEED_SOL, 'DEVNET_SELLER_NEVER_BOUGHT'))) return;
+  const { PUMP_SDK } = await import('@pump-fun/pump-sdk');
+  const { watchWindow } = await import('../server/signals/watchWindow');
+  const { pumpFeedListener } = await import('../server/solana/pumpFeedListener');
+  const { FunderLookup, wireFunderLookup } = await import('../server/signals/funderLookup');
+  watchWindow.attach(pumpFeedListener);
+  wireFunderLookup(watchWindow, new FunderLookup(() => d.coordinator.getConnection()));
+  watchWindow.start();
+  const subscribed = await pumpFeedListener.start();
+  steps.rec('(u) B3: the pump log stream subscribed', subscribed, subscribed ? 'onLogs on the coordinator connection' : 'pumpFeedListener.start() returned false');
+  try {
+    if (subscribed) {
+      const kit = S.makeChainKit({ conn: d.conn, web3: d.web3, sdk: PUMP_SDK, curve: d.PumpCurveService, builder: d.txBuilder, keyDir: tempWalletDir });
+      await S.sellerWhoNeverBought(steps, kit, { snapshot: () => watchWindow.getSnapshot() }, d.kp);
+    }
+  } finally {
+    watchWindow.stop();
+    await pumpFeedListener.stop();
+  }
 }
 
 function finish() {

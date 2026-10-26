@@ -9,7 +9,7 @@
  *       no position, and an immediate second buy refused by the 15 s failure cooldown with nothing sent. The wrapper is restored in `finally`.
  *  (e') two sequential `executeTrade` calls on one mint: the first is CONFIRMED and opens one position, the second is refused before
  *       anything is signed (POSITION_ALREADY_OPEN). The position is then closed so step (f) starts flat.
- *  (e''), (g), (h), (i), (j) and (k) are described at their functions below.
+ *  (e''), (g), (h), (i), (j) and (k) are described at their functions below, and so are the Stage 3 steps (s), (t) and (u) (task 3I).
  *
  *  (e''') P1.4: the emergency stop. One LIVE position is opened, auto is set to DEVNET_LIVE, then Telegram `/panic_sell` is driven
  *       through the app's `processTelegramCommand` (no bot): the LIVE position must be sold on chain and auto must end OFF. Then the
@@ -23,6 +23,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
+import { createAssociatedTokenAccountIdempotentInstruction, createTransferCheckedInstruction, getAssociatedTokenAddressSync } from '@solana/spl-token';
 import type { ExecuteTradeRequest, ExecutionResponse } from '../server/execution/coordinator';
 
 type Tx = { signature: string; orderId: string; direction: string; reconciliationState: string; mint: string };
@@ -38,8 +39,8 @@ export interface HarnessSteps {
   };
   /** (g) the RPC the coordinator uses normally (the proxy forwards to it). */
   rpcUrl?: string;
-  /** The PumpCurveService class itself (its static `calculateBuyQuote` is wrapped for one call). */
-  curve: { calculateBuyQuote: (...args: any[]) => any };
+  /** The PumpCurveService class itself (its static `calculateBuyQuote` is wrapped for one call; (s) also wraps `fetchPumpMarketState`). */
+  curve: { calculateBuyQuote: (...args: any[]) => any; fetchPumpMarketState?: (...args: any[]) => Promise<any> };
   db: { loadTransactions(orderId?: string): Tx[]; loadPositions(): Pos[] };
   riskLimits: () => { cooldownAfterFailedTradeMs: number; cooldownPerMintMs: number };
   /** A signature's on-chain error (readChainErr): undefined when no read gave an answer, null when it succeeded. */
@@ -188,11 +189,20 @@ export async function ambiguousSendThroughApp(s: HarnessSteps): Promise<void> {
   }
 }
 
+/** Listens on 127.0.0.1:`port` (0: any free port); rejects when the port is taken. */
+function listenOn(server: http.Server, port: number): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', () => { server.off('error', reject); resolve(); });
+  });
+}
+
 /**
  * A loopback JSON-RPC proxy in front of `upstream` for (g). The first getLatestBlockhash it sees is held: no reply for `holdMs`, then the
- * socket is closed. Everything else is forwarded as is.
+ * socket is closed. Everything else is forwarded as is. With `holdMs` 0 nothing is held (the plain relay (t) switches to); `port` 0 takes
+ * any free port.
  */
-export async function startHoldingProxy(upstream: string, holdMs: number) {
+export async function startHoldingProxy(upstream: string, holdMs: number, port = 0) {
   const st = { blockhashCalls: 0, held: 0, holdOpen: false };
   const timers = new Set<NodeJS.Timeout>();
   const server = http.createServer((req, res) => {
@@ -203,7 +213,7 @@ export async function startHoldingProxy(upstream: string, holdMs: number) {
       try { method = String(JSON.parse(body)?.method ?? ''); } catch { /* a batch or junk: forward it */ }
       if (method === 'getLatestBlockhash') {
         st.blockhashCalls++;
-        if (st.held === 0) {
+        if (st.held === 0 && holdMs > 0) {
           st.held++;
           st.holdOpen = true;
           const t = setTimeout(() => { st.holdOpen = false; timers.delete(t); res.destroy(); }, holdMs);
@@ -219,7 +229,7 @@ export async function startHoldingProxy(upstream: string, holdMs: number) {
       }
     });
   });
-  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  await listenOn(server, port);
   return {
     url: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
     st,
@@ -350,6 +360,10 @@ export interface ChainKit {
   buy(kp: any, mint: string, sol: number): Promise<string>;
   /** Sells everything `kp` holds of `mint`; null when it holds none. */
   sellAll(kp: any, mint: string): Promise<string | null>;
+  /** (u): an SPL transfer of everything `from` holds of `mint` to `to`'s associated token account (created if missing, `from` pays its rent). */
+  transferTokens(from: any, mint: string, to: any): Promise<string>;
+  /** Raw token amount `owner` holds of `mint` (0 when it has no token account). */
+  tokenBalance(owner: any, mint: string): Promise<bigint>;
   /** Spot price in SOL per UI token, from the curve. */
   priceSol(mint: string): Promise<number>;
   /** The curve's state as the app reads it (PumpMarketState). */
@@ -446,6 +460,19 @@ export function makeChainKit(d: { conn: any; web3: any; sdk: any; curve: any; bu
       const tx = await d.builder.buildSellTransaction(d.conn, { ...tradeParams(s, m, kp.publicKey), seller: kp.publicKey, amountTokens: amount, minSolOutputLamports: BigInt(q.minOutputLamports) });
       return send(tx, [kp]);
     },
+    async transferTokens(from, mint, to) {
+      const m = new PublicKey(mint);
+      const amount = await held(from.publicKey, m);
+      if (amount <= 0n) throw new Error(`${from.publicKey.toBase58()} holds none of ${mint} to transfer`);
+      const s = await state(m);
+      const src = getAssociatedTokenAddressSync(m, from.publicKey, false, s.tokenProgram);
+      const dst = getAssociatedTokenAddressSync(m, to, false, s.tokenProgram);
+      return send(new Transaction().add(
+        createAssociatedTokenAccountIdempotentInstruction(from.publicKey, dst, to, m, s.tokenProgram),
+        createTransferCheckedInstruction(src, m, dst, from.publicKey, amount, s.tokenDecimals, [], s.tokenProgram),
+      ), [from]);
+    },
+    tokenBalance: (owner, mint) => held(owner, new PublicKey(mint)),
     curveState: (mint) => state(new PublicKey(mint)),
     async priceSol(mint) {
       const s = await state(new PublicKey(mint));
@@ -722,9 +749,10 @@ export async function creatorClusterOnChain(s: HarnessSteps, kit: ChainKit, feed
  * matters: accepting the socket and closing it at once drives web3.js 1.99's resubscribe into a microtask loop (see the validator's
  * `localnet_dropWebSockets`).
  */
-export async function startBlockingWsProxy(upstreamWs: string) {
+export async function startBlockingWsProxy(upstreamWs: string, port = 0) {
   const { WebSocketServer, WebSocket } = await import('ws');
   let blockedUntil = 0;
+  let unsubscribeDelayMs = 0;
   const pairs = new Set<{ a: any; b: any }>();
   const server = http.createServer((_req, res) => res.writeHead(426).end());
   const wss = new WebSocketServer({ noServer: true });
@@ -738,16 +766,22 @@ export async function startBlockingWsProxy(upstreamWs: string) {
       const end = () => { pairs.delete(pair); try { client.terminate(); } catch { /* gone */ } try { up.terminate(); } catch { /* gone */ } };
       up.on('open', () => { for (const m of queue.splice(0)) up.send(m); });
       up.on('message', (m: any, isBinary: boolean) => { if (client.readyState === WebSocket.OPEN) client.send(m, { binary: isBinary }); });
+      const forward = (data: any) => { if (up.readyState === WebSocket.OPEN) up.send(data); else queue.push(data); };
       client.on('message', (m: any, isBinary: boolean) => {
         const data = isBinary ? m : String(m);
-        if (up.readyState === WebSocket.OPEN) up.send(data); else queue.push(data);
+        let method = '';
+        if (!isBinary && unsubscribeDelayMs > 0) { try { method = String(JSON.parse(data)?.method ?? ''); } catch { /* not JSON: forward it */ } }
+        if (method.endsWith('Unsubscribe')) setTimeout(() => forward(data), unsubscribeDelayMs); // (t): the reply, so the client's unsubscribe, comes late
+        else forward(data);
       });
       up.on('close', end); up.on('error', end); client.on('close', end); client.on('error', end);
     });
   });
-  await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+  await listenOn(server, port);
   return {
     url: `ws://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    /** (t): every `*Unsubscribe` request from a client is forwarded `ms` late (0: at once again), as a slow RPC answers it. */
+    slowUnsubscribe(ms: number) { unsubscribeDelayMs = ms; },
     block(ms: number) {
       blockedUntil = Date.now() + ms;
       for (const p of [...pairs]) { try { p.a.terminate(); } catch { /* gone */ } try { p.b.terminate(); } catch { /* gone */ } }
@@ -1071,4 +1105,304 @@ export async function readChainErr(
     if (st && st.confirmationStatus) return st.err ?? null;
   } catch { /* no answer */ }
   return undefined;
+}
+
+// ---- Stage 3 steps (task 3I). Letters (l) to (p) are kept for the Stage 3 tasks' own steps (workplan-stage3-plus.md, 3A to 3F). ----
+
+/**
+ * 3I: an opt-in step starts only when the harness wallet holds `needSol` (the most the step lends, plus fees and a margin). Below it the
+ * step records `<label>: funding` as a FAIL with the figures and returns false before any wallet is made or any SOL moves.
+ */
+export async function hasBudget(s: Pick<HarnessSteps, 'rec'>, label: string, balanceSol: () => Promise<number>, needSol: number, flag: string): Promise<boolean> {
+  let have: number;
+  try {
+    have = await balanceSol();
+  } catch (e: any) {
+    s.rec(`${label}: funding`, false, `the harness wallet's balance could not be read (${String(e?.message ?? e).slice(0, 120)}); ${flag} step not started`);
+    return false;
+  }
+  if (!(have >= needSol)) {
+    s.rec(`${label}: funding`, false, `${flag} needs ${needSol} SOL free in the harness wallet, it has ${have.toFixed(4)}; step not started, nothing sent`);
+    return false;
+  }
+  return true;
+}
+
+/** Sells what `w` holds of each coin, then sends what is left back to `payer`. A failed refund is a FAIL line naming the key file. */
+async function sellAndRefund(s: Pick<HarnessSteps, 'rec'>, label: string, kit: ChainKit, wallets: any[], coins: string[], payer: any): Promise<void> {
+  for (const w of wallets) {
+    for (const c of coins) { try { await kit.sellAll(w, c); } catch { /* nothing held, or the curve moved; the refund below still runs */ } }
+    try { await kit.refund(w, payer.publicKey); } catch (e: any) { s.rec(`${label}: refund ${w.publicKey.toBase58()}`, false, `${String(e?.message ?? e).slice(0, 120)}; key in <scratch>/temp-wallets/`); }
+  }
+}
+
+/**
+ * (s) A1 (review finding 8, cloud patch A 0001), free: a LIVE buy is refused when the curve's token reserves cannot be read. Built like (d'):
+ * for one `executeTrade` call the harness wraps `PumpCurveService.fetchPumpMarketState` so the coordinator's LIVE read of the harness mint
+ * comes back without `realTokenReserves` (SOL reserves still there), and counts `calculateBuyQuote` calls. Both are restored in `finally`.
+ * Expected: not successful, lifecycle RISK_REJECTED, error starting CURVE_PROGRESS_UNREADABLE, no quote made, no BUY row, no position.
+ * Nothing is signed or sent, so this step costs nothing and starts no cooldown (the refusal comes before the risk engine).
+ */
+export async function unreadableReservesRefused(s: HarnessSteps): Promise<void> {
+  const L = '(s) A1: LIVE buy with unreadable token reserves';
+  const curve = s.curve;
+  if (!curve.fetchPumpMarketState) { s.rec(L, false, 'harness did not pass PumpCurveService.fetchPumpMarketState'); return; }
+  await s.coordinator.syncRealWalletBalance();
+  const req = await s.buildBuyRequest();
+  const rowsBefore = buyRowsFor(s).length;
+  const origFetch = curve.fetchPumpMarketState;
+  const origQuote = curve.calculateBuyQuote;
+  let stripped = 0;
+  let quotes = 0;
+  curve.fetchPumpMarketState = async function (this: unknown, ...args: any[]) {
+    const st = await origFetch.apply(this, args);
+    const p = args[0];
+    const m = String(p?.mint?.toBase58?.() ?? p?.mint ?? '');
+    if (stripped === 0 && st && p?.executionMode === 'LIVE' && m === s.mint) {
+      stripped++;
+      return { ...st, realTokenReserves: undefined };
+    }
+    return st;
+  };
+  curve.calculateBuyQuote = function (this: unknown, ...args: any[]) {
+    quotes++;
+    return origQuote.apply(this, args);
+  };
+  let r: ExecutionResponse;
+  try {
+    r = await s.coordinator.executeTrade(req);
+  } finally {
+    curve.fetchPumpMarketState = origFetch;
+    curve.calculateBuyQuote = origQuote;
+  }
+  s.rec(`${L}: reserves wrapper used`, stripped === 1, `the coordinator's LIVE curve read came back without token reserves ${stripped} time(s); wrappers restored`);
+  s.rec(`${L}: refused CURVE_PROGRESS_UNREADABLE`, !r.success && r.lifecycleState === 'RISK_REJECTED' && /^CURVE_PROGRESS_UNREADABLE/.test(r.error ?? ''), `${r.lifecycleState} ${r.error ?? ''}`.slice(0, 300));
+  const rowsAfter = buyRowsFor(s).length;
+  const sig = r.txSignature || r.signature || '';
+  s.rec(`${L}: nothing quoted or sent`, quotes === 0 && rowsAfter === rowsBefore && !sig, `calculateBuyQuote calls ${quotes}; BUY rows ${rowsBefore} -> ${rowsAfter}${sig ? `; signature ${s.link(sig)}` : ''}`);
+  const open = openFor(s);
+  s.rec(`${L}: no position`, open.length === 0, JSON.stringify(open.map((p) => ({ id: p.id, status: p.status }))));
+}
+
+/** (t) what the RPC-switch step needs from the app (passed in, so this file still imports nothing from server/). */
+export interface RpcSwitchDeps {
+  /** The app's pumpFeedListener singleton (server.ts calls `follow(executionCoordinator)` on it at boot). */
+  listener: {
+    start(): Promise<boolean>;
+    stop(): Promise<void>;
+    follow(source: unknown): void;
+    getTelemetry(): { status: string; subscriptionId: number | null; feedGaps: number };
+    on(ev: 'feed_gap', fn: (g: { reason: string; detail?: string }) => void): unknown;
+    off(ev: 'feed_gap', fn: (g: { reason: string; detail?: string }) => void): unknown;
+  };
+  /** The app's executionCoordinator singleton. */
+  coordinator: {
+    setRpcEndpoint(url: string): Promise<{ success: boolean; error?: string }>;
+    getConnection(): any;
+    onConnectionChange(fn: (conn: any) => void): () => void;
+  };
+  /** web3.js's Connection class: its `onLogs` and `removeOnLogsListener` are wrapped for the step, to count live log subscriptions per Connection. */
+  Connection: { prototype: any };
+  /** The pump program id the listener subscribes to (only those subscriptions are counted). */
+  pumpProgramId: string;
+  /** The RPC the coordinator uses normally (B); the step puts two loopback relays in front of it (R0 and A). */
+  rpcUrl: string;
+  feed: WatchFeed;
+  kit: ChainKit;
+  payer: any;
+  waitMs?: number;
+  /** How late relay R0 answers unsubscribes during the switch (2000 ms by default). */
+  unsubscribeDelayMs?: number;
+}
+
+/** A loopback relay in front of `upstream` on two adjacent ports, HTTP on P and its websocket on P + 1 (web3.js's rule, see wsUrlFor). */
+export async function startRpcRelay(upstream: string) {
+  for (let i = 0; i < 20; i++) {
+    const http0 = await startHoldingProxy(upstream, 0);
+    const port = Number(new URL(http0.url).port);
+    try {
+      const ws = await startBlockingWsProxy(wsUrlFor(upstream), port + 1);
+      return { url: http0.url, slowUnsubscribe: (ms: number) => ws.slowUnsubscribe(ms), close: async () => { await ws.close(); await http0.close(); } };
+    } catch {
+      await http0.close(); // P + 1 was taken: try another pair
+    }
+  }
+  throw new Error('no two adjacent free loopback ports for the RPC relay');
+}
+
+/**
+ * (t) B7 and B10 (cloud patch B 0001 and 0002), opt-in (DEVNET_FEED_SWITCH=1), cheap. Three devnet endpoints: R0 and A are loopback relays
+ * (HTTP and websocket) in front of the normal devnet RPC, B is the normal RPC itself. The coordinator is pointed at R0 and the app's
+ * pumpFeedListener follows it as server.ts wires it (`follow`), subscribes, and reaches ACTIVE. R0 is then made to answer unsubscribes
+ * `unsubscribeDelayMs` late (as a slow RPC does), so moving the feed off R0 takes that long, and the harness calls `setRpcEndpoint(A)` and,
+ * without awaiting it, `setRpcEndpoint(B)`. Both switch notices reach the listener while the first move is still unsubscribing, the case
+ * B10 fixed (before it, the two moves ran interleaved and one subscription was left behind). Expected: an ENDPOINT_SWITCH feed gap with
+ * status RECONNECTING (B7), then ACTIVE; exactly one live pump log subscription across every Connection the step saw, on the coordinator's
+ * current Connection, with the listener's subscription id; and a launch made after the switch is watched. A throwaway creator (key on disk
+ * first) pays for that launch and refunds the rest. `finally` restores the wrappers, stops the listener, puts the coordinator back on B,
+ * and closes the relays.
+ */
+export async function rpcSwitchMovesFeed(s: Pick<HarnessSteps, 'rec' | 'sleep' | 'link'>, d: RpcSwitchDeps): Promise<void> {
+  const L = '(t) B7/B10: two quick RPC switches';
+  const waitMs = d.waitMs ?? 30_000;
+  const unsubscribeDelayMs = d.unsubscribeDelayMs ?? 2_000;
+  const until = async (cond: () => boolean, ms: number) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline && !cond()) await s.sleep(250);
+    return cond();
+  };
+  const P = d.Connection.prototype;
+  const origOn = P.onLogs;
+  const origOff = P.removeOnLogsListener;
+  const live = new Map<any, Set<number>>();
+  P.onLogs = function (this: any, ...a: any[]) {
+    const id = origOn.apply(this, a);
+    if (String(a[0]?.toBase58?.() ?? a[0]) === d.pumpProgramId) {
+      if (!live.has(this)) live.set(this, new Set());
+      live.get(this)!.add(id);
+    }
+    return id;
+  };
+  P.removeOnLogsListener = function (this: any, id: number) {
+    live.get(this)?.delete(id);
+    return origOff.call(this, id);
+  };
+  const gaps: string[] = [];
+  const onGap = (g: { reason: string }) => gaps.push(`${g.reason}/${d.listener.getTelemetry().status}`);
+  const switchedAt: number[] = [];
+  const unhook = d.coordinator.onConnectionChange(() => switchedAt.push(Date.now()));
+  const creator = d.kit.newWallet();
+  const coins: string[] = [];
+  const relays: Array<Awaited<ReturnType<typeof startRpcRelay>>> = [];
+  try {
+    const r0 = await startRpcRelay(d.rpcUrl);
+    relays.push(r0);
+    const a = await startRpcRelay(d.rpcUrl);
+    relays.push(a);
+    const on0 = await d.coordinator.setRpcEndpoint(r0.url);
+    d.listener.on('feed_gap', onGap);
+    d.listener.follow(d.coordinator);
+    const started = on0.success && (await d.listener.start());
+    const active0 = started && (await until(() => d.listener.getTelemetry().status === 'ACTIVE', 10_000));
+    s.rec(`${L}: listener ACTIVE on the coordinator's Connection (relay R0)`, active0, `${on0.success ? '' : `setRpcEndpoint(R0) ${on0.error}; `}status ${d.listener.getTelemetry().status}, subscription ${d.listener.getTelemetry().subscriptionId}`);
+    if (!active0) return;
+    await s.sleep(3_000); // ACTIVE is set when onLogs is called; the server confirms the subscription over the socket a moment later
+
+    r0.slowUnsubscribe(unsubscribeDelayMs);
+    const gapsBefore = gaps.length;
+    const noticesBefore = switchedAt.length;
+    const toA = d.coordinator.setRpcEndpoint(a.url);
+    const toB = d.coordinator.setRpcEndpoint(d.rpcUrl);
+    const [ra, rb] = await Promise.all([toA, toB]);
+    s.rec(`${L}: both switches succeeded`, ra.success && rb.success, `A (loopback relay) ${ra.success ? 'ok' : ra.error}; B (the normal RPC) ${rb.success ? 'ok' : rb.error}`.slice(0, 300));
+    const notices = switchedAt.slice(noticesBefore);
+    const endedOn = d.coordinator.getConnection()?.rpcEndpoint === a.url ? 'A (relay)' : 'B (normal RPC)';
+    console.log(`INFO  ${L}: the coordinator ended on ${endedOn}; ${notices.length} switch notice(s)${notices.length === 2 ? `, ${notices[1] - notices[0]} ms apart (moving off R0 takes about ${2 * unsubscribeDelayMs} ms)` : ''}`);
+    const gapSeen = await until(() => gaps.slice(gapsBefore).some((g) => g.startsWith('ENDPOINT_SWITCH/RECONNECTING')), 2 * unsubscribeDelayMs + 5_000);
+    s.rec(`${L}: the switch is a feed gap (ENDPOINT_SWITCH, RECONNECTING)`, gapSeen, `gaps seen: ${gaps.slice(gapsBefore).join(', ') || 'none'}`);
+    const back = await until(() => d.listener.getTelemetry().status === 'ACTIVE', waitMs);
+    s.rec(`${L}: ACTIVE again`, back, `status ${d.listener.getTelemetry().status}, gaps ${d.listener.getTelemetry().feedGaps}`);
+    await s.sleep(2 * unsubscribeDelayMs + 2_000); // every move still unsubscribing from R0 has finished by now
+
+    const subs = [...live.entries()].filter(([, ids]) => ids.size > 0);
+    const current = d.coordinator.getConnection();
+    const tel = d.listener.getTelemetry();
+    const onCurrent = live.get(current) ?? new Set<number>();
+    const name = (c: any) => (c === current ? 'current' : c?.rpcEndpoint === r0.url ? 'R0' : c?.rpcEndpoint === a.url ? 'A' : c?.rpcEndpoint === d.rpcUrl ? 'B' : 'other');
+    const describe = subs.map(([c, ids]) => `${name(c)}:${[...ids].join('+')}`).join(', ') || 'none';
+    s.rec(
+      `${L}: one live log subscription, on the coordinator's current Connection`,
+      subs.length === 1 && onCurrent.size === 1 && tel.subscriptionId !== null && onCurrent.has(tel.subscriptionId),
+      `live pump subscriptions by Connection: ${describe}; listener subscription ${tel.subscriptionId}`
+    );
+    const stale = subs.filter(([c]) => c !== current);
+    s.rec(`${L}: no subscription left on an old Connection`, stale.length === 0, `${live.size} Connection(s) subscribed during the step, ${stale.length} still holding one${stale.length ? ` (${stale.map(([c]) => name(c)).join(', ')})` : ''}`);
+
+    await d.kit.transfer(d.payer, creator.publicKey, 0.05);
+    const coin = await d.kit.create(creator, 'T3IS', 'S3I harness');
+    coins.push(coin.mint);
+    const seen = await until(() => d.feed.snapshot().watching.some((w) => w.metrics?.mint === coin.mint) || d.feed.snapshot().released.some((r) => r.metrics?.mint === coin.mint), waitMs);
+    s.rec(`${L}: a launch made after the switch is watched`, seen, seen ? coin.mint : `not in the watch window after ${waitMs / 1000} s`);
+  } catch (e: any) {
+    s.rec(L, false, String(e?.message ?? e).slice(0, 300));
+  } finally {
+    d.listener.off('feed_gap', onGap);
+    unhook();
+    try { await d.listener.stop(); } catch (e: any) { s.rec(`${L}: listener stopped after the step`, false, String(e?.message ?? e).slice(0, 200)); }
+    P.onLogs = origOn;
+    P.removeOnLogsListener = origOff;
+    if (d.coordinator.getConnection()?.rpcEndpoint !== d.rpcUrl) {
+      const r = await d.coordinator.setRpcEndpoint(d.rpcUrl).catch((e: any) => ({ success: false, error: String(e?.message ?? e) }));
+      s.rec(`${L}: coordinator back on its RPC`, r.success, r.error ?? 'ok');
+    }
+    for (const r of relays) await r.close();
+    await sellAndRefund(s, L, d.kit, [creator], coins, d.payer);
+  }
+}
+
+/**
+ * (u) B3 (cloud patch B 0004), opt-in (DEVNET_SELLER_NEVER_BOUGHT=1), cheap: a seller that never bought, the case B3 was written for. A
+ * throwaway creator launches a coin with no dev buy and funds a throwaway W with SOL for fees (so the creator is W's funder: the first
+ * system transfer into it). A second throwaway X, funded by the harness wallet, buys and SPL-transfers all its tokens to W; W sells them.
+ * W is not a buyer, so before B3 its funder was never looked up and the sell counted as organic. Expected: /api/watch shows DEAD
+ * CREATOR_SOLD naming W. Every throwaway wallet's key is on disk (kit.newWallet) before it receives SOL; `finally` sells what each holds
+ * and refunds the harness wallet, a failed refund being a FAIL line.
+ */
+export async function sellerWhoNeverBought(
+  s: Pick<HarnessSteps, 'rec' | 'sleep' | 'link'>, kit: ChainKit, feed: WatchFeed, payer: any,
+  opts: { buySol?: number; waitMs?: number } = {}
+): Promise<void> {
+  const L = '(u) B3: a seller that never bought';
+  const buySol = opts.buySol ?? 0.01;
+  const waitMs = opts.waitMs ?? 45_000;
+  const find = (mint: string) => {
+    const snap = feed.snapshot();
+    return (snap.watching.find((w) => w.metrics?.mint === mint) as { state?: string; reason?: string; metrics: any } | undefined)
+      ?? snap.released.find((r) => r.metrics?.mint === mint);
+  };
+  const waitFor = async (mint: string, pred: (e: { state?: string; reason?: string; metrics: any }) => boolean) => {
+    for (let i = 0; i < Math.ceil(waitMs / 500); i++) {
+      const e = find(mint);
+      if (e && pred(e)) return e;
+      await s.sleep(500);
+    }
+    return find(mint);
+  };
+  const creator = kit.newWallet();
+  const W = kit.newWallet();
+  const X = kit.newWallet();
+  const coins: string[] = [];
+  try {
+    await kit.transfer(payer, creator.publicKey, 0.06 + 0.02);
+    const a = await kit.create(creator, 'U3IB', 'S3I harness');
+    coins.push(a.mint);
+    const seen = await waitFor(a.mint, () => true);
+    s.rec(`${L}: the app's feed watches the launch`, !!seen, seen ? a.mint : `not in the watch window after ${waitMs / 1000} s (capacity ${JSON.stringify(feed.snapshot().capacity)})`);
+    if (!seen) return;
+    await kit.transfer(creator, W.publicKey, 0.02); // W's first incoming transfer: the creator is W's funder
+    await kit.transfer(payer, X.publicKey, buySol + 0.02);
+    await kit.buy(X, a.mint, buySol);
+    const bought = await waitFor(a.mint, (e) => e.metrics.tradeCount >= 1);
+    s.rec(`${L}: X's buy reached the window`, !!bought && bought.metrics.tradeCount >= 1, `trades ${bought?.metrics.tradeCount ?? 0}, state ${bought?.state ?? 'WATCHING'}`);
+    const tx = await kit.transferTokens(X, a.mint, W.publicKey);
+    const wHolds = await kit.tokenBalance(W.publicKey, a.mint);
+    const before = find(a.mint);
+    s.rec(
+      `${L}: W got X's tokens by transfer, without buying; the launch still WATCHING`,
+      wHolds > 0n && (before?.state ?? 'WATCHING') === 'WATCHING',
+      `W holds ${wHolds} raw ${s.link(tx)}; state ${before?.state ?? 'WATCHING'} ${before?.reason ?? ''}`.slice(0, 300)
+    );
+    if (wHolds <= 0n || (before?.state ?? 'WATCHING') !== 'WATCHING') return;
+    const sellSig = await kit.sellAll(W, a.mint);
+    const r = await waitFor(a.mint, (e) => !!e.state && e.state !== 'WATCHING');
+    s.rec(
+      `${L}: W (funded by the creator, never bought) sold: /api/watch shows DEAD CREATOR_SOLD`,
+      r?.state === 'DEAD' && /^CREATOR_SOLD/.test(r.reason ?? '') && (r.reason ?? '').includes(W.publicKey.toBase58().slice(0, 6)),
+      `${r?.state ?? 'WATCHING'} ${r?.reason ?? ''}${sellSig ? ` ${s.link(sellSig)}` : ' (W held nothing to sell)'}`.slice(0, 300)
+    );
+  } catch (e: any) {
+    s.rec(L, false, String(e?.message ?? e).slice(0, 300));
+  } finally {
+    await sellAndRefund(s, L, kit, [W, X, creator], coins, payer);
+  }
 }

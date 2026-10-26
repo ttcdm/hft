@@ -185,3 +185,46 @@ describe('5C (R1-106): the replay labels truncated, graduated and unresolved lau
     expect(html).toMatch(/1 cut by the trade cap, 0 graduated, 1 unresolved/);
   });
 });
+
+// ---- the recordings reader for the offline studies ------------------------------------------------------------------------------------
+import { vi } from 'vitest';
+import { openJsonl, openSqlite } from '../scripts/recorder_backtest/recorded';
+
+describe('5C: the own-recordings reader takes END rows (JSONL and SQLite) and gives each launch its end', () => {
+  const rows = curve();
+  const events = toRecordedLaunch(launch(rows), 150).events;
+  const endTs = rows[rows.length - 1][0] + 1;
+
+  it('a JSONL snapshot with END lines skips nothing and sets endTs / endReason', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 's5c-jsonl-'));
+    const err = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const file = path.join(dir, 'snap.jsonl');
+      const lines = [...events.map((e) => ({ ts: e.ts, mint: 'Mint5C', kind: e.kind, payload: e.payload })), { ts: endTs, mint: 'Mint5C', kind: 'END', payload: { reason: 'TRADE_CAP', trades: rows.length } }];
+      fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+      const src = await openJsonl(file);
+      const [l] = [...src.launches()];
+      expect(err).not.toHaveBeenCalled();
+      expect(l.endTs).toBe(endTs);
+      expect(l.endReason).toBe('TRADE_CAP');
+      expect(l.events.every((e) => e.kind === 'CREATE' || e.kind === 'TRADE')).toBe(true);
+      expect(replayLaunch(l, [], 150, GATE).recording).toBe('TRUNCATED');
+    } finally { err.mockRestore(); fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('the paper database gives the same launch the same end', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 's5c-sqlite-'));
+    try {
+      const file = path.join(dir, 'paper.db');
+      const db = new WorkstationDatabase(file);
+      for (const e of events) db.recordLaunchEvent(e.ts, 'Mint5C', e.kind, e.payload);
+      db.recordLaunchEvent(endTs, 'Mint5C', 'END', { reason: 'WINDOW', trades: rows.length });
+      const src = openSqlite(file);
+      const [l] = [...src.launches()];
+      src.close();
+      expect(l.endTs).toBe(endTs);
+      expect(l.endReason).toBe('WINDOW');
+      expect(l.events.length).toBe(events.length);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});

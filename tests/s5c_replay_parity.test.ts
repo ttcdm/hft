@@ -228,3 +228,82 @@ describe('5C: the own-recordings reader takes END rows (JSONL and SQLite) and gi
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });
+
+// ---- the late-rule studies (R1-109) -----------------------------------------------------------------------------------------------------
+import * as corpusLate from '../scripts/hfcorpus/late_rule';
+import * as ownLate from '../scripts/recorder_backtest/late_rule';
+import { recordedToLaunch } from '../scripts/recorder_backtest/recorded';
+
+describe('5C (R1-109): the late-rule studies decide on what is known at the checkpoint', () => {
+  afterEach(() => restoreStockEngine());
+  const CP = 30, LAND = T0 + CP * 60_000 + corpusLate.ENTRY_DELAY;
+  /** the warm-up (all in the first minute), then whatever comes after the checkpoint */
+  const withLater = (later: TradeRow[]) => [...curve(), ...later];
+  const px = (r: TradeRow) => r[5] / r[6] / 1000;
+  const at = (ts: number, m: number): TradeRow => { const w = curve(); const [, , , , , vS, vT] = w[w.length - 1]; return [ts, true, 0.1, 1, 'later', Math.round(vS * Math.sqrt(m)), Math.round(vT / Math.sqrt(m)), `l-${ts}`]; };
+  const roundTrip = (side: number) => corpusLate.ORDER * (1 - side / 100) ** 2 - corpusLate.ORDER - corpusLate.FIXED;
+
+  it('a launch that never trades after the checkpoint is entered at the last price before the buy and closed by the stale exit (corpus)', () => {
+    const rows = curve();
+    const e = corpusLate.planEntry(rows, T0, CP)!;
+    expect(e).not.toBeNull();
+    expect(e.ts).toBe(LAND);
+    expect(e.px).toBeCloseTo(px(rows[rows.length - 1]), 15);
+    expect(e.next).toBe(rows.length); // nothing after: it used to be dropped as noTradeAfterCp
+    const out = corpusLate.simulate(rows, e, 'STOCK', 2).finish(T0 + 48 * 3_600_000);
+    expect(out.open).toBe(false);
+    expect(out.net).toBeCloseTo(roundTrip(2), 12);
+    // TRAIL closes it at its 6 h exit, at the same price
+    expect(corpusLate.simulate(rows, e, 'TRAIL', 2).finish(T0 + 48 * 3_600_000)).toEqual({ net: expect.closeTo(roundTrip(2), 12), open: false });
+    // where the data ends before the stale exit is due, it stays open, marked at the last price
+    expect(corpusLate.simulate(rows, e, 'STOCK', 2).finish(LAND + 10 * 60_000).open).toBe(true);
+  });
+
+  it('the buy fills at the curve state when it lands, not at the next print hours later (corpus and recordings)', () => {
+    const rows = withLater([at(T0 + 3 * 3_600_000, 3)]); // the next print is 3 h later, at 3x
+    for (const plan of [corpusLate.planEntry, ownLate.planEntry]) {
+      const e = plan(rows, T0, CP)!;
+      expect(e.ts).toBe(LAND);
+      expect(e.px).toBeCloseTo(px(curve()[59]), 15);
+      expect(e.next).toBe(60);
+    }
+  });
+
+  it('own recordings: quiet but recorded past the buy is priced; too short and unknown end are counted apart', () => {
+    const c = recordedToLaunch(toRecordedLaunch(launch(curve()), 150))!;
+    // recorded quiet to create + 70 min: the stale exit (entry + 30 min) is due inside it
+    const priced = ownLate.considerLaunch(c, { endTs: T0 + 70 * 60_000, endReason: 'WINDOW' }, CP);
+    expect('entry' in priced).toBe(true);
+    if ('entry' in priced) expect(ownLate.simulate(c.trades, priced.entry, 'STOCK', 2, priced.coveredUntilTs)).toEqual({ net: expect.closeTo(roundTrip(2), 12), open: false });
+    expect(ownLate.considerLaunch(c, { endTs: T0 + 20 * 60_000, endReason: 'WINDOW' }, CP)).toEqual({ skip: 'RECORDING_TOO_SHORT' });
+    expect(ownLate.considerLaunch(c, { endTs: T0 + 20 * 60_000, endReason: 'CURVE_COMPLETE' }, CP)).toEqual({ skip: 'CURVE_COMPLETE_BEFORE_ENTRY' });
+    expect(ownLate.considerLaunch(c, {}, CP)).toEqual({ skip: 'END_UNKNOWN' });
+    // recorded past the buy but not to the stale exit: entered, still open, marked at the last price
+    const short = ownLate.considerLaunch(c, { endTs: T0 + 35 * 60_000, endReason: 'WINDOW' }, CP);
+    if ('entry' in short) expect(ownLate.simulate(c.trades, short.entry, 'STOCK', 2, short.coveredUntilTs).open).toBe(true); else throw new Error('not entered');
+  });
+});
+
+import { execFileSync } from 'node:child_process';
+describe('5C (R1-109): the corpus late-rule script end to end', () => {
+  it('keeps a launch that never trades again, and decides graduation at the buy, not at the next print', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 's5c-late-'));
+    try {
+      const rows = curve();
+      const dead: CorpusLaunch = { ...launch(rows), mint: 'Dead' };
+      // graduates 10 min after the checkpoint; its next print comes an hour after the checkpoint
+      const later: TradeRow = [T0 + 90 * 60_000, true, 0.1, 1, 'later', rows[59][5], rows[59][6], 'later'];
+      const grad: CorpusLaunch = { ...launch([...rows, later]), mint: 'Grad' };
+      fs.writeFileSync(path.join(dir, 'l.jsonl'), [dead, grad].map((c) => JSON.stringify(c)).join('\n') + '\n');
+      fs.writeFileSync(path.join(dir, 'g.csv'), `mint,graduated_ms\nGrad,${T0 + 40 * 60_000}\n`);
+      const tsx = path.join(process.cwd(), 'node_modules', '.bin', 'tsx');
+      execFileSync(tsx, ['scripts/hfcorpus/late_rule.ts', path.join(dir, 'l.jsonl'), path.join(dir, 'g.csv'), '--curve', '0', '--out', path.join(dir, 'o.json')],
+        { cwd: process.cwd(), env: { PATH: process.env.PATH ?? '', HOME: os.homedir() }, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 110_000 });
+      const res = JSON.parse(fs.readFileSync(path.join(dir, 'o.json'), 'utf8'));
+      expect(res.counts).toEqual({ launches: 2, tradedBeforeCp: 2, graduatedBeforeEntry: 0, noTradeAfterEntry: 1 });
+      const stock = res.rows.find((r: any) => r.group === 'RULE' && r.exits === 'STOCK');
+      expect(stock.entries).toBe(2);
+      expect(stock.openAtEnd).toBe(0); // the file's last trade (90 min) reaches both stale exits
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  }, 120_000);
+});

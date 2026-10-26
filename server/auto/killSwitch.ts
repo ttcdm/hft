@@ -34,8 +34,13 @@ export interface KillContext {
   maxDailyLossSol: number;
   slippageBreaches: number;
   readinessRed: Array<{ name: string; redForMs: number }>;
-  /** Wallet checks apply to DEVNET_LIVE only. null balance there counts as red. */
+  /** Wallet checks apply to DEVNET_LIVE only. null balance there counts as red once it has lasted (see walletUnknownForMs). */
   walletSol: number | null;
+  /**
+   * 3E: how long the balance has been unknown (no good read), in ms. WALLET_UNKNOWN fires only past READINESS_RED_LIMIT_MS, so one failed
+   * read does not stop a session. Left out, the caller does not track it and a null balance fires at once (fail-closed).
+   */
+  walletUnknownForMs?: number;
   reserveSol: number;
   maxTradeSol: number;
 }
@@ -82,7 +87,10 @@ export function evaluateKillTriggers(ctx: KillContext): KillTrigger[] {
 
   if (ctx.mode === 'DEVNET_LIVE') {
     if (ctx.walletSol === null) {
-      out.push({ code: 'WALLET_UNKNOWN', message: 'wallet balance is unknown' });
+      const forMs = ctx.walletUnknownForMs ?? Number.POSITIVE_INFINITY;
+      if (!(forMs <= READINESS_RED_LIMIT_MS)) {
+        out.push({ code: 'WALLET_UNKNOWN', message: Number.isFinite(forMs) ? `no good wallet balance read for ${Math.round(forMs / 1000)}s` : 'wallet balance is unknown' });
+      }
     } else if (ctx.walletSol < ctx.reserveSol + ctx.maxTradeSol) {
       out.push({ code: 'WALLET_LOW', message: `wallet ${ctx.walletSol.toFixed(4)} SOL is below reserve ${ctx.reserveSol} + one max trade ${ctx.maxTradeSol}` });
     }

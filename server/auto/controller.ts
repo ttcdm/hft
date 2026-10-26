@@ -199,6 +199,8 @@ export class AutoSnipeController extends EventEmitter {
   private redSince = new Map<string, number>();
   private monitorTimer: NodeJS.Timeout | null = null;
   private walletMark: { sol: number; ts: number } | null = null;
+  /** 3E: performance.now() of the first trigger check that found the wallet balance unknown; null while reads succeed. */
+  private walletUnknownSince: number | null = null;
 
   public getMode(): AutoMode {
     return this.mode;
@@ -519,6 +521,7 @@ export class AutoSnipeController extends EventEmitter {
     this.slippageBreaches = 0;
     this.redSince.clear();
     this.walletMark = null;
+    this.walletUnknownSince = null;
     this.attempted.clear();
     this.clearPendingReleases();
     this.mode = next;
@@ -591,6 +594,11 @@ export class AutoSnipeController extends EventEmitter {
       else if (!this.redSince.has(name)) this.redSince.set(name, now);
     }
 
+    // 3E: WALLET_UNKNOWN needs the balance unknown for longer than READINESS_RED_LIMIT_MS (monotonic clock), not one failed read
+    const walletSol = executionCoordinator.getRealWalletBalanceSol() ?? null;
+    const mono = performance.now();
+    if (walletSol === null) { if (this.walletUnknownSince === null) this.walletUnknownSince = mono; } else this.walletUnknownSince = null;
+
     const ctx = {
       mode: this.mode,
       closedNetPnlSol: this.sessionEvidencePnl(execMode),
@@ -598,7 +606,8 @@ export class AutoSnipeController extends EventEmitter {
       maxDailyLossSol: riskEngine.effectiveMaxDailyLossSol(),
       slippageBreaches: this.slippageBreaches,
       readinessRed: [...this.redSince.entries()].map(([name, since]) => ({ name, redForMs: now - since })),
-      walletSol: executionCoordinator.getRealWalletBalanceSol(),
+      walletSol,
+      walletUnknownForMs: this.walletUnknownSince === null ? 0 : mono - this.walletUnknownSince,
       reserveSol: 0.015,
       maxTradeSol: this.orderSol(),
     };

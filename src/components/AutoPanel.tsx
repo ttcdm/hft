@@ -2,6 +2,7 @@ import React, { useEffect, useState, useCallback } from 'react';
 import { authFetch } from '../services/engineClient';
 import { fmt } from './TokenBoard';
 import { parseThreshold, thresholdWarning } from '../utils/confluenceThreshold';
+import { onAuthenticated } from '../utils/authEvents';
 
 /** H3: the auto-snipe controller panel. Every number is read from GET /api/auto/status (controller state + decision journal). */
 export type AutoMode = 'OFF' | 'SHADOW' | 'PAPER' | 'DEVNET_LIVE';
@@ -195,7 +196,8 @@ export function useAutoStatus(): AutoStatusData | null {
     };
     load();
     const t = setInterval(load, 4000);
-    return () => { alive = false; clearInterval(t); };
+    const off = onAuthenticated(load); // UI-5
+    return () => { alive = false; clearInterval(t); off(); };
   }, []);
   return status;
 }

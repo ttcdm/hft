@@ -5,6 +5,7 @@ import { hftAudio } from './utils/audio';
 
 import { Header } from './components/Header';
 import { AlertSystem, isAlertExpired } from './components/AlertSystem';
+import { announceAuthenticated } from './utils/authEvents';
 import { AiDiagnosticsModal } from './components/AiDiagnosticsModal';
 import { SystemChecksModal } from './components/SystemChecksModal';
 import { ExecutionLatencyModal } from './components/ExecutionLatencyModal';
@@ -107,6 +108,7 @@ export default function App() {
     setIsAuthModalOpen(false);
     triggerAlert('INFO', 'OPERATOR AUTHENTICATED', 'Operator session successfully established.');
     engineClient.authenticate();
+    announceAuthenticated(); // UI-5: the mode banner, auto panel and board read now, not at their next tick
   };
 
   // Helper to add an alert

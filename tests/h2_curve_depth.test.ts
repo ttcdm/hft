@@ -3,6 +3,7 @@ import { PumpCurveService } from '../server/solana/pumpCurve';
 import { buildCurveDepth, spotPriceSol, postBuySpot, BUY_STEPS_PCT } from '../server/market/curveDepth';
 import { TradeTape, TAPE_PER_MINT } from '../server/market/tradeTape';
 import { curveFixture } from './fixtures/curve';
+import { CURVE_INITIAL_REAL_TOKENS } from '../server/market/poolStats';
 import { replay, wallet } from './fixtures/watch';
 
 const quote = (state: ReturnType<typeof curveFixture>, lamports: number) =>
@@ -45,8 +46,10 @@ describe('H2: curve depth ladder uses the coordinator quote function', () => {
     expect(depth.sell).toBeNull();
   });
 
-  it('reports progress toward migration from real reserves, and a migrated curve has no ladder', () => {
-    expect(depth.curveProgressPct).toBeCloseTo((4 / 85) * 100, 6);
+  it('reports progress as the share of the curve\'s tokens sold (review M2: not real SOL over 85), and a migrated curve has no ladder', () => {
+    expect(depth.curveProgressPct).toBeCloseTo((Number(CURVE_INITIAL_REAL_TOKENS - state.realTokenReserves) / Number(CURVE_INITIAL_REAL_TOKENS)) * 100, 6);
+    expect(depth.curveProgressPct).toBeLessThan(1); // 4 SOL over 85 would have said 4.7
+    expect(buildCurveDepth({ ...state, realTokenReserves: undefined as any }, { mode: 'PAPER' }).curveProgressPct).toBeNull();
     expect(depth.spotPriceSol).toBeCloseTo(spotPriceSol(state), 15);
     const done = buildCurveDepth(curveFixture({ complete: true }), { mode: 'PAPER', positionTokensRaw: 1n });
     expect(done.buy.every((r) => r.solNeeded === null)).toBe(true);

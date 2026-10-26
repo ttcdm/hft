@@ -30,7 +30,7 @@ export interface ConfluenceFactorsInput {
   priceChange5mPct: number | null;
   liquidityUsd: number | null;
   top10HoldersPct: number | null;
-  bondingCurveProgress: number;
+  bondingCurveProgress: number | null;
   buys5m: number | null;
   sells5m: number | null;
   devHoldingPct: number | null;

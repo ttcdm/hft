@@ -504,7 +504,8 @@ export class WatchWindow extends EventEmitter {
       if (now - c.registeredAt >= this.opts.maxMs) return this.release(c, 'DEAD', 'NO_TRADES: no trade seen within the window', now);
       return hold('waiting for the first trade');
     }
-    // P4.3 (R1-57): a curve past the cap is never bought; checked from the first trade on, the minimum hold does not delay it
+    // P4.3 (R1-57): a curve past the cap is never bought; checked from the first trade on, the minimum hold does not delay it.
+    // Review M2: an unknown progress (null, no token reserve yet) is not a SOL estimate and does not release the launch here.
     const progress = this.curveProgressPct(mint);
     if (progress !== null && isCurveTooFar(progress)) return this.release(c, 'DEAD', curveTooFarReason('CURVE_TOO_FAR', progress), now);
     if (m.elapsedMs < this.opts.minMs) return hold(`holding: ${Math.ceil((this.opts.minMs - m.elapsedMs) / 1000)}s of the minimum left`);

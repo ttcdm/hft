@@ -4,7 +4,7 @@ import { fmt } from './TokenBoard';
 
 /** H2: bonding-curve depth ladder + trade tape for the selected mint. No order book exists on Pump.fun; empty states are honest. */
 export interface CurveData {
-  spotPriceSol: number; priceUsd: number | null; curveProgressPct: number; complete: boolean; note: string | null;
+  spotPriceSol: number; priceUsd: number | null; curveProgressPct: number | null; complete: boolean; note: string | null;
   buy: Array<{ upPct: number; solNeeded: number | null; tokensOut: number | null; feesSol: number | null }>;
   sell: Array<{ sellPct: number; solReceived: number | null; impactBps: number | null }> | null;
 }
@@ -24,8 +24,8 @@ export function CurvePanelView({ mint, curve, tape, error }: { mint: string | nu
             <span>Price <b className="font-mono text-slate-100">{curve.spotPriceSol.toExponential(3)} SOL</b></span>
             <span className="text-slate-400">{curve.priceUsd === null ? '—' : `$${curve.priceUsd.toExponential(3)}`}</span>
           </div>
-          <div className="h-1.5 rounded bg-slate-800 overflow-hidden mb-1"><div className="h-full bg-cyan-500" style={{ width: `${Math.min(100, curve.curveProgressPct)}%` }} /></div>
-          <p className="text-slate-500 mb-2">{curve.curveProgressPct.toFixed(1)}% to migration</p>
+          <div className="h-1.5 rounded bg-slate-800 overflow-hidden mb-1"><div className="h-full bg-cyan-500" style={{ width: `${Math.min(100, curve.curveProgressPct ?? 0)}%` }} /></div>
+          <p className="text-slate-500 mb-2">{curve.curveProgressPct === null ? 'progress unknown (token reserves unreadable)' : `${curve.curveProgressPct.toFixed(1)}% to migration`}</p>
           {curve.note && <p className="text-amber-400 mb-2">{curve.note}</p>}
           <table className="w-full mb-2"><thead><tr className="text-slate-500"><th className="text-left px-2">Buy to move price</th><th className={k}>SOL needed</th><th className={k}>Fees</th></tr></thead>
             <tbody>{curve.buy.map((r) => <tr key={r.upPct} className="border-t border-slate-800/60"><td className="px-2 py-1 text-emerald-400">+{r.upPct}%</td><td className={k}>{fmt(r.solNeeded, 4)}</td><td className={k}>{fmt(r.feesSol, 5)}</td></tr>)}</tbody></table>

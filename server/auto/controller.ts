@@ -830,6 +830,7 @@ export class AutoSnipeController extends EventEmitter {
       }
     }
     // P4.3 (R1-57): the curve measured from the feed now. Above the cap it is not bought (the coordinator checks again on its own fresh read).
+    // Review M2: null while the feed has no token reserve for the mint (never a SOL estimate); it passes here, and a LIVE buy is refused on it.
     const progressPct = onChainPoolStats.get(c.mint)?.curveProgressPct ?? null;
     if (isCurveTooFar(progressPct)) {
       return remember(rec('DROPPED', 'curve', curveTooFarReason('CURVE_PROGRESS_TOO_HIGH', progressPct as number), { inputs: { curveProgressPct: progressPct } }));

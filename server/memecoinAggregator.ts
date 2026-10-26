@@ -340,7 +340,7 @@ export class MemecoinAggregatorService extends EventEmitter {
     pool.priceUsd = m.priceSol * solUsd;
     pool.marketCapUsd = m.priceSol * 1_000_000_000 * solUsd;
     pool.liquidityUsd = m.realSolReserves * solUsd * 2;
-    pool.bondingCurveProgress = Number(m.curveProgressPct.toFixed(1));
+    if (m.curveProgressPct !== null) pool.bondingCurveProgress = Number(m.curveProgressPct.toFixed(1)); // review M2: unknown leaves the last figure
     pool.priceChange5mPct = Number(m.priceChange5mPct.toFixed(2)); // a float residue like 9.99e-8 is not a price move
     pool.buys5m = m.buys5m;
     pool.sells5m = m.sells5m;

@@ -1,5 +1,6 @@
 import { PumpCurveService, type PumpMarketState } from '../solana/pumpCurve';
 import type { ExecutionMode } from '../core/types';
+import { curveProgressPctOfState } from '../signals/curveProgressCap';
 
 /**
  * H2: Pump.fun has no order book. The depth ladder is derived from the real reserves, using the SAME quote function
@@ -28,8 +29,8 @@ export interface SellRung { sellPct: number; solReceived: number | null; avgPric
 export interface CurveDepth {
   mint: string;
   spotPriceSol: number;
-  /** SOL in the curve toward the 85 SOL migration (real reserves); null if the state has none. */
-  curveProgressPct: number;
+  /** Share of the curve's tokens sold (pump.fun's bar, curveProgressPctOfState); null when the token reserves are unreadable. Review M2: was real SOL over 85. */
+  curveProgressPct: number | null;
   complete: boolean;
   buy: BuyRung[];
   sell: SellRung[] | null;
@@ -83,7 +84,7 @@ export function buildCurveDepth(state: PumpMarketState, opts: { positionTokensRa
   return {
     mint: state.mint.toBase58(),
     spotPriceSol: spot,
-    curveProgressPct: Math.min(100, (Number(state.realSolReserves) / (85 * LAMPORTS)) * 100),
+    curveProgressPct: curveProgressPctOfState(state),
     complete: state.complete,
     buy,
     sell,

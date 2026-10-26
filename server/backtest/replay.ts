@@ -329,7 +329,8 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
   if (!released) {
     // the recording ended before the window gave a verdict: let it run to its own maximum on the data it has
     // 5A (R1-104): the window's maximum runs from the first trade, so the fallback does too
-    for (let t = lastTick; t <= trades[0].ts + WATCH_MAX_MS + o.tickMs && !released; t += o.tickMs) {
+    // 5C: from the tick after the last one, which ran before the trades recorded since; evaluating that tick again would let it see them
+    for (let t = lastTick + o.tickMs; t <= trades[0].ts + WATCH_MAX_MS + o.tickMs && !released; t += o.tickMs) {
       clock = t;
       applyFacts(t);
       const r = ww.evaluate(launch.mint, t);

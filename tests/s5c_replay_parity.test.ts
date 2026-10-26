@@ -307,3 +307,20 @@ describe('5C (R1-109): the corpus late-rule script end to end', () => {
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   }, 120_000);
 });
+
+describe('5C: the replay\'s end-of-recording ticks never see a trade before it happens', () => {
+  afterEach(() => restoreStockEngine());
+  it('a buy at +5 s that takes the curve past the cap releases CURVE_TOO_FAR after it, not at the +4 s tick before it', () => {
+    let vSol = 30e9, vTok = 1.073e15;
+    const rows: TradeRow[] = [];
+    for (const [dt, sol] of [[500, 0.2], [5_000, 26]] as const) {
+      const k = vSol * vTok, newS = vSol + sol * 1e9, newT = k / newS;
+      rows.push([T0 + dt, true, sol, (vTok - newT) / 1e6, 'w' + dt, Math.round(newS), Math.round(newT), `s${dt}`]);
+      vSol = newS; vTok = newT;
+    }
+    const r = replayLaunch(toRecordedLaunch(launch(rows), 150), [], 150, { minScore: 0 });
+    expect(r.verdict).toBe('DEAD');
+    expect(r.verdictReason).toMatch(/CURVE_TOO_FAR/);
+    expect(r.releasedAfterMs).toBeGreaterThanOrEqual(5_000);
+  });
+});

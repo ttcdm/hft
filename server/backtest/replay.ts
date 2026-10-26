@@ -242,6 +242,9 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
     const metrics = velocity.getMetrics(launch.mint, now);
     const b = ConfluenceEngine.calculate({
       mint: launch.mint,
+      // 5C (R1-61): the creator is known, its wallet-history report is not recorded, so it scores as live does without one (0, P4.1).
+      // null keeps the running app's creator cache out of the replay.
+      creatorAddress: create.payload.creator || undefined, creatorRiskReport: null,
       priceChange5mPct: m.priceChange5mPct,
       liquidityUsd: solUsd === null ? null : m.realSolReserves * solUsd * 2,
       top10HoldersPct: m.top10HoldersPct,
@@ -389,7 +392,7 @@ export const NOT_REPLAYED = {
     'Funder facts the live window would learn but the recording lacks (corpus replays have none); the direction was not measured',
     'Entry and exit latency are fixed assumptions (entry and exit delay), not the measured distribution',
     'The fee rate is the SDK default (0.95% + 0.30%); the live quote reads the real tier',
-    'Creator wallet history (the live score may add points a replay cannot)',
+    'Creator wallet history is not recorded: every creator scores 0 of its 5 points, as live does without a report; live adds up to 5 for an established wallet, so the replay can refuse a launch live buys',
     'Positions still open when the data ends are marked at the last recorded price, which may be the graduation top or a dead curve',
   ],
 };

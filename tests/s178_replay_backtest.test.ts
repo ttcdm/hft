@@ -155,7 +155,7 @@ describe('S178: replay runs the real rules over what was recorded', () => {
     }
     const m = stats.get(launches[0].mint, releasedAt)!;
     const by = ConfluenceEngine.calculate({
-      mint: launches[0].mint, priceChange5mPct: m.priceChange5mPct, liquidityUsd: m.realSolReserves * 150 * 2, top10HoldersPct: m.top10HoldersPct, bondingCurveProgress: m.curveProgressPct,
+      mint: launches[0].mint, creatorAddress: create.creator, creatorRiskReport: null, priceChange5mPct: m.priceChange5mPct, liquidityUsd: m.realSolReserves * 150 * 2, top10HoldersPct: m.top10HoldersPct, bondingCurveProgress: m.curveProgressPct,
       buys5m: m.buys5m, sells5m: m.sells5m, devHoldingPct: m.devHoldingPct, hasVerifiedSocialCall: false, socialCallCount: 0, curveVelocityMetrics: vel.getMetrics(launches[0].mint, releasedAt),
     }).compositeScore;
     if (r.score !== null) expect(r.score).toBe(by);

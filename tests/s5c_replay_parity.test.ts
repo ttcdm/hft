@@ -57,3 +57,42 @@ describe('5C (R1-105): the replay applies the dev-holding gate executeSnipe appl
     expect(rep.notReplayed.join(' ')).not.toMatch(/holder concentration\): not recorded/);
   });
 });
+
+// ---- the creator factor ----------------------------------------------------------------------------------------------------------------
+import { Keypair } from '@solana/web3.js';
+import { creatorRiskScorer } from '../server/signals/creatorRiskScorer';
+import { ConfluenceEngine } from '../server/signals/confluenceEngine';
+
+describe('5C (R1-61): the replay scores the creator as live does without a report', () => {
+  afterEach(() => { restoreStockEngine(); creatorRiskScorer.clearCache(); });
+  const creator = Keypair.generate().publicKey.toBase58();
+  const withCreator = (who: string) => toRecordedLaunch({ ...launch(curve()), creator: who }, 150);
+
+  it('a known creator with 0% dev holding and no report gets 0 creator points, not the 5 of the dev-holding fallback', () => {
+    const known = replayLaunch(withCreator(creator), [], 150, GATE);
+    const unknown = replayLaunch(withCreator(''), [], 150, GATE); // no creator at all: the engine's dev-holding fallback (0% = 5 points)
+    expect(known.releasedAfterMs).toBe(unknown.releasedAfterMs);
+    expect((unknown.score as number) - (known.score as number)).toBe(5);
+  });
+
+  it('the running app\'s creator cache does not leak into the replay', async () => {
+    const before = replayLaunch(withCreator(creator), [], 150, GATE).score;
+    // an established wallet: 60 signatures over 40 days, which live scores 5 of 5
+    const nowSec = Math.floor(Date.now() / 1000);
+    const sigs = Array.from({ length: 60 }, (_, i) => ({ signature: `s${i}`, slot: i, err: null, memo: null, blockTime: nowSec - 40 * 86_400 + i * 3_600 }));
+    const report = await creatorRiskScorer.evaluateCreator({ getSignaturesForAddress: async () => sigs }, creator);
+    expect(report.confluenceScore).toBe(5);
+    expect(creatorRiskScorer.getCachedReport(creator)).toBeDefined();
+    expect(replayLaunch(withCreator(creator), [], 150, GATE).score).toBe(before);
+  });
+
+  it('live reads still use the cache: null is the only way to say "no report"', async () => {
+    const base = { priceChange5mPct: 0, liquidityUsd: null, top10HoldersPct: null, bondingCurveProgress: 0, buys5m: 0, sells5m: 0, devHoldingPct: 0, hasVerifiedSocialCall: false, socialCallCount: 0 };
+    const nowSec = Math.floor(Date.now() / 1000);
+    const sigs = Array.from({ length: 60 }, (_, i) => ({ signature: `s${i}`, slot: i, err: null, memo: null, blockTime: nowSec - 40 * 86_400 + i * 3_600 }));
+    await creatorRiskScorer.evaluateCreator({ getSignaturesForAddress: async () => sigs }, creator);
+    expect(ConfluenceEngine.calculate({ ...base, creatorAddress: creator }).creatorRiskScore).toBe(5);
+    const none = ConfluenceEngine.calculate({ ...base, creatorAddress: creator, creatorRiskReport: null });
+    expect(none.creatorRiskScore).toBe(0);
+  });
+});

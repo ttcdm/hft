@@ -18,6 +18,8 @@ import { PANIC_BUY_SETTLE_WAIT_MS } from '../server/execution/emergencyStop';
 import { READINESS_RED_LIMIT_MS, WALLET_AUDIT_BASE_TOLERANCE_SOL } from '../server/auto/killSwitch';
 import { CONFLUENCE_DEVNET_LIVE_FLOOR } from '../server/signals/confluenceThreshold';
 import { LOGIN_RATE_LIMIT } from '../server/middleware/enterprise';
+import { REPLAY_DEFAULTS } from '../server/backtest/replay';
+import { PUMP_FEED_ONLINE_WINDOW_MS } from '../server/pumpfunService';
 
 /**
  * 3J: every constant that docs/LATENCY.md, docs/RUNBOOK.md and docs/ARCHITECTURE.md state a value for has that value in the code, and the
@@ -148,5 +150,19 @@ describe('3E statements in the documents (the code is in the 3E patches)', () =>
     expect(READINESS_RED_LIMIT_MS).toBe(10_000);
     for (const phrase of ['last 20', 'LOSS_TRIGGERS_NEED_ACK', 'ackLossTriggers', '10 s']) expect(doc.runbook).toContain(phrase);
     for (const phrase of ['LOSS_TRIGGER_TRADES', 'auto.lossTriggerAck', 'auto.kill']) expect(doc.arch).toContain(phrase);
+  });
+});
+
+describe('5A and 3H statements in the documents', () => {
+  it('the replay delays LATENCY.md states are the ones the replay uses', () => {
+    expect(REPLAY_DEFAULTS.entryDelayMs).toBe(1_500);
+    expect(REPLAY_DEFAULTS.exitDelayMs).toBe(1_500);
+    expect(doc.latency).toContain('Replay entry delay 1.5 s after release');
+    expect(doc.latency).toContain('replay sell delay 1.5 s after the exit decision');
+  });
+  it('the feed-online window ARCHITECTURE states is the one the callouts feed status uses', () => {
+    expect(PUMP_FEED_ONLINE_WINDOW_MS).toBe(60_000);
+    expect(doc.arch).toContain('`PUMP_FEED_ONLINE_WINDOW_MS` (60 s');
+    for (const status of ['NO_DATA', 'ONLINE', 'STALE']) expect(doc.arch).toContain(`\`${status}\``);
   });
 });

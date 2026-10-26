@@ -876,7 +876,8 @@ export class AutoSnipeController extends EventEmitter {
     try {
       const shadow = startMode === 'SHADOW';
       const solUsd = solPriceService.lastKnownPrice();
-      // P4.3 (R1-56): DEVNET_LIVE never buys below the floor, whatever the threshold is set to; the floor turns the execution score gate on for HOT too
+      // P4.3 (R1-56): DEVNET_LIVE never buys below the floor, whatever the threshold is set to; the floor turns the execution score gate on for HOT too.
+      // It applies to auto buys only: a manual snipe goes through executeSnipe with the plain threshold, LIVE armed or not.
       const threshold = getConfluenceThreshold();
       const minScore = startMode === 'DEVNET_LIVE' ? Math.max(threshold, CONFLUENCE_DEVNET_LIVE_FLOOR) : threshold;
       const scoreGate = verdict.state === 'READY' || minScore > threshold;

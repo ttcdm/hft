@@ -744,6 +744,27 @@ export class WorkstationDatabase {
   }
 
   /**
+   * 3F (R1-9): the closed positions of `mint` in `mode`, for the re-entry block. `lastExit` is the most recently closed one (its
+   * `updated_at` is when the close was written); `loss` is the most recent one closed with a negative realized PnL, if any.
+   * null when the query cannot run: the caller cannot know the mint was never exited, so it must refuse (fail closed).
+   */
+  public loadMintExits(mint: string, mode: ExecutionMode): { lastExit: { positionId: string; exitedAt: number } | null; loss: { positionId: string; realizedLamports: number } | null } | null {
+    try {
+      const rows = this.db
+        .prepare(`SELECT id, realized_pnl_lamports, updated_at FROM positions WHERE mint = ? AND execution_mode = ? AND status = 'CLOSED' ORDER BY updated_at DESC`)
+        .all(mint, mode) as any[];
+      const loss = rows.find((r) => r.realized_pnl_lamports < 0);
+      return {
+        lastExit: rows.length > 0 ? { positionId: rows[0].id, exitedAt: Number(rows[0].updated_at) } : null,
+        loss: loss ? { positionId: loss.id, realizedLamports: loss.realized_pnl_lamports } : null,
+      };
+    } catch (err: any) {
+      Logger.error(`loadMintExits could not read the positions table (${err?.message || err}); the buy is refused`);
+      return null;
+    }
+  }
+
+  /**
    * N18: the append-only audit tables (risk_decisions, decisions, system_journal) grew without bound. Rows older than the retention
    * window are deleted. Kept regardless of age because something still reads them: the halt journal (the latest row decides whether
    * trading is halted after a restart) and PAPER_FILL_GATES / PAPER_SELL_FILLED (mark which old paper fills and exits are unverified or model-priced, for the closed-trade statistics).

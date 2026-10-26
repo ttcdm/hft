@@ -2307,6 +2307,19 @@ export class ExecutionCoordinator {
     return { verdict, gates };
   }
 
+  /** 3F (R1-9): the MINT_RECENTLY_EXITED refusal for a buy of `mint` in the current mode, or null when it may be bought. Fails closed. */
+  private mintReentryRefusal(mint: string, now: number): string | null {
+    const exits = workstationDb.loadMintExits(mint, this.executionMode);
+    if (exits === null) return `MINT_RECENTLY_EXITED: the closed positions of ${mint} could not be read, so a re-entry after an exit cannot be ruled out; buy refused.`;
+    if (exits.loss) return `MINT_RECENTLY_EXITED: ${mint} was closed at a loss (position ${exits.loss.positionId}, ${(exits.loss.realizedLamports / 1e9).toFixed(6)} SOL); this mint is not bought again.`;
+    if (!exits.lastExit) return null;
+    const ageMs = now - exits.lastExit.exitedAt;
+    if (ageMs >= MINT_REENTRY_BLOCK_MS) return null; // a missing or future close time (NaN, negative age) stays blocked
+    const until = Number.isFinite(exits.lastExit.exitedAt) ? new Date(exits.lastExit.exitedAt + MINT_REENTRY_BLOCK_MS).toISOString() : 'an unknown time (the close time is unreadable)';
+    const ago = Number.isFinite(ageMs) ? `${(Math.max(0, ageMs) / 3_600_000).toFixed(1)} h ago` : 'at an unreadable time';
+    return `MINT_RECENTLY_EXITED: ${mint} was closed ${ago} (position ${exits.lastExit.positionId}); it can be bought again after ${until}, 24 h after the exit.`;
+  }
+
   // Authoritative Central Execution Entrypoint
   /** The one entry for every trade. S209: a span of its own (a child of the auto candidate's when auto started it, else the root of a manual trade's trace). */
   public executeTrade(req: ExecuteTradeRequest): Promise<ExecutionResponse> {
@@ -2392,6 +2405,12 @@ export class ExecutionCoordinator {
     if (this.executionMode === 'PAPER') {
       const evaluated = await this.evaluatePaperBuy(req, correlationId, now, openPositions, totalExposureSol);
       if ('rejection' in evaluated) return evaluated.rejection;
+      // 3F (R1-9): after the paper gates, so a halt, the kill switch or a loss limit still answers first
+      const paperReentry = this.mintReentryRefusal(req.mint, now);
+      if (paperReentry) {
+        workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'PAPER', { reason: 'MINT_RECENTLY_EXITED', mint: req.mint, message: paperReentry });
+        return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'PAPER', error: paperReentry, correlationId };
+      }
       const { quotePriceSol, paperEligibility, paperTip, maxPaperOrderSol, curveState } = evaluated;
 
       // Q7: quote the fill from the curve that was just read. A quote that cannot be made (curve nearly complete, order larger than the
@@ -2787,6 +2806,15 @@ export class ExecutionCoordinator {
         error: `POSITION_ALREADY_OPEN: an open LIVE position in ${req.mint} exists; close it before buying the same mint again.`,
         correlationId,
       };
+    }
+    // 3F (R1-9): no re-entry into a mint closed in the last 24 h, and none ever after a loss. Read from the positions table, for manual
+    // and auto buys alike, so the auto controller's setMode (which clears its per-session attempted set), a re-arm or a restart cannot clear
+    // it. Here, after the risk check (a halt, the kill switch or the loss latch answers first) and with no await before the reservation, so a
+    // close written during the awaits above is seen.
+    const reentry = this.mintReentryRefusal(req.mint, Date.now());
+    if (reentry) {
+      workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'LIVE', { reason: 'MINT_RECENTLY_EXITED', mint: req.mint, message: reentry });
+      return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'LIVE', error: reentry, correlationId };
     }
     this.inFlightBuyMints.add(req.mint);
     let buySettled!: () => void;
@@ -4368,5 +4396,8 @@ export class ExecutionCoordinator {
     }
   }
 }
+
+/** 3F (R1-9): a mint whose position (in the same execution mode) was closed less than this long ago is not bought again; after a loss, never. */
+export const MINT_REENTRY_BLOCK_MS = 24 * 60 * 60 * 1000;
 
 export const executionCoordinator = new ExecutionCoordinator(true);

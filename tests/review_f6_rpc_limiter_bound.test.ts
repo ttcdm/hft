@@ -81,4 +81,24 @@ describe('S271: the limiter survives the wall clock moving back', () => {
       Date.now = real;
     }
   });
+
+  it('wall-clock jumps either way while requests queue change neither the spacing nor the order (the limiter reads the monotonic clock)', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance', 'Date'] });
+    const l = new RpcRateLimiter(10); // 100 ms apart
+    const served: string[] = [];
+    const all = ['a', 'b', 'c', 'd'].map((n) => l.acquire(false, 3_000).then(() => served.push(n)));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(served).toEqual(['a']);
+    vi.setSystemTime(Date.now() + 18 * 3_600_000); // forward: no burst
+    await vi.advanceTimersByTimeAsync(50);
+    expect(served).toEqual(['a']);
+    await vi.advanceTimersByTimeAsync(50);
+    expect(served).toEqual(['a', 'b']);
+    vi.setSystemTime(Date.now() - 2 * 18 * 3_600_000); // back past the start: no stall
+    await vi.advanceTimersByTimeAsync(100);
+    expect(served).toEqual(['a', 'b', 'c']);
+    await vi.advanceTimersByTimeAsync(100);
+    await Promise.all(all);
+    expect(served).toEqual(['a', 'b', 'c', 'd']);
+  });
 });

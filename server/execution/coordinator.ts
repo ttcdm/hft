@@ -149,6 +149,8 @@ export function exitStageAfterFill(reason: string | undefined, current: Normaliz
 /** E2: true when a token program (SPL Token or Token-2022) owns the account; an unknown owner counts as owned, so a read that cannot tell decides nothing. */
 const ownedByTokenProgram = (owner: PublicKey | undefined): boolean => !owner || typeof (owner as any).equals !== 'function' || owner.equals(TOKEN_PROGRAM_ID) || owner.equals(TOKEN_2022_PROGRAM_ID);
 
+/** 3B: the decision-journal outcome of a landed LIVE buy (any caller); its row carries the buy's wallet SOL delta. */
+export const LIVE_BUY_FILLED = 'LIVE_BUY_FILLED';
 export const isRecoveredPosition = (p: { entryTxSignature?: string }): boolean => !!p.entryTxSignature?.startsWith('RECOVERED:');
 
 // Q11: the reasons the operator routes actually pass ('Manual user order' from POST /api/wallet/close, 'Aggregator Close' from the WS
@@ -902,8 +904,10 @@ export class ExecutionCoordinator {
 
                 if (recovery.recovered && recovery.mint) {
                   if (recovery.type === 'BUY' && recovery.tokenQuantityRaw) {
-                    workstationDb.savePosition(this.positionFromRecoveredBuy(pTx, recovery, txDetails.slot));
+                    const adopted = this.positionFromRecoveredBuy(pTx, recovery, txDetails.slot);
+                    workstationDb.savePosition(adopted);
                     pTx.reconciliationState = 'RECONCILED';
+                    this.journalLiveBuySolDelta(adopted, recovery.solSpentLamports ?? 0, 'STARTUP_RECONCILIATION', 'RECOVERED'); // 3B (R1-38)
                     Logger.info(`Successfully recovered interrupted BUY position for ${recovery.mint} (${pTx.signature})`);
                   } else if (recovery.type === 'SELL') {
                     const targetPos = workstationDb
@@ -1090,6 +1094,28 @@ export class ExecutionCoordinator {
     this.reconcileRetryTimer.unref?.();
   }
 
+  /**
+   * 3B (P3.2, R1-38): one decision row per landed LIVE buy, carrying the SOL it took from the wallet (negative), so the DEVNET_LIVE wallet
+   * audit (sumDecisionSolDelta) explains it. Written once per buy: by the confirmed path when its position is saved, or by orphan recovery
+   * when it adopts a buy that returned UNCONFIRMED or with an unread fill (that path's idempotent branch, a position already saved, writes none).
+   * The auto controller's BOUGHT row carries no delta of its own, so an auto buy is not counted twice. PAPER buys never journal one.
+   */
+  private journalLiveBuySolDelta(pos: NormalizedPosition, walletDeltaLamports: number, source: string, how: 'CONFIRMED' | 'RECOVERED'): void {
+    if (pos.executionMode !== 'LIVE') return;
+    workstationDb.logDecision({
+      autoMode: 'n/a',
+      mint: pos.mint,
+      symbol: pos.symbol,
+      source,
+      stage: 'fill',
+      outcome: LIVE_BUY_FILLED,
+      reason: how === 'CONFIRMED' ? 'LIVE buy confirmed and reconciled' : 'LIVE buy adopted by orphan recovery',
+      inputs: { walletDeltaLamports, signature: pos.entryTxSignature },
+      positionId: pos.id,
+      solDelta: -walletDeltaLamports / 1e9,
+    });
+  }
+
   /** Position for a buy rebuilt from confirmed on-chain data. Entry price is the curve price paid; cost basis is the whole wallet delta. */
   private positionFromRecoveredBuy(
     pTx: { signature: string; mint: string; jitoTipLamports: number; executionMode: ExecutionMode },
@@ -1154,9 +1180,12 @@ export class ExecutionCoordinator {
         }
         const recovery = await TradeReconciler.recoverInterruptedTransaction(this.connection, t.signature, wallet, t.jitoTipLamports);
         if (recovery.recovered && recovery.type === 'BUY' && recovery.mint && recovery.tokenQuantityRaw) {
-          workstationDb.savePosition(this.positionFromRecoveredBuy(t, recovery, t.landingSlot ?? 0));
+          const adopted = this.positionFromRecoveredBuy(t, recovery, t.landingSlot ?? 0);
+          workstationDb.savePosition(adopted);
           t.reconciliationState = 'RECONCILED';
           workstationDb.saveTransaction(t);
+          // 3B (R1-38): the SOL this buy took left the wallet without a journal row (it returned UNCONFIRMED, or its fill was unread); journal it now.
+          this.journalLiveBuySolDelta(adopted, recovery.solSpentLamports ?? 0, 'ORPHAN_RECOVERY', 'RECOVERED');
           recovered.push(t.signature);
           Logger.warn(`Recovered orphaned LIVE buy ${t.signature} for ${recovery.mint}: position opened with stop-loss coverage`);
         } else if (recovery.error && /reverted/i.test(recovery.error)) {
@@ -3033,6 +3062,10 @@ export class ExecutionCoordinator {
         jitoTipLamports: resolvedTip.tipLamports,
         executionMode: 'LIVE',
       });
+      // 3B (P3.2, R1-38): every LIVE buy journals what it took from the wallet, whoever placed it (auto, a manual route, Telegram), so the
+      // DEVNET_LIVE wallet audit can explain it. The whole wallet delta: curve spend, tip, fees, and the rent of the token account and (first
+      // buy) the volume accumulator. A position the database refused is journaled by orphan recovery when it rebuilds it, not here.
+      if (positionPersisted) this.journalLiveBuySolDelta(livePosition, reconciliation.actualSolSpentLamports, req.source, 'CONFIRMED');
       if (!ledgerWritten) {
         this.raiseOperatorAlert('LEDGER_WRITE_FAILED', `The transaction row for a landed buy (${subRes.signature.slice(0, 8)}) could not be written; the position ${positionPersisted ? 'was saved' : 'was NOT saved either'}.`, subRes.signature);
       }

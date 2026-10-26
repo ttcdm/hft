@@ -2,7 +2,7 @@ import '../suppress-warnings.cjs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair, MessageAccountKeys, PublicKey, SystemProgram, TransactionMessage, VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
-import { ExecutionCoordinator, ExecuteTradeRequest, executionCoordinator } from '../server/execution/coordinator';
+import { ExecutionCoordinator, ExecuteTradeRequest, executionCoordinator, LIVE_BUY_FILLED } from '../server/execution/coordinator';
 import { autoSnipeController, DEVNET_CONFIRMATION_CODE, AUTO_DEVNET_ORDER_SOL } from '../server/auto/controller';
 import { auditWalletChange, WALLET_AUDIT_RENT_ALLOWANCE_SOL } from '../server/auto/killSwitch';
 import { memecoinAggregator } from '../server/memecoinAggregator';
@@ -253,5 +253,27 @@ describe('3B: unresolved LIVE buys count everywhere; the wallet audit knows them
     expect(d.reason).not.toMatch(/DEVNET_MAX_OPEN_POSITIONS/);
     expect(d.outcome, d.reason).toBe('BOUGHT');
     expect(snipe).toHaveBeenCalledTimes(1);
+  });
+
+  it('R1-38: a manual LIVE buy during DEVNET_LIVE journals its wallet delta once and does not halt', async () => {
+    const bal = await armAuto();
+    const t0 = Date.now();
+    expect(await autoSnipeController.auditWallet(t0)).toBeNull();
+    const delta = 7_500_000;
+    confirmEdges(delta);
+    const mint = Keypair.generate().publicKey.toBase58();
+    const res = await coordinator.executeTrade(buyReq(mint, 'MANUAL'));
+    expect(res.lifecycleState, res.error).toBe('CONFIRMED');
+    const rows = workstationDb.loadDecisions({ mint, outcome: LIVE_BUY_FILLED });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].solDelta).toBeCloseTo(-delta / SOL, 12);
+    expect(rows[0].positionId).toBe(res.positionId);
+
+    const halt = vi.spyOn(executionCoordinator, 'haltAll');
+    bal.mockReturnValue(1 - delta / SOL);
+    const audit = await autoSnipeController.auditWallet(Date.now() + 1);
+    expect(audit?.explained).toBe(true);
+    expect(halt).not.toHaveBeenCalled();
+    expect(executionCoordinator.getHaltReason()).toBeNull();
   });
 });

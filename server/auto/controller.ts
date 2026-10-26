@@ -2,7 +2,7 @@ import { EventEmitter } from 'events';
 import { isReadOnly } from '../solana/readOnly';
 import { workstationDb } from '../db/database';
 import { traced } from '../observability/tracing';
-import { executionCoordinator, isRecoveredPosition } from '../execution/coordinator';
+import { executionCoordinator, isRecoveredPosition, LIVE_BUY_FILLED } from '../execution/coordinator';
 import { memecoinAggregator } from '../memecoinAggregator';
 import { solPriceService } from '../market/solPriceService';
 import { executionConfig } from '../solana/executionConfig';
@@ -231,8 +231,9 @@ export class AutoSnipeController extends EventEmitter {
     const d: AutoDecision = { ts: Date.now(), mode: this.mode, mint: c.mint, symbol: c.symbol, source: c.source, outcome, stage, reason, ...pub };
     this.decisions.push(d);
     if (this.decisions.length > MAX_DECISIONS) this.decisions.shift();
-    // Q8: only DEVNET_LIVE fills move the wallet; a PAPER fill's delta must not enter the wallet audit
-    const solDelta = outcome === 'BOUGHT' && d.mode === 'DEVNET_LIVE' && extra.amountSol !== undefined ? -(extra.amountSol + (extra.feesSol ?? 0)) : undefined;
+    // 3B (R1-38): a BOUGHT row carries no wallet delta. The coordinator journals every landed LIVE buy (LIVE_BUY_FILLED, the whole wallet
+    // delta with rent, keyed by the same positionId), whoever placed it; a delta here as well would count an auto buy twice in the audit.
+    // (Q8: a PAPER fill never had one.)
     workstationDb.logDecision({
       ts: d.ts,
       autoMode: d.mode,
@@ -244,7 +245,6 @@ export class AutoSnipeController extends EventEmitter {
       reason: d.reason,
       inputs: extra.inputs,
       positionId: d.positionId,
-      solDelta,
       unverified: extra.unverified,
     });
     this.emit('decision', d);

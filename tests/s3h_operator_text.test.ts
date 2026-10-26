@@ -95,6 +95,18 @@ describe('3H P3.7: the connectivity diagnostics are built from the probes that r
     expect(toast.message).toContain('Skipped (external feeds off)');
   }, 180_000);
 
+  it('POST /api/memecoins/config with a bot token: the reply and GET never carry it, and both say a token is set', async () => {
+    const { app } = await boot({ APEX_DISABLE_EXTERNAL_FEEDS: 'true' });
+    const set = await app.call('POST', '/api/memecoins/config', { telegramBotToken: 'SECRET-3H-TOKEN:abc' });
+    expect(set.status).toBe(200);
+    const got = await app.call('GET', '/api/memecoins/config');
+    for (const r of [set, got]) {
+      expect(JSON.stringify(r.json)).not.toContain('SECRET-3H-TOKEN');
+      expect(r.json.config.telegramBotToken).toBe('');
+      expect(r.json.config.telegramBotTokenSet).toBe(true); // the second redaction in server.ts made this always false
+    }
+  }, 180_000);
+
   it('with feeds on and every outside fetch failing, the rows say the probes failed and carry none of the placeholder text', async () => {
     const { app, hosts } = await boot({ APEX_DISABLE_EXTERNAL_FEEDS: '' });
     const d = await app.call('GET', '/api/connectivity/diagnostics');

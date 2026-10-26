@@ -60,8 +60,10 @@ describe('L1: server.ts keeps the second line of defence and the redaction', () 
   });
   it('never returns the stored Telegram bot token from /api/memecoins/config', () => {
     const block = src.slice(src.indexOf("app.get('/api/memecoins/config'"), src.indexOf("app.post('/api/memecoins/config'") + 700);
-    expect(block).toMatch(/redactSniperConfig\(memecoinAggregator\.getConfig\(\)\)/);
-    expect(block).toMatch(/redactSniperConfig\(updated\)/);
-    expect(src).toMatch(/telegramBotToken: '', telegramBotTokenSet: Boolean/);
+    // 3H: the redaction is the aggregator's own (getConfig and updateConfig); the route returns what they give
+    expect(block).toMatch(/config: memecoinAggregator\.getConfig\(\)/);
+    expect(block).toMatch(/const updated = memecoinAggregator\.updateConfig\(patch\)/);
+    expect(block).toMatch(/config: updated/);
+    expect(fs.readFileSync('server/memecoinAggregator.ts', 'utf8')).toMatch(/telegramBotToken: '', telegramBotTokenSet: Boolean\(this\.config\.telegramBotToken\)/);
   });
 });

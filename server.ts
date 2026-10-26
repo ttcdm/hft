@@ -945,15 +945,13 @@ app.post('/api/memecoins/close', requireOperatorAuth, validateTradeBody(Operator
   });
 }));
 
-/** The bot token is write-only: it never leaves the server once stored. */
-function redactSniperConfig<T extends { telegramBotToken?: string }>(c: T) {
-  return { ...c, telegramBotToken: '', telegramBotTokenSet: Boolean(c.telegramBotToken) };
-}
+// The bot token is write-only: memecoinAggregator.getConfig() and updateConfig() never return it, only telegramBotTokenSet. (3H: a second
+// redaction here, redactSniperConfig, re-derived telegramBotTokenSet from the already-blanked token, so the API always said no token was set.)
 
 app.get('/api/memecoins/config', requireOperatorAuth, (req, res) => {
   res.json({
     status: 'OK',
-    config: redactSniperConfig(memecoinAggregator.getConfig()),
+    config: memecoinAggregator.getConfig(),
     exitRules: exitRulesSummary(), // the fixed ExitEngine rules; config.takeProfitPct / stopLossPct do not drive exits
   });
 });
@@ -965,7 +963,7 @@ app.post('/api/memecoins/config', requireOperatorAuth, validateTradeBody(SniperC
   const updated = memecoinAggregator.updateConfig(patch);
   res.json({
     status: 'OK',
-    config: redactSniperConfig(updated),
+    config: updated,
   });
 });
 

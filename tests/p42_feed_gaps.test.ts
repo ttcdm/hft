@@ -130,7 +130,7 @@ describe('R1-52: a gap in the log stream releases every watched launch DEAD with
     await listener.stop();
   });
 
-  it('slot heartbeat: a jump of more than FEED_SLOT_JUMP_MAX slots is a gap; a normal step is not', async () => {
+  it('slot heartbeat: a jump of more than FEED_SLOT_JUMP_MAX slots is a gap until the next in-order slot; a normal step is not', async () => {
     const { listener, ww, replay, slot } = await running();
     slot(500);
     slot(500 + FEED_SLOT_JUMP_MAX); // within the limit
@@ -139,7 +139,12 @@ describe('R1-52: a gap in the log stream releases every watched launch DEAD with
     expect(ww.getVerdict(mint.toBase58())?.state).toBe('WATCHING');
     slot(500 + 2 * FEED_SLOT_JUMP_MAX + 1);
     expect(ww.getVerdict(mint.toBase58())?.reason).toMatch(/^FEED_GAP: .*SLOT_JUMP/);
-    expect(listener.getTelemetry().status).toBe('ACTIVE'); // slots are arriving again
+    // B7: the jump shows as RECONNECTING (it used to go straight back to ACTIVE in the same call)
+    expect(listener.getTelemetry().status).toBe('RECONNECTING');
+    expect(listener.isActive()).toBe(false);
+    slot(500 + 2 * FEED_SLOT_JUMP_MAX + 2); // the next slot is in order: the stream is delivering again
+    expect(listener.getTelemetry().status).toBe('ACTIVE');
+    expect(listener.getTelemetry().feedGaps).toBe(1);
     await listener.stop();
   });
 
@@ -164,7 +169,8 @@ describe('R1-63: setRpcEndpoint moves the log subscription', () => {
     });
     const onLogs = vi.spyOn(Connection.prototype, 'onLogs').mockReturnValue(11);
     const removeLogs = vi.spyOn(Connection.prototype, 'removeOnLogsListener').mockResolvedValue(undefined);
-    vi.spyOn(Connection.prototype, 'onSlotChange').mockReturnValue(12);
+    const slotCbs: Array<{ conn: unknown; fn: (info: any) => void }> = [];
+    vi.spyOn(Connection.prototype, 'onSlotChange').mockImplementation(function (this: unknown, fn: any) { slotCbs.push({ conn: this, fn }); return 12; });
     vi.spyOn(Connection.prototype, 'removeSlotChangeListener').mockResolvedValue(undefined);
 
     const c = new ExecutionCoordinator();
@@ -187,10 +193,16 @@ describe('R1-63: setRpcEndpoint moves the log subscription', () => {
       expect(removeLogs.mock.contexts[0]).toBe(a);
       expect(removeLogs.mock.calls[0][0]).toBe(11);
       expect(onLogs.mock.contexts[1]).toBe(b);
-      expect(listener.isActive()).toBe(true);
       expect(listener.getTelemetry().activeEndpoint).toBe('http://127.0.0.1:9');
       expect(listener.getTelemetry().lastFeedGap?.reason).toBe('ENDPOINT_SWITCH');
       expect(ww.getVerdict(mint)?.reason).toMatch(/^FEED_GAP: .*ENDPOINT_SWITCH/);
+      // B7: the switch shows as RECONNECTING until the new Connection delivers (here its first slot)
+      expect(listener.getTelemetry().status).toBe('RECONNECTING');
+      expect(listener.isActive()).toBe(false);
+      const onB = slotCbs.filter((s) => s.conn === b);
+      expect(onB).toHaveLength(1);
+      onB[0].fn({ slot: 43, parent: 42, root: 42 });
+      expect(listener.isActive()).toBe(true);
       await listener.stop();
       listener.destroy();
     } finally {
@@ -346,5 +358,51 @@ describe('R1-65: no pump.fun / DexScreener HTTP polling off mainnet', () => {
       svc.startBackground({ env: { ALLOWED_CLUSTER: 'mainnet-beta' } });
       expect(sync).toHaveBeenCalledTimes(1);
     } finally { vi.clearAllTimers(); }
+  });
+});
+
+describe('B7 (review 2026-10-24, finding 7): slot-jump and RPC-switch gaps show RECONNECTING', () => {
+  it('switchConnection: RECONNECTING with one feed_gap until the new Connection delivers; its first log also closes the gap', async () => {
+    const { listener, ww, replay } = await running();
+    const gaps = vi.fn();
+    listener.on('feed_gap', gaps);
+    const mint = Keypair.generate().publicKey;
+    replay(createLog(mint, Keypair.generate().publicKey), 10);
+    const next = fakeConn('http://127.0.0.1:28899');
+    expect(await listener.switchConnection(next.conn)).toBe(true);
+    expect(listener.getTelemetry().status).toBe('RECONNECTING');
+    expect(listener.isActive()).toBe(false);
+    expect(gaps).toHaveBeenCalledTimes(1);
+    expect(gaps.mock.calls[0][0].reason).toBe('ENDPOINT_SWITCH');
+    expect(ww.getVerdict(mint.toBase58())?.reason).toMatch(/^FEED_GAP: .*ENDPOINT_SWITCH/);
+    // an RPC without slot notifications: the first log on the new subscription shows it is delivering
+    const later = Keypair.generate().publicKey;
+    next.replay(createLog(later, Keypair.generate().publicKey), 20);
+    expect(listener.getTelemetry().status).toBe('ACTIVE');
+    expect(ww.getVerdict(later.toBase58())?.state).toBe('WATCHING'); // watched after the switch, not released by it
+    expect(listener.getTelemetry().feedGaps).toBe(1);
+    await listener.stop();
+  });
+
+  it('switchConnection: the new socket opening closes the gap', async () => {
+    const { listener } = await running();
+    const next = fakeConn('http://127.0.0.1:28899');
+    await listener.switchConnection(next.conn);
+    expect(listener.getTelemetry().status).toBe('RECONNECTING');
+    next.socket.emit('open');
+    expect(listener.getTelemetry().status).toBe('ACTIVE');
+    await listener.stop();
+  });
+
+  it('a log does not close a slot-jump gap: only the next in-order slot does', async () => {
+    const { listener, replay, slot } = await running();
+    slot(100);
+    slot(100 + FEED_SLOT_JUMP_MAX + 1);
+    expect(listener.getTelemetry().status).toBe('RECONNECTING');
+    replay(createLog(Keypair.generate().publicKey, Keypair.generate().publicKey), 127);
+    expect(listener.getTelemetry().status).toBe('RECONNECTING');
+    slot(100 + FEED_SLOT_JUMP_MAX + 2);
+    expect(listener.getTelemetry().status).toBe('ACTIVE');
+    await listener.stop();
   });
 });

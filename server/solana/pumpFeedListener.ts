@@ -144,6 +144,8 @@ export class PumpFeedListener extends EventEmitter {
   private lastSlot: number | null = null;
   private lastSlotAt = 0;
   private gapOpen = false;
+  /** Why the open gap was opened. An ENDPOINT_SWITCH gap is also closed by the first log from the new subscription. */
+  private gapReason: FeedGapReason | null = null;
   private feedGaps = 0;
   private lastFeedGap: FeedGapEvent | null = null;
   private nonSolQuoteSkipped = 0;
@@ -529,6 +531,7 @@ export class PumpFeedListener extends EventEmitter {
         PUMP_FUN_PROGRAM_ID,
         (logs: Logs, ctx: Context) => {
           this.eventsReceived++;
+          if (this.gapReason === 'ENDPOINT_SWITCH') this.closeGap(); // the new subscription is delivering
           const handlerStart = performance.now();
           try {
             const trades = this.parseTradeLogs(logs, ctx);
@@ -647,6 +650,7 @@ export class PumpFeedListener extends EventEmitter {
     }
     this.slotSubscriptionId = null;
     this.gapOpen = false;
+    this.gapReason = null;
   }
 
   private onSlot(info: SlotInfo): void {
@@ -654,9 +658,11 @@ export class PumpFeedListener extends EventEmitter {
     this.lastSlot = info.slot;
     this.lastSlotAt = Date.now();
     if (prev !== null && info.slot - prev > FEED_SLOT_JUMP_MAX) {
+      // B7: stays RECONNECTING until the next slot shows the stream is delivering in order again
       this.openGap('SLOT_JUMP', `slot notifications jumped from ${prev} to ${info.slot} (more than ${FEED_SLOT_JUMP_MAX})`);
+      return;
     }
-    this.closeGap(); // a slot arrived: the stream is delivering again
+    this.closeGap(); // a slot arrived in order: the stream is delivering again
   }
 
   private checkHeartbeat(now = Date.now()): void {
@@ -666,10 +672,14 @@ export class PumpFeedListener extends EventEmitter {
     }
   }
 
-  /** Open a gap once: status RECONNECTING and a 'feed_gap' event. It closes when the socket reopens or a slot arrives. */
+  /**
+   * Open a gap once: status RECONNECTING and a 'feed_gap' event. It closes when the socket reopens or an in-order slot arrives (after
+   * SLOT_JUMP, the slot after the jump), and an ENDPOINT_SWITCH gap also on the first log from the new subscription.
+   */
   private openGap(reason: FeedGapReason, detail: string): void {
     if (this.gapOpen || this.subscriptionId === null) return;
     this.gapOpen = true;
+    this.gapReason = reason;
     this.status = 'RECONNECTING';
     this.emitGap(reason, detail);
   }
@@ -677,6 +687,7 @@ export class PumpFeedListener extends EventEmitter {
   private closeGap(): void {
     if (!this.gapOpen) return;
     this.gapOpen = false;
+    this.gapReason = null;
     if (this.subscriptionId !== null) this.status = 'ACTIVE';
     Logger.info('PumpFeedListener: log stream delivering again after a gap');
   }
@@ -695,8 +706,10 @@ export class PumpFeedListener extends EventEmitter {
 
   /**
    * P4.2 (R1-63): move the subscription to a new Connection: unsubscribe on the old one, resubscribe on `conn`. The switch itself is
-   * a gap (logs between the two subscriptions are lost), so it emits 'feed_gap' ENDPOINT_SWITCH. A listener that was not running only
-   * takes the new Connection. Creator lookups (`scoreCreator`) use the same Connection, so they move with it.
+   * a gap (logs between the two subscriptions are lost), so it is opened as an ENDPOINT_SWITCH gap on the new subscription: status
+   * RECONNECTING and 'feed_gap' (B7: before, the status went straight from DISCONNECTED to ACTIVE). The gap closes on the new
+   * Connection's first slot, socket open or log. A listener that was not running only takes the new Connection. Creator lookups
+   * (`scoreCreator`) use the same Connection, so they move with it.
    */
   public async switchConnection(conn: Connection): Promise<boolean> {
     if (conn === this.connection) return this.isActive();
@@ -704,8 +717,11 @@ export class PumpFeedListener extends EventEmitter {
     await this.stop();
     this.connection = conn;
     if (!wasRunning || this.isDestroyed) return false;
-    this.emitGap('ENDPOINT_SWITCH', 'the RPC endpoint was switched; logs between the two subscriptions are not seen');
-    return this.start();
+    const detail = 'the RPC endpoint was switched; logs between the two subscriptions are not seen';
+    const started = await this.start();
+    if (started) this.openGap('ENDPOINT_SWITCH', detail);
+    else this.emitGap('ENDPOINT_SWITCH', detail); // not subscribed (status ERROR or RECONNECTING): watched launches are still released
+    return started;
   }
 
   /** Follow the coordinator's trading Connection: every successful `setRpcEndpoint` moves the subscription (switchConnection). */

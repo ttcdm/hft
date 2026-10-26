@@ -1707,7 +1707,7 @@ export function bootRefusesBadLimit(s: Pick<HarnessSteps, 'rec'>, boot: () => { 
   );
 }
 
-// ---- Stage 3 steps (task 3K): (m) for 3B. ----
+// ---- Stage 3 steps (task 3K): (m) for 3B, (o) for 3E. ----
 
 /** 3K: a balance read retried after 0.5, 1 and 2 s; null when no read answered (the caller SKIPs the check that needed it). */
 async function readWithRetry<T>(read: () => Promise<T | null>, sleep: (ms: number) => Promise<unknown>): Promise<T | null> {
@@ -1875,3 +1875,196 @@ export function stepCoins(s: Pick<HarnessSteps, 'rec'>, label: string, kit: Chai
   };
 }
 
+/**
+ * 3K (o): a loopback relay in front of `upstream` for a child server: HTTP on P, its websocket on P + 1 (web3.js's rule). `holdNextSend`
+ * arms it: the next `sendTransaction` is forwarded upstream at once (so it can land) but its reply is kept back, and the promise resolves
+ * when that request arrived. `release` lets every reply kept back go.
+ */
+export async function startSendHoldingRelay(upstream: string) {
+  for (let i = 0; i < 20; i++) {
+    let arm: (() => void) | null = null;
+    const held: Array<() => void> = [];
+    const server = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', async () => {
+        let method = '';
+        try { method = String(JSON.parse(body)?.method ?? ''); } catch { /* a batch or junk: forward it */ }
+        let up: Response;
+        try {
+          up = await fetch(upstream, { method: 'POST', headers: { 'content-type': 'application/json' }, body });
+        } catch {
+          res.writeHead(502).end();
+          return;
+        }
+        const text = await up.text();
+        const reply = () => { if (!res.writableEnded && !res.destroyed) res.writeHead(up.status, { 'content-type': up.headers.get('content-type') ?? 'application/json' }).end(text); };
+        if (method === 'sendTransaction' && arm) { const a = arm; arm = null; held.push(reply); a(); return; }
+        reply();
+      });
+    });
+    await listenOn(server, 0);
+    const port = (server.address() as AddressInfo).port;
+    try {
+      const ws = await startBlockingWsProxy(wsUrlFor(upstream), port + 1);
+      return {
+        url: `http://127.0.0.1:${port}`,
+        wsUrl: ws.url,
+        holdNextSend: () => new Promise<void>((r) => { arm = r; }),
+        release: () => { arm = null; for (const f of held.splice(0)) f(); },
+        close: async () => {
+          for (const f of held.splice(0)) f();
+          await ws.close();
+          await new Promise<void>((r) => { server.closeAllConnections(); server.close(() => r()); });
+        },
+      };
+    } catch {
+      await new Promise<void>((r) => { server.closeAllConnections(); server.close(() => r()); }); // P + 1 was taken: try another pair
+    }
+  }
+  throw new Error('no two adjacent free loopback ports for the send-holding relay');
+}
+
+/** 3K (o): one boot of server.ts in a child process (its own scratch DB and signer, behind the step's relay). */
+export interface ChildApp {
+  call(method: 'GET' | 'POST', route: string, body?: unknown): Promise<{ status: number; json: any }>;
+  /** A crash: SIGKILL, no shutdown hooks. */
+  kill(): Promise<void>;
+  /** A normal stop: SIGTERM (SIGKILL after 5 s). */
+  stop(): Promise<void>;
+}
+
+/**
+ * 3K (o): starts `node [--require <guard>] --import tsx server.ts` with exactly `env` (plus APP_PORT and OPERATOR_AUTH_TOKEN), logs appended
+ * to `logFile`, and waits for /api/health (up to 120 s). Node runs the server itself (not the tsx CLI), so SIGKILL reaches it.
+ */
+export async function spawnServer(o: { env: Record<string, string>; logFile: string; guard?: string; token: string }): Promise<ChildApp> {
+  const { spawn } = await import('node:child_process');
+  const net = await import('node:net');
+  const port = await new Promise<number>((res, rej) => { const srv = net.createServer(); srv.once('error', rej); srv.listen(0, '127.0.0.1', () => { const p = (srv.address() as AddressInfo).port; srv.close(() => res(p)); }); });
+  const args = [...(o.guard ? ['--require', o.guard] : []), '--import', 'tsx', 'server.ts'];
+  const child = spawn(process.execPath, args, { cwd: process.cwd(), env: { ...o.env, APP_PORT: String(port), OPERATOR_AUTH_TOKEN: o.token }, stdio: ['ignore', 'pipe', 'pipe'] });
+  child.stdout!.on('data', (c) => fs.appendFileSync(o.logFile, c));
+  child.stderr!.on('data', (c) => fs.appendFileSync(o.logFile, c));
+  const base = `http://127.0.0.1:${port}`;
+  const stopWith = (sig: NodeJS.Signals) => new Promise<void>((r) => {
+    if (child.exitCode !== null || child.signalCode !== null) return r();
+    child.once('exit', () => r());
+    child.kill(sig);
+    if (sig !== 'SIGKILL') setTimeout(() => child.kill('SIGKILL'), 5_000).unref();
+  });
+  let up = false;
+  for (let i = 0; i < 480 && !up; i++) {
+    if (child.exitCode !== null) throw new Error(`server.ts exited at boot (${child.exitCode}); log ${o.logFile}`);
+    try { up = (await fetch(`${base}/api/health`)).ok; } catch { /* not listening yet */ }
+    if (!up) await new Promise((r) => setTimeout(r, 250));
+  }
+  if (!up) { await stopWith('SIGKILL'); throw new Error(`server.ts did not answer /api/health in 120 s; log ${o.logFile}`); }
+  return {
+    async call(method, route, body) {
+      const res = await fetch(base + route, { method, headers: { 'content-type': 'application/json', authorization: `Bearer ${o.token}` }, body: body === undefined ? undefined : JSON.stringify(body) });
+      return { status: res.status, json: await res.json().catch(() => null) };
+    },
+    kill: () => stopWith('SIGKILL'),
+    stop: () => stopWith('SIGTERM'),
+  };
+}
+
+export interface KillRestartDeps {
+  /** Boots server.ts (AUTO_SNIPE_ENABLED=true) on the step's DB, signed by the step's own wallet, its RPC the relay below. Resolves when /api/health answers. */
+  boot(): Promise<ChildApp>;
+  relay: { holdNextSend(): Promise<void>; release(): void };
+  /** The coin the child buys by hand (POST /api/execution/trade body). */
+  buyBody: Record<string, unknown>;
+  /**
+   * Writes one BOUGHT auto decision naming `positionId` into the step's DB while no server runs on it, so the next server's
+   * `kill({exitAll})` counts the position as auto-owned and sells it (the child cannot be made to buy through auto here).
+   */
+  plantAutoOwned(positionId: string, mint: string): void;
+  /** Lends the step's wallet its SOL (the key is on disk before this runs). */
+  fund(): Promise<void>;
+  /** Sells what the step's wallet holds of the coin and refunds it; a failure is the caller's FAIL line. Always called, in `finally`. */
+  cleanup(): Promise<void>;
+}
+
+/**
+ * (o) 3E, opt-in (DEVNET_KILL_RESTART=1): the auto kill and the kill switch survive a restart. Runs server.ts itself, in child processes
+ * on a scratch DB of its own, signed by a throwaway wallet of its own (the harness's process holds the harness wallet's and DB's locks).
+ *  1. Boot, arm LIVE, buy the coin by hand (one LIVE position); stop. A BOUGHT auto decision naming that position is written into the DB.
+ *  2. Boot, arm, auto DEVNET_LIVE. The relay keeps back the reply to the next sendTransaction, and POST /api/auto/kill {exitAll:true} is sent:
+ *     the kill sells the auto-owned position, and while that sell's reply is kept back the server is killed (SIGKILL). Before 3E the mode
+ *     was saved only after the sells, so the saved mode was still DEVNET_LIVE.
+ *  3. Boot again: GET /api/auto/status says mode OFF, killed true and the kill reason (3E). Then POST /api/execution/kill-switch {activate:true}; stop.
+ *  4. Boot again: GET /api/execution/can-arm lists KILL_SWITCH_WAS_ON and auto is OFF; POST /api/auto/resume {clearHalt:true} clears it
+ *     from can-arm.
+ * `finally`: the relay lets everything go, any server still up is stopped, and the wallet is sold out and refunded.
+ */
+export async function killSurvivesRestart(s: Pick<HarnessSteps, 'rec' | 'sleep'>, d: KillRestartDeps): Promise<void> {
+  const L = '(o) 3E: kill survives a restart';
+  const ARM = { arm: true, confirmationCode: 'CONFIRM_LIVE_TRADING_RISK' };
+  const KILL_REASON = 'e2e (o) kill mid-sell';
+  let app: ChildApp | null = null;
+  const armWhenReady = async (a: ChildApp, label: string): Promise<boolean> => {
+    let last: any = null;
+    for (let i = 0; i < 120; i++) {
+      last = (await a.call('GET', '/api/execution/can-arm')).json;
+      if (last?.allowed === true) break;
+      await s.sleep(1_000);
+    }
+    const r = await a.call('POST', '/api/execution/arm', ARM);
+    s.rec(`${L}: ${label}: arm LIVE`, r.json?.success === true, r.json?.message ?? r.json?.error ?? JSON.stringify(last?.reasons ?? []).slice(0, 300));
+    return r.json?.success === true;
+  };
+  try {
+    await d.fund();
+    // 1. a LIVE position, made auto-owned
+    app = await d.boot();
+    if (!(await armWhenReady(app, 'boot 1'))) return;
+    const buy = await app.call('POST', '/api/execution/trade', d.buyBody);
+    const posId: string | undefined = buy.json?.positionId;
+    s.rec(`${L}: boot 1: a LIVE position`, buy.json?.success === true && !!posId, `${buy.status} ${buy.json?.lifecycleState ?? ''} ${buy.json?.error ?? ''} ${posId ?? 'no position id'}`.slice(0, 300));
+    await app.stop(); app = null;
+    if (!posId) return;
+    d.plantAutoOwned(posId, String(d.buyBody.mint));
+
+    // 2. kill with the sell's reply kept back, then crash
+    app = await d.boot();
+    if (!(await armWhenReady(app, 'boot 2'))) return;
+    const mode = await app.call('POST', '/api/auto/mode', { mode: 'DEVNET_LIVE', confirmationCode: 'CONFIRM_AUTO_DEVNET' });
+    s.rec(`${L}: boot 2: auto DEVNET_LIVE`, mode.json?.success === true, `${mode.status} ${mode.json?.mode ?? ''} ${mode.json?.error ?? ''}`.slice(0, 200));
+    if (mode.json?.success !== true) return;
+    const sent = d.relay.holdNextSend();
+    void app.call('POST', '/api/auto/kill', { exitAll: true, reason: KILL_REASON }).catch(() => null); // never answers: the server dies first
+    const reached = await Promise.race([sent.then(() => true), s.sleep(60_000).then(() => false)]);
+    s.rec(`${L}: boot 2: the kill reached its sell (reply kept back)`, reached, reached ? 'sendTransaction held; killing the server' : 'no sendTransaction within 60 s of POST /api/auto/kill {exitAll:true}');
+    await app.kill(); app = null;
+    d.relay.release();
+    if (!reached) return;
+
+    // 3. after the crash
+    app = await d.boot();
+    const st = (await app.call('GET', '/api/auto/status')).json;
+    s.rec(`${L}: boot 3 (after a crash mid-kill): auto is OFF`, st?.mode === 'OFF', `mode ${st?.mode}`);
+    s.rec(`${L}: boot 3: the status says it was killed, and why`, st?.killed === true && String(st?.killReason ?? '').includes(KILL_REASON), `killed ${st?.killed}, killReason ${JSON.stringify(st?.killReason ?? null)}`.slice(0, 200));
+    const trip = await app.call('POST', '/api/execution/kill-switch', { activate: true });
+    s.rec(`${L}: boot 3: kill switch tripped`, trip.json?.success === true && trip.json?.killSwitchActive === true, `${trip.status} killSwitchActive ${trip.json?.killSwitchActive}`);
+    await app.stop(); app = null;
+
+    // 4. after the kill switch
+    app = await d.boot();
+    const reasons = async (): Promise<string[]> => (await app!.call('GET', '/api/execution/can-arm')).json?.reasons ?? [];
+    const r4 = await reasons();
+    s.rec(`${L}: boot 4: can-arm lists KILL_SWITCH_WAS_ON`, r4.some((x) => x.includes('KILL_SWITCH_WAS_ON')), JSON.stringify(r4).slice(0, 300));
+    const st4 = (await app.call('GET', '/api/auto/status')).json;
+    s.rec(`${L}: boot 4: auto is OFF, killed by the kill switch`, st4?.mode === 'OFF' && st4?.killed === true, `mode ${st4?.mode}, killed ${st4?.killed}, killReason ${JSON.stringify(st4?.killReason ?? null)}`.slice(0, 200));
+    await app.call('POST', '/api/auto/resume', { clearHalt: true });
+    const r5 = await reasons();
+    s.rec(`${L}: boot 4: resume {clearHalt} takes KILL_SWITCH_WAS_ON off can-arm`, !r5.some((x) => x.includes('KILL_SWITCH_WAS_ON')), JSON.stringify(r5).slice(0, 300));
+  } catch (e: any) {
+    s.rec(L, false, String(e?.message ?? e).slice(0, 300));
+  } finally {
+    d.relay.release();
+    if (app) { try { await app.stop(); } catch { /* already gone */ } }
+    try { await d.cleanup(); } catch (e: any) { s.rec(`${L}: sell out and refund the step's wallet`, false, `${String(e?.message ?? e).slice(0, 160)}; key in <scratch>/temp-wallets/`); }
+  }
+}

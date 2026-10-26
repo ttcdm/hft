@@ -1,10 +1,12 @@
 /**
- * Localnet dry run of the devnet harness's Stage 3 steps for task 3K: (m) for 3B in scripts/devnet_e2e_steps.ts, the same
+ * Localnet dry run of the devnet harness's Stage 3 steps for task 3K: (m) for 3B and (o) for 3E in scripts/devnet_e2e_steps.ts, the same
  * functions `npm run devnet:e2e` runs, against the LiteSVM local validator (real pump.fun program binaries, scripts/localnet/validator.ts).
  *
  *   npx tsx scripts/localnet/harness_steps_3k.ts            (prints PASS/FAIL/SKIP lines, exits 1 on any FAIL)
+ *   APEX_3K_ONLY=m or APEX_3K_ONLY=o                                   (one step only)
  *
- * Built like scripts/localnet/harness_steps.ts (3I): the app's coordinator, auto controller and watch window run in this process. Everything is loopback; ALLOWED_CLUSTER=localnet
+ * Built like scripts/localnet/harness_steps.ts (3I): the app's coordinator, auto controller and watch window run in this process for (m);
+ * (o) boots server.ts in child processes on its own scratch DB and its own throwaway signer. Everything is loopback; ALLOWED_CLUSTER=localnet
  * with the validator's genesis hash, throwaway keys funded only by the local airdrop, external feeds off, no .env read (hermeticEnv). Every
  * temp wallet's key is written under <scratch>/temp-wallets before it is funded, and the run checks they all end empty.
  */
@@ -17,6 +19,7 @@ import { spawn } from 'node:child_process';
 
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'apex-3k-steps-'));
 const tempWalletDir = path.join(scratch, 'temp-wallets');
+const only = process.env['APEX_3K_ONLY'] ?? '';
 const results: { step: string; ok: boolean; detail: string }[] = [];
 const rec = (step: string, ok: boolean, detail: string) => {
   results.push({ step, ok, detail });
@@ -101,7 +104,7 @@ async function run(info: { url: string; genesisHash: string }) {
   const bal = async () => (await conn.getBalance(kp.publicKey)) / LAMPORTS_PER_SOL;
   const steps = { coordinator, rec, sleep, skip: (step: string, detail: string) => rec(`${step} (a SKIP in the dry run)`, false, detail) };
 
-  {
+  if (!only || only === 'm') {
     if (armed.success && (await S.hasBudget(steps, '(m) 3B: DEVNET_LIVE session spend', bal, 0.25, 'DEVNET_SESSION_SPEND'))) {
       const coins = S.stepCoins(steps, '(m) 3B: DEVNET_LIVE session spend', kit, kp);
       const b0 = await bal();
@@ -119,6 +122,55 @@ async function run(info: { url: string; genesisHash: string }) {
     }
   }
   coordinator.armLiveTrading(false);
+
+  if (!only || only === 'o') {
+    const L = '(o) 3E: kill survives a restart';
+    if (await S.hasBudget(steps, L, bal, 0.2, 'DEVNET_KILL_RESTART')) {
+      const crypto = await import('node:crypto');
+      const { WorkstationDatabase } = await import('../../server/db/database');
+      const signer = kit.newWallet(); // the step's own server signer: its key is on disk before it is funded
+      const creator = kit.newWallet();
+      const relay = await S.startSendHoldingRelay(info.url);
+      const dbPath = path.join(scratch, 'o-app.db');
+      const token = crypto.randomBytes(24).toString('hex');
+      let mint = '';
+      const b0 = await bal();
+      await S.killSurvivesRestart(steps, {
+        boot: () => S.spawnServer({
+          token, logFile: path.join(scratch, 'o-server.log'),
+          env: {
+            PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? scratch, NODE_ENV: 'production', APEX_ENV_FILE: '',
+            ALLOWED_CLUSTER: 'localnet', LOCALNET_GENESIS_HASH: info.genesisHash, SOLANA_RPC_URL: relay.url, SOLANA_WS_URL: relay.wsUrl,
+            JITO_BLOCK_ENGINE_URL: '', ENABLE_RPC_FALLBACK: 'true', APEX_DB_PATH: dbPath, SIGNER_KEYPAIR_PATH: path.join(tempWalletDir, `${signer.publicKey.toBase58()}.json`),
+            LOCALNET_SOL_PRICE_USD: '150', ALLOW_LIVE_REAL_MONEY_TRADING: 'true', APEX_DISABLE_EXTERNAL_FEEDS: 'true', STARTUP_GRACE_PERIOD_MS: '0',
+            MIN_LIQUIDITY_USD: '0', AUTO_SNIPE_ENABLED: 'true',
+          },
+        }),
+        relay,
+        get buyBody() { return { mint, symbol: 'O3K', name: '3K harness', amountSol: 0.01, confirmLive: true }; },
+        plantAutoOwned: (positionId, m) => {
+          const db = new WorkstationDatabase(dbPath);
+          db.logDecision({ autoMode: 'DEVNET_LIVE', mint: m, source: 'TEST', stage: 'fill', outcome: 'BOUGHT', reason: 'e2e (o): marks the hand-bought position auto-owned', positionId });
+          (db as any).db.close();
+        },
+        fund: async () => {
+          await kit.transfer(kp, signer.publicKey, 0.15); // the 10% spendable ceiling: a 0.01 SOL buy needs about 0.12 in the wallet
+          await kit.transfer(kp, creator.publicKey, 0.03);
+          mint = (await kit.create(creator, 'O3K', '3K harness')).mint;
+        },
+        cleanup: async () => {
+          const errors: string[] = [];
+          try { await relay.close(); } catch (e: any) { errors.push(`relay close: ${String(e?.message ?? e).slice(0, 80)}`); }
+          for (const w of [signer, creator]) { // each wallet on its own: one failed refund does not skip the other
+            if (mint) { try { await kit.sellAll(w, mint); } catch { /* nothing held */ } }
+            try { await kit.refund(w, kp.publicKey); } catch (e: any) { errors.push(`refund ${w.publicKey.toBase58()}: ${String(e?.message ?? e).slice(0, 80)}`); }
+          }
+          if (errors.length) throw new Error(errors.join('; '));
+        },
+      });
+      console.log(`INFO  (o) cost the harness wallet ${(b0 - (await bal())).toFixed(5)} SOL`);
+    }
+  }
 
   // Every temp wallet written to disk ends empty (refunded, less nothing but dust under one fee).
   const left: string[] = [];

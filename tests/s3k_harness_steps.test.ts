@@ -1,12 +1,14 @@
 import { describe, it, expect } from 'vitest';
+import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import {
-  hasBudget, sessionSpendMatchesWallet,
-  type SessionSpendDeps,
+  hasBudget, sessionSpendMatchesWallet, killSurvivesRestart, startSendHoldingRelay,
+  type SessionSpendDeps, type KillRestartDeps, type ChildApp,
 } from '../scripts/devnet_e2e_steps';
 
 /**
- * 3K: the devnet harness step (m) for 3B. The real step function; the app (auto controller, coordinator) and
- * the chain are stubs. What is checked: the step's lines pass against an app that behaves, the 3B line FAILs against an app without
+ * 3K: the devnet harness steps (m) for 3B and (o) for 3E. The real step functions; the app (auto controller, coordinator, child servers) and
+ * the chain are stubs. What is checked: each step's lines pass against an app that behaves, the 3B and 3E lines FAIL against an app without
  * the fix, a lost balance read is a SKIP, a failed path still cleans up (refunds) and puts back what it wrapped, and a failed refund is a
  * FAIL line. The steps against the real app and a real chain: `npx tsx scripts/localnet/harness_steps_3k.ts`.
  */
@@ -123,3 +125,131 @@ describe('3K (m): a 5-buy DEVNET_LIVE session, spentSol against the wallet (3B)'
   });
 });
 
+// ---- (o) ----------------------------------------------------------------------------------------------------------------------------
+
+/** A server whose saved state lives on a fake disk across boots. `persistBeforeAwait` is 3E's change. */
+function fakeServers(o: { persistBeforeAwait: boolean; neverSells?: boolean; cleanupThrows?: boolean }) {
+  const disk = { mode: 'OFF', killed: false, killReason: null as string | null, tripped: false, planted: [] as string[], positions: 0 };
+  const log: string[] = [];
+  let onSend: (() => void) | null = null;
+  let held = false;
+  let running: { alive: boolean } | null = null;
+  const relay = {
+    holdNextSend: () => new Promise<void>((r) => { onSend = () => { held = true; r(); }; }),
+    release: () => { held = false; log.push('release'); },
+  };
+  const boot = async (): Promise<ChildApp> => {
+    if (running?.alive) throw new Error('two servers on one DB');
+    const me = { alive: true };
+    running = me;
+    let mode = disk.mode === 'DEVNET_LIVE' ? 'SHADOW' : disk.mode; // S222: a saved DEVNET_LIVE comes back as SHADOW
+    let alert = disk.tripped;
+    disk.tripped = false;
+    const killed = disk.killed;
+    const killReason = disk.killReason;
+    log.push('boot');
+    return {
+      async call(method, route, body: any) {
+        if (!me.alive) throw new Error('server gone');
+        if (route === '/api/execution/can-arm') return { status: 200, json: { allowed: !alert, reasons: alert ? ['The kill switch was on before the restart; clear KILL_SWITCH_WAS_ON with POST /api/auto/resume {clearHalt:true} before arming'] : [] } };
+        if (route === '/api/execution/arm') return { status: 200, json: { success: !alert, message: 'armed' } };
+        if (route === '/api/execution/trade') { disk.positions++; return { status: 200, json: { success: true, lifecycleState: 'CONFIRMED', positionId: `pos${disk.positions}` } }; }
+        if (route === '/api/auto/mode') { mode = body.mode; disk.mode = mode; return { status: 200, json: { success: true, mode } }; }
+        if (route === '/api/auto/status') return { status: 200, json: { success: true, mode, killed, killReason } };
+        if (route === '/api/auto/kill') {
+          mode = 'OFF';
+          if (o.persistBeforeAwait) { disk.mode = 'OFF'; disk.killed = true; disk.killReason = body.reason; }
+          if (!o.neverSells && disk.planted.length) onSend?.();
+          return new Promise(() => undefined); // the sell's reply is kept back: never answers
+        }
+        if (route === '/api/execution/kill-switch') { disk.mode = 'OFF'; disk.tripped = true; if (o.persistBeforeAwait) { disk.killed = true; disk.killReason = 'operator kill switch'; } return { status: 200, json: { success: true, killSwitchActive: true } }; }
+        if (route === '/api/auto/resume') { if (body.clearHalt) alert = false; return { status: 200, json: { success: true } }; }
+        return { status: 404, json: null };
+      },
+      kill: async () => { me.alive = false; log.push('kill'); },
+      stop: async () => { me.alive = false; log.push('stop'); },
+    };
+  };
+  const deps: KillRestartDeps = {
+    boot, relay,
+    buyBody: { mint: 'MINTo', symbol: 'O3K', name: '3K harness', amountSol: 0.01, confirmLive: true },
+    plantAutoOwned: (id) => { if (running?.alive) throw new Error('planted while a server runs'); disk.planted.push(id); },
+    fund: async () => { log.push('fund'); },
+    cleanup: async () => { log.push('cleanup'); if (o.cleanupThrows) throw new Error('refund failed'); },
+  };
+  return { deps, disk, log, isHeld: () => held, isRunning: () => !!running?.alive };
+}
+
+describe('3K (o): the kill survives a restart (3E)', () => {
+  it('an app that saves OFF before its awaits: every line passes; the relay is released, no server is left up, the wallet is cleaned up', async () => {
+    const r = recorder();
+    const f = fakeServers({ persistBeforeAwait: true });
+    await killSurvivesRestart(r, f.deps);
+    expect(fails(r.recs), JSON.stringify(r.recs, null, 1)).toEqual([]);
+    for (const part of ['boot 3 (after a crash mid-kill): auto is OFF', 'killed, and why', 'can-arm lists KILL_SWITCH_WAS_ON', 'takes KILL_SWITCH_WAS_ON off']) expect(line(r.recs, part)?.ok).toBe(true);
+    expect(f.disk.planted).toEqual(['pos1']);
+    expect(f.log.filter((x) => x === 'kill')).toHaveLength(1);
+    expect(f.log.at(-1)).toBe('cleanup');
+    expect(f.isHeld()).toBe(false);
+    expect(f.isRunning()).toBe(false);
+  });
+  it('an app that saves the mode only after the sells (3E missing): the OFF and killed lines after the crash FAIL', async () => {
+    const r = recorder();
+    const f = fakeServers({ persistBeforeAwait: false });
+    await killSurvivesRestart(r, f.deps);
+    expect(line(r.recs, 'boot 3 (after a crash mid-kill): auto is OFF')).toMatchObject({ ok: false, detail: 'mode SHADOW' });
+    expect(line(r.recs, 'killed, and why')?.ok).toBe(false);
+    expect(f.log.at(-1)).toBe('cleanup');
+  });
+  it('the kill never reaches a sell: a FAIL line, no restart checks, the wallet is still cleaned up', async () => {
+    const r = recorder();
+    const f = fakeServers({ persistBeforeAwait: true, neverSells: true });
+    await killSurvivesRestart(r, f.deps);
+    expect(line(r.recs, 'the kill reached its sell')?.ok).toBe(false);
+    expect(line(r.recs, 'boot 3')).toBeUndefined();
+    expect(f.log.at(-1)).toBe('cleanup');
+    expect(f.isRunning()).toBe(false);
+  });
+  it('a refund that fails is a FAIL line pointing at the key files', async () => {
+    const r = recorder();
+    const f = fakeServers({ persistBeforeAwait: true, cleanupThrows: true });
+    await killSurvivesRestart(r, f.deps);
+    expect(fails(r.recs)).toEqual([expect.objectContaining({ step: expect.stringContaining('sell out and refund'), detail: expect.stringMatching(/refund failed.*temp-wallets/) })]);
+  });
+  it('underfunded: the budget check refuses before anything is funded', async () => {
+    const r = recorder();
+    expect(await hasBudget(r, '(o) 3E: kill survives a restart', async () => 0.2, 0.25, 'DEVNET_KILL_RESTART')).toBe(false);
+    expect(r.recs[0]).toMatchObject({ step: '(o) 3E: kill survives a restart: funding', ok: false });
+  });
+});
+
+describe('3K startSendHoldingRelay', () => {
+  it('forwards a sendTransaction at once but keeps its reply back until release; other calls pass straight through', async () => {
+    const seen: string[] = [];
+    const upstream = http.createServer((req, res) => {
+      let b = '';
+      req.on('data', (c) => (b += c));
+      req.on('end', () => { const m = JSON.parse(b).method; seen.push(m); res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ jsonrpc: '2.0', id: 1, result: m })); });
+    });
+    await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', () => r()));
+    const relay = await startSendHoldingRelay(`http://127.0.0.1:${(upstream.address() as AddressInfo).port}`);
+    const post = (method: string) => fetch(relay.url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method }) }).then((r) => r.json());
+    try {
+      expect((await post('getSlot')).result).toBe('getSlot');
+      const held = relay.holdNextSend();
+      let answered = false;
+      const send = post('sendTransaction').then((j) => { answered = true; return j; });
+      await held;
+      await new Promise((r) => setTimeout(r, 50));
+      expect(seen).toContain('sendTransaction'); // it reached upstream (it can land)
+      expect(answered).toBe(false); // but the caller has no answer
+      expect((await post('getBalance')).result).toBe('getBalance'); // other calls still answer
+      relay.release();
+      expect((await send).result).toBe('sendTransaction');
+      expect((await post('sendTransaction')).result).toBe('sendTransaction'); // not armed again: answered at once
+    } finally {
+      await relay.close();
+      await new Promise<void>((r) => upstream.close(() => r()));
+    }
+  });
+});

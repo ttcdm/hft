@@ -24,7 +24,7 @@ const DEFAULT_MINTS = [
 const phase = process.argv.includes('--phase=crash') ? 'crash' : process.argv.includes('--phase=recover') ? 'recover' : 'main';
 const scratch = process.env.APEX_E2E_SCRATCH || fs.mkdtempSync(path.join(os.tmpdir(), 'apex-e2e-'));
 const keyPath = path.join(scratch, 'throwaway-keypair.json');
-// Every throwaway wallet steps (i), (k), (t), (u) and (m) create is written here before it is funded, and left here (Mike, 2026-10-24).
+// Every throwaway wallet steps (i), (k), (t), (u), (m) and (o) create is written here before it is funded, and left here (Mike, 2026-10-24).
 const tempWalletDir = path.join(scratch, 'temp-wallets');
 // 3I: what the opt-in steps (t), (u) and (n) need free in the harness wallet before they start: what they lend, plus fees and a margin.
 const RPC_SWITCH_NEED_SOL = 0.1;
@@ -35,6 +35,8 @@ const LOSS_FLOOR_NEED_SOL = 0.05;
 const READINESS_GATE_NEED_SOL = 0.05;
 // 3K (m): 0.15 lent to the coin creator, and enough left for five 0.008 SOL auto buys under the 10% spendable ceiling, with a margin.
 const SESSION_SPEND_NEED_SOL = 0.3;
+// 3K (o): 0.15 lent to the step's own server wallet (a 0.01 SOL buy under the 10% ceiling) and 0.03 to the coin creator, with a margin.
+const KILL_RESTART_NEED_SOL = 0.25;
 
 // ---- sanitized environment: must be set before any server module is imported ----
 process.env.SOLANA_RPC_URL = process.env.DEVNET_RPC_URL || 'https://api.devnet.solana.com';
@@ -461,6 +463,7 @@ async function main() {
   const lDoneAt = await readinessGateStep(steps, S, { conn, kp, Keypair, coordinator, workstationDb });
   await S.waitPast(steps, lDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (l) trades');
   await sessionSpendStep(steps, S, { conn, web3, kp, coordinator, workstationDb, PumpCurveService, txBuilder }); // 3K (m): its own coins
+  await killRestartStep(steps, S, { conn, web3, kp, PumpCurveService, txBuilder }); // 3K (o): its own server, DB, wallet and coin
   await S.emergencyStopThroughApp(steps); // P1.4, last: it leaves LIVE disarmed and auto OFF. Telegram-path panic sells the LIVE position; kill switch on/off/re-arm buys nothing
 
   // (f) crash after submit, then recover in a fresh process on the same scratch DB. This process holds that DB's and that key's
@@ -696,6 +699,68 @@ async function sessionSpendStep(steps: import('./devnet_e2e_steps').HarnessSteps
   });
   const b1 = await bal().catch(() => null);
   if (b0 !== null && b1 !== null) console.log(`INFO  (m) cost the harness wallet ${(b0 - b1).toFixed(5)} SOL`);
+}
+
+/**
+ * (o) 3E, task 3K, opt-in (DEVNET_KILL_RESTART=1): the auto kill and the kill switch survive a restart (S.killSurvivesRestart). server.ts runs in
+ * child processes under the devnet guard, on <scratch>/o-app.db, signed by a throwaway wallet of the step's own (key under temp-wallets/
+ * before it is funded), its RPC a loopback relay in front of the devnet RPC (the relay holds one sell's reply; the private URL never reaches
+ * the child). The child reads the SOL price itself, as server.ts does.
+ */
+async function killRestartStep(steps: import('./devnet_e2e_steps').HarnessSteps, S: typeof import('./devnet_e2e_steps'), d: { conn: any; web3: any; kp: any; PumpCurveService: any; txBuilder: any }): Promise<void> {
+  const L = '(o) 3E: kill survives a restart';
+  if (process.env.DEVNET_KILL_RESTART !== '1') {
+    console.log(`INFO  (o) skipped: set DEVNET_KILL_RESTART=1 (needs ${KILL_RESTART_NEED_SOL} SOL free, spends about 0.01) to run the kill-and-restart step (3E)`);
+    return;
+  }
+  const bal = async () => (await d.conn.getBalance(d.kp.publicKey)) / 1e9;
+  if (!(await S.hasBudget(steps, L, bal, KILL_RESTART_NEED_SOL, 'DEVNET_KILL_RESTART'))) return;
+  const crypto = await import('crypto');
+  const { PUMP_SDK } = await import('@pump-fun/pump-sdk');
+  const { WorkstationDatabase } = await import('../server/db/database');
+  const kit = S.makeChainKit({ conn: d.conn, web3: d.web3, sdk: PUMP_SDK, curve: d.PumpCurveService, builder: d.txBuilder, keyDir: tempWalletDir });
+  const signer = kit.newWallet();
+  const creator = kit.newWallet();
+  const relay = await S.startSendHoldingRelay(process.env.SOLANA_RPC_URL!);
+  const dbPath = path.join(scratch, 'o-app.db');
+  const token = crypto.randomBytes(24).toString('hex');
+  let mint = '';
+  const b0 = await bal().catch(() => null);
+  await S.killSurvivesRestart(steps, {
+    boot: () => S.spawnServer({
+      token, logFile: path.join(scratch, 'o-server.log'), guard: path.resolve('scripts/devnet_guard.cjs'),
+      env: {
+        PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? scratch, NODE_ENV: 'production', APEX_ENV_FILE: '',
+        ALLOWED_CLUSTER: 'devnet', SOLANA_RPC_URL: relay.url, SOLANA_WS_URL: relay.wsUrl, ENABLE_RPC_FALLBACK: 'true',
+        RPC_MAX_REQUESTS_PER_SEC: process.env.RPC_MAX_REQUESTS_PER_SEC ?? '10', MIN_LIQUIDITY_USD: '0', JITO_MAX_RETRIES: '1', JITO_RETRY_INTERVAL_MS: '200',
+        APEX_DB_PATH: dbPath, SIGNER_KEYPAIR_PATH: path.join(tempWalletDir, `${signer.publicKey.toBase58()}.json`),
+        ALLOW_LIVE_REAL_MONEY_TRADING: 'true', AUTO_SNIPE_ENABLED: 'true',
+      },
+    }),
+    relay,
+    get buyBody() { return { mint, symbol: 'O3K', name: '3K harness', amountSol: 0.01, confirmLive: true }; },
+    plantAutoOwned: (positionId, m) => {
+      const db = new WorkstationDatabase(dbPath);
+      db.logDecision({ autoMode: 'DEVNET_LIVE', mint: m, source: 'TEST', stage: 'fill', outcome: 'BOUGHT', reason: 'e2e (o): marks the hand-bought position auto-owned', positionId });
+      (db as any).db.close();
+    },
+    fund: async () => {
+      await kit.transfer(d.kp, signer.publicKey, 0.15); // the 10% spendable ceiling: a 0.01 SOL buy needs about 0.12 in the wallet
+      await kit.transfer(d.kp, creator.publicKey, 0.03);
+      mint = (await kit.create(creator, 'O3K', '3K harness')).mint;
+    },
+    cleanup: async () => {
+      const errors: string[] = [];
+      try { await relay.close(); } catch (e: any) { errors.push(`relay close: ${String(e?.message ?? e).slice(0, 80)}`); }
+      for (const w of [signer, creator]) { // each wallet on its own: one failed refund does not skip the other
+        if (mint) { try { await kit.sellAll(w, mint); } catch { /* nothing held */ } }
+        try { await kit.refund(w, d.kp.publicKey); } catch (e: any) { errors.push(`refund ${w.publicKey.toBase58()}: ${String(e?.message ?? e).slice(0, 80)}`); }
+      }
+      if (errors.length) throw new Error(errors.join('; '));
+    },
+  });
+  const b1 = await bal().catch(() => null);
+  if (b0 !== null && b1 !== null) console.log(`INFO  (o) cost the harness wallet ${(b0 - b1).toFixed(5)} SOL`);
 }
 
 function finish() {

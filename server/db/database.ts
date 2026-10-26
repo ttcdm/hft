@@ -684,8 +684,10 @@ export class WorkstationDatabase {
         .prepare(`SELECT 1 FROM transactions WHERE mint = ? AND direction = 'BUY' AND execution_mode = 'LIVE' AND reconciliation_state IN ('PENDING', 'RECONCILIATION_REQUIRED') LIMIT 1`)
         .get(mint);
       return !!row;
-    } catch {
-      return false;
+    } catch (err: any) {
+      // P3.1 (R1-15): fail closed. A query that cannot run cannot say there is no unresolved buy, so the caller refuses the buy.
+      Logger.error(`hasUnresolvedLiveBuy could not read the transactions table (${err?.message || err}); answering "unresolved" so the buy is refused`);
+      return true;
     }
   }
 

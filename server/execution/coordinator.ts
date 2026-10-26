@@ -2719,7 +2719,7 @@ export class ExecutionCoordinator {
         success: false,
         lifecycleState: 'RISK_REJECTED',
         executionMode: 'LIVE',
-        error: `UNRESOLVED_BUY: an earlier buy of ${req.mint} was sent and is not reconciled yet; waiting for it before buying again.`,
+        error: `UNRESOLVED_BUY: an earlier buy of ${req.mint} was sent and is not reconciled yet (or the check could not read the database); waiting for it before buying again.`,
         correlationId,
       };
     }

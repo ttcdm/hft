@@ -210,4 +210,19 @@ describe('3A: per-buy readiness and fail-closed buy checks (real coordinator, LI
     expect(coordinator.getSpendableBankrollSol()).toBe(before); // the reservation was given back
   });
 
+  it('R1-15: the unresolved-buy query throws: hasUnresolvedLiveBuy answers true and the buy is refused before anything is built', async () => {
+    const db = (workstationDb as any).db;
+    const realPrepare = db.prepare.bind(db);
+    vi.spyOn(db, 'prepare').mockImplementation((sql: any) => {
+      if (/reconciliation_state IN \('PENDING', 'RECONCILIATION_REQUIRED'\)/.test(sql) && /direction = 'BUY'/.test(sql)) throw new Error('SQLITE_IOERR: disk I/O error');
+      return realPrepare(sql);
+    });
+    const req = buyReq();
+    expect(workstationDb.hasUnresolvedLiveBuy(req.mint)).toBe(true);
+    const res = await coordinator.executeTrade(req);
+    expect(res.lifecycleState).toBe('RISK_REJECTED');
+    expect(res.error).toMatch(/^UNRESOLVED_BUY/);
+    expect(build).not.toHaveBeenCalled();
+  });
+
 });

@@ -269,7 +269,7 @@ export function resolveBindHost(env: NodeJS.ProcessEnv = process.env): { host: s
   };
 }
 
-// WebSocket connection token validator
+// WebSocket token check: server.ts uses it for the AUTHENTICATE handshake and for every mutating WebSocket command
 export function verifyWsAuth(token?: string | null): boolean {
   if (!token) return false;
   return authManager.validateToken(token);

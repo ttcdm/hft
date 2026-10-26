@@ -76,6 +76,7 @@ import {
   resolveBindHost,
   isAllowedClientOrigin,
   isAllowedWsConnection,
+  verifyWsAuth,
 } from './server/middleware/auth';
 import {
   findLoosePermissions,
@@ -204,7 +205,7 @@ wss.on('connection', (ws: WebSocket, req: any) => {
         parsed.type === 'AUTHENTICATE'
       ) {
         const token = parsed.sessionToken || parsed.token;
-        if (authManager.validateToken(token)) {
+        if (verifyWsAuth(token)) {
           (ws as any).isAuthenticated = true;
           ws.send(JSON.stringify({ type: 'AUTHENTICATED', authenticated: true, timestamp: Date.now() }));
           ws.send(JSON.stringify({ type: 'AUTH_SUCCESS', authenticated: true }));
@@ -254,7 +255,7 @@ wss.on('connection', (ws: WebSocket, req: any) => {
 
       if (MUTATING_WS_ACTIONS.has(parsed.action)) {
         const token = parsed.sessionToken || parsed.token;
-        if (!authManager.validateToken(token)) {
+        if (!verifyWsAuth(token)) {
           ws.send(
             JSON.stringify({
               type: 'AUTH_ERROR',

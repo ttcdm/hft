@@ -62,7 +62,7 @@ export type PumpSwapPoolState = PumpSwapExecutionState;
 
 /** Static helpers around the PumpSwap pool of one mint. Pool state is cached per mint for 15 s, unless the caller asks for a fresh read. */
 export class PumpSwapVenueService {
-  private static poolCache: Map<string, { pool: PumpSwapExecutionState | null; timestamp: number }> = new Map();
+  private static poolCache: Map<string, { pool: PumpSwapExecutionState | null; timestamp: number }> = new Map(); // timestamp: performance.now(), so a wall clock set back cannot keep a stale pool fresh (S271 review)
   private static readonly CACHE_TTL_MS = 15000;
 
   /**
@@ -149,7 +149,7 @@ export class PumpSwapVenueService {
     }
     const mintStr = mint.toBase58();
     const cached = this.poolCache.get(mintStr);
-    if (!opts.fresh && cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
+    if (!opts.fresh && cached && performance.now() - cached.timestamp < this.CACHE_TTL_MS) {
       return cached.pool;
     }
 
@@ -160,7 +160,7 @@ export class PumpSwapVenueService {
         if (executionMode === 'LIVE') {
           Logger.error(`PUMPSWAP_POOL_NOT_FOUND in LIVE mode: Canonical pool ${poolKey.toBase58()} not found on-chain.`);
         }
-        this.poolCache.set(mintStr, { pool: null, timestamp: Date.now() });
+        this.poolCache.set(mintStr, { pool: null, timestamp: performance.now() });
         return null;
       }
 
@@ -227,7 +227,7 @@ export class PumpSwapVenueService {
         marketDataTimestamp: Date.now(),
       };
 
-      this.poolCache.set(mintStr, { pool: state, timestamp: Date.now() });
+      this.poolCache.set(mintStr, { pool: state, timestamp: performance.now() });
       return state;
     } catch (err: any) {
       Logger.warn(`Failed to fetch PumpSwap pool state for ${mintStr}: ${err.message}`);

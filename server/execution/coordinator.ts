@@ -3066,7 +3066,7 @@ export class ExecutionCoordinator {
     return this.haltReason;
   }
 
-  private exitFailures = new Map<string, { count: number; nextAttemptAt: number; lastError: string }>();
+  private exitFailures = new Map<string, { count: number; nextAttemptAt: number; lastError: string; waitMs?: number }>();
 
   /** Sell slippage for the next attempt on this position: starts at 800 bps and widens after each consecutive failure. */
   public exitSlippageBps(positionId: string): number {
@@ -3077,7 +3077,11 @@ export class ExecutionCoordinator {
   /** ms until the auto-exit loop may try this position again (0 when free). */
   public exitRetryWaitMs(positionId: string, now: number = Date.now()): number {
     const f = this.exitFailures.get(positionId);
-    return f ? Math.max(0, f.nextAttemptAt - now) : 0;
+    if (!f) return 0;
+    // S271 review: never more than the backoff that was set. nextAttemptAt is wall-clock time; set under a clock that was later set back
+    // (devnet harness, NTP), it would hold this position's exits, its stop-loss included, for the size of the jump.
+    const left = f.nextAttemptAt - now;
+    return Math.max(0, f.waitMs === undefined ? left : Math.min(left, f.waitMs));
   }
 
   public getExitFailureCount(positionId: string): number {
@@ -3130,7 +3134,7 @@ export class ExecutionCoordinator {
     if (mode !== 'LIVE' || res.notSent || ExecutionCoordinator.isNonAttemptExitError(res.error)) return;
     const count = (this.exitFailures.get(positionId)?.count ?? 0) + 1;
     const wait = Math.min(EXIT_RETRY_MAX_MS, EXIT_RETRY_BASE_MS * 2 ** (count - 1));
-    this.exitFailures.set(positionId, { count, nextAttemptAt: Date.now() + wait, lastError: res.error || 'unknown' });
+    this.exitFailures.set(positionId, { count, nextAttemptAt: Date.now() + wait, lastError: res.error || 'unknown', waitMs: wait });
     if (count >= EXIT_FAILURE_ALERT_AFTER) {
       this.raiseOperatorAlert('EXIT_FAILING', `Exit for position ${positionId.slice(0, 8)} failed ${count} times in a row (last: ${res.error}). Retrying every ${Math.round(wait / 1000)}s with wider slippage; consider closing manually.`, positionId);
     }
@@ -3364,6 +3368,9 @@ export class ExecutionCoordinator {
         }
         // P2.1: the window is only an upper bound. Once the blockhash has expired and the signature has no status, the sell can never land,
         // so the next pass (a stop-loss included) may sell at once instead of waiting out the rest of the 100 s.
+        // S271 review: a send time ahead of now means the wall clock was set back since; the window restarts from now (bounded), rather
+        // than holding the position until the clock catches up (hours, for a sell with no lastValidBlockHeight to prove it expired).
+        if (pendingSell.ts > Date.now()) pendingSell.ts = Date.now();
         if (Date.now() - pendingSell.ts < PENDING_SELL_WINDOW_MS && !(await this.pendingSellCannotLand(pendingSell))) {
           return { success: false, pnlSol: 0, error: `SELL_PENDING_VERIFICATION: sell ${pendingSell.signature.slice(0, 8)} was sent and is not confirmed or expired yet; not selling again` };
         }

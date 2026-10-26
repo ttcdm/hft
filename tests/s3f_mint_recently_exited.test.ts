@@ -2,7 +2,7 @@ import '../suppress-warnings.cjs';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair } from '@solana/web3.js';
 import { ExecutionCoordinator, ExecuteTradeRequest, MINT_REENTRY_BLOCK_MS } from '../server/execution/coordinator';
-import { autoSnipeController, DEVNET_CONFIRMATION_CODE } from '../server/auto/controller';
+import { autoSnipeController, DEVNET_CONFIRMATION_CODE, classifyRejection, RETRYABLE_REJECTION } from '../server/auto/controller';
 import { executionCoordinator } from '../server/execution/coordinator';
 import { memecoinAggregator } from '../server/memecoinAggregator';
 import { localSigner } from '../server/solana/signer';
@@ -245,5 +245,11 @@ describe('3F: MINT_RECENTLY_EXITED, 24 h after any exit and for good after a los
     expect(res.lifecycleState).toBe('RISK_REJECTED');
     expect(res.error).toMatch(/^MINT_RECENTLY_EXITED: the closed positions of .* could not be read/);
     expect(build).not.toHaveBeenCalled();
+  });
+
+  it('the auto controller files the refusal under risk and does not retry it', () => {
+    const msg = 'MINT_RECENTLY_EXITED: x was closed at a loss (position p, -0.001000 SOL); this mint is not bought again.';
+    expect(classifyRejection(msg)).toBe('risk');
+    expect(RETRYABLE_REJECTION.test(msg)).toBe(false);
   });
 });

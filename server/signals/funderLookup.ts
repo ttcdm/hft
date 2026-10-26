@@ -7,8 +7,9 @@ export const FUNDER_SIGNATURE_PAGE = 1000;
 /** S4c: an RPC error is retried after these delays (then the wallet stays unknown). Public RPCs rate-limit; one error used to pin the wallet unknown for the candidate's life. */
 export const FUNDER_RETRY_DELAYS_MS = [1_500, 4_000, 10_000];
 /**
- * P4.1 (R1-60): the most lookups that may wait at once, across all mints. When it is full, waiting jobs for mints that are no longer
- * watched are dropped first; if it is still full the new request is refused (the wallet stays unknown, so coverage stays below 1).
+ * P4.1 (R1-60): the most lookups that may wait at once, across all mints: jobs in the queue plus jobs waiting in a retry timer (B14).
+ * When it is full, waiting jobs for mints that are no longer watched are dropped first; if it is still full the new request is refused
+ * (the wallet stays unknown, so coverage stays below 1).
  */
 export const FUNDER_LOOKUP_MAX_QUEUE = 1_000;
 
@@ -46,6 +47,8 @@ function fundingOf(ix: any): [string, string] | null {
 export class FunderLookup {
   private cache = new Map<string, FunderResult>();
   private queue: Job[] = [];
+  /** B14 (review 2026-10-24, finding 14): jobs waiting for a retry, with their timers. They count toward FUNDER_LOOKUP_MAX_QUEUE. */
+  private retrying = new Map<Job, ReturnType<typeof setTimeout>>();
   private inFlight = 0;
   private perMint = new Map<string, number>();
   /** Every wallet with a job waiting, running or waiting for a retry. */
@@ -63,8 +66,13 @@ export class FunderLookup {
     this.wanted = fn;
   }
 
-  public getStats(): { queued: number; inFlight: number; dropped: number; refusedFull: number } {
-    return { queued: this.queue.length, inFlight: this.inFlight, dropped: this.dropped, refusedFull: this.refusedFull };
+  public getStats(): { queued: number; retrying: number; inFlight: number; dropped: number; refusedFull: number } {
+    return { queued: this.queue.length, retrying: this.retrying.size, inFlight: this.inFlight, dropped: this.dropped, refusedFull: this.refusedFull };
+  }
+
+  /** Jobs that wait: in the queue or in a retry timer. */
+  private waitingCount(): number {
+    return this.queue.length + this.retrying.size;
   }
 
   private isWanted(job: Job): boolean {
@@ -97,11 +105,17 @@ export class FunderLookup {
     const used = this.perMint.get(mint) ?? 0;
     if (used >= (this.opts.maxPerMint ?? FUNDER_LOOKUP_MAX_PER_MINT)) return;
     const maxQueue = this.opts.maxQueue ?? FUNDER_LOOKUP_MAX_QUEUE;
-    if (this.queue.length >= maxQueue) {
+    if (this.waitingCount() >= maxQueue) {
       const keep: Job[] = [];
       for (const j of this.queue) if (this.isWanted(j)) keep.push(j); else this.drop(j);
       this.queue = keep;
-      if (this.queue.length >= maxQueue) {
+      for (const [j, timer] of [...this.retrying]) {
+        if (this.isWanted(j)) continue;
+        clearTimeout(timer);
+        this.retrying.delete(j);
+        this.drop(j);
+      }
+      if (this.waitingCount() >= maxQueue) {
         this.refusedFull++;
         return;
       }
@@ -131,11 +145,13 @@ export class FunderLookup {
             // S4c: keep the wallet in `queued` while it waits, so a second request for it does not start a parallel lookup.
             retrying = true;
             const timer = setTimeout(() => {
+              this.retrying.delete(job);
               job.attempt++;
               this.queue.push(job);
               this.pump();
             }, delays[job.attempt]);
             timer.unref?.();
+            this.retrying.set(job, timer);
             return;
           }
           if (result.reason !== 'ERROR') this.remember(job.wallet, result);

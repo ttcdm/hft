@@ -247,3 +247,19 @@ describe('5A (R1-111): the own-recordings study holds out 30% by default', () =>
     }
   });
 });
+
+// ---- follow-up: the corpus replay's open mark ----------------------------------------
+import { thresholdSummary } from '../scripts/hfcorpus/replay';
+
+describe('5A (R1-98): the corpus replay\'s open mark keeps the take-profit proceeds', () => {
+  afterEach(() => restoreStockEngine());
+  it('openMarkSol is the replay\'s openNetPnlSol, not the unsold part minus the whole order', () => {
+    const { rows, at } = released();
+    const r = replay([...rows, at(4_000, 1.35), at(10_000, 1.35), at(16_000, 1.7), at(22_000, 1.7)]);
+    expect(r.outcome).toBe('OPEN_AT_END');
+    const s = thresholdSummary([r]);
+    expect(s.openMarkSol).toBeCloseTo(r.openNetPnlSol as number, 12);
+    expect(s.openMarkSol).toBeGreaterThan((r.openValueSol as number) - REPLAY_DEFAULTS.orderSol);
+    expect(s.realizedNetSol).toBe(0);
+  });
+});

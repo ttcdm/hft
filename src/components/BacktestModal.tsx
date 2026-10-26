@@ -19,6 +19,8 @@ export interface ReplayReportData {
     launches: number; released: Record<string, number>; entries: number; closed: number; openAtEnd: number; wins: number; losses: number; winRate: number | null; netPnlSol: number | null; avgHoldMs: number | null; exitReasons: Record<string, number>;
     /** 5A: the open-at-end positions marked at the last price, kept out of netPnlSol. Absent on an older server. */
     openMarkNetPnlSol?: number | null;
+    /** 5C: the same figures by how each recording ended. Absent on an older server. */
+    byRecording?: Record<'COMPLETE' | 'TRUNCATED' | 'GRADUATED' | 'UNRESOLVED', { launches: number; entries: number; closed: number; openAtEnd: number; netPnlSol: number | null; openMarkNetPnlSol: number | null }>;
   };
   launches: ReplayedLaunchRow[];
   /** S190. Absent on an older server. */
@@ -122,6 +124,12 @@ export function ReplayBacktestView({ data, error }: { data: ReplayResponse | nul
               <span className="text-slate-500">Average hold</span><span className="text-right">{dur(s.avgHoldMs)}</span>
               <span className="text-slate-500">Exits by reason</span><span className="text-right">{Object.entries(s.exitReasons).map(([k, v]) => `${k} ${v}`).join(' · ') || '—'}</span>
             </div>
+            {s.byRecording && (
+              <p className="text-slate-400 mb-3" data-testid="replay-by-recording">
+                Recordings: {s.byRecording.COMPLETE.launches} recorded for the whole window, {s.byRecording.TRUNCATED.launches} cut by the trade cap, {s.byRecording.GRADUATED.launches} graduated, {s.byRecording.UNRESOLVED.launches} unresolved (no END row: still recording, stopped with the app, or recorded before END rows).
+                {(['TRUNCATED', 'GRADUATED', 'UNRESOLVED'] as const).filter((k) => s.byRecording![k].entries > 0).map((k) => ` ${k}: ${s.byRecording![k].entries} entered, net ${sol(s.byRecording![k].netPnlSol)} closed, ${sol(s.byRecording![k].openMarkNetPnlSol)} open mark.`).join('')}
+              </p>
+            )}
             {s.closed < 30 && <p className="text-amber-300/90 mb-3" data-testid="replay-small-n">Only {s.closed} closed trade(s): too few to say anything about expectancy.</p>}
             {r.launches.length > TABLE_ROWS_SHOWN && <p className="text-slate-500 mb-1" data-testid="replay-table-capped">Table: the newest {TABLE_ROWS_SHOWN} of {r.launches.length} replayed launches (the summary above counts all of them).</p>}
             <table className="w-full text-left mb-3" data-testid="replay-table">

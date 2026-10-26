@@ -122,3 +122,66 @@ describe('5C (R1-108): the late-spike counts and their "of" are the same launche
     expect(a.late.peakAfter60MinAtLeast2x).toBe(1); // 90/200; not 70/120 (120 min observed)
   });
 });
+
+// ---- how each recording ended (5B's END rows) ------------------------------------------------------------------------------------------
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { ReplayBacktestView, type ReplayResponse } from '../src/components/BacktestModal';
+import { WorkstationDatabase } from '../server/db/database';
+
+describe('5C (R1-106): the replay labels truncated, graduated and unresolved launches and reports them apart', () => {
+  afterEach(() => restoreStockEngine());
+  /** the warm-up cut at its release, so the coin is quiet after the buy */
+  const quiet = (): TradeRow[] => { const full = curve(); const rel = T0 + (replay(full).releasedAfterMs as number); return full.filter((x) => x[0] <= rel); };
+  const rec = (end?: { endTs: number; endReason: string }, mint = 'Mint5C') => ({ ...toRecordedLaunch({ ...launch(quiet()), mint }, 150), ...(end ?? {}) });
+  const lastTs = () => { const q = quiet(); return q[q.length - 1][0]; };
+
+  it('each END reason gives its label; no END row is UNRESOLVED', () => {
+    expect(replayLaunch(rec({ endTs: T0 + 35 * 60_000, endReason: 'WINDOW' }), [], 150, GATE).recording).toBe('COMPLETE');
+    expect(replayLaunch(rec({ endTs: lastTs() + 1, endReason: 'TRADE_CAP' }), [], 150, GATE).recording).toBe('TRUNCATED');
+    expect(replayLaunch(rec({ endTs: lastTs(), endReason: 'CURVE_COMPLETE' }), [], 150, GATE).recording).toBe('GRADUATED');
+    expect(replayLaunch(rec(), [], 150, GATE).recording).toBe('UNRESOLVED');
+  });
+
+  it('the summary splits launches, entries and money by label', () => {
+    const rep = replayLaunches([rec({ endTs: T0 + 35 * 60_000, endReason: 'WINDOW' }), rec({ endTs: lastTs() + 1, endReason: 'TRADE_CAP' }, 'cut'), rec(undefined, 'open')], [], 150, GATE);
+    const b = rep.summary.byRecording;
+    expect([b.COMPLETE.launches, b.TRUNCATED.launches, b.GRADUATED.launches, b.UNRESOLVED.launches]).toEqual([1, 1, 0, 1]);
+    expect(b.COMPLETE.closed).toBe(1); // recorded quiet to the window end: the stale exit closes it
+    expect(b.TRUNCATED.openAtEnd).toBe(1); // cut by the cap: nothing assumed past the cut
+    expect(b.COMPLETE.closed + b.TRUNCATED.closed + b.UNRESOLVED.closed).toBe(rep.summary.closed);
+    expect(b.COMPLETE.netPnlSol).toBeCloseTo(rep.launches[0].netPnlSol as number, 12);
+  });
+
+  it('a launch with no END row is never assumed recorded past the moment the recording was read', () => {
+    const W = { recordedForMs: 35 * 60_000 };
+    expect(replayLaunch(rec(), [], 150, { ...GATE, ...W }).outcome).toBe('CLOSED'); // the window alone: quiet to create + 35 min, stale exit
+    // read 5 minutes after the create: the launch may still be recording, so nothing after the read is assumed
+    expect(replayLaunch(rec(), [], 150, { ...GATE, ...W, readAtTs: T0 + 5 * 60_000 }).outcome).toBe('OPEN_AT_END');
+    // an END row decides on its own
+    expect(replayLaunch(rec({ endTs: T0 + 35 * 60_000, endReason: 'WINDOW' }), [], 150, { ...GATE, ...W, readAtTs: T0 + 5 * 60_000 }).outcome).toBe('CLOSED');
+  });
+
+  it('the label comes through from the database: an END/TRADE_CAP row read back by loadLaunchRecording', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 's5c-'));
+    try {
+      const db = new WorkstationDatabase(path.join(dir, 'r.db'));
+      const rows = quiet();
+      for (const e of toRecordedLaunch(launch(rows), 150).events) db.recordLaunchEvent(e.ts, 'Mint5C', e.kind, e.payload);
+      db.recordLaunchEvent(rows[rows.length - 1][0] + 1, 'Mint5C', 'END', { reason: 'TRADE_CAP', trades: rows.length });
+      const { launches } = db.loadLaunchRecording();
+      expect(replayLaunches(launches, [], 150, GATE).summary.byRecording.TRUNCATED.launches).toBe(1);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('the Backtest screen says how many recordings are unresolved or cut', () => {
+    const report = replayLaunches([rec({ endTs: lastTs() + 1, endReason: 'TRADE_CAP' }, 'cut'), rec()], [], 150, GATE);
+    const data = { recorded: { launches: 2, events: 10, oldestTs: T0, newestTs: T0 + 1 }, report, message: null, replayedLaunches: 2, replayCap: 5000 } as unknown as ReplayResponse;
+    const html = renderToStaticMarkup(React.createElement(ReplayBacktestView, { data }));
+    expect(html).toContain('data-testid="replay-by-recording"');
+    expect(html).toMatch(/1 cut by the trade cap, 0 graduated, 1 unresolved/);
+  });
+});

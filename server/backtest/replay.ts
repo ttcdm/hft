@@ -59,6 +59,11 @@ export type ReplayOptions = Partial<typeof REPLAY_DEFAULTS> & {
    * extend its coverage (5B's END rows, as `RecordedLaunch.endTs`, say so exactly).
    */
   recordedMaxTrades?: number;
+  /**
+   * 5C: when the recording was read (the route passes now). A launch with no END row may still be recording, so `recordedForMs` never extends
+   * its coverage past this moment: a launch created 5 minutes ago was not recorded quiet for 35.
+   */
+  readAtTs?: number;
 };
 
 /** 5A: the replay's costs as a costModel cost case. */
@@ -79,8 +84,26 @@ export function tradeRow(ev: RecordedEvent): TradeRow | null {
 }
 
 export interface RecordedEvent { ts: number; kind: 'CREATE' | 'TRADE'; payload: any }
-/** `endTs` (optional): when the recording of this launch is known to have ended (an END row). When present it decides the coverage, not ReplayOptions.recordedForMs. */
-export interface RecordedLaunch { mint: string; events: RecordedEvent[]; endTs?: number }
+/**
+ * `endTs` (optional): when the recording of this launch is known to have ended (an END row). When present it decides the coverage, not ReplayOptions.recordedForMs.
+ * `endReason` (5B): the END row's reason, TRADE_CAP, WINDOW or CURVE_COMPLETE.
+ */
+export interface RecordedLaunch { mint: string; events: RecordedEvent[]; endTs?: number; endReason?: string }
+
+/**
+ * 5C (R1-106): how the recording of a launch ended, from its END row. COMPLETE: recorded for the whole window. TRUNCATED: the recorder's
+ * trade cap cut it (trades after it are missing). GRADUATED: the curve completed (nothing after graduation is recorded). UNRESOLVED: no END
+ * row, so still recording, stopped with the process, or recorded before END rows existed; its end is not known.
+ */
+export type RecordingEnd = 'COMPLETE' | 'TRUNCATED' | 'GRADUATED' | 'UNRESOLVED';
+export const RECORDING_ENDS: RecordingEnd[] = ['COMPLETE', 'TRUNCATED', 'GRADUATED', 'UNRESOLVED'];
+export function recordingEnd(l: Pick<RecordedLaunch, 'endTs' | 'endReason'>): RecordingEnd {
+  if (l.endTs === undefined) return 'UNRESOLVED';
+  if (l.endReason === 'WINDOW') return 'COMPLETE';
+  if (l.endReason === 'TRADE_CAP') return 'TRUNCATED';
+  if (l.endReason === 'CURVE_COMPLETE') return 'GRADUATED';
+  return 'UNRESOLVED'; // an END row with a reason this code does not know
+}
 export interface FunderFact { ts: number; wallet: string; funder: string | null }
 
 export type ReplayOutcome = 'NO_ENTRY' | 'CLOSED' | 'OPEN_AT_END';
@@ -114,6 +137,8 @@ export interface ReplayedLaunch {
   /** P4.3: the release's strong-signal count and whether concentration passed. Null without a release. */
   passingSignals?: number | null;
   concentrationPass?: boolean | null;
+  /** 5C (R1-106): how the launch's recording ended (see RecordingEnd) */
+  recording?: RecordingEnd;
 }
 
 /** S190: the release-to-peak buckets, in minutes. A peak at exactly a boundary belongs to the later bucket. */
@@ -148,6 +173,8 @@ export interface ReplayReport {
     wins: number; losses: number; winRate: number | null; netPnlSol: number | null; avgHoldMs: number | null; exitReasons: Record<string, number>;
     /** 5A: the OPEN_AT_END positions marked at the last recorded price with their exit cost charged; reported apart from the realized netPnlSol */
     openMarkNetPnlSol: number | null;
+    /** 5C (R1-106): the same figures for each way a recording ended, so truncated, graduated and unresolved launches can be read apart */
+    byRecording: Record<RecordingEnd, { launches: number; entries: number; closed: number; openAtEnd: number; netPnlSol: number | null; openMarkNetPnlSol: number | null }>;
   };
   launches: ReplayedLaunch[];
   /** S190 */
@@ -222,6 +249,7 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
   const base: ReplayedLaunch = {
     mint: launch.mint, symbol: create?.payload?.symbol ?? '?', trades: trades.length, verdict: 'NO_TRADES', verdictReason: 'no trade recorded', releasedAfterMs: null, score: null,
     entered: false, noEntryReason: null, outcome: 'NO_ENTRY', entryPriceSol: null, exits: [], holdMs: null, netPnlSol: null, openValueSol: null,
+    recording: recordingEnd(launch),
   };
   if (!create || trades.length === 0) return { ...base, noEntryReason: 'nothing to replay' };
 
@@ -338,7 +366,7 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
   if (rows.length === 0) return { ...result, noEntryReason: 'no recorded trade carries a price, so no price to buy at' };
   const lastEventTs = launch.events[launch.events.length - 1]?.ts ?? rows[rows.length - 1][0];
   const capped = o.recordedMaxTrades !== undefined && trades.length >= o.recordedMaxTrades;
-  const window = launch.endTs !== undefined ? launch.endTs : (o.recordedForMs !== undefined && !capped ? startTs + o.recordedForMs : -Infinity);
+  const window = launch.endTs !== undefined ? launch.endTs : (o.recordedForMs !== undefined && !capped ? Math.min(startTs + o.recordedForMs, o.readAtTs ?? Infinity) : -Infinity);
   const coveredUntilTs = Math.max(lastEventTs, window);
   const path = simulatePath(rows, releasedAt, { entryMs: o.entryDelayMs, exitMs: o.exitDelayMs }, null, { coveredUntilTs });
   if (!path) return { ...result, noEntryReason: 'the entry trade carries no price' };
@@ -429,6 +457,15 @@ function buildReplayReport(rows: ReplayedLaunch[], opts: ReplayOptions, minScore
       avgHoldMs: closed.length ? closed.reduce((a, r) => a + (r.holdMs ?? 0), 0) / closed.length : null,
       exitReasons,
       openMarkNetPnlSol: open.length ? open.reduce((a, r) => a + (r.openNetPnlSol ?? 0), 0) : null,
+      byRecording: Object.fromEntries(RECORDING_ENDS.map((k) => {
+        const of = rows.filter((r) => (r.recording ?? 'UNRESOLVED') === k);
+        const c = of.filter((r) => r.outcome === 'CLOSED'), op = of.filter((r) => r.outcome === 'OPEN_AT_END');
+        return [k, {
+          launches: of.length, entries: of.filter((r) => r.entered).length, closed: c.length, openAtEnd: op.length,
+          netPnlSol: c.length ? c.reduce((a, r) => a + (r.netPnlSol ?? 0), 0) : null,
+          openMarkNetPnlSol: op.length ? op.reduce((a, r) => a + (r.openNetPnlSol ?? 0), 0) : null,
+        }];
+      })) as ReplayReport['summary']['byRecording'],
     },
     launches: rows,
     peakAnalysis: analysePeaks(rows),

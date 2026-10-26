@@ -1,7 +1,6 @@
 import '../suppress-warnings.cjs';
 import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
-import path from 'node:path';
 import { WATCH_MIN_MS, WATCH_MAX_MS } from '../server/signals/watchWindow';
 import { FEED_SLOT_SILENCE_MS, FEED_SLOT_JUMP_MAX } from '../server/solana/pumpFeedListener';
 import { FUNDER_RETRY_DELAYS_MS, FUNDER_LOOKUP_CONCURRENCY, FUNDER_LOOKUP_MAX_PER_MINT } from '../server/signals/funderLookup';
@@ -24,7 +23,7 @@ import { LOGIN_RATE_LIMIT } from '../server/middleware/enterprise';
  * 3J: every constant that docs/LATENCY.md, docs/RUNBOOK.md and docs/ARCHITECTURE.md state a value for has that value in the code, and the
  * document still states it. A change to the constant fails the first check; a rewrite of the document that drops or changes the figure
  * fails the second. Constants that are not exported are read from the source text with a pattern that must match exactly once.
- * Also: every repository path those documents name exists, and every `file:line` in LATENCY.md points inside the file.
+ * The checks that only read repository files (paths named in the documents, `file:line` references) are in s3j_docs_paths.repo.test.ts.
  */
 const read = (f: string) => fs.readFileSync(f, 'utf8');
 const doc = { latency: read('docs/LATENCY.md'), runbook: read('docs/RUNBOOK.md'), arch: read('docs/ARCHITECTURE.md'), env: read('docs/ENV.md') };
@@ -109,41 +108,15 @@ describe('constants named in the docs have the value the docs state', () => {
     expect(rows.length).toBeGreaterThan(50);
   });
 
-  it.each(rows.map((r) => [r[0], r[1], r[2]]))('%s in the code is %j', (_name, actual, expected) => {
+  const byName = (name: string): Row => rows.find((r) => r[0] === name)!;
+
+  it.each(rows.map((r) => r[0]))('%s in the code is the value the document states', (name) => {
+    const [, actual, expected] = byName(name);
     expect(actual).toEqual(expected);
   });
 
-  it.each(rows.map((r) => [r[0], r[3], r[4]]))('%s: the document still says %j', (_name, which, phrase) => {
-    expect(doc[which as keyof typeof doc], `${which} should contain: ${phrase}`).toContain(phrase as string);
-  });
-});
-
-describe('paths and file:line references in LATENCY.md and RUNBOOK.md', () => {
-  const targets: Array<[string, string]> = [['docs/LATENCY.md', doc.latency], ['docs/RUNBOOK.md', doc.runbook]];
-
-  for (const [name, text] of targets) {
-    const prose = text.replace(/```[\s\S]*?```/g, '');
-    const tokens = [...new Set([...prose.matchAll(/`([A-Za-z0-9_.\-/]+)(?::\d+)?`/g)].map((m) => m[1]))]
-      .filter((t) => (t.includes('/') || /\.(ts|tsx|md|cjs|mjs|json)$/.test(t)) && !t.startsWith('/') && !t.startsWith('$') && !/^(api|GET|POST)/.test(t) && !/apex_trading_keypair/.test(t)); // the keypair file is a runtime file, not in the repository
-
-    it(`${name} names a useful number of repo paths`, () => {
-      expect(tokens.length).toBeGreaterThan(name.includes('LATENCY') ? 15 : 2);
-    });
-
-    it.each(tokens)(`${name}: path %s exists`, (p) => {
-      const rel = p.replace(/\/$/, '');
-      expect(fs.existsSync(rel) || fs.existsSync(path.join('docs', rel)), `${rel} is named in ${name} but does not exist`).toBe(true);
-    });
-  }
-
-  const refs = [...doc.latency.matchAll(/`([A-Za-z0-9_./-]+\.tsx?):(\d+)`/g)].map((m) => [m[1], Number(m[2])] as [string, number]);
-  it('LATENCY.md has file:line references to check', () => {
-    expect(refs.length).toBeGreaterThan(40);
-  });
-  it.each(refs)('%s:%i is inside the file and not blank', (file, line) => {
-    const lines = read(file).split('\n');
-    expect(line).toBeGreaterThan(0);
-    expect(line).toBeLessThanOrEqual(lines.length);
-    expect(lines[line - 1].trim().length, `${file}:${line} is blank`).toBeGreaterThan(0);
+  it.each(rows.map((r) => r[0]))('%s: the document still says it', (name) => {
+    const [, , , which, phrase] = byName(name);
+    expect(doc[which], `${which} should contain: ${phrase}`).toContain(phrase);
   });
 });

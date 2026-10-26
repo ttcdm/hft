@@ -1055,16 +1055,16 @@ app.get('/api/wallet/state', requireOperatorAuth, (req, res) => {
   res.json({
     success: true,
     data: walletTrader.getState(),
-    config: { ...walletTrader.getConfig(), rpcEndpoint: endpointOrigin(walletTrader.getConfig().rpcEndpoint) }, // Q54: no key from the URL path or query
+    config: walletTrader.getPublicConfig(), // Q54, 3G: RPC and Jito URLs as their origin only, no key from a path or query
   });
 });
 
 app.post('/api/wallet/config', requireOperatorAuth, validateBody(WalletConfigSchema), asyncHandler(async (req, res) => {
   try {
-    const updated = await walletTrader.updateConfig(req.body);
+    await walletTrader.updateConfig(req.body);
     res.json({
       success: true,
-      config: { ...updated, rpcEndpoint: endpointOrigin(updated.rpcEndpoint) },
+      config: walletTrader.getPublicConfig(),
       state: walletTrader.getState(),
     });
   } catch (err: any) {

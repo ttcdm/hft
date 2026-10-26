@@ -206,25 +206,35 @@ export const WalletConfigSchema = z.object({
     // Absent leaves the current endpoint alone. (A default here silently re-pointed the RPC at the public devnet URL on every
     // config save, which also fails the cluster check when running against a local validator.)
     .optional(),
-  // '' means Jito is disabled (the fail-closed default). There is no mainnet default.
+  // '' turns Jito off; absent leaves it as it is (3G, N-8: a default of '' here made "absent" and "off" the same, and the update path then
+  // skipped '' as falsy, so Jito could never be turned off). Whether a URL is allowed on this cluster is checked in walletTrader.updateConfig.
   jitoBlockEngineUrl: z
     .string()
     .refine(
       (v) => v === '' || (z.string().url().safeParse(v).success && isSafeExternalUrl(v)),
       'Jito Block Engine must be empty (disabled) or a valid URL that does not point to private metadata services'
     )
-    .default(''),
+    .optional(),
   jitoTipSol: z.number().min(0.0001).max(0.2).optional(), // absent leaves the stored value alone (C6)
-  slippageToleranceBps: z.number().min(10).max(5000).default(600), // 6.0% default for meme volatility
-  capitalTier: z.enum(['MICRO_10', 'INSTITUTIONAL', 'CUSTOM']).default('MICRO_10'),
+  // 3G (N-67): every field below is optional with no default. A default here was applied to every save that left the field out, so a save
+  // without riskLimits.maxPositionSizeSol reset the risk engine's position cap to 0.02 SOL.
+  slippageToleranceBps: z.number().min(10).max(5000).optional(),
+  capitalTier: z.enum(['MICRO_10', 'INSTITUTIONAL', 'CUSTOM']).optional(),
   // Audit 2026-10-22: `allocatedSol` and `enabledStrategies` are gone. Nothing read the strategy toggles, and `allocatedSol` was a
   // constant that was echoed back as if it were a wallet figure. Unknown keys are dropped, as for the other removed settings (Q34).
-  riskLimits: z.object({
-    maxDailyLossUsd: z.number().min(1).max(100000).default(2.5),
-    maxPositionSizeSol: z.number().min(0.005).max(50).default(0.02),
-    stopLossPct: z.number().min(5).max(90).default(20),
-    takeProfitMultiple: z.number().min(1.2).max(50).default(1.5),
-  }),
+  riskLimits: z
+    .object({
+      // 3G (N-67): refused, not dropped. The daily-loss limit comes from MAX_DAILY_LOSS_USD (read by the risk engine through
+      // executionConfig); a value sent here was stored and echoed back but never used, so a caller believed it had set a limit.
+      maxDailyLossUsd: z
+        .unknown()
+        .refine((v) => v === undefined, 'maxDailyLossUsd cannot be set through the API: set MAX_DAILY_LOSS_USD in the environment and restart')
+        .optional(),
+      maxPositionSizeSol: z.number().min(0.005).max(50).optional(),
+      stopLossPct: z.number().min(5).max(90).optional(),
+      takeProfitMultiple: z.number().min(1.2).max(50).optional(),
+    })
+    .optional(),
 });
 
 export const LiveSnipeOrderSchema = z.object({

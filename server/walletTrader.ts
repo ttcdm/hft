@@ -1,12 +1,12 @@
 import { EventEmitter } from 'events';
-import { Logger } from './middleware/enterprise';
+import { Logger, endpointOrigin } from './middleware/enterprise';
 import { executionCoordinator } from './execution/coordinator';
 import { localSigner } from './solana/signer';
 import { workstationDb } from './db/database';
 import { riskEngine } from './risk/riskEngine';
 import { ExecutionMode, NormalizedPosition } from './core/types';
 import { executionConfig } from './solana/executionConfig';
-import { resolveRpcUrl } from './solana/clusterGuard';
+import { allowedCluster, resolveJitoUrl, resolveRpcUrl } from './solana/clusterGuard';
 import { solPriceService } from './market/solPriceService';
 import { emergencyStop, type EmergencyStopReport } from './execution/emergencyStop';
 
@@ -188,7 +188,10 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     }
   }
 
-  /** Throws (before changing anything) when the new RPC endpoint is refused by the cluster guard or unreachable. */
+  /**
+   * Throws (before changing anything) when a value is refused: a position size above the environment ceiling, a Jito URL this cluster
+   * does not allow, or an RPC endpoint the cluster guard refuses or cannot reach. Only the fields that are present are changed (3G).
+   */
   public async updateConfig(newConfig: Partial<WalletTraderConfig>): Promise<WalletTraderConfig> {
     // R8s: the HTTP API may lower the per-trade size but not raise it past what the environment and capital tier allow
     // (MAX_POSITION_SIZE_SOL). Checked first, so a refused request changes nothing.
@@ -197,22 +200,39 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     if (requested !== undefined && requested > ceiling) {
       throw new Error(`maxPositionSizeSol ${requested} exceeds the configured ceiling ${ceiling} SOL; raise MAX_POSITION_SIZE_SOL in the environment and restart to allow more`);
     }
+    // 3G (N-19): the Jito URL is checked before anything changes. It used to be stored, and the RPC switched, before the transport
+    // refused it, so a 400 left the request half applied. `undefined` leaves Jito alone and '' turns it off (N-8).
+    const jitoUrl = newConfig.jitoBlockEngineUrl;
+    if (jitoUrl !== undefined && jitoUrl.trim() !== '' && resolveJitoUrl(jitoUrl) === '') {
+      throw new Error(
+        allowedCluster() === 'localnet'
+          ? 'CLUSTER_GUARD: Jito is not used on localnet; send an empty jitoBlockEngineUrl or leave it out'
+          : 'CLUSTER_GUARD: refusing to configure a mainnet Jito block engine URL'
+      );
+    }
     if (newConfig.rpcEndpoint && newConfig.rpcEndpoint !== this.config.rpcEndpoint) {
       const switched = await executionCoordinator.setRpcEndpoint(newConfig.rpcEndpoint);
       if (!switched.success) throw new Error(`RPC endpoint rejected: ${switched.error ?? 'unknown error'}`);
       this.config.rpcEndpoint = newConfig.rpcEndpoint;
     }
-    if (newConfig.jitoBlockEngineUrl) {
-      this.config.jitoBlockEngineUrl = newConfig.jitoBlockEngineUrl;
-      executionCoordinator.setJitoBlockEngineUrl(newConfig.jitoBlockEngineUrl);
+    if (jitoUrl !== undefined) {
+      executionCoordinator.setJitoBlockEngineUrl(jitoUrl);
+      this.config.jitoBlockEngineUrl = resolveJitoUrl(jitoUrl); // as the transport resolves it: '' when off
     }
     if (newConfig.jitoTipSol !== undefined) this.config.jitoTipSol = newConfig.jitoTipSol;
     if (newConfig.slippageToleranceBps !== undefined) this.config.slippageToleranceBps = newConfig.slippageToleranceBps;
     if (newConfig.capitalTier) this.config.capitalTier = newConfig.capitalTier;
-    if (newConfig.riskLimits) {
-      this.config.riskLimits = { ...this.config.riskLimits, ...newConfig.riskLimits };
-      // C3: the daily-loss limit stays derived from the live SOL price inside the risk engine; only the size is pushed.
-      riskEngine.updateLimits({ maxPositionSol: newConfig.riskLimits.maxPositionSizeSol });
+    const limits = newConfig.riskLimits;
+    if (limits) {
+      // 3G (N-67): only the limits that were sent. maxDailyLossUsd is never taken from a request (the route refuses it): the risk
+      // engine reads MAX_DAILY_LOSS_USD, so the stored value stays the environment's.
+      if (limits.stopLossPct !== undefined) this.config.riskLimits.stopLossPct = limits.stopLossPct;
+      if (limits.takeProfitMultiple !== undefined) this.config.riskLimits.takeProfitMultiple = limits.takeProfitMultiple;
+      if (limits.maxPositionSizeSol !== undefined) {
+        this.config.riskLimits.maxPositionSizeSol = limits.maxPositionSizeSol;
+        // C3: the daily-loss limit stays derived from the live SOL price inside the risk engine; only the size is pushed.
+        riskEngine.updateLimits({ maxPositionSol: limits.maxPositionSizeSol });
+      }
     }
 
     Logger.info('Wallet Trader configuration updated', {
@@ -225,7 +245,12 @@ class PlugAndPlayWalletTrader extends EventEmitter {
   }
 
   public getConfig(): WalletTraderConfig {
-    return { ...this.config };
+    return { ...this.config, riskLimits: { ...this.config.riskLimits } };
+  }
+
+  /** The config as the API shows it (Q54, 3G): the RPC and Jito URLs as their origin only, so no key in a path or query is returned. */
+  public getPublicConfig(): WalletTraderConfig {
+    return { ...this.getConfig(), rpcEndpoint: endpointOrigin(this.config.rpcEndpoint), jitoBlockEngineUrl: endpointOrigin(this.config.jitoBlockEngineUrl) };
   }
 
   public getState(): LiveWalletState {

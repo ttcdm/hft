@@ -26,7 +26,7 @@ describe('audit 2026-10-22: the wallet config has no do-nothing settings', () =>
     const parsed = WalletConfigSchema.parse({ enabledStrategies: { pumpFunSniper: false, marketMaking: true }, allocatedSol: 3, riskLimits: {} }) as any;
     expect(parsed.enabledStrategies).toBeUndefined();
     expect(parsed.allocatedSol).toBeUndefined();
-    expect(Object.keys(parsed).sort()).toEqual(['capitalTier', 'jitoBlockEngineUrl', 'riskLimits', 'slippageToleranceBps']);
+    expect(Object.keys(parsed)).toEqual(['riskLimits']); // 3G: the schema adds no defaults, so only what was sent and is known stays
   });
 
   it('the stored config carries neither field, and a save naming them does not bring them back', async () => {

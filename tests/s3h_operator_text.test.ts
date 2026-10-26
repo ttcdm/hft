@@ -228,3 +228,42 @@ describe('3H: callout copy says what the feed gave', () => {
     expect(fs.readFileSync('src/components/PumpFunHotCalloutsView.tsx', 'utf8')).not.toContain('photo-1622979135225');
   });
 });
+
+describe('3H A7: one truth for the callout auto-snipe rules', () => {
+  it('the rules screen and KNOWN_RISKS section 6 carry the same text, and neither says "no code acts on them" or "live"', async () => {
+    const { CALLOUT_RULES_SCOPE_NOTE } = await import('../src/utils/calloutRuleText');
+    const view = fs.readFileSync('src/components/PumpFunHotCalloutsView.tsx', 'utf8');
+    expect(view).toContain('{CALLOUT_RULES_SCOPE_NOTE}');
+    expect(view).not.toContain('no code acts on them');
+    const doc = fs.readFileSync('KNOWN_RISKS.md', 'utf8');
+    const s6 = doc.slice(doc.indexOf('## 6.'), doc.indexOf('## 7.'));
+    expect(s6).toContain(CALLOUT_RULES_SCOPE_NOTE);
+    expect(s6).not.toMatch(/rules on the Hot Callouts screen are live/);
+    expect(s6).not.toContain('Jito bundles are used only on mainnet-beta');
+  });
+
+  it('what the text says about devnet holds: a callout built from an on-chain create event is never INSTANT_SNIPE', async () => {
+    const { PumpFunService } = await import('../server/pumpfunService');
+    const svc = new PumpFunService();
+    svc.handleOnChainCreateEvent({
+      signature: 's', slot: 1, mint: 'RuleScopeMint11111111111111111111111111111', bondingCurve: 'b', user: 'u', creator: 'c', name: 'R', symbol: 'R', uri: '',
+      virtualTokenReserves: 1_073_000_000_000_000n, virtualSolReserves: 30_000_000_000n, realTokenReserves: 793_100_000_000_000n, realSolReserves: 0n,
+      tokenTotalSupply: 1_000_000_000_000_000n, initialPriceSol: 0.000000028, initialMarketCapSol: 28, receivedAt: Date.now(), parsedAt: Date.now(),
+      parseLatencyMs: 0.5, source: 'SOLANA_WS_LOGS',
+    } as any);
+    const [c] = svc.getHotCallouts();
+    expect(c.confluenceCount).toBeLessThan(2);
+    expect(c.hftAction).not.toBe('INSTANT_SNIPE');
+  });
+
+  it('the 6 s poll leaves unsaved rule edits alone and takes the server copy otherwise', async () => {
+    const { rulesAfterPoll } = await import('../src/components/PumpFunHotCalloutsView');
+    const mine = { maxElapsedSeconds: 30 };
+    const server = { maxElapsedSeconds: 60 };
+    expect(rulesAfterPoll(mine, server, true)).toBe(mine);
+    expect(rulesAfterPoll(mine, server, false)).toBe(server);
+    const view = fs.readFileSync('src/components/PumpFunHotCalloutsView.tsx', 'utf8');
+    expect(view).toContain('rulesAfterPoll(current, data.autoSnipeRules, rulesDirty.current)');
+    expect(view).not.toMatch(/setRules\(\{ \.\.\.rules,/); // every input goes through editRules, which marks the form dirty
+  });
+});

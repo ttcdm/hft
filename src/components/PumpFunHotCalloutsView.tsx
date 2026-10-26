@@ -13,10 +13,10 @@
  */
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { SnipeAmountControl } from './SnipeAmountControl';
-import { CONFLUENCE_RULE_LABEL, CONFLUENCE_RULE_NOTE } from '../utils/calloutRuleText';
+import { CONFLUENCE_RULE_LABEL, CONFLUENCE_RULE_NOTE, CALLOUT_RULES_SCOPE_NOTE } from '../utils/calloutRuleText';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
 import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Flame,
   Award,
@@ -66,6 +66,11 @@ interface PumpFunHotCalloutsViewProps {
   capitalTier?: 'MICRO_10' | 'INSTITUTIONAL';
   onAlertTrigger?: (level: 'INFO' | 'WARNING' | 'CRITICAL', title: string, message: string) => void;
   onRefreshParent?: () => void;
+}
+
+/** 3H: what the rules form holds after a poll. While the operator has unsaved edits, the poll leaves them alone (it used to replace them every 6 s). */
+export function rulesAfterPoll<T>(current: T, fromServer: T, dirty: boolean): T {
+  return dirty ? current : fromServer;
 }
 
 /** 3H: the coin's own image, or an empty tile with its first letters. A missing or broken image used to show a stock photo as if it were the coin's. */
@@ -127,6 +132,12 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
     jitoPriorityTipSol: 0.00018,
   });
 
+  const rulesDirty = useRef(false); // true from the first edit until the server confirms a save
+  const editRules = (patch: Partial<typeof rules>) => {
+    rulesDirty.current = true;
+    setRules((r) => ({ ...r, ...patch }));
+  };
+
   const [activeFilter, setActiveFilter] = useState<'ALL' | 'CONFLUENCE' | 'TOP_WHALES' | 'FRESH' | 'MIGRATING'>('ALL');
   const [searchQuery, setSearchQuery] = useState('');
   const [copiedCa, setCopiedCa] = useState<string | null>(null);
@@ -150,9 +161,8 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
           tokensTrackedCount: data.tokensTrackedCount ?? 0,
           lastUpdated: data.lastUpdated || null,
         });
-        if (data.autoSnipeRules) {
-          setRules(data.autoSnipeRules);
-        }
+        // 3H: the 6 s poll no longer overwrites a rule the operator is editing; the server copy is taken again after a save
+        if (data.autoSnipeRules) setRules((current) => rulesAfterPoll(current, data.autoSnipeRules, rulesDirty.current));
       }
     } catch (e) {
       console.error(e);
@@ -267,7 +277,11 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
     hftAudio.playClick();
     const res = await engineClient.updatePumpFunRules(rules);
     if (res?.status === 'OK') {
-      onAlertTrigger?.('INFO', 'AUTO-SNIPE RULES UPDATED', 'Pump.fun HFT callout parameters saved');
+      rulesDirty.current = false;
+      if (res.rules) setRules(res.rules);
+      onAlertTrigger?.('INFO', 'AUTO-SNIPE RULES SAVED', 'Saved in server memory until the next restart.');
+    } else {
+      onAlertTrigger?.('WARNING', 'AUTO-SNIPE RULES NOT SAVED', `The server did not confirm the save${res?.error ? `: ${res.error}` : ''}; your edits are still on screen.`);
     }
   };
 
@@ -1011,7 +1025,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 Autonomous Pump.fun Callout Sniper Parameters
               </h3>
               <p className="text-xs text-slate-400 mt-0.5">
-                These rules are stored and shown here; no code acts on them. Auto trading is controlled in the Auto panel (a real transaction only when LIVE is armed; PAPER sends nothing).
+                {CALLOUT_RULES_SCOPE_NOTE}
               </p>
             </div>
 
@@ -1034,7 +1048,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 type="number"
                 value={rules.minCallerWinRate2x}
                 onChange={(e) =>
-                  setRules({ ...rules, minCallerWinRate2x: parseFloat(e.target.value) || 0 })
+                  editRules({ minCallerWinRate2x: parseFloat(e.target.value) || 0 })
                 }
                 step="1"
                 min="10"
@@ -1055,7 +1069,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 type="number"
                 value={rules.minAvgMultiple}
                 onChange={(e) =>
-                  setRules({ ...rules, minAvgMultiple: parseFloat(e.target.value) || 0 })
+                  editRules({ minAvgMultiple: parseFloat(e.target.value) || 0 })
                 }
                 step="0.5"
                 min="1.5"
@@ -1076,7 +1090,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 type="number"
                 value={rules.maxEntryMultiple}
                 onChange={(e) =>
-                  setRules({ ...rules, maxEntryMultiple: parseFloat(e.target.value) || 1 })
+                  editRules({ maxEntryMultiple: parseFloat(e.target.value) || 1 })
                 }
                 step="0.05"
                 min="1.05"
@@ -1097,7 +1111,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 type="number"
                 value={rules.maxElapsedSeconds}
                 onChange={(e) =>
-                  setRules({ ...rules, maxElapsedSeconds: parseInt(e.target.value) || 30 })
+                  editRules({ maxElapsedSeconds: parseInt(e.target.value) || 30 })
                 }
                 step="10"
                 min="15"
@@ -1119,7 +1133,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                   type="checkbox"
                   checked={rules.autoSnipeOnConfluence}
                   onChange={(e) =>
-                    setRules({ ...rules, autoSnipeOnConfluence: e.target.checked })
+                    editRules({ autoSnipeOnConfluence: e.target.checked })
                   }
                   className="w-4 h-4 rounded text-rose-600 bg-slate-800 border-slate-700"
                 />
@@ -1138,7 +1152,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 type="number"
                 value={rules.jitoPriorityTipSol}
                 onChange={(e) =>
-                  setRules({ ...rules, jitoPriorityTipSol: parseFloat(e.target.value) || 0.00018 })
+                  editRules({ jitoPriorityTipSol: parseFloat(e.target.value) || 0.00018 })
                 }
                 step="0.0001"
                 min="0.00015"

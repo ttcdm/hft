@@ -1,7 +1,7 @@
 import '../hermeticEnv';
-import { replayLaunch, type RecordedLaunch } from '../../server/backtest/replay';
+import { replayLaunch, replayCostCase, REPLAY_DEFAULTS, type RecordedLaunch } from '../../server/backtest/replay';
 import {
-  COST_CASES, LATENCIES, VARIANTS, STOCK_VARIANT, latencyName, variantName, priceEntry, simulatePath, restoreStockEngine,
+  COST_CASES, LATENCIES, VARIANTS, STOCK_VARIANT, latencyName, variantName, priceEntry, priceEntryParts, simulatePath, restoreStockEngine,
   type TradeRow, type CostCase, type Latency, type Variant,
 } from '../../server/backtest/costModel';
 
@@ -62,13 +62,6 @@ export function newTotals(dims: Dims, firstDay: number, lastDay: number): Totals
   };
 }
 
-/** The stock-engine check: legacy path + 'stock' cost must reproduce replayLaunch's own net P&L for a CLOSED entry. */
-function legacyCheck(trades: TradeRow[], releaseTs: number, entryDelayMs: number, replayNet: number, orderSol: number, stock: CostCase): boolean {
-  const p = simulatePath(trades, releaseTs, { entryMs: entryDelayMs, exitMs: 0 }, STOCK_VARIANT, { legacy: true });
-  if (!p || p.open) return false;
-  return Math.abs(priceEntry(trades, p, orderSol, stock) - replayNet) < 1e-9;
-}
-
 export function addLaunch(t: Totals, l: StudyLaunch, o: StudyOptions): void {
   const d = t.dims;
   t.launches++;
@@ -104,16 +97,23 @@ export function addLaunch(t: Totals, l: StudyLaunch, o: StudyOptions): void {
   }
 }
 
-/** Runs the replayLaunch comparison for up to `limit` entered launches and returns how many were checked / differ. Called by the caller on a sample. */
+/**
+ * 5A: the built-in check that the in-app replay and the study price a position with the same model. For up to `limit` entered launches,
+ * replayLaunch at its defaults (closed: netPnlSol; open at the end: openNetPnlSol) must equal simulatePath + priceEntryParts with the
+ * replay's own latency and cost case. Returns how many were checked / differ.
+ */
 export function validateLegacy(launches: Iterable<StudyLaunch>, o: StudyOptions, threshold: number, limit = 200): { checked: number; differ: number } {
-  const stock = COST_CASES.find((c) => c.name === 'stock') as CostCase;
+  const cost = replayCostCase(REPLAY_DEFAULTS);
+  const lat = { entryMs: REPLAY_DEFAULTS.entryDelayMs, exitMs: REPLAY_DEFAULTS.exitDelayMs };
   let checked = 0, differ = 0;
   restoreStockEngine();
   for (const l of launches) {
-    const r = replayLaunch(l.rec, [], o.solUsd, { minScore: threshold, entryDelayMs: 1_500, orderSol: 0.005 });
-    if (!r.entered || r.outcome !== 'CLOSED' || r.releasedAfterMs === null || r.netPnlSol === null) continue;
+    const r = replayLaunch(l.rec, [], o.solUsd, { minScore: threshold });
+    if (!r.entered || r.releasedAfterMs === null) continue;
+    const replayNet = r.outcome === 'CLOSED' ? r.netPnlSol : r.openNetPnlSol;
     checked++;
-    if (!legacyCheck(l.trades, l.t0 + r.releasedAfterMs, 1_500, r.netPnlSol, 0.005, stock)) differ++;
+    const p = simulatePath(l.trades, l.t0 + r.releasedAfterMs, lat, STOCK_VARIANT);
+    if (!p || replayNet === null || replayNet === undefined || Math.abs(priceEntryParts(l.trades, p, REPLAY_DEFAULTS.orderSol, cost).netSol - replayNet) >= 1e-9) differ++;
     restoreStockEngine();
     if (checked >= limit) break;
   }
@@ -221,7 +221,7 @@ export function renderMarkdown(r: Report, t: Totals, grid: { latency: string; va
   L.push(`# Realistic EV replay - ${r.source}`, '', `> ${r.note}`, '');
   L.push(`Launches replayed: ${r.launches}; launches the gate released at some threshold: ${r.releasedLaunches}. Train/test boundary: ${new Date(r.splitTs).toISOString()} (${r.splitNote}).`);
   L.push(`Selection search: ${r.combinationsPerScenario} combinations per scenario (${d.thr.length} thresholds x ${d.sizes.length} sizes x ${d.variants.length} exit variants), ${r.scenarios.length} scenarios (latency x cost), ${r.combinationsTotal} combinations tried in total. Chosen on TRAIN only (>= ${r.options.minTrainEntries} train entries); the test column is read once, for the chosen settings. Bootstrap: ${r.options.bootstrapResamples} resamples of launch blocks of ${(r.options.blockMs ?? DAY_MS) / 3_600_000} h (seed ${r.options.seed}).`);
-  L.push(`Built-in check: legacy path + stock cost vs replayLaunch: ${r.validation.checked} closed entries compared, ${r.validation.differ} differ.`, '');
+  L.push(`Built-in check: this model vs the in-app replayLaunch at its defaults: ${r.validation.checked} entries compared, ${r.validation.differ} differ.`, '');
   L.push('## Cost cases', '', ...r.costCases.map((c) => `- \`${c.name}\`: ${c.note}`), '');
   L.push('## Chosen settings per scenario (entry delay / exit delay x cost case)', '');
   L.push(row(['latency', 'cost', 'thr', 'size SOL', 'exit variant', 'train n', 'train EV %', 'test n', 'test EV SOL', 'test EV %', 'test 90% CI % (block bootstrap)']));

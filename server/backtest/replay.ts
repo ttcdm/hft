@@ -1,25 +1,35 @@
-import { WatchWindow, readyGate, READY_MIN_SIGNALS, type WatchState } from '../signals/watchWindow';
+import { WatchWindow, readyGate, READY_MIN_SIGNALS, WATCH_MAX_MS, type WatchState } from '../signals/watchWindow';
 import { getConfluenceThreshold } from '../signals/confluenceThreshold';
 import { ConfluenceEngine, isConfluencePassed } from '../signals/confluenceEngine';
 import { CurveVelocityEvaluator } from '../signals/curveVelocityEvaluator';
 import { OnChainPoolStats, tradePriceSol } from '../market/poolStats';
-import { ExitEngine } from '../exits/exitEngine';
 import type { PumpTradeEvent } from '../solana/pumpFeedListener';
+import { simulatePath, priceEntryParts, px, BASE_FEE_SOL, PRIORITY_BUY_SOL, PRIORITY_SELL_SOL, PUMP_FEE_SDK_PCT, type CostCase, type TradeRow } from './costModel';
 
 /**
  * Replays the auto trader's own rules over recorded launches: the real WatchWindow (verdict at the same 20 s / 120 s timing), the real
  * ConfluenceEngine (score at or above the buy threshold for a READY release; default 70, replayable at any value), and the real ExitEngine (stop, trailing stop, take-profit ladder, stale exit).
- * Entry and exit prices are the recorded trades' prices; costs are the pump.fun fee on each side plus the network fee and tip.
+ * 5A: the fill, the exits and the money come from the one cost and latency model the offline studies use (./costModel.ts): the buy lands
+ * `entryDelayMs` after the release and fills at the curve state then; the exit engine is polled every 3 s (also between prints, so the stale
+ * exit fires on quiet coins) and a sell lands `exitDelayMs` after its decision, at the curve state then; the pump.fun fee is charged on the
+ * buy (net into the curve = order / (1 + fee)) and on every sell, the order's own impact on the curve is applied, and every transaction
+ * sent pays the network fee, the priority fee and the tip. Closed (realized) results and positions still open at the end are reported apart.
  *
- * NOT replayed (the data to do it was not recorded, so the result is optimistic by that much): the eligibility filter (authorities,
- * holder concentration), risk limits and capital sizing, slippage beyond the recorded price, and creator wallet history.
+ * Not replayed: see `notReplayed` in the report, split by the direction the gap moves the result.
  */
 export const REPLAY_DEFAULTS = {
   orderSol: 0.005,
-  /** Delay between the watch window's release and the buy landing. An ASSUMPTION; the recorded trade at or after this is the fill price. */
+  /** Delay between the watch window's release and the buy landing. An ASSUMPTION; the curve state at that moment is the fill. */
   entryDelayMs: 1_500,
-  feePct: 1.0,            // pump.fun protocol fee, each side
-  networkFeeSol: 0.000005,
+  /** 5A: delay between an exit decision and the sell landing. An ASSUMPTION until the devnet sell-latency measurement replaces it. */
+  exitDelayMs: 1_500,
+  /** pump.fun fee, % on each side: the SDK default 0.95% protocol + 0.30% creator (the live quote reads the real tier). */
+  feePct: PUMP_FEE_SDK_PCT,
+  /** per transaction sent: base fee, priority fee (buy and sell compute limits differ) and tip */
+  networkFeeSol: BASE_FEE_SOL,
+  priorityBuySol: PRIORITY_BUY_SOL,
+  prioritySellSol: PRIORITY_SELL_SOL,
+  /** charged on every transaction, the conservative side: a straight-to-RPC send (Jito unset) pays none, so pass 0 to price that path */
   tipSol: 0.0001,
   /** How often the window is ticked while replaying (the live loop ticks every 2 s). */
   tickMs: 2_000,
@@ -30,10 +40,37 @@ export const REPLAY_DEFAULTS = {
  * gives the window the replayed curve progress, so a launch past APEX_MAX_CURVE_PROGRESS_PCT is released DEAD CURVE_TOO_FAR as live. A study turns
  * `readyGate` off to price the READY entries the rule refuses (scripts/recorder_backtest/ready_strength.ts).
  */
-export type ReplayOptions = Partial<typeof REPLAY_DEFAULTS> & { minScore?: number; readyGate?: boolean; curveCap?: boolean };
+export type ReplayOptions = Partial<typeof REPLAY_DEFAULTS> & {
+  minScore?: number; readyGate?: boolean; curveCap?: boolean;
+  /** 5A: price the order's own impact on the curve (default true); false prices at the recorded spot price */
+  impact?: boolean;
+  /**
+   * 5A: how long after its create each launch was recorded (the recorder window). With it, a sell or a stale decision after the last print is
+   * priced at that print (no print: the curve did not move) up to create + this; without it nothing is assumed past the last recorded print.
+   */
+  recordedForMs?: number;
+};
+
+/** 5A: the replay's costs as a costModel cost case. */
+export function replayCostCase(o: Pick<typeof REPLAY_DEFAULTS, 'feePct' | 'networkFeeSol' | 'priorityBuySol' | 'prioritySellSol' | 'tipSol'> & { impact?: boolean }): CostCase {
+  const buy = o.networkFeeSol + o.priorityBuySol + o.tipSol, sell = o.networkFeeSol + o.prioritySellSol + o.tipSol;
+  return {
+    name: 'replay', note: 'the in-app replay: fee each side, impact, base + priority + tip per transaction', buyFeePct: o.feePct, sellFeePct: o.feePct, impact: o.impact !== false,
+    fixedBuy: buy, fixedSell: sell, fixedOnce: 0, failCostBuy: 0, failCostSell: 0, pFailBuy: 0, pFailSell: 0, retryDelayMs: 3_000,
+  };
+}
+
+/** 5A: a recorded TRADE as a costModel row ([ts, isBuy, sol, tokens, user, virtualSol, virtualTokens, signature]); null without a price. */
+export function tradeRow(ev: RecordedEvent): TradeRow | null {
+  const p = ev.payload;
+  const vS = Number(p.virtualSolReserves), vT = Number(p.virtualTokenReserves);
+  if (!(vS > 0) || !(vT > 0)) return null;
+  return [ev.ts, !!p.isBuy, Number(p.solAmountLamports) / 1e9, Number(p.tokenAmount) / 1e6, String(p.user ?? ''), vS, vT, String(p.signature ?? '')];
+}
 
 export interface RecordedEvent { ts: number; kind: 'CREATE' | 'TRADE'; payload: any }
-export interface RecordedLaunch { mint: string; events: RecordedEvent[] }
+/** `endTs` (optional): when the recording of this launch is known to have ended (an END row); see ReplayOptions.recordedForMs. */
+export interface RecordedLaunch { mint: string; events: RecordedEvent[]; endTs?: number }
 export interface FunderFact { ts: number; wallet: string; funder: string | null }
 
 export type ReplayOutcome = 'NO_ENTRY' | 'CLOSED' | 'OPEN_AT_END';
@@ -52,9 +89,16 @@ export interface ReplayedLaunch {
   entryPriceSol: number | null;
   exits: Array<{ reason: string; sellPct: number; priceSol: number; afterMs: number }>;
   holdMs: number | null;
-  /** net SOL after fees for the closed part; for OPEN_AT_END the value at the last recorded price is in `openValueSol`, not here */
+  /** net SOL after every fee and transaction cost, CLOSED positions only (realized); null for OPEN_AT_END */
   netPnlSol: number | null;
+  /** OPEN_AT_END: the part still held, valued at the last recorded price after the sell fee and its own sell transaction */
   openValueSol: number | null;
+  /** 5A: OPEN_AT_END: what the sells that did land brought in (after the sell fee) */
+  realizedProceedsSol?: number | null;
+  /** 5A: OPEN_AT_END: the whole position marked at the end: realizedProceedsSol + openValueSol - order - every transaction cost. Never mixed into netPnlSol. */
+  openNetPnlSol?: number | null;
+  /** 5A: transactions the position sent (1 buy + the sells, + 1 for the open mark) */
+  transactions?: number | null;
   /** S190: after the watch window's release, the highest recorded trade price against the price the window left it at. Null: no released launch / no later trade. */
   peak?: { refPriceSol: number; peakPriceSol: number; peakMultiple: number; timeToPeakMs: number; observedMs: number } | null;
   /** P4.3: the release's strong-signal count and whether concentration passed. Null without a release. */
@@ -85,11 +129,15 @@ export interface PeakAnalysis {
 
 export interface ReplayReport {
   rules: string[];
+  /** 5A: what is not replayed, by the direction it moves the result */
   notReplayed: string[];
+  notReplayedByDirection: { optimistic: string[]; pessimistic: string[]; unknown: string[] };
   assumptions: Record<string, number>;
   summary: {
     launches: number; released: Record<string, number>; entries: number; closed: number; openAtEnd: number;
     wins: number; losses: number; winRate: number | null; netPnlSol: number | null; avgHoldMs: number | null; exitReasons: Record<string, number>;
+    /** 5A: the OPEN_AT_END positions marked at the last recorded price with their exit cost charged; reported apart from the realized netPnlSol */
+    openMarkNetPnlSol: number | null;
   };
   launches: ReplayedLaunch[];
   /** S190 */
@@ -238,7 +286,8 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
   }
   if (!released) {
     // the recording ended before the window gave a verdict: let it run to its own maximum on the data it has
-    for (let t = lastTick; t <= startTs + 125_000 && !released; t += o.tickMs) {
+    // 5A (R1-104): the window's maximum runs from the first trade, so the fallback does too
+    for (let t = lastTick; t <= trades[0].ts + WATCH_MAX_MS + o.tickMs && !released; t += o.tickMs) {
       clock = t;
       applyFacts(t);
       const r = ww.evaluate(launch.mint, t);
@@ -260,44 +309,21 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
     return { ...result, noEntryReason: `READY below the confluence gate (score ${released.score ?? 'n/a'} < ${minScore})` };
   }
 
-  // entry: the first recorded trade at or after release + delay
-  const entryAt = releasedAt + o.entryDelayMs;
-  const after = trades.filter((e) => e.ts >= entryAt);
-  if (after.length === 0) return { ...result, noEntryReason: 'no trade recorded after the release, so no price to buy at' };
-  const entryTrade = tradeFromJson(after[0].payload);
-  const entryPrice = tradePriceSol(entryTrade);
-  if (entryPrice === null || !(entryPrice > 0)) return { ...result, noEntryReason: 'the entry trade carries no price' };
-  const entryTs = after[0].ts;
-
-  const fixed = 2 * (o.networkFeeSol + o.tipSol);
-  const costBasis = o.orderSol; // SOL put in (the fee is inside it, as on the curve)
-  let remaining = 1; // fraction of the position still held
-  let proceeds = 0;
-  let hwm = entryPrice, trail = 0, stage = 0;
-  const exits: ReplayedLaunch['exits'] = [];
-  let lastPrice = entryPrice, lastTs = entryTs;
-  for (const ev of after.slice(1)) {
-    const p = tradePriceSol(tradeFromJson(ev.payload));
-    if (p === null || !(p > 0)) continue;
-    lastPrice = p; lastTs = ev.ts;
-    const d = ExitEngine.evaluate({ entryPriceSol: entryPrice, currentPriceSol: p, highWaterMarkSol: hwm, trailingStopSol: trail, exitStage: stage, entryTimestamp: entryTs, currentTimestamp: ev.ts });
-    hwm = d.newHighWaterMarkSol; trail = d.newTrailingStopSol;
-    if (!d.shouldExit) continue;
-    // like closePosition: the percentage is of what is still held (33% of all at the first step, 33% of the remaining at the second)
-    const sellFrac = remaining * Math.min(100, Math.max(1, d.sellPercentage)) / 100;
-    const gross = sellFrac * costBasis * (p / entryPrice);
-    proceeds += gross * (1 - o.feePct / 100);
-    remaining -= sellFrac;
-    stage = d.newExitStage;
-    exits.push({ reason: d.reason, sellPct: d.sellPercentage, priceSol: p, afterMs: ev.ts - entryTs });
-    if (remaining <= 1e-9 || d.sellPercentage >= 100) { remaining = 0; break; }
+  // 5A: entry, exits and money from the shared cost and latency model
+  const rows = trades.map(tradeRow).filter((r): r is TradeRow => r !== null);
+  if (rows.length === 0) return { ...result, noEntryReason: 'no recorded trade carries a price, so no price to buy at' };
+  const lastEventTs = launch.events[launch.events.length - 1]?.ts ?? rows[rows.length - 1][0];
+  const coveredUntilTs = Math.max(lastEventTs, launch.endTs ?? -Infinity, o.recordedForMs !== undefined ? startTs + o.recordedForMs : -Infinity);
+  const path = simulatePath(rows, releasedAt, { entryMs: o.entryDelayMs, exitMs: o.exitDelayMs }, null, { coveredUntilTs });
+  if (!path) return { ...result, noEntryReason: 'the entry trade carries no price' };
+  const money = priceEntryParts(rows, path, o.orderSol, replayCostCase({ ...o, impact: optsIn.impact }));
+  const exits: ReplayedLaunch['exits'] = path.sells.map((x) => ({ reason: x.reason, sellPct: Math.round(x.frac * 100), priceSol: px(rows[x.fillIdx]), afterMs: (x.fillTs ?? rows[x.fillIdx][0]) - path.entryTs }));
+  const entered = { ...result, entered: true, entryPriceSol: px(rows[path.entryIdx]), exits, noEntryReason: null, transactions: money.transactions };
+  if (path.open) {
+    const lastTs = Math.max(rows[rows.length - 1][0], path.entryTs);
+    return { ...entered, outcome: 'OPEN_AT_END', holdMs: lastTs - path.entryTs, netPnlSol: null, openValueSol: money.openMarkSol, realizedProceedsSol: money.realizedProceedsSol, openNetPnlSol: money.netSol };
   }
-  const entered = { ...result, entered: true, entryPriceSol: entryPrice, exits, noEntryReason: null };
-  if (remaining > 1e-9) {
-    const openValue = remaining * costBasis * (lastPrice / entryPrice) * (1 - o.feePct / 100);
-    return { ...entered, outcome: 'OPEN_AT_END', holdMs: lastTs - entryTs, openValueSol: openValue, netPnlSol: null };
-  }
-  return { ...entered, outcome: 'CLOSED', holdMs: lastTs - entryTs, netPnlSol: proceeds - costBasis - fixed, openValueSol: null };
+  return { ...entered, outcome: 'CLOSED', holdMs: exits[exits.length - 1].afterMs, netPnlSol: money.netSol, openValueSol: null, realizedProceedsSol: null, openNetPnlSol: null };
 }
 
 export function replayLaunches(launches: RecordedLaunch[], funders: FunderFact[], solUsdFallback: number | null, opts: ReplayOptions = {}): ReplayReport {
@@ -325,8 +351,29 @@ export async function replayLaunchesAsync(launches: RecordedLaunch[], funders: F
   return buildReplayReport(rows, opts, minScore);
 }
 
+/** 5A (R1-111): the gaps, by the direction each one moves the replayed result. */
+export const NOT_REPLAYED = {
+  optimistic: [
+    'Failed or reverted transactions: every buy and sell lands (no revert on slippage, no failed send)',
+    'Risk limits, capital sizing and the one-position cap: every release is bought',
+    'Eligibility filter (mint / freeze authority, holder concentration): not recorded',
+  ],
+  pessimistic: [
+    'The tip is charged on every transaction; a straight-to-RPC send (Jito unset) pays none',
+    'The order\'s impact is priced against recorded reserves that do not include the replayed buy, so a sell is priced as if the buy had not moved the curve',
+  ],
+  unknown: [
+    'Funder facts the live window would learn but the recording lacks (corpus replays have none); the direction was not measured',
+    'Entry and exit latency are fixed assumptions (entry and exit delay), not the measured distribution',
+    'The fee rate is the SDK default (0.95% + 0.30%); the live quote reads the real tier',
+    'Creator wallet history (the live score may add points a replay cannot)',
+    'Positions still open when the data ends are marked at the last recorded price, which may be the graduation top or a dead curve',
+  ],
+};
+
 function buildReplayReport(rows: ReplayedLaunch[], opts: ReplayOptions, minScore: number): ReplayReport {
   const closed = rows.filter((r) => r.outcome === 'CLOSED');
+  const open = rows.filter((r) => r.outcome === 'OPEN_AT_END');
   const wins = closed.filter((r) => (r.netPnlSol ?? 0) > 0).length;
   const released: Record<string, number> = {};
   const exitReasons: Record<string, number> = {};
@@ -339,21 +386,20 @@ function buildReplayReport(rows: ReplayedLaunch[], opts: ReplayOptions, minScore
       'Watch window verdict (real WatchWindow: 20 s minimum, 120 s maximum, HOT / READY / DEAD)',
       `READY needs a confluence score of at least ${minScore} (real ConfluenceEngine over the replayed pool stats)`,
       `READY also needs concentration passing and at least ${READY_MIN_SIGNALS} strong signals, as the auto controller asks (P4.3); a curve past the progress cap (default 60% of the tokens sold) is DEAD CURVE_TOO_FAR`,
-      'Exits: real ExitEngine (hard stop -20%, trailing stop, take-profit ladder: sell 33% of the holding at +30%, then 33% of what is left at +60%, stale exit at 30 min)',
+      'Exits: real ExitEngine polled every 3 s, also between prints (hard stop -20%, trailing stop, take-profit ladder: sell 33% of the holding at +30%, then 33% of what is left at +60%, stale exit at 30 min)',
+      'Fills: the buy lands the entry delay after the release and each sell the exit delay after its decision, at the curve state then, with the order\'s own impact on the curve',
+      'Costs: the pump.fun fee on the buy and on every sell, and base + priority fee + tip on every transaction sent; positions still open at the end are marked at the last price with their sell cost and reported apart',
     ],
-    notReplayed: [
-      'Eligibility filter (mint / freeze authority, holder concentration): not recorded',
-      'Risk limits, capital sizing and the one-position cap',
-      'Slippage and price impact beyond the recorded trade price',
-      'Creator wallet history (the live score may add points a replay cannot)',
-    ],
-    assumptions: (({ readyGate: _g, curveCap: _c, ...numeric }) => ({ ...REPLAY_DEFAULTS, ...numeric, minScore }))(opts),
+    notReplayed: [...NOT_REPLAYED.optimistic, ...NOT_REPLAYED.pessimistic, ...NOT_REPLAYED.unknown],
+    notReplayedByDirection: NOT_REPLAYED,
+    assumptions: (({ readyGate: _g, curveCap: _c, impact: _i, ...numeric }) => ({ ...REPLAY_DEFAULTS, ...numeric, minScore, impact: opts.impact === false ? 0 : 1 }))(opts) as Record<string, number>,
     summary: {
-      launches: rows.length, released, entries: rows.filter((r) => r.entered).length, closed: closed.length, openAtEnd: rows.filter((r) => r.outcome === 'OPEN_AT_END').length,
+      launches: rows.length, released, entries: rows.filter((r) => r.entered).length, closed: closed.length, openAtEnd: open.length,
       wins, losses: closed.length - wins, winRate: closed.length ? wins / closed.length : null,
       netPnlSol: closed.length ? closed.reduce((a, r) => a + (r.netPnlSol ?? 0), 0) : null,
       avgHoldMs: closed.length ? closed.reduce((a, r) => a + (r.holdMs ?? 0), 0) / closed.length : null,
       exitReasons,
+      openMarkNetPnlSol: open.length ? open.reduce((a, r) => a + (r.openNetPnlSol ?? 0), 0) : null,
     },
     launches: rows,
     peakAnalysis: analysePeaks(rows),

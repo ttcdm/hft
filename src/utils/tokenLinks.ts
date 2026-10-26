@@ -348,7 +348,3 @@ export function calloutSendNote(tipSol: number): string {
   return `Sent over the normal RPC path. Jito tip ${tipSol} SOL only if the server has Jito configured (devnet: never).`;
 }
 
-/** S179: the per-caller marker is a screen flag. Nothing buys because of it. */
-export const CALLER_MARK_LABEL = (on: boolean): string => (on ? 'CALLER MARKED' : 'MARK CALLER');
-export const CALLER_MARK_TITLE = (on: boolean): string =>
-  on ? 'Unmark this caller (a screen marker only; nothing buys because of it)' : 'Mark this caller (a screen marker only; nothing buys because of it)';

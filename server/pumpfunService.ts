@@ -20,6 +20,7 @@ import {
 import { ConfluenceBreakdown, SignalProvenance } from './core/types';
 import { autoSnipeController } from './auto/controller';
 import { checkSnipeAmountSol } from './execution/snipeAmount';
+import { allowedCluster } from './solana/clusterGuard';
 
 interface AutoSnipeRules {
   minCallerWinRate2x: number;
@@ -49,7 +50,6 @@ const INITIAL_CALLERS: PumpFunCaller[] = [
     followersCount: 38400,
     totalVolumeDrivenUsd: 14850000,
     reputationTier: 'LEGENDARY_WHALE',
-    isAutoSnipeSubscribed: true,
     topCallouts: [
       {
         calloutId: 'top-01',
@@ -104,7 +104,6 @@ const INITIAL_CALLERS: PumpFunCaller[] = [
     followersCount: 72100,
     totalVolumeDrivenUsd: 28900000,
     reputationTier: 'VERIFIED_ALPHA',
-    isAutoSnipeSubscribed: true,
     topCallouts: [
       {
         calloutId: 'top-04',
@@ -147,7 +146,6 @@ const INITIAL_CALLERS: PumpFunCaller[] = [
     followersCount: 41200,
     totalVolumeDrivenUsd: 19400000,
     reputationTier: 'LEGENDARY_WHALE',
-    isAutoSnipeSubscribed: true,
     topCallouts: [
       {
         calloutId: 'top-06',
@@ -178,7 +176,6 @@ const INITIAL_CALLERS: PumpFunCaller[] = [
     followersCount: 26300,
     totalVolumeDrivenUsd: 9800000,
     reputationTier: 'HIGH_MOMENTUM',
-    isAutoSnipeSubscribed: false,
     topCallouts: [],
   },
   {
@@ -196,7 +193,6 @@ const INITIAL_CALLERS: PumpFunCaller[] = [
     followersCount: 18900,
     totalVolumeDrivenUsd: 6200000,
     reputationTier: 'VERIFIED_ALPHA',
-    isAutoSnipeSubscribed: false,
     topCallouts: [],
   },
 ];
@@ -293,7 +289,6 @@ const UNATTRIBUTED_CALLER: PumpFunCaller = {
   totalVolumeDrivenUsd: 0,
   reputationTier: 'EMERGING_CALLER',
   topCallouts: [],
-  isAutoSnipeSubscribed: false,
 };
 
 const DEMO_CALLER_IDS: ReadonlySet<string> = new Set(INITIAL_CALLERS.map((c) => c.userId));
@@ -301,14 +296,6 @@ const DEMO_CALLER_IDS: ReadonlySet<string> = new Set(INITIAL_CALLERS.map((c) => 
 /** Fake hardcoded callers are only loaded when DEMO_MODE=true (A5). */
 function isDemoMode(): boolean {
   return process.env.DEMO_MODE === 'true';
-}
-
-/**
- * Auto-snipe is off unless explicitly enabled via AUTO_SNIPE_ENABLED=true (A5).
- * PLACEHOLDER: no caller left after G1; the auto-snipe controller reads the env itself. Kept, not removed, until the removal audit (H4).
- */
-export function isAutoSnipeEnvEnabled(): boolean {
-  return process.env.AUTO_SNIPE_ENABLED === 'true';
 }
 
 /**
@@ -323,14 +310,20 @@ export function calloutProvenance(callout: PumpFunHotCallout): SignalProvenance 
 }
 
 /**
- * S28: what the server starts at boot. FULL: the log stream plus the HTTP pollers. WS_ONLY: only the log stream, which is
- * what a loopback-only server needs so auto mode can be driven by a local chain's create events. OFF: nothing.
- * WS_ONLY needs the operator's APEX_PUMP_WS_ONLY=true together with disabled external feeds, and is honoured only on
- * ALLOWED_CLUSTER=localnet, where the websocket is a loopback validator; anywhere else it falls back to OFF.
+ * S28: what the server starts at boot. FULL: the log stream plus the HTTP pollers. WS_ONLY: only the log stream. OFF: nothing.
+ * With external feeds on, FULL is for ALLOWED_CLUSTER=mainnet-beta only (P4.2, R1-65): the pollers read the mainnet pump.fun and
+ * DexScreener HTTP APIs, whose mints do not exist on devnet or localnet, so off mainnet the feed is the log stream alone (WS_ONLY).
+ * With external feeds disabled, WS_ONLY needs the operator's APEX_PUMP_WS_ONLY=true and is honoured only on ALLOWED_CLUSTER=localnet,
+ * where the websocket is a loopback validator; anywhere else it falls back to OFF.
  */
 export function pumpBootMode(env: NodeJS.ProcessEnv = process.env): 'FULL' | 'WS_ONLY' | 'OFF' {
-  if (env.APEX_DISABLE_EXTERNAL_FEEDS !== 'true') return 'FULL';
+  if (env.APEX_DISABLE_EXTERNAL_FEEDS !== 'true') return allowedCluster(env) === 'mainnet-beta' ? 'FULL' : 'WS_ONLY';
   return env.APEX_PUMP_WS_ONLY === 'true' && env.ALLOWED_CLUSTER === 'localnet' ? 'WS_ONLY' : 'OFF';
+}
+
+/** P4.2 (R1-65): the pump.fun / DexScreener HTTP pollers run only when the cluster is mainnet-beta, whatever the caller asked. */
+export function httpPollersAllowed(env: NodeJS.ProcessEnv = process.env): boolean {
+  return allowedCluster(env) === 'mainnet-beta';
 }
 
 export class PumpFunService extends EventEmitter {
@@ -364,13 +357,14 @@ export class PumpFunService extends EventEmitter {
 
   /**
    * Begin the on-chain feed and, unless `httpPollers` is false, the pump.fun / DexScreener HTTP fallback poll. Called once by the server,
-   * never on import. `httpPollers: false` is for a server whose only feed is a loopback chain (S28).
+   * never on import. `httpPollers: false` is for a server whose only feed is a loopback chain (S28). The pollers also need
+   * ALLOWED_CLUSTER=mainnet-beta (`httpPollersAllowed`, P4.2): on devnet and localnet they are never started.
    */
-  public startBackground(opts: { httpPollers?: boolean } = {}): void {
+  public startBackground(opts: { httpPollers?: boolean; env?: NodeJS.ProcessEnv } = {}): void {
     if (this.backgroundStarted) return;
     this.backgroundStarted = true;
     pumpFeedListener.start().catch(() => {});
-    if (opts.httpPollers !== false) this.initPolling();
+    if (opts.httpPollers !== false && httpPollersAllowed(opts.env)) this.initPolling(opts.env);
   }
 
   /**
@@ -420,9 +414,9 @@ export class PumpFunService extends EventEmitter {
   }
 
   // Start background sync from real-world APIs (relegated to secondary fallback behind WebSocket)
-  private initPolling() {
+  private initPolling(env?: NodeJS.ProcessEnv) {
     // Initial fetch immediately
-    this.syncRealWorldData().catch(console.error);
+    this.syncRealWorldData({ env }).catch(console.error);
 
     // Poll every 5 seconds as secondary fallback when WebSocket logs are inactive or reconnecting (B08)
     setInterval(() => {
@@ -431,14 +425,19 @@ export class PumpFunService extends EventEmitter {
         // WebSocket is actively streaming on-chain events; HTTP polling is relegated to standby
         return;
       }
-      this.syncRealWorldData().catch(() => {});
+      this.syncRealWorldData({ env }).catch(() => {});
     }, 5000);
   }
 
   // Real-world API synchronization: pump.fun + DexScreener
   // `evaluateTriggers: false` refreshes the feed without ever evaluating auto-snipe (used by the manual refresh route).
-  public async syncRealWorldData(opts: { evaluateTriggers?: boolean } = {}): Promise<void> {
-    if (this.isPolling) return;
+  // Returns a reason when nothing was fetched because the cluster is not mainnet-beta (the same rule as the pollers, P4.2): these are
+  // mainnet feeds, and their mints do not exist on devnet or localnet. The manual refresh route used to skip that check.
+  public async syncRealWorldData(opts: { evaluateTriggers?: boolean; env?: NodeJS.ProcessEnv } = {}): Promise<{ skipped?: string }> {
+    if (!httpPollersAllowed(opts.env)) {
+      return { skipped: `HTTP_FEEDS_MAINNET_ONLY: pump.fun and DexScreener are mainnet feeds; on ${allowedCluster(opts.env)} the board fills from the on-chain log stream only` };
+    }
+    if (this.isPolling) return {};
     this.isPolling = true;
     const t0 = performance.now();
 
@@ -510,6 +509,7 @@ export class PumpFunService extends EventEmitter {
     } finally {
       this.isPolling = false;
     }
+    return {};
   }
 
   // Transform real-world tokens into Hot Callouts with caller attribution
@@ -843,15 +843,6 @@ export class PumpFunService extends EventEmitter {
   public updateAutoSnipeRules(rules: Partial<AutoSnipeRules>): AutoSnipeRules {
     this.autoSnipeRules = { ...this.autoSnipeRules, ...rules };
     return this.autoSnipeRules;
-  }
-
-  public toggleCallerAutoSnipe(userId: string): PumpFunCaller | null {
-    const caller = this.callers.find((c) => c.userId === userId);
-    if (caller) {
-      caller.isAutoSnipeSubscribed = !caller.isAutoSnipeSubscribed;
-      return caller;
-    }
-    return null;
   }
 
   public getStatus() {

@@ -18,6 +18,8 @@ import { execFileSync } from 'node:child_process';
  *  - a URL whose host names mainnet, and the known mainnet-only RPC and Jito hosts, `api.solana.com` included;
  *  - an explorer link (solscan, explorer.solana.com, solana.fm, solanaexplorer), with or without the scheme, that lacks `?cluster=devnet`;
  *  - `ALLOWED_CLUSTER` set to mainnet-beta;
+ *  - real-money wallet framing: "cold wallet", "cold storage", "treasury", "import your/an existing wallet or key" (no exemption);
+ *  - `solana transfer` on a line without `--url devnet`;
  *  - the real-money switch (`ALLOW_LIVE_REAL_MONEY_TRADING`) turned on, in any of these forms: `KEY=true`, YAML `KEY: true`, a table cell
  *    `KEY | true`, or prose such as "set KEY to true" / "KEY is true" (and the values 1, yes, on).
  *
@@ -98,6 +100,13 @@ const ON = '(?:true|1|yes|on)';
 /** KEY=true, KEY: true, KEY | true, "KEY": "true", KEY is/to/as/=> true. The key may be wrapped in backticks, quotes or table pipes. */
 const SWITCH_ON = new RegExp(`${SWITCH}[\`"']*\\s*(?:=|:|\\||\\bis\\b|\\bto\\b|\\bas\\b|=>)\\s*[\`"']*${ON}\\b`, 'i');
 
+const BOOT_RECIPE = /\bnode\s+(?:\S*\/)?dist\/server\.cjs\b/;
+function unsafeBootRecipe(line: string): boolean {
+  if (!BOOT_RECIPE.test(line)) return false;
+  const scratchState = /scratch cwd|scratch \(`?mkdtemp`?\) cwd|mkdtemp|mktemp|APEX_DB_PATH/.test(line);
+  return !(scratchState && /SIGNER_KEYPAIR_PATH/.test(line));
+}
+
 const RULES: Array<{ name: string; test: (line: string) => boolean }> = [
   { name: 'mainnet RPC or Jito host', test: (l) => MAINNET_ANYWHERE.test(l) },
   {
@@ -106,6 +115,15 @@ const RULES: Array<{ name: string; test: (line: string) => boolean }> = [
   },
   { name: 'advice to enable real-money trading', test: (l) => flagsWithPrefixExemption(l, SWITCH_ON) },
   { name: 'ALLOWED_CLUSTER set to mainnet-beta', test: (l) => flagsWithPrefixExemption(l, /ALLOWED_CLUSTER[`"']*\s*(?:=|:|\bto\b|\bis\b)\s*[`"']*mainnet/i) },
+  // P1.8 (R1-137, R1-128): the key is a throwaway devnet key. Real-money wallet framing has no place in these docs, not even negated
+  // ("never use your treasury wallet" still tells the reader one might be used), so these rules have no refusal exemption.
+  { name: 'cold wallet or treasury framing', test: (l) => /\bcold[\s-]?(?:wallet|storage)\b|\btreasur(?:y|ies)\b/i.test(l) },
+  { name: 'advice to import an existing wallet or key', test: (l) => /\bimport\s+(?:your|an\s+existing)\s+(?:own\s+)?(?:wallet|key)/i.test(l) },
+  // the Solana CLI's default cluster is not devnet, so a transfer must name it
+  { name: 'solana transfer without --url devnet', test: (l) => /\bsolana\s+transfer\b/i.test(l) && !/--url[\s=]devnet\b/.test(l) },
+  // N-58: a booted server is a full instance (it reads `.env`, opens `./apex_workstation.db`, loads `./.apex_trading_keypair.json` and adopts
+  // the wallet's tokens), so a recipe that boots `node dist/server.cjs` must say, on the same line, where its state and key come from.
+  { name: 'a node dist/server.cjs recipe without a scratch cwd or APEX_DB_PATH, and SIGNER_KEYPAIR_PATH', test: unsafeBootRecipe },
 ];
 
 /** In-process harnesses that may set the switch inside a TypeScript object or process.env assignment. */
@@ -174,6 +192,11 @@ describe('docs safety: nothing points at mainnet or real-money trading', () => {
   });
   it('the rules catch what they claim to catch (so the test cannot pass by matching nothing)', () => {
     const [host, explorer, money, cluster] = RULES.map((r) => r.test);
+    const boot = RULES.find((r) => r.name.startsWith('a node dist/server.cjs recipe'))!.test;
+    expect(boot('  1. Boot the compiled artifact (`node dist/server.cjs`) on an ephemeral test port (e.g., `PORT=3001`).')).toBe(true); // the old AGENTS.md recipe
+    expect(boot('Boot `node dist/server.cjs` from scratch cwd with sanitized `.env`, `PORT=3001`')).toBe(true);
+    expect(boot('cd "$D" && APEX_ENV_FILE=\'\' APEX_DB_PATH="$D/x.db" SIGNER_KEYPAIR_PATH="$D/none.json" node dist/server.cjs')).toBe(false);
+    expect(files.some((f) => fs.readFileSync(f, 'utf8').split('\n').some((l) => BOOT_RECIPE.test(l)))).toBe(true); // AGENTS.md section 5 has one, so the rule is not matching nothing
     expect(host('SOLANA_RPC_URL=https://api.mainnet-beta.solana.com')).toBe(true);
     expect(host('JITO_BLOCK_ENGINE_URL=https://frankfurt.mainnet.block-engine.jito.wtf')).toBe(true);
     expect(host('JITO_BLOCK_ENGINE_URL=https://ny.mainnet.jito.wtf/api/v1')).toBe(true);
@@ -200,5 +223,17 @@ describe('docs safety: nothing points at mainnet or real-money trading', () => {
     expect(cluster('  ALLOWED_CLUSTER: mainnet-beta')).toBe(true);
     expect(cluster('Do not set ALLOWED_CLUSTER=mainnet-beta')).toBe(false);
     expect(cluster('ALLOWED_CLUSTER=devnet')).toBe(false);
+    const [cold, importKey, transfer] = RULES.slice(4).map((r) => r.test);
+    expect(cold('transfer all remaining SOL out of the trading keypair to a designated cold wallet')).toBe(true);
+    expect(cold('Never use cold-storage or primary treasury wallets for automated execution.')).toBe(true);
+    expect(cold('fund it only from the devnet faucet')).toBe(false);
+    expect(importKey('Import your wallet with npm run signer:import')).toBe(true);
+    expect(importKey('import an existing key from Phantom')).toBe(true);
+    expect(importKey('npm run signer:import -- /path/to/throwaway-keypair.json')).toBe(false);
+    expect(transfer('via standard CLI tools (`solana transfer`)')).toBe(true);
+    expect(transfer('solana transfer --keypair k.json <addr> ALL')).toBe(true);
+    expect(transfer('solana transfer --url mainnet-beta --keypair k.json <addr> ALL')).toBe(true);
+    expect(transfer('solana transfer --url devnet --keypair k.json <addr> ALL')).toBe(false);
   });
 });
+

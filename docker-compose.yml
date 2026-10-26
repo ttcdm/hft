@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   apex-trading-engine:
     build:
@@ -26,6 +24,11 @@ services:
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - APEX_TRACING=${APEX_TRACING:-false} # true sends spans to the jaeger service below; see docs/TRACING.md
       - APEX_TRACING_OTLP_ENDPOINT=http://jaeger:4318/v1/traces
+      # No signing key is passed in: OPERATOR_PRIVATE_KEY, SOLANA_PRIVATE_KEY and SIGNER_KEYPAIR_PATH are deliberately not listed,
+      # and there is no env_file, so a key in your shell or .env never reaches the container. It starts with no signer (PAPER) unless a
+      # key is generated or imported in the UI, which then lands in the apex-data volume.
+    volumes:
+      - apex-data:/app/data # database and any key made in the UI; survives down and rebuilds (`docker compose down -v` deletes it)
     healthcheck:
       test: ['CMD', 'wget', '--spider', '-q', 'http://localhost:3000/api/health']
       interval: 10s
@@ -56,3 +59,6 @@ services:
       - '127.0.0.1:4318:4318' # OTLP over http: the app, when run outside docker, sends here
     environment:
       - COLLECTOR_OTLP_ENABLED=true
+
+volumes:
+  apex-data:

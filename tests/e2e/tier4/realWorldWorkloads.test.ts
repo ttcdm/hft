@@ -250,61 +250,6 @@ describe('Tier 4: Real-World Workload Scenarios (Realistic Multi-Step Lifecycles
   });
 
   // ===========================================================================
-  // Scenario 4: Crash Recovery Replay of Interrupted In-Flight Buy
-  // ===========================================================================
-  it('W4: Crash Recovery: interrupted PENDING order in WAL is reconciled cleanly on restart', () => {
-    const unconfirmedOrderId = `ord_crash_${Date.now()}`;
-    const clientOrderId = `client_crash_${Date.now()}`;
-
-    // Order written to WAL before simulated crash
-    testDb.saveOrder({
-      id: unconfirmedOrderId,
-      clientOrderId,
-      correlationId: 'corr_crash_1',
-      mint: VALID_PUMP_MINT_1.toBase58(),
-      symbol: 'CRASHBUY',
-      side: 'BUY',
-      amountLamports: 5000000,
-      expectedTokensRaw: '1000000',
-      slippageBps: 300,
-      status: 'PENDING',
-      executionMode: 'PAPER',
-      createdAt: Date.now() - 60000,
-      updatedAt: Date.now() - 60000,
-    });
-
-    // Verify order is pending in WAL
-    const pendingOrder = testDb.db.prepare('SELECT * FROM orders WHERE id = ?').get(unconfirmedOrderId) as any;
-    expect(pendingOrder.status).toBe('PENDING');
-
-    // Simulate startup reconciliation: tx never landed on-chain -> mark FAILED
-    testDb.saveOrder({
-      id: unconfirmedOrderId,
-      clientOrderId,
-      correlationId: 'corr_crash_1',
-      mint: VALID_PUMP_MINT_1.toBase58(),
-      symbol: 'CRASHBUY',
-      side: 'BUY',
-      amountLamports: 5000000,
-      expectedTokensRaw: '1000000',
-      slippageBps: 300,
-      status: 'FAILED',
-      rejectionReason: 'STARTUP_RECONCILIATION_UNCONFIRMED',
-      executionMode: 'PAPER',
-      createdAt: pendingOrder.created_at,
-      updatedAt: Date.now(),
-    });
-
-    const reconciledOrder = testDb.db.prepare('SELECT * FROM orders WHERE id = ?').get(unconfirmedOrderId) as any;
-    expect(reconciledOrder.status).toBe('FAILED');
-    expect(reconciledOrder.rejection_reason).toContain('STARTUP_RECONCILIATION_UNCONFIRMED');
-
-    // Verify no phantom position exists
-    const phantomPositions = testDb.loadPositions('PAPER', 'OPEN').filter(p => p.mint === VALID_PUMP_MINT_1.toBase58());
-    expect(phantomPositions.length).toBe(0);
-  });
-
-  // ===========================================================================
   // Scenario 5: Crash Recovery Replay of Partially Executed Exit
   // ===========================================================================
   it('W5: Crash Recovery: partially closed position retains correct token quantity and cost basis in WAL', () => {

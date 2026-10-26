@@ -10,6 +10,7 @@ import { MockSolanaRpc } from '../helpers/mockRpc';
 import { MockJitoEngine } from '../helpers/mockJito';
 import { TestDatabase } from '../helpers/testDb';
 import { PumpCurveService } from '../../../server/solana/pumpCurve';
+import { TradeReconciler } from '../../../server/execution/reconciliation';
 import { VALID_PUMP_MINT_1, DUMMY_FEE_RECIPIENT, createSimulatedBondingCurveState, createPassingEligibilityReport } from '../helpers/simulatedStates';
 
 describe('Tier 5 [mock-level]: Live Production Readiness Gates & Capital Safety Limits', () => {
@@ -210,17 +211,17 @@ describe('Tier 5 [mock-level]: Live Production Readiness Gates & Capital Safety 
       (coordinator as any).realWalletBalanceSol = 0.10;
       (coordinator as any).inFlightReservedSol = 0;
 
-      // Force quote error to trigger failure after reservation acquire
-      vi.spyOn(coordinator as any, 'submitAndConfirmWithRetry').mockResolvedValue({
-        success: false,
-        signature: 'failed_tx_sig',
-        transport: 'JITO',
-        error: 'Network timeout',
-        lifecycleState: 'SUBMIT_FAILED',
+      // The send fails after the reservation was taken. The spy records the reservation it saw, so a trade refused before the reservation
+      // (which also leaves it at 0) no longer passes.
+      vi.spyOn(TradeReconciler, 'capturePreTradeSnapshot').mockResolvedValue({ walletSolLamports: 1e8, tokenBalanceRaw: '0', tokenDecimals: 6, timestamp: Date.now() });
+      vi.spyOn(localSigner, 'signTransaction').mockImplementation(async (tx: any) => tx);
+      let reservedDuringSend = 0;
+      const send = vi.spyOn(coordinator as any, 'submitAndConfirmWithRetry').mockImplementation(async () => {
+        reservedDuringSend = (coordinator as any).inFlightReservedSol;
+        return { success: false, signature: 'failed_tx_sig', transport: 'JITO', error: 'Network timeout', lifecycleState: 'SUBMIT_FAILED' };
       });
 
-      // Execute trade
-      await coordinator.executeTrade({
+      const result = await coordinator.executeTrade({
         signalTimestamp: Date.now(),
         mint: VALID_PUMP_MINT_1.toBase58(),
         symbol: 'TEST1',
@@ -228,9 +229,12 @@ describe('Tier 5 [mock-level]: Live Production Readiness Gates & Capital Safety 
         amountSol: 0.005,
         source: 'AUTO_SNIPER',
         provenance: 'REAL_ONCHAIN',
+        eligibilityReport: createPassingEligibilityReport(VALID_PUMP_MINT_1.toBase58()),
       });
 
-      // Verify inFlightReservedSol is released back to 0
+      expect(result.success).toBe(false);
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(reservedDuringSend).toBeGreaterThan(0);
       expect((coordinator as any).inFlightReservedSol).toBe(0);
     });
   });

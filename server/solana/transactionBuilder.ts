@@ -20,16 +20,12 @@ import {
   VersionedTransaction,
   SystemProgram,
   Connection,
-  SYSVAR_RENT_PUBKEY,
 } from '@solana/web3.js';
 import BN from 'bn.js';
 import { PumpSdk } from '@pump-fun/pump-sdk';
 import { createCloseAccountInstruction } from '@solana/spl-token';
 import {
   PUMP_FUN_PROGRAM_ID,
-  PUMP_FUN_FEE_RECIPIENT,
-  PUMP_FUN_GLOBAL_ACCOUNT,
-  PUMP_FUN_EVENT_AUTHORITY,
   TOKEN_PROGRAM_ID,
   ASSOCIATED_TOKEN_PROGRAM_ID,
   COMPUTE_BUDGET_PROGRAM_ID,
@@ -82,6 +78,8 @@ export interface PumpSellParams {
 export class SolanaTransactionBuilder {
   private cachedBlockhash: { blockhash: string; lastValidBlockHeight: number; timestamp: number } | null = null;
   private readonly BLOCKHASH_MAX_AGE_MS = 25000; // 25s for fast Solana slot time
+  /** P2.1: lastValidBlockHeight of each blockhash fetched recently, so the coordinator can store it on the PENDING row of a transaction built with it. */
+  private validUntil = new Map<string, number>();
 
   /** Derives an associated token account address for any token program. Production code uses `PumpCurveService.getAssociatedTokenAddress` instead; only tests call this one. */
   public static getAssociatedTokenAddress(
@@ -113,7 +111,14 @@ export class SolanaTransactionBuilder {
 
     const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
     this.cachedBlockhash = { blockhash, lastValidBlockHeight, timestamp: now };
+    this.validUntil.set(blockhash, lastValidBlockHeight);
+    if (this.validUntil.size > 256) this.validUntil.delete(this.validUntil.keys().next().value as string); // oldest first
     return blockhash;
+  }
+
+  /** P2.1: the lastValidBlockHeight `getLatestBlockhash` returned with `blockhash`, if this builder fetched it; undefined otherwise. */
+  public lastValidBlockHeightOf(blockhash: string | undefined): number | undefined {
+    return blockhash ? this.validUntil.get(blockhash) : undefined;
   }
 
   /** Associated-token-account CreateIdempotent: succeeds whether or not the account exists, so a repeat buy never fails on it. The payer funds the rent on first creation. */
@@ -270,75 +275,6 @@ export class SolanaTransactionBuilder {
       throw new Error(`PUMP_V2_SELL_KEYS_MISMATCH: Expected 26 keys, got ${ix.keys.length}`);
     }
     return ix;
-  }
-
-  /**
-   * Legacy 12-account buy with a hard-coded discriminator and fee recipient. Nothing in `server/`, `scripts/` or `tests/` calls it, and it is
-   * not what the app sends (that is `createPumpBuyV2Instruction`). Flagged as dead, not removed: do not use it for a real send.
-   */
-  // Anchor instruction discriminator for Pump.fun legacy "global:buy" (kept for backward compatibility reference)
-  public static createPumpBuyInstruction(params: PumpBuyParams): TransactionInstruction {
-    const data = Buffer.alloc(8 + 8 + 8);
-    const discriminator = Buffer.from('66063d1201daebea', 'hex');
-    discriminator.copy(data, 0);
-    data.writeBigUInt64LE(params.amountTokens, 8);
-    data.writeBigUInt64LE(params.maxSolCostLamports, 16);
-
-    const tokenProgram = params.tokenProgram || TOKEN_PROGRAM_ID;
-
-    const keys = [
-      { pubkey: PUMP_FUN_GLOBAL_ACCOUNT, isSigner: false, isWritable: false },
-      { pubkey: PUMP_FUN_FEE_RECIPIENT, isSigner: false, isWritable: true },
-      { pubkey: params.mint, isSigner: false, isWritable: false },
-      { pubkey: params.bondingCurve, isSigner: false, isWritable: true },
-      { pubkey: params.associatedBondingCurve, isSigner: false, isWritable: true },
-      { pubkey: params.associatedUser, isSigner: false, isWritable: true },
-      { pubkey: params.buyer, isSigner: true, isWritable: true },
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      { pubkey: tokenProgram, isSigner: false, isWritable: false },
-      { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
-      { pubkey: PUMP_FUN_EVENT_AUTHORITY, isSigner: false, isWritable: false },
-      { pubkey: PUMP_FUN_PROGRAM_ID, isSigner: false, isWritable: false },
-    ];
-
-    return new TransactionInstruction({
-      programId: PUMP_FUN_PROGRAM_ID,
-      keys,
-      data,
-    });
-  }
-
-  /** Legacy 12-account sell, as above: no caller anywhere, not what the app sends (`createPumpSellV2Instruction` is). Flagged as dead, not removed. */
-  // Anchor instruction discriminator for Pump.fun "global:sell" = [0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad]
-  public static createPumpSellInstruction(params: PumpSellParams): TransactionInstruction {
-    const data = Buffer.alloc(8 + 8 + 8);
-    const discriminator = Buffer.from('33e685a4017f83ad', 'hex');
-    discriminator.copy(data, 0);
-    data.writeBigUInt64LE(params.amountTokens, 8);
-    data.writeBigUInt64LE(params.minSolOutputLamports, 16);
-
-    const tokenProgram = params.tokenProgram || TOKEN_PROGRAM_ID;
-
-    const keys = [
-      { pubkey: PUMP_FUN_GLOBAL_ACCOUNT, isSigner: false, isWritable: false },
-      { pubkey: PUMP_FUN_FEE_RECIPIENT, isSigner: false, isWritable: true },
-      { pubkey: params.mint, isSigner: false, isWritable: false },
-      { pubkey: params.bondingCurve, isSigner: false, isWritable: true },
-      { pubkey: params.associatedBondingCurve, isSigner: false, isWritable: true },
-      { pubkey: params.associatedUser, isSigner: false, isWritable: true },
-      { pubkey: params.seller, isSigner: true, isWritable: true },
-      { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
-      { pubkey: ASSOCIATED_TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      { pubkey: tokenProgram, isSigner: false, isWritable: false },
-      { pubkey: PUMP_FUN_EVENT_AUTHORITY, isSigner: false, isWritable: false },
-      { pubkey: PUMP_FUN_PROGRAM_ID, isSigner: false, isWritable: false },
-    ];
-
-    return new TransactionInstruction({
-      programId: PUMP_FUN_PROGRAM_ID,
-      keys,
-      data,
-    });
   }
 
   /**

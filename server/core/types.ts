@@ -113,7 +113,8 @@ export type RiskReasonCode =
   | 'KILL_SWITCH_ACTIVE'
   | 'EXECUTION_DISABLED'
   | 'SIGNER_UNAVAILABLE'
-  | 'CIRCUIT_BREAKER_OPEN';
+  | 'CIRCUIT_BREAKER_OPEN'
+  | 'RISK_LIMIT_INVALID';
 
 /** The limits `HardenedRiskEngine.evaluateOrder` enforces. Amounts are in SOL or lamports as the names say; ages and cooldowns are in milliseconds. */
 export interface PreTradeRiskLimits {

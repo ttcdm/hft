@@ -5,10 +5,12 @@ import os from 'os';
 import path from 'path';
 import { WorkstationDatabase } from '../server/db/database';
 import { socialScanner } from '../server/socialScanner';
-import { memecoinAggregator } from '../server/memecoinAggregator';
+import { workstationDb } from '../server/db/database';
+import { riskEngine } from '../server/risk/riskEngine';
+import { autoSnipeController } from '../server/auto/controller';
 import { ExecutionCoordinator } from '../server/execution/coordinator';
 
-afterEach(() => { vi.restoreAllMocks(); socialScanner.setPanicHook(null); });
+afterEach(async () => { vi.restoreAllMocks(); vi.unstubAllEnvs(); riskEngine.setKillSwitch(false); await autoSnipeController.setMode('OFF'); });
 
 describe('S13', () => {
   it('"Trading venue … cannot be resolved" is a non-attempt exit error', () => {
@@ -17,20 +19,23 @@ describe('S13', () => {
     expect(f('RPC timeout while sending')).toBe(false);
   });
 
-  it('Telegram /panic_sell runs the panic hook (kill switch, disarm, stop auto) even with nothing open, and says so', async () => {
-    const hook = vi.fn(async () => {});
-    socialScanner.setPanicHook(hook);
-    vi.spyOn(memecoinAggregator, 'getPositions').mockReturnValue([] as any);
+  // P1.4: /panic_sell runs the shared emergencyStop (it used to run a hook set by server.ts, then sell through the aggregator)
+  it('Telegram /panic_sell runs the emergency stop (kill switch, disarm, stop auto) even with nothing open, and says so', async () => {
+    vi.spyOn(workstationDb, 'loadPositions').mockReturnValue([]);
     const r = await socialScanner.processTelegramCommand('/panic_sell');
-    expect(hook).toHaveBeenCalledTimes(1);
+    expect(riskEngine.isKillSwitchActive()).toBe(true);
+    expect(autoSnipeController.getStatus().killed).toBe(true);
     expect(r.reply).toContain('auto stopped');
   });
 
-  it('a failing panic hook is reported, not hidden', async () => {
-    socialScanner.setPanicHook(async () => { throw new Error('boom'); });
-    vi.spyOn(memecoinAggregator, 'getPositions').mockReturnValue([] as any);
+  it('a failing auto stop is reported, not hidden', async () => {
+    vi.spyOn(workstationDb, 'loadPositions').mockReturnValue([]);
+    vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
+    expect((await autoSnipeController.setMode('SHADOW')).ok).toBe(true);
+    vi.spyOn(autoSnipeController, 'kill').mockRejectedValue(new Error('boom'));
     const r = await socialScanner.processTelegramCommand('/panic_sell');
-    expect(r.reply).toContain('Could not stop new entries: boom');
+    expect(r.reply).toContain('Could not stop auto: boom');
+    expect(autoSnipeController.getMode()).toBe('OFF'); // forced OFF anyway
   });
 
   it('the realized_events backfill skips adopted (RECOVERED) balances', () => {

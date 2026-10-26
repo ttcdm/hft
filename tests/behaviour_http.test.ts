@@ -57,6 +57,53 @@ describe('mainnet guard over HTTP: a server pointed at a mainnet RPC can never a
   });
 });
 
+describe('R1-125: a server started with ALLOWED_CLUSTER=mainnet-beta, on an RPC that really answers with the mainnet genesis, never arms or sends', () => {
+  let rpc: RpcStub; let app: AppHandle;
+  const positionId = 'mainnet-guard-live-1';
+  beforeAll(async () => {
+    rpc = await startRpcStub(MAINNET_GENESIS);
+    const d = dir();
+    // one open LIVE position, so close and panic have something they would sell
+    const db = new WorkstationDatabase(`${d}/app.db`);
+    const now = Date.now();
+    db.savePosition({
+      id: positionId, mint: Keypair.generate().publicKey.toBase58(), symbol: 'MNG', name: 'Mainnet guard', tokenDecimals: 6, tokenQuantityRaw: '1000000000',
+      entryPriceSol: 1e-7, currentPriceSol: 1e-7, currentValueSol: 0.0001, costBasisLamports: 100_000, realizedPnLSol: 0, status: 'OPEN',
+      venue: 'PUMP_BONDING_CURVE', executionMode: 'LIVE', entryTxSignature: 'MainnetGuardSeededEntry', entryTimestamp: now, lastMarkTimestamp: now, recordUpdatedAt: now, updatedAt: now,
+    } as any);
+    (db as any).db.close();
+    app = await startApp(d, { SOLANA_RPC_URL: rpc.url, ALLOWED_CLUSTER: 'mainnet-beta', LOCALNET_GENESIS_HASH: '', ALLOW_LIVE_REAL_MONEY_TRADING: 'true' });
+    handles.push(app);
+  }, 90_000);
+  afterAll(() => rpc.close());
+
+  it('arming is 403 and DEVNET_LIVE is refused; a trade, a close of the LIVE position and a panic liquidation send nothing; the position stays open', async () => {
+    const arm = await app.call('POST', '/api/execution/arm', { arm: true, confirmationCode: 'CONFIRM_LIVE_TRADING_RISK' });
+    expect(arm.status).toBe(403); // even though the RPC's genesis matches the configured cluster
+    expect(arm.json.success).toBe(false);
+    expect((await app.call('GET', '/api/execution/mode')).json.isLiveArmed).toBe(false);
+    const auto = await app.call('POST', '/api/auto/mode', { mode: 'DEVNET_LIVE', confirmationCode: 'CONFIRM_LIVE_TRADING_RISK' });
+    expect(auto.status).toBe(409);
+    expect(auto.json.success).toBe(false);
+    expect(auto.json.status.mode).not.toBe('DEVNET_LIVE');
+
+    const t = await app.call('POST', '/api/execution/trade', { ...trade(), confirmLive: true });
+    expect(t.json?.executionMode).not.toBe('LIVE'); // never armed, so the order cannot take the LIVE branch
+    const c = await app.call('POST', '/api/execution/close', { positionId, sellPct: 100 });
+    expect(c.json.success).toBe(false);
+    expect(c.json.error).toMatch(/CLUSTER_GUARD: ALLOWED_CLUSTER=mainnet-beta/);
+    const p = await app.call('POST', '/api/wallet/panic-liquidate');
+    expect(p.status).toBe(200);
+    expect(p.json.data.attemptedCount).toBe(1);
+    expect(p.json.data.succeeded).toEqual([]);
+    expect(p.json.data.failed[0].error).toMatch(/CLUSTER_GUARD: ALLOWED_CLUSTER=mainnet-beta/);
+    expect(sends(rpc)).toBe(0);
+    expect(rpc.count('getGenesisHash')).toBeGreaterThan(0); // the stub really was the server's RPC
+    const db = new WorkstationDatabase(app.dbPath);
+    expect(db.loadPositions('LIVE', 'ACTIVE').map((p) => p.id)).toContain(positionId); // nothing was sold, so nothing was booked as sold
+  });
+});
+
 describe('kill switch input is strict (R6s)', () => {
   let rpc: RpcStub; let app: AppHandle;
   beforeAll(async () => {

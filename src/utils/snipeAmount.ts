@@ -35,9 +35,6 @@ export function formatUsdEquivalent(sol: number, solPriceUsd: number | null): st
   return usd === null ? 'USD unknown (no SOL price)' : `≈ $${usd < 1 ? usd.toFixed(3) : usd.toFixed(2)}`;
 }
 
-/** What a snipe button says about its size, e.g. "0.01 SOL". */
-export const snipeAmountLabel = (sol: number): string => formatSol(sol);
-
 export function readSavedAmount(storage: Pick<Storage, 'getItem'> | null, fallback: number): string {
   try {
     const v = storage?.getItem(SNIPE_AMOUNT_STORAGE_KEY);
@@ -91,6 +88,3 @@ export function useSnipeAmount(): SnipeAmountState {
   if (text === null) text = readSavedAmount(browserStorage(), limits.defaultSol);
   return { text, setText: setSnipeAmountText, limits, limitsKnown: limitsCache !== null, parsed: parseSnipeAmount(text, limits) };
 }
-
-/** test hook */
-export function __resetSnipeAmountForTests(): void { text = null; limitsCache = null; }

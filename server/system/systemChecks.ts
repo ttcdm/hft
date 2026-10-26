@@ -24,6 +24,10 @@ export interface SystemCheck {
 }
 export interface SystemChecksResult { checkedAt: number; cluster: string; mode: string; checks: SystemCheck[] }
 
+/** B3b: the capacity check warns when more than this share of seller funder lookups ended up unread, once this many were asked for. */
+export const SELLER_FUNDER_UNREAD_WARN_SHARE = 0.05;
+export const SELLER_FUNDER_UNREAD_MIN_ASKED = 20;
+
 const sec = (ms: number | null) => (ms === null ? 'never' : ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
 
 /**
@@ -74,7 +78,7 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
   const walletAuditRuns = auto.mode === 'DEVNET_LIVE';
   checks.push(halt
     ? { id: 'halt', label: 'Wallet audit / halt', status: 'FAIL', value: 'ALL TRADING HALTED', detail: halt }
-    : { id: 'halt', label: 'Wallet audit / halt', status: 'OK', value: walletAuditRuns ? 'audit running, no halt' : 'no halt', detail: walletAuditRuns ? 'The wallet balance is compared with the journal; an unexplained change halts everything.' : `The wallet audit only runs in DEVNET_LIVE (auto mode is ${auto.mode}).` });
+    : { id: 'halt', label: 'Wallet audit / halt', status: 'OK', value: walletAuditRuns ? 'audit running, no halt' : 'no halt', detail: walletAuditRuns ? 'The wallet balance is compared with the journal; an unexplained change halts every buy plus the take-profit and stale exits; stop-loss, trailing stop, manual close and panic still run.' : `The wallet audit only runs in DEVNET_LIVE (auto mode is ${auto.mode}).` });
 
   checks.push({
     id: 'killswitch', label: 'Kill switch / circuit breaker', status: riskEngine.isKillSwitchActive() ? 'FAIL' : riskEngine.getCircuitBreakerState() === 'OPEN' ? 'FAIL' : 'OK',
@@ -92,10 +96,14 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
   const evicted = onChainPoolStats.getEvictedCount();
   const trimmed = memecoinAggregator.getPoolsTrimmedCount();
   const dropped = cap.refusedFull + evicted + trimmed + feed.handlerErrors;
+  // B3b: seller funders that ended up unread. Above SELLER_FUNDER_UNREAD_WARN_SHARE of at least SELLER_FUNDER_UNREAD_MIN_ASKED lookups, the lookups need more capacity.
+  const sf = watchWindow.getSellerFunderStats();
+  const sfUnread = sf.unreadable + sf.pendingAtWindowEnd;
+  const sfWarn = sf.asked >= SELLER_FUNDER_UNREAD_MIN_ASKED && sfUnread / sf.asked > SELLER_FUNDER_UNREAD_WARN_SHARE;
   checks.push({
-    id: 'capacity', label: 'Feed capacity (dropped candidates)', status: dropped > 0 ? 'WARN' : 'OK',
-    value: `watching ${cap.active} of ${cap.max}; dropped ${dropped}`,
-    detail: `Launches refused because the watch window was full: ${cap.refusedFull}${cap.lastRefusedMint ? ` (last ${cap.lastRefusedMint.slice(0, 8)}...)` : ''}. Measured-stat tables evicted: ${evicted}. Board pools trimmed: ${trimmed}. Feed log handler errors: ${feed.handlerErrors} (slowest handler ${feed.slowestHandlerMs} ms). Raise APEX_WATCH_MAX_CANDIDATES if the first number grows. Logs the RPC provider itself drops are not visible here.`,
+    id: 'capacity', label: 'Feed capacity (dropped candidates)', status: dropped > 0 || sfWarn ? 'WARN' : 'OK',
+    value: `watching ${cap.active} of ${cap.max}; dropped ${dropped}; seller funders unread ${sfUnread} of ${sf.asked}`,
+    detail: `Launches refused because the watch window was full: ${cap.refusedFull}${cap.lastRefusedMint ? ` (last ${cap.lastRefusedMint.slice(0, 8)}...)` : ''}. Measured-stat tables evicted: ${evicted}. Board pools trimmed: ${trimmed}. Feed log handler errors: ${feed.handlerErrors} (slowest handler ${feed.slowestHandlerMs} ms). Raise APEX_WATCH_MAX_CANDIDATES if the first number grows. Logs the RPC provider itself drops are not visible here. Seller funder lookups: ${sf.asked} asked, ${sf.unreadable} failed or refused, ${sf.pendingAtWindowEnd} still pending at the window end (each costs that launch its buyers signal; a WARN above ${SELLER_FUNDER_UNREAD_WARN_SHARE * 100}% of ${SELLER_FUNDER_UNREAD_MIN_ASKED}+ lookups means the funder lookups need more RPC capacity).`,
   });
 
   checks.push(recorderCheck(now));

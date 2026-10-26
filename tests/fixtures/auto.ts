@@ -17,7 +17,7 @@ import { memecoinAggregator } from '../../server/memecoinAggregator';
 import { PumpFeedListener } from '../../server/solana/pumpFeedListener';
 
 /** A real pool for a fresh mint, created the way the feed creates one. */
-export function newPumpPool(verdict: 'HOT' | 'READY' | 'DEAD' | 'NONE' = 'HOT') {
+export function newPumpPool(verdict: 'HOT' | 'READY' | 'READY_WEAK' | 'DEAD' | 'NONE' = 'HOT') {
   const mint = Keypair.generate().publicKey.toBase58();
   const creator = Keypair.generate().publicKey.toBase58();
   const l = new PumpFeedListener();
@@ -38,18 +38,26 @@ watchWindow.setScoreFn((m) => (hotMints.has(m) ? 80 : null));
 /**
  * G2b: auto candidates must come out of the watch window. Drive the REAL window with replayed trades so the mint
  * is released HOT (30 de-clustered buyers, rising velocity, score 80), READY (window elapsed, no score) or DEAD (creator sold).
+ * P4.3: READY is a release the controller may buy (10 equal buyers: concentration and flow pass, 2 strong signals); READY_WEAK is the
+ * old READY (two buyers, so one holds 60% of the volume: concentration fails, 1 strong signal), which the controller refuses.
  */
-export function releaseAs(mint: string, verdict: 'HOT' | 'READY' | 'DEAD', creator: string = walletFx()): void {
+export function releaseAs(mint: string, verdict: 'HOT' | 'READY' | 'READY_WEAK' | 'DEAD', creator: string = walletFx()): void {
   // The release happens "now": LIVE/PAPER risk checks the signal's age, and the release is the signal behind an auto buy.
-  const start = Date.now() - (verdict === 'HOT' ? 28_000 : verdict === 'READY' ? 120_000 : 6_000);
+  const start = Date.now() - (verdict === 'HOT' ? 28_000 : verdict === 'READY' || verdict === 'READY_WEAK' ? 120_000 : 6_000);
   watchWindow.watch(mint, creator, start);
   if (verdict === 'HOT') {
     hotMints.add(mint);
     const b = buyers(30, 25);
     b.wallets.forEach((w, i) => watchWindow.setFunder(w, `fx-funder-${mint.slice(0, 6)}-${i}`));
-    for (const { trade, at } of replay(mint, start, [...b.steps, [26, walletFx(), 'sell', 0.05], [27, walletFx(), 'sell', 0.05]])) watchWindow.onTrade(trade, at);
+    // B3: with server.ts's funder lookup wired, a seller whose funder is unknown holds HOT until its lookup answers
+    const sellers = [walletFx(), walletFx()];
+    sellers.forEach((w, i) => watchWindow.setFunder(w, `fx-funder-${mint.slice(0, 6)}-s${i}`));
+    for (const { trade, at } of replay(mint, start, [...b.steps, [26, sellers[0], 'sell', 0.05], [27, sellers[1], 'sell', 0.05]])) watchWindow.onTrade(trade, at);
     watchWindow.evaluate(mint, start + 28_000);
   } else if (verdict === 'READY') {
+    for (const { trade, at } of replay(mint, start, buyers(10, 15).steps)) watchWindow.onTrade(trade, at);
+    watchWindow.evaluate(mint, start + 120_000);
+  } else if (verdict === 'READY_WEAK') {
     for (const { trade, at } of replay(mint, start, [[0, walletFx(), 'buy', 0.3], [10, walletFx(), 'buy', 0.2]])) watchWindow.onTrade(trade, at);
     watchWindow.evaluate(mint, start + 120_000);
   } else {

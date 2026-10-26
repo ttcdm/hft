@@ -2,7 +2,8 @@ import type { AutoMode } from './controller';
 
 /**
  * G3: kill-switch triggers. Pure functions over a snapshot, so each rule is testable on its own.
- * Triggers PAUSE BUYS only; exits keep running. The one exception is an unexplained wallet change, which halts everything.
+ * Triggers PAUSE BUYS only; exits keep running. The one exception is an unexplained wallet change, which halts every buy plus the
+ * take-profit and stale exits (stop-loss, trailing stop, manual close and panic still run).
  */
 export const EXPECTANCY_WINDOW = 20;
 /** One-sided 80% normal quantile (Q30: this was 1.2816, the 90% value). */

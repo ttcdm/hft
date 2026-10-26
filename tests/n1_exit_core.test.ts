@@ -18,6 +18,7 @@ import { txBuilder } from '../server/solana/transactionBuilder';
 import { MockSolanaRpc } from './e2e/helpers/mockRpc';
 import { MockJitoEngine } from './e2e/helpers/mockJito';
 import { VALID_PUMP_MINT_1, DUMMY_FEE_RECIPIENT, createSimulatedBondingCurveState, createPassingEligibilityReport } from './e2e/helpers/simulatedStates';
+import { settleLeftoverLiveBuys } from './helpers/leftoverBuys';
 
 /**
  * P4 (critique #4): a failing stop-loss must not bleed fees. Real coordinator and SQLite; the RPC, builder and reconciler are stubbed at their edges.
@@ -47,6 +48,7 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
   };
 
   beforeEach(async () => {
+    settleLeftoverLiveBuys();
     const kp = Keypair.generate();
     mockRpc = new MockSolanaRpc();
     mockJito = new MockJitoEngine();
@@ -170,6 +172,88 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
     expect(third.success).toBe(true);
     expect(submit).toHaveBeenCalledTimes(1);
     expect(workstationDb.loadPositions().find((p) => p.id === posId)!.status).toBe('CLOSED');
+  });
+
+  describe('S251 (P2.1): a pending sell whose blockhash expired unseen does not hold the next stop-loss for the rest of the 100 s', () => {
+    const unconfirmedSell = async () => {
+      submit.mockResolvedValueOnce({ success: false, signature: 'unlanded_sell', transport: 'SOLANA_RPC', error: 'UNCONFIRMED', lifecycleState: 'TIMED_OUT', unconfirmed: true });
+      vi.spyOn(txBuilder, 'lastValidBlockHeightOf').mockReturnValue(1_000);
+      const first = await coordinator.closePosition(posId, 100, 'TAKE_PROFIT_1');
+      expect(first.success).toBe(false);
+      expect(submit).toHaveBeenCalledTimes(1);
+      (coordinator as any).connection.getTokenAccountBalance = vi.fn(async () => ({ value: { amount: '1000000000' } })); // the wallet is still full
+    };
+
+    it('past lastValidBlockHeight with no signature status: the stop-loss sells on the next pass', async () => {
+      await unconfirmedSell();
+      const conn = (coordinator as any).connection;
+      conn.getBlockHeight = vi.fn(async () => 1_001);
+      conn.getSignatureStatuses = vi.fn(async () => ({ context: { slot: 1 }, value: [null] }));
+      const next = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(next.error ?? '').not.toMatch(/SELL_PENDING_VERIFICATION/);
+      expect(submit).toHaveBeenCalledTimes(2);
+      expect(conn.getSignatureStatuses).toHaveBeenCalledWith(['unlanded_sell'], { searchTransactionHistory: true });
+    });
+
+    it('while the blockhash is still valid the hold stands', async () => {
+      await unconfirmedSell();
+      (coordinator as any).connection.getBlockHeight = vi.fn(async () => 1_000);
+      const next = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(next.error).toMatch(/SELL_PENDING_VERIFICATION/);
+      expect(submit).toHaveBeenCalledTimes(1);
+    });
+
+    it('a signature that has a status is never released early, even past expiry', async () => {
+      await unconfirmedSell();
+      const conn = (coordinator as any).connection;
+      conn.getBlockHeight = vi.fn(async () => 2_000);
+      conn.getSignatureStatuses = vi.fn(async () => ({ context: { slot: 1 }, value: [{ slot: 9, confirmations: 1, err: null, confirmationStatus: 'processed' }] }));
+      const next = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(next.error).toMatch(/SELL_PENDING_VERIFICATION/);
+      expect(submit).toHaveBeenCalledTimes(1);
+    });
+
+    it('an unreadable block height keeps the hold', async () => {
+      await unconfirmedSell();
+      (coordinator as any).connection.getBlockHeight = vi.fn(async () => { throw new Error('fetch failed'); });
+      const next = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(next.error).toMatch(/SELL_PENDING_VERIFICATION/);
+      expect(submit).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  it('S258 (P2.3): an adopted sell whose transaction is readable books its proceeds and PnL, and its row is RECONCILED', async () => {
+    const recon = TradeReconciler.reconcileSellTransaction as any;
+    recon.mockResolvedValueOnce({ success: false, reconciliationState: 'RECONCILIATION_REQUIRED', error: 'fill unreadable' });
+    workstationDb.saveTransaction({
+      signature: 'sellsig', orderId: `ord-exit-${uid()}`, correlationId: 'exit-s258', mint: VALID_PUMP_MINT_1.toBase58(), direction: 'SELL',
+      submissionTransport: 'SOLANA_RPC', submissionTime: Date.now(), reconciliationState: 'RECONCILIATION_REQUIRED', networkFeeLamports: 5000, jitoTipLamports: 0, executionMode: 'LIVE',
+    });
+    const before = workstationDb.loadPositions().find((p) => p.id === posId)!.realizedPnLSol ?? 0;
+    const first = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+    expect(first.success).toBe(false);
+    // the wallet is empty: the first sell landed; now its transaction reads (the beforeEach answer: 1e9 sold, net 0.049 SOL, PnL -0.05)
+    (coordinator as any).connection.getTokenAccountBalance = vi.fn(async () => ({ value: { amount: '0' } }));
+    const adopted = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+    expect(adopted).toMatchObject({ success: true, pnlSol: -0.05, solMoved: 0.049 });
+    expect(submit).toHaveBeenCalledTimes(1);
+    expect(recon.mock.calls.at(-1)[1]).toBe('sellsig');
+    const row = workstationDb.loadPositions().find((p) => p.id === posId)!;
+    expect(row.status).toBe('CLOSED');
+    expect(row.realizedPnLSol).toBeCloseTo(before - 0.05, 9);
+    expect(workstationDb.loadTransactions().find((t) => t.signature === 'sellsig')?.reconciliationState).toBe('RECONCILED');
+    expect(coordinator.getOperatorAlerts().find((a) => a.code === 'SELL_ADOPTED' && a.positionId === posId)?.message).toMatch(/booked \(PnL -0\.050000 SOL\)/);
+  });
+
+  it('S259 (P2.3, N-28): a 100% exit that finds an empty wallet, with no pending sell, books the basis as a realized loss and sends nothing', async () => {
+    (coordinator as any).connection.getTokenAccountBalance = vi.fn(async () => ({ value: { amount: '0' } }));
+    const res = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+    expect(res).toMatchObject({ success: true, status: 'CLOSED', solMoved: 0 });
+    expect(res.pnlSol).toBeCloseTo(-0.1, 9);
+    expect(submit).not.toHaveBeenCalled();
+    const row = workstationDb.loadPositions().find((p) => p.id === posId)!;
+    expect(row.realizedPnLSol).toBeCloseTo(-0.1, 9);
+    expect(row.exitReason).toMatch(/REALIZED_ASSUMED_LOSS/);
   });
 
   it('N3: a partial sell that landed leaves the wallet balance as the remaining quantity', async () => {
@@ -392,6 +476,8 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
       let release!: (v: any) => void;
       const inner = vi.spyOn(coordinator as any, 'submitAndConfirmInner').mockImplementation(() => new Promise((r) => { release = r; }));
       const p = coordinator.submitAndConfirmWithRetry(params(7, 'ord-n20-a'));
+      // P1.5 (N-35): the cluster checks now run before the row is written, so wait for the send to be in flight rather than reading synchronously
+      await vi.waitFor(() => expect(inner).toHaveBeenCalledTimes(1));
       const rows = rowFor('ord-n20-a');
       expect(rows).toHaveLength(1);
       expect(rows[0].reconciliationState).toBe('PENDING');

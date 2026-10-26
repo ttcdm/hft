@@ -71,7 +71,7 @@ describe('(a) wrong cluster: the chain answers with a genesis the server does no
     // The same validator reached as "localhost" is a new endpoint for the app, so the switch runs the cluster check: its genesis is
     // not devnet's, so the switch must be refused and nothing may change.
     const alias = v.url.replace('127.0.0.1', 'localhost');
-    const r = await app.call('POST', '/api/wallet/config', { walletAddress: trader.publicKey.toBase58(), rpcEndpoint: alias, enabledStrategies: { pumpFunSniper: true }, riskLimits: {} });
+    const r = await app.call('POST', '/api/wallet/config', { walletAddress: trader.publicKey.toBase58(), rpcEndpoint: alias, riskLimits: {} });
     expect(r.status, JSON.stringify(r.json)).toBe(400);
     expect(JSON.stringify(r.json)).toMatch(/CLUSTER_GUARD/);
     expect((await app.call('GET', '/api/execution/can-arm')).json.allowed).toBe(false);

@@ -27,7 +27,6 @@ afterEach(async () => {
     const p = workstationDb.loadPositions().find((x) => x.id === id);
     if (p) { p.status = 'CLOSED'; p.tokenQuantityRaw = '0'; workstationDb.savePosition(p); }
   }
-  (executionCoordinator as any).markRetry.clear();
 });
 
 describe('stale marks on mints that do not exist do not flood the RPC or the log', () => {
@@ -52,14 +51,17 @@ describe('stale marks on mints that do not exist do not flood the RPC or the log
     q.mockClear();
     await executionCoordinator.evaluateAndProcessExits();
     expect(q.mock.calls.some((c) => (c[1] as string[]).length > 0 && workstationDb.loadPositions().some((p) => ids.includes(p.id) && (c[1] as string[]).includes(p.mint)))).toBe(false);
-    const map = (executionCoordinator as any).markRetry as Map<string, { failures: number; nextAt: number }>;
-    expect(map.size).toBeGreaterThanOrEqual(3);
-    for (const v of map.values()) v.nextAt = Date.now() - 1; // the wait has passed
+    // P1.6: the clock moves past the wait instead of the test rewriting the private back-off map
+    const t0 = Date.now();
+    const now = vi.spyOn(Date, 'now').mockReturnValue(t0 + MARK_RETRY_BASE_MS + 1);
     q.mockClear();
     await executionCoordinator.evaluateAndProcessExits();
     expect(q.mock.calls.length).toBeGreaterThan(0);
-    const [mint] = [...map.keys()];
-    expect(map.get(mint)!.nextAt - Date.now()).toBeGreaterThan(MARK_RETRY_BASE_MS); // the second failure doubles the wait
+    // the second failure doubles the wait: one base wait later the mints are still not asked
+    now.mockReturnValue(t0 + 2 * MARK_RETRY_BASE_MS + 2);
+    q.mockClear();
+    await executionCoordinator.evaluateAndProcessExits();
+    expect(q.mock.calls.some((c) => (c[1] as string[]).length > 0 && workstationDb.loadPositions().some((p) => ids.includes(p.id) && (c[1] as string[]).includes(p.mint)))).toBe(false);
   });
 
   it('many unpriced PAPER positions raise a handful of alerts and one with a count, not one each', async () => {

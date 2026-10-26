@@ -44,17 +44,47 @@ export interface CreatorRiskReport {
   details: string;
 }
 
+/** How long a creator report lives in the cache when nothing pins it. */
+export const CREATOR_REPORT_TTL_MS = 120_000;
+/**
+ * P4.1 (R1-53): a report stays while a mint of that creator is in the watch window (the pin, see watchPins.ts) and this long after the
+ * watch releases, so an execution-time re-score of a released candidate still finds it.
+ */
+export const CREATOR_REPORT_GRACE_MS = 60_000;
+/**
+ * P4.1 (R1-53): a failed history lookup is cached this long (not pinned), so repeated asks do not hammer a failing RPC and a later ask
+ * can still retry. It scores 0 and is listed as missing data, the same as no report.
+ */
+export const CREATOR_FAILURE_CACHE_TTL_MS = 30_000;
+export const CREATOR_LOOKUP_FAILED_FLAG = 'RPC_HISTORY_QUERY_FAILED';
+
 export class CreatorRiskScorer {
-  private cache: Map<string, { report: CreatorRiskReport; expiresAt: number }> = new Map();
-  private readonly defaultCacheTtlMs = 120_000; // 2 minutes cache for HFT speed
+  private cache: Map<string, { report: CreatorRiskReport; expiresAt: number; failed: boolean }> = new Map();
+  private readonly defaultCacheTtlMs = CREATOR_REPORT_TTL_MS;
   /** S14: expired entries were only ignored on read, never removed, so the cache grew with every creator seen. */
   private readonly maxCacheEntries = 2_000;
+  /** P4.1: creators whose report must not expire now (a mint of theirs is being watched). */
+  private pinned: ((creatorAddress: string) => boolean) | null = null;
 
-  private storeInCache(creatorAddress: string, report: CreatorRiskReport): void {
+  public setPinned(fn: ((creatorAddress: string) => boolean) | null): void {
+    this.pinned = fn;
+  }
+
+  /** P4.1: keep a creator's (successful) report at least `ms` from now; called when the watch on its mint ends. */
+  public holdFor(creatorAddress: string, ms: number = CREATOR_REPORT_GRACE_MS): void {
+    const e = this.cache.get(creatorAddress.trim());
+    if (e && !e.failed) e.expiresAt = Math.max(e.expiresAt, Date.now() + ms);
+  }
+
+  private live(k: string, e: { expiresAt: number; failed: boolean }, now: number): boolean {
+    return e.expiresAt > now || (!e.failed && !!this.pinned?.(k));
+  }
+
+  private storeInCache(creatorAddress: string, report: CreatorRiskReport, failed = false): void {
     const now = Date.now();
-    this.cache.set(creatorAddress, { report, expiresAt: now + this.defaultCacheTtlMs });
+    this.cache.set(creatorAddress, { report, expiresAt: now + (failed ? CREATOR_FAILURE_CACHE_TTL_MS : this.defaultCacheTtlMs), failed });
     if (this.cache.size > this.maxCacheEntries) {
-      for (const [k, v] of this.cache) if (v.expiresAt <= now) this.cache.delete(k);
+      for (const [k, v] of this.cache) if (!this.live(k, v, now)) this.cache.delete(k);
       while (this.cache.size > this.maxCacheEntries) this.cache.delete(this.cache.keys().next().value as string);
     }
   }
@@ -74,7 +104,7 @@ export class CreatorRiskScorer {
     // Check cache
     if (!options?.bypassCache) {
       const cached = this.cache.get(creatorAddress);
-      if (cached && cached.expiresAt > Date.now()) {
+      if (cached && this.live(creatorAddress, cached, Date.now())) {
         return cached.report;
       }
     }
@@ -103,10 +133,11 @@ export class CreatorRiskScorer {
         walletAgeSeconds: 0,
         hasDrainPattern: false,
         failedTxCount: 0,
-        riskFlags: ['RPC_HISTORY_QUERY_FAILED'],
+        riskFlags: [CREATOR_LOOKUP_FAILED_FLAG],
         evaluatedAt: Date.now(),
         details: `RPC error querying creator history: ${err?.message || err}`,
       };
+      this.storeInCache(creatorAddress, fallbackReport, true); // P4.1 (R1-53): short-lived, never pinned
       return fallbackReport;
     }
   }
@@ -329,10 +360,11 @@ export class CreatorRiskScorer {
     return { riskScore, confluenceScore, isBurner: false };
   }
 
-  /** Cached report for a creator, or undefined when none has been evaluated (or it expired). Never calls the network. */
+  /** Cached report for a creator, or undefined when none has been evaluated (or it expired and is not pinned). Never calls the network. */
   public getCachedReport(creatorAddress: string): CreatorRiskReport | undefined {
-    const cached = this.cache.get(creatorAddress.trim());
-    return cached && cached.expiresAt > Date.now() ? cached.report : undefined;
+    const k = creatorAddress.trim();
+    const cached = this.cache.get(k);
+    return cached && this.live(k, cached, Date.now()) ? cached.report : undefined;
   }
 
   public clearCache(): void {

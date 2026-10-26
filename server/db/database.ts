@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import path from 'path';
+import { resolveDbPath } from './dbPath';
 import { NormalizedPosition, ExecutionMode } from '../core/types';
 import { Logger } from '../middleware/enterprise';
 
@@ -41,6 +41,10 @@ export interface PersistedTransaction {
   jitoTipLamports: number;
   executionMode: ExecutionMode;
   error?: string;
+  /** P2.1: the last block height at which this transaction's blockhash is valid. Past it, a signature with no status never landed. */
+  lastValidBlockHeight?: number;
+  /** SELL rows: the exit reason it was sent for (TAKE_PROFIT_1, STOP_LOSS, ...), so a restart that applies a landed sell can advance the take-profit stage. */
+  exitReason?: string;
 }
 
 export class WorkstationDatabase {
@@ -48,11 +52,13 @@ export class WorkstationDatabase {
   private dbPath: string;
 
   constructor(customDbPath?: string) {
-    this.dbPath = customDbPath || process.env.TEST_DB_PATH || process.env.APEX_DB_PATH || path.join(process.cwd(), 'apex_workstation.db');
+    this.dbPath = resolveDbPath(customDbPath);
     this.db = new DatabaseSync(this.dbPath);
     this.db.exec('PRAGMA busy_timeout = 10000;');
     this.db.exec('PRAGMA journal_mode = WAL;');
-    this.db.exec('PRAGMA synchronous = NORMAL;');
+    // P2.2 (R1-96): FULL, not NORMAL. Under WAL, NORMAL can lose the last commits on an OS crash or power loss, and the last commit before a
+    // broadcast is the PENDING row that lets startup recovery find a transaction that was sent.
+    this.db.exec('PRAGMA synchronous = FULL;');
     this.initSchema();
   }
 
@@ -191,6 +197,12 @@ export class WorkstationDatabase {
         payload_json TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value_json TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS system_journal (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         event_type TEXT NOT NULL,
@@ -212,6 +224,8 @@ export class WorkstationDatabase {
     this.ensureColumn('positions', 'trailing_stop_sol', 'REAL DEFAULT 0.0');
     this.ensureColumn('positions', 'exit_stage', 'INTEGER DEFAULT 0');
     this.ensureColumn('positions', 'record_updated_at', 'INTEGER NOT NULL DEFAULT 0');
+    this.ensureColumn('positions', 'exit_claim', 'TEXT'); // P1.1: which process is selling this position (claimExit)
+    this.ensureColumn('positions', 'exit_claim_at', 'INTEGER');
 
     // Rows that carry realized PnL from before realized_events existed: one event at their updated_at, which is what the daily figure used.
     try {
@@ -237,6 +251,8 @@ export class WorkstationDatabase {
     this.ensureColumn('transactions', 'confirmation_time', 'INTEGER');
     this.ensureColumn('transactions', 'reconciliation_state', "TEXT NOT NULL DEFAULT 'PENDING'");
     this.ensureColumn('transactions', 'error', 'TEXT');
+    this.ensureColumn('transactions', 'last_valid_block_height', 'INTEGER');
+    this.ensureColumn('transactions', 'exit_reason', 'TEXT');
 
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
@@ -254,8 +270,68 @@ export class WorkstationDatabase {
     Logger.info(`SQLite persistence initialized at ${this.dbPath}`);
   }
 
+  /** S222: a small operator setting that survives a restart (the confluence threshold and the auto mode). null when unset or unreadable. */
+  public getSetting<T = unknown>(key: string): T | null {
+    try {
+      const row = this.db.prepare(`SELECT value_json FROM app_settings WHERE key = ?`).get(key) as { value_json: string } | undefined;
+      return row ? (JSON.parse(row.value_json) as T) : null;
+    } catch (err: any) {
+      Logger.warn(`Setting ${key} could not be read: ${err.message}`);
+      return null;
+    }
+  }
+
+  /** Returns false when the value could not be saved (logged); the in-memory setting still applies until restart. */
+  public setSetting(key: string, value: unknown): boolean {
+    try {
+      this.db.prepare(`INSERT INTO app_settings (key, value_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at`)
+        .run(key, JSON.stringify(value), Date.now());
+      return true;
+    } catch (err: any) {
+      Logger.warn(`Setting ${key} could not be saved: ${err.message}`);
+      return false;
+    }
+  }
+
   public getDbPath(): string {
     return this.dbPath;
+  }
+
+  /**
+   * P2.2 (R1-89): the cluster this database's ledger belongs to, by genesis hash. The first verified RPC stamps it (`cluster_genesis_hash`
+   * in app_settings); after that an RPC on another genesis is refused, so a devnet ledger is never reconciled against another cluster.
+   * An in-memory database (tests, scratch tools) is never stamped. `ok: false` carries the stored hash.
+   */
+  public checkClusterStamp(genesisHash: string): { ok: true; stamped: boolean } | { ok: false; stored: string; unreadable?: string } {
+    if (!genesisHash || this.dbPath === ':memory:') return { ok: true, stamped: false };
+    // S255 follow-up: not getSetting, which answers null for a failed read too. A failed read is not "unstamped": taking it for one wrote
+    // this RPC's genesis over the real stamp, and a ledger of another cluster then passed. Unreadable refuses, like a mismatch.
+    const read = (): { stored: string | null } | { unreadable: string } => {
+      try {
+        const row = this.db.prepare(`SELECT value_json FROM app_settings WHERE key = 'cluster_genesis_hash'`).get() as { value_json: string } | undefined;
+        if (!row) return { stored: null };
+        const v = JSON.parse(row.value_json);
+        return typeof v === 'string' && v ? { stored: v } : { unreadable: 'the stamp row holds no genesis hash' };
+      } catch (err: any) {
+        return { unreadable: String(err?.message ?? err) };
+      }
+    };
+    let r = read();
+    if ('stored' in r && r.stored === null) {
+      // insert only, so a stamp another process wrote meanwhile is compared below and never overwritten
+      try {
+        const res = this.db.prepare(`INSERT INTO app_settings (key, value_json, updated_at) VALUES ('cluster_genesis_hash', ?, ?) ON CONFLICT(key) DO NOTHING`)
+          .run(JSON.stringify(genesisHash), Date.now());
+        if (Number(res.changes) > 0) return { ok: true, stamped: true };
+      } catch (err: any) {
+        Logger.warn(`Cluster stamp could not be saved: ${err.message}`);
+        return { ok: true, stamped: false };
+      }
+      r = read();
+    }
+    if ('unreadable' in r) return { ok: false, stored: '', unreadable: r.unreadable };
+    if (r.stored === null || r.stored === genesisHash) return { ok: true, stamped: false };
+    return { ok: false, stored: r.stored };
   }
 
   /** The last recorded all-trading halt state: a halt survives a restart until an operator clears it. */
@@ -270,6 +346,20 @@ export class WorkstationDatabase {
       // R8: an unreadable journal is not "no halt". Fail closed: report a halt whose reason says why, so an operator looks before trading.
       Logger.error(`Halt state could not be read: ${err.message}`);
       return `HALT_STATE_UNREADABLE: could not read the persisted halt state (${String(err.message).slice(0, 80)}); clear it explicitly once the database is healthy`;
+    }
+  }
+
+  /** The reason of the last kill-switch trip when the switch was still on at the last journal row (it is off after a restart), else null. */
+  public getKillSwitchTripBeforeRestart(): string | null {
+    try {
+      const row = this.db
+        .prepare(`SELECT event_type, payload_json FROM system_journal WHERE event_type IN ('KILL_SWITCH_TRIPPED','KILL_SWITCH_RESET') ORDER BY id DESC LIMIT 1`)
+        .get() as { event_type: string; payload_json: string } | undefined;
+      if (!row || row.event_type !== 'KILL_SWITCH_TRIPPED') return null;
+      return String(JSON.parse(row.payload_json)?.reason ?? 'no reason given');
+    } catch (err: any) {
+      Logger.error(`Kill-switch state could not be read: ${err.message}`);
+      return null;
     }
   }
 
@@ -437,16 +527,19 @@ export class WorkstationDatabase {
         INSERT INTO transactions (
           signature, bundle_id, order_id, correlation_id, mint, direction,
           submission_transport, submission_time, landing_slot, confirmation_time,
-          reconciliation_state, network_fee_lamports, jito_tip_lamports, execution_mode, error
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          reconciliation_state, network_fee_lamports, jito_tip_lamports, execution_mode, error, last_valid_block_height, exit_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(signature) DO UPDATE SET
+          submission_transport = excluded.submission_transport,
           bundle_id = excluded.bundle_id,
           landing_slot = excluded.landing_slot,
           confirmation_time = excluded.confirmation_time,
           reconciliation_state = excluded.reconciliation_state,
           network_fee_lamports = excluded.network_fee_lamports,
           jito_tip_lamports = excluded.jito_tip_lamports,
-          error = excluded.error
+          error = excluded.error,
+          last_valid_block_height = COALESCE(excluded.last_valid_block_height, transactions.last_valid_block_height),
+          exit_reason = COALESCE(excluded.exit_reason, transactions.exit_reason)
       `);
       stmt.run(
         tx.signature,
@@ -463,7 +556,9 @@ export class WorkstationDatabase {
         tx.networkFeeLamports,
         tx.jitoTipLamports,
         tx.executionMode,
-        tx.error || null
+        tx.error || null,
+        tx.lastValidBlockHeight ?? null,
+        tx.exitReason ?? null
       );
       return true;
     } catch (err: any) {
@@ -491,35 +586,89 @@ export class WorkstationDatabase {
     }
   }
 
+  /**
+   * S258: a landed sell booked on its position (savePosition: realized PnL, quantity, status, exitTxSignature) and its ledger row marked
+   * RECONCILED, in one transaction. Written separately, a crash between the two left the row PENDING with the PnL already on the position;
+   * startup reconciliation matches a PENDING sell to its position by exitTxSignature only, so once a later sell had replaced that it booked
+   * the same sell again. Throws (nothing written) when either write fails.
+   */
+  public saveSellBooking(pos: NormalizedPosition, signature: string, landing: { slot?: number; networkFeeLamports?: number } = {}): void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.savePosition(pos);
+      this.db
+        .prepare(
+          `UPDATE transactions SET reconciliation_state = 'RECONCILED', confirmation_time = ?,
+             landing_slot = COALESCE(?, landing_slot), network_fee_lamports = COALESCE(?, network_fee_lamports)
+           WHERE signature = ?`
+        )
+        .run(Date.now(), landing.slot || null, landing.networkFeeLamports ?? null, signature);
+      this.db.exec('COMMIT');
+    } catch (err) {
+      try { this.db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+      throw err;
+    }
+  }
+
   public getPendingTransactions(): PersistedTransaction[] {
     try {
       const stmt = this.db.prepare(`
         SELECT * FROM transactions WHERE reconciliation_state = 'PENDING'
       `);
-      const rows = stmt.all() as any[];
-      return rows.map((r) => ({
-        signature: r.signature,
-        bundleId: r.bundle_id || undefined,
-        orderId: r.order_id,
-        correlationId: r.correlation_id,
-        mint: r.mint,
-        direction: r.direction as 'BUY' | 'SELL',
-        submissionTransport: r.submission_transport as 'SOLANA_RPC' | 'JITO' | 'PAPER',
-        submissionTime: r.submission_time,
-        landingSlot: r.landing_slot || undefined,
-        confirmationTime: r.confirmation_time || undefined,
-        reconciliationState: r.reconciliation_state,
-        networkFeeLamports: r.network_fee_lamports,
-        jitoTipLamports: r.jito_tip_lamports,
-        executionMode: r.execution_mode as ExecutionMode,
-        error: r.error || undefined,
-      }));
+      // the shared mapper: the hand-written copy here dropped exit_reason and last_valid_block_height, which startup recovery reads
+      return this.mapTransactions(stmt.all() as any[]);
     } catch {
       return [];
     }
   }
 
   /** A LIVE buy of this mint was sent and not yet resolved (PENDING or RECONCILIATION_REQUIRED): it may still become a position. */
+  /**
+   * P1.1 (N-52): claim the right to sell a position, across processes. `owner` is `<pid>:<nonce>`. Succeeds when the row has no claim,
+   * the claim is older than `staleBeforeTs`, or the claiming process is dead. Returns false while another live claim stands (another
+   * process, or another coordinator in this process, is selling it). The caller clears its claim in a `finally` (releaseExitClaim).
+   */
+  public claimExit(positionId: string, owner: string, now: number, staleBeforeTs: number, isOwnerAlive: (owner: string) => boolean): boolean {
+    const tryClaim = (extra: string, ...args: Array<string | number>) => Number((this.db
+      .prepare(`UPDATE positions SET exit_claim = ?, exit_claim_at = ? WHERE id = ? AND (${extra})`)
+      .run(owner, now, positionId, ...args) as any).changes) > 0;
+    if (tryClaim('exit_claim IS NULL OR exit_claim_at IS NULL OR exit_claim_at < ?', staleBeforeTs)) return true;
+    const row = this.db.prepare('SELECT exit_claim AS c FROM positions WHERE id = ?').get(positionId) as { c: string | null } | undefined;
+    if (!row?.c || isOwnerAlive(row.c)) return false;
+    return tryClaim('exit_claim = ?', row.c); // the holder died mid-sell: take it, unless someone else just did
+  }
+
+  public releaseExitClaim(positionId: string, owner: string): void {
+    try {
+      this.db.prepare('UPDATE positions SET exit_claim = NULL, exit_claim_at = NULL WHERE id = ? AND exit_claim = ?').run(positionId, owner);
+    } catch (err: any) {
+      Logger.error(`Failed to release the exit claim on ${positionId}: ${err.message}`);
+    }
+  }
+
+  /**
+   * P1.1 (N-57): write the PENDING row of a LIVE BUY only if no other unresolved LIVE BUY of that mint exists, in one BEGIN IMMEDIATE
+   * transaction so two processes cannot both pass the check. False: another buy of the mint is unresolved (nothing written).
+   */
+  public savePendingBuyIfNoneUnresolved(tx: PersistedTransaction): boolean {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const other = this.db
+        .prepare(`SELECT 1 FROM transactions WHERE mint = ? AND direction = 'BUY' AND execution_mode = 'LIVE' AND reconciliation_state IN ('PENDING', 'RECONCILIATION_REQUIRED') AND order_id != ? LIMIT 1`)
+        .get(tx.mint, tx.orderId);
+      if (other) {
+        this.db.exec('ROLLBACK');
+        return false;
+      }
+      if (!this.saveTransaction(tx)) throw new Error(`could not record the PENDING buy ${tx.signature}`);
+      this.db.exec('COMMIT');
+      return true;
+    } catch (err) {
+      try { this.db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+      throw err;
+    }
+  }
+
   public hasUnresolvedLiveBuy(mint: string): boolean {
     try {
       const row = this.db
@@ -545,7 +694,7 @@ export class WorkstationDatabase {
       return {
         riskDecisions: run('DELETE FROM risk_decisions WHERE created_at < ?', cutoff),
         decisions: run('DELETE FROM decisions WHERE ts < ?', cutoff),
-        journal: run(`DELETE FROM system_journal WHERE created_at < ? AND event_type NOT IN ('TRADING_HALTED','TRADING_HALT_CLEARED','PAPER_FILL_GATES','PAPER_SELL_FILLED')`, cutoff),
+        journal: run(`DELETE FROM system_journal WHERE created_at < ? AND event_type NOT IN ('TRADING_HALTED','TRADING_HALT_CLEARED','KILL_SWITCH_TRIPPED','KILL_SWITCH_RESET','PAPER_FILL_GATES','PAPER_SELL_FILLED')`, cutoff),
       };
     } catch (e: any) {
       Logger.error(`Retention prune failed: ${e?.message ?? e}`);
@@ -650,6 +799,8 @@ export class WorkstationDatabase {
       jitoTipLamports: r.jito_tip_lamports,
       executionMode: r.execution_mode as ExecutionMode,
       error: r.error || undefined,
+      lastValidBlockHeight: r.last_valid_block_height ?? undefined,
+      exitReason: r.exit_reason ?? undefined,
     }));
   }
 
@@ -887,10 +1038,18 @@ export class WorkstationDatabase {
     );
   }
 
-  public getDailyRealizedPnLSol(mode: ExecutionMode = 'LIVE'): number {
+  private static utcMidnightMs(): number {
     const startOfDay = new Date();
     startOfDay.setUTCHours(0, 0, 0, 0);
-    const startMs = startOfDay.getTime();
+    return startOfDay.getTime();
+  }
+
+  /**
+   * Realized PnL since `sinceMs`. The default is UTC midnight (the figure the UI shows as "today"); the risk gate passes a rolling
+   * 24 h start instead (N-61, 3C), so a new calendar day does not hand out a fresh loss budget.
+   */
+  public getDailyRealizedPnLSol(mode: ExecutionMode = 'LIVE', sinceMs: number = WorkstationDatabase.utcMidnightMs()): number {
+    const startMs = sinceMs;
 
     const stmt = this.db.prepare(`
       SELECT COALESCE(SUM(delta_lamports), 0) as total_pnl_lamports
@@ -901,22 +1060,31 @@ export class WorkstationDatabase {
     return (res?.total_pnl_lamports || 0) / 1e9;
   }
 
+  /** Unrealized PnL of the mode's OPEN and PARTIALLY_CLOSED positions at their last marks (3C: the risk gate's worst case uses it). */
+  public getOpenUnrealizedPnLSol(mode: ExecutionMode): number {
+    return this.loadPositions()
+      .filter((p) => p.executionMode === mode && (p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED'))
+      .reduce((sum, pos) => sum + (pos.unrealizedPnLSol ?? 0), 0);
+  }
+
+  /** 3C: time of the oldest losing realized event at or after `sinceMs`, or null. Tells the operator when the 24 h window can move. */
+  public getOldestRealizedLossTs(mode: ExecutionMode, sinceMs: number): number | null {
+    const res = this.db.prepare(`
+      SELECT MIN(ts) as oldest FROM realized_events WHERE execution_mode = ? AND ts >= ? AND delta_lamports < 0
+    `).get(mode, sinceMs) as any;
+    return typeof res?.oldest === 'number' ? res.oldest : null;
+  }
+
   /**
    * B20: Daily Total PnL (Realized Closed PnL + Open Unrealized PnL - Transaction Fees)
    * Prevents unrealized drawdown blindness by accounting for mark-to-market open position losses.
    */
-  public getDailyTotalPnLSol(mode: ExecutionMode = 'LIVE'): number {
-    const closedPnL = this.getDailyRealizedPnLSol(mode);
-    const openPositions = this.loadPositions().filter(
-      (p) => p.executionMode === mode && (p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED')
-    );
-    const openUnrealizedPnL = openPositions.reduce(
-      (sum, pos) => sum + (pos.unrealizedPnLSol ?? 0),
-      0
-    );
+  public getDailyTotalPnLSol(mode: ExecutionMode = 'LIVE', sinceMs: number = WorkstationDatabase.utcMidnightMs()): number {
+    const closedPnL = this.getDailyRealizedPnLSol(mode, sinceMs);
+    const openUnrealizedPnL = this.getOpenUnrealizedPnLSol(mode);
     // Q3: realized and unrealized PnL already contain every fee, tip and rent of the trades that produced a position (cost basis is the
     // whole wallet delta, proceeds are post-fee). Only the fee of a transaction that landed and failed has no position to sit in.
-    const unbookedFeesSol = this.getDailyUnbookedFeesLamports(mode) / 1e9;
+    const unbookedFeesSol = this.getDailyUnbookedFeesLamports(mode, sinceMs) / 1e9;
     return Number((closedPnL + openUnrealizedPnL - unbookedFeesSol).toFixed(6));
   }
 
@@ -925,15 +1093,13 @@ export class WorkstationDatabase {
    * Their cost is in no position's basis. Pre-written PENDING rows, rows that never reached the chain and rows that became positions
    * are not counted. A revert path has to record the landing slot for its fee to show up here.
    */
-  public getDailyUnbookedFeesLamports(mode: ExecutionMode): number {
-    const startOfDay = new Date();
-    startOfDay.setUTCHours(0, 0, 0, 0);
+  public getDailyUnbookedFeesLamports(mode: ExecutionMode, sinceMs: number = WorkstationDatabase.utcMidnightMs()): number {
     try {
       const res = this.db.prepare(`
         SELECT COALESCE(SUM(network_fee_lamports), 0) as total_fees
         FROM transactions
         WHERE execution_mode = ? AND submission_time >= ? AND reconciliation_state = 'REVERTED' AND landing_slot IS NOT NULL AND landing_slot > 0
-      `).get(mode, startOfDay.getTime()) as any;
+      `).get(mode, sinceMs) as any;
       return res?.total_fees || 0;
     } catch {
       return 0;

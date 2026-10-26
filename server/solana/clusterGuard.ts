@@ -156,9 +156,17 @@ export function rememberGenesisCheck(connection: object, env: NodeJS.ProcessEnv 
 }
 
 /**
+ * R1-1/N-27: drop a remembered pass for `connection`, so the next send asks the RPC for its genesis hash again. Called when the heartbeat's
+ * cluster check fails (`verifyCluster`), when the RPC endpoint is switched, and when the send-path check itself fails.
+ */
+export function forgetGenesisCheck(connection: object): void {
+  passedGenesisChecks.delete(connection);
+}
+
+/**
  * `assertClusterAllowed` for the send path, without a genesis RPC call on every order. A pass is remembered per Connection object for
- * GENESIS_CHECK_TTL_MS. A new Connection (RPC change or failover), a changed ALLOWED_CLUSTER or an expired entry checks again, and a failure is never
- * remembered. The localnet loopback check is cheap and always runs. The mainnet-beta refusal is `assertSendClusterAllowed`, which stays uncached.
+ * GENESIS_CHECK_TTL_MS. A new Connection (RPC change or failover), a changed ALLOWED_CLUSTER or an expired entry checks again, a failure is never
+ * remembered, and a failed check anywhere (`forgetGenesisCheck`) removes the pass. The localnet loopback check is cheap and always runs. The mainnet-beta refusal is `assertSendClusterAllowed`, which stays uncached.
  */
 export async function assertClusterAllowedCached(
   connection: Pick<Connection, 'getGenesisHash'> & { rpcEndpoint?: string },
@@ -173,7 +181,13 @@ export async function assertClusterAllowedCached(
     }
     return { cluster, genesisHash: hit.expected };
   }
-  const res = await assertClusterAllowed(connection, env);
+  let res: { cluster: AllowedCluster; genesisHash: string };
+  try {
+    res = await assertClusterAllowed(connection, env);
+  } catch (err) {
+    forgetGenesisCheck(connection);
+    throw err;
+  }
   rememberGenesisCheck(connection, env, now);
   return res;
 }

@@ -345,13 +345,6 @@ describe('Tier 2: Boundary & Corner Cases (Features 16 - 20)', () => {
       }
     });
 
-    it('B20.4: position held past maxHoldTime triggers MAX_HOLD_TIME exit', () => {
-      const maxHoldTimeMs = 300000; // 5 min
-      const entryTime = Date.now() - 301000; // 5 min 1 sec ago
-      const isExceeded = Date.now() - entryTime >= maxHoldTimeMs;
-      expect(isExceeded).toBe(true);
-    });
-
     it('B20.5: stop loss boundary: price at or below -20% triggers ExitEngine STOP_LOSS exit', () => {
       const engine = new ExitEngine();
       const entryPriceSol = 0.0001;

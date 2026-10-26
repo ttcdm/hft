@@ -47,7 +47,7 @@ describe('Q10b: mode, cluster and confirmation', () => {
     expect(call.success && (call.data as any).confirmLive).toBe(true);
     const src = fs.readFileSync('server.ts', 'utf8');
     const snipeBlock = src.slice(src.indexOf("'/api/social/signals/snipe'"), src.indexOf("'/api/telegram/config'"));
-    const calloutBlock = src.slice(src.indexOf("'/api/pumpfun/callouts/snipe'"), src.indexOf("'/api/pumpfun/callouts/toggle-autosnipe'"));
+    const calloutBlock = src.slice(src.indexOf("'/api/pumpfun/callouts/snipe'"), src.indexOf("'/api/pumpfun/callouts/rules'"));
     for (const block of [snipeBlock, calloutBlock]) expect(block).toMatch(/liveConfirmationRefusal\(executionCoordinator\.isLiveArmed\(\)/);
     expect(snipeBlock.indexOf('liveConfirmationRefusal')).toBeLessThan(snipeBlock.indexOf('markSniped'));
   });

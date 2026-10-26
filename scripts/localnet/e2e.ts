@@ -327,7 +327,7 @@ async function main() {
   }
   const curve = await call('GET', `/api/market/curve/${mint.toBase58()}`);
   rec('GET /api/market/curve/:mint (real reserves)', curve.status === 200 && curve.body?.success === true, JSON.stringify(curve.body).slice(0, 220));
-  const mainnetCfg = await call('POST', '/api/wallet/config', { walletAddress: trader.publicKey.toBase58(), rpcEndpoint: 'https://api.mainnet-beta.solana.com', enabledStrategies: { pumpFunSniper: true }, riskLimits: {} });
+  const mainnetCfg = await call('POST', '/api/wallet/config', { walletAddress: trader.publicKey.toBase58(), rpcEndpoint: 'https://api.mainnet-beta.solana.com', riskLimits: {} });
   rec('K6: POST /api/wallet/config with a mainnet RPC is refused', mainnetCfg.status === 400 && /CLUSTER_GUARD/.test(JSON.stringify(mainnetCfg.body)), JSON.stringify(mainnetCfg.body).slice(0, 260));
   const connAfter = await call('GET', '/api/wallet/state');
   rec('K6: RPC endpoint unchanged after the refused switch', JSON.stringify(connAfter.body).includes('mainnet') === false, 'wallet state mentions no mainnet endpoint');

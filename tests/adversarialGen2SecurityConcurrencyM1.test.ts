@@ -34,6 +34,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
       virtualSolReserves: 30_000_000_000n,
       virtualTokenReserves: 1_000_000_000_000_000n,
       realSolReserves: 5_000_000_000n,
+      realTokenReserves: 700_000_000_000_000n, // about 12% of the curve sold: a LIVE buy needs a readable progress
       marketDataTimestamp: Date.now(),
       isMintAuthorityRevoked: true,
       isFreezeAuthorityRevoked: true,
@@ -1012,7 +1013,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
     });
 
     it('5.1: verifies SQLite WAL mode and synchronous pragmas are enabled', () => {
-      // WorkstationDatabase executes PRAGMA journal_mode = WAL and synchronous = NORMAL on startup
+      // WorkstationDatabase executes PRAGMA journal_mode = WAL and synchronous = FULL on startup (P2.2; checked on a file DB in s253)
       expect(workstationDb).toBeDefined();
     });
 
@@ -1337,6 +1338,8 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
         context: { slot: 280009000 },
         value: { amount: '0', decimals: 6, uiAmount: 0 },
       } as any);
+      // Review E (S259): an empty answer is checked against the mint's owning program first; these mints are SPL Token mints
+      vi.spyOn(Connection.prototype, 'getAccountInfo').mockResolvedValue({ owner: TOKEN_PROGRAM_ID, lamports: 1, data: Buffer.alloc(82), executable: false } as any);
 
       const res = await coordinator.startupReconciliation();
 

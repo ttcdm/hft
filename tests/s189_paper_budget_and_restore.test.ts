@@ -129,6 +129,9 @@ describe('S189 a PAPER session downgraded only by a flapping readiness check com
   it('DEVNET_LIVE stays sticky on READINESS_RED', async () => {
     const c = new AutoSnipeController();
     (c as any).mode = 'DEVNET_LIVE';
+    // P1.4: a DEVNET_LIVE session whose coordinator is not LIVE and armed turns OFF before triggers are judged; stand in for an armed one
+    vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('LIVE');
+    vi.spyOn(executionCoordinator, 'isLiveArmed').mockReturnValue(true);
     vi.spyOn(executionCoordinator, 'getRealWalletBalanceSol').mockReturnValue(5);
     vi.spyOn(executionCoordinator, 'getLiveReadiness').mockReturnValue(readiness(false));
     const t0 = Date.now();

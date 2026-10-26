@@ -15,6 +15,7 @@ import { signalFeedBadge } from '../utils/signalBadge';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { probeBadge, probeLatency, hostOfService } from '../utils/probeBadge';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
+import { useAutoStatus, AutoModeBadge, type AutoMode } from './AutoPanel';
 import { buildPoolSnipeRequest } from '../utils/poolSnipe';
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { SnipeAmountControl } from './SnipeAmountControl';
@@ -67,6 +68,70 @@ import { hftAudio } from '../utils/audio';
 import { PumpFunHotCalloutsView } from './PumpFunHotCalloutsView';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
 
+/**
+ * P1.4 (N-12): the sniper tab's header. The auto mode shown is the auto controller's own (GET /api/auto/status), read-only: the
+ * controller is the only thing that buys automatically, from watch-window releases of pump.fun launches, and its mode is set in the
+ * Auto panel. This used to be an "Auto-Sniper ARMED/DISARMED" switch that flipped a flag only the aggregator callout loop reads, so
+ * "DISARMED" was shown while DEVNET_LIVE kept buying.
+ */
+export function SniperAutoHeader({ autoMode, halted }: { autoMode: AutoMode | null; halted?: boolean }) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#1E293B] pb-3" data-testid="sniper-auto-header">
+      <div className="flex items-center space-x-2">
+        <Bot className="w-5 h-5 text-cyan-400" />
+        <div>
+          <h3 className="text-sm font-bold text-white">Auto sniper (pump.fun watch window)</h3>
+          <p className="text-xs text-slate-400">
+            Auto buys come only from watch-window releases (HOT or READY) of new pump.fun launches on Solana, through the auto controller&apos;s gates. No Raydium, no Base, no social-signal auto trades.
+          </p>
+        </div>
+      </div>
+      <div className="flex items-center space-x-2">
+        <span className="text-xs font-mono text-slate-300">Auto mode:</span>
+        <AutoModeBadge mode={autoMode} halted={halted} />
+        <span className="text-[10px] text-slate-500 font-mono" data-testid="sniper-auto-pointer">read-only: change it in the Auto panel on the home screen</span>
+      </div>
+    </div>
+  );
+}
+
+/** The fixed exit rules as GET /api/memecoins/config reports them (server/exits/exitEngine.ts exitRulesSummary). */
+export interface ExitRulesData {
+  stopLossPct: number;
+  trailingStartPct: number;
+  trailingBelowHighPct: number;
+  takeProfit: Array<{ atPct: number; sellPct: number }>;
+  finalTrailBelowHighPct: number;
+  staleAfterMinutes: number;
+  staleBelowPct: number;
+}
+
+export function formatExitRules(r: ExitRulesData): string {
+  const tps = r.takeProfit.map((t) => `sell ${t.sellPct}% at +${t.atPct}%`).join(', ');
+  return `Exits (fixed): stop ${r.stopLossPct}%, trailing stop ${r.trailingBelowHighPct}% below the high from +${r.trailingStartPct}%, ${tps}, then trail ${r.finalTrailBelowHighPct}% below the high; sell all after ${r.staleAfterMinutes} min under +${r.staleBelowPct}%`;
+}
+
+/**
+ * The exit rules every position follows. This used to read "Auto TP / Auto SL" from the sniper config, numbers no exit ever used;
+ * the real rules are ExitEngine's constants, sent by the server.
+ */
+export function ExitRulesNote({ rules }: { rules: ExitRulesData | null }) {
+  return (
+    <span className="text-slate-500 hidden sm:inline text-[11px]" data-testid="exit-rules-note">
+      {rules ? formatExitRules(rules) : 'Exit rules not loaded from the server'}
+    </span>
+  );
+}
+
+/** What the Telegram "Save Config" click reports, from the server's answer (it used to say "saved securely" without waiting for one). */
+export function telegramSaveOutcome(res: any): { level: 'INFO' | 'WARNING'; title: string; message: string } {
+  if (res?.status === 'OK') {
+    const tokenNote = res.config?.botTokenSet ? 'a bot token is set' : 'no bot token is set';
+    return { level: 'INFO', title: 'TELEGRAM SETTINGS SAVED', message: `Saved in server memory until the next restart; ${tokenNote}. No alerts are sent automatically.` };
+  }
+  return { level: 'WARNING', title: 'TELEGRAM SETTINGS NOT SAVED', message: `The server did not confirm the save${res?.error ? `: ${res.error}` : ''}.` };
+}
+
 interface MemecoinSocialSniperModalProps {
   isOpen: boolean;
   onClose: () => void;
@@ -86,16 +151,15 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const [signals, setSignals] = useState<SocialSignal[]>([]);
   const [pools, setPools] = useState<MemecoinPool[]>([]);
   const [positions, setPositions] = useState<SniperPosition[]>([]);
+  const [exitRules, setExitRules] = useState<ExitRulesData | null>(null);
   const [sniperConfig, setSniperConfig] = useState<SniperBotConfig>({
     isAutoSnipeEnabled: false,
-    minConfidenceScore: 85,
     defaultSnipeAmountUsd: capitalTier === 'MICRO_10' ? 5.0 : 50.0,
     maxSlippagePct: 8.0,
     jitoTipSol: 0.005,
     takeProfitPct: 50.0,
     stopLossPct: 20.0,
     trailingStopEnabled: true,
-    requireMintRevoked: true,
     requireFreezeRevoked: true,
     maxDevHoldingPct: 5.0,
     telegramBotToken: '',
@@ -120,7 +184,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const [terminalHistory, setTerminalHistory] = useState<Array<{ sender: 'USER' | 'BOT'; text: string; time: string }>>([
     {
       sender: 'BOT',
-      text: '🤖 APEX QUANT TELEGRAM BOT ENGINE ONLINE\nListening to alpha channels and market maker bots on Telegram & X.com.\nType /help or /signals to view intelligence stream.',
+      text: '🤖 Local command console for the Telegram command handler. It does not read Telegram or X.com; commands typed here run on this server.\nType /help or /signals.',
       time: new Date().toLocaleTimeString(),
     },
   ]);
@@ -131,6 +195,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const [sendPingMsg, setSendPingMsg] = useState(false);
   const [isTestingDiagnostics, setIsTestingDiagnostics] = useState(false);
   const tradingMode = useTradingMode();
+  const autoStatus = useAutoStatus(); // P1.4 (N-12): the sniper tab mirrors the auto controller's mode; it does not set it
   const [diagnosticsResult, setDiagnosticsResult] = useState<any | null>(null);
   const [showDiagnosticsModal, setShowDiagnosticsModal] = useState(false);
 
@@ -211,6 +276,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
       const cfgData = await engineClient.getSniperConfig();
       if (cfgData?.config) setSniperConfig(cfgData.config);
+      if (cfgData?.exitRules) setExitRules(cfgData.exitRules);
     } catch (e) {
       console.error(e);
     } finally {
@@ -602,9 +668,6 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                   <span className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 font-mono text-[11px] border border-slate-700">
                     X.com KOLs & Smart Money
                   </span>
-                </div>
-                <div className="text-xs text-slate-400 font-mono">
-                  Autonomous Snipe Threshold: <strong className="text-emerald-400">&gt;={sniperConfig.minConfidenceScore}% Confidence</strong>
                 </div>
               </div>
 
@@ -1028,54 +1091,10 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
             <div className="space-y-5">
               {/* AUTONOMOUS SNIPER CONFIG PANEL */}
               <div className="p-4 rounded-xl bg-[#12192C] border border-[#1E293B] space-y-4">
-                <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#1E293B] pb-3">
-                  <div className="flex items-center space-x-2">
-                    <Bot className="w-5 h-5 text-cyan-400" />
-                    <div>
-                      <h3 className="text-sm font-bold text-white">Autonomous Social & MM Sniper Swarm</h3>
-                      <p className="text-xs text-slate-400">
-                        Automatically executes trades across Pump.fun, Raydium, and Base when social signals meet criteria.
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="flex items-center space-x-2">
-                    <span className="text-xs font-mono text-slate-300">Auto-Sniper:</span>
-                    <button
-                      onClick={async () => {
-                        const next = !sniperConfig.isAutoSnipeEnabled;
-                        setSniperConfig({ ...sniperConfig, isAutoSnipeEnabled: next });
-                        await engineClient.updateSniperConfig({ isAutoSnipeEnabled: next });
-                      }}
-                      className={`px-3 py-1 rounded-full text-xs font-bold font-mono transition ${
-                        sniperConfig.isAutoSnipeEnabled
-                          ? 'bg-emerald-500 text-black shadow-lg shadow-emerald-500/30'
-                          : 'bg-slate-800 text-slate-400 border border-slate-700'
-                      }`}
-                    >
-                      {sniperConfig.isAutoSnipeEnabled ? 'ARMED & ACTIVE' : 'DISARMED'}
-                    </button>
-                  </div>
-                </div>
+                <SniperAutoHeader autoMode={autoStatus?.mode ?? null} halted={!!autoStatus?.haltReason} />
 
                 {/* Configuration Inputs */}
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-xs font-mono">
-                  <div>
-                    <label className="block text-slate-400 text-[10px] mb-1">
-                      Min Confidence Score
-                    </label>
-                    <input
-                      type="number"
-                      min="50"
-                      max="100"
-                      value={sniperConfig.minConfidenceScore}
-                      onChange={(e) =>
-                        setSniperConfig({ ...sniperConfig, minConfidenceScore: Number(e.target.value) })
-                      }
-                      className="w-full bg-[#141B2D] border border-[#1E293B] rounded p-2 text-white font-mono outline-none focus:border-cyan-400"
-                    />
-                  </div>
-
                   <div>
                     <label className="block text-slate-400 text-[10px] mb-1">
                       Snipe Amount (USD)
@@ -1108,7 +1127,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
                   <div>
                     <label className="block text-slate-400 text-[10px] mb-1">
-                      Take-Profit Target (%)
+                      Take-Profit Target (%) (not used by exits)
                     </label>
                     <input
                       type="number"
@@ -1197,9 +1216,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                             </button>
                           )}
                         </div>
-                        <span className="text-slate-500 hidden sm:inline text-[11px]">
-                          Auto TP: +{sniperConfig.takeProfitPct}% | Auto SL: -{sniperConfig.stopLossPct}%
-                        </span>
+                        <ExitRulesNote rules={exitRules} />
                       </div>
                     </div>
 
@@ -1389,7 +1406,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                     <span>Telegram API Credentials</span>
                   </h4>
                   <p className="text-slate-400 text-[11px]">
-                    Connect your private BotFather token to broadcast instant pump and migration alerts to your private channel.
+                    A bot token lets you test the connection and send one ping. Nothing is sent to Telegram automatically: alert forwarding is not built, and commands run only when something posts to /api/telegram/webhook.
                   </p>
 
                   <div>
@@ -1420,12 +1437,13 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
                   <div className="flex items-center space-x-2 pt-1">
                     <button
-                      onClick={() => {
-                        engineClient.updateTelegramConfig({
+                      onClick={async () => {
+                        const res = await engineClient.updateTelegramConfig({
                           botToken: sniperConfig.telegramBotToken,
                           chatId: sniperConfig.telegramChatId,
                         });
-                        onAlertTrigger?.('INFO', 'CONFIG SAVED', 'Telegram credentials saved securely.');
+                        const out = telegramSaveOutcome(res);
+                        onAlertTrigger?.(out.level, out.title, out.message);
                       }}
                       className="flex-1 py-2 rounded bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-slate-700 font-bold text-xs transition"
                     >

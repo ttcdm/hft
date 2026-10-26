@@ -151,7 +151,7 @@ describe('Tier 1: Feature Coverage (Features 21 - 25)', () => {
       const result = riskEngine.evaluateOrder(validReq);
       expect(result.approved).toBe(false);
       expect(result.reasonCode).toBe('DAILY_LOSS_LIMIT');
-      expect(result.message).toContain('daily stop limit');
+      expect(result.message).toContain('Net daily PnL floor');
     });
   });
 

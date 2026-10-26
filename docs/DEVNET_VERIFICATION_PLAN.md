@@ -59,7 +59,7 @@ Devnet facts checked by raw JSON-RPC (no repo code): genesis `EtWTRABZ…krZBG`;
 ### Phase A — local, safe, no code changes
 1. `npm run typecheck`, `npx eslint .`, `npx vitest run` (full suite, unfiltered).
 2. `npm run build` → `dist/server.cjs`.
-3. Boot `node dist/server.cjs` from scratch cwd with sanitized `.env`, `PORT=3001`, network guard preloaded. Check startup logs (no unhandled rejections, no `ERR_INVALID_ARG_VALUE`, no module errors), `GET /`, `GET /api/health`, `POST /api/auth/login` + `GET /api/auth/session`, WS `ws://127.0.0.1:3001/ws/engine` auth handshake, clean SIGTERM.
+3. Boot `node dist/server.cjs` from a scratch (`mkdtemp`) cwd with `dist` linked in, `NODE_ENV=production`, `APEX_ENV_FILE=''`, a scratch `APEX_DB_PATH` and a `SIGNER_KEYPAIR_PATH` that does not exist (`npm run smoke` does all of this), `APP_PORT=3001`, network guard preloaded, and never next to a running instance. Check startup logs (no unhandled rejections, no `ERR_INVALID_ARG_VALUE`, no module errors), `GET /`, `GET /api/health`, `POST /api/auth/login` + `GET /api/auth/session`, WS `ws://127.0.0.1:3001/ws/engine` auth handshake, clean SIGTERM.
 
 ### Phase B — devnet E2E (needs Mike's go-ahead, see Decision)
 Requires the real Solana/Pump libraries. Proposed: copy the repo (minus `node_modules`, `.env`, DBs, keypairs) into a scratch folder, `npm install` the exact versions already in `package.json` there, and run everything from that copy. The repo itself is not touched.

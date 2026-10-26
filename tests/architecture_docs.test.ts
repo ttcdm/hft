@@ -5,7 +5,7 @@ import path from 'node:path';
 /**
  * docs/ARCHITECTURE.md must not name code that is gone. Two checks, both offline:
  *   1. every file or folder named in backticks exists (paths relative to the repo root, or to docs/ for ../ links);
- *   2. every Mermaid node written as `functionName<br/>file.ts` names a function the file still defines.
+ *   2. every Mermaid node written as `file.ts: functionName` names a function the file still defines.
  * It cannot tell whether an arrow still points the right way; a person has to read the diagram against the code for that.
  */
 const DOC = 'docs/ARCHITECTURE.md';
@@ -36,8 +36,8 @@ describe('docs/ARCHITECTURE.md matches the tree', () => {
   });
 
   const mermaid = [...text.matchAll(/```mermaid([\s\S]*?)```/g)].map((m) => m[1]);
-  const nodes = mermaid.flatMap((block) => [...block.matchAll(/\["([^"]+)"\]/g)].map((m) => m[1])).filter((l) => l.includes('<br/>'));
-  const checked = nodes.map((l) => l.split('<br/>')).filter(([fn, file]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(fn.trim()) && /\.tsx?$/.test(file.trim()));
+  const labels = mermaid.flatMap((block) => [...block.matchAll(/\["([^"]+)"\]/g)].map((m) => m[1]));
+  const checked = labels.map((l) => l.split(': ')).filter(([file, fn]) => /^[A-Za-z0-9_.]+\.tsx?$/.test(file) && /^[A-Za-z_][A-Za-z0-9_]*$/.test(fn ?? '')).map(([file, fn]) => [fn, file]);
 
   it('has function nodes to check', () => {
     expect(checked.length).toBeGreaterThan(15);

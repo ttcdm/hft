@@ -10,8 +10,10 @@ import {
   TransactionMessage,
   VersionedTransaction,
   ComputeBudgetProgram,
+  Keypair,
 } from '@solana/web3.js';
 import { localSigner } from '../server/solana/signer';
+import { parseSecretKey } from '../server/solana/parseSecretKey';
 
 const DEVNET_GENESIS_HASH = 'EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG';
 const MAINNET_GENESIS_HASH = '5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d';
@@ -52,6 +54,11 @@ async function runDevnetVerification() {
     throw new Error(`Local signer is not ready: status is ${signerStatus}`);
   }
   const walletPubkey = localSigner.getPublicKey();
+  // R1-121: sign only when the app's signer is the throwaway key in SIGNER_KEYPAIR_PATH, never a key from the shell or an env file.
+  const throwaway = Keypair.fromSecretKey(parseSecretKey(fs.readFileSync(keyPath, 'utf8').trim())).publicKey;
+  if (!walletPubkey.equals(throwaway)) {
+    throw new Error(`The signer is ${walletPubkey.toBase58()}, not the throwaway key in SIGNER_KEYPAIR_PATH (${throwaway.toBase58()}). Nothing was signed.`);
+  }
   console.log(`[3/6] Signer Status: READY`);
   console.log(`      Wallet Public Key: ${walletPubkey.toBase58()}`);
 

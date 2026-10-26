@@ -14,13 +14,18 @@ describe('S207: a kill trigger that drops DEVNET_LIVE to SHADOW also disarms the
     vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
     vi.stubEnv('ALLOWED_CLUSTER', 'devnet');
     vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('LIVE');
+    // P1.4: a DEVNET_LIVE session whose coordinator reports itself disarmed turns OFF before any trigger is judged, so the stand-in
+    // for an armed LIVE coordinator must report armed too (until the trigger disarms it)
+    let armed = true;
+    vi.spyOn(executionCoordinator, 'isLiveArmed').mockImplementation(() => armed);
     vi.spyOn(executionCoordinator, 'syncRealWalletBalance').mockResolvedValue(null);
     const bal = vi.spyOn(executionCoordinator, 'getRealWalletBalanceSol');
     bal.mockReturnValue(1);
     const ok = await autoSnipeController.setMode('DEVNET_LIVE', { confirmationCode: DEVNET_CONFIRMATION_CODE });
     expect(ok.ok, ok.error).toBe(true);
 
-    const disarm = vi.spyOn(executionCoordinator, 'armLiveTrading');
+    const realArm = executionCoordinator.armLiveTrading.bind(executionCoordinator);
+    const disarm = vi.spyOn(executionCoordinator, 'armLiveTrading').mockImplementation((a, c) => { if (!a) armed = false; return realArm(a, c); });
     bal.mockReturnValue(0.019); // reserve 0.015 + one trade 0.005 -> WALLET_LOW
     const hits = await autoSnipeController.checkTriggers();
     expect(hits.map((h) => h.code)).toContain('WALLET_LOW');

@@ -26,6 +26,7 @@ import {
   VALID_PUMP_MINT_2,
   createSimulatedBondingCurveState,
 } from './e2e/helpers/simulatedStates';
+import { settleLeftoverLiveBuys } from './helpers/leftoverBuys';
 
 describe('Empirical Adversarial Challenger Suite: Protocol & Execution Correctness (R0.1 - R0.6)', () => {
   let mockRpc: MockSolanaRpc;
@@ -51,6 +52,7 @@ describe('Empirical Adversarial Challenger Suite: Protocol & Execution Correctne
   }
 
   beforeEach(async () => {
+    settleLeftoverLiveBuys();
     mockRpc = new MockSolanaRpc();
     mockJito = new MockJitoEngine();
     await mockJito.start();

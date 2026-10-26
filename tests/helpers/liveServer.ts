@@ -103,6 +103,7 @@ export const baseEnv = (dir: string, extra: Record<string, string>): Record<stri
   APEX_ENV_FILE: '', // never the real .env
   APEX_DB_PATH: path.join(dir, 'app.db'),
   SIGNER_KEYPAIR_PATH: throwawayKeyFile(dir),
+  APEX_LOCK_DIR: path.join(dir, 'locks'), // P1.1: the signer lock of a test server stays in its scratch folder
   OPERATOR_PASSWORD: 'behaviour-test-password',
   // S7: no test child may default to a public RPC (it is outside the vitest network guard): a closed loopback port on the local cluster.
   SOLANA_RPC_URL: 'http://127.0.0.1:9',
@@ -114,12 +115,13 @@ export const baseEnv = (dir: string, extra: Record<string, string>): Record<stri
   ...extra,
 });
 
-export async function startApp(dir: string, env: Record<string, string>): Promise<AppHandle> {
+/** `opts.entry` boots another entry file that starts the real server (e.g. scripts/visual/serve_fixture.ts) instead of server.ts. */
+export async function startApp(dir: string, env: Record<string, string>, opts: { entry?: string } = {}): Promise<AppHandle> {
   const port = await freePort();
   const full = { ...baseEnv(dir, env), APP_PORT: String(port) };
   // S27: `node --import tsx`, not the node_modules/.bin/tsx wrapper. The wrapper does not relay SIGKILL, so a crash test that killed it left the real server running.
   const tsxEsm = pathToFileURL(createRequire(path.resolve('package.json')).resolve('tsx/esm')).href;
-  const child: ChildProcess = spawn(process.execPath, ['--import', tsxEsm, path.resolve('server.ts')], { cwd: dir, env: full, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child: ChildProcess = spawn(process.execPath, ['--import', tsxEsm, path.resolve(opts.entry ?? 'server.ts')], { cwd: dir, env: full, stdio: ['ignore', 'pipe', 'pipe'] });
   let log = '';
   child.stdout?.on('data', (d) => (log += d));
   child.stderr?.on('data', (d) => (log += d));

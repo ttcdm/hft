@@ -148,7 +148,16 @@ export class TradeReconciler {
         tokenDecimals = tokenBalRes.value.decimals;
       }
     } catch (e: any) {
-      // ATA likely does not exist yet (common for fresh buys) -> 0 balance
+      // The ATA does not exist yet (common for fresh buys): a balance of 0. P2.3 (R1-88, R1-138, N-26): any other error (a 429, a timeout)
+      // says nothing about the balance. In LIVE (the buy path) it throws: a 0 taken for a wallet that already holds the token would make the
+      // landed check read the old balance as this buy's fill. A sell (called without 'LIVE') keeps 0, so a stop-loss is never blocked on it;
+      // its fill comes from the transaction's own token balances, and a 0 baseline can only make its landed check say "not landed".
+      // S260/S259: only "could not find account" is an absent account; any other "Invalid param" says nothing about the balance.
+      // S269 (devnet run 12): "not a Token account" is a definite 0 too. The address this buy's landed check reads holds no token account,
+      // which is what an ATA closed by an earlier 100% sell reads as on devnet; refusing it blocked every re-buy of a mint after a close.
+      if (executionMode === 'LIVE' && !/could not find account|not a Token account/i.test(String(e?.message ?? e))) {
+        throw new Error(`PRE_TRADE_SNAPSHOT_FAILED: Cannot read the token balance in LIVE mode: ${e?.message ?? e}`, { cause: e });
+      }
       tokenBalanceRaw = '0';
     }
 
@@ -672,8 +681,6 @@ export class TradeReconciler {
 /** On-chain mark prices for open positions. No random walks and no estimates: a mint with no readable price is simply absent from the result. */
 // Real Mark Price Service (No synthetic random walks)
 export class RealMarkPriceService {
-  private lastFetchTimestamp: number = 0;
-
   /** Spot price in SOL per token for each mint: from the bonding curve while it is open, from the canonical PumpSwap pool once it has migrated. Each entry says which source it came from and when it was read. */
   // Query on-chain bonding curve reserves for active open positions
   public static async queryOnChainMarkPrices(
@@ -690,11 +697,9 @@ export class RealMarkPriceService {
     for (const mintStr of uniqueMints) {
       try {
         const mintPubkey = new PublicKey(mintStr);
-        const state = await PumpCurveService.fetchPumpMarketState({
-          connection,
-          mint: mintPubkey,
-          executionMode,
-        });
+        const read = await PumpCurveService.fetchPumpMarketStateResult({ connection, mint: mintPubkey, executionMode });
+        // P1.6 (N-42): a LIVE curve whose fee tier could not be verified still has readable reserves; its spot price needs no fee.
+        const state = read.state ?? read.failure.sellableState ?? null;
         if (state && !state.complete && state.virtualTokenReserves > 0n) {
           const spotPriceSol =
             Number(state.virtualSolReserves) /
@@ -714,7 +719,9 @@ export class RealMarkPriceService {
         } else {
           // If bonding curve completed or not found, check canonical PumpSwap AMM pool
           const { PumpSwapVenueService } = await import('../solana/pumpSwapService');
-          const poolState = await PumpSwapVenueService.getPoolState(connection, mintPubkey, executionMode);
+          // P1.6 (R1-31): a LIVE mark never comes from the 15 s pool cache (a migrated position's stop must see every price move, and
+          // a pool created just after a cached "no pool" must be seen on the next pass).
+          const poolState = await PumpSwapVenueService.getPoolState(connection, mintPubkey, executionMode, { fresh: executionMode === 'LIVE' });
           if (poolState && poolState.spotPriceSol > 0) {
             result[mintStr] = {
               priceSol: poolState.spotPriceSol,

@@ -35,18 +35,22 @@ export const PAPER_STALE_REFRESH_PER_PASS = 5;
 /** PAPER positions with no price get their own alert up to this many per pass; the rest share one alert with a count. */
 export const PAPER_INDIVIDUAL_ALERTS = 5;
 import { EligibilityFilter } from '../signals/eligibilityFilter';
+import { curveProgressPctOfState, curveProgressUnreadable, isCurveTooFar, curveTooFarReason } from '../signals/curveProgressCap';
 import { localSigner } from '../solana/signer';
 import { txBuilder, SolanaTransactionBuilder, PumpBuyParams, PumpSellParams } from '../solana/transactionBuilder';
 import { SolanaRpcTransport, JitoTransport } from '../solana/transports';
 import { riskEngine, estimateRoundTripCostLamports, MAX_ROUND_TRIP_COST_FRACTION, PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS } from '../risk/riskEngine';
 import { userVolumeAccumulatorPda } from '@pump-fun/pump-sdk';
 import { paperEngine, PaperExecutionEngine } from './paperEngine';
-import { workstationDb } from '../db/database';
+import { workstationDb, type PersistedTransaction } from '../db/database';
 import { getRandomJitoTipAccount, TOKEN_2022_PROGRAM_ID } from '../solana/programs';
 import { executionConfig } from '../solana/executionConfig';
 import { Logger, endpointOrigin } from '../middleware/enterprise';
 import { traced } from '../observability/tracing';
-import { allowedCluster, assertClusterAllowed, assertClusterAllowedCached, assertSendClusterAllowed, blockhashCheckEnabled, rememberGenesisCheck, resolveRpcUrl, verifyBlockhashIndependently } from '../solana/clusterGuard';
+import { acquireLock, dbLockPath, isPidAlive, signerLockPath, updateHeldLock } from '../system/instanceLock';
+import crypto from 'node:crypto';
+import { createTradingConnection } from '../solana/rpcConnection';
+import { allowedCluster, assertClusterAllowed, assertClusterAllowedCached, assertSendClusterAllowed, blockhashCheckEnabled, ClusterGuardError, forgetGenesisCheck, rememberGenesisCheck, resolveRpcUrl, verifyBlockhashIndependently } from '../solana/clusterGuard';
 import { PumpCurveService, TradeQuote, PumpMarketState, fetchTokenHolderDistribution } from '../solana/pumpCurve';
 import { TradeReconciler, RealMarkPriceService, PreTradeSnapshot } from './reconciliation';
 export type { PreTradeSnapshot };
@@ -93,10 +97,48 @@ export interface ExecutionResponse {
   correlationId: string;
 }
 
+/**
+ * S245: the waits before resending a SELL that the RPC refused with a rate limit (HTTP 429, -32007, "request limit reached"): three
+ * resends, 0.5 s, 1 s and 2 s apart. Every sell gets them (the stop-loss, the hard stop and the panic among them: one rate-limit answer
+ * must not leave a position open). 3.5 s of waits plus four bounded sends (RPC_REQUEST_TIMEOUT_MS each) is far inside a blockhash's
+ * ~60-90 s life, and the resent bytes are the same signed transaction, so it can land at most once. A BUY gets none: it is optional,
+ * its quote ages on a fast curve, and the next signal re-quotes; a rate-limited buy fails closed as SUBMIT_FAILED.
+ */
+export const SELL_RATE_LIMIT_BACKOFF_MS: readonly number[] = [500, 1_000, 2_000];
+
 /** Exit reasons that run even while all trading is halted (see closePosition). */
 // A blockhash lives ~60-90s; after this a sent-but-unseen sell can no longer land.
 const PENDING_SELL_WINDOW_MS = 100_000;
 const ORPHAN_MAX_AGE_MS = 15 * 60_000;
+/** P1.7: how long one exit pass waits for the sells it started before it ends; a longer sell keeps running and the next pass goes on. */
+export const EXIT_SELL_WAIT_MS = 2_500;
+/** P1.1: a sell claim older than this is stale (longer than a sell takes end to end: build, send, confirm, reconcile). */
+const EXIT_CLAIM_STALE_MS = 2 * PENDING_SELL_WINDOW_MS;
+/** One id per process run: a pid alone is reused, and in a container every restart of the app is PID 1 again. */
+const PROCESS_RUN_ID = crypto.randomUUID();
+/** The exit claim owner for one sell: `<pid>:<run id>:<nonce>`. */
+export const newExitClaimOwner = (): string => `${process.pid}:${PROCESS_RUN_ID}:${crypto.randomUUID()}`;
+/**
+ * P1.1: a claim whose process has died is stale at once (a crash mid-sell must not hold the stop-loss off). A claim with this process's pid
+ * but another run id (or the older `<pid>:<nonce>` form) was left by an earlier run that had the same pid, so it is dead too: after a
+ * container restart the app is PID 1 again, and `isPidAlive(1)` held the stop-loss off for EXIT_CLAIM_STALE_MS.
+ */
+export const exitClaimOwnerAlive = (owner: string): boolean => {
+  const [pidText, runId] = owner.split(':');
+  const pid = Number(pidText);
+  if (pid === process.pid) return owner.split(':').length === 3 && runId === PROCESS_RUN_ID;
+  return isPidAlive(pid);
+};
+
+/**
+ * The take-profit stage a filled exit leaves the position at: TAKE_PROFIT_1 and TAKE_PROFIT_2 advance it (never backwards), every other
+ * reason leaves it. Booked with the fill itself, and by startup recovery from the SELL row's reason, so a crash between the sell and a
+ * separate stage write cannot make the same take-profit fire again (R1-24, R1-91).
+ */
+export function exitStageAfterFill(reason: string | undefined, current: NormalizedPosition['exitStage']): NormalizedPosition['exitStage'] {
+  const reached = reason === 'TAKE_PROFIT_2' ? 2 : reason === 'TAKE_PROFIT_1' ? 1 : 0;
+  return Math.max(current ?? 0, reached) as NormalizedPosition['exitStage'];
+}
 
 /** A balance found in the wallet that this app never bought (cost basis unknown): watched with a hard stop, not a trade the app chose. */
 export const isRecoveredPosition = (p: { entryTxSignature?: string }): boolean => !!p.entryTxSignature?.startsWith('RECOVERED:');
@@ -156,10 +198,7 @@ export class ExecutionCoordinator {
     } else {
       this.isDefaultSingleton = Boolean(connectionOrIsSingleton);
       this.rpcEndpoint = resolveRpcUrl();
-      this.connection = new Connection(this.rpcEndpoint, {
-        commitment: 'confirmed',
-        confirmTransactionInitialTimeout: 30000,
-      });
+      this.connection = createTradingConnection(this.rpcEndpoint); // P1.7: bounded calls, no web3.js 429 sleeps
     }
     this.jitoTransport = new JitoTransport(this.connection);
     this.rpcTransport = new SolanaRpcTransport(this.connection);
@@ -171,10 +210,51 @@ export class ExecutionCoordinator {
         Logger.error(`[HALT] Trading is still halted from before the restart: ${persisted}`);
         this.raiseOperatorAlert('TRADING_HALTED', `All trading is halted (restored after a restart): ${persisted}. Protective exits (stop-loss, trailing stop, manual close, panic) still run; clear it with POST /api/auto/resume {clearHalt:true}.`);
       }
+      // The kill switch is in memory and off after a restart (by decision: LIVE boots disarmed, auto's OFF persists). An operator who
+      // tripped it must still hear that it no longer holds. The reset row makes the alert fire on this boot only.
+      const killSwitchTrip = workstationDb.getKillSwitchTripBeforeRestart();
+      if (killSwitchTrip) {
+        Logger.warn(`[KILL SWITCH] It was on before the restart (${killSwitchTrip}) and is off now`);
+        this.raiseOperatorAlert('KILL_SWITCH_WAS_ON', `The kill switch was on before the restart (${killSwitchTrip}) and is off now. LIVE is disarmed and auto keeps its persisted mode (a panic left it OFF); check why it was tripped before arming. Cleared by POST /api/auto/resume {clearHalt:true}.`);
+        workstationDb.logJournal('KILL_SWITCH_RESET', 'kill-switch', 'PAPER', { reason: 'process restart' });
+      }
     }
+    // P1.1 (N-51): the module singleton is built at import time and starts nothing; server.ts calls start() once its port is bound,
+    // so a second process that fails to boot never reconciles, runs the exit loop or polls the RPC. Instances built directly (tests,
+    // tools that pass their own Connection) start at once, as before.
+    if (!this.isDefaultSingleton) this.start();
+  }
+
+  private started = false;
+
+  /**
+   * P1.1: begin trading-side work: the instance locks (database file and signing key), the RPC connection check with startup
+   * reconciliation, the 3 s exit loop and the feed heartbeat. Idempotent. Throws InstanceLockError when another live process holds
+   * either lock, before anything has started.
+   */
+  public start(): void {
+    if (this.started) return;
+    const dbLock = dbLockPath(workstationDb.getDbPath());
+    if (dbLock) acquireLock(dbLock, { dbPath: workstationDb.getDbPath() });
+    let pub: string | null;
+    try {
+      pub = localSigner.getStatus() === 'READY' ? localSigner.getPublicKey().toBase58() : null;
+    } catch {
+      pub = null; // no key to lock; signTransaction takes the signer lock on the first signature anyway
+    }
+    if (pub) {
+      acquireLock(signerLockPath(pub), { walletPubkey: pub, dbPath: workstationDb.getDbPath() });
+      if (dbLock) updateHeldLock(dbLock, { walletPubkey: pub });
+    }
+    this.started = true;
+    this.seedPendingSellsFromLedger();
     this.initializeConnection();
     this.startAutoPositionMonitor();
     this.startMarketFeedHeartbeat();
+  }
+
+  public isStarted(): boolean {
+    return this.started;
   }
 
   private startMarketFeedHeartbeat() {
@@ -257,6 +337,10 @@ export class ExecutionCoordinator {
       await this.jitoTransport.probe();
       this.startJitoProbeLoop();
       if (!(await clusterCheck)) {
+        // S254 (L3): reconciliation is skipped here, so the heartbeat must run it once the RPC verifies. Its own check can pass before this
+        // one fails (the two run at once at boot); it then sees no cluster problem and, without this flag, never reconciled, which left
+        // the exit pass skipping every LIVE position with an unresolved sell for good.
+        this.bootConnectFailed = true;
         Logger.warn(`Solana RPC is not on the allowed cluster: ${this.clusterProblem}. Staying DISCONNECTED; the heartbeat re-checks.`);
         return;
       }
@@ -280,13 +364,18 @@ export class ExecutionCoordinator {
    */
   private async verifyCluster(): Promise<boolean> {
     try {
-      await assertClusterAllowed(this.connection);
+      const { genesisHash } = await assertClusterAllowed(this.connection);
+      // P2.2 (R1-89): the database remembers the cluster it was written for and refuses an RPC on another one.
+      const stamp = workstationDb.checkClusterStamp(genesisHash);
+      if (!stamp.ok && stamp.unreadable) throw new Error(`DB_CLUSTER_STAMP_UNREADABLE: the cluster stamp of ${workstationDb.getDbPath()} could not be read (${stamp.unreadable}); refusing to reconcile or trade until it can`);
+      if (!stamp.ok) throw new Error(`DB_CLUSTER_MISMATCH: ${workstationDb.getDbPath()} holds the ledger of genesis ${stamp.stored}, but the RPC is on ${genesisHash}; refusing to reconcile or trade against it`);
       rememberGenesisCheck(this.connection); // S208: readiness warms the send-path cache
       this.clusterProblem = null;
       return true;
     } catch (err: any) {
       this.clusterProblem = err?.message ?? 'cluster check failed';
       this.rpcHealth = 'DISCONNECTED';
+      forgetGenesisCheck(this.connection); // R1-1/N-27: sends must not ride an earlier pass for up to 60 s
       return false;
     }
   }
@@ -295,7 +384,11 @@ export class ExecutionCoordinator {
   private async blockhashProblem(tx: VersionedTransaction, side: 'BUY' | 'SELL'): Promise<string | null> {
     if (!blockhashCheckEnabled()) return null;
     const verdict = await traced('guard.blockhash', () => verifyBlockhashIndependently(tx.message.recentBlockhash), { 'apex.side': side });
-    if (verdict.ok) return null;
+    if (verdict.ok) {
+      // S227: say so when the check really ran, so a run that has it on shows it; a skipped check (flag off, localnet) is silent.
+      if (!('skipped' in verdict && verdict.skipped)) Logger.info(`[S210] independent blockhash check passed for the ${side}`);
+      return null;
+    }
     if (side === 'SELL' && !verdict.definite) {
       Logger.warn(`[S210] SELL not blocked: ${verdict.reason}`);
       return null;
@@ -474,16 +567,25 @@ export class ExecutionCoordinator {
     };
   }
 
+  private connectionChangeListeners = new Set<(conn: Connection) => void>();
+
+  /**
+   * P4.2 (R1-63): called with the new trading Connection after every successful `setRpcEndpoint`, so what holds a Connection of its
+   * own (the pump log listener) moves with it. Returns the unsubscribe function.
+   */
+  public onConnectionChange(fn: (conn: Connection) => void): () => void {
+    this.connectionChangeListeners.add(fn);
+    return () => { this.connectionChangeListeners.delete(fn); };
+  }
+
   // Update RPC endpoint with safe re-instantiation
   public async setRpcEndpoint(newEndpoint: string): Promise<{ success: boolean; latencyMs: number; error?: string }> {
     try {
       if (resolveRpcUrl(newEndpoint) !== newEndpoint.trim()) {
         throw new Error(`CLUSTER_GUARD: RPC endpoint rejected (looks like mainnet while ALLOWED_CLUSTER=${allowedCluster()})`);
       }
-      const newConn = new Connection(newEndpoint, {
-        commitment: 'confirmed',
-        confirmTransactionInitialTimeout: 30000,
-      });
+      const newConn = createTradingConnection(newEndpoint); // P1.7: the replacement is bounded the same way
+      forgetGenesisCheck(this.connection); // R1-1: a switch never keeps the old connection's pass
       await assertClusterAllowed(newConn);
       rememberGenesisCheck(newConn);
       const t0 = performance.now();
@@ -492,10 +594,15 @@ export class ExecutionCoordinator {
 
       this.rpcEndpoint = newEndpoint;
       this.connection = newConn;
+      this.clusterProblem = null; // the new connection just passed the genesis check above
       this.rpcLatencyMs = latency;
       this.rpcHealth = latency > 800 ? 'DEGRADED' : 'HEALTHY';
       this.jitoTransport = new JitoTransport(this.connection);
       this.rpcTransport = new SolanaRpcTransport(this.connection);
+      PumpCurveService.resetGlobalCache(); // P4.2 (N-43): the pump Global and FeeConfig are read again from the new endpoint
+      for (const fn of this.connectionChangeListeners) {
+        try { fn(newConn); } catch (e: any) { Logger.warn(`RPC switch listener failed: ${e?.message || e}`); }
+      }
 
       Logger.info(`Switched Solana RPC endpoint to ${endpointOrigin(newEndpoint)} (${latency}ms)`);
       await this.syncRealWalletBalance();
@@ -663,6 +770,7 @@ export class ExecutionCoordinator {
         .finally(() => {
           if (timer) clearTimeout(timer);
           if (this.reconcileInFlight === run) this.reconcileInFlight = null;
+          this.firstReconciliationDone = true; // P2.2: whatever the outcome (a timeout included), exits stop waiting for it
         });
       this.reconcileInFlight = run;
     }
@@ -679,7 +787,15 @@ export class ExecutionCoordinator {
     const issues: string[] = [];
 
     // 0. A reconcile never vouches for an RPC on the wrong cluster (it would otherwise make a mainnet-answering RPC armable).
-    if (!(await this.verifyCluster())) issues.push(`RPC is not on the allowed cluster: ${this.clusterProblem}`);
+    // A wrong-cluster RPC answers "no such signature" for every real one, so steps 4 and 5 would mark pending and orphaned rows TIMED_OUT
+    // (a landed sell then never gets its PnL, a landed buy its cost basis). While it is untrusted they wait, the pass is a mismatch, and
+    // it is tried again.
+    const clusterTrusted = await this.verifyCluster();
+    if (!clusterTrusted) {
+      issues.push(`RPC is not on the allowed cluster: ${this.clusterProblem}`);
+      mismatchesCount++;
+      this.scheduleReconcileRetry();
+    }
 
     // 1. Check signer status
     const signerStatus = localSigner.getStatus();
@@ -692,7 +808,9 @@ export class ExecutionCoordinator {
 
     // 4. Resolve pending transactions from previous runs with actual on-chain transaction verification
     const pendingTxs = workstationDb.getPendingTransactions();
-    if (pendingTxs.length > 0) {
+    if (pendingTxs.length > 0 && !clusterTrusted) {
+      issues.push(`${pendingTxs.length} pending transaction(s) left as they are until the RPC is on the allowed cluster`);
+    } else if (pendingTxs.length > 0) {
       Logger.info(`Found ${pendingTxs.length} pending transactions from previous session to reconcile.`);
       const walletPubkey = signerStatus === 'READY' ? localSigner.getPublicKey() : null;
 
@@ -774,10 +892,14 @@ export class ExecutionCoordinator {
                       }
 
                       targetPos.exitTxSignature = pTx.signature;
+                      // R1-24: a take-profit sell that landed before the crash keeps its stage, or the next pass sells the same take-profit again
+                      targetPos.exitStage = exitStageAfterFill(pTx.exitReason, targetPos.exitStage);
+                      if (pTx.exitReason) targetPos.exitReason = pTx.exitReason;
                       targetPos.exitTimestamp = recovery.blockTime ?? Date.now();
                       targetPos.exitSlot = recovery.slot ?? txDetails.slot;
                       targetPos.lastUpdatedTimestamp = Date.now();
-                      workstationDb.savePosition(targetPos);
+                      // S258: one write with the RECONCILED row; if it fails nothing is booked and the row stays PENDING for the next pass
+                      workstationDb.saveSellBooking(targetPos, pTx.signature, { slot: txDetails.slot, networkFeeLamports: pTx.networkFeeLamports });
                       pTx.reconciliationState = 'RECONCILED';
                       Logger.info(`Successfully recovered interrupted SELL trade for ${recovery.mint} (${pTx.signature})`);
                     } else if (workstationDb.loadPositions('LIVE').some((p) => p.mint === recovery.mint && p.status === 'CLOSED')) {
@@ -804,8 +926,17 @@ export class ExecutionCoordinator {
               }
             }
             workstationDb.saveTransaction(pTx);
+          } else if (typeof pTx.lastValidBlockHeight === 'number' && pTx.lastValidBlockHeight > 0) {
+            // P2.1 here too: with no status, the row is decided by the chain's block height against its lastValidBlockHeight, not by its
+            // age (a slow RPC or a long restart said nothing about whether it can still land). Not expired yet: keep it and look again.
+            if (await this.blockhashExpired(pTx)) {
+              pTx.reconciliationState = 'TIMED_OUT';
+              workstationDb.saveTransaction(pTx);
+            } else {
+              this.scheduleReconcileRetry();
+            }
           } else if (Date.now() - pTx.submissionTime > 120000) {
-            pTx.reconciliationState = 'TIMED_OUT';
+            pTx.reconciliationState = 'TIMED_OUT'; // a row written before lastValidBlockHeight was stored
             workstationDb.saveTransaction(pTx);
           }
         } catch (err: any) {
@@ -828,33 +959,34 @@ export class ExecutionCoordinator {
       for (const pos of activeLivePositions) {
         try {
           const mintPubkey = new PublicKey(pos.mint);
-          // Query ATA balance using position's actual token program (supports Token-2022 & standard SPL)
-          const tokenProgramId = pos.baseTokenProgram ? new PublicKey(pos.baseTokenProgram) : undefined;
-          const ata = PumpCurveService.getAssociatedTokenAddress(mintPubkey, walletPubkey, tokenProgramId);
           // N5: "the account does not exist" is a confirmed zero; any other RPC failure is unknown and must not close a position.
-          let onChainAmount: bigint | null = null;
-          try {
-            const balRes = await this.connection.getTokenAccountBalance(ata, 'confirmed');
-            onChainAmount = BigInt(balRes?.value?.amount ?? '0');
-          } catch (e: any) {
-            if (/could not find account|Invalid param/i.test(String(e?.message))) onChainAmount = 0n;
-            else throw e;
-          }
+          // Audit 2026-10-22 (F1): the read goes through `readHeldTokens`, the exit path's read (P1.6), so an empty answer from an RPC
+          // that is not on the allowed cluster, or from a slot before the buy landed, is `untrusted` and leaves the row open too.
+          const read = await this.readHeldTokens(pos, walletPubkey, mintPubkey);
+          if (read.held === null) throw new Error(read.error ?? 'the token balance could not be read');
+          const onChainAmount = read.held;
 
-          if (onChainAmount <= 0n && unsettledSellMints.has(pos.mint)) {
+          if (onChainAmount <= 0n && read.untrusted) {
+            mismatchesCount++; // unknown is not zero: the row stays open and readiness stays at MISMATCH until a trusted read
+            issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) shows no tokens, but the read is not trusted (${read.untrusted}); left open`);
+            this.scheduleReconcileRetry();
+          } else if (onChainAmount <= 0n && unsettledSellMints.has(pos.mint)) {
             mismatchesCount++;
             issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) shows no tokens but its sell ${String(unsettledSellMints.get(pos.mint)).slice(0, 8)}... is not settled yet; left open so the fill and its PnL can be applied`);
             this.scheduleReconcileRetry();
           } else if (onChainAmount <= 0n) {
             // The tokens are gone (sold or moved outside this app). Left OPEN this position blocks arming until someone edits the DB,
             // while the exit loop keeps trying to sell an empty account. Close it with the reason on the record, and say so.
+            // P2.3 (N-28): with no sell found, the basis is booked as a realized loss (REALIZED_ASSUMED_LOSS), so the daily and session
+            // loss caps and the expectancy count it. Booking 0 made a vanished position look free.
+            const assumedLossSol = this.bookAssumedLoss(pos, 'startup reconciliation');
             pos.status = 'CLOSED';
             pos.tokenQuantityRaw = '0';
             pos.costBasisLamports = 0;
-            pos.exitReason = 'RECONCILED_ZERO_BALANCE: no tokens in the wallet at startup reconciliation';
+            pos.exitReason = 'RECONCILED_ZERO_BALANCE: no tokens in the wallet at startup reconciliation (REALIZED_ASSUMED_LOSS)';
             pos.lastUpdatedTimestamp = Date.now();
             workstationDb.savePosition(pos);
-            this.raiseOperatorAlert('POSITION_GONE', `Position ${pos.symbol || pos.mint.slice(0, 6)} was recorded open but the wallet holds none of it. Closed in the database; realized PnL for it is unknown.`, pos.id);
+            this.raiseOperatorAlert('POSITION_GONE', `Position ${pos.symbol || pos.mint.slice(0, 6)} was recorded open but the wallet holds none of it. Closed in the database and booked as a loss of its cost basis (${assumedLossSol.toFixed(6)} SOL), since no sell was found.`, pos.id);
             issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) had no on-chain balance: closed in the database`);
           }
         } catch (e: any) {
@@ -971,6 +1103,9 @@ export class ExecutionCoordinator {
     const candidates = workstationDb
       .loadTransactionsInStates(['RECONCILIATION_REQUIRED'])
       .filter((t) => t.direction === 'BUY' && t.executionMode === 'LIVE' && t.reconciliationState === 'RECONCILIATION_REQUIRED');
+    // On a wrong-cluster RPC every signature reads as "not found" and its block height means nothing: a row decided there could be
+    // TIMED_OUT although the buy landed. Leave them all for a pass on a trusted RPC (the background retries keep trying).
+    if (this.clusterProblem !== null) return { recovered, stillOrphaned: candidates.map((t) => t.signature) };
     for (const t of candidates) {
       try {
         if (workstationDb.loadPositions().some((p) => p.entryTxSignature === t.signature)) {
@@ -989,9 +1124,10 @@ export class ExecutionCoordinator {
           t.reconciliationState = 'REVERTED';
           t.error = recovery.error;
           workstationDb.saveTransaction(t);
-        } else if (recovery.error && /not found on-chain/i.test(recovery.error) && Date.now() - t.submissionTime > ORPHAN_MAX_AGE_MS) {
-          // N6: a transaction that is still not on chain long after its blockhash expired never landed. Any tokens it did buy would be
-          // found by the wallet scan; leaving the row open would hold readiness at MISMATCH forever.
+        } else if (recovery.error && /not found on-chain/i.test(recovery.error) && (await this.blockhashExpired(t) || Date.now() - t.submissionTime > ORPHAN_MAX_AGE_MS) && (await this.signatureUnseen(t.signature))) {
+          // N6: a transaction that is still not on chain after its blockhash expired never landed. Any tokens it did buy would be
+          // found by the wallet scan; leaving the row open would hold readiness at MISMATCH, and block buys of the mint, until a restart.
+          // P2.1: decided by the chain's block height against the row's lastValidBlockHeight; the 15-minute age is only for rows without one.
           t.reconciliationState = 'TIMED_OUT';
           t.error = 'never landed: not found on chain after the blockhash window';
           workstationDb.saveTransaction(t);
@@ -1084,6 +1220,33 @@ export class ExecutionCoordinator {
       }
     }
     return { untracked, adopted };
+  }
+
+  /**
+   * P2.1: true when the chain's `confirmed` block height is past the row's lastValidBlockHeight, so the transaction can no longer land.
+   * False when the row has no height or the height cannot be read (the caller then falls back to the wall-clock rule).
+   */
+  private async blockhashExpired(t: PersistedTransaction): Promise<boolean> {
+    if (!(typeof t.lastValidBlockHeight === 'number' && t.lastValidBlockHeight > 0)) return false;
+    try {
+      return (await this.connection.getBlockHeight('confirmed')) > t.lastValidBlockHeight;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * S250: true only when the signature has no status, history included. getTransaction answers null both for a transaction that never
+   * landed and for one this node cannot return (pruned history, not indexed yet), so "not found" alone does not prove it never landed.
+   * A status, or a read that fails, is false: the row stays for the next pass.
+   */
+  private async signatureUnseen(signature: string): Promise<boolean> {
+    try {
+      const st = await this.connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
+      return Array.isArray(st?.value) && st.value.length === 1 && st.value[0] === null;
+    } catch {
+      return false;
+    }
   }
 
   /** Delays (ms) at which a failed live-buy reconciliation is retried in the background. Tests set [] . */
@@ -1231,7 +1394,7 @@ export class ExecutionCoordinator {
 
     // 2. Query on-chain bonding curve marks for active positions. A mint that failed recently waits out its back-off.
     for (const k of this.markRetry.keys()) if (!positions.some((p) => p.mint === k)) this.markRetry.delete(k); // closed positions leave the map
-    const askable = positions.filter((p) => !this.markBackedOff(p.mint, now));
+    const askable = positions.filter((p) => !this.markBackedOff(p, now));
     const mints = askable.map((p) => p.mint);
     try {
       const hasLivePositions = positions.some((p) => p.executionMode === 'LIVE');
@@ -1392,31 +1555,83 @@ export class ExecutionCoordinator {
   public async submitAndConfirmWithRetry(
     params: Parameters<ExecutionCoordinator['submitAndConfirmInner']>[0]
   ): ReturnType<ExecutionCoordinator['submitAndConfirmInner']> {
+    // S227: an order that is already recorded as landed is answered before anything is written. The PENDING row below is for a signature about
+    // to be sent; written first, a skipped resubmission left a row for a transaction that was never sent.
+    const already = this.alreadyLandedResult(params.orderId);
+    if (already) return already;
+    // P1.5 (N-35): the read-only and cluster refusals run before the PENDING row is written, so a refused order leaves no row for a
+    // transaction that was never sent (a REVERTED row with a fee that never existed, or a PENDING row that blocks the mint).
+    assertNotReadOnly(`sending a ${params.side} order`);
+    try {
+      traced('guard.sendCluster', () => assertSendClusterAllowed());
+      await traced('guard.genesis', () => assertClusterAllowedCached(this.connection));
+    } catch (err: any) {
+      Logger.error(`[R1] ${params.side} for order ${params.orderId} blocked before anything was recorded or sent: ${err.message}`);
+      workstationDb.logJournal('CLUSTER_GUARD_BLOCK', params.correlationId, 'LIVE', { orderId: params.orderId, side: params.side, mint: params.mint, error: err.message });
+      return { success: false, signature: '', transport: 'SOLANA_RPC', error: err.message, lifecycleState: 'SUBMIT_FAILED' };
+    }
     const preSignature = this.signatureOf(params.tx);
     if (preSignature) {
-      workstationDb.saveTransaction({
+      const pendingRow: PersistedTransaction = {
         signature: preSignature,
         orderId: params.orderId,
         correlationId: params.correlationId,
         mint: params.mint,
         direction: params.side,
-        submissionTransport: 'JITO',
+        // S227: with no block engine configured nothing goes through Jito, so the row says SOLANA_RPC from the start.
+        submissionTransport: this.jitoTransport.isEnabled() ? 'JITO' : 'SOLANA_RPC',
         submissionTime: Date.now(),
         reconciliationState: 'PENDING',
         networkFeeLamports: 5000,
         jitoTipLamports: params.jitoTipLamports,
         executionMode: 'LIVE',
-      });
+        // P2.1: past this height a signature with no status never landed; orphan recovery resolves the row on it instead of on wall-clock age.
+        lastValidBlockHeight: txBuilder.lastValidBlockHeightOf((params.tx as any)?.message?.recentBlockhash),
+        exitReason: params.side === 'SELL' ? params.exitReason : undefined,
+      };
+      if (params.side === 'BUY') {
+        // P1.1 (N-57): the check for another unresolved buy of this mint and this row are one database transaction, so a second process
+        // (or a second coordinator) buying the same mint at the same moment is refused here, before anything is sent.
+        let recorded: boolean;
+        try {
+          recorded = workstationDb.savePendingBuyIfNoneUnresolved(pendingRow);
+        } catch (err: any) {
+          return { success: false, signature: '', transport: 'SOLANA_RPC', error: `PENDING_WRITE_FAILED: ${err.message}; nothing was sent`, lifecycleState: 'SUBMIT_FAILED' };
+        }
+        if (!recorded) {
+          workstationDb.logJournal('TRADE_REJECTED_UNRESOLVED_BUY', params.correlationId, 'LIVE', { mint: params.mint, orderId: params.orderId, at: 'submit' });
+          return { success: false, signature: '', transport: 'SOLANA_RPC', error: `UNRESOLVED_BUY: another buy of ${params.mint} was sent and is not reconciled yet; nothing was sent`, lifecycleState: 'SUBMIT_FAILED' };
+        }
+      } else {
+        workstationDb.saveTransaction(pendingRow);
+      }
     }
     const res = await this.submitAndConfirmInner(params);
     if (preSignature && !res.success && !res.unconfirmed) {
       // Definitely not landing (never sent, rejected, or seen failing): do not leave a PENDING row to block readiness.
       const rows = workstationDb.loadTransactions(params.orderId).filter((t) => t.signature === preSignature);
       if (rows.some((t) => t.reconciliationState === 'PENDING')) {
-        workstationDb.saveTransaction({ ...rows[0], reconciliationState: 'REVERTED', error: res.error ?? 'not sent or rejected' });
+        // P2.1: a transaction whose blockhash expired unseen did not fail on chain; it never landed (TIMED_OUT, as orphan recovery writes it).
+        const neverLanded = /^(BLOCKHASH_EXPIRED|RPC_RATE_LIMITED)/.test(res.error ?? ''); // S262: a rate-limited send is only reported after its blockhash expired
+        workstationDb.saveTransaction({ ...rows[0], reconciliationState: neverLanded ? 'TIMED_OUT' : 'REVERTED', error: res.error ?? 'not sent or rejected' });
       }
     }
     return res;
+  }
+
+  /** R0.6: the result for an order the database already holds as landed (RECONCILED), or null. Writes nothing. */
+  private alreadyLandedResult(orderId: string): { success: true; signature: string; transport: 'JITO' | 'SOLANA_RPC'; slot?: number; lifecycleState: 'CONFIRMED' } | null {
+    if (!orderId) return null;
+    const resolved = workstationDb.loadTransactions(orderId).find((t) => t.reconciliationState === 'RECONCILED');
+    if (!resolved) return null;
+    Logger.warn(`[R0.6] Order ${orderId} already landed or recorded in database; skipping resubmission`);
+    return {
+      success: true,
+      signature: resolved.signature,
+      transport: resolved.submissionTransport === 'SOLANA_RPC' ? 'SOLANA_RPC' : 'JITO',
+      slot: resolved.landingSlot,
+      lifecycleState: 'CONFIRMED',
+    };
   }
 
   private signatureOf(tx: any): string | null {
@@ -1440,6 +1655,8 @@ export class ExecutionCoordinator {
     tokenProgram: PublicKey;
     preSnapshot: PreTradeSnapshot;
     jitoTipLamports: number;
+    /** SELL only: the exit reason, stored on the transaction row (see exitStageAfterFill). */
+    exitReason?: string;
   }): Promise<{
     success: boolean;
     signature: string;
@@ -1459,6 +1676,8 @@ export class ExecutionCoordinator {
     // unless the RPC reports the allowed cluster's genesis hash (devnet unless Mike set ALLOWED_CLUSTER).
     try {
       traced('guard.sendCluster', () => assertSendClusterAllowed()); // mainnet is never a send target, even when the RPC reports its genesis
+      // R1-1/N-27: while the heartbeat says the RPC is not on the allowed cluster, no buy or sell is sent, whatever the send-path cache holds.
+      if (this.clusterProblem !== null) throw new ClusterGuardError(`the RPC is not trusted (${this.clusterProblem.replace(/^CLUSTER_GUARD: /, '')}); refusing to send`);
       await traced('guard.genesis', () => assertClusterAllowedCached(this.connection)); // S208: a pass is remembered per Connection for 60 s
     } catch (err: any) {
       Logger.error(`[R1] ${side} for order ${orderId} blocked: ${err.message}`);
@@ -1492,20 +1711,8 @@ export class ExecutionCoordinator {
     const confirmTimeoutMs = Math.max(1000, cfg.bundleConfirmTimeoutMs);
 
     // 0. Pre-execution check: Has this order already executed or landed?
-    if (orderId) {
-      const txs = workstationDb.loadTransactions(orderId);
-      const resolved = txs.find((t) => t.reconciliationState === 'RECONCILED');
-      if (resolved) {
-        Logger.warn(`[R0.6] Order ${orderId} already landed or recorded in database; skipping resubmission`);
-        return {
-          success: true,
-          signature: resolved.signature,
-          transport: resolved.submissionTransport === 'SOLANA_RPC' ? 'SOLANA_RPC' : 'JITO',
-          slot: resolved.landingSlot,
-          lifecycleState: 'CONFIRMED',
-        };
-      }
-    }
+    const already = this.alreadyLandedResult(orderId);
+    if (already) return already;
 
     let lastSignature = '';
     let lastBundleId: string | undefined;
@@ -1617,7 +1824,8 @@ export class ExecutionCoordinator {
         };
       }
 
-      Logger.warn(`[R0.6] Jito attempts exhausted for order ${orderId}. Evaluating direct RPC fallback...`);
+      if (jitoEnabled) Logger.warn(`[R0.6] Jito attempts exhausted for order ${orderId}. Evaluating direct RPC fallback...`);
+      else Logger.info(`[S227] No Jito block engine is configured; order ${orderId} goes through the RPC transport`);
       // Crucial pre-check before fallback to prevent double fill:
       if (lastSignature || lastBundleId) {
         const preFallbackCheck = await this.checkIfTransactionLanded(lastSignature, lastBundleId, owner, mintPubkey, tokenProgram, preSnapshot, side, orderId);
@@ -1646,14 +1854,33 @@ export class ExecutionCoordinator {
         };
       }
 
-      workstationDb.logJournal('FALLBACK_RPC_ATTEMPT', correlationId, 'LIVE', {
-        orderId,
-        previousJitoSignature: lastSignature,
-        previousJitoBundleId: lastBundleId,
-      });
+      if (jitoEnabled) {
+        workstationDb.logJournal('FALLBACK_RPC_ATTEMPT', correlationId, 'LIVE', {
+          orderId,
+          previousJitoSignature: lastSignature,
+          previousJitoBundleId: lastBundleId,
+        });
+      }
 
-      const rpcSubmit = await traced('tx.submit', () => this.rpcTransport.submit(tx), { 'apex.transport': 'SOLANA_RPC', 'apex.side': side });
-      if (!rpcSubmit.success || !rpcSubmit.signature) {
+      // S245: a rate-limited send was refused, not lost: a SELL is resent (same signed bytes) after short waits; a BUY is not.
+      const rpcSubmit = await traced('tx.submit', () => this.rpcTransport.submitThroughRateLimit(tx, side === 'SELL' ? SELL_RATE_LIMIT_BACKOFF_MS : []), { 'apex.transport': 'SOLANA_RPC', 'apex.side': side });
+      // S262 (review 2026-10-24, HIGH on S245): a send the RPC rate-limited past every resend is an unknown outcome, not "nothing was sent"
+      // (a balancer may have forwarded an earlier attempt, or a block engine may hold the same transaction). It is watched below like any
+      // ambiguous send, with resends, until it confirms or its blockhash expires; only then is it reported RPC_RATE_LIMITED (never landed).
+      const rateLimitedOnly = !!rpcSubmit.rateLimited && !rpcSubmit.success;
+      if (rateLimitedOnly) {
+        Logger.warn(`[S262] ${side} for order ${orderId}: the RPC rate-limited the send ${rpcSubmit.rateLimitedResends + 1} time(s); watching ${rpcSubmit.signature.slice(0, 8)} until it lands or its blockhash expires`);
+        workstationDb.logJournal('SEND_RATE_LIMITED', correlationId, 'LIVE', { orderId, side, mint, signature: rpcSubmit.signature, tries: rpcSubmit.rateLimitedResends + 1, error: rpcSubmit.error });
+      }
+      // P1.5 (R1-2): a send that failed without proof of rejection (fetch failed, socket reset, 502/504 after forwarding) may still land.
+      // It is watched like any sent transaction below: confirmed means success, failed on chain means REVERTED, unseen means unconfirmed
+      // (the buy path then keeps it RECONCILIATION_REQUIRED with orphan recovery, the sell path records a pending sell). Never REVERTED here.
+      const ambiguousSend = !rpcSubmit.success && (!!rpcSubmit.ambiguous || rateLimitedOnly) && !!rpcSubmit.signature;
+      if (ambiguousSend) {
+        Logger.warn(`[P1.5] ${side} for order ${orderId}: the send failed with no proof of rejection (${rpcSubmit.error}); watching ${rpcSubmit.signature.slice(0, 8)} in case it lands`);
+        workstationDb.logJournal('SEND_OUTCOME_UNKNOWN', correlationId, 'LIVE', { orderId, side, mint, signature: rpcSubmit.signature, error: rpcSubmit.error });
+      }
+      if (!ambiguousSend && (!rpcSubmit.success || !rpcSubmit.signature)) {
         return {
           success: false,
           signature: rpcSubmit.signature || lastSignature,
@@ -1678,7 +1905,11 @@ export class ExecutionCoordinator {
         executionMode: 'LIVE',
       });
 
-      const rpcConfirm = await traced('tx.confirm', () => this.rpcTransport.confirm(rpcSubmit.signature, cfg.rpcFallbackTimeoutMs || 15000), { 'apex.transport': 'SOLANA_RPC', 'apex.side': side });
+      // P2.1: the same signed bytes are resent while the transaction is watched, and the watch runs until the blockhash expires (not a fixed 15 s).
+      const rpcConfirm = await traced('tx.confirm', () => this.rpcTransport.confirm(rpcSubmit.signature, cfg.rpcFallbackTimeoutMs || 15000, undefined, {
+        rebroadcast: tx,
+        lastValidBlockHeight: txBuilder.lastValidBlockHeightOf((tx as any)?.message?.recentBlockhash),
+      }), { 'apex.transport': 'SOLANA_RPC', 'apex.side': side });
       if (rpcConfirm.confirmed) {
         return {
           success: true,
@@ -1698,11 +1929,24 @@ export class ExecutionCoordinator {
             lifecycleState: 'CONFIRMED',
           };
         }
+        // P2.1: expired with no status and not landed by the balance check either: a definite "never landed", like the Jito path's
+        // BLOCKHASH_EXPIRED. Not unconfirmed, so a buy leaves no unresolved row for the mint and a sell leaves no pending sell.
+        if (rpcConfirm.lifecycleState === 'EXPIRED_BLOCKHASH') {
+          workstationDb.logJournal('SEND_EXPIRED_UNLANDED', correlationId, 'LIVE', { orderId, side, mint, signature: rpcSubmit.signature });
+          // S262: every send of it was rate-limited and it never landed: the refusals are now proven, so it is RPC_RATE_LIMITED (a sell then
+          // counts as no attempt and raises EXIT_RATE_LIMITED, as in S245), with BLOCKHASH_EXPIRED kept in the text.
+          const error = rateLimitedOnly
+            ? `RPC_RATE_LIMITED: the RPC refused the ${side.toLowerCase()} ${rpcSubmit.rateLimitedResends + 1} time(s) with a rate limit and it never landed (${rpcConfirm.error}; ${rpcSubmit.error})`
+            : rpcConfirm.error;
+          return { success: false, signature: rpcSubmit.signature, transport: 'SOLANA_RPC', error, lifecycleState: 'SUBMIT_FAILED' };
+        }
         return {
           success: false,
           signature: rpcSubmit.signature,
           transport: 'SOLANA_RPC',
-          error: rpcConfirm.error || 'RPC fallback transaction dropped or unconfirmed',
+          error: ambiguousSend && rpcConfirm.lifecycleState !== 'REVERTED'
+            ? `SEND_OUTCOME_UNKNOWN: ${rpcSubmit.error}; not seen on chain yet (${rpcConfirm.error || 'unconfirmed'})`
+            : rpcConfirm.error || 'RPC fallback transaction dropped or unconfirmed',
           lifecycleState: 'REVERTED',
           unconfirmed: rpcConfirm.lifecycleState !== 'REVERTED',
         };
@@ -1829,6 +2073,16 @@ export class ExecutionCoordinator {
         quotePriceSol = Number(state.virtualSolReserves) / Number(state.virtualTokenReserves) / (1e9 / Math.pow(10, state.tokenDecimals));
       }
     } catch {}
+
+    // P4.3 (R1-57): the curve-progress cap on the fresh read, so SHADOW, PAPER and manual PAPER buys stop where LIVE does
+    if (curveState) {
+      const progressPct = curveProgressPctOfState(curveState);
+      if (progressPct !== null && isCurveTooFar(progressPct)) {
+        const error = curveTooFarReason('CURVE_PROGRESS_TOO_HIGH', progressPct);
+        workstationDb.logJournal('TRADE_FILTER_REJECTED', correlationId, 'PAPER', { reason: error, curveProgressPct: progressPct });
+        return { rejection: { success: false, lifecycleState: 'FILTER_REJECTED', executionMode: 'PAPER', error, correlationId } };
+      }
+    }
 
     if (!quotePriceSol || quotePriceSol <= 0) {
       return { rejection: {
@@ -2188,6 +2442,23 @@ export class ExecutionCoordinator {
       };
     }
 
+    // P4.3 (R1-57): the authoritative curve-progress cap, on this fresh read, for every caller (auto, callout, manual)
+    const liveProgressPct = curveProgressPctOfState(marketState);
+    // Review 2026-10-24, finding 8: a LIVE buy needs a known progress. With the token reserves unreadable the cap cannot be
+    // checked, so the buy is refused (fail closed). PAPER and SHADOW still let an unknown progress through (see curveProgressCap.ts).
+    if (liveProgressPct === null) {
+      const error = curveProgressUnreadable(marketState)
+        ? 'CURVE_PROGRESS_UNREADABLE: the bonding curve\'s token reserves could not be read (SOL reserves did), so its progress is unknown; LIVE buy refused'
+        : 'CURVE_PROGRESS_UNREADABLE: the bonding curve state carries no readable reserves, so its progress is unknown; LIVE buy refused';
+      workstationDb.logJournal('TRADE_FILTER_REJECTED', correlationId, 'LIVE', { reason: error, curveProgressPct: null });
+      return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'LIVE', error, correlationId };
+    }
+    if (isCurveTooFar(liveProgressPct)) {
+      const error = curveTooFarReason('CURVE_PROGRESS_TOO_HIGH', liveProgressPct);
+      workstationDb.logJournal('TRADE_FILTER_REJECTED', correlationId, 'LIVE', { reason: error, curveProgressPct: liveProgressPct });
+      return { success: false, lifecycleState: 'FILTER_REJECTED', executionMode: 'LIVE', error, correlationId };
+    }
+
     // 2. Authoritative Token Eligibility Verification (Fail-Closed in LIVE mode)
     if (req.eligibilityReport && req.eligibilityReport.mint !== req.mint) {
       return {
@@ -2414,6 +2685,8 @@ export class ExecutionCoordinator {
       };
     }
     this.inFlightBuyMints.add(req.mint);
+    let buySettled!: () => void;
+    this.liveBuysInFlight.set(req.mint, new Promise<void>((r) => { buySettled = r; })); // waitForBuysInFlight awaits it
 
     // Acquire in-flight balance reservation
     this.inFlightReservedSol += requiredSol;
@@ -2557,7 +2830,8 @@ export class ExecutionCoordinator {
           direction: 'BUY',
           submissionTransport: subRes.transport,
           submissionTime: Date.now(),
-          reconciliationState: 'REVERTED',
+          // P2.1/S262: a buy whose blockhash expired unseen never landed (TIMED_OUT, as submitAndConfirmWithRetry wrote it); it did not fail on chain
+          reconciliationState: /^(BLOCKHASH_EXPIRED|RPC_RATE_LIMITED)/.test(subRes.error ?? '') ? 'TIMED_OUT' : 'REVERTED',
           networkFeeLamports: 5000,
           jitoTipLamports: resolvedTip.tipLamports,
           executionMode: 'LIVE',
@@ -2707,6 +2981,21 @@ export class ExecutionCoordinator {
     } catch (err: any) {
       riskEngine.recordTradeFailure();
       Logger.error(`LIVE trade exception: ${err.message}`);
+      // P1.5 (R1-6, R1-80): an exception after the PENDING row was written (the transaction may have been sent) must not leave that row
+      // PENDING and unwatched: it becomes RECONCILIATION_REQUIRED, which orphan recovery re-reads and adopts if the buy landed.
+      const pending = workstationDb.loadTransactions(`ord-${correlationId}`).filter((t) => t.direction === 'BUY' && t.reconciliationState === 'PENDING');
+      if (pending.length > 0) {
+        for (const t of pending) workstationDb.saveTransaction({ ...t, reconciliationState: 'RECONCILIATION_REQUIRED', error: `UNCONFIRMED: exception after the send was prepared: ${err.message}` });
+        this.scheduleOrphanRecovery();
+        return {
+          success: false,
+          lifecycleState: 'RECONCILIATION_REQUIRED',
+          executionMode: 'LIVE',
+          txSignature: pending[0].signature,
+          error: `UNCONFIRMED: ${err.message}. The transaction may have been sent; it is being watched, do not retry the buy.`,
+          correlationId,
+        };
+      }
       return {
         success: false,
         lifecycleState: 'CHAIN_ERROR',
@@ -2718,13 +3007,15 @@ export class ExecutionCoordinator {
       // Always release in-flight balance reservation
       this.inFlightReservedSol = Math.max(0, this.inFlightReservedSol - requiredSol);
       this.inFlightBuyMints.delete(req.mint);
+      this.liveBuysInFlight.delete(req.mint);
+      buySettled();
     }
   }
 
   // Canonical Close Position supporting partial sells (1-100%) and real proceeds reconciliation
   private haltReason: string | null = null;
 
-  /** G3: hard stop of ALL trading, exits included (used when the wallet balance changes for a reason the journal cannot explain). */
+  /** G3: halt every buy plus the take-profit and stale exits; protective exits still run (PROTECTIVE_EXIT_REASONS). Used when the wallet balance changes for a reason the journal cannot explain. */
   public haltAll(reason: string): void {
     if (this.haltReason) return;
     this.haltReason = reason;
@@ -2733,13 +3024,34 @@ export class ExecutionCoordinator {
       // R8: the halt holds in memory but will not survive a restart; say so instead of letting the operator assume it will.
       this.raiseOperatorAlert('HALT_NOT_PERSISTED', `The halt could not be written to the database (${reason}). It holds until this process restarts; after a restart trading would not be halted. Fix the database and halt again.`);
     }
-    this.raiseOperatorAlert('TRADING_HALTED', `All trading including exits is halted: ${reason}`);
+    this.raiseOperatorAlert('TRADING_HALTED', `All buys, take-profit and stale exits are halted: ${reason}. Stop-loss, trailing stop, manual close and panic still run; clear it with POST /api/auto/resume {clearHalt:true}.`);
   }
 
   public clearHalt(): void {
     if (this.haltReason && this.isDefaultSingleton) workstationDb.logJournal('TRADING_HALT_CLEARED', 'halt', this.executionMode, {});
     this.haltReason = null;
     this.clearOperatorAlert('TRADING_HALTED');
+    this.clearOperatorAlert('KILL_SWITCH_WAS_ON');
+  }
+
+  /** One promise per LIVE buy past its reservation (any caller: auto, manual routes, Telegram); it resolves when the buy has settled. */
+  private liveBuysInFlight = new Map<string, Promise<void>>();
+
+  /**
+   * The emergency stop waits here before it reads the positions to sell: a LIVE buy already past the risk gate (a manual one included;
+   * auto's own buy is awaited by its kill) may still turn into a position. Resolves once no LIVE buy is in flight, or after `timeoutMs`
+   * with the mints still in flight. Never rejects.
+   */
+  public async waitForBuysInFlight(timeoutMs: number): Promise<string[]> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.liveBuysInFlight.size > 0) {
+      const left = deadline - Date.now();
+      if (left <= 0) break;
+      let timer: NodeJS.Timeout | undefined;
+      await Promise.race([Promise.allSettled([...this.liveBuysInFlight.values()]), new Promise<void>((r) => { timer = setTimeout(r, left); })]);
+      clearTimeout(timer);
+    }
+    return [...this.liveBuysInFlight.keys()];
   }
 
   /** Q8: true while a LIVE buy is being sent/reconciled or an exit is between its send and its journal row. */
@@ -2772,29 +3084,47 @@ export class ExecutionCoordinator {
   /**
    * Errors that mean no send was attempted (or that an earlier send is still being waited for), so they neither cost fees nor count
    * toward backoff or the EXIT_FAILING alert. Q12: waiting for a pending sell, an undeterminable venue, a missing signer and a zero
-   * quantity are not rejected sends; counting them walked the ladder to 4000 bps before the real resend.
+   * quantity are not rejected sends; counting them walked the ladder to 4000 bps before the real resend. P1.6: nor are a refusal by the
+   * cluster guard, an invalid sell percentage, or anything thrown before the send (closePositionImpl reports those with `notSent`).
+   * S245: nor is a sell the RPC rate-limited past every resend (RPC_RATE_LIMITED): it was refused, not priced wrong; it raises EXIT_RATE_LIMITED.
    */
   private static isNonAttemptExitError(error?: string): boolean {
-    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found|SELL_PENDING_VERIFICATION|UNKNOWN_TRADING_VENUE|Trading venue for mint|Signer is not configured|Calculated sell quantity is zero)/.test(error) || ExecutionCoordinator.isQuoteFailure(error);
+    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found|SELL_PENDING_VERIFICATION|UNKNOWN_TRADING_VENUE|Trading venue for mint|Signer is not configured|Calculated sell quantity is zero|CLUSTER_GUARD|INVALID_SELL_PCT|BALANCE_UNTRUSTED|RPC_RATE_LIMITED)/.test(error) || ExecutionCoordinator.isQuoteFailure(error);
   }
 
-  /** R10: the sell could not even be quoted (fail-closed quote, fee config, market state). Nothing was sent, and widening slippage cannot help. */
+  /**
+   * R10: the sell could not even be quoted (fail-closed quote, fee config, market state). Nothing was sent, and widening slippage cannot help.
+   * P1.6 (R1-30, N-42): also the quote and pool errors thrown before anything is sent: a math cross-check, a migrated or invalid curve
+   * state, every PumpSwap pool error, and a curve read that failed (CURVE_READ_FAILED, which names the reason).
+   */
   private static isQuoteFailure(error?: string): boolean {
-    return !!error && /^(OFFICIAL_PUMP_QUOTE_FAILED|DYNAMIC_FEE_CALCULATION_FAILED|FEE_RECIPIENT_UNRESOLVED|UNSUPPORTED_QUOTE_MINT|Cannot fetch market state)/.test(error);
+    return !!error && /^(OFFICIAL_PUMP_QUOTE_FAILED|DYNAMIC_FEE_CALCULATION_FAILED|FEE_RECIPIENT_UNRESOLVED|UNSUPPORTED_QUOTE_MINT|Cannot fetch market state|QUOTE_MATH_DISCREPANCY|BONDING_CURVE_MIGRATED|Invalid curve state|PUMPSWAP_|UNSUPPORTED_PUMPSWAP_QUOTE_MINT|CURVE_READ_FAILED)/.test(error);
   }
 
-  private recordExitOutcome(positionId: string, res: { success: boolean; error?: string }, mode?: string): void {
+  private recordExitOutcome(positionId: string, res: { success: boolean; error?: string; notSent?: boolean }, mode?: string): void {
     if (res.success) {
       this.exitFailures.delete(positionId);
       this.clearOperatorAlert('EXIT_FAILING', positionId);
       this.clearOperatorAlert('EXIT_QUOTE_FAILING', positionId);
+      this.clearOperatorAlert('EXIT_RATE_LIMITED', positionId);
+      this.clearOperatorAlert('EXIT_NO_SIGNER', positionId);
       return;
     }
-    if (mode === 'LIVE' && ExecutionCoordinator.isQuoteFailure(res.error)) {
-      // No fee was spent and the ladder must not advance, but a stop-loss that cannot be priced is exactly what an operator must hear about.
-      this.raiseOperatorAlert('EXIT_QUOTE_FAILING', `Exit for position ${positionId.slice(0, 8)} cannot be quoted, so nothing is being sent (${String(res.error).slice(0, 140)}). Retrying every tick; close it manually if this persists.`, positionId);
+    if (mode === 'LIVE' && /^Signer is not configured/.test(res.error || '')) {
+      // A LIVE exit that cannot be signed sends nothing and costs nothing, so it is no attempt; but the position has no working stop-loss
+      // until a signer is back (a locked or missing key, or a read-only server over a database with LIVE rows), and the operator must know.
+      this.raiseOperatorAlert('EXIT_NO_SIGNER', `Exit for LIVE position ${positionId.slice(0, 8)} cannot be signed: ${isReadOnly() ? 'this server is read-only (APEX_READ_ONLY=true) and holds no key' : `the signer is ${localSigner.getStatus()}`}. Its stop-loss cannot sell until a signer is loaded; nothing was sent.`, positionId);
     }
-    if (mode !== 'LIVE' || ExecutionCoordinator.isNonAttemptExitError(res.error)) return;
+    const quoteFailure = ExecutionCoordinator.isQuoteFailure(res.error);
+    if (mode === 'LIVE' && /^RPC_RATE_LIMITED/.test(res.error || '')) {
+      // S245: no fee was spent and wider slippage cannot help, but an exit the RPC keeps refusing is something an operator must hear about.
+      this.raiseOperatorAlert('EXIT_RATE_LIMITED', `Exit for position ${positionId.slice(0, 8)} was refused by the RPC's rate limit after ${SELL_RATE_LIMIT_BACKOFF_MS.length} resends; nothing was sent. Retrying on the next exit pass; use a private RPC if this persists.`, positionId);
+    }
+    if (mode === 'LIVE' && (quoteFailure || (res.notSent && !ExecutionCoordinator.isNonAttemptExitError(res.error)))) {
+      // No fee was spent and the ladder must not advance, but a stop-loss that cannot be priced or built is exactly what an operator must hear about.
+      this.raiseOperatorAlert('EXIT_QUOTE_FAILING', `Exit for position ${positionId.slice(0, 8)} cannot be quoted or built, so nothing is being sent (${String(res.error).slice(0, 140)}). Retrying every tick; close it manually if this persists.`, positionId);
+    }
+    if (mode !== 'LIVE' || res.notSent || ExecutionCoordinator.isNonAttemptExitError(res.error)) return;
     const count = (this.exitFailures.get(positionId)?.count ?? 0) + 1;
     const wait = Math.min(EXIT_RETRY_MAX_MS, EXIT_RETRY_BASE_MS * 2 ** (count - 1));
     this.exitFailures.set(positionId, { count, nextAttemptAt: Date.now() + wait, lastError: res.error || 'unknown' });
@@ -2809,7 +3139,7 @@ export class ExecutionCoordinator {
     positionId: string,
     sellPct: number = 100,
     reason: string = 'Manual Close'
-  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number }> {
+  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number; notSent?: boolean }> {
     return traced('exit.close', () => this.closePositionUntraced(positionId, sellPct, reason), { 'apex.reason': reason, 'apex.sellPct': sellPct });
   }
 
@@ -2817,7 +3147,7 @@ export class ExecutionCoordinator {
     positionId: string,
     sellPct: number = 100,
     reason: string = 'Manual Close'
-  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number }> {
+  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number; notSent?: boolean }> {
     // A halt stops entries and discretionary exits. It never stops the exits that protect the wallet: stop-loss, trailing stop,
     // an operator's manual close and panic liquidation (a halt that froze a losing position would be the opposite of its purpose).
     if (this.haltReason && !PROTECTIVE_EXIT_REASONS.test(reason)) {
@@ -2858,11 +3188,16 @@ export class ExecutionCoordinator {
     positionId: string,
     sellPct: number,
     reason: string
-  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number }> {
+  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number; notSent?: boolean }> {
     if (this.inFlightPositionExits.has(positionId)) {
       return { success: false, pnlSol: 0, error: 'EXIT_IN_PROGRESS: An exit transaction for this position is already in progress.' };
     }
     this.inFlightPositionExits.add(positionId);
+    let exitDone!: () => void;
+    this.positionExitDone.set(positionId, new Promise<void>((r) => { exitDone = r; })); // P1.7: what waitForPositionExit awaits
+    let claimed = false;
+    let sendStarted = false;
+    const exitClaimOwner = newExitClaimOwner();
 
     try {
       const positions = workstationDb.loadPositions();
@@ -2872,10 +3207,15 @@ export class ExecutionCoordinator {
         return { success: false, pnlSol: 0, error: 'Position not found or already closed' };
       }
 
-      const safeSellPct = Math.min(100, Math.max(1, sellPct));
-      const fraction = safeSellPct / 100;
-      const percentageToSell = safeSellPct;
-      const closeAta = (percentageToSell === 100);
+      // N-44: the share is computed in basis points, so a fractional percentage (33.5) sells floor(raw * 3350 / 10000) instead of
+      // throwing a BigInt RangeError (the HTTP schemas take integers only; this covers every other caller).
+      if (typeof sellPct !== 'number' || !Number.isFinite(sellPct)) {
+        return { success: false, pnlSol: 0, error: `INVALID_SELL_PCT: ${String(sellPct)} is not a number between 1 and 100`, notSent: true };
+      }
+      const sellBps = Math.round(Math.min(100, Math.max(1, sellPct)) * 100);
+      const safeSellPct = sellBps / 100;
+      const fraction = sellBps / 10_000;
+      const closeAta = sellBps >= 10_000;
 
       const tipFloor = await this.jitoTransport.getTipFloorLamports();
       const resolvedTip = this.resolveLiveTip({
@@ -2917,7 +3257,7 @@ export class ExecutionCoordinator {
         try {
           const state = await PumpCurveService.fetchPumpMarketState({ connection: this.connection, mint: new PublicKey(target.mint), executionMode: 'PAPER' });
           if (state && !state.complete) {
-            const sold = (BigInt(target.tokenQuantityRaw) * BigInt(safeSellPct)) / 100n;
+            const sold = (BigInt(target.tokenQuantityRaw) * BigInt(sellBps)) / 10_000n;
             if (sold > 0n) sellQuote = PumpCurveService.calculateSellQuote({ state, tokenAmountRaw: sold, executionMode: 'PAPER' });
           }
         } catch {}
@@ -2937,11 +3277,25 @@ export class ExecutionCoordinator {
       return { success: false, pnlSol: 0, error: 'Signer is not configured or locked' };
     }
 
+    // P1.6: on an RPC the cluster check does not trust (wrong genesis, or genesis unreadable) every read answers for the wrong chain, so a
+    // wallet balance read there would "find" no tokens and close the row although the tokens are on the real chain. Refuse before any
+    // read decides anything; the position stays open and the next pass tries again once the RPC is trusted.
+    if (this.clusterProblem !== null) {
+      return { success: false, pnlSol: 0, error: `CLUSTER_GUARD: the RPC is not trusted (${this.clusterProblem.replace(/^CLUSTER_GUARD: /, '')}); not reading balances or selling`, notSent: true };
+    }
+
+    // P1.1 (N-52): inFlightPositionExits guards this coordinator only. The claim in the database stops a second coordinator or a second
+    // process from selling the same position at the same time (both would sell a take-profit partial or a stop-loss). Cleared in finally.
+    if (!workstationDb.claimExit(positionId, exitClaimOwner, Date.now(), Date.now() - EXIT_CLAIM_STALE_MS, exitClaimOwnerAlive)) {
+      return { success: false, pnlSol: 0, error: 'EXIT_IN_PROGRESS: another process or coordinator is selling this position.' };
+    }
+    claimed = true;
+
     const seller = localSigner.getPublicKey();
     const mintPubkey = new PublicKey(target.mint);
 
       let totalTokensRaw = BigInt(target.tokenQuantityRaw);
-      let amountTokensToSell = (totalTokensRaw * BigInt(safeSellPct)) / 100n;
+      let amountTokensToSell = (totalTokensRaw * BigInt(sellBps)) / 10_000n;
 
       if (amountTokensToSell <= 0n) {
         return { success: false, pnlSol: 0, error: 'Calculated sell quantity is zero' };
@@ -2951,35 +3305,63 @@ export class ExecutionCoordinator {
       // read the wallet first: if the balance dropped the sell landed (adopt it), if not wait out the blockhash window.
       const pendingSell = this.pendingSells.get(positionId);
       if (pendingSell) {
-        const tp = target.baseTokenProgram ? new PublicKey(target.baseTokenProgram) : TOKEN_PROGRAM_ID;
-        let onChain: bigint | null = null;
-        try {
-          const bal = await this.connection.getTokenAccountBalance(PumpCurveService.getAssociatedTokenAddress(mintPubkey, seller, tp), 'confirmed');
-          onChain = BigInt(bal?.value?.amount ?? '0');
-        } catch (e: any) {
-          // an unreadable ATA balance after a sell that closed the account means it is gone
-          onChain = /could not find account|Invalid param/i.test(String(e?.message)) ? 0n : null;
-        }
+        // an unreadable ATA balance after a sell that closed the account means it is gone; P1.6: only when the read is trusted
+        const read = await this.readHeldTokens(target, seller, mintPubkey);
+        if (read.untrusted) return { success: false, pnlSol: 0, error: read.untrusted, notSent: true };
+        const onChain = read.held;
         if (onChain !== null && onChain < totalTokensRaw) {
           this.pendingSells.delete(positionId);
-          target.exitReason = reason;
-          target.exitTxSignature = pendingSell.signature;
-          target.lastUpdatedTimestamp = Date.now();
+          // P2.3 (R1-21, R1-22, R1-86): the earlier sell landed. Read its transaction and book the chain's numbers (proceeds, PnL, the row
+          // RECONCILED) instead of 0, so the daily loss, the realized events and the DEVNET_LIVE wallet audit see the SOL it moved.
+          // Only when the transaction cannot be read does it fall back to matching the wallet with no PnL, as before.
+          const adoptedTp = target.baseTokenProgram ? new PublicKey(target.baseTokenProgram) : TOKEN_PROGRAM_ID;
+          const adopted = await TradeReconciler.reconcileSellTransaction(
+            this.connection, pendingSell.signature, seller, mintPubkey, adoptedTp,
+            { walletSolLamports: 0, tokenBalanceRaw: totalTokensRaw.toString(), tokenDecimals: target.tokenDecimals ?? 6, timestamp: Date.now() },
+            target.costBasisLamports, Number(totalTokensRaw - onChain) / Number(totalTokensRaw), 0
+          ).catch(() => null);
+          const booked = !!adopted?.success && BigInt(adopted.actualTokensSoldRaw) > 0n;
+          // S258 (L2): book on the row as it is now, as the normal sell path does: `target` was loaded before the wallet and
+          // transaction reads above, and saving it would undo marks or exit state written meanwhile.
+          const filled = workstationDb.loadPositions().find((p) => p.id === positionId) ?? target;
+          filled.baseTokenProgram = target.baseTokenProgram; // S259: readHeldTokens may have corrected it
+          if (booked) filled.realizedPnLSol = (filled.realizedPnLSol ?? 0) + Number(adopted!.actualRealizedPnLSol.toFixed(6));
+          filled.exitReason = reason;
+          filled.exitTxSignature = pendingSell.signature;
+          filled.lastUpdatedTimestamp = Date.now();
           if (onChain === 0n) {
-            target.status = 'CLOSED';
-            target.tokenQuantityRaw = '0';
-            target.costBasisLamports = 0;
+            filled.status = 'CLOSED';
+            filled.tokenQuantityRaw = '0';
+            filled.costBasisLamports = 0;
           } else {
-            target.status = 'PARTIALLY_CLOSED';
-            target.costBasisLamports = Math.round(target.costBasisLamports * Number(onChain) / Number(totalTokensRaw));
-            target.tokenQuantityRaw = onChain.toString();
+            filled.status = 'PARTIALLY_CLOSED';
+            filled.costBasisLamports = Math.round(filled.costBasisLamports * Number(onChain) / Number(totalTokensRaw));
+            filled.tokenQuantityRaw = onChain.toString();
           }
-          workstationDb.savePosition(target);
-          this.raiseOperatorAlert('SELL_ADOPTED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed but its fill could not be read. The position now matches the wallet; realized PnL for it was not recorded.`, positionId);
+          target.status = filled.status;
+          if (booked) {
+            try {
+              workstationDb.saveSellBooking(filled, pendingSell.signature, { slot: adopted!.slot, networkFeeLamports: adopted!.actualNetworkFeeLamports });
+            } catch (err: any) {
+              // S258: nothing was written, so the sell is still pending; the next pass adopts it again
+              this.pendingSells.set(positionId, pendingSell);
+              return { success: false, pnlSol: 0, error: `SELL_BOOKING_FAILED: ${err?.message ?? err}; the landed sell ${pendingSell.signature.slice(0, 8)} is booked on the next pass`, notSent: true };
+            }
+            this.raiseOperatorAlert('SELL_ADOPTED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed after its confirmation was missed. Its fill was read from the chain and booked (PnL ${adopted!.actualRealizedPnLSol.toFixed(6)} SOL); the position now matches the wallet.`, positionId);
+          } else {
+            workstationDb.savePosition(filled);
+            this.raiseOperatorAlert('SELL_ADOPTED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed but its fill could not be read. The position now matches the wallet; realized PnL for it was not recorded.`, positionId);
+          }
           await this.syncRealWalletBalance();
-          return { success: true, pnlSol: 0, status: target.status, solMoved: 0 }; // S2: the earlier sell moved the SOL; this call moved none
+          // S2: with no readable fill this call moved nothing it can account for. P2.3: with one, it reports the earlier sell's net proceeds,
+          // which reached the wallet unjournaled, so the wallet audit can explain them.
+          return booked
+            ? { success: true, pnlSol: adopted!.actualRealizedPnLSol, status: target.status, solMoved: adopted!.actualNetSolProceedsLamports / 1e9 }
+            : { success: true, pnlSol: 0, status: target.status, solMoved: 0 };
         }
-        if (Date.now() - pendingSell.ts < PENDING_SELL_WINDOW_MS) {
+        // P2.1: the window is only an upper bound. Once the blockhash has expired and the signature has no status, the sell can never land,
+        // so the next pass (a stop-loss included) may sell at once instead of waiting out the rest of the 100 s.
+        if (Date.now() - pendingSell.ts < PENDING_SELL_WINDOW_MS && !(await this.pendingSellCannotLand(pendingSell))) {
           return { success: false, pnlSol: 0, error: `SELL_PENDING_VERIFICATION: sell ${pendingSell.signature.slice(0, 8)} was sent and is not confirmed or expired yet; not selling again` };
         }
         this.pendingSells.delete(positionId);
@@ -2988,25 +3370,22 @@ export class ExecutionCoordinator {
       // Q13: a 100% sell sells what the wallet holds. When the row says more than the wallet has (tokens moved outside the app, a partial
       // that landed with no pending record), every attempt fails simulation and the stop-loss can never clear. Scale the row to the wallet
       // (the N3 adoption arithmetic) and sell that; an empty wallet closes the row without a send.
-      if (safeSellPct >= 100) {
-        let held: bigint | null = null;
-        try {
-          const tp = target.baseTokenProgram ? new PublicKey(target.baseTokenProgram) : TOKEN_PROGRAM_ID;
-          const bal = await this.connection.getTokenAccountBalance(PumpCurveService.getAssociatedTokenAddress(mintPubkey, seller, tp), 'confirmed');
-          held = BigInt(bal?.value?.amount ?? '0');
-        } catch (e: any) {
-          held = /could not find account|Invalid param/i.test(String(e?.message)) ? 0n : null; // unreadable for another reason: sell what the row says
-        }
+      if (sellBps >= 10_000) {
+        // unreadable for another reason: sell what the row says; P1.6: an empty answer closes the row only when the read is trusted
+        const read = await this.readHeldTokens(target, seller, mintPubkey);
+        if (read.untrusted) return { success: false, pnlSol: 0, error: read.untrusted, notSent: true };
+        const held = read.held;
         if (held !== null && held < totalTokensRaw) {
           target.lastUpdatedTimestamp = Date.now();
           if (held === 0n) {
+            const assumedLossSol = this.bookAssumedLoss(target, 'an exit found an empty wallet'); // P2.3 (N-28)
             target.status = 'CLOSED';
             target.tokenQuantityRaw = '0';
             target.costBasisLamports = 0;
-            target.exitReason = 'RECONCILED_ZERO_BALANCE: the wallet held no tokens when the sell was prepared';
+            target.exitReason = 'RECONCILED_ZERO_BALANCE: the wallet held no tokens when the sell was prepared (REALIZED_ASSUMED_LOSS)';
             workstationDb.savePosition(target);
-            this.raiseOperatorAlert('POSITION_BALANCE_MISSING', `${target.symbol || target.mint} was closed without a sell: the wallet held none of it. Realized PnL for it was not recorded.`, positionId);
-            return { success: true, pnlSol: 0, status: 'CLOSED', solMoved: 0 }; // S2: nothing was sent, so nothing moved
+            this.raiseOperatorAlert('POSITION_BALANCE_MISSING', `${target.symbol || target.mint} was closed without a sell: the wallet held none of it. Booked as a loss of its cost basis (${assumedLossSol.toFixed(6)} SOL), since no sell was found.`, positionId);
+            return { success: true, pnlSol: -assumedLossSol, status: 'CLOSED', solMoved: 0 }; // S2: nothing was sent, so nothing moved
           }
           target.costBasisLamports = Math.round(target.costBasisLamports * Number(held) / Number(totalTokensRaw));
           target.tokenQuantityRaw = held.toString();
@@ -3038,7 +3417,7 @@ export class ExecutionCoordinator {
         } catch (err: any) {
           Logger.error(`[R1] SELL for position ${positionId} blocked before signing: ${err.message}`);
           workstationDb.logJournal('CLUSTER_GUARD_BLOCK', `exit-${positionId.slice(0, 8)}`, 'LIVE', { side: 'SELL', mint: target.mint, error: err.message });
-          return { success: false, pnlSol: 0, error: err.message };
+          return { success: false, pnlSol: 0, error: err.message, notSent: true };
         }
       }
 
@@ -3047,10 +3426,15 @@ export class ExecutionCoordinator {
       const venueInfo = await PumpSwapVenueService.resolveVenue(this.connection, mintPubkey, posMode);
 
       if (venueInfo.venue === 'UNKNOWN' && target.executionMode === 'LIVE') {
+        // P1.6 (N-42): when the curve could not be read, say so (decode failure, fee config, RPC error) instead of an unknown venue
+        const cf = venueInfo.curveFailure;
         return {
           success: false,
           pnlSol: 0,
-          error: 'UNKNOWN_TRADING_VENUE: Could not authoritatively determine whether token is bonding curve or PumpSwap pool in LIVE mode.',
+          error: cf
+            ? `CURVE_READ_FAILED (${cf.reason}): ${cf.message}; no PumpSwap pool either, so nothing was sent.`
+            : 'UNKNOWN_TRADING_VENUE: Could not authoritatively determine whether token is bonding curve or PumpSwap pool in LIVE mode.',
+          notSent: true,
         };
       }
 
@@ -3091,14 +3475,13 @@ export class ExecutionCoordinator {
 
         v0Tx = await txBuilder.buildCustomVersionedTransaction(this.connection, seller, instructions);
       } else if (venueInfo.venue === 'PUMP_BONDING_CURVE') {
-        const marketState = await PumpCurveService.fetchPumpMarketState({
-          connection: this.connection,
-          mint: mintPubkey,
-          executionMode: posMode,
-        });
+        const read = await PumpCurveService.fetchPumpMarketStateResult({ connection: this.connection, mint: mintPubkey, executionMode: posMode });
+        // P1.6 (N-42): when only the fee tier could not be verified, the sell is quoted at the highest fee tier (a lower minimum output)
+        const marketState = read.state ?? read.failure.sellableState;
         if (!marketState) {
-          return { success: false, pnlSol: 0, error: 'Cannot fetch market state to quote and execute sell' };
+          return { success: false, pnlSol: 0, error: `Cannot fetch market state to quote and execute sell (${read.failure?.reason}: ${read.failure?.message})`, notSent: true };
         }
+        if (!read.state) Logger.warn(`[P1.6] SELL of ${target.symbol || target.mint} built with an unverified fee tier (${read.failure?.reason}); minimum output assumes ${marketState.unverifiedFeeCeilingBps} bps in fees`);
         tokenProgramToUse = marketState.tokenProgram;
 
         const sellQuote = PumpCurveService.calculateSellQuote({
@@ -3140,7 +3523,7 @@ export class ExecutionCoordinator {
 
         v0Tx = await traced('tx.build', () => txBuilder.buildSellTransaction(this.connection, sellParams, closeAtaEffective), { 'apex.side': 'SELL' });
       } else {
-        return { success: false, pnlSol: 0, error: `Trading venue for mint ${target.mint} cannot be resolved or migrated to unknown DEX` };
+        return { success: false, pnlSol: 0, error: `Trading venue for mint ${target.mint} cannot be resolved or migrated to unknown DEX`, notSent: true };
       }
 
       // Capture pre-sell balance snapshot
@@ -3156,7 +3539,7 @@ export class ExecutionCoordinator {
       const bhSell = await this.blockhashProblem(v0Tx, 'SELL');
       if (bhSell) {
         workstationDb.logJournal('CLUSTER_GUARD_BLOCK', `exit-${positionId.slice(0, 8)}`, 'LIVE', { side: 'SELL', mint: target.mint, error: bhSell });
-        return { success: false, pnlSol: 0, error: `CLUSTER_GUARD: ${bhSell}; nothing was signed or sent.` };
+        return { success: false, pnlSol: 0, error: `CLUSTER_GUARD: ${bhSell}; nothing was signed or sent.`, notSent: true };
       }
       await traced('tx.sign', () => localSigner.signTransaction(v0Tx), { 'apex.side': 'SELL' });
 
@@ -3168,6 +3551,7 @@ export class ExecutionCoordinator {
       }
 
       const exitOrderId = `ord-exit-${positionId.slice(0, 8)}-${Date.now()}`;
+      sendStarted = true; // P1.6: from here a throw may follow a send; before it, nothing left this process
       const subRes = await this.submitAndConfirmWithRetry({
         tx: v0Tx,
         orderId: exitOrderId,
@@ -3179,11 +3563,15 @@ export class ExecutionCoordinator {
         tokenProgram: tokenProgramToUse,
         preSnapshot,
         jitoTipLamports: expectedJitoTipLamports,
+        exitReason: reason,
       });
 
       if (!subRes.success || !subRes.signature) {
-        if (subRes.unconfirmed && subRes.signature) this.pendingSells.set(positionId, { signature: subRes.signature, ts: Date.now() });
-        return { success: false, pnlSol: 0, error: subRes.error || 'Failed to submit or confirm sell bundle' };
+        if (subRes.unconfirmed && subRes.signature) this.pendingSells.set(positionId, { signature: subRes.signature, ts: Date.now(), lastValidBlockHeight: txBuilder.lastValidBlockHeightOf((v0Tx as any)?.message?.recentBlockhash) });
+        // S245: a sell the RPC rate-limited past every resend was never accepted: no pending sell (unconfirmed is false), no fee, and not a
+        // slippage failure, so it is reported as not sent and the ladder does not widen.
+        const rateLimited = /^RPC_RATE_LIMITED/.test(subRes.error || '');
+        return { success: false, pnlSol: 0, error: subRes.error || 'Failed to submit or confirm sell bundle', ...(rateLimited ? { notSent: true } : {}) };
       }
 
       // S2: the basis being sold, AFTER any clamp to the wallet balance above (target.costBasisLamports was scaled there)
@@ -3207,23 +3595,36 @@ export class ExecutionCoordinator {
         return { success: false, pnlSol: 0, error: sellRecon.error };
       }
 
-      target.realizedPnLSol += Number(sellRecon.actualRealizedPnLSol.toFixed(6));
-      target.exitReason = reason;
-      target.exitTxSignature = subRes.signature;
-      target.lastUpdatedTimestamp = Date.now();
+      // P1.1 (N-52): book the fill on the row as it is NOW, not on `target`, which was loaded before several awaits (marks and exit
+      // state written meanwhile would be undone, and the realized delta would be computed against a stale copy).
+      const filled = workstationDb.loadPositions().find((p) => p.id === positionId) ?? target;
+      filled.baseTokenProgram = target.baseTokenProgram; // S259: readHeldTokens may have corrected it
+      filled.realizedPnLSol = (filled.realizedPnLSol ?? 0) + Number(sellRecon.actualRealizedPnLSol.toFixed(6));
+      filled.exitReason = reason;
+      filled.exitTxSignature = subRes.signature;
+      filled.lastUpdatedTimestamp = Date.now();
+      filled.exitStage = exitStageAfterFill(reason, filled.exitStage); // in the same write as the fill (R1-91)
 
-      if (sellRecon.isFullyClosed || safeSellPct >= 100) {
-        target.status = 'CLOSED';
-        target.tokenQuantityRaw = '0';
-        target.costBasisLamports = 0;
+      if (sellRecon.isFullyClosed || sellBps >= 10_000) {
+        filled.status = 'CLOSED';
+        filled.tokenQuantityRaw = '0';
+        filled.costBasisLamports = 0;
       } else {
-        target.status = 'PARTIALLY_CLOSED';
-        target.tokenQuantityRaw = sellRecon.remainingTokensRaw;
-        target.costBasisLamports = Math.round(target.costBasisLamports * (1 - fraction));
+        filled.status = 'PARTIALLY_CLOSED';
+        filled.tokenQuantityRaw = sellRecon.remainingTokensRaw;
+        filled.costBasisLamports = Math.round(filled.costBasisLamports * (1 - fraction));
       }
+      target.status = filled.status;
 
-      workstationDb.savePosition(target);
-      workstationDb.markTransactionReconciled(subRes.signature, { slot: sellRecon.slot, networkFeeLamports: sellRecon.actualNetworkFeeLamports });
+      try {
+        // S258: the position and its RECONCILED ledger row are one write, so a crash between them cannot leave a booked sell PENDING
+        // (startup reconciliation would book it a second time once a later sell had replaced exitTxSignature)
+        workstationDb.saveSellBooking(filled, subRes.signature, { slot: sellRecon.slot, networkFeeLamports: sellRecon.actualNetworkFeeLamports });
+      } catch (err: any) {
+        // nothing was written: the row still holds the sold tokens, so the sell is pending and the next pass adopts it from the wallet
+        this.pendingSells.set(positionId, { signature: subRes.signature, ts: Date.now(), lastValidBlockHeight: txBuilder.lastValidBlockHeightOf((v0Tx as any)?.message?.recentBlockhash) });
+        return { success: false, pnlSol: 0, error: `SELL_BOOKING_FAILED: ${err?.message ?? err}; the landed sell ${subRes.signature.slice(0, 8)} is booked on the next pass` };
+      }
       await this.syncRealWalletBalance();
 
       return {
@@ -3233,9 +3634,88 @@ export class ExecutionCoordinator {
         solMoved: costSoldSol + sellRecon.actualRealizedPnLSol,
       };
     } catch (err: any) {
-      return { success: false, pnlSol: 0, error: err.message };
+      // P1.6 (N-44, R1-30): a throw before the send (quote math, pool reads, building, signing) attempted nothing, so it is not counted
+      return { success: false, pnlSol: 0, error: err?.message ?? String(err), notSent: !sendStarted };
     } finally {
+      if (claimed) workstationDb.releaseExitClaim(positionId, exitClaimOwner);
       this.inFlightPositionExits.delete(positionId);
+      this.positionExitDone.delete(positionId);
+      exitDone();
+    }
+  }
+
+  /**
+   * P1.6: the wallet's balance of a LIVE position's token, read before an exit. `held` is the raw amount, 0n when the token account does
+   * not exist, null when the read failed for another reason (the caller then sells what the row says). A zero or absent answer closes the
+   * row without a sell, so it must come from a read that can be trusted: `untrusted` (a non-attempt error the exit returns as it is) is
+   * set when the RPC is not on the allowed cluster, or when its answer is from a slot before the position's buy landed (a lagging node).
+   * `error` carries the RPC's message when `held` is null. Startup reconciliation (step 4b) reads through this too, with the same rules.
+   */
+  private async readHeldTokens(target: NormalizedPosition, owner: PublicKey, mint: PublicKey): Promise<{ held: bigint | null; untrusted?: string; error?: string }> {
+    const tp = target.baseTokenProgram ? new PublicKey(target.baseTokenProgram) : TOKEN_PROGRAM_ID;
+    const ata = PumpCurveService.getAssociatedTokenAddress(mint, owner, tp);
+    let held: bigint;
+    let slot: number | undefined;
+    let absent = false;
+    try {
+      const bal = await this.connection.getTokenAccountBalance(ata, 'confirmed');
+      held = BigInt(bal?.value?.amount ?? '0');
+      slot = bal?.context?.slot;
+    } catch (e: any) {
+      // S259: only "could not find account" means the account is absent. Another "Invalid param" (an account that is not a token
+      // account of this program, say) says nothing about the balance, and a 0 here closes the row as an assumed loss.
+      if (!/could not find account/i.test(String(e?.message))) return { held: null, error: String(e?.message ?? e) };
+      held = 0n;
+      absent = true;
+    }
+    if (held > 0n) return { held };
+    // S259: a row written before base_token_program existed got the column default (SPL Token), so a Token-2022 mint's tokens sit in a
+    // token account this read did not look at. Before an empty answer decides anything, ask the mint which program owns it; on a mismatch
+    // read again with that program (and keep it on the row, saved with it).
+    const mintProgram = await this.mintOwnerProgram(mint);
+    if (mintProgram === 'UNREADABLE') return { held: null, error: `the empty balance was not checked: the mint account of ${mint.toBase58()} could not be read` };
+    if (mintProgram && !mintProgram.equals(tp)) {
+      Logger.warn(`[S259] ${target.symbol || target.mint}: the row says token program ${tp.toBase58()} but the mint is owned by ${mintProgram.toBase58()}; reading that token account`);
+      target.baseTokenProgram = mintProgram.toBase58();
+      return this.readHeldTokens(target, owner, mint);
+    }
+    if (this.clusterProblem !== null) {
+      return { held, untrusted: `CLUSTER_GUARD: the RPC is not trusted (${this.clusterProblem.replace(/^CLUSTER_GUARD: /, '')}); an empty wallet balance from it does not close the position` };
+    }
+    try {
+      await assertClusterAllowedCached(this.connection);
+    } catch (err: any) {
+      const why = String(err?.message ?? err).replace(/^CLUSTER_GUARD: /, '');
+      return { held, untrusted: `CLUSTER_GUARD: ${why}; an empty wallet balance from this RPC does not close the position` };
+    }
+    const entrySlot = target.entrySlot ?? 0;
+    if (entrySlot > 0) {
+      if (slot === undefined) {
+        try {
+          const r = await this.connection.getAccountInfoAndContext(ata, 'confirmed');
+          slot = r?.context?.slot;
+          if (absent && r?.value) slot = undefined; // the account exists after all: the two reads disagree, so neither decides
+        } catch {
+          slot = undefined;
+        }
+      }
+      if (slot === undefined || slot < entrySlot) {
+        return { held, untrusted: `BALANCE_UNTRUSTED: the RPC reported no tokens as of slot ${slot ?? 'unknown'}, but the buy landed in slot ${entrySlot}; not closing the position on that read` };
+      }
+    }
+    return { held };
+  }
+
+  /**
+   * S259: the program that owns the mint account (SPL Token or Token-2022), null when the account does not exist or is owned by another
+   * program (nothing to correct the row with), 'UNREADABLE' when the read failed.
+   */
+  private async mintOwnerProgram(mint: PublicKey): Promise<PublicKey | null | 'UNREADABLE'> {
+    try {
+      const owner = (await this.connection.getAccountInfo(mint, 'confirmed'))?.owner;
+      return owner && (owner.equals(TOKEN_PROGRAM_ID) || owner.equals(TOKEN_2022_PROGRAM_ID)) ? owner : null;
+    } catch {
+      return 'UNREADABLE';
     }
   }
 
@@ -3274,10 +3754,13 @@ export class ExecutionCoordinator {
    * A mint whose price could not be read is not asked again at once. Without this, 515 stale PAPER positions on mints that do not exist
    * cost one RPC read each on every 3 s pass (and a log line each), which also drew 429s from the endpoint. The wait doubles from
    * MARK_RETRY_BASE_MS to MARK_RETRY_MAX_MS and resets on a successful read.
+   * P1.6 (R1-19, R1-112): a LIVE position is never backed off, so one failed read cannot blind its stop-loss for a minute or more; it is
+   * read on every pass. The exception is a mint that can never be marked (PumpCurveService.getMintRejection: not a token mint).
    */
   private markRetry = new Map<string, { failures: number; nextAt: number }>();
-  private markBackedOff(mint: string, now = Date.now()): boolean {
-    const r = this.markRetry.get(mint);
+  private markBackedOff(pos: Pick<NormalizedPosition, 'mint' | 'executionMode'>, now = Date.now()): boolean {
+    if (pos.executionMode === 'LIVE' && !PumpCurveService.getMintRejection(pos.mint)) return false;
+    const r = this.markRetry.get(pos.mint);
     return !!r && now < r.nextAt;
   }
   private noteMarkFailure(mint: string, now = Date.now()): void {
@@ -3290,7 +3773,7 @@ export class ExecutionCoordinator {
 
   /** C4: isolated per-position price read used when the shared mark feed has gone stale. */
   private async refreshStaleMark(pos: NormalizedPosition): Promise<boolean> {
-    if (this.markBackedOff(pos.mint)) return false; // asked recently and failed: no RPC read this time
+    if (this.markBackedOff(pos)) return false; // asked recently and failed: no RPC read this time (never a LIVE position, P1.6)
     try {
       const marks = await RealMarkPriceService.queryOnChainMarkPrices(
         this.connection,
@@ -3346,9 +3829,110 @@ export class ExecutionCoordinator {
 
   // Evaluate dynamic exit conditions for all active positions and execute exits via ExitEngine (B13)
   private exitPassInFlight: Promise<void> | null = null;
-  private pendingSells = new Map<string, { signature: string; ts: number }>();
+  /** P1.7: one promise per position whose sell is running (set and cleared with inFlightPositionExits); it only ever resolves. */
+  private positionExitDone = new Map<string, Promise<void>>();
+  private panicActive = false;
 
-  // N1: one pass at a time. A pass awaits sells that can outlast the 3s timer; an overlapping pass would see the same
+  /**
+   * P1.7: resolves once no exit (sell) of this position is running on this coordinator; at once when none is. Never rejects. A panic
+   * liquidation (P1.4) awaits it so it does not race a sell that is already on its way.
+   */
+  public async waitForPositionExit(positionId: string): Promise<void> {
+    for (let p = this.positionExitDone.get(positionId); p; p = this.positionExitDone.get(positionId)) await p;
+  }
+
+  /** P1.7: while a panic liquidation runs, the exit pass sends only protective exits (PROTECTIVE_EXIT_REASONS, the haltAll set). */
+  public setPanicActive(active: boolean): void {
+    this.panicActive = active;
+  }
+
+  public isPanicActive(): boolean {
+    return this.panicActive;
+  }
+
+  /**
+   * P1.7: one auto exit, started by the exit pass and not awaited in its loop. The exit stage advances here, after the sell filled, from
+   * the row as it is then. Never rejects.
+   */
+  private dispatchExit(pos: NormalizedPosition, sellPct: number, reason: string, priorExitStage: NormalizedPosition['exitStage'], newExitStage: NormalizedPosition['exitStage']): Promise<void> {
+    return this.closePosition(pos.id, sellPct, reason).then((exitRes) => {
+      if (exitRes.success && newExitStage !== priorExitStage) {
+        const after = workstationDb.loadPositions(undefined, 'ACTIVE').find((p) => p.id === pos.id);
+        if (after) {
+          after.exitStage = newExitStage;
+          workstationDb.savePosition(after);
+        }
+      }
+    }).catch((err: any) => {
+      Logger.error(`[B13 ExitEngine] ${reason} for ${pos.symbol || pos.mint} failed: ${err?.message ?? err}`);
+    });
+  }
+
+  private pendingSells = new Map<string, { signature: string; ts: number; lastValidBlockHeight?: number }>();
+  /** P2.2: set when the first startup reconciliation run ends, whatever its result. */
+  private firstReconciliationDone = false;
+
+  /**
+   * P2.3 (N-28): a position closed because the wallet holds none of it, with no sell found, loses its whole remaining cost basis.
+   * Adds that loss to `pos.realizedPnLSol` (the caller's savePosition writes the realized_events delta) and journals
+   * REALIZED_ASSUMED_LOSS. Returns the loss in SOL (0 for a RECOVERED position, whose basis is unknown and stored as 0).
+   */
+  private bookAssumedLoss(pos: NormalizedPosition, where: string): number {
+    const lossSol = Math.max(0, pos.costBasisLamports || 0) / 1e9;
+    if (lossSol <= 0) return 0;
+    pos.realizedPnLSol = Number(((pos.realizedPnLSol ?? 0) - lossSol).toFixed(9));
+    workstationDb.logJournal('REALIZED_ASSUMED_LOSS', `assumed-loss-${pos.id.slice(0, 8)}`, pos.executionMode, { positionId: pos.id, mint: pos.mint, lossSol, where });
+    return lossSol;
+  }
+
+  /** P2.2: mints with a LIVE SELL row still PENDING or RECONCILIATION_REQUIRED. */
+  private unresolvedLiveSellMints(): Set<string> {
+    return new Set(
+      workstationDb.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED'])
+        .filter((t) => t.direction === 'SELL' && t.executionMode === 'LIVE')
+        .map((t) => t.mint)
+    );
+  }
+
+  /**
+   * P2.2 (R1-23, R1-83): pendingSells lived in memory only, so after a restart a sell that was sent but not confirmed was forgotten and the
+   * position could be sold again (or closed at cost 0 by the zero-balance branch). At start, every LIVE SELL row still PENDING or
+   * RECONCILIATION_REQUIRED becomes a pending sell of the active LIVE position of that mint (one position per mint), with its submission
+   * time and blockhash height, so closePosition reads the wallet before it sells again (the N3 adoption path).
+   */
+  private seedPendingSellsFromLedger(): void {
+    try {
+      const active = workstationDb.loadPositions(undefined, 'ACTIVE').filter((p) => p.executionMode === 'LIVE');
+      const rows = workstationDb.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED']).filter((t) => t.direction === 'SELL' && t.executionMode === 'LIVE');
+      for (const t of rows) {
+        const pos = active.find((p) => p.mint === t.mint);
+        if (!pos) continue;
+        const known = this.pendingSells.get(pos.id);
+        if (known && known.ts >= t.submissionTime) continue; // keep the latest sell of the position
+        this.pendingSells.set(pos.id, { signature: t.signature, ts: t.submissionTime, lastValidBlockHeight: t.lastValidBlockHeight });
+      }
+      if (this.pendingSells.size > 0) Logger.warn(`[P2.2] ${this.pendingSells.size} sell(s) sent before the restart are unresolved; their positions check the wallet before selling again`);
+    } catch (err: any) {
+      Logger.warn(`[P2.2] could not seed pending sells from the ledger: ${err.message}`);
+    }
+  }
+
+  /**
+   * P2.1: true only when the pending sell's blockhash has expired (confirmed block height past its lastValidBlockHeight) AND its signature
+   * has no status, history included: it was never processed and can no longer be. Any read that fails, or a sell with no stored height, is false.
+   */
+  private async pendingSellCannotLand(p: { signature: string; lastValidBlockHeight?: number }): Promise<boolean> {
+    if (!(typeof p.lastValidBlockHeight === 'number' && p.lastValidBlockHeight > 0)) return false;
+    try {
+      if ((await this.connection.getBlockHeight('confirmed')) <= p.lastValidBlockHeight) return false;
+      const st = await this.connection.getSignatureStatuses([p.signature], { searchTransactionHistory: true });
+      return Array.isArray(st?.value) && st.value.length === 1 && st.value[0] === null;
+    } catch {
+      return false;
+    }
+  }
+
+  // N1: one pass at a time. A pass waits (up to EXIT_SELL_WAIT_MS) for sells that can outlast the 3s timer; an overlapping pass would see the same
   // ACTIVE row and sell it again, or write back its stale copy over a position the first pass already closed.
   public evaluateAndProcessExits(): Promise<void> {
     if (this.exitPassInFlight) return this.exitPassInFlight;
@@ -3364,11 +3948,16 @@ export class ExecutionCoordinator {
       await this.updatePositionMarkPrices();
     } catch {}
 
-    const positions = workstationDb.loadPositions(undefined, 'ACTIVE');
+    let positions = workstationDb.loadPositions(undefined, 'ACTIVE');
+    // P2.2 (R1-23, R1-83, R1-115): until the first startup reconciliation has applied the SELL rows from before a restart, a LIVE position
+    // with an unresolved sell is not evaluated: its earlier sell may have landed, and selling again could sell a partial twice.
+    if (!this.firstReconciliationDone) {
+      const held = this.unresolvedLiveSellMints();
+      if (held.size > 0) positions = positions.filter((p) => !(p.executionMode === 'LIVE' && held.has(p.mint)));
+    }
     const loadedQty = new Map(positions.map((p) => [p.id, p.tokenQuantityRaw]));
     // N17: failure counters only matter for positions still open; drop the rest so the map cannot grow forever.
     for (const id of this.exitFailures.keys()) if (!loadedQty.has(id)) this.exitFailures.delete(id);
-    const now = Date.now();
     // Nothing LIVE is open, so there is no mark to be stale (see the feed heartbeat): reset the clock here too.
     if (!positions.some((p) => p.executionMode === 'LIVE')) {
       this.lastPositionMarkTimestamp = 0;
@@ -3378,10 +3967,14 @@ export class ExecutionCoordinator {
     let paperRefreshes = 0;
     let paperAlertsThisPass = 0;
     const paperNoMark: Array<{ pos: NormalizedPosition; ageMs: number }> = [];
+    const exits: Array<{ pos: NormalizedPosition; decision: ReturnType<typeof ExitEngine.evaluate>; priorExitStage: NormalizedPosition['exitStage'] }> = [];
     for (const pos of positions) {
+      // R1-32: each position's clock is read when it is evaluated, not when the pass started (a stale-mark read above can take a while).
+      const posNow = Date.now();
       // C4: staleness is measured from the last real mark only. lastUpdatedTimestamp is rewritten on every tick
       // and would hide a dead feed, so it is never a fallback; a never-marked position ages from its entry.
-      const markAge = now - (pos.lastMarkTimestamp || pos.entryTimestamp || now);
+      const markAge = posNow - (pos.lastMarkTimestamp || pos.entryTimestamp || posNow);
+      let staleStopOnly = false;
       if (markAge > MARK_STALE_MS) {
         // Before skipping, read this position's curve/pool directly. A fresh read lets the stop-loss run.
         // PAPER positions cost no more than PAPER_STALE_REFRESH_PER_PASS direct reads per pass; LIVE positions always get theirs.
@@ -3399,11 +3992,16 @@ export class ExecutionCoordinator {
             );
           }
           // A position nobody can price must age the mark feed from its entry, or an empty history would read as healthy.
-          if (pos.executionMode === 'LIVE' && this.lastPositionMarkTimestamp === 0) this.lastPositionMarkTimestamp = pos.entryTimestamp || now;
-          continue;
+          if (pos.executionMode === 'LIVE' && this.lastPositionMarkTimestamp === 0) this.lastPositionMarkTimestamp = pos.entryTimestamp || posNow;
+          // P1.6: a LIVE position whose last known mark is already past the hard stop still gets its STOP_LOSS (and nothing else): the
+          // sell re-reads the curve or pool before it is built, so it does not trade on the stale price. Every other exit waits for a mark.
+          if (pos.executionMode !== 'LIVE' || !(pos.currentPriceSol > 0)) continue;
+          staleStopOnly = true;
         }
-        this.clearOperatorAlert('POSITION_MARK_UNAVAILABLE', pos.id);
-        if (pos.executionMode === 'LIVE') this.recordPositionMarkEvent();
+        if (!staleStopOnly) {
+          this.clearOperatorAlert('POSITION_MARK_UNAVAILABLE', pos.id);
+          if (pos.executionMode === 'LIVE') this.recordPositionMarkEvent();
+        }
       } else if (pos.executionMode === 'LIVE') {
         this.recordPositionMarkEvent(); // a real mark within the staleness window
       }
@@ -3416,8 +4014,9 @@ export class ExecutionCoordinator {
         trailingStopSol: pos.trailingStopSol,
         exitStage: pos.exitStage,
         entryTimestamp: pos.entryTimestamp,
-        currentTimestamp: now,
+        currentTimestamp: posNow,
       });
+      if (staleStopOnly && !(decision.shouldExit && decision.reason === 'STOP_LOSS')) continue; // P1.6: no price, and not past the hard stop
 
       // A RECOVERED position (a balance found in the wallet that this app never bought) has an entry price that is just the mark at
       // adoption, so take-profit, trailing and stale exits would sell whatever lands in the wallet on an invented schedule. Only the
@@ -3438,7 +4037,7 @@ export class ExecutionCoordinator {
       pos.highWaterMarkSol = decision.newHighWaterMarkSol;
       pos.trailingStopSol = decision.newTrailingStopSol;
       pos.exitStage = decision.shouldExit ? priorExitStage : decision.newExitStage;
-      pos.lastUpdatedTimestamp = now;
+      pos.lastUpdatedTimestamp = posNow;
       // N1: this row was loaded before the awaits above (and before earlier positions' sells in this pass). If a manual
       // close, partial sell or reconcile changed it since, writing the stale copy back would resurrect a sold position
       // or undo a partial; skip it and let the next pass re-evaluate from the current row.
@@ -3451,19 +4050,32 @@ export class ExecutionCoordinator {
       }
 
       if (decision.shouldExit) {
-        const waitMs = this.exitRetryWaitMs(pos.id, now);
-        if (waitMs > 0) continue; // backing off after a failed attempt; the next tick past the deadline retries
-        Logger.info(
-          `[B13 ExitEngine] ${decision.reason} triggered for ${pos.symbol || pos.mint} (Sell ${decision.sellPercentage}%, PnL: ${decision.profitPct.toFixed(2)}%)`
-        );
-        const exitRes = await this.closePosition(pos.id, decision.sellPercentage, decision.reason);
-        if (exitRes.success && decision.newExitStage !== priorExitStage) {
-          const after = workstationDb.loadPositions(undefined, 'ACTIVE').find((p) => p.id === pos.id);
-          if (after) {
-            after.exitStage = decision.newExitStage;
-            workstationDb.savePosition(after);
-          }
+        if (this.exitRetryWaitMs(pos.id, posNow) > 0) continue; // backing off after a failed attempt; the next tick past the deadline retries
+        if (this.inFlightPositionExits.has(pos.id)) continue; // P1.7: its sell from an earlier pass is still running; it must not be sent twice
+        if (this.panicActive && !PROTECTIVE_EXIT_REASONS.test(decision.reason)) {
+          Logger.warn(`[B13 ExitEngine] ${decision.reason} for ${pos.symbol || pos.mint} refused: panic liquidation is running`);
+          continue;
         }
+        exits.push({ pos, decision, priorExitStage });
+      }
+    }
+
+    // P1.7 (R1-71): every decision above was made before any sell started. Now start the sells together, so a slow or hung sell of one
+    // position cannot hold another position's stop-loss. The pass waits for them at most EXIT_SELL_WAIT_MS; a sell still running after
+    // that keeps going in the background, its position stays in inFlightPositionExits (no second send), and the next pass evaluates the rest.
+    const sells = exits.map(({ pos, decision, priorExitStage }) => {
+      Logger.info(
+        `[B13 ExitEngine] ${decision.reason} triggered for ${pos.symbol || pos.mint} (Sell ${decision.sellPercentage}%, PnL: ${decision.profitPct.toFixed(2)}%)`
+      );
+      return this.dispatchExit(pos, decision.sellPercentage, decision.reason, priorExitStage, decision.newExitStage);
+    });
+    if (sells.length > 0) {
+      let timer: NodeJS.Timeout | undefined;
+      const deadline = new Promise<void>((r) => { timer = setTimeout(r, EXIT_SELL_WAIT_MS); });
+      try {
+        await Promise.race([Promise.allSettled(sells), deadline]);
+      } finally {
+        clearTimeout(timer);
       }
     }
 

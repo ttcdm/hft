@@ -11,6 +11,8 @@ import { formatPctChange, calloutSnipeBlock, formatCalloutMcap, getTokenExternal
 import { autoSnipeController } from '../server/auto/controller';
 import { newPumpPool } from './fixtures/auto';
 import { pumpCoin, jsonResponse } from './fixtures/socialFeeds';
+/** The pump.fun / DexScreener HTTP feeds run on mainnet-beta only (P4.2); these tests replay recorded feed responses as if there. */
+const MAINNET_FEEDS = { ALLOWED_CLUSTER: 'mainnet-beta' };
 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); memecoinAggregator.setConfluenceGating(true); });
 
@@ -56,7 +58,7 @@ describe('S176 #3: callout market cap and multiple are measured or unknown', () 
     vi.restoreAllMocks();
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input: any) =>
       String(input).includes('frontend-api-v3.pump.fun') ? jsonResponse([pumpCoin(coin)]) : jsonResponse([]));
-    await svc.syncRealWorldData({ evaluateTriggers: false });
+    await svc.syncRealWorldData({ evaluateTriggers: false, env: MAINNET_FEEDS });
     return { svc, fetchMock };
   }
   it('the callout mcap is the mcap first seen, not a fixed $5,000, and the multiple is measured against it', async () => {
@@ -65,7 +67,7 @@ describe('S176 #3: callout market cap and multiple are measured or unknown', () 
     expect(c.token.marketCapAtCalloutUsd).toBe(80_000);
     expect(c.token.currentMultiple).toBe(1);
     fetchMock.mockImplementation(async (input: any) => String(input).includes('frontend-api-v3.pump.fun') ? jsonResponse([pumpCoin({ usd_market_cap: 160_000 })]) : jsonResponse([]));
-    await svc.syncRealWorldData({ evaluateTriggers: false });
+    await svc.syncRealWorldData({ evaluateTriggers: false, env: MAINNET_FEEDS });
     c = svc.getHotCallouts()[0];
     expect(c.token.marketCapAtCalloutUsd).toBe(80_000);
     expect(c.token.currentMultiple).toBe(2);

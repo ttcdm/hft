@@ -40,21 +40,24 @@ This document outlines structural, economic, and operational risks of running th
 * **Risk Description:** Volatile memecoin liquidity pools are vulnerable to sandwich attacks when transactions are submitted via public mempools.
 * **Operational Impact:** High slippage settings can result in severe adverse execution prices.
 * **Required Countermeasure:**
-  - The risk engine strictly enforces an 800 bps (8%) maximum slippage cap (`SLIPPAGE_TOO_HIGH`).
+  - Buys: the risk engine refuses a buy whose slippage is above `MAX_SLIPPAGE_BPS` (default 800 bps, 8%; `SLIPPAGE_TOO_HIGH`). That check runs for buys only.
+  - Sells are not checked by the risk engine. Each consecutive failed exit of a LIVE position widens its sell slippage along the ladder 800, 1500, 2500, 4000 bps (`SELL_SLIPPAGE_LADDER_BPS` in `server/execution/coordinator.ts`), and waits 3, 6, 12, 24, then 30 s before the next try, so a stop-loss in a fast dump can still clear. After three counted failures a stop-loss goes out accepting up to 40% less than quoted. The ladder advances only for LIVE sells and only on errors counted as attempts: a send that failed and a failed simulation (nothing was sent) count; quote failures and anything thrown before the send (`EXIT_QUOTE_FAILING`), and results that attempted nothing (a pending sell, unknown venue or unreadable curve, no signer, halt, dust, the cluster guard, an untrusted empty balance, an exit already in flight, a send the RPC rate-limited past its three resends, `RPC_RATE_LIMITED`) do not. A rate-limited sell send is resent after 0.5, 1 and 2 s without counting and without widening slippage; when every resend is refused the exit pass tries again on its next tick with no back-off, and `EXIT_RATE_LIMITED` is raised. A successful exit resets it.
   - On devnet and localnet there is no private bundle route (see 1.2): orders go through the public mempool as ordinary transactions, so sandwich protection is not provided or tested here.
 
 ---
 
-## 3. MICRO_10 Capital Allocation & Economic Risks
+## 3. Capital allocation on a small devnet wallet (`CAPITAL_TIER=MICRO_10`)
 
-### 3.1 Tiny Bankroll Sensitivity (~0.07 SOL)
-* **Risk Description:** At ~0.07 SOL total bankroll, fixed execution costs (SOL signature fee, ATA rent, priority fee, Jito tip) represent a substantial percentage of position size.
+All amounts in this section are devnet SOL, on a throwaway devnet key (see 4.1).
+
+### 3.1 Tiny Bankroll Sensitivity (~0.07 devnet SOL)
+* **Risk Description:** At ~0.07 SOL total bankroll, fixed execution costs (signature fee, token account rent, priority fee, and the one-time pump account rent on a wallet's first pump buy) are a large share of the order size.
 * **Operational Impact:** Indiscriminate trading can lead to severe fee drag even on winning trades.
 * **Required Countermeasure:**
-  - Hard per-trade position cap: $\le 10\%$ of spendable bankroll ($\approx 0.007\text{ SOL}$).
-  - Sizing uses spendable bankroll: $\text{Spendable} = \text{Wallet SOL} - \text{Reserve} - \text{Pending Capital}$.
-  - Pre-trade fee economics check: If projected fees exceed 20% of trade size, the trade is rejected (`EXPECTED_EDGE_BELOW_EXECUTION_COST`).
-  - Dynamic trailing stops and take-profit ladders enforce fee awareness, preventing micro-dust executions.
+  - Sizing uses spendable bankroll: $\text{Spendable} = \text{Wallet SOL} - 0.015\text{ SOL reserve} - \text{in-flight orders}$.
+  - Hard per-trade cap for a LIVE buy: 10% of spendable, so about 0.0055 SOL on a 0.07 SOL wallet (`EXCEEDS_CAPITAL_CEILING`).
+  - Pre-trade fee economics check: if the estimated round-trip cost exceeds 20% of the order, the buy is refused (`EXPECTED_EDGE_BELOW_EXECUTION_COST`). On a wallet's first pump buy that cost includes the pump volume-accumulator rent (1,346,200 lamports, never refunded), which alone is 20% of about 0.0067 SOL, so a first buy must be larger than that; the refusal names the size that would pass. If the accumulator account cannot be read, the rent is counted as unpaid.
+  - The first trailing stop is never below entry x 1.03. A LIVE sell whose proceeds would not cover its fees is refused as dust (`DUST_POSITION_EXIT_UNECONOMICAL`) unless it is a stop-loss, trailing stop or panic.
 
 ---
 
@@ -64,13 +67,9 @@ This document outlines structural, economic, and operational risks of running th
 * **Risk Description:** Compromise of the server host filesystem exposes unencrypted keypair files.
 * **Operational Impact:** Potential unauthorized asset drainage.
 * **Required Countermeasure:**
-  - Always import trading keys via the local CLI:
-    ```bash
-    npm run signer:import -- /path/to/trading-keypair.json
-    ```
-  - The import script creates `.apex_trading_keypair.json` with POSIX `0600` permissions (readable and writable solely by the running user).
+  - Use a throwaway devnet key generated for this app: the UI, `POST /api/signer/generate`, or `solana-keygen new`. Fund it only from the devnet faucet.
+  - `npm run signer:import -- /path/to/throwaway-keypair.json` copies a keypair file into `.apex_trading_keypair.json` with POSIX `0600` permissions (readable and writable solely by the running user). It does no cluster check and accepts any key, so never give it a key that holds, or has ever held, mainnet funds.
   - Key material is never transmitted to web browsers, client frontends, or WebSocket consumers.
-  - Dedicate a dedicated low-balance trading wallet (0.07 SOL). Never use cold-storage or primary treasury wallets for automated execution.
 
 ### 4.2 Operator Authentication
 * **Risk Description:** Unprotected HTTP mutation routes could allow unauthorized trade initiation or configuration changes.
@@ -86,31 +85,24 @@ This document outlines structural, economic, and operational risks of running th
 
 ## 5. Emergency Procedures
 
-1. **Immediate Execution Halt:** Engage the Hardware Kill Switch via the UI or `POST /api/live/disarm`. This halts order generation and trips the circuit breaker.
-2. **Panic Liquidation:** `POST /api/wallet/panic-liquidate` (or Telegram `/panic_sell`). It turns the kill switch on, disarms live trading and stops auto first, then sells every active position. **Decision (Q53): panic sells everything the app holds in the wallet, including balances it adopted at startup (RECOVERED) that it never bought, and rows of every mode.** It is an emergency exit, so it does not apply the "only what auto bought" scoping that auto's own kill uses (R23). If you hold a balance you want kept, do not use panic; close positions one by one.
-3. **Wallet Balance Sweep:** In the event of an infrastructure anomaly, transfer all remaining SOL out of the trading keypair to a designated cold wallet via standard CLI tools (`solana transfer`).
+Step-by-step procedures, with the commands: [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+
+1. **Stop new buys:** the KILL SWITCH button, or `POST /api/execution/kill-switch` with `{"activate":true}`. It runs the shared emergency stop without the sells (`server/execution/emergencyStop.ts`): the kill switch goes on (every new buy is refused, PAPER included), auto is killed and set OFF once any buy it already had in flight has finished (the OFF is saved, so a restart comes back OFF), and LIVE is disarmed. It does not open the circuit breaker and does not stop exits. The switch itself is held in memory only, so a restart clears it. Reset it with `{"activate":false}`; the reply says whether the circuit breaker or a halt is still set. Resetting it does not turn auto back on or re-arm LIVE: a DEVNET_LIVE session ended by the switch needs LIVE armed and DEVNET_LIVE set again with `CONFIRM_AUTO_DEVNET`. Independently, a DEVNET_LIVE session that sees the coordinator disarmed or the kill switch on (at its next candidate, its 5 s monitor tick or a status read) turns itself OFF, so re-arming LIVE never revives it.
+2. **Panic Liquidation:** `POST /api/wallet/panic-liquidate`. The shared emergency stop with the sells, in this order: kill switch on; auto killed, after waiting for a buy it already had in flight, so the position that buy opens is in the list; LIVE disarmed; then 100% of every active position of every mode is sold, one at a time, with `EMERGENCY_PANIC_LIQUIDATION` (a protective reason: it runs during a halt and is never refused as dust). A position whose exit was already in flight (for example a take-profit partial) is waited for, re-read and its remainder sold. The active positions are read once more after the loop and any new one (a manual buy that was already past the risk gate) is sold too. Read the reply: `Failed` lists what is still open, for example a sell still being verified (`SELL_PENDING_VERIFICATION`) or a position another process is selling (`EXIT_IN_PROGRESS`); run panic again until nothing fails. **Decision (Q53): panic sells everything the app holds in the wallet, including balances it adopted at startup (RECOVERED) that it never bought, and rows of every mode.** It is an emergency exit, so it does not apply the "only what auto bought" scoping that auto's own kill uses (R23). If you hold a balance you want kept, do not use panic; close positions one by one.
+   - The WebSocket `PANIC_LIQUIDATE` action and Telegram `/panic_sell` run the same emergency stop and report the same lists.
+   - Telegram `/panic_sell` is still not an emergency control you can rely on from a phone: Telegram cannot deliver it (no webhook is registered with Telegram and nothing polls for updates); it runs only when something posts it to `POST /api/telegram/webhook` with the operator token.
+3. **Move devnet SOL off the throwaway key:** `solana transfer --url devnet --keypair <throwaway.json> <another devnet address> ALL`. Always pass `--url devnet`: the Solana CLI's default cluster is not devnet. The destination is another devnet key you control.
 
 ## 6. Settings that are stored but change nothing (checked against the code, Q34)
 
-These can be set (some from the UI) and are saved, but no code path reads them to decide anything. Do not rely on them.
+S215 removed the settings this section used to list (`snipeThresholdScore`, `autoForwardAlerts`, `webhookActive`, `isAutoSnipeEnvEnabled`, the per-caller auto-snipe marker, `requireMintRevoked`, `ENABLE_SYNTHETIC_SOCIAL`, `minConfidenceScore`, `requireConfluenceScore`, the unused wallet-config fields and `priorityTipSol`), and the 2026-10-22 audit removed `enabledStrategies` (four strategy toggles nothing read) and `allocatedSol` (a constant per capital tier, 0.07 or 5 SOL, that the wallet state echoed as `allocatedSol` / `availableSol` as if it were a wallet figure; `totalPortfolioValueUsd` now comes from the real balance and is null until one has been read). None of them was read. The auto-snipe score gate is the confluence threshold: default 70, starting from `CONFLUENCE_MIN_SCORE`, editable at runtime (`POST /api/auto/threshold`, S187).
 
 | Setting | Where it lives | What it actually does |
 |---|---|---|
-| `snipeThresholdScore` (Telegram config) | `server/socialScanner.ts` | Stored and returned only. The auto-snipe score gate is the confluence threshold: default 70, starting from `CONFLUENCE_MIN_SCORE`, editable at runtime (`POST /api/auto/threshold`, S187). |
-| `autoForwardAlerts` (Telegram config) | `server/socialScanner.ts` | Stored only. Nothing forwards alerts to Telegram. |
-| `webhookActive` (Telegram config) | `server/socialScanner.ts` | Changes the word in the `/status` reply. No webhook is registered with Telegram. |
-| `isAutoSnipeEnvEnabled()` | `server/pumpfunService.ts` | Defined, never called. |
-| `isAutoSnipeSubscribed` / `toggleCallerAutoSnipe` | `server/pumpfunService.ts` | Flips a flag shown in the UI. No code buys because of it. |
-| `requireMintRevoked` | `server/memecoinAggregator.ts` config | Accepted and stored. The mint-authority rule is enforced by the eligibility gate, not by this field. |
-| `ENABLE_SYNTHETIC_SOCIAL` | `server/solana/executionConfig.ts` | Read into the config object, never consulted. |
+| Two "auto snipe" switches | env `AUTO_SNIPE_ENABLED` (`server/auto/controller.ts`) and `isAutoSnipeEnabled` in `server/memecoinAggregator.ts` | Both are read. The env flag and the Auto panel's mode decide whether auto trades at all. The aggregator flag, when on, makes its 5-second loop submit hot callouts to the controller as candidates (only while the controller is not OFF); the controller drops any that the watch window never released, so in practice it buys nothing. No screen sets the aggregator flag any more (P1.4): the sniper screen shows the controller's mode, read-only, and only `POST /api/memecoins/config` can change the flag. |
+| Sniper take-profit and stop-loss | `takeProfitPct` / `stopLossPct` in `server/memecoinAggregator.ts` (and the Sniper tab's take-profit box) | Nothing. Every exit follows the fixed rules in `server/exits/exitEngine.ts` (stop −20%, trailing stop from +15%, 33% sold at +30% and 33% at +60%, all sold after 30 min under +5%). The Sniper tab shows those rules, from `exitRules` in `GET /api/memecoins/config`; it used to show the two config numbers as "Auto TP / Auto SL". |
 
-| `minConfidenceScore` | `server/memecoinAggregator.ts` config | Accepted and stored, never read. |
-| `requireConfluenceScore` (wallet config `riskLimits`, default 70) | `server/walletTrader.ts`, `server/middleware/enterprise.ts` | Accepted by the schema and kept in the config object. No code compares a score with it. The real gate is the confluence threshold (`CONFLUENCE_MIN_SCORE`, `POST /api/auto/threshold`). |
-| Two "auto snipe" switches | env `AUTO_SNIPE_ENABLED` (`server/auto/controller.ts`) and the UI/config flag in `server/memecoinAggregator.ts` | Only the env flag and the Auto panel's mode decide whether auto trades. The other flag is stored only. |
-| `walletAddress`, `jitoTipAccount`, `wsRpcEndpoint`, `autoStartTrading` (wallet config body) | `server/execution/schemas`/`walletTrader.updateConfig` | Accepted by the schema, never applied by `updateConfig`. |
-| `priorityTipSol` on close-position | `ClosePositionSchema` | Labelled placeholder; ignored. |
-
-Also: the per-caller auto-snipe toggle in the Hot Callouts screen is a screen marker only, and says so on screen; nothing reads it. The callout auto-snipe rules next to it are not markers: while the Auto controller is not OFF, `server/pumpfunService.ts` (`evaluateAutoSnipeTriggers`) reads them and submits matching callouts to the controller as candidates, and the controller applies its own gates (in SHADOW nothing is sent). Jito bundles are used only on mainnet-beta, which this build does not use. On devnet and localnet the app sends ordinary transactions with a priority fee.
+Also: the callout auto-snipe rules on the Hot Callouts screen are live: while the Auto controller is not OFF, `server/pumpfunService.ts` (`evaluateAutoSnipeTriggers`) reads them and submits matching callouts to the controller as candidates, and the controller applies its own gates (in SHADOW nothing is sent). Jito bundles are used only on mainnet-beta, which this build does not use. On devnet and localnet the app sends ordinary transactions with a priority fee.
 
 ## 7. What the live confirmation (`confirmLive`) is, and is not (S1)
 
@@ -120,7 +112,7 @@ It is a guard against an accidental or scripted one-click trade. It is **not** a
 
 ## 8. What score auto can reach, and what the seeded devnet token will and will not do (S5, S4)
 
-The auto gate asks for a confluence score at or above the threshold in force (HOT also needs 3 of the watch window's 4 signals). The threshold is **editable** since S187 (`CONFLUENCE_MIN_SCORE`, or `POST /api/auto/threshold`, whole number 0 to 100, default 70, kept until restart), and the table below was measured against the default 70. Lowering it buys more and weaker coins; the Auto panel warns below 50 and the replay backtest can show a what-if (`?minScore=N`). The second review measured the score on the production modules at SOL $150; the earlier notes that put the ceiling at 90, or at 81, were wrong, because Liquidity cannot reach its maximum (it is real SOL x price x 2, so it is 0 to 3 below about 30 SOL real and 6 only at graduation, when the curve is complete and untradable), and Social is always 0.
+The auto gate asks for a confluence score at or above the threshold in force (HOT also needs 3 of the watch window's 4 signals). The threshold is **editable** since S187 (`CONFLUENCE_MIN_SCORE`, or `POST /api/auto/threshold`, whole number 0 to 100, default 70, saved and restored after a restart since S222), and the table below was measured against the default 70. Lowering it buys more and weaker coins; the Auto panel warns below 50 and the replay backtest can show a what-if (`?minScore=N`). The second review measured the score on the production modules at SOL $150; the earlier notes that put the ceiling at 90, or at 81, were wrong, because Liquidity cannot reach its maximum (it is real SOL x price x 2, so it is 0 to 3 below about 30 SOL real and 6 only at graduation, when the curve is complete and untradable), and Social is always 0.
 
 | Scenario (hand-built replays, not recorded feeds) | Score |
 |---|---|
@@ -133,7 +125,7 @@ The auto gate asks for a confluence score at or above the threshold in force (HO
 | one whale plus 30 small buyers | 56 |
 | the devnet seed, 30 x 0.01 SOL, all funded by one wallet | 35 |
 
-What to expect: **72-76 at best with an ideal crowd, 62-68 for a typical launch, and 81 only at graduation.** Reaching 70 needs Momentum 20, OrderFlow 20 (no sells), Distribution at least 10 (about 35 near-equal buyers), Curve at least 13 and DevRisk 5 at the same tick. DevRisk is 5 only when no creator report arrived; a mainnet creator who dev-buys gets 0-1. So a quiet auto run is normal, not a fault.
+What to expect: **72-76 at best with an ideal crowd, 62-68 for a typical launch, and 81 only at graduation.** Reaching 70 needs Momentum 20, OrderFlow 20 (no sells), Distribution at least 10 (about 35 near-equal buyers), Curve at least 13 and DevRisk 5 at the same tick. DevRisk is 5 live only when the creator's history report says seasoned wallet; a creator whose report is missing (lookup failed, or not back yet) scores 0 and is listed as missing data (P4.1; it used to borrow 5 points from a 0% dev holding). The scenarios above are replays, which know no creator address and still use the dev-holding stand-in, so the same crowd behind a fresh-wallet creator scores 5 lower live. So a quiet auto run is normal, not a fault.
 
 The seeded devnet token (`scripts/devnet_seed.ts`) is **not expected to be bought by auto**: the seed funds all 30 buyers from one wallet, the watch window clusters buyers by who first funded them, so it sees one buyer (HOT needs 25 unique buyers), and the measured score is 35. That is by design here; funding the buyers through disguised intermediaries to get around the check was considered and rejected. The seed is useful for watching the board and the watch window, and for manual buys, not as proof that auto can trade.
 
@@ -142,7 +134,7 @@ The seeded devnet token (`scripts/devnet_seed.ts`) is **not expected to be bough
 
 - **Finality is instant.** The in-process validator reports `finalized` for every landed signature at once. The "sent and unknown" class (SELL_PENDING_VERIFICATION, blockhash expiry, processed to confirmed) therefore runs only through explicit fault injection. Step (g) of `npm run localnet:e2e` covers "landed but the response was withheld", not "sent and the outcome is unknown". Devnet is the first place those paths meet real latency.
 - **The `localnet_*` methods are harness-only.** No production code calls them (`grep` finds none), so `localnet_setAccount` cannot be reached from the app.
-- **A buyer funded through a program call is untested.** The validator's `getTransaction` (`jsonParsed`) understands only direct system transfers. A buyer funded by a CPI (the case S4d's public-funder list handles) has no localnet test.
+- **A buyer funded through a program call is untested on localnet.** The funder lookup reads inner (CPI) system transfers, `createAccount` and `transferWithSeed` since P4.1, but only a fake Connection test covers that: the validator's `getTransaction` (`jsonParsed`) returns no inner instructions and parses only direct system transfers.
 
 ## 10. Persistence and journal limits (Q55, Q56)
 
@@ -150,4 +142,4 @@ The seeded devnet token (`scripts/devnet_seed.ts`) is **not expected to be bough
 - **No multi-statement transactions.** Each save is its own statement. The mark and exit-state writes now touch only their own columns and never a CLOSED row (S11), which closes the known race, but a crash between two statements of a trade can still leave the order and the position out of step; startup reconciliation repairs that against the chain.
 - **Unbounded tables.** `positions`, `orders` and `transactions` are never pruned, and `loadPositions()` scans the table in several loops. Fine for a devnet session; revisit before long runs.
 - **Operator alerts are in memory only.** A restart forgets them (the journal keeps the events they came from).
-- **SOL price.** A reading outside $1 to $100,000, or more than 2x away from a reading under 10 minutes old, is rejected. A price older than an hour no longer converts the USD daily-loss limit; the fixed SOL default applies until a fresh price is read.
+- **SOL price.** A reading outside $1 to $100,000, or more than 2x away from a reading under 10 minutes old, is rejected. The first price, the first after a 10-minute gap, and a price outside the 2x band are taken only when two sources agree within 5%; a disagreement shows on the reading. A price older than an hour no longer converts the USD net daily PnL floor at full trust: the floor is then min(3 x MAX_POSITION_SIZE_SOL, MAX_DAILY_LOSS_USD / last known price), which a stale price can only tighten. With no price ever read it is 3 x MAX_POSITION_SIZE_SOL, which is looser than the USD floor; LIVE buys still need a fresh price (`requireFreshPrice`), so this reaches PAPER and the auto kill trigger only.

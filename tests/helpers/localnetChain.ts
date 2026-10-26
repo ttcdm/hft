@@ -5,7 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, Transaction, ComputeBudgetProgram } from '@solana/web3.js';
+import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, Transaction, ComputeBudgetProgram, SystemProgram } from '@solana/web3.js';
 
 /**
  * Long behaviour tests: a REAL chain flow on loopback.
@@ -90,8 +90,9 @@ function pipeLogs(child: ChildProcess, file: string): () => string {
   return () => log;
 }
 
-export async function startValidator(dir: string, env: Record<string, string> = {}): Promise<ValidatorHandle> {
-  const port = await freePortPair();
+/** `port` restarts a validator on a port a stopped one used (a new chain, with its own genesis hash, behind the same URL). */
+export async function startValidator(dir: string, env: Record<string, string> = {}, port?: number): Promise<ValidatorHandle> {
+  port ??= await freePortPair();
   const child = spawn(process.execPath, ['--import', 'tsx', 'scripts/localnet/run_validator.ts', String(port)], {
     cwd: ROOT,
     env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? dir, ...env },
@@ -303,6 +304,14 @@ export class LocalMarket {
     return kp;
   }
 
+  /** A top-level system transfer from `from` (its first incoming transfer makes `from` the recipient's funder for the funder lookup). */
+  async transfer(from: Keypair, to: PublicKey, sol: number): Promise<string> {
+    const tx = new Transaction().add(SystemProgram.transfer({ fromPubkey: from.publicKey, toPubkey: to, lamports: Math.ceil(sol * LAMPORTS_PER_SOL) }));
+    tx.recentBlockhash = (await this.conn.getLatestBlockhash()).blockhash;
+    tx.feePayer = from.publicKey;
+    return this.send(tx, [from]);
+  }
+
   /** Throwaway signer key file for the app, funded only by the local validator. */
   async signerKeyFile(dir: string, sol = 5): Promise<{ keypair: Keypair; path: string }> {
     const kp = await this.fresh(sol);
@@ -418,9 +427,4 @@ export class LocalMarket {
     }
     return (await this.priceSol(mint)) / start;
   }
-}
-
-/** The app's own key file must never be the repo keypair: assert the path is under the scratch dir. */
-export function assertScratchPath(p: string, dir: string): void {
-  if (!path.resolve(p).startsWith(path.resolve(dir))) throw new Error(`refusing to use ${p}: not under ${dir}`);
 }

@@ -3,13 +3,19 @@
  * synthetic launches, watch-window entries and paper positions into the real singletons so the home board has rows to
  * lay out in a headless-browser pass. Nothing in the app imports this file; the data is never produced at runtime.
  * Usage: APP_PORT=3188 OPERATOR_PASSWORD=... npx tsx scripts/visual/serve_fixture.ts
+ * N-53: it never signs. The key path is always a file that does not exist, so the signer is NOT_CONFIGURED and the boot-time wallet
+ * scan cannot adopt (and hard-stop) the tokens of whatever wallet sits next to it. The database is hermeticEnv's scratch one unless
+ * APEX_DB_PATH is passed.
  */
 import '../hermeticEnv';
 import '../../server/loadEnv';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { Keypair } from '@solana/web3.js';
 
 async function main() {
-  process.env.APEX_DB_PATH ||= '/tmp/apex-visual-fixture.db';
+  process.env.SIGNER_KEYPAIR_PATH = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'apex-visual-')), 'no-keypair.json');
   await import('../../server');
   const { memecoinAggregator } = await import('../../server/memecoinAggregator');
   const { PumpFeedListener } = await import('../../server/solana/pumpFeedListener');

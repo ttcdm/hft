@@ -121,20 +121,6 @@ export interface ApiErrorResponse {
   };
 }
 
-export class AppError extends Error {
-  public statusCode: number;
-  public code: string;
-  public details?: any;
-
-  constructor(message: string, statusCode = 500, code = 'INTERNAL_ERROR', details?: any) {
-    super(message);
-    this.statusCode = statusCode;
-    this.code = code;
-    this.details = details;
-    Object.setPrototypeOf(this, new.target.prototype);
-  }
-}
-
 export function errorHandler(err: any, req: Request, res: Response, next: NextFunction) {
   const correlationId = (req as any).correlationId || crypto.randomUUID();
   const statusCode = err.statusCode || (err instanceof z.ZodError ? 400 : 500);
@@ -213,11 +199,6 @@ export function isSafeExternalUrl(val: string): boolean {
 }
 
 export const WalletConfigSchema = z.object({
-  walletAddress: z
-    .string()
-    .min(32, 'Solana wallet address must be at least 32 characters')
-    .max(44, 'Solana wallet address cannot exceed 44 characters')
-    .regex(SOLANA_ADDRESS_REGEX, 'Invalid Base58 Solana public key address'),
   rpcEndpoint: z
     .string()
     .url('RPC Endpoint must be a valid HTTP or HTTPS URL')
@@ -225,41 +206,35 @@ export const WalletConfigSchema = z.object({
     // Absent leaves the current endpoint alone. (A default here silently re-pointed the RPC at the public devnet URL on every
     // config save, which also fails the cluster check when running against a local validator.)
     .optional(),
-  wsRpcEndpoint: z
-    .string()
-    .url('WebSocket RPC must be a valid WS or WSS URL')
-    .refine(isSafeExternalUrl, 'WebSocket RPC cannot point to private metadata services')
-    .optional(),
-  // '' means Jito is disabled (the fail-closed default). There is no mainnet default.
+  // '' turns Jito off; absent leaves it as it is (3G, N-8: a default of '' here made "absent" and "off" the same, and the update path then
+  // skipped '' as falsy, so Jito could never be turned off). Whether a URL is allowed on this cluster is checked in walletTrader.updateConfig.
   jitoBlockEngineUrl: z
     .string()
     .refine(
       (v) => v === '' || (z.string().url().safeParse(v).success && isSafeExternalUrl(v)),
       'Jito Block Engine must be empty (disabled) or a valid URL that does not point to private metadata services'
     )
-    .default(''),
-  jitoTipAccount: z
-    .string()
-    .regex(SOLANA_ADDRESS_REGEX, 'Invalid Jito tip account public key')
-    .default('96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5'),
+    .optional(),
   jitoTipSol: z.number().min(0.0001).max(0.2).optional(), // absent leaves the stored value alone (C6)
-  slippageToleranceBps: z.number().min(10).max(5000).default(600), // 6.0% default for meme volatility
-  capitalTier: z.enum(['MICRO_10', 'INSTITUTIONAL', 'CUSTOM']).default('MICRO_10'),
-  allocatedSol: z.number().min(0.01).max(5000).default(0.07), // ~0.07 SOL = ~$10
-  autoStartTrading: z.boolean().default(false), // STRICT SAFETY: Always false by default
-  enabledStrategies: z.object({
-    pumpFunSniper: z.boolean().default(true),
-    marketMaking: z.boolean().default(false),
-    crossArb: z.boolean().default(false),
-    momentumScalp: z.boolean().default(false),
-  }),
-  riskLimits: z.object({
-    maxDailyLossUsd: z.number().min(1).max(100000).default(2.5),
-    maxPositionSizeSol: z.number().min(0.005).max(50).default(0.02),
-    stopLossPct: z.number().min(5).max(90).default(20),
-    takeProfitMultiple: z.number().min(1.2).max(50).default(1.5),
-    requireConfluenceScore: z.number().min(0).max(100).default(70),
-  }),
+  // 3G (N-67): every field below is optional with no default. A default here was applied to every save that left the field out, so a save
+  // without riskLimits.maxPositionSizeSol reset the risk engine's position cap to 0.02 SOL.
+  slippageToleranceBps: z.number().min(10).max(5000).optional(),
+  capitalTier: z.enum(['MICRO_10', 'INSTITUTIONAL', 'CUSTOM']).optional(),
+  // Audit 2026-10-22: `allocatedSol` and `enabledStrategies` are gone. Nothing read the strategy toggles, and `allocatedSol` was a
+  // constant that was echoed back as if it were a wallet figure. Unknown keys are dropped, as for the other removed settings (Q34).
+  riskLimits: z
+    .object({
+      // 3G (N-67): refused, not dropped. The daily-loss limit comes from MAX_DAILY_LOSS_USD (read by the risk engine through
+      // executionConfig); a value sent here was stored and echoed back but never used, so a caller believed it had set a limit.
+      maxDailyLossUsd: z
+        .unknown()
+        .refine((v) => v === undefined, 'maxDailyLossUsd cannot be set through the API: set MAX_DAILY_LOSS_USD in the environment and restart')
+        .optional(),
+      maxPositionSizeSol: z.number().min(0.005).max(50).optional(),
+      stopLossPct: z.number().min(5).max(90).optional(),
+      takeProfitMultiple: z.number().min(1.2).max(50).optional(),
+    })
+    .optional(),
 });
 
 export const LiveSnipeOrderSchema = z.object({
@@ -275,9 +250,7 @@ export const LiveSnipeOrderSchema = z.object({
 
 export const ClosePositionSchema = z.object({
   positionId: z.string().min(1, 'positionId is required'),
-  sellPct: z.number().min(1).max(100).default(100),
-  // PLACEHOLDER: parsed but never read by the close-position handler; no default so nothing implies a tip is sent.
-  priorityTipSol: z.number().min(0.0001).max(0.1).optional(),
+  sellPct: z.number().int().min(1).max(100).default(100), // N-44: whole percent only
 });
 
 // Middleware factory for Zod validation
@@ -300,17 +273,36 @@ interface RateLimitBucket {
   lastRefillMs: number;
 }
 
-const rateLimitBuckets = new Map<string, RateLimitBucket>();
+export type RateLimitMiddleware = ((req: Request, res: Response, next: NextFunction) => void) & {
+  /** How many peers this limiter is tracking now (idle ones are dropped). */
+  bucketCount(): number;
+};
 
-export function rateLimiter(opts: { maxTokens: number; refillRatePerSec: number }) {
-  return (req: Request, res: Response, next: NextFunction) => {
-    const key = (req.headers['x-api-key'] as string) || req.ip || 'global';
+/**
+ * Token bucket per peer. 3G (N-5): the key is the TCP peer address only. It used to be the client-chosen `x-api-key` header, checked
+ * before the auth gate, so a new header value on every POST /api/auth/login got a fresh bucket (no throttle on password guessing) and
+ * a new map entry that was never removed. `req.ip` is not used: it follows X-Forwarded-For when `trust proxy` is set.
+ * Each limiter has its own buckets. A bucket idle long enough to have refilled completely is the same as a new one, so it is dropped
+ * (swept at most once per refill period, on a request); the map holds only peers seen within that period.
+ */
+export function rateLimiter(opts: { maxTokens: number; refillRatePerSec: number }): RateLimitMiddleware {
+  const buckets = new Map<string, RateLimitBucket>();
+  const fullRefillMs = (opts.maxTokens / opts.refillRatePerSec) * 1000;
+  let lastSweepMs = Date.now();
+
+  const middleware = (req: Request, res: Response, next: NextFunction) => {
+    const key = req.socket?.remoteAddress || 'unknown-peer';
     const now = Date.now();
 
-    let bucket = rateLimitBuckets.get(key);
+    if (now - lastSweepMs >= fullRefillMs) {
+      for (const [k, b] of buckets) if (now - b.lastRefillMs >= fullRefillMs) buckets.delete(k);
+      lastSweepMs = now;
+    }
+
+    let bucket = buckets.get(key);
     if (!bucket) {
       bucket = { tokens: opts.maxTokens, lastRefillMs: now };
-      rateLimitBuckets.set(key, bucket);
+      buckets.set(key, bucket);
     }
 
     // Refill tokens based on elapsed time
@@ -319,7 +311,7 @@ export function rateLimiter(opts: { maxTokens: number; refillRatePerSec: number 
     bucket.lastRefillMs = now;
 
     if (bucket.tokens < 1) {
-      res.setHeader('Retry-After', '1');
+      res.setHeader('Retry-After', String(Math.max(1, Math.ceil((1 - bucket.tokens) / opts.refillRatePerSec))));
       return res.status(429).json({
         success: false,
         error: {
@@ -335,7 +327,11 @@ export function rateLimiter(opts: { maxTokens: number; refillRatePerSec: number 
     res.setHeader('X-RateLimit-Remaining', Math.floor(bucket.tokens).toString());
     next();
   };
+  return Object.assign(middleware, { bucketCount: () => buckets.size });
 }
+
+/** 3G (N-5): POST /api/auth/login on top of the /api limiter: 5 attempts at once, then one every 12 s, per peer address. */
+export const LOGIN_RATE_LIMIT = { maxTokens: 5, refillRatePerSec: 5 / 60 } as const;
 
 // ============================================================================
 // 5. SECURITY HEADERS & SANITIZATION

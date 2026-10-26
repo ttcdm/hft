@@ -15,6 +15,7 @@ import {
 import { MockSolanaRpc } from '../helpers/mockRpc';
 import { MockJitoEngine } from '../helpers/mockJito';
 import { TestDatabase } from '../helpers/testDb';
+import { settleLeftoverLiveBuys } from '../../helpers/leftoverBuys';
 
 describe('Tier 2: Boundary & Corner Cases (Features 6 - 10)', () => {
   let mockRpc: MockSolanaRpc;
@@ -23,6 +24,7 @@ describe('Tier 2: Boundary & Corner Cases (Features 6 - 10)', () => {
   let coordinator: ExecutionCoordinator;
 
   beforeEach(async () => {
+    settleLeftoverLiveBuys();
     mockRpc = new MockSolanaRpc();
     mockJito = new MockJitoEngine();
     await mockJito.start();
@@ -540,7 +542,7 @@ describe('Tier 2: Boundary & Corner Cases (Features 6 - 10)', () => {
     it('B10.1: DEMO_MODE=false enforces production defaults', () => {
       const cfg = executionConfig.getConfig();
       expect(cfg.demoMode).toBe(false);
-      expect(cfg.enableSyntheticSocial).toBe(false);
+      expect((cfg as any).enableSyntheticSocial).toBeUndefined(); // S215: ENABLE_SYNTHETIC_SOCIAL was read and never used
     });
 
     it('B10.2: memecoinAggregator does not contaminate live coordinator market state', () => {

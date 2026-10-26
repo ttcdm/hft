@@ -84,7 +84,6 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
 
   // Settings
   const [capitalTier, setCapitalTier] = useState<'MICRO_10' | 'INSTITUTIONAL'>('MICRO_10');
-  const [allocatedSol, setAllocatedSol] = useState(0.07);
   const [jitoTipSol, setJitoTipSol] = useState(0.002);
   const [slippageBps, setSlippageBps] = useState(600);
 

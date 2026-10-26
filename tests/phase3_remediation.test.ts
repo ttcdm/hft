@@ -17,7 +17,7 @@ import {
 } from '../server/solana/executionConfig';
 import { ExecutionCoordinator } from '../server/execution/coordinator';
 import { workstationDb, WorkstationDatabase } from '../server/db/database';
-import { riskEngine, HardenedRiskEngine } from '../server/risk/riskEngine';
+import { HardenedRiskEngine } from '../server/risk/riskEngine';
 import { EligibilityFilter } from '../server/signals/eligibilityFilter';
 import fs from 'fs';
 import path from 'path';
@@ -475,7 +475,8 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
         status: 'OPEN',
       });
 
-      const orderEvaluation = riskEngine.evaluateOrder({
+      // 3C: the engine with the 0.02 SOL floor pinned above; the shared one now follows the $7.00 MICRO default.
+      const orderEvaluation = risk.evaluateOrder({
         mint: Keypair.generate().publicKey.toBase58(),
         orderSizeSol: 0.006,
         expectedPriceSol: 0.0001,
@@ -494,7 +495,7 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
       // so trading is halted immediately with DAILY_LOSS_LIMIT!
       expect(orderEvaluation.approved).toBe(false);
       expect(orderEvaluation.reasonCode).toBe('DAILY_LOSS_LIMIT');
-      expect(orderEvaluation.message).toContain('daily stop limit');
+      expect(orderEvaluation.message).toContain('Net daily PnL floor');
     });
   });
 });

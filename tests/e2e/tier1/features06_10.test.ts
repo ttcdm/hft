@@ -17,6 +17,7 @@ import {
 import { MockSolanaRpc } from '../helpers/mockRpc';
 import { MockJitoEngine } from '../helpers/mockJito';
 import { TestDatabase } from '../helpers/testDb';
+import { settleLeftoverLiveBuys } from '../../helpers/leftoverBuys';
 
 describe('Tier 1: Feature Coverage (Features 6 - 10)', () => {
   let mockRpc: MockSolanaRpc;
@@ -25,6 +26,7 @@ describe('Tier 1: Feature Coverage (Features 6 - 10)', () => {
   let coordinator: ExecutionCoordinator;
 
   beforeEach(async () => {
+    settleLeftoverLiveBuys();
     mockRpc = new MockSolanaRpc();
     mockJito = new MockJitoEngine();
     await mockJito.start();

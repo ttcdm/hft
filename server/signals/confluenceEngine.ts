@@ -9,6 +9,7 @@ import {
   CreatorRiskReport,
   CreatorRiskScorer,
   creatorRiskScorer,
+  CREATOR_LOOKUP_FAILED_FLAG,
 } from './creatorRiskScorer';
 
 /** The built-in default. The threshold in force is getConfluenceThreshold() (S187: operator-editable, env CONFLUENCE_MIN_SCORE). */
@@ -29,7 +30,7 @@ export interface ConfluenceFactorsInput {
   priceChange5mPct: number | null;
   liquidityUsd: number | null;
   top10HoldersPct: number | null;
-  bondingCurveProgress: number;
+  bondingCurveProgress: number | null;
   buys5m: number | null;
   sells5m: number | null;
   devHoldingPct: number | null;
@@ -129,6 +130,7 @@ export class ConfluenceEngine {
       input.creatorRiskReport ?? (input.creatorAddress ? creatorRiskScorer.getCachedReport(input.creatorAddress) : undefined);
     if (creatorReport) {
       creatorRiskScore = creatorReport.confluenceScore;
+      if (creatorReport.riskFlags.includes(CREATOR_LOOKUP_FAILED_FLAG)) missing.push('creator'); // a failed lookup is 0 points of missing data
     } else if (input.isCreatorBurner === true) {
       creatorRiskScore = 0;
     } else if (input.creatorWalletAgeSeconds !== undefined || input.creatorSignatureCount !== undefined) {
@@ -137,8 +139,12 @@ export class ConfluenceEngine {
         signatureCount: input.creatorSignatureCount,
         isBurner: input.isCreatorBurner,
       }).confluenceScore;
+    } else if (input.creatorAddress) {
+      // P4.1 (R1-53): the creator is known but its report is not (expired, never fetched). Dev holding is no stand-in for it: a burner
+      // with no dev buy holds 0% and used to get the full 5 points here once its 0-point report expired.
+      missing.push('creator');
     } else {
-      // Fallback: 0% dev holding = 5 points
+      // No creator known at all (replay, a feed without it): fall back to dev holding. 0% dev holding = 5 points
       if (!known(input.devHoldingPct)) {
         missing.push('creator');
       } else if (input.devHoldingPct <= 0.1) {

@@ -1,4 +1,4 @@
-import { WatchWindow, type WatchState } from '../signals/watchWindow';
+import { WatchWindow, readyGate, READY_MIN_SIGNALS, type WatchState } from '../signals/watchWindow';
 import { getConfluenceThreshold } from '../signals/confluenceThreshold';
 import { ConfluenceEngine, isConfluencePassed } from '../signals/confluenceEngine';
 import { CurveVelocityEvaluator } from '../signals/curveVelocityEvaluator';
@@ -24,8 +24,13 @@ export const REPLAY_DEFAULTS = {
   /** How often the window is ticked while replaying (the live loop ticks every 2 s). */
   tickMs: 2_000,
 };
-/** `minScore`: the confluence buy threshold to replay at (S187 what-if). Default: the threshold in force. */
-export type ReplayOptions = Partial<typeof REPLAY_DEFAULTS> & { minScore?: number };
+/**
+ * `minScore`: the confluence buy threshold to replay at (S187 what-if). Default: the threshold in force.
+ * P4.3: `readyGate` (default true) applies the controller's READY rule (concentration and READY_MIN_SIGNALS strong signals); `curveCap` (default true)
+ * gives the window the replayed curve progress, so a launch past APEX_MAX_CURVE_PROGRESS_PCT is released DEAD CURVE_TOO_FAR as live. A study turns
+ * `readyGate` off to price the READY entries the rule refuses (scripts/recorder_backtest/ready_strength.ts).
+ */
+export type ReplayOptions = Partial<typeof REPLAY_DEFAULTS> & { minScore?: number; readyGate?: boolean; curveCap?: boolean };
 
 export interface RecordedEvent { ts: number; kind: 'CREATE' | 'TRADE'; payload: any }
 export interface RecordedLaunch { mint: string; events: RecordedEvent[] }
@@ -52,6 +57,9 @@ export interface ReplayedLaunch {
   openValueSol: number | null;
   /** S190: after the watch window's release, the highest recorded trade price against the price the window left it at. Null: no released launch / no later trade. */
   peak?: { refPriceSol: number; peakPriceSol: number; peakMultiple: number; timeToPeakMs: number; observedMs: number } | null;
+  /** P4.3: the release's strong-signal count and whether concentration passed. Null without a release. */
+  passingSignals?: number | null;
+  concentrationPass?: boolean | null;
 }
 
 /** S190: the release-to-peak buckets, in minutes. A peak at exactly a boundary belongs to the later bucket. */
@@ -187,7 +195,10 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
     });
     return b.compositeScore;
   };
-  const ww = new WatchWindow({ scoreOf: () => scoreAt(clock), publicFunders: [], minScore });
+  const ww = new WatchWindow({
+    scoreOf: () => scoreAt(clock), publicFunders: [], minScore,
+    progressOf: optsIn.curveCap === false ? undefined : () => stats.get(launch.mint, clock)?.curveProgressPct ?? null,
+  });
   ww.watch(launch.mint, create.payload.creator ?? null, startTs, [create.payload.user]);
 
   // funder facts the window had learned by the end of the launch, applied at their recorded time (earlier ones at the start)
@@ -196,7 +207,7 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
   let fi = 0;
   const applyFacts = (upTo: number) => {
     while (fi < facts.length && facts[fi].ts <= upTo) {
-      if (facts[fi].funder) ww.setFunder(facts[fi].wallet, facts[fi].funder as string); else ww.setNoFunder(facts[fi].wallet);
+      if (facts[fi].funder) ww.setFunder(facts[fi].wallet, facts[fi].funder as string, upTo); else ww.setNoFunder(facts[fi].wallet);
       fi++;
     }
   };
@@ -236,8 +247,15 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
   }
   if (!released) return { ...base, verdict: 'NO_TRADES', verdictReason: 'no verdict inside the recording', noEntryReason: 'still watching when the recording ended' };
 
-  const result: ReplayedLaunch = { ...base, verdict: released.state, verdictReason: released.reason, releasedAfterMs: releasedAt - startTs, score: released.score ?? null, peak: peakAfter(trades, releasedAt) };
+  const result: ReplayedLaunch = {
+    ...base, verdict: released.state, verdictReason: released.reason, releasedAfterMs: releasedAt - startTs, score: released.score ?? null, peak: peakAfter(trades, releasedAt),
+    passingSignals: released.metrics.passingSignals, concentrationPass: released.metrics.signals.concentration?.pass ?? null,
+  };
   if (released.state === 'DEAD') return { ...result, noEntryReason: `watch verdict DEAD: ${released.reason}` };
+  if (released.state === 'READY' && optsIn.readyGate !== false) {
+    const g = readyGate(released.metrics);
+    if (!g.pass) return { ...result, noEntryReason: g.reason };
+  }
   if (released.state === 'READY' && !(released.score !== null && released.score !== undefined && isConfluencePassed(released.score, minScore))) {
     return { ...result, noEntryReason: `READY below the confluence gate (score ${released.score ?? 'n/a'} < ${minScore})` };
   }
@@ -320,6 +338,7 @@ function buildReplayReport(rows: ReplayedLaunch[], opts: ReplayOptions, minScore
     rules: [
       'Watch window verdict (real WatchWindow: 20 s minimum, 120 s maximum, HOT / READY / DEAD)',
       `READY needs a confluence score of at least ${minScore} (real ConfluenceEngine over the replayed pool stats)`,
+      `READY also needs concentration passing and at least ${READY_MIN_SIGNALS} strong signals, as the auto controller asks (P4.3); a curve past the progress cap (default 60% of the tokens sold) is DEAD CURVE_TOO_FAR`,
       'Exits: real ExitEngine (hard stop -20%, trailing stop, take-profit ladder: sell 33% of the holding at +30%, then 33% of what is left at +60%, stale exit at 30 min)',
     ],
     notReplayed: [
@@ -328,7 +347,7 @@ function buildReplayReport(rows: ReplayedLaunch[], opts: ReplayOptions, minScore
       'Slippage and price impact beyond the recorded trade price',
       'Creator wallet history (the live score may add points a replay cannot)',
     ],
-    assumptions: { ...REPLAY_DEFAULTS, ...opts, minScore },
+    assumptions: (({ readyGate: _g, curveCap: _c, ...numeric }) => ({ ...REPLAY_DEFAULTS, ...numeric, minScore }))(opts),
     summary: {
       launches: rows.length, released, entries: rows.filter((r) => r.entered).length, closed: closed.length, openAtEnd: rows.filter((r) => r.outcome === 'OPEN_AT_END').length,
       wins, losses: closed.length - wins, winRate: closed.length ? wins / closed.length : null,

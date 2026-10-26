@@ -12,12 +12,13 @@ A full-stack workstation and automated execution engine for Pump.fun bonding-cur
 2. **Safe Default (PAPER Mode)**: The engine starts in **PAPER simulation**; auto trading starts **OFF**. A live buy needs an explicit arm.
 3. **Cluster guard (devnet or localnet only)**:
    - `ALLOWED_CLUSTER` defaults to `devnet`. Before any send the RPC's genesis hash must match the allowed cluster; a mainnet RPC URL or a mainnet genesis is refused, and the check fails closed if the genesis cannot be read. A `mainnet-beta` value of `ALLOWED_CLUSTER` is accepted only so a read-only server can watch mainnet; while it is set, arming LIVE, `executeTrade` and every send refuse (`assertSendClusterAllowed`). `ALLOWED_CLUSTER=localnet` (needs `LOCALNET_GENESIS_HASH`) is allowed for a local validator. There is no mainnet auto mode; only a read-only server should use a `mainnet-beta` cluster value.
+   - The database file remembers the genesis hash of the first verified RPC (`cluster_genesis_hash` in `app_settings`). After that, an RPC on another cluster fails the cluster check with `DB_CLUSTER_MISMATCH`, so that ledger is never reconciled or traded against another chain. To change clusters, point `APEX_DB_PATH` at a new file.
    - A wrong-cluster RPC is also refused at arming time (`GET /api/execution/can-arm`), not only at the first send.
 4. **Strict live safeguards**:
    - The `ALLOW_LIVE_REAL_MONEY_TRADING` switch must be on before any send (the name is historical; on this project it gates devnet and localnet sends, nothing else). The in-process test harnesses turn it on only after asserting the cluster genesis; the repository's `.env.example` leaves it off.
    - Arming: `POST /api/execution/arm` with confirmation code `CONFIRM_LIVE_TRADING_RISK`, a loaded keypair in `READY` status, RPC health `HEALTHY` on the verified cluster, and no halt.
    - Hardened pre-trade risk limits (daily loss, exposure, slippage, priority fee caps) must pass. Live trades need real on-chain quotes; synthetic prices are refused.
-   - **Kill switch**: `POST /api/execution/kill-switch` with an explicit `{"activate": true|false}` (anything else is a 400). Activating it also disarms live trading.
+   - **Kill switch**: `POST /api/execution/kill-switch` with an explicit `{"activate": true|false}` (anything else is a 400). Activating it also disarms live trading and sets auto OFF (after any buy in flight); resetting it turns neither back on. `POST /api/wallet/panic-liquidate`, the WebSocket `PANIC_LIQUIDATE` and Telegram `/panic_sell` run the same stop and then sell every active position. `POST /api/execution/close` always closes with the reason `Operator close` (the client's `reason` text is kept only as a journal note).
    - **Persisted halt**: a halt (for example an unexplained wallet balance change) survives a restart. While halted, buys are refused and the can-arm reasons say why; protective exits (stop-loss, trailing stop, manual close, panic) still run. An operator clears it with `POST /api/auto/resume {"clearHalt":true}`.
 5. **Post-Trade On-Chain Reconciliation**: Positions are constructed from verified on-chain transaction outcomes and actual balance changes, not pre-trade estimates.
 6. **Operator Authentication**: every `/api` route except `GET /api/health` and `POST /api/auth/login` requires an operator token (deny by default; the path is normalized first, so case, encoding and absolute-form tricks do not bypass it). The token is `OPERATOR_AUTH_TOKEN` (16+ characters); `OPERATOR_PASSWORD`, if set, enables password login that returns a session token. The server binds to loopback unless `ALLOW_PUBLIC_BIND=true` (then `BIND_HOST` is honoured).
@@ -43,6 +44,8 @@ npm start
 
 Open [http://localhost:3000](http://localhost:3000) in your browser.
 
+**One server per database and per wallet.** Every guard against selling or buying twice lives in the server's memory, so two servers on one database or one signing key would both sell the same stop-loss. The server takes a lock file next to the database (`<APEX_DB_PATH>.lock`) before anything else starts, and one per signing key in `~/.apex/locks` (`APEX_LOCK_DIR`). A second server on the same database, port or key prints `INSTANCE_LOCKED` or the listen error and exits with code 1 before it reconciles, runs the exit loop or restores the auto mode. A lock left by a process that is no longer running is taken over on the next start. For a second copy (a smoke test, a scratch run) use its own scratch folder, database and throwaway key: `npm run smoke` does this.
+
 For live development with hot reloading:
 ```bash
 npm run dev
@@ -55,15 +58,24 @@ npm run dev
 **Prerequisites:** Docker and Docker Compose installed.
 
 ```bash
+# Compose refuses to start without an operator token (16+ characters). Put it in your shell or in .env next to docker-compose.yml.
+export OPERATOR_AUTH_TOKEN=$(openssl rand -hex 32)
+
 # Build and launch container in background
 docker compose up -d --build
 
 # View real-time logs
 docker compose logs -f
 
-# Stop the container
+# Stop the container (the data volume is kept)
 docker compose down
 ```
+
+What to expect from the container:
+- The dashboard is at <http://127.0.0.1:3000>, published on the host's loopback only.
+- It is devnet-only and starts in PAPER with no signer: compose passes a fixed list of variables (see `docker-compose.yml`) and does not load `.env` as a whole, so `OPERATOR_PRIVATE_KEY`, `SIGNER_KEYPAIR_PATH` and other `.env` settings outside that list do not reach it. A key generated or imported in the UI is saved in the volume.
+- The database (and any such key) lives in the named volume `apex-data`, mounted at `/app/data`. It survives `docker compose down` and rebuilds; `docker compose down -v` deletes it.
+- The image only runs the app. Tests and the localnet scripts (`npm run localnet:e2e` and friends) need `solana-test-validator` and the dev dependencies, so run them on the host.
 
 ---
 
@@ -141,13 +153,17 @@ What the code does, and where the limits are:
 ## 🏠 Home page and auto-snipe
 
 - The home page is the Pump.fun token board: **New launches / Watching / Holding**, a SOL wallet strip, a bonding-curve depth ladder and trade tape for the selected token, and the auto-snipe panel. Unknown values show "—".
-- Auto trading is owned by one controller (`server/auto/controller.ts`), **OFF on every start**. Change mode with `POST /api/auto/mode`, stop with `POST /api/auto/kill` (optionally `exitAll`). Modes: `OFF`, `SHADOW` (all gates, journals "would buy", nothing sent), `PAPER`, `DEVNET_LIVE` (devnet only, 0.005 SOL per order unless the operator changes it, one open position, needs `ALLOWED_CLUSTER=devnet`, the coordinator armed LIVE and the confirmation code). There is no mainnet auto mode. It needs `AUTO_SNIPE_ENABLED=true`.
+- Auto trading is owned by one controller (`server/auto/controller.ts`), **OFF on a first start; after that the last mode and the confluence threshold come back on restart** (a saved `DEVNET_LIVE` comes back as `SHADOW`, so a restart never resumes live sending: arm and set it again; a mode that needs `AUTO_SNIPE_ENABLED=true` stays OFF without it). The order size, session budgets and callout rules are still in memory only. Change mode with `POST /api/auto/mode`, stop with `POST /api/auto/kill` (optionally `exitAll`). Modes: `OFF`, `SHADOW` (all gates, journals "would buy", nothing sent), `PAPER`, `DEVNET_LIVE` (devnet only, 0.005 SOL per order unless the operator changes it, one open position, needs `ALLOWED_CLUSTER=devnet`, the coordinator armed LIVE and the confirmation code). There is no mainnet auto mode. It needs `AUTO_SNIPE_ENABLED=true`.
 - **Order sizes are editable.** One saved **snipe amount** sizes every manual snipe (default 0.01 SOL, minimum 0.001 SOL, at most `MAX_POSITION_SIZE_SOL`; `GET /api/snipe/limits` returns the limits). The auto trader has its own **order size** (`POST /api/auto/order-size`, default 0.005 SOL) that applies in PAPER and DEVNET_LIVE alike, so paper results match what live would do. An out-of-range value is refused with a reason, never clamped. Auto order size and budget are kept in memory and reset at restart.
 - **Session spend cap.** `POST /api/auto/budget` edits the session budget. A DEVNET_LIVE session defaults to 5 buys and 0.02 SOL including fees. A PAPER session may turn its bankroll over: up to 50 buys and 10 times `PAPER_BANKROLL_SOL`. A PAPER limit never carries into real SOL.
 - **PAPER auto-restore.** If a PAPER session is dropped to SHADOW only because readiness turned red, it comes back to PAPER by itself after readiness has stayed green for 60 seconds. Any other cause, and any operator choice, cancels the pending restore. DEVNET_LIVE is never restored automatically.
-- **One confluence threshold.** The watch window's HOT gate, the buy gate and manual snipes all read the same score threshold. Its starting value is `CONFLUENCE_MIN_SCORE` (default 70); the operator changes it with `POST /api/auto/threshold` or the Auto panel (whole number 0 to 100, kept until restart, and the panel warns below 50). A lower threshold means more buys of weaker coins. See [`KNOWN_RISKS.md`](KNOWN_RISKS.md) section 8 for the scores that are actually reachable.
-- Candidates must come out of the watch window (20-120s of real trade events) before any gate runs. Every decision, accept or reject, is a row in the `decisions` table with its reason.
-- Kill switch: session budgets (defaults for DEVNET_LIVE: 5 buys, 0.02 SOL incl. fees, 15% loss, 4h; a PAPER session gets 50 buys and spend up to 10 times the paper bankroll; the operator can edit buys and spend, not the loss or time limit), negative expectancy over the last 20 verified closed trades, 8 losses in a row, 2 slippage breaches, readiness red over 10s, and low wallet drop to SHADOW; an unexplained wallet balance change halts all trading including exits.
+- **One confluence threshold.** The watch window's HOT gate, the buy gate and manual snipes all read the same score threshold. Its starting value is `CONFLUENCE_MIN_SCORE` (default 70); the operator changes it with `POST /api/auto/threshold` or the Auto panel (whole number 0 to 100, saved and restored after a restart, and the panel warns below 50). A lower threshold means more buys of weaker coins. See [`KNOWN_RISKS.md`](KNOWN_RISKS.md) section 8 for the scores that are actually reachable.
+- Candidates must come out of the watch window (20-120s of real trade events) before any gate runs. Every decision, accept or reject, is a row in the `decisions` table with its reason and the release's `passingSignals`.
+- **Release gates (P4.3).** A `READY` release (the window ran out without a HOT verdict) is bought only with concentration passing and at least 2 strong signals (`READY_TOO_WEAK` otherwise), and the `DEVNET_LIVE` auto mode never buys a score below 50 (`CONFLUENCE_DEVNET_LIVE_FLOOR`), whatever the threshold. The floor is an auto-buy gate only: a manual snipe, LIVE armed or not, is held to the plain threshold. A launch past 60% of its curve (tokens sold; `APEX_MAX_CURVE_PROGRESS_PCT`) is not bought: the window releases it `DEAD` `CURVE_TOO_FAR`, the controller drops a release past it (stage `curve`) and the coordinator refuses it on its fresh curve read, manual buys too. A release is a signal for 8 s in every mode, SHADOW included (`STALE_SIGNAL`); a queued release is kept 6 s. A refusal that only says "not now" (a cooldown, a stale read) no longer burns the mint for the session, and a watch release refused that way is tried again 2 s later while it is fresh. `npx tsx scripts/recorder_backtest/ready_strength.ts --recorded <db|jsonl>` prices the READY entries the new rule refuses against HOT entries on the app's own recordings.
+- **The creator cluster is not demand.** In the watch window the creator, the create signer and every wallet whose first funder is one of them form one cluster. Their trades are left out of velocity, flow and net inflow (the board's net inflow column is the organic figure; `/api/watch` reports the cluster's own SOL as `creatorClusterBuySol` / `creatorClusterSellSol`), and a sell by any of them releases the launch `DEAD` with `CREATOR_SOLD`, also when the funder that ties a seller to the creator is learned after the sell. Funder coverage is measured over the 100 largest buyers by volume, and funder lookups for launches that are no longer watched are dropped.
+- **Feed gaps.** When the pump log stream may have missed logs (the websocket closed, no slot heartbeat for 10 s, a slot jump, or an RPC switch), the feed shows `RECONNECTING` and every launch in the watch window is released `DEAD` with `FEED_GAP`, because a creator sell in the gap would never arrive. The feed telemetry counts the gaps (`feedGaps`, `lastFeedGap`). A switch of the RPC endpoint moves the log subscription and the creator lookups to the new endpoint. Launches quoted in a mint other than SOL are not watched (`nonSolQuoteSkipped`).
+- **No mainnet HTTP feeds off mainnet.** The pump.fun and DexScreener HTTP pollers start only on a read-only server watching a `mainnet-beta` cluster value; on devnet and localnet the feed is the program log stream alone.
+- Kill switch: session budgets (defaults for DEVNET_LIVE: 5 buys, 0.02 SOL incl. fees, 15% loss, 4h; a PAPER session gets 50 buys and spend up to 10 times the paper bankroll; the operator can edit buys and spend, not the loss or time limit), negative expectancy over the last 20 verified closed trades, 8 losses in a row, 2 slippage breaches, readiness red over 10s, and low wallet drop to SHADOW; an unexplained wallet balance change (DEVNET_LIVE wallet audit) halts every buy plus the take-profit and stale exits and sets auto OFF, while stop-loss, trailing stop, manual close and panic still run. Emergency procedures: [`docs/RUNBOOK.md`](docs/RUNBOOK.md).
 - Thresholds (holder concentration 20% top-10 / 5% creator, kill-switch limits, watch-window numbers) are conservative overnight defaults, **not validated on real launches**.
 
 ## 👁️ Read-only mode
@@ -171,6 +187,7 @@ Commands (repo root; Node 22.5+ because of `node:sqlite`):
 | `npm run lint` | ESLint (0 errors, 162 warnings) plus `tsc --noEmit` |
 | `npm run build` | frontend + `dist/server.cjs` |
 | `npm run smoke` | boots `dist/server.cjs` on a random port and checks `/`, `/api/health`, login, session and the `/ws/engine` handshake |
+| `npm run test:long` | the long behaviour tests (`tests/long/*.longtest.ts`, about 2.5 min): the real server against the LiteSVM validator for the exit loop, crash recovery, the guards and the validator's fault controls. Runs in CI after `npm test`; `tests/test_globs.test.ts` fails if a test file under `tests/` is in neither suite. |
 | `npm run localnet:e2e` | the full flow against an in-process LiteSVM validator (real pump binaries, loopback RPC, throwaway key, scratch DB, empty `APEX_ENV_FILE`): see `scripts/localnet/README.md`. 39 checks. Not a real cluster. |
 | `npm run devnet:e2e` | the devnet harness (`scripts/DEVNET_E2E_README.md`). Needs network and a **throwaway** devnet key it generates itself; it aborts unless the genesis hash is devnet's, never uses the repo keypair, and airdrops at most once and only with `DEVNET_AIRDROP_ONCE=1`. **Not run yet** (a manual devnet round trip through the app did pass; see Status). |
 | `FIXTURE=1 node scripts/visual/click_through.cjs` | Chromium click-through of the real UI on a seeded fixture (layout and values checks); set `WIDTHS`, `OUT` to choose viewports and output |

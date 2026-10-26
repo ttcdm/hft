@@ -39,47 +39,56 @@ From a launch on the feed (or a manual click) to a closed position. The auto pat
 
 ```mermaid
 flowchart TD
-  feed["on Create and Trade events<br/>pumpFeedListener.ts"] --> ww["attach<br/>watchWindow.ts"]
-  ww -->|"DEAD, or still WATCHING"| dropped(["no candidate: not bought"])
-  ww -->|"HOT, or READY released"| att["attachWatchWindow<br/>controller.ts"]
-  att --> sub["submitCandidate<br/>controller.ts"]
-  sub -.-> subg["auto gates: mode not OFF, AUTO_SNIPE_ENABLED, one try per mint,<br/>one buy in flight, no open position, watch verdict,<br/>coordinator mode matches auto mode, position cap, session budget"]
-  sub --> snipe["executeSnipe<br/>memecoinAggregator.ts"]
-  manual["manual snipe routes, hot callout snipe, social signal, Telegram<br/>server.ts and the services"] -->|"LIVE armed: needs confirmLive"| snipe
-  snipe -.-> snipeg["checks: amount, fresh SOL price, sizing and 10 percent cap, real pool or curve,<br/>freeze authority if required, creator share if the cap is set,<br/>confluence score at or above the threshold if gating is on (default on)"]
-  snipe -->|"SHADOW: dry run"| prev["previewBuy<br/>coordinator.ts"]
-  prev --> would(["WOULD_BUY row, nothing sent"])
-  snipe --> exec["executeTrade<br/>coordinator.ts"]
-  direct["POST /api/execution/trade<br/>POST /api/wallet/snipe<br/>server.ts, walletTrader.ts"] -->|"LIVE armed: needs confirmLive"| exec
-  exec -.-> execg["halted, read-only LIVE refused, mode changed (only if the caller named a mode),<br/>provenance and signal timestamp (LIVE only)"]
-  exec -->|"PAPER"| pgate["evaluatePaperBuy<br/>coordinator.ts"]
-  pgate -.-> pgateg["price from the real curve, eligibility, capital ceiling, risk engine"]
-  pgate --> pfill["executePaperBuy<br/>paperEngine.ts"]
-  exec -->|"LIVE"| elig["evaluate<br/>eligibilityFilter.ts"]
-  elig --> risk["evaluateOrder<br/>riskEngine.ts"]
-  risk --> build["createPumpBuyV2Instruction<br/>transactionBuilder.ts"]
-  build --> send["submitAndConfirmWithRetry<br/>coordinator.ts"]
-  send --> recon["reconcileBuyTransaction<br/>reconciliation.ts"]
-  pfill --> pos[("position in SQLite<br/>database.ts")]
+  feed["pumpFeedListener.ts: Create and Trade events"] --> ww["watchWindow.ts: attach"]
+  ww -->|"DEAD (FEED_GAP and CURVE_TOO_FAR included), or still WATCHING"| dropped["no candidate, not bought"]
+  ww -->|"HOT, or READY released"| att["controller.ts: attachWatchWindow"]
+  att --> sub["controller.ts: submitCandidate"]
+  sub -->|"release older than the signal-age limit, READY failing readyGate, or curve past the cap"| refused["REJECTED or DROPPED row, not bought"]
+  sub --> snipe["memecoinAggregator.ts: executeSnipe"]
+  manual["manual snipe routes, callout snipe, social signal, Telegram"] -->|"LIVE armed: needs confirmLive"| snipe
+  snipe -->|"SHADOW: dry run"| prev["coordinator.ts: previewBuy"]
+  prev --> would["WOULD_BUY row, nothing sent"]
+  snipe --> exec["coordinator.ts: executeTrade"]
+  direct["POST /api/execution/trade and POST /api/wallet/snipe"] -->|"LIVE armed: needs confirmLive"| exec
+  exec -->|"PAPER"| pgate["coordinator.ts: evaluatePaperBuy"]
+  pgate --> pfill["paperEngine.ts: executePaperBuy"]
+  exec -->|"LIVE"| elig["eligibilityFilter.ts: evaluate"]
+  elig --> risk["riskEngine.ts: evaluateOrder"]
+  risk --> build["transactionBuilder.ts: createPumpBuyV2Instruction"]
+  build --> send["coordinator.ts: submitAndConfirmWithRetry"]
+  send --> recon["reconciliation.ts: reconcileBuyTransaction"]
+  pfill --> pos["position in SQLite, database.ts"]
   recon --> pos
-  pos --> exits["evaluateAndProcessExits<br/>coordinator.ts"]
-  exits --> rule["evaluate<br/>exitEngine.ts"]
-  rule -->|"stop, trailing stop, take-profit, stale, or manual close"| close["closePosition<br/>coordinator.ts"]
-  close -->|"LIVE position"| sell["reconcileSellTransaction<br/>reconciliation.ts"]
-  close -->|"PAPER position"| psell["executePaperSell<br/>paperEngine.ts"]
+  pos --> exits["coordinator.ts: evaluateAndProcessExits"]
+  exits --> rule["exitEngine.ts: evaluate"]
+  rule -->|"stop, trailing stop, take-profit, stale, or manual close"| close["coordinator.ts: closePosition"]
+  close -->|"LIVE position"| sell["reconciliation.ts: reconcileSellTransaction"]
+  close -->|"PAPER position"| psell["paperEngine.ts: executePaperSell"]
 ```
 
 Things worth knowing when you read it:
 
-- The watch window only releases a launch after at least 20 s and at most 120 s of real trades. An auto candidate from any source is dropped unless the window has released it (`NOT_IN_WATCH_WINDOW`, `WATCH_PENDING` or `WATCH_DEAD`). A sell by the creator is the exception to the 20 s: it marks the launch `DEAD` at once.
+- What each step checks (these were notes on the diagram):
+  - `submitCandidate` runs the auto gates: mode not OFF, `AUTO_SNIPE_ENABLED`, one try per mint, one buy in flight, no open position, the watch verdict, the release's age (older than the risk engine's 8 s signal-age limit is `STALE_SIGNAL`, in SHADOW too), for READY `readyGate` (concentration passing and at least 2 strong signals, `READY_TOO_WEAK` otherwise, stage `watch`), the measured curve progress (above `APEX_MAX_CURVE_PROGRESS_PCT`, default 60%, is `CURVE_PROGRESS_TOO_HIGH`, stage `curve`), the coordinator mode matching the auto mode, the position cap and the session budget. "One try per mint" (P4.3): a mint is marked tried only after a send, a buy or would-buy, or a final refusal; a "not now" refusal (`RETRYABLE_REJECTION`: a cooldown, a stale read, the SOL price, a halt) leaves it open, and a watch release refused that way is queued and tried again after `RELEASE_RETRY_MS` (2 s) while it is younger than `pendingReleaseMaxAgeMs` (the signal-age limit minus 2 s for the reads, 6 s). A queued release older than that is journaled `STALE_SIGNAL` without a curve read or risk call. Every decision row carries the release's `passingSignals` in its inputs.
+  - `executeSnipe` checks the amount, a fresh SOL price, sizing and the 10 percent cap, a real pool or curve, the freeze authority if required, the creator share if the cap is set, and the confluence score against the threshold if gating is on (default on).
+  - `executeTrade` first checks that trading is not halted, that read-only mode does not refuse LIVE, that the mode matches if the caller named one, and (LIVE only) provenance and the signal timestamp.
+  - `evaluatePaperBuy` prices from the real curve, refuses a curve past the progress cap (`CURVE_PROGRESS_TOO_HIGH`), then runs eligibility, the capital ceiling and the risk engine. SHADOW's `previewBuy` gets the release time as `signalTimestamp`, so its risk check ages the signal as PAPER and LIVE do.
+- The exit pass (`evaluateAndProcessExits`, every 3 s, one pass at a time) first evaluates every open position with its own clock, then starts all the sells it decided on together, without awaiting them one by one, and waits for them at most `EXIT_SELL_WAIT_MS` (2.5 s). A sell still running after that keeps going; its position is skipped by later passes until it ends (`inFlightPositionExits`), so it is never sent twice, and a hung sell of one position does not hold another position's stop-loss. A take-profit's exit stage advances when its sell fills. While `setPanicActive(true)` is in force the pass sends only `PROTECTIVE_EXIT_REASONS` exits; `waitForPositionExit` resolves when a position has no sell running. Every RPC call of the trading connection is bounded by `RPC_REQUEST_TIMEOUT_MS`, and with `RPC_MAX_REQUESTS_PER_SEC` set its wait for a request slot is bounded by `RPC_LIMITER_MAX_WAIT_MS` (`server/solana/rpcConnection.ts`); a request past that bound fails unsent.
+- Marks for the exit pass (P1.6): a mint whose price read fails is not read again for 60 s, doubling to 10 min (`MARK_RETRY_BASE_MS`), but only for PAPER positions; a LIVE position is read on every pass unless its mint can never be marked (not a token mint). A LIVE position with no fresh price whose last known mark is already past the hard stop still gets its STOP_LOSS (the sell re-reads the curve or pool before it is built); every other exit waits for a price. LIVE marks of a migrated position read the PumpSwap pool on every pass, not from the 15 s pool cache.
+- Sends on the RPC (P2.1, S252): the same signed transaction is resent every 1.5 s while it is watched, until it confirms, fails on chain, or the blockhash expires with no status (`BLOCKHASH_EXPIRED`, booked as never landed: the row is TIMED_OUT, a buy does not hold its mint and a sell leaves no pending sell).
+- Sell errors (P1.6): anything thrown before the send, and quote, pool and curve-read errors (`QUOTE_MATH_DISCREPANCY`, `BONDING_CURVE_MIGRATED`, `PUMPSWAP_*`, `CURVE_READ_FAILED`, ...), count as no attempt: the slippage ladder and back-off do not move, and quote or build failures raise `EXIT_QUOTE_FAILING`. A send the RPC refuses with a rate limit (HTTP 429, JSON-RPC -32007, "request limit reached") is an unknown outcome, not proof that nothing was sent (S262; S245 had made it definite): a balancer may have forwarded an earlier attempt. A sell is resent, same signed bytes, after 0.5, 1 and 2 s (`SELL_RATE_LIMIT_BACKOFF_MS`); a buy is not resent there. Either is then watched, with resends, until it confirms or its blockhash expires. If every send was rate-limited and it expired unseen, the result is `RPC_RATE_LIMITED`: the row is TIMED_OUT, a sell leaves no pending sell, counts as no attempt and raises `EXIT_RATE_LIMITED`, and a buy fails as `SUBMIT_FAILED`. A LIVE sell quote that disagrees with the official SDK uses the SDK's net and logs the difference (a buy still fails closed). When only the curve's fee tier cannot be verified, a LIVE sell is still built on the curve with the minimum output at the highest fee tier (`PUMP_SELL_FEE_CEILING_BPS` when the fee config is missing); when the curve itself cannot be read and there is no pool, the refusal names the reason (`CURVE_READ_FAILED (<reason>)`) instead of `UNKNOWN_TRADING_VENUE`. The close schemas take whole percents; `closePosition` computes the share in basis points.
+- The feed (P4.2). `server/solana/pumpFeedListener.ts` subscribes to the pump program's logs and to slot changes on the trading Connection. A websocket close, no slot for `FEED_SLOT_SILENCE_MS` (10 s, once a first slot was seen), a slot jump above `FEED_SLOT_JUMP_MAX` (25) or an RPC switch is a gap: the status is `RECONNECTING` until the socket reopens or a slot arrives, and a `feed_gap` event makes `server/signals/watchWindow.ts` release every active launch `DEAD` with `FEED_GAP` (no backfill: logs from the gap are never replayed by web3.js). A successful `setRpcEndpoint` moves the subscription to the new Connection (`onConnectionChange`, `switchConnection`) and clears the pump Global/FeeConfig cache. A CreateEvent whose `quote_mint` is not SOL is not emitted, and the curve read refuses a non-SOL quote in PAPER as well as LIVE.
+- Boot modes (`pumpBootMode` in `server/pumpfunService.ts`): with external feeds on, `FULL` (log stream plus the pump.fun / DexScreener HTTP pollers) only when the cluster value is `mainnet-beta` (a read-only server), otherwise `WS_ONLY` (log stream only); with `APEX_DISABLE_EXTERNAL_FEEDS=true`, `WS_ONLY` with `APEX_PUMP_WS_ONLY=true` on localnet, otherwise `OFF`. `startBackground` refuses the pollers off mainnet whatever it is asked.
+- The watch window only releases a launch after at least 20 s and at most 120 s of real trades. An auto candidate from any source is dropped unless the window has released it (`NOT_IN_WATCH_WINDOW`, `WATCH_PENDING` or `WATCH_DEAD`). A sell by the creator cluster (the creator, the create signer, or a wallet either of them funded) is the exception to the 20 s: it marks the launch `DEAD` at once (`CREATOR_SOLD`). The cluster's trades are not counted in the velocity, flow and net-inflow signals.
 - The manual routes do not go through the auto controller or its watch window. `POST /api/memecoins/trade`, the callout snipe, the social snipe and the WebSocket snipe run the `executeSnipe` checks; `POST /api/execution/trade` and `POST /api/wallet/snipe` run only `executeTrade`'s own checks (section 3). Those include the on-chain eligibility filter (freeze authority, creator and top-10 share) in both PAPER and LIVE, but there is no confluence gate and no `executeSnipe` pool check on those two; they use no pools, so the placeholder-pool question does not arise.
-- A `HOT` release has already cleared the confluence threshold inside the window; a `READY` release is checked against it again before the buy. One threshold serves both (`server/signals/confluenceThreshold.ts`).
+- A `HOT` release has already cleared the confluence threshold inside the window; a `READY` release must also pass `readyGate` and is checked against the threshold again before the buy. One threshold serves both (`server/signals/confluenceThreshold.ts`). In `DEVNET_LIVE` the score a buy needs is never below `CONFLUENCE_DEVNET_LIVE_FLOOR` (50), HOT included, whatever the threshold is set to.
+- Curve progress is the share of the curve's 793.1M tokens sold (pump.fun's bar, `curveProgressOf` in `server/market/poolStats.ts`), in all three places it is checked: the watch window (DEAD `CURVE_TOO_FAR`, from the first trade on), the controller (the feed-measured figure) and the coordinator's fresh curve read (authoritative, every caller). 60% of the tokens sold is about 24 SOL of real reserves. With the token reserve unknown the progress is unknown, never real SOL over 85 (`curveProgressOf` returns null): the watch window and the controller let it through, and a LIVE buy is refused on the coordinator's fresh read (`CURVE_PROGRESS_UNREADABLE`). The curve panel's depth figure uses the same token share.
 - In PAPER the fill is priced from the real curve when it can be read; otherwise a flat model is used and the position is marked unverified.
 - `executeSnipe` can build a "pool" for a mint it has no market data for. The auto controller passes `noSyntheticPool`, which refuses the demo pools and `pool-simulated-*` ones; manual PAPER snipes can still use those. A `pool-callout-*` placeholder (built from a hot callout when the curve could not be read, never in LIVE) is not on that refusal list, so a PAPER or SHADOW candidate from a callout can reach one. Those placeholder pools carry fixed liquidity and price figures; they are marked `unverified` or given `SYNTHETIC_TEST` provenance, and LIVE refuses that provenance.
 
 ## 2. Auto mode states
 
-Modes live in memory only, so every start is OFF. An operator can call `setMode` to any target its checks allow, in either direction (the diagram draws the usual upward arrows only). The server moves a mode down (to SHADOW or OFF) and puts a PAPER session back after a readiness-only downgrade.
+The mode is saved in the database (`app_settings`) and `restorePersisted` brings it back at startup, up to PAPER: a saved `DEVNET_LIVE` comes back as SHADOW and needs a fresh arm and confirmation code, and without `AUTO_SNIPE_ENABLED=true` auto stays OFF. A first start is OFF. The confluence threshold is saved and restored the same way. An operator can call `setMode` to any target its checks allow, in either direction (the diagram draws the usual upward arrows only). The server moves a mode down (to SHADOW or OFF) and puts a PAPER session back after a readiness-only downgrade.
 
 ```mermaid
 stateDiagram-v2
@@ -96,19 +105,12 @@ stateDiagram-v2
   DEVNET_LIVE --> SHADOW: enforceBudgets, a session budget runs out
   PAPER --> OFF: kill
   SHADOW --> OFF: kill
-  DEVNET_LIVE --> OFF: kill, or auditWallet finds an unexplained balance change
-  note right of SHADOW
-    The auto gates and the executeSnipe checks run, then the PAPER
-    gates through previewBuy (never the LIVE-only checks); the decision
-    is journalled as WOULD_BUY. Nothing is sent. Exits keep running.
-  end note
-  note right of DEVNET_LIVE
-    One open position, devnet or localnet only.
-    Refused in read-only mode.
-  end note
+  DEVNET_LIVE --> OFF: kill, or auditWallet finds an unexplained balance change, or dropDevnetLiveIfUnarmed, LIVE disarmed or kill switch on
 ```
 
-Budget limits (buys, spend, loss, time) are checked when a candidate arrives and when the status is read, so a quiet session whose time limit has passed drops to SHADOW when someone next looks or the next candidate comes. The operator can also call `setMode` directly to any target its checks allow (the arrows above show the conditions, not who may fire them). The operator kill switch (`POST /api/execution/kill-switch`) disarms the coordinator but does not touch the auto mode: auto then stays labelled `DEVNET_LIVE` and rejects every candidate with a mode error until an operator changes it. A kill trigger that drops `DEVNET_LIVE` to SHADOW also disarms the coordinator (S207, `checkTriggers` calls `armLiveTrading(false)`), so the manual routes cannot send either until an operator arms again. Budget drops (`enforceBudgets`) and a PAPER trip do not touch the arming. An unexplained wallet balance change also calls `haltAll`. That halt stops every buy, is written to the database so it survives a restart, and is cleared only by `POST /api/auto/resume` with `clearHalt`. While halted, only stop-loss, trailing-stop, emergency and manual closes run; take-profit and stale-position exits are refused until the halt is cleared (`PROTECTIVE_EXIT_REASONS` in `server/execution/coordinator.ts`). Read-only mode allows OFF, SHADOW and PAPER only.
+In SHADOW the auto gates and the `executeSnipe` checks run, then the PAPER gates through `previewBuy` (never the LIVE-only checks, but with the release's signal timestamp, so a stale release fails `STALE_SIGNAL` as in PAPER), and the decision is journalled as `WOULD_BUY`. Nothing is sent and exits keep running. `DEVNET_LIVE` allows one open position, on devnet or localnet only, is refused in read-only mode, and buys nothing scoring below 50 (`CONFLUENCE_DEVNET_LIVE_FLOOR`) whatever the threshold.
+
+Budget limits (buys, spend, loss, time) are checked when a candidate arrives and when the status is read, so a quiet session whose time limit has passed drops to SHADOW when someone next looks or the next candidate comes. The operator can also call `setMode` directly to any target its checks allow (the arrows above show the conditions, not who may fire them). The operator kill switch (`POST /api/execution/kill-switch`) and the panics run one emergency stop (`server/execution/emergencyStop.ts`): kill switch on, auto killed to OFF after any buy in flight, coordinator disarmed. A `DEVNET_LIVE` session that finds the coordinator disarmed or the kill switch on (at a candidate, a monitor tick or a status read) also turns itself OFF (`dropDevnetLiveIfUnarmed`), so re-arming LIVE never revives it. A kill trigger that drops `DEVNET_LIVE` to SHADOW also disarms the coordinator (S207, `checkTriggers` calls `armLiveTrading(false)`), so the manual routes cannot send either until an operator arms again. Budget drops (`enforceBudgets`) and a PAPER trip do not touch the arming. An unexplained wallet balance change also calls `haltAll`. That halt stops every buy, is written to the database so it survives a restart, and is cleared only by `POST /api/auto/resume` with `clearHalt`. While halted, only stop-loss, trailing-stop, emergency and manual closes run; take-profit and stale-position exits are refused until the halt is cleared (`PROTECTIVE_EXIT_REASONS` in `server/execution/coordinator.ts`). Read-only mode allows OFF, SHADOW and PAPER only.
 
 ## 3. What a live send must pass
 
@@ -117,35 +119,36 @@ LIVE means a signed transaction on devnet or localnet. Everything on the left mu
 ```mermaid
 flowchart TD
   subgraph arm["To arm: armLiveTrading"]
-    a0["not read-only"] --> a1["confirmation code<br/>CONFIRM_LIVE_TRADING_RISK"]
+    a0["not read-only"] --> a1["confirmation code"]
     a1 --> a2["the real-money environment switch is on"]
     a2 --> a2b["ALLOWED_CLUSTER is not mainnet-beta"]
-    a2b --> a3["getLiveReadiness<br/>coordinator.ts"]
+    a2b --> a3["coordinator.ts: getLiveReadiness"]
   end
-  a3 -.-> a3g["signer READY, balance above the 0.015 SOL reserve, database writable,<br/>startup reconciliation EXECUTION_READY, RPC HEALTHY,<br/>position mark feed healthy, no halt, kill switch off, circuit breaker closed, Jito ready or not configured"]
   a3 --> t0
   subgraph trade["For each trade: executeTrade"]
-    t0["not halted, LIVE not refused by read-only,<br/>mode matches if the caller named one"] --> t1["provenance is a real source<br/>and signal timestamp is present"]
-    t1 --> t2["still armed, signer READY,<br/>ALLOWED_CLUSTER not mainnet-beta"]
-    t2 --> t3["real bonding curve read, not migrated"]
+    t0["not halted, not read-only, mode matches if the caller named one"] --> t1["provenance is a real source and signal timestamp is present"]
+    t1 --> t2["still armed, signer READY, ALLOWED_CLUSTER not mainnet-beta"]
+    t2 --> t3["real bonding curve read, not migrated, progress at most APEX_MAX_CURVE_PROGRESS_PCT"]
     t3 --> t4["EligibilityFilter passes"]
     t4 --> t5["one open LIVE position per mint"]
     t5 --> t6["spendable bankroll above zero and 10 percent ceiling"]
-    t6 --> t7["quote; balance covers worst case,<br/>in-flight orders and the reserve"]
+    t6 --> t7["quote, balance covers worst case, in-flight orders and the reserve"]
     t7 --> t8["round-trip cost at most 20 percent of the order"]
-    t8 --> t9["evaluateOrder<br/>riskEngine.ts"]
+    t8 --> t9["riskEngine.ts: evaluateOrder"]
     t9 --> t10["no buy of this mint in flight or unresolved"]
     t10 --> t11["after the awaits: still armed, not halted, kill switch off"]
   end
-  t11 --> s0["assertNotReadOnly<br/>readOnly.ts"]
-  s0 --> s1["assertSendClusterAllowed, then assertClusterAllowed<br/>clusterGuard.ts"]
-  s1 --> s2(["transaction signed and sent"])
-  m["manual one-click route: confirmLive true<br/>liveConfirmationRefusal"] -.-> t0
+  t11 --> s0["readOnly.ts: assertNotReadOnly"]
+  s0 --> s1["clusterGuard.ts: assertSendClusterAllowed, then assertClusterAllowed"]
+  s1 --> s2["transaction signed and sent"]
+  m["manual one-click route: confirmLive true, liveConfirmationRefusal"] -.-> t0
 ```
+
+`getLiveReadiness` requires: signer READY, balance above the 0.015 SOL reserve, database writable, startup reconciliation `EXECUTION_READY`, RPC HEALTHY, position mark feed healthy, no halt, kill switch off, circuit breaker closed, and Jito ready or not configured.
 
 The provenance and signal-timestamp checks apply to LIVE only; PAPER runs its own gate (`evaluatePaperBuy`) instead of everything after the provenance row. The "mode matches" check does nothing for the two direct manual routes, which name no mode; the auto controller does name one.
 
-`assertClusterAllowed` compares the RPC's genesis hash with the allowed cluster's and refuses if it cannot read it, so a mainnet RPC cannot send even if every earlier check passed. On the send path a pass is remembered per Connection object for 60 seconds (`assertClusterAllowedCached`), so each order does not pay for a genesis RPC call; a new connection, a changed `ALLOWED_CLUSTER`, an expired entry or any failure checks again, and the `mainnet-beta` refusal is never cached. An opt-in second check (`APEX_VERIFY_BLOCKHASH=true`, `verifyBlockhashIndependently`) asks the public devnet RPC whether each LIVE order's blockhash exists on devnet before signing, which a configured RPC that lies about its genesis hash would fail. The code still accepts a `mainnet-beta` value of `ALLOWED_CLUSTER`, but only so a read-only server can watch mainnet: while it is set, `armLiveTrading`, the LIVE branch of `executeTrade` and the send path (`assertSendClusterAllowed`) all refuse, and DEVNET_LIVE refuses it too. `confirmLive` is a guard against an accidental click, not a security boundary: the operator token is the authorisation ([`KNOWN_RISKS.md`](../KNOWN_RISKS.md) section 7).
+`assertClusterAllowed` compares the RPC's genesis hash with the allowed cluster's and refuses if it cannot read it, so a mainnet RPC cannot send even if every earlier check passed. On the send path a pass is remembered per Connection object for 60 seconds (`assertClusterAllowedCached`), so each order does not pay for a genesis RPC call; a new connection, a changed `ALLOWED_CLUSTER` or an expired entry checks again. A failed genesis check removes the pass (`forgetGenesisCheck`), whether it fails on the send path or in the 10 s heartbeat (`verifyCluster`), and so does switching the RPC endpoint (`setRpcEndpoint`); while the heartbeat has the RPC flagged (`clusterProblem` is set), `submitAndConfirmInner` refuses every buy and sell with `CLUSTER_GUARD` until a later check passes, and a LIVE close or exit is refused with `CLUSTER_GUARD` before it reads any wallet balance, so the position stays open (P1.6). A LIVE row is closed without a sell on an empty balance only when that read can be trusted: the RPC passes the cluster check and answers from a slot at or after the buy's (`BALANCE_UNTRUSTED` otherwise). The `mainnet-beta` refusal is never cached. An opt-in second check (`APEX_VERIFY_BLOCKHASH=true`, `verifyBlockhashIndependently`) asks the public devnet RPC whether each LIVE order's blockhash exists on devnet before signing, which a configured RPC that lies about its genesis hash would fail. The code still accepts a `mainnet-beta` value of `ALLOWED_CLUSTER`, but only so a read-only server can watch mainnet: while it is set, `armLiveTrading`, the LIVE branch of `executeTrade` and the send path (`assertSendClusterAllowed`) all refuse, and DEVNET_LIVE refuses it too. `confirmLive` is a guard against an accidental click, not a security boundary: the operator token is the authorisation ([`KNOWN_RISKS.md`](../KNOWN_RISKS.md) section 7).
 
 ## Code that looks functional and is not
 

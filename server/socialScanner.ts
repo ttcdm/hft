@@ -1,6 +1,7 @@
 import { PublicKey } from '@solana/web3.js';
 import { SocialSignal, SocialSource, AuthorTier, SignalPattern } from '../src/types';
 import { memecoinAggregator } from './memecoinAggregator';
+import { emergencyStop, type EmergencyStopReport } from './execution/emergencyStop';
 
 export interface TelegramConnectionTestResult {
   reachable: boolean;
@@ -31,9 +32,6 @@ export interface TelegramConnectionTestResult {
 export interface TelegramBotConfig {
   botToken: string;
   chatId: string;
-  webhookActive: boolean;
-  autoForwardAlerts: boolean;
-  snipeThresholdScore: number;
 }
 
 const INITIAL_SIGNALS: SocialSignal[] = [
@@ -211,9 +209,6 @@ export class SocialAlphaScanner {
   private telegramConfig: TelegramBotConfig = {
     botToken: process.env.TELEGRAM_BOT_TOKEN || '',
     chatId: process.env.TELEGRAM_CHAT_ID || '',
-    webhookActive: false, // Q34: no webhook is registered with Telegram; the /status reply must not say LIVE WEBHOOK
-    autoForwardAlerts: true,
-    snipeThresholdScore: 85,
   };
 
   constructor() {
@@ -238,11 +233,6 @@ export class SocialAlphaScanner {
     // R4s: the UI never receives the stored token, so it posts '' on Save Config; an empty token means "unchanged", never "wipe".
     if (typeof cfg?.botToken === 'string' && cfg.botToken.trim() !== '') next.botToken = cfg.botToken.trim();
     if (typeof cfg?.chatId === 'string') next.chatId = cfg.chatId.trim();
-    if (typeof cfg?.webhookActive === 'boolean') next.webhookActive = cfg.webhookActive;
-    if (typeof cfg?.autoForwardAlerts === 'boolean') next.autoForwardAlerts = cfg.autoForwardAlerts;
-    if (typeof cfg?.snipeThresholdScore === 'number' && Number.isFinite(cfg.snipeThresholdScore)) {
-      next.snipeThresholdScore = Math.min(100, Math.max(0, cfg.snipeThresholdScore));
-    }
     this.telegramConfig = { ...this.telegramConfig, ...next };
     return this.telegramConfig;
   }
@@ -281,10 +271,6 @@ export class SocialAlphaScanner {
   }
 
   // Handle simulated or real incoming Telegram Bot commands
-  private panicHook: (() => Promise<void>) | null = null;
-  /** S13: what /panic_sell does besides closing positions (kill switch, disarm, stop auto). Set by server.ts, so this file imports none of it. */
-  public setPanicHook(fn: (() => Promise<void>) | null): void { this.panicHook = fn; }
-
   public async processTelegramCommand(commandText: string): Promise<{ reply: string; actionTaken?: string }> {
     const trimmed = commandText.trim();
     if (trimmed.startsWith('/start') || trimmed.startsWith('/help')) {
@@ -327,28 +313,25 @@ export class SocialAlphaScanner {
     }
 
     if (trimmed.startsWith('/panic_sell') || trimmed.startsWith('/dump_all')) {
-      // S13: like the HTTP panic, stop new entries first, so auto does not re-buy after the exits.
-      let stopNote = '';
-      try { await this.panicHook?.(); } catch (e: any) { stopNote = `\n⚠️ Could not stop new entries: ${e?.message || e}`; }
-      const positions = memecoinAggregator.getPositions();
-      if (positions.length === 0) {
-        return { reply: `⚠️ No active positions to liquidate. Kill switch on, live trading disarmed, auto stopped.${stopNote}` };
+      // P1.4 (N-11, R1-119): the same emergency stop as the HTTP panic: kill switch, auto killed (after its buy in flight), LIVE disarmed,
+      // then every ACTIVE position of every mode sold with EMERGENCY_PANIC_LIQUIDATION. It used to disarm first and then list the
+      // positions of the mode it had just switched to (PAPER), so open LIVE positions were never sold.
+      let r: EmergencyStopReport;
+      try {
+        r = await emergencyStop({ exitAll: true, reason: 'telegram panic' });
+      } catch (e: any) {
+        return { reply: `❌ EMERGENCY DUMP FAILED: ${e?.message || e}. Positions may still be open; check the workstation.`, actionTaken: 'PANIC_SELL_PARTIAL' };
       }
-      let totalRealized = 0;
-      const closedNames: string[] = [];
-      const failedNames: string[] = []; // Q23: a close that failed is reported, never counted as sold
-      for (const p of positions) {
-        const res = await memecoinAggregator.closePosition(p.id, 100).catch((e: any) => ({ success: false as const, realizedPnl: 0, message: e?.message }));
-        if (res.success) {
-          totalRealized += res.realizedPnl || 0;
-          closedNames.push(p.tokenTicker);
-        } else {
-          failedNames.push(`${p.tokenTicker}${(res as any).message ? ` (${(res as any).message})` : ''}`);
-        }
+      const stopNote = r.autoStopError || !r.autoStopped ? `\n⚠️ Could not stop auto: ${r.autoStopError || 'mode is not OFF'}${r.autoStopped ? ' (it was forced OFF)' : ''}` : '';
+      const tail = `Kill switch on, live trading disarmed, ${r.autoStopped ? 'auto stopped' : 'auto NOT confirmed stopped'}.${stopNote}`;
+      if (r.attemptedCount === 0) {
+        return { reply: `⚠️ No active positions to liquidate. ${tail}` };
       }
+      const failedNames = r.failed.map((f) => `${f.symbol} (${f.error})`); // Q23: a close that failed is reported, never counted as sold
       const head = failedNames.length === 0 ? '🚨 EMERGENCY DUMP COMPLETE' : `⚠️ EMERGENCY DUMP INCOMPLETE: ${failedNames.length} position(s) STILL OPEN`;
+      const pnl = r.totalRealizedPnLSol;
       return {
-        reply: `${head}:\nClosed ${closedNames.length}: ${closedNames.join(', ') || 'none'}${failedNames.length ? `\nStill open: ${failedNames.join(', ')}` : ''}\nRealized PnL of the closed: ${totalRealized >= 0 ? '+' : ''}$${totalRealized.toFixed(2)}\nKill switch on, live trading disarmed, auto stopped.${stopNote}`,
+        reply: `${head}:\nClosed ${r.succeeded.length}: ${r.succeeded.map((x) => x.symbol).join(', ') || 'none'}${failedNames.length ? `\nStill open: ${failedNames.join(', ')}` : ''}\nRealized PnL of the closed: ${pnl >= 0 ? '+' : ''}${pnl.toFixed(6)} SOL\n${tail}`,
         actionTaken: failedNames.length === 0 ? 'PANIC_SELL_EXECUTED' : 'PANIC_SELL_PARTIAL',
       };
     }
@@ -356,7 +339,7 @@ export class SocialAlphaScanner {
     if (trimmed.startsWith('/status')) {
       const positions = memecoinAggregator.getPositions();
       return {
-        reply: `🟢 APEX QUANT TELEGRAM BOT ENGINE STATUS:\n• Connection: ${this.telegramConfig.webhookActive ? 'LIVE WEBHOOK ACTIVE' : 'POLLING ACTIVE'}\n• Alert Chat: ${this.telegramConfig.chatId || 'not set'}\n• Active Alpha Signals: ${this.signals.length}\n• Open Positions: ${positions.length}`,
+        reply: `🟢 APEX QUANT TELEGRAM BOT ENGINE STATUS:\n• Connection: commands via /api/telegram/webhook (no webhook registered with Telegram)\n• Alert Chat: ${this.telegramConfig.chatId || 'not set'}\n• Active Alpha Signals: ${this.signals.length}\n• Open Positions: ${positions.length}`,
       };
     }
 
@@ -561,7 +544,7 @@ export class SocialAlphaScanner {
           httpStatus: probeRes.status,
           latencyMs,
           bearerAuthorized: false,
-          diagnosis: `api.twitter.com is REACHABLE (HTTP ${probeRes.status}, ${latencyMs}ms). No TWITTER_BEARER_TOKEN configured in environment. The engine is pulling live token X/Twitter and Telegram feeds directly from on-chain Pump.fun and DexScreener metadata.`,
+          diagnosis: `api.twitter.com answered HTTP ${probeRes.status} in ${latencyMs}ms. No TWITTER_BEARER_TOKEN is configured. Nothing reads the X API; X links on the board come from token metadata.`,
           timestamp,
         };
       }
@@ -791,3 +774,17 @@ export class SocialAlphaScanner {
 }
 
 export const socialScanner = new SocialAlphaScanner();
+
+/**
+ * The X/Twitter row of the connectivity audit, built from the probe that just ran. It used to be fixed text claiming "verified (HTTP 200)"
+ * and "ready to connect to Twitter API v2" whatever the probe found. The bearer token is only used by the probe: nothing ingests from the
+ * X API. X links shown on tokens come from pump.fun / DexScreener metadata, which this server fetches on mainnet-beta only.
+ */
+export function xTwitterScopeEntry(test: { reachable: boolean; httpStatus: number | null; bearerAuthorized: boolean }, cluster: string) {
+  const probe = test.reachable ? `api.twitter.com answered HTTP ${test.httpStatus}` : `api.twitter.com was not reachable${test.httpStatus ? ` (HTTP ${test.httpStatus})` : ''}`;
+  const token = test.bearerAuthorized ? 'the bearer token was accepted, but nothing reads the X API with it' : 'no accepted bearer token, and nothing reads the X API';
+  const links = cluster === 'mainnet-beta'
+    ? 'X links on tokens come from pump.fun and DexScreener metadata.'
+    : `X links come from pump.fun and DexScreener metadata, which is not fetched on ${cluster}, so tokens here carry none.`;
+  return { subsystem: 'X.com / Twitter', nature: test.reachable ? 'PROBE_ONLY' : 'UNREACHABLE', details: `${probe}; ${token}. ${links}` };
+}

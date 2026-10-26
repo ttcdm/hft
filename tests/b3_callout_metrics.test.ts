@@ -51,7 +51,7 @@ describe('B3: missing metrics are null and score zero, never a default', () => {
       String(input).includes('frontend-api-v3.pump.fun')
         ? jsonResponse([pumpCoin({ bonding_curve: undefined, creator: undefined, market_cap: undefined, usd_market_cap: undefined })])
         : jsonResponse([]));
-    await svc.syncRealWorldData({ evaluateTriggers: false });
+    await svc.syncRealWorldData({ evaluateTriggers: false, env: { ALLOWED_CLUSTER: 'mainnet-beta' } }); // the HTTP feeds are mainnet-only
     const c = svc.getHotCallouts()[0];
     expect(c.token.volume5mUsd).toBeNull();
     expect(c.token.buys5m).toBeNull();

@@ -13,15 +13,18 @@ import type { SignalProvenance } from '../core/types';
 import { computeJournalStats, type JournalStats } from './journalStats';
 import { evaluateKillTriggers, auditWalletChange, type KillTrigger } from './killSwitch';
 import { riskEngine } from '../risk/riskEngine';
-import { watchWindow, type WatchResult } from '../signals/watchWindow';
-import { getConfluenceThreshold, setConfluenceThreshold, confluenceThresholdInfo, type ConfluenceThresholdInfo } from '../signals/confluenceThreshold';
+import { watchWindow, readyGate, type WatchResult, type WatchVerdict } from '../signals/watchWindow';
+import { checkConfluenceThreshold, getConfluenceThreshold, setConfluenceThreshold, confluenceThresholdInfo, CONFLUENCE_DEVNET_LIVE_FLOOR, type ConfluenceThresholdInfo } from '../signals/confluenceThreshold';
+import { isCurveTooFar, curveTooFarReason } from '../signals/curveProgressCap';
+import { onChainPoolStats } from '../market/poolStats';
+import { dbLockPath, liveLockHolder } from '../system/instanceLock';
 
 /**
  * G1: the only owner of auto trading.
  *
  * Both candidate sources (pumpfunService callouts, the memecoinAggregator sniper loop) hand candidates to
- * `submitCandidate`; neither may call execution directly. The mode is held in memory only, so a restart always
- * comes back OFF. There is no mainnet mode. Open positions stay under the exit engine in every mode.
+ * `submitCandidate`; neither may call execution directly. The mode is saved, and a restart brings it back up to PAPER
+ * (a saved DEVNET_LIVE comes back as SHADOW and needs a fresh arm). There is no mainnet mode. Open positions stay under the exit engine in every mode.
  *
  *   OFF         drop every candidate (manual trades still work)
  *   SHADOW      run every gate and journal "would buy"; nothing is sent or filled
@@ -83,7 +86,7 @@ export interface AutoDecision {
   symbol?: string;
   source: AutoCandidate['source'];
   outcome: AutoOutcome;
-  /** Pipeline stage that decided (G3): queue | auto | watch | budget | eligibility | score | size | risk | execute | fill | exit */
+  /** Pipeline stage that decided (G3): queue | auto | watch | curve | budget | eligibility | score | size | risk | execute | fill | exit */
   stage: string;
   reason: string;
   amountSol?: number;
@@ -129,14 +132,40 @@ const MAX_DECISIONS = 500;
 export const DROP_REPEAT_MS = 10 * 60_000;
 /** S4b: how many releases may wait behind a buy in flight, and how long a signal stays good (the watch window decides in 120 s; a release older than this is not acted on late). */
 export const PENDING_RELEASE_MAX = 10;
-export const PENDING_RELEASE_MAX_AGE_MS = 20_000;
+/**
+ * P4.3 (R1-46, R1-59): what the curve, eligibility and balance reads take between a queued release leaving the queue and the risk engine checking its
+ * age. A queued release is kept only while it is younger than the risk engine's signal-age limit (8 s) minus this, so it is never retried just to fail
+ * STALE_SIGNAL after a round of RPC reads. Measured from the release (`releasedAt`), not from when it was queued.
+ */
+export const RELEASE_READ_ALLOWANCE_MS = 2_000;
+/** The default that rule gives: 8 000 - 2 000 ms (was 20 s, longer than the 8 s signal-age limit). `pendingReleaseMaxAgeMs` follows the risk engine's limit. */
+export const PENDING_RELEASE_MAX_AGE_MS = 6_000;
+/** P4.3 (R1-46): a watch release refused for a passing reason (a cooldown, a stale read) is tried again after this, while it is still fresh. */
+export const RELEASE_RETRY_MS = 2_000;
+
+/** The queue age limit in force: never above PENDING_RELEASE_MAX_AGE_MS, nor above the risk engine's signal-age limit minus the read allowance. */
+export function pendingReleaseMaxAgeMs(): number {
+  return Math.max(0, Math.min(PENDING_RELEASE_MAX_AGE_MS, riskEngine.getLimits().maxSignalAgeMs - RELEASE_READ_ALLOWANCE_MS));
+}
+
+/**
+ * P4.3 (R1-46): refusals that say "not now", not "not this mint": a cooldown after a failed trade, a stale or missing market read, the SOL price, the
+ * wallet balance, exposure, a halt or kill switch that may be lifted, a mode that changed under the trade. Such a candidate is not marked attempted,
+ * so a later submission (or the watch-release retry) while its signal is fresh can still buy. Everything else (a send, an eligibility, score or
+ * curve refusal, a stale signal, an unknown error) is final for the session. Pre-send refusals only: no message here is produced after a send.
+ */
+export const RETRYABLE_REJECTION = /^(REJECTED: )?(EXECUTION_DISABLED|CIRCUIT_BREAKER_OPEN|KILL_SWITCH_ACTIVE|TRADING_HALTED|STALE_MARKET_DATA|SOL_PRICE_UNAVAILABLE|WALLET_BALANCE_UNKNOWN|MARKET_DATA_UNAVAILABLE|MAX_EXPOSURE|INSUFFICIENT_BALANCE|SIGNER_UNAVAILABLE|MODE_CHANGED)\b/;
 const MONITOR_INTERVAL_MS = 5_000;
+/** S222: keys in `app_settings`. */
+const SETTING_THRESHOLD = 'auto.confluenceThreshold';
+const SETTING_MODE = 'auto.mode';
 /** S189: how long readiness must stay green before a PAPER session downgraded by READINESS_RED is put back. */
 export const READINESS_RESTORE_GREEN_MS = 60_000;
 
 /** Map a rejection message to the pipeline stage that produced it. */
 export function classifyRejection(message: string): string {
   const m = message || '';
+  if (/^(REJECTED: )?CURVE_PROGRESS_TOO_HIGH/.test(m)) return 'curve';
   if (/^(REJECTED: )?(ELIGIBILITY|UNSUPPORTED_TOKEN|SAFETY_CHECK|Freeze authority|Creator holds)/.test(m)) return 'eligibility';
   if (/Confluence score/.test(m)) return 'score';
   if (/^(REJECTED: )?(Capital sizing|WALLET_BALANCE_UNKNOWN|SOL_PRICE_UNAVAILABLE)|^(EXCEEDS_CAPITAL_CEILING|INSUFFICIENT_|EXPECTED_EDGE_BELOW|MARKET_DATA_UNAVAILABLE)/.test(m)) return 'size';
@@ -145,7 +174,12 @@ export function classifyRejection(message: string): string {
 }
 
 export class AutoSnipeController extends EventEmitter {
-  private mode: AutoMode = 'OFF'; // never restored from disk: a restart is always OFF
+  constructor() {
+    super();
+    this.on('mode', () => this.persistMode());
+  }
+
+  private mode: AutoMode = 'OFF'; // S222: restored from the last run at startup by `restorePersisted`, never above PAPER
   private killed = false;
   private killReason: string | null = null;
   private downgradeReason: string | null = null;
@@ -176,6 +210,20 @@ export class AutoSnipeController extends EventEmitter {
 
   public getDecisions(limit = 100): AutoDecision[] {
     return this.decisions.slice(-limit).map((d) => ({ ...d }));
+  }
+
+  /**
+   * P4.3 (R1-56): the watch facts every decision row carries, so the journal shows what a release had behind it. passingSignals is null for a mint the
+   * window never released (never watched, still watching).
+   */
+  private static watchInputs(v: WatchVerdict | null): Record<string, unknown> {
+    return {
+      watchState: v?.state ?? null,
+      passingSignals: v?.passingSignals ?? null,
+      concentrationPass: v?.concentrationPass ?? null,
+      releaseScore: v?.score ?? null,
+      releasedAt: v?.releasedAt ?? null,
+    };
   }
 
   private record(c: AutoCandidate, outcome: AutoOutcome, stage: string, reason: string, extra: Partial<AutoDecision> & { feesSol?: number; inputs?: Record<string, any>; unverified?: boolean } = {}): AutoDecision {
@@ -286,11 +334,58 @@ export class AutoSnipeController extends EventEmitter {
     const r = setConfluenceThreshold(raw);
     if (!r.ok) return { ok: false, reason: r.reason };
     workstationDb.logDecision({ autoMode: this.mode, mint: '-', stage: 'score', outcome: 'INFO', reason: `operator set the confluence buy threshold: ${r.previous} -> ${r.value} (watch window HOT gate and execution gate together)` });
+    workstationDb.setSetting(SETTING_THRESHOLD, r.value); // S222: kept across restarts
     return { ok: true, value: r.value };
   }
 
+  /**
+   * S222: bring back what the operator had set before a restart. The confluence threshold always. The mode only up to PAPER: a saved
+   * DEVNET_LIVE comes back as SHADOW (nothing is sent) and needs a fresh arm and confirmation code, so a restart never resumes live
+   * sending by itself. A mode that cannot be restored (AUTO_SNIPE_ENABLED not true, coordinator not in PAPER) leaves auto OFF.
+   * Call once at startup, before `startMonitor`.
+   */
+  public async restorePersisted(): Promise<{ threshold: number | null; mode: AutoMode; note: string | null }> {
+    let threshold: number | null = null;
+    const savedThreshold = workstationDb.getSetting<unknown>(SETTING_THRESHOLD);
+    if (savedThreshold !== null) {
+      const c = checkConfluenceThreshold(savedThreshold);
+      if (c.ok) { setConfluenceThreshold(c.value); threshold = c.value; } else Logger.warn(`[AUTO] saved confluence threshold ignored: ${c.reason}`);
+    }
+    let note: string | null = null;
+    // P1.1 (N-59): another live process owns this database. Restoring here would start a second session on it and rewrite the mode that
+    // process saved, out of reach of its kill switch. The instance lock normally stops a second server before this; this is the backstop.
+    const lock = dbLockPath(workstationDb.getDbPath());
+    const holder = lock ? liveLockHolder(lock) : null;
+    if (holder && holder.pid !== process.pid) {
+      note = `restart: auto mode not restored: process ${holder.pid} holds ${lock}; auto stays OFF and the saved mode is left as it is`;
+      Logger.warn(`[AUTO] ${note}`);
+      return { threshold, mode: this.mode, note };
+    }
+    const saved = workstationDb.getSetting<unknown>(SETTING_MODE);
+    if (saved === 'PAPER' || saved === 'SHADOW' || saved === 'DEVNET_LIVE') {
+      const target: AutoMode = saved === 'DEVNET_LIVE' ? 'SHADOW' : saved;
+      const res = await this.setMode(target);
+      if (res.ok) {
+        note = saved === 'DEVNET_LIVE'
+          ? 'restart: the last run was in DEVNET_LIVE; auto came back as SHADOW (nothing is sent). Arm LIVE and set DEVNET_LIVE again to trade.'
+          : `restart: auto mode ${target} restored from the last run`;
+        if (saved === 'DEVNET_LIVE') this.downgradeReason = note;
+        workstationDb.logDecision({ autoMode: this.mode, mint: '-', stage: 'auto', outcome: 'INFO', reason: note });
+      } else {
+        note = `restart: could not restore auto mode ${target} (${res.error}); auto stays OFF`;
+        Logger.warn(`[AUTO] ${note}`);
+      }
+    }
+    if (note) Logger.info(`[AUTO] ${note}`);
+    return { threshold, mode: this.mode, note };
+  }
+
+  /** S222: every mode change is saved, so `restorePersisted` can bring it back. */
+  private persistMode = (): void => { workstationDb.setSetting(SETTING_MODE, this.mode); };
+
   public getStatus(): AutoStatus {
     this.enforceBudgets();
+    this.dropDevnetLiveIfUnarmed(); // P1.4: the status never shows a DEVNET_LIVE session that can no longer trade
     let session: AutoStatus['session'] = null;
     if (this.session) {
       const pnl = this.sessionPnlSol();
@@ -359,6 +454,7 @@ export class AutoSnipeController extends EventEmitter {
     this.autoRestore = null; // S189: an operator choice replaces any pending automatic restore
     if (next === 'OFF') {
       this.mode = 'OFF';
+      this.clearPendingReleases();
       // Q29: OFF stops new candidates at once; the session is dropped only after a buy in flight has booked itself in it
       await this.waitInflight('setMode(OFF)');
       this.session = null;
@@ -399,7 +495,7 @@ export class AutoSnipeController extends EventEmitter {
     this.redSince.clear();
     this.walletMark = null;
     this.attempted.clear();
-    this.pendingReleases.clear();
+    this.clearPendingReleases();
     this.mode = next;
     if (next === 'PAPER' || next === 'DEVNET_LIVE') {
       // S12: only DEVNET_LIVE sizes from the real wallet; PAPER trades a simulated bankroll, so its budgets must not depend on what the wallet holds.
@@ -425,6 +521,7 @@ export class AutoSnipeController extends EventEmitter {
     this.autoRestore = null;
     this.killed = true;
     this.killReason = opts.reason || 'operator kill';
+    this.clearPendingReleases(); // P1.4: a release queued behind the buy in flight is not bought after a kill
     // Q29: a buy already past the gates finishes (its position exists once it does); wait for it so its position is in the owned set below
     // and is sold by exitAll. Mode OFF already stops any new candidate.
     await this.waitInflight('kill');
@@ -454,6 +551,7 @@ export class AutoSnipeController extends EventEmitter {
    */
   public async checkTriggers(now = Date.now()): Promise<KillTrigger[]> {
     if (this.mode === 'SHADOW' && this.autoRestore) { this.tryAutoRestore(now); return []; }
+    if (this.dropDevnetLiveIfUnarmed()) return [];
     if (this.mode !== 'PAPER' && this.mode !== 'DEVNET_LIVE') return [];
     const live = this.mode === 'DEVNET_LIVE';
     const execMode = live ? 'LIVE' : 'PAPER';
@@ -495,6 +593,31 @@ export class AutoSnipeController extends EventEmitter {
     return hits;
   }
 
+  /**
+   * P1.4 (N-0): a DEVNET_LIVE session that finds the coordinator disarmed (or not LIVE) or the kill switch on turns itself OFF, for good.
+   * Re-arming LIVE later does not revive it: only setMode('DEVNET_LIVE') with the confirmation code does. Returns the reason, or null.
+   */
+  private dropDevnetLiveIfUnarmed(): string | null {
+    if (this.mode !== 'DEVNET_LIVE') return null;
+    const coordMode = executionCoordinator.getExecutionMode();
+    const armed = executionCoordinator.isLiveArmed();
+    const killSwitch = riskEngine.isKillSwitchActive();
+    if (coordMode === 'LIVE' && armed && !killSwitch) return null;
+    const reason = killSwitch
+      ? 'the kill switch is on'
+      : `the coordinator is ${coordMode} and LIVE is ${armed ? 'armed' : 'not armed'}`;
+    const note = `DEVNET_LIVE turned OFF: ${reason}. Arm LIVE and set DEVNET_LIVE again (with its confirmation code) to trade.`;
+    this.mode = 'OFF';
+    this.session = null;
+    this.autoRestore = null;
+    this.clearPendingReleases();
+    this.downgradeReason = note;
+    workstationDb.logDecision({ autoMode: 'DEVNET_LIVE', mint: '-', stage: 'mode', outcome: 'INFO', reason: note });
+    Logger.warn(`[AUTO] ${note}`);
+    this.emit('mode', { mode: this.mode, reason: note });
+    return reason;
+  }
+
   /** S189: set only while a PAPER session sits in SHADOW because of READINESS_RED; greenSince is when readiness last turned (and stayed) all green. */
   private autoRestore: { greenSince: number | null } | null = null;
 
@@ -521,7 +644,8 @@ export class AutoSnipeController extends EventEmitter {
 
   /**
    * DEVNET_LIVE only: compare the real wallet balance with what the decision journal says moved since the last look.
-   * A change nothing in the journal explains (a drain, or an unknown spend) halts ALL trading, exits included.
+   * A change nothing in the journal explains (a drain, or an unknown spend) halts every buy plus the take-profit and stale exits;
+   * stop-loss, trailing stop, manual close and panic still run (coordinator PROTECTIVE_EXIT_REASONS).
    */
   public async auditWallet(now = Date.now()): Promise<{ explained: boolean; unexplainedSol: number } | null> {
     if (this.mode !== 'DEVNET_LIVE') {
@@ -567,9 +691,10 @@ export class AutoSnipeController extends EventEmitter {
       .map((p) => p.realizedPnLSol ?? 0);
   }
 
-  /** Clear an all-trading halt. Does not turn auto trading back on: the operator still sets a mode. */
-  public resume(opts: { clearHalt?: boolean } = {}): { halted: boolean; mode: AutoMode } {
+  /** Clear an all-trading halt and/or the daily-loss latch (3C: separate flags). Does not turn auto trading back on. */
+  public resume(opts: { clearHalt?: boolean; clearDailyLossLatch?: boolean } = {}): { halted: boolean; mode: AutoMode } {
     if (opts.clearHalt) executionCoordinator.clearHalt();
+    if (opts.clearDailyLossLatch) riskEngine.clearDailyLossLatch();
     return { halted: executionCoordinator.getHaltReason() !== null, mode: this.mode };
   }
 
@@ -579,7 +704,14 @@ export class AutoSnipeController extends EventEmitter {
    * instead (one per mint, newest 10) and is retried when the buy in flight settles, provided its verdict is still HOT/READY and it is
    * fresh enough to still be a signal.
    */
-  private pendingReleases = new Map<string, { candidate: AutoCandidate; queuedAt: number }>();
+  private pendingReleases = new Map<string, { candidate: AutoCandidate; queuedAt: number; notBefore: number }>();
+  private retryTimer: NodeJS.Timeout | null = null;
+
+  private clearPendingReleases(): void {
+    this.pendingReleases.clear();
+    if (this.retryTimer) clearTimeout(this.retryTimer);
+    this.retryTimer = null;
+  }
 
   /**
    * Q6f: the watch window is the candidate source. A HOT or READY release becomes a candidate here. Nothing did this before: the window
@@ -651,27 +783,58 @@ export class AutoSnipeController extends EventEmitter {
     const repeatKey = `${key}|${c.source}|${this.mode}|${v0?.state ?? 'NONE'}`;
     const prior = this.repeatDrops.get(repeatKey);
     if (prior && Date.now() - prior.ts < DROP_REPEAT_MS) return { ...prior.decision };
-    workstationDb.logDecision({ autoMode: this.mode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'queue', outcome: 'QUEUED', reason: 'candidate received' });
-    if (this.mode === 'OFF') return this.record(c, 'DROPPED', 'auto', 'AUTO_OFF');
+    let watchInputs = AutoSnipeController.watchInputs(v0);
+    // P4.3: every row of a candidate carries the watch facts (passingSignals among them); a row's own inputs win on a clash
+    type Extra = Parameters<AutoSnipeController['record']>[4];
+    const rec = (outcome: AutoOutcome, stage: string, reason: string, extra: Extra = {}): AutoDecision =>
+      this.record(c, outcome, stage, reason, { ...extra, inputs: { ...watchInputs, ...(extra?.inputs ?? {}) } });
+    const remember = (d: AutoDecision): AutoDecision => {
+      if (this.repeatDrops.size >= 500) this.repeatDrops.delete(this.repeatDrops.keys().next().value as string);
+      this.repeatDrops.set(repeatKey, { ts: Date.now(), decision: d });
+      return d;
+    };
+    workstationDb.logDecision({ autoMode: this.mode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'queue', outcome: 'QUEUED', reason: 'candidate received', inputs: watchInputs });
+    if (this.mode === 'OFF') return rec('DROPPED', 'auto', 'AUTO_OFF');
     const downgraded = this.enforceBudgets();
-    if (process.env.AUTO_SNIPE_ENABLED !== 'true') return this.record(c, 'DROPPED', 'auto', 'AUTO_SNIPE_ENABLED is not true');
-    if (this.attempted.has(key)) return this.record(c, 'DROPPED', 'auto', 'ALREADY_ATTEMPTED_THIS_SESSION');
+    if (process.env.AUTO_SNIPE_ENABLED !== 'true') return rec('DROPPED', 'auto', 'AUTO_SNIPE_ENABLED is not true');
+    if (this.attempted.has(key)) return rec('DROPPED', 'auto', 'ALREADY_ATTEMPTED_THIS_SESSION');
     if (this.busy) {
       const queued = c.source === 'WATCH_WINDOW' && this.queueRelease(c);
-      return this.record(c, 'DROPPED', 'auto', queued ? 'ANOTHER_CANDIDATE_IN_FLIGHT: queued, retried when the buy in flight settles' : 'ANOTHER_CANDIDATE_IN_FLIGHT');
+      return rec('DROPPED', 'auto', queued ? 'ANOTHER_CANDIDATE_IN_FLIGHT: queued, retried when the buy in flight settles' : 'ANOTHER_CANDIDATE_IN_FLIGHT');
     }
     const open = workstationDb.loadPositions(undefined, 'ACTIVE');
-    if (open.some((p) => p.mint.toLowerCase() === key)) return this.record(c, 'DROPPED', 'auto', 'POSITION_ALREADY_OPEN');
+    if (open.some((p) => p.mint.toLowerCase() === key)) return rec('DROPPED', 'auto', 'POSITION_ALREADY_OPEN');
 
-    // G2b: only watch-window releases get this far. HOT goes straight to the execution stages; READY must also clear
-    // the confluence score (the threshold in force, default 70) here; DEAD, still-watching and never-watched candidates are dropped.
+    // G2b: only watch-window releases get this far. HOT goes on to the execution stages; READY must also show concentration and
+    // READY_MIN_SIGNALS strong signals (P4.3) and clear the confluence score (the threshold in force, default 70) at execution;
+    // DEAD, still-watching and never-watched candidates are dropped.
     const verdict = traced('watch.release', () => watchWindow.getVerdict(c.mint));
+    watchInputs = AutoSnipeController.watchInputs(verdict);
     if (!verdict || verdict.state === 'WATCHING' || verdict.state === 'DEAD') {
       const reason = !verdict ? 'NOT_IN_WATCH_WINDOW' : verdict.state === 'WATCHING' ? 'WATCH_PENDING: still in the watch window' : `WATCH_DEAD: ${verdict.reason}`;
-      const dropped = this.record(c, 'DROPPED', 'watch', reason);
-      if (this.repeatDrops.size >= 500) this.repeatDrops.delete(this.repeatDrops.keys().next().value as string);
-      this.repeatDrops.set(repeatKey, { ts: Date.now(), decision: dropped });
-      return dropped;
+      return remember(rec('DROPPED', 'watch', reason));
+    }
+    // P4.3 (R1-46, R1-59): the release is the signal. Once it is older than the risk engine's limit it can never be bought; say so here, in every
+    // mode alike, without a curve read or a risk call. Final for the session.
+    const signalLimitMs = riskEngine.getLimits().maxSignalAgeMs;
+    const releaseAgeMs = verdict.releasedAt !== undefined ? Date.now() - verdict.releasedAt : null;
+    if (releaseAgeMs !== null && releaseAgeMs > signalLimitMs) {
+      this.attempted.add(key);
+      return rec('REJECTED', 'risk', `STALE_SIGNAL: the watch release is ${releaseAgeMs} ms old (limit ${signalLimitMs} ms)`);
+    }
+    // P4.3 (R1-56): a READY release is bought only with concentration passing and at least READY_MIN_SIGNALS strong signals. Final: the verdict is.
+    if (verdict.state === 'READY') {
+      const g = verdict.metrics ? readyGate(verdict.metrics) : { pass: false, reason: 'READY_TOO_WEAK: the release carries no metrics' };
+      if (!g.pass) {
+        this.attempted.add(key);
+        return remember(rec('REJECTED', 'watch', g.reason));
+      }
+    }
+    // P4.3 (R1-57): the curve measured from the feed now. Above the cap it is not bought (the coordinator checks again on its own fresh read).
+    // Review M2: null while the feed has no token reserve for the mint (never a SOL estimate); it passes here, and a LIVE buy is refused on it.
+    const progressPct = onChainPoolStats.get(c.mint)?.curveProgressPct ?? null;
+    if (isCurveTooFar(progressPct)) {
+      return remember(rec('DROPPED', 'curve', curveTooFarReason('CURVE_PROGRESS_TOO_HIGH', progressPct as number), { inputs: { curveProgressPct: progressPct } }));
     }
 
     const mode = this.mode;
@@ -680,13 +843,14 @@ export class AutoSnipeController extends EventEmitter {
     const coordMode = executionCoordinator.getExecutionMode();
     const armed = executionCoordinator.isLiveArmed();
     if (mode === 'PAPER' && (coordMode !== 'PAPER' || armed)) {
-      return this.record(c, 'REJECTED', 'mode', `PAPER auto refused: the coordinator is ${coordMode}${armed ? ' and LIVE is armed' : ''}; PAPER auto needs the coordinator in PAPER and disarmed`);
+      return rec('REJECTED', 'mode', `PAPER auto refused: the coordinator is ${coordMode}${armed ? ' and LIVE is armed' : ''}; PAPER auto needs the coordinator in PAPER and disarmed`);
     }
-    if (mode === 'DEVNET_LIVE' && (coordMode !== 'LIVE' || !armed)) {
-      return this.record(c, 'REJECTED', 'mode', `DEVNET_LIVE auto refused: the coordinator is ${coordMode} and LIVE is ${armed ? 'armed' : 'not armed'}; it must be LIVE and armed`);
+    if (mode === 'DEVNET_LIVE') {
+      const dropped = this.dropDevnetLiveIfUnarmed();
+      if (dropped) return rec('REJECTED', 'mode', `DEVNET_LIVE auto refused and turned OFF: ${dropped}`, { mode: 'DEVNET_LIVE' });
     }
     if (mode === 'DEVNET_LIVE' && open.filter((p) => !isRecoveredPosition(p)).length >= DEVNET_MAX_OPEN_POSITIONS) { // R3: adopted dust does not take the slot
-      return this.record(c, 'DROPPED', 'budget', `DEVNET_MAX_OPEN_POSITIONS (${DEVNET_MAX_OPEN_POSITIONS}) reached`);
+      return rec('DROPPED', 'budget', `DEVNET_MAX_OPEN_POSITIONS (${DEVNET_MAX_OPEN_POSITIONS}) reached`);
     }
     if (downgraded) {
       // already moved to SHADOW by enforceBudgets; carry on as a shadow run
@@ -698,21 +862,27 @@ export class AutoSnipeController extends EventEmitter {
     if (this.session && mode === 'DEVNET_LIVE') {
       const plannedSol = this.orderSol();
       if (this.session.spentSol + plannedSol > this.session.budgets.maxSpendSol) {
-        return this.record(c, 'REJECTED', 'budget', `would exceed the session spend limit (${this.session.spentSol.toFixed(4)} + ${plannedSol.toFixed(4)} > ${this.session.budgets.maxSpendSol} SOL)`);
+        return rec('REJECTED', 'budget', `would exceed the session spend limit (${this.session.spentSol.toFixed(4)} + ${plannedSol.toFixed(4)} > ${this.session.budgets.maxSpendSol} SOL)`);
       }
     }
 
     this.busy = true;
     let settle!: () => void;
     this.inflight = new Promise<void>((r) => { settle = r; });
-    this.attempted.add(key);
+    // P4.3 (R1-46): the mint is marked attempted only after a send or a final refusal (below), not before: a cooldown no longer burns it.
     // Q29: kill() and setMode() change this.mode and this.session while the buy below awaits. Its journal rows and its accounting
     // belong to the mode and the session it started in.
     const startMode = this.mode;
     const startSession = this.session;
+    let retryable = false;
     try {
       const shadow = startMode === 'SHADOW';
       const solUsd = solPriceService.lastKnownPrice();
+      // P4.3 (R1-56): DEVNET_LIVE never buys below the floor, whatever the threshold is set to; the floor turns the execution score gate on for HOT too.
+      // It applies to auto buys only: a manual snipe goes through executeSnipe with the plain threshold, LIVE armed or not.
+      const threshold = getConfluenceThreshold();
+      const minScore = startMode === 'DEVNET_LIVE' ? Math.max(threshold, CONFLUENCE_DEVNET_LIVE_FLOOR) : threshold;
+      const scoreGate = verdict.state === 'READY' || minScore > threshold;
       const params: Parameters<typeof memecoinAggregator.executeSnipe>[0] = {
         contractAddress: c.mint,
         amountUsd: c.amountUsd ?? 0,
@@ -721,9 +891,9 @@ export class AutoSnipeController extends EventEmitter {
         slippagePct: c.slippagePct ?? 6.0,
         signalId: c.signalId,
         provenance: c.provenance,
-        enforceConfluence: verdict.state === 'READY' ? true : c.enforceConfluence,
-        minConfluenceScore: verdict.state === 'READY' ? getConfluenceThreshold() : undefined,
-        // The signal behind an auto buy is the watch window's release; LIVE refuses a trade without one.
+        enforceConfluence: scoreGate ? true : c.enforceConfluence,
+        minConfluenceScore: scoreGate ? minScore : undefined,
+        // The signal behind an auto buy is the watch window's release; LIVE refuses a trade without one, and (P4.3) SHADOW checks its age too.
         signalTimestamp: verdict.releasedAt,
         // R5: the mode checked above; the coordinator refuses the trade if LIVE was armed or disarmed during the awaits in executeSnipe.
         expectedMode: coordMode,
@@ -732,7 +902,7 @@ export class AutoSnipeController extends EventEmitter {
       if (shadow) params.dryRun = true;
       const startOrderSol = this.orderSol();
       if (startMode === 'DEVNET_LIVE') {
-        if (solUsd === null) return this.record(c, 'REJECTED', 'size', 'SOL_PRICE_UNAVAILABLE', { mode: startMode });
+        if (solUsd === null) { retryable = true; return rec('REJECTED', 'size', 'SOL_PRICE_UNAVAILABLE', { mode: startMode }); }
         params.amountSolOverride = startOrderSol;
       } else if (this.orderSolOverride !== null) {
         params.amountSolOverride = this.orderSolOverride; // S183: PAPER and SHADOW use the operator's size too
@@ -742,11 +912,12 @@ export class AutoSnipeController extends EventEmitter {
         // R6: a buy that was sent and may have landed (unconfirmed, or landed with an unreadable fill) spent real SOL the cap must count.
         if (startSession && !shadow && /^(UNCONFIRMED|RECONCILIATION FAILED)/.test(res.message)) {
           startSession.spentSol += startOrderSol;
-          workstationDb.logDecision({ autoMode: startMode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'budget', outcome: 'INFO', reason: `counted ${startOrderSol} SOL against the session cap: the buy was sent and may have landed` });
+          workstationDb.logDecision({ autoMode: startMode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'budget', outcome: 'INFO', reason: `counted ${startOrderSol} SOL against the session cap: the buy was sent and may have landed`, inputs: watchInputs });
         }
-        return this.record(c, 'REJECTED', classifyRejection(res.message), res.message, { mode: startMode, inputs: { confluenceScore: res.confluenceScore, dryRun: shadow } });
+        retryable = RETRYABLE_REJECTION.test(res.message || '');
+        return rec('REJECTED', classifyRejection(res.message), res.message, { mode: startMode, inputs: { confluenceScore: res.confluenceScore, dryRun: shadow, retryable } });
       }
-      if (shadow) return this.record(c, 'WOULD_BUY', 'fill', res.message, { mode: startMode, amountSol: res.amountSol, inputs: { dryRun: true, confluenceScore: res.confluenceScore, gates: res.gates } });
+      if (shadow) return rec('WOULD_BUY', 'fill', res.message, { mode: startMode, amountSol: res.amountSol, inputs: { dryRun: true, confluenceScore: res.confluenceScore, gates: res.gates } });
       if (startSession) {
         startSession.buys += 1;
         startSession.spentSol += (res.amountSol ?? 0) + (res.feesPaidLamports ?? 0) / 1e9;
@@ -759,15 +930,17 @@ export class AutoSnipeController extends EventEmitter {
         const slipBps = (res.fillPriceSol / res.quotePriceSol - 1) * 10_000;
         if (slipBps > res.slippageBps + 1) this.slippageBreaches += 1;
       }
-      const d = this.record(c, 'BOUGHT', 'fill', res.message, {
+      const d = rec('BOUGHT', 'fill', res.message, {
         mode: startMode, amountSol: res.amountSol, positionId: res.positionId, feesSol, unverified,
         inputs: { confluenceScore: res.confluenceScore, quotePriceSol: res.quotePriceSol, fillPriceSol: res.fillPriceSol, feesSol, gates: res.gates },
       });
       this.enforceBudgets();
       return d;
     } catch (e: any) {
-      return this.record(c, 'REJECTED', 'execute', `ERROR: ${e?.message || e}`, { mode: startMode });
+      return rec('REJECTED', 'execute', `ERROR: ${e?.message || e}`, { mode: startMode });
     } finally {
+      if (!retryable) this.attempted.add(key);
+      else if (c.source === 'WATCH_WINDOW') this.queueRelease(c, Date.now() + RELEASE_RETRY_MS); // tried again while the release is still fresh
       this.busy = false;
       this.inflight = null;
       settle();
@@ -775,27 +948,49 @@ export class AutoSnipeController extends EventEmitter {
     }
   }
 
-  private queueRelease(c: AutoCandidate): boolean {
+  private queueRelease(c: AutoCandidate, notBefore = 0): boolean {
     const key = c.mint.toLowerCase();
     if (!this.pendingReleases.has(key)) {
       if (this.pendingReleases.size >= PENDING_RELEASE_MAX) this.pendingReleases.delete(this.pendingReleases.keys().next().value as string);
-      this.pendingReleases.set(key, { candidate: c, queuedAt: Date.now() });
+      this.pendingReleases.set(key, { candidate: c, queuedAt: Date.now(), notBefore });
     }
     return true;
   }
 
   private scheduleReleaseDrain(): void {
     if (this.pendingReleases.size === 0) return;
-    setImmediate(() => {
-      if (this.busy || this.mode === 'OFF') return;
-      for (const [key, p] of this.pendingReleases) {
+    setImmediate(() => this.drainReleases());
+  }
+
+  /**
+   * One queued release at a time: the next waits for this buy to settle (its own finally drains again). P4.3: a release older than
+   * `pendingReleaseMaxAgeMs` (measured from the release) is refused STALE_SIGNAL here, journaled, with no curve read or risk call, in every mode
+   * alike; a release waiting out a retry delay stays queued and a timer comes back for it.
+   */
+  private drainReleases(): void {
+    if (this.busy || this.mode === 'OFF') return;
+    const now = Date.now();
+    const maxAgeMs = pendingReleaseMaxAgeMs();
+    let waitMs: number | null = null;
+    for (const [key, p] of this.pendingReleases) {
+      const v = watchWindow.getVerdict(p.candidate.mint);
+      if (!v || (v.state !== 'HOT' && v.state !== 'READY')) { this.pendingReleases.delete(key); continue; }
+      const ageMs = now - (v.releasedAt ?? p.queuedAt);
+      if (ageMs > maxAgeMs) {
         this.pendingReleases.delete(key);
-        const v = watchWindow.getVerdict(p.candidate.mint);
-        if (Date.now() - p.queuedAt > PENDING_RELEASE_MAX_AGE_MS || !v || (v.state !== 'HOT' && v.state !== 'READY')) continue;
-        void this.submitCandidate(p.candidate).catch(() => undefined);
-        return; // one at a time: the next waits for this buy to settle (its own finally drains again)
+        this.attempted.add(key);
+        this.record(p.candidate, 'REJECTED', 'risk', `STALE_SIGNAL: the queued watch release is ${ageMs} ms old (a queued release is kept ${maxAgeMs} ms: the ${riskEngine.getLimits().maxSignalAgeMs} ms signal-age limit minus ${RELEASE_READ_ALLOWANCE_MS} ms for the reads)`, { inputs: AutoSnipeController.watchInputs(v) });
+        continue;
       }
-    });
+      if (p.notBefore > now) { waitMs = Math.min(waitMs ?? Infinity, p.notBefore - now); continue; }
+      this.pendingReleases.delete(key);
+      void this.submitCandidate(p.candidate).catch(() => undefined);
+      return;
+    }
+    if (waitMs !== null && !this.retryTimer) {
+      this.retryTimer = setTimeout(() => { this.retryTimer = null; this.drainReleases(); }, waitMs);
+      this.retryTimer.unref?.();
+    }
   }
 }
 

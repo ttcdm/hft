@@ -6,12 +6,25 @@
  *
  * Computes slot acceleration v = Delta SOL / Delta slots and calculates
  * real trading flow momentum, acceleration, and buy volume surge.
+ *
+ * P4.3 (R1-58): acceleration decays. It is measured only between transitions seen in the last ACCELERATION_WINDOW_MS (10 s) of `now`, only between
+ * two different slots (a same-slot pair, deltaSlots 0, says nothing about speed), and never from the create pseudo-transition (the curve's state at
+ * the create event, recorded with `{ create: true }`). A dev buy in the create slot used to score the full 6 acceleration points for as long as the
+ * mint was kept. A mint the watch window still holds is pinned against the 1,000-mint eviction (setPinned, wired by wireWatchPins).
+ *
+ * Not changed here: the trade flow (volume and buy-surge points) still counts every trade, the creator cluster's included. The pump feed records it
+ * without the wallet, so the creator cluster cannot be told apart in this class (the watch window's own signals leave the cluster out, P4.1).
  */
+
+/** P4.3: only transitions this recent count for slot acceleration. */
+export const ACCELERATION_WINDOW_MS = 10_000;
 
 export interface ReserveTransition {
   slot: number;
   realSolReservesSol: number;
   timestampMs: number;
+  /** P4.3: the curve's state at the create event, not a trade. Never one end of an acceleration pair. */
+  create?: boolean;
 }
 
 export interface TradeFlowEntry {
@@ -45,10 +58,21 @@ export class CurveVelocityEvaluator {
   private readonly maxTradeFlowsPerMint = 600;
   /** S14: the number of mints kept, oldest first out. Per-mint lists were bounded; the maps themselves grew for as long as the feed ran. */
   private readonly maxMints = 1_000;
+  private isPinned: (mint: string) => boolean = () => false;
+
+  /** P4.3 (R1-58): a mint the watch window is still scoring is never evicted to make room (see wireWatchPins). */
+  public setPinned(fn: (mint: string) => boolean): void {
+    this.isPinned = fn;
+  }
 
   private trimMints(): void {
     for (const m of [this.transitionsByMint, this.tradeFlowsByMint]) {
-      while (m.size > this.maxMints) m.delete(m.keys().next().value as string);
+      if (m.size <= this.maxMints) continue;
+      // oldest first, skipping pinned mints (the window holds at most a few dozen, so unpinned victims exist)
+      for (const k of [...m.keys()]) {
+        if (m.size <= this.maxMints) break;
+        if (!this.isPinned(k)) m.delete(k);
+      }
     }
   }
 
@@ -59,7 +83,8 @@ export class CurveVelocityEvaluator {
     mint: string,
     slot: number,
     realSolReservesSol: number,
-    timestampMs?: number
+    timestampMs?: number,
+    opts: { create?: boolean } = {}
   ): void {
     const cleanMint = mint.trim();
     const now = timestampMs ?? Date.now();
@@ -75,9 +100,10 @@ export class CurveVelocityEvaluator {
       slot,
       realSolReservesSol,
       timestampMs: now,
+      ...(opts.create ? { create: true } : {}),
     });
 
-    // Keep sorted by slot ascending
+    // Keep sorted by slot ascending (a stable sort: within one slot the arrival order is kept, so the last entry is the slot's closing state)
     list.sort((a, b) => a.slot - b.slot);
 
     if (list.length > this.maxTransitionsPerMint) {
@@ -153,20 +179,21 @@ export class CurveVelocityEvaluator {
     let windowVelocitySolPerSec = 0;
     let lastSlot = 0;
 
-    // 1. Calculate slot acceleration: v = Delta SOL / Delta slots
+    // 1. Calculate slot acceleration: v = Delta SOL / Delta slots, between the newest trade transition and the newest one of an earlier slot,
+    //    both inside the last ACCELERATION_WINDOW_MS (P4.3: 0 when there is no such pair; never a same-slot pair or the create pseudo-transition)
+    const recent = transitions.filter((t) => !t.create && t.timestampMs >= nowMs - ACCELERATION_WINDOW_MS && t.timestampMs <= nowMs);
+    if (recent.length >= 2) {
+      const latest = recent[recent.length - 1];
+      let previous: ReserveTransition | undefined;
+      for (let i = recent.length - 2; i >= 0; i--) if (recent[i].slot < latest.slot) { previous = recent[i]; break; }
+      if (previous) {
+        slotAcceleration = Number(((latest.realSolReservesSol - previous.realSolReservesSol) / (latest.slot - previous.slot)).toFixed(6));
+      }
+    }
+
     if (transitions.length >= 2) {
       const latest = transitions[transitions.length - 1];
-      const previous = transitions[transitions.length - 2];
       lastSlot = latest.slot;
-
-      const deltaSol = latest.realSolReservesSol - previous.realSolReservesSol;
-      const deltaSlots = latest.slot - previous.slot;
-
-      if (deltaSlots > 0) {
-        slotAcceleration = Number((deltaSol / deltaSlots).toFixed(6));
-      } else {
-        slotAcceleration = deltaSol > 0 ? deltaSol : 0;
-      }
 
       // Time derivative over window (Delta SOL / Delta t)
       const earliestInWindow = transitions[0];

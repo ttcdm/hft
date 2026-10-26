@@ -41,6 +41,13 @@ jobs:
       - name: Run Test Suites
         run: npm test
 
+      # R1-122 (P1.2): the only on-chain tests of the exit loop, crash recovery, the guards and the validator's fault controls. Each file
+      # boots the LiteSVM validator and the real server as loopback child processes (about 2.5 min in all). tests/test_globs.test.ts
+      # (in npm test above) fails when a file under tests/ is in neither this suite nor the default one.
+      - name: Long behaviour tests (real server against the in-process localnet validator, loopback only)
+        run: npm run test:long
+        timeout-minutes: 20
+
       - name: No new facade tests (tests that touch no production code; baseline in tests/facade-baseline.json)
         run: npm run test:facades
 

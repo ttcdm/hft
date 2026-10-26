@@ -1,4 +1,5 @@
 import { seedSurge } from './fixtures/velocity';
+import { seedSeasonedCreator } from './fixtures/creator';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { PublicKey } from '@solana/web3.js';
 import {
@@ -68,9 +69,9 @@ describe('Adversarial Stress & Empirical Challenge Suite: Alpha Pipeline Integra
       expect(metrics.lastSlot).toBe(5000);
       expect(Number.isFinite(metrics.slotAcceleration)).toBe(true);
       expect(isNaN(metrics.slotAcceleration)).toBe(false);
-      // Fallback: deltaSol > 0 ? deltaSol : 0
-      expect(metrics.slotAcceleration).toBe(4.5);
-      expect(metrics.velocityScore).toBeGreaterThanOrEqual(6);
+      // P4.3 (R1-58): a same-slot pair is ignored: 0 (it used to score deltaSol, 4.5, worth 6 points)
+      expect(metrics.slotAcceleration).toBe(0);
+      expect(metrics.velocityScore).toBe(0);
     });
 
     it('handles same-slot sell (deltaSlots = 0, deltaSol < 0) safely with 0 acceleration', () => {
@@ -90,7 +91,7 @@ describe('Adversarial Stress & Empirical Challenge Suite: Alpha Pipeline Integra
       const evaluator = new CurveVelocityEvaluator();
       const mint = MINT_A;
 
-      evaluator.recordTransition(mint, 1_000_000, 30.0, 100_000);
+      evaluator.recordTransition(mint, 1_000_000, 30.0, 292_000); // P4.3 (R1-58): inside the 10 s acceleration window (was 200 s before the second)
       evaluator.recordTransition(mint, 1_500_000, 40.0, 300_000);
 
       const metrics = evaluator.getMetrics(mint, 300_000);
@@ -693,7 +694,6 @@ describe('Adversarial Stress & Empirical Challenge Suite: Alpha Pipeline Integra
           followersCount: 10000,
           totalVolumeDrivenUsd: 1_000_000,
           reputationTier: 'LEGENDARY_WHALE',
-          isAutoSnipeSubscribed: false,
           topCallouts: [],
         },
         token: {
@@ -738,7 +738,7 @@ describe('Adversarial Stress & Empirical Challenge Suite: Alpha Pipeline Integra
       expect(isConfluencePassed(confluence.compositeScore)).toBe(false);
     });
 
-    it('enables auto-snipe when confluenceCount >= 2 and composite score >= 70', () => {
+    it('enables auto-snipe when confluenceCount >= 2 and composite score >= 70', async () => {
       const strongMint = 'StrongCalloutMint11111111111111111111111111';
       const strongCallout: PumpFunHotCallout = {
         id: 'callout-strong-1',
@@ -758,7 +758,6 @@ describe('Adversarial Stress & Empirical Challenge Suite: Alpha Pipeline Integra
           followersCount: 10000,
           totalVolumeDrivenUsd: 1_000_000,
           reputationTier: 'LEGENDARY_WHALE',
-          isAutoSnipeSubscribed: false,
           topCallouts: [],
         },
         token: {
@@ -800,9 +799,11 @@ describe('Adversarial Stress & Empirical Challenge Suite: Alpha Pipeline Integra
       };
 
       // Record high velocity metrics for this mint
-      curveVelocityEvaluator.recordTransition(strongMint, 9000, 15.0, Date.now() - 15_000);
+      curveVelocityEvaluator.recordTransition(strongMint, 9000, 15.0, Date.now() - 8_000); // P4.3 (R1-58): inside the 10 s acceleration window (was 15 s)
       curveVelocityEvaluator.recordTransition(strongMint, 9030, 28.0, Date.now());
       curveVelocityEvaluator.recordTradeFlow(strongMint, 13.0, true, Date.now() - 5_000);
+      // P4.1 (R1-53): a known creator with no report now scores 0 (it used to borrow 5 points from dev holding), so the fixture's seasoned creator gets its report
+      await seedSeasonedCreator(CREATOR_ADDR);
 
       const confluence = pumpfunService.evaluateCalloutConfluence(strongCallout);
       expect(confluence.compositeScore).toBeGreaterThanOrEqual(70);

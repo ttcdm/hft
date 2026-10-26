@@ -14,7 +14,7 @@
  *
  * Called by: `server/execution/coordinator.ts` only.
  */
-import { Connection, VersionedTransaction } from '@solana/web3.js';
+import { Connection, SendTransactionError, VersionedTransaction } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { Logger } from '../middleware/enterprise';
 import { assertSendClusterAllowed, jitoTipFloorAllowed, resolveJitoUrl } from './clusterGuard';
@@ -22,8 +22,9 @@ import { executionConfig } from './executionConfig';
 import { assertNotReadOnly } from './readOnly';
 
 /**
- * Where a submission stands. `SUBMITTED_TO_JITO` and `BUNDLE_PENDING` only occur on the Jito path. `BUNDLE_LANDED`, `TX_RECONCILED` and
- * `EXPIRED_BLOCKHASH` are declared but nothing assigns them (checked by searching `server/`).
+ * Where a submission stands. `SUBMITTED_TO_JITO` and `BUNDLE_PENDING` only occur on the Jito path. `EXPIRED_BLOCKHASH` is what
+ * `SolanaRpcTransport.confirm` returns when the blockhash expired with no status (P2.1). `BUNDLE_LANDED` and `TX_RECONCILED` are declared
+ * but nothing assigns them (checked by searching `server/`).
  */
 export type BundleLifecycleState =
   | 'SUBMITTED_TO_JITO'
@@ -36,9 +37,79 @@ export type BundleLifecycleState =
   | 'TIMED_OUT'
   | 'EXPIRED_BLOCKHASH';
 
-/** What one submit attempt returned: the signature (empty on failure), which transport, timing and, on failure, the reason. */
+/**
+ * P1.5 (R1-2, R1-70, R1-82, R1-113): the send errors that prove the RPC did not accept the transaction. Only a JSON-RPC error object
+ * the node returned can prove that (web3.js SendTransactionError: a preflight failure, a sanitize or deserialize failure, a failed signature
+ * check, an unknown blockhash), or a message that names one of those. Everything else
+ * (fetch failed, a socket reset, a timeout, an HTTP 5xx page, an "already processed" answer that means it landed earlier) leaves the
+ * outcome unknown: the transaction may have been forwarded and may land.
+ *
+ * S262: a rate-limit refusal (`isRateLimitedSendError`) is NOT definite. S245 made it definite to stop a refused sell from holding the
+ * position for the pending window. A review showed that a balancer may already have forwarded the request. Since P2.1 (S251, S252) an
+ * unknown send is watched, with resends, until its blockhash expires, and then released, so S245's problem no longer needs the
+ * definite reading.
+ */
+export const DEFINITE_SEND_REJECTION = /sanitiz|failed to deserialize|signature verification fail|Transaction signature verification failure|Blockhash not found|invalid transaction/i;
+
+/** "Already processed": the node has seen this transaction, so it may well be on chain. Never a definite rejection. */
+const ALREADY_PROCESSED = /already (?:been )?processed/i;
+
+/**
+ * S245: the shapes a rate-limit refusal of sendTransaction takes through web3.js 1.x (lib/index.cjs.js):
+ *  - HTTP 429. With `disableRetryOnRateLimit` (the trading Connection, rpcConnection.ts) web3.js does not retry and throws a plain
+ *    `Error(\`${status} ${statusText}: ${body}\`)`, so the message starts with "429" (statusText may be empty over HTTP/2, "429 : {...}"),
+ *    followed by the JSON-RPC body (public devnet: code -32007 or 429, "15/second request limit reached", "Too many requests ...").
+ *  - HTTP 200 with a JSON-RPC error body: `sendEncodedTransaction` throws `SendTransactionError` whose message carries only the
+ *    error's message text (the code is dropped), e.g. "Transaction  resulted in an error. \n15/second request limit reached ...".
+ *  - a `SolanaJSONRPCError`-like object with `code` -32007 or 429 (providers' "limit reached"). Not -32005: that is Solana's "node unhealthy".
+ */
+export const RATE_LIMITED_SEND = /request limit reached|too many requests|rate[ -]?limit(?:ed| exceeded| reached)|"code"\s*:\s*-3200[57]\b/i;
+export const RATE_LIMIT_RPC_CODES: ReadonlySet<number> = new Set([-32007, 429]); // S262: not -32005, which is Solana's "node unhealthy"
+
+export function isRateLimitedSendError(err: unknown): boolean {
+  const code = Number((err as any)?.code);
+  if (Number.isFinite(code) && RATE_LIMIT_RPC_CODES.has(code)) return true;
+  const msg = String((err as any)?.message ?? err ?? '');
+  if (ALREADY_PROCESSED.test(msg)) return false;
+  return /^429\b/.test(msg) || RATE_LIMITED_SEND.test(msg);
+}
+
+export function isDefiniteSendRejection(err: unknown): boolean {
+  const msg = String((err as any)?.message ?? err ?? '');
+  if (ALREADY_PROCESSED.test(msg)) return false;
+  // S262 (review 2026-10-24, HIGH on S245): a rate limit proves only that this answer was a refusal. Behind a load balancer an earlier
+  // attempt of the same request may have been forwarded, so it is an unknown outcome, never proof that nothing was sent. The resend loop
+  // (`submitThroughRateLimit`) is still safe: it resends the same signed bytes.
+  if (isRateLimitedSendError(err)) return false;
+  // web3.js throws SendTransactionError only when the RPC answered sendTransaction with a JSON-RPC error object (a preflight failure such as
+  // -32002, a failed signature check, a node that is behind). The node returns those before it forwards anything. An HTTP error page, a
+  // timeout or a reset socket is a plain Error and stays ambiguous.
+  if (err instanceof SendTransactionError) return true;
+  return DEFINITE_SEND_REJECTION.test(msg);
+}
+
+/**
+ * S245: the wait before each resend of a send the RPC refused with a rate limit. Tests replace `sleep` with a spy (it is the only clock
+ * the resend loop reads), so they need not wait for real.
+ */
+export const sendBackoff = {
+  sleep: (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
+/** P2.1: the clock `SolanaRpcTransport.confirm` reads. Tests replace both with a virtual clock (sleep advances now), so no test waits for real. */
+export const confirmPacing = {
+  now: (): number => Date.now(),
+  sleep: (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms)),
+};
+
+/** What one submit attempt returned: the signature, which transport, timing and, on failure, the reason. */
 export interface SubmitResult {
+  /** P1.5: the transaction's own signature whenever it was signed, also when the send failed (it is known before anything is sent). */
   signature: string;
+  /** P1.5: the send failed without proof that the transaction was not accepted. It may still land; the caller must watch it, not call it REVERTED. */
+  ambiguous?: boolean;
+  /** S245: the RPC refused the send with a rate limit (HTTP 429, -32007, "request limit reached"). Definite: nothing was accepted, so resending the same signed transaction is safe. */
+  rateLimited?: boolean;
   bundleId?: string;
   transport: 'SOLANA_RPC' | 'JITO';
   success: boolean;
@@ -74,6 +145,13 @@ export interface JitoHealthTelemetry {
   lastError: string | null;
 }
 
+/** The first signature of a signed transaction, base58; '' when it is unsigned (all zero). */
+function localSignature(tx: VersionedTransaction): string {
+  const sig = tx?.signatures?.[0];
+  if (!sig || sig.every((b) => b === 0)) return '';
+  return bs58.encode(sig);
+}
+
 /** Sends over plain RPC (`sendRawTransaction`, no preflight, 2 node-side retries) and confirms by polling signature statuses. The only transport used on devnet and localnet. */
 export class SolanaRpcTransport implements ExecutionTransport {
   private lastRequestTimestamp: number | null = null;
@@ -82,7 +160,7 @@ export class SolanaRpcTransport implements ExecutionTransport {
   constructor(private connection: Connection) {}
 
   /** Sends one signed transaction with `sendRawTransaction`, `skipPreflight: true`. Throws `READ_ONLY` before touching the network in read-only mode. */
-  public async submit(tx: VersionedTransaction): Promise<SubmitResult> {
+  public async submit(tx: VersionedTransaction, opts: { maxRetries?: number } = {}): Promise<SubmitResult> {
     assertNotReadOnly('sending a transaction over RPC'); // S185: before anything is serialized or sent
     assertSendClusterAllowed(); // S206: the lowest choke point; a mainnet setting never reaches the network from here
     const t0 = performance.now();
@@ -90,7 +168,7 @@ export class SolanaRpcTransport implements ExecutionTransport {
       const raw = tx.serialize();
       const signature = await this.connection.sendRawTransaction(raw, {
         skipPreflight: true,
-        maxRetries: 2,
+        maxRetries: opts.maxRetries ?? 2,
         preflightCommitment: 'processed',
       });
       const duration = Math.round(performance.now() - t0);
@@ -108,16 +186,37 @@ export class SolanaRpcTransport implements ExecutionTransport {
       const duration = Math.round(performance.now() - t0);
       this.lastRequestTimestamp = Date.now();
       this.lastLatencyMs = duration;
-      Logger.error(`RPC submit failed: ${err.message}`);
+      const ambiguous = !isDefiniteSendRejection(err);
+      const rateLimited = isRateLimitedSendError(err);
+      Logger.error(`RPC submit failed${rateLimited ? ' (rate limited; outcome unknown, it is watched)' : ambiguous ? ' (outcome unknown: it may have been forwarded)' : ''}: ${err.message}`);
       return {
-        signature: '',
+        signature: localSignature(tx),
         transport: 'SOLANA_RPC',
         success: false,
+        ambiguous,
+        rateLimited,
         submitDurationMs: duration,
         lifecycleState: 'SUBMIT_FAILED',
         error: err.message,
       };
     }
+  }
+
+  /**
+   * S245: `submit`, and while the RPC refuses it with a rate limit, wait `backoffMs[i]` and send the same signed transaction again (one
+   * resend per entry). Safe: a rate-limited send was not accepted, and a resend carries the same signature, so it can land at most once.
+   * Any other outcome (sent, ambiguous, another definite rejection) is returned at once. `rateLimitedResends` counts the resends.
+   */
+  public async submitThroughRateLimit(tx: VersionedTransaction, backoffMs: readonly number[]): Promise<SubmitResult & { rateLimitedResends: number }> {
+    let res = await this.submit(tx);
+    let resends = 0;
+    while (res.rateLimited && resends < backoffMs.length) {
+      Logger.warn(`[S245] RPC rate-limited the send of ${res.signature.slice(0, 8) || 'an unsigned transaction'}; resending in ${backoffMs[resends]} ms (${resends + 1}/${backoffMs.length})`);
+      await sendBackoff.sleep(backoffMs[resends]);
+      resends++;
+      res = await this.submit(tx);
+    }
+    return { ...res, rateLimitedResends: resends };
   }
 
   /** Retries `submit` (default 2 retries, 200 ms apart). Returns the last result and the number of attempts. */
@@ -150,68 +249,97 @@ export class SolanaRpcTransport implements ExecutionTransport {
     return { ...lastResult, attempts };
   }
 
-  /** Polls signature status (including history) until confirmed, failed on chain or `maxWaitMs` (default 25 s). */
-  public async confirm(signature: string, maxWaitMs = 25000): Promise<ConfirmationResult> {
+  /**
+   * Polls the signature's status until it is confirmed, fails on chain, or the wait ends.
+   * P2.1 (R1-20, R1-69, R1-77): with `opts.rebroadcast` (the signed transaction) the same transaction is resent through `submit` every `resendEveryMs` (default 1.5 s)
+   * with `maxRetries: 0`. It has the same signature, so it can land at most once. With `opts.lastValidBlockHeight` the wait does not stop at
+   * `maxWaitMs` while the blockhash is still valid. It goes on until the confirmed block height passes that height, capped at
+   * `maxWaitMs + maxExtendMs` (default 60 s more). Past the height, with no status even in history, the result is `EXPIRED_BLOCKHASH`:
+   * the transaction never landed and never can. A failed status read or resend only skips that round. No `getTransaction` is made.
+   */
+  public async confirm(
+    signature: string,
+    maxWaitMs = 25000,
+    _bundleId?: string,
+    opts: { rebroadcast?: VersionedTransaction; lastValidBlockHeight?: number; resendEveryMs?: number; maxExtendMs?: number } = {}
+  ): Promise<ConfirmationResult> {
     const t0 = performance.now();
-    const startTime = Date.now();
-
-    try {
-      // Loop with bounded timeout rather than ignoring maxWaitMs
-      while (Date.now() - startTime < maxWaitMs) {
-        const statuses = await this.connection.getSignatureStatuses([signature], {
-          searchTransactionHistory: true,
-        });
-        const status = statuses?.value?.[0];
-
-        if (status) {
-          if (status.err) {
-            return {
-              signature,
-              confirmed: false,
-              confirmDurationMs: Math.round(performance.now() - t0),
-              lifecycleState: 'REVERTED',
-              error: JSON.stringify(status.err),
-            };
-          }
-
-          if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
-            const txDetails = await this.connection.getTransaction(signature, {
-              maxSupportedTransactionVersion: 0,
-              commitment: 'confirmed',
-            });
-
-            return {
-              signature,
-              confirmed: true,
-              slot: status.slot || txDetails?.slot,
-              feeLamports: txDetails?.meta?.fee || 5000,
-              confirmDurationMs: Math.round(performance.now() - t0),
-              lifecycleState: 'TX_CONFIRMED',
-            };
-          }
-        }
-
-        // Sleep 400ms before next polling attempt
-        await new Promise((r) => setTimeout(r, 400));
+    const now = confirmPacing.now;
+    const startTime = now();
+    const lvbh = typeof opts.lastValidBlockHeight === 'number' && opts.lastValidBlockHeight > 0 ? opts.lastValidBlockHeight : undefined;
+    const hardStop = startTime + maxWaitMs + (lvbh !== undefined ? (opts.maxExtendMs ?? 60_000) : 0);
+    const resendEveryMs = opts.resendEveryMs ?? 1_500;
+    let lastResend = startTime;
+    let resendStopped = false;
+    let lastPollError: string | null = null;
+    let expired = false;
+    const statusOf = async (history: boolean) => {
+      try {
+        return (await this.connection.getSignatureStatuses([signature], { searchTransactionHistory: history }))?.value?.[0] ?? null;
+      } catch (pollErr: any) {
+        lastPollError = pollErr?.message ?? String(pollErr); // P1.5: one failed poll says nothing about the transaction; keep polling
+        return undefined;
       }
+    };
+    const settled = (status: any): ConfirmationResult | null => {
+      if (!status) return null;
+      if (status.err) {
+        return { signature, confirmed: false, confirmDurationMs: Math.round(performance.now() - t0), lifecycleState: 'REVERTED', error: JSON.stringify(status.err) };
+      }
+      if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
+        return { signature, confirmed: true, slot: status.slot, feeLamports: 5000, confirmDurationMs: Math.round(performance.now() - t0), lifecycleState: 'TX_CONFIRMED' };
+      }
+      return null;
+    };
 
+    for (;;) {
+      const done = settled(await statusOf(false));
+      if (done) return done;
+      const t = now();
+      if (t >= hardStop) break;
+      if (t - startTime >= maxWaitMs) {
+        if (lvbh === undefined) break;
+        try {
+          if ((await this.connection.getBlockHeight('confirmed')) > lvbh) { expired = true; break; }
+        } catch (hErr: any) {
+          lastPollError = hErr?.message ?? String(hErr); // an unreadable height is not expiry: keep watching until the hard stop
+        }
+      }
+      if (opts.rebroadcast && !resendStopped && t - lastResend >= resendEveryMs) {
+        lastResend = t;
+        // through submit, so the read-only and cluster guards run on every resend; a failed resend is logged there and only skips this round
+        try {
+          await this.submit(opts.rebroadcast, { maxRetries: 0 });
+        } catch (guardErr: any) {
+          // Review L1: a guard that throws before sending (read-only turned on, or the cluster refused, mid-watch) stops the resends only.
+          // The transaction may already have landed, so the watch goes on and settles the row as it would without resends.
+          resendStopped = true;
+          Logger.warn(`Resends of ${signature.slice(0, 8)} stopped, the watch goes on: ${guardErr?.message ?? String(guardErr)}`);
+        }
+      }
+      await confirmPacing.sleep(400);
+    }
+
+    // One last look with history before saying it did not land.
+    const last = await statusOf(true);
+    const done = settled(last);
+    if (done) return done;
+    if (expired && last === null) {
       return {
         signature,
         confirmed: false,
         confirmDurationMs: Math.round(performance.now() - t0),
-        lifecycleState: 'TIMED_OUT',
-        error: `Transaction did not confirm within ${maxWaitMs}ms limit`,
-      };
-    } catch (err: any) {
-      return {
-        signature,
-        confirmed: false,
-        confirmDurationMs: Math.round(performance.now() - t0),
-        // An RPC exception while polling says nothing about the transaction: it may still land. Not a revert (N2).
-        lifecycleState: 'TIMED_OUT',
-        error: err.message,
+        lifecycleState: 'EXPIRED_BLOCKHASH',
+        error: 'BLOCKHASH_EXPIRED: the transaction did not land and its blockhash is no longer valid; safe to retry with a new transaction',
       };
     }
+    return {
+      signature,
+      confirmed: false,
+      confirmDurationMs: Math.round(performance.now() - t0),
+      lifecycleState: 'TIMED_OUT',
+      error: `Transaction did not confirm within ${Math.round(now() - startTime)}ms${lastPollError ? ` (last status read failed: ${lastPollError})` : ''}`,
+    };
   }
 }
 
@@ -601,6 +729,7 @@ export class JitoTransport implements ExecutionTransport {
 
     // If bundleId is present, check bundle statuses periodically
     let bundleLandedSlot: number | undefined;
+    let lastPollError: string | null = null;
 
     while (Date.now() - startTime < maxWaitMs) {
       if (bundleId && !bundleLandedSlot) {
@@ -634,10 +763,16 @@ export class JitoTransport implements ExecutionTransport {
         }
       }
 
-      // Check on-chain signature confirmation
-      const statuses = await this.connection.getSignatureStatuses([signature], {
-        searchTransactionHistory: true,
-      });
+      // Check on-chain signature confirmation. P1.5 (R1-6, R1-80): an RPC error while polling says nothing about the transaction, so it is
+      // caught here and polling goes on until the deadline (TIMED_OUT, which the caller treats as unconfirmed, never as a revert).
+      let statuses: Awaited<ReturnType<Connection['getSignatureStatuses']>> | null = null;
+      try {
+        statuses = await this.connection.getSignatureStatuses([signature], {
+          searchTransactionHistory: true,
+        });
+      } catch (pollErr: any) {
+        lastPollError = pollErr?.message ?? String(pollErr);
+      }
       const status = statuses?.value?.[0];
 
       if (status) {
@@ -652,10 +787,11 @@ export class JitoTransport implements ExecutionTransport {
         }
 
         if (status.confirmationStatus === 'confirmed' || status.confirmationStatus === 'finalized') {
+          // The fee read is best effort: the transaction is confirmed whether or not its details can be read now.
           const txDetails = await this.connection.getTransaction(signature, {
             maxSupportedTransactionVersion: 0,
             commitment: 'confirmed',
-          });
+          }).catch(() => null);
 
           return {
             signature,
@@ -676,7 +812,7 @@ export class JitoTransport implements ExecutionTransport {
       confirmed: false,
       confirmDurationMs: Math.round(performance.now() - t0),
       lifecycleState: 'TIMED_OUT',
-      error: `Bundle transaction did not confirm within ${maxWaitMs}ms limit`,
+      error: `Bundle transaction did not confirm within ${maxWaitMs}ms limit${lastPollError ? ` (last status read failed: ${lastPollError})` : ''}`,
     };
   }
 }

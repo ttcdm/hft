@@ -120,13 +120,11 @@ export class MemecoinAggregatorService extends EventEmitter {
   private simulationTimer: NodeJS.Timeout | null = null;
   private config: SniperBotConfig = {
     isAutoSnipeEnabled: false,
-    minConfidenceScore: 80,
     defaultSnipeAmountUsd: 5.0,
     maxSlippagePct: 6.0,
     takeProfitPct: 45.0,
     stopLossPct: 20.0,
     trailingStopEnabled: true,
-    requireMintRevoked: true,
     requireFreezeRevoked: true,
     maxDevHoldingPct: 5.0,
     telegramBotToken: '',
@@ -260,7 +258,8 @@ export class MemecoinAggregatorService extends EventEmitter {
       cleanCa,
       event.slot,
       Number(event.realSolReserves) / 1e9,
-      event.receivedAt
+      event.receivedAt,
+      { create: true } // P4.3: the create's state is a baseline, never one end of an acceleration pair
     );
 
     if (existing) {
@@ -341,7 +340,7 @@ export class MemecoinAggregatorService extends EventEmitter {
     pool.priceUsd = m.priceSol * solUsd;
     pool.marketCapUsd = m.priceSol * 1_000_000_000 * solUsd;
     pool.liquidityUsd = m.realSolReserves * solUsd * 2;
-    pool.bondingCurveProgress = Number(m.curveProgressPct.toFixed(1));
+    if (m.curveProgressPct !== null) pool.bondingCurveProgress = Number(m.curveProgressPct.toFixed(1)); // review M2: unknown leaves the last figure
     pool.priceChange5mPct = Number(m.priceChange5mPct.toFixed(2)); // a float residue like 9.99e-8 is not a price move
     pool.buys5m = m.buys5m;
     pool.sells5m = m.sells5m;
@@ -837,6 +836,7 @@ export class MemecoinAggregatorService extends EventEmitter {
         source: 'AUTO_SNIPER',
         provenance,
         liquidityUsd: pool.liquidityUsd,
+        signalTimestamp: params.signalTimestamp, // P4.3 (R1-59): SHADOW runs the same signal-age check as PAPER and LIVE
       });
       if (preview.status === 'REJECTED') {
         return { success: false, message: preview.error, txHash: '', confluenceScore: confluenceEval.score, dryRun: true };
@@ -864,7 +864,10 @@ export class MemecoinAggregatorService extends EventEmitter {
       provenance,
       liquidityUsd: pool.liquidityUsd,
       signalTimestamp: params.signalTimestamp,
-      executionMode: params.expectedMode,
+      // R1-10: a caller that names no mode (the operator routes, callout and Telegram snipes) gets the mode this call started in, checked
+      // before any await, where the route's live confirmation was checked too. A LIVE arm during the reads above must not turn a PAPER
+      // click into a LIVE send; the coordinator refuses it as MODE_CHANGED.
+      executionMode: params.expectedMode ?? executionMode,
     });
 
     if (!execRes.success) {

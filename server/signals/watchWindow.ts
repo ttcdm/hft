@@ -1,6 +1,7 @@
 import { EventEmitter } from 'events';
 import { watchMaxCandidates } from './capacity';
 import { CONFLUENCE_DEFAULT_THRESHOLD, getConfluenceThreshold } from './confluenceThreshold';
+import { isCurveTooFar, curveTooFarReason } from './curveProgressCap';
 import type { PumpTradeEvent } from '../solana/pumpFeedListener';
 
 /**
@@ -10,10 +11,25 @@ import type { PumpTradeEvent } from '../solana/pumpFeedListener';
  * Pure bookkeeping over TradeEvents with an injected clock, so every metric is replayable from fixtures.
  * Nothing here trades: a release is information for the auto controller and the board.
  *
+ * The creator cluster (the creator, the create signer, and every wallet the creator funded) is not demand: its trades are left out of
+ * velocity, flow and net inflow (P4.1, R1-55), and a sell by any wallet in it is CREATOR_SOLD. It still counts in concentration.
+ *
  * Release states:
- *   DEAD   cumulative net inflow negative once the minimum hold has passed, or ANY creator sell (instant)
+ *   DEAD   cumulative organic net inflow negative once the minimum hold has passed, or ANY creator-cluster sell (instant; also when the
+ *          funder that puts a wallet that already sold into the creator cluster arrives later), or (P4.3) the measured curve progress is
+ *          above the cap, 60% by default (CURVE_TOO_FAR, at any evaluation after the first trade, see curveProgressCap.ts)
  *   HOT    minimum hold passed, >= 3 measured signals strong, and the confluence score is at or above the threshold in force (default 70)
- *   READY  the full window elapsed without a dead or hot verdict
+ *
+ * B3 (review 2026-10-24, finding 3, second half): when a funder lookup is wired, every seller whose funder is not known is looked up
+ * (ahead of buyer lookups, outside the buyer sample), and no HOT or READY verdict is given while that lookup is outstanding, because the
+ * sell may be the creator cluster's (an answer in the creator cluster releases CREATOR_SOLD). A seller whose funder could not be read
+ * (the lookup failed after its retries, or was refused), or whose lookup is still outstanding when the full window has elapsed, costs a
+ * signal, not the launch, as an unreadable buyer does: it counts as an unknown funder in funderCoverage, so the buyers signal cannot pass,
+ * and its sell stays in the organic flow (the pessimistic side for net inflow and flow). A lost Connection or a full queue therefore never
+ * releases launches DEAD on its own.
+ *   READY  the full window elapsed without a dead or hot verdict. P4.3 (R1-56): a READY release is information, not a buy signal by itself:
+ *          the auto controller (and the replay) buy it only when `readyGate` passes (concentration and at least READY_MIN_SIGNALS signals)
+ *          and its score clears the threshold.
  */
 /** Q6c: was 10, which a busy feed fills with the first ten launches while the rest are refused without a trace. */
 export const WATCH_MAX_CANDIDATES = 60;
@@ -24,6 +40,12 @@ export const HOT_MIN_VELOCITY_SOL_PER_MIN = 1.5;
 export const HOT_MIN_UNIQUE_BUYERS = 25;
 export const HOT_MAX_LARGEST_BUYER_SHARE = 0.15;
 /**
+ * P4.1 (R1-60): funder coverage is measured over the largest this-many buyers by buy volume, not over every raw buyer. A launch with more
+ * buyers than the lookup will serve per mint (FUNDER_LOOKUP_MAX_PER_MINT, 150) could never reach coverage 1 before. The first this-many
+ * buyers are looked up as they arrive; a later buyer whose volume moves it into the largest set is looked up at the next evaluation.
+ */
+export const WATCH_FUNDER_SAMPLE_BUYERS = 100;
+/**
  * S4d: wallets that fund thousands of unrelated traders (exchange hot wallets, a faucet) and must not make their customers one cluster.
  * EXPLICIT only: an operator-supplied list in APEX_PUBLIC_FUNDERS (comma-separated addresses), empty by default. It is deliberately not
  * inferred from behaviour (for example "funds buyers of 5 mints"), because an attacker can fake any behaviour cheaply and so make their own
@@ -33,6 +55,8 @@ export function publicFundersFromEnv(env: NodeJS.ProcessEnv = process.env): Set<
   return new Set((env.APEX_PUBLIC_FUNDERS ?? '').split(',').map((a) => a.trim()).filter(Boolean));
 }
 export const HOT_MIN_SIGNALS = 3;
+/** P4.3 (R1-56): a READY release must still show this many strong signals (one fewer than HOT), concentration among them. */
+export const READY_MIN_SIGNALS = HOT_MIN_SIGNALS - 1;
 /** The built-in default; the gate itself reads the one shared threshold (S187), so HOT and the execution gate never diverge. */
 export const HOT_MIN_SCORE = CONFLUENCE_DEFAULT_THRESHOLD;
 const CREATOR_CLUSTER = 'cluster:creator';
@@ -41,13 +65,13 @@ const MAX_FUNDERS_KEPT = 20_000;
 export type WatchState = 'WATCHING' | 'HOT' | 'READY' | 'DEAD';
 
 export interface WatchSignals {
-  /** Net inflow over the last 30s, scaled to SOL/min, and whether it beats the 30s before it. null before 20s of data. */
+  /** Organic net inflow (creator cluster left out) over the last 30s, scaled to SOL/min, and whether it beats the 30s before it. null before 20s of data. */
   velocity: { solPerMin: number; rising: boolean; pass: boolean } | null;
-  /** De-clustered unique buyers; only passes when every buyer's funder is known (otherwise the count may be inflated). */
+  /** De-clustered unique buyers; only passes when the funder of every buyer in the sample (the largest WATCH_FUNDER_SAMPLE_BUYERS by volume) is known. */
   buyers: { count: number; funderCoverage: number; pass: boolean } | null;
   /** Largest cluster's share of buy volume. */
   concentration: { share: number; pass: boolean } | null;
-  /** Buys outnumber sells. */
+  /** Organic buys (creator cluster left out) outnumber organic sells. */
   flow: { buyCount: number; sellCount: number; pass: boolean } | null;
 }
 
@@ -57,16 +81,21 @@ export interface WatchMetrics {
   firstTradeAt: number | null;
   elapsedMs: number;
   tradeCount: number;
-  /** Net SOL inflow (buys - sells) per 10s bucket from the first trade. */
+  /** Organic net SOL inflow (buys - sells, creator cluster left out) per 10s bucket from the first trade. */
   netInflowPer10s: number[];
   cumulativeNetInflowSol: number;
+  /** P4.1: what the creator cluster bought and sold, reported apart from the organic flow above. */
+  creatorClusterBuySol: number;
+  creatorClusterSellSol: number;
   buyVolumeSol: number;
   sellVolumeSol: number;
   rawUniqueBuyers: number;
   /** Buyers after merging wallets with one funder, and everything the creator funded, into one. */
   uniqueBuyers: number;
-  /** Share of distinct buyers whose funder is known (fixtures or lookup). 0 when nothing is known. */
+  /** Share of the sampled buyers (the largest WATCH_FUNDER_SAMPLE_BUYERS by volume) whose funder is known. 0 when nothing is known.
+   *  B3: a seller outside the sample whose funder lookup is outstanding or failed counts as one more unknown. */
   funderCoverage: number;
+  /** Organic buy and sell counts (creator cluster left out). */
   buyCount: number;
   sellCount: number;
   /** buys / sells; null with no sells (never Infinity). */
@@ -93,16 +122,20 @@ interface Candidate {
   insiders: Set<string>;
   registeredAt: number;
   firstTradeAt: number | null;
-  /** Net SOL by 10s bucket index. */
-  buckets: number[];
   buyVolumeByWallet: Map<string, number>;
-  buyCount: number;
-  sellCount: number;
   sellVolumeSol: number;
   tradeCount: number;
   creatorSold: boolean;
-  /** Trade times (ms) with signed SOL, for the velocity windows. */
-  flow: Array<{ at: number; sol: number }>;
+  /** Every trade (ms seen, signed SOL, wallet). Flow, velocity and net inflow are computed from it at evaluation time, because a wallet
+   *  can join the creator cluster after its trade, when its funder arrives. */
+  flow: Array<{ at: number; sol: number; wallet: string; buy: boolean }>;
+  /** Wallets that sold this mint: a funder arriving later can make one of them a creator-cluster seller. */
+  sellers: Set<string>;
+  /** B3: sellers whose funder lookup was asked for and has not answered yet, and sellers whose funder could not be read. */
+  sellersPending: Set<string>;
+  sellersUnreadable: Set<string>;
+  /** Wallets whose funder was asked for on this mint's behalf. */
+  requested: Set<string>;
   seen: Set<string>;
 }
 
@@ -118,21 +151,49 @@ export interface WatchWindowOptions {
   publicFunders?: Iterable<string>;
   /** S187: a fixed HOT score for this window (what-if replay). Default: the shared threshold in force, read at each evaluation. */
   minScore?: number;
+  /** P4.3 (R1-57): measured curve progress (0..100, tokens sold) of a mint, or null when unknown. Above the cap the launch is released DEAD CURVE_TOO_FAR. */
+  progressOf?: (mint: string) => number | null | undefined;
+}
+
+/**
+ * P4.3 (R1-56): what a READY release must still show to be bought: concentration passing and at least READY_MIN_SIGNALS strong signals. A launch whose
+ * window ran out with one funder group behind most of the volume, or with a single passing signal, is not bought on its score alone.
+ */
+export function readyGate(m: Pick<WatchMetrics, 'passingSignals' | 'signals'>): { pass: boolean; reason: string } {
+  const conc = m.signals.concentration;
+  const concText = conc === null ? 'no buys' : `largest cluster ${(conc.share * 100).toFixed(1)}% of buy volume (limit ${HOT_MAX_LARGEST_BUYER_SHARE * 100}%)`;
+  if (!conc?.pass) return { pass: false, reason: `READY_TOO_WEAK: concentration fails (${concText}), ${m.passingSignals} strong signal(s)` };
+  if (m.passingSignals < READY_MIN_SIGNALS) return { pass: false, reason: `READY_TOO_WEAK: ${m.passingSignals} strong signal(s), a READY release needs ${READY_MIN_SIGNALS}` };
+  return { pass: true, reason: `READY with ${m.passingSignals} strong signals, concentration passing` };
+}
+
+/** What `getVerdict` reports. P4.3: a released mint also carries its release metrics' signal count and concentration (additive fields). */
+export interface WatchVerdict {
+  state: WatchState;
+  reason: string;
+  releasedAt?: number;
+  score?: number | null;
+  passingSignals?: number;
+  concentrationPass?: boolean | null;
+  /** The release-time metrics; absent while WATCHING. */
+  metrics?: WatchMetrics;
 }
 
 export class WatchWindow extends EventEmitter {
   private active = new Map<string, Candidate>();
   private released = new Map<string, WatchResult>();
-  private opts: Required<Pick<WatchWindowOptions, 'maxCandidates' | 'minMs' | 'maxMs'>> & Pick<WatchWindowOptions, 'funderOf' | 'scoreOf' | 'minScore'>;
+  private opts: Required<Pick<WatchWindowOptions, 'maxCandidates' | 'minMs' | 'maxMs'>> & Pick<WatchWindowOptions, 'funderOf' | 'scoreOf' | 'minScore' | 'progressOf'>;
   private funders = new Map<string, string>();
   private publicFunders: Set<string>;
   /** Wallets whose funder was looked up and does not exist / is out of reach: they count as known, in a cluster of their own. */
   private noFunder = new Set<string>();
-  private requestFunder: ((wallet: string, mint: string) => void) | null = null;
+  private requestFunder: ((wallet: string, mint: string, priority?: boolean) => boolean | void) | null = null;
   /** Q6c: launches that were not watched because the window was full. */
   private refusedFull = 0;
   private lastRefusedMint: string | null = null;
   private timer: NodeJS.Timeout | null = null;
+  /** B3b: seller funder lookups asked for, those that failed or were refused, and sellers still pending when a launch reached its window end. */
+  private sellerFunderStats = { asked: 0, unreadable: 0, pendingAtWindowEnd: 0 };
 
   constructor(opts: WatchWindowOptions = {}) {
     super();
@@ -144,14 +205,28 @@ export class WatchWindow extends EventEmitter {
       minScore: opts.minScore,
       funderOf: opts.funderOf,
       scoreOf: opts.scoreOf,
+      progressOf: opts.progressOf,
     };
   }
 
-  /** Record a wallet's funder (the sender of its earliest incoming transfer). */
-  public setFunder(wallet: string, funder: string): void {
+  /**
+   * Record a wallet's funder (the sender of its earliest incoming transfer). P4.1: when that puts a wallet that already sold a watched
+   * mint into the mint's creator cluster, the mint is released DEAD CREATOR_SOLD now (the sell came before its funder was known).
+   */
+  public setFunder(wallet: string, funder: string, at = Date.now()): void {
     this.emit('funder', { wallet, funder });
     this.funders.set(wallet, funder);
     if (this.funders.size > MAX_FUNDERS_KEPT) this.funders.delete(this.funders.keys().next().value as string);
+    this.sellerAnswered(wallet);
+    for (const c of [...this.active.values()]) {
+      if (!c.creatorSold && c.sellers.has(wallet) && this.clusterOf(c, wallet) === CREATOR_CLUSTER) this.releaseCreatorSold(c, wallet, at);
+    }
+  }
+
+  private releaseCreatorSold(c: Candidate, wallet: string, at: number): void {
+    c.creatorSold = true;
+    const who = c.insiders.has(wallet) ? 'the creator sold' : `a wallet the creator funded (${wallet.slice(0, 6)}) sold`;
+    this.release(c, 'DEAD', `CREATOR_SOLD: ${who}, instant reject`, at);
   }
 
   /** Q6b: record that a wallet's funder was looked up and there is none to cluster it with. */
@@ -159,15 +234,44 @@ export class WatchWindow extends EventEmitter {
     this.emit('funder', { wallet, funder: null });
     this.noFunder.add(wallet);
     if (this.noFunder.size > MAX_FUNDERS_KEPT) this.noFunder.delete(this.noFunder.values().next().value as string);
+    this.sellerAnswered(wallet);
   }
 
-  /** Q6b: ask this function for the funder of every new buyer. The answer comes back through setFunder / setNoFunder. */
-  public setFunderRequester(fn: ((wallet: string, mint: string) => void) | null): void {
+  /** B3: a wallet's funder lookup failed for good (after its retries). A watched launch it sold loses the buyers signal (funderCoverage < 1). */
+  public setFunderUnreadable(wallet: string): void {
+    for (const c of this.active.values()) {
+      if (c.sellersPending.delete(wallet)) { c.sellersUnreadable.add(wallet); this.sellerFunderStats.unreadable++; }
+    }
+  }
+
+  private sellerAnswered(wallet: string): void {
+    for (const c of this.active.values()) {
+      c.sellersPending.delete(wallet);
+      c.sellersUnreadable.delete(wallet);
+    }
+  }
+
+  /**
+   * Q6b: ask this function for the funder of every new buyer, and (B3) of every seller whose funder is not known, with `priority` true.
+   * The answer comes back through setFunder / setNoFunder (setFunderUnreadable when it failed); a `false` return means it was refused.
+   */
+  public setFunderRequester(fn: ((wallet: string, mint: string, priority?: boolean) => boolean | void) | null): void {
     this.requestFunder = fn;
   }
 
   public setScoreFn(fn: WatchWindowOptions['scoreOf']): void {
     this.opts.scoreOf = fn;
+  }
+
+  /** P4.3: the measured curve progress of a mint (server.ts wires onChainPoolStats). Null: not wired or not known. */
+  public setCurveProgressFn(fn: WatchWindowOptions['progressOf']): void {
+    this.opts.progressOf = fn;
+  }
+
+  /** P4.3: the measured curve progress the window sees for a mint now, or null. */
+  public curveProgressPct(mint: string): number | null {
+    const p = this.opts.progressOf?.(mint);
+    return typeof p === 'number' && Number.isFinite(p) ? p : null;
   }
 
   private funderFor(wallet: string): string | null {
@@ -184,14 +288,45 @@ export class WatchWindow extends EventEmitter {
       return false;
     }
     this.active.set(mint, {
-      mint, creator, insiders: new Set([creator, ...alsoInsiders].filter((w): w is string => !!w)), registeredAt: now, firstTradeAt: null, buckets: [], buyVolumeByWallet: new Map(),
-      buyCount: 0, sellCount: 0, sellVolumeSol: 0, tradeCount: 0, creatorSold: false, flow: [], seen: new Set(),
+      mint, creator, insiders: new Set([creator, ...alsoInsiders].filter((w): w is string => !!w)), registeredAt: now, firstTradeAt: null, buyVolumeByWallet: new Map(),
+      sellVolumeSol: 0, tradeCount: 0, creatorSold: false, flow: [], sellers: new Set(), sellersPending: new Set(), sellersUnreadable: new Set(),
+      requested: new Set(), seen: new Set(),
     });
     return true;
   }
 
   public isWatching(mint: string): boolean {
     return this.active.has(mint);
+  }
+
+  /** P4.1: true while any watched mint was launched by this creator (its creator report is pinned for that long, see watchPins.ts). */
+  public isWatchingCreator(creator: string): boolean {
+    for (const c of this.active.values()) if (c.creator === creator) return true;
+    return false;
+  }
+
+  private funderKnown(c: Candidate, wallet: string): boolean {
+    return !!this.funderFor(wallet) || this.noFunder.has(wallet) || c.insiders.has(wallet);
+  }
+
+  private askFunder(c: Candidate, wallet: string): void {
+    if (c.requested.has(wallet) || this.funderKnown(c, wallet)) return;
+    c.requested.add(wallet);
+    this.requestFunder?.(wallet, c.mint);
+  }
+
+  /**
+   * B3: a seller outside the buyer sample, or one whose lookup was refused or failed, is asked for again, ahead of buyers. setFunder
+   * releases CREATOR_SOLD when the answer puts it in the creator cluster. Without a lookup wired (replay, fixtures) nothing is pending.
+   */
+  private askSellerFunder(c: Candidate, wallet: string): void {
+    if (!this.requestFunder || c.sellersPending.has(wallet)) return;
+    c.requested.add(wallet);
+    c.sellersUnreadable.delete(wallet);
+    c.sellersPending.add(wallet);
+    this.sellerFunderStats.asked++;
+    const accepted = this.requestFunder(wallet, c.mint, true);
+    if (accepted === false && c.sellersPending.delete(wallet)) { c.sellersUnreadable.add(wallet); this.sellerFunderStats.unreadable++; }
   }
 
   /** Feed one decoded TradeEvent. `at` is when it was seen (ms). Duplicate signatures are ignored. */
@@ -205,23 +340,26 @@ export class WatchWindow extends EventEmitter {
     const sol = Number(trade.solAmountLamports) / 1e9;
     if (c.firstTradeAt === null) c.firstTradeAt = at;
     c.tradeCount++;
-    const idx = Math.max(0, Math.floor((at - c.firstTradeAt) / WATCH_BUCKET_MS));
-    while (c.buckets.length <= idx) c.buckets.push(0);
-    c.buckets[idx] += trade.isBuy ? sol : -sol;
-    c.flow.push({ at, sol: trade.isBuy ? sol : -sol });
+    c.flow.push({ at, sol: trade.isBuy ? sol : -sol, wallet: trade.user, buy: trade.isBuy });
 
     if (trade.isBuy) {
-      c.buyCount++;
-      if (!c.buyVolumeByWallet.has(trade.user) && !c.insiders.has(trade.user) && !this.funders.has(trade.user) && !this.noFunder.has(trade.user)) this.requestFunder?.(trade.user, trade.mint);
+      // The first WATCH_FUNDER_SAMPLE_BUYERS buyers are looked up at once; later ones only if they become one of the largest (evaluate).
+      if (!c.buyVolumeByWallet.has(trade.user) && c.requested.size < WATCH_FUNDER_SAMPLE_BUYERS) this.askFunder(c, trade.user);
       c.buyVolumeByWallet.set(trade.user, (c.buyVolumeByWallet.get(trade.user) ?? 0) + sol);
     } else {
-      c.sellCount++;
       c.sellVolumeSol += sol;
-      if (c.insiders.has(trade.user) && !c.creatorSold) {
-        c.creatorSold = true;
-        this.release(c, 'DEAD', 'CREATOR_SOLD: the creator sold, instant reject', at);
-      }
+      c.sellers.add(trade.user);
+      // P4.1 (R1-55): any creator-cluster wallet, not only the literal creator and create signer
+      if (!c.creatorSold && this.clusterOf(c, trade.user) === CREATOR_CLUSTER) this.releaseCreatorSold(c, trade.user, at);
+      else if (!this.funderKnown(c, trade.user)) this.askSellerFunder(c, trade.user);
     }
+  }
+
+  /** The largest WATCH_FUNDER_SAMPLE_BUYERS buyers by buy volume (ties: first buyer first). */
+  private fundersSample(c: Candidate): string[] {
+    const all = [...c.buyVolumeByWallet.entries()];
+    if (all.length <= WATCH_FUNDER_SAMPLE_BUYERS) return all.map(([w]) => w);
+    return all.sort((a, b) => b[1] - a[1]).slice(0, WATCH_FUNDER_SAMPLE_BUYERS).map(([w]) => w);
   }
 
   private clusterOf(c: Candidate, wallet: string): string {
@@ -238,16 +376,39 @@ export class WatchWindow extends EventEmitter {
     const first = c.firstTradeAt;
     const elapsedMs = first === null ? 0 : Math.max(0, now - first);
     const buyVolume = [...c.buyVolumeByWallet.values()].reduce((a, b) => a + b, 0);
-    const cumulative = c.buckets.reduce((a, b) => a + b, 0);
+    const clusterCache = new Map<string, string>();
+    const clusterOf = (wallet: string): string => {
+      let k = clusterCache.get(wallet);
+      if (k === undefined) clusterCache.set(wallet, (k = this.clusterOf(c, wallet)));
+      return k;
+    };
+
+    // P4.1 (R1-55): the creator cluster's trades are not demand. Flow, velocity and net inflow count the organic trades only.
+    const buckets: number[] = [];
+    const organic: Array<{ at: number; sol: number }> = [];
+    let buyCount = 0, sellCount = 0, creatorClusterBuySol = 0, creatorClusterSellSol = 0;
+    for (const f of c.flow) {
+      if (clusterOf(f.wallet) === CREATOR_CLUSTER) {
+        if (f.buy) creatorClusterBuySol += f.sol; else creatorClusterSellSol -= f.sol;
+        continue;
+      }
+      organic.push(f);
+      if (f.buy) buyCount++; else sellCount++;
+      const idx = Math.max(0, Math.floor((f.at - (first ?? f.at)) / WATCH_BUCKET_MS));
+      while (buckets.length <= idx) buckets.push(0);
+      buckets[idx] += f.sol;
+    }
+    const cumulative = buckets.reduce((a, b) => a + b, 0);
 
     // A funder that is itself a buyer shares its cluster with the wallets it funded.
     const clusters = new Map<string, number>();
-    let known = 0;
     for (const [wallet, vol] of c.buyVolumeByWallet) {
-      const k = this.clusterOf(c, wallet);
+      const k = clusterOf(wallet);
       clusters.set(k, (clusters.get(k) ?? 0) + vol);
-      if (this.funderFor(wallet) || this.noFunder.has(wallet) || c.insiders.has(wallet)) known++;
     }
+    // P4.1 (R1-60): coverage over the largest buyers by volume, so a launch with hundreds of small buyers can still be measured
+    const sample = this.fundersSample(c);
+    const known = sample.filter((w) => this.funderKnown(c, w)).length;
     // Merge a buyer's own cluster into the cluster of wallets it funded
     for (const wallet of c.buyVolumeByWallet.keys()) {
       const own = `wallet:${wallet}`;
@@ -258,32 +419,47 @@ export class WatchWindow extends EventEmitter {
       }
     }
     const rawUnique = c.buyVolumeByWallet.size;
-    const funderCoverage = rawUnique === 0 ? 0 : known / rawUnique;
+    // B3: a seller whose funder lookup is outstanding or failed, and who is not in the sample, counts as one more unknown funder
+    const inSample = new Set(sample);
+    const unresolvedSellers = [...c.sellersPending, ...c.sellersUnreadable].filter((w) => !inSample.has(w)).length;
+    const funderCoverage = sample.length + unresolvedSellers === 0 ? 0 : known / (sample.length + unresolvedSellers);
     const largestShare = buyVolume > 0 ? Math.max(...clusters.values()) / buyVolume : null;
 
     let velocity: WatchSignals['velocity'] = null;
     if (first !== null && elapsedMs >= this.opts.minMs) {
-      const now30 = c.flow.filter((f) => f.at > now - 30_000 && f.at <= now).reduce((a, f) => a + f.sol, 0);
-      const prev30 = c.flow.filter((f) => f.at > now - 60_000 && f.at <= now - 30_000).reduce((a, f) => a + f.sol, 0);
+      const now30 = organic.filter((f) => f.at > now - 30_000 && f.at <= now).reduce((a, f) => a + f.sol, 0);
+      const prev30 = organic.filter((f) => f.at > now - 60_000 && f.at <= now - 30_000).reduce((a, f) => a + f.sol, 0);
       const solPerMin = now30 * 2;
       const rising = now30 > prev30;
       velocity = { solPerMin, rising, pass: solPerMin >= HOT_MIN_VELOCITY_SOL_PER_MIN && rising };
     }
-    const uniqueBuyers = clusters.size;
+    // S264 (review 2026-10-24, finding 3): buyers outside the funder sample whose funder was never looked up used to count as one cluster
+    // each, so on a launch with more than WATCH_FUNDER_SAMPLE_BUYERS buyers a swarm of small wallets from one funder could pass the
+    // unique-buyer gate while coverage (measured over the sample) read 1. They now count as one cluster together; concentration still sees
+    // each of them on its own, so a busy launch is not rejected for a cluster it cannot measure.
+    const sampled = new Set(sample);
+    let unknownOutside = false;
+    const countedClusters = new Set<string>();
+    for (const wallet of c.buyVolumeByWallet.keys()) {
+      if (!sampled.has(wallet) && !this.funderKnown(c, wallet)) { unknownOutside = true; continue; }
+      const k = clusterOf(wallet);
+      countedClusters.add(clusters.has(k) ? k : `funder:${wallet}`); // a buyer merged into the cluster of the wallets it funded
+    }
+    const uniqueBuyers = countedClusters.size + (unknownOutside ? 1 : 0);
     const signals: WatchSignals = {
       velocity,
       buyers: rawUnique === 0 ? null : { count: uniqueBuyers, funderCoverage, pass: uniqueBuyers >= HOT_MIN_UNIQUE_BUYERS && funderCoverage === 1 },
       concentration: largestShare === null ? null : { share: largestShare, pass: largestShare < HOT_MAX_LARGEST_BUYER_SHARE },
-      flow: c.tradeCount === 0 ? null : { buyCount: c.buyCount, sellCount: c.sellCount, pass: c.buyCount > c.sellCount },
+      flow: c.tradeCount === 0 ? null : { buyCount, sellCount, pass: buyCount > sellCount },
     };
     const passingSignals = Object.values(signals).filter((s) => s && s.pass).length;
 
     return {
       mint: c.mint, creator: c.creator, firstTradeAt: first, elapsedMs, tradeCount: c.tradeCount,
-      netInflowPer10s: [...c.buckets], cumulativeNetInflowSol: cumulative,
+      netInflowPer10s: buckets, cumulativeNetInflowSol: cumulative, creatorClusterBuySol, creatorClusterSellSol,
       buyVolumeSol: buyVolume, sellVolumeSol: c.sellVolumeSol,
       rawUniqueBuyers: rawUnique, uniqueBuyers, funderCoverage,
-      buyCount: c.buyCount, sellCount: c.sellCount, buySellRatio: c.sellCount > 0 ? c.buyCount / c.sellCount : null,
+      buyCount, sellCount, buySellRatio: sellCount > 0 ? buyCount / sellCount : null,
       largestBuyerShare: largestShare, creatorSold: c.creatorSold, signals, passingSignals,
     };
   }
@@ -298,9 +474,14 @@ export class WatchWindow extends EventEmitter {
   }
 
   /** What the window has decided about a mint: its verdict if released, WATCHING if still held, null if never watched. */
-  public getVerdict(mint: string): { state: WatchState; reason: string; releasedAt?: number } | null {
+  public getVerdict(mint: string): WatchVerdict | null {
     const done = this.released.get(mint);
-    if (done) return { state: done.state, reason: done.reason, releasedAt: done.releasedAt ?? undefined };
+    if (done) {
+      return {
+        state: done.state, reason: done.reason, releasedAt: done.releasedAt ?? undefined, score: done.score,
+        passingSignals: done.metrics.passingSignals, concentrationPass: done.metrics.signals.concentration?.pass ?? null, metrics: done.metrics,
+      };
+    }
     if (this.active.has(mint)) return { state: 'WATCHING', reason: 'still in the watch window' };
     return null;
   }
@@ -317,6 +498,8 @@ export class WatchWindow extends EventEmitter {
     const c = this.active.get(mint);
     if (!c) return null;
 
+    // P4.1 (R1-60): a buyer that has become one of the largest is looked up even if it arrived after the first sample filled
+    if (c.buyVolumeByWallet.size > WATCH_FUNDER_SAMPLE_BUYERS) for (const w of this.fundersSample(c)) this.askFunder(c, w);
     const m = this.computeMetrics(c, now);
     const hold = (reason: string): WatchResult => ({ state: 'WATCHING', reason, metrics: m, score: null, releasedAt: null });
 
@@ -324,18 +507,27 @@ export class WatchWindow extends EventEmitter {
       if (now - c.registeredAt >= this.opts.maxMs) return this.release(c, 'DEAD', 'NO_TRADES: no trade seen within the window', now);
       return hold('waiting for the first trade');
     }
+    // P4.3 (R1-57): a curve past the cap is never bought; checked from the first trade on, the minimum hold does not delay it.
+    // Review M2: an unknown progress (null, no token reserve yet) is not a SOL estimate and does not release the launch here.
+    const progress = this.curveProgressPct(mint);
+    if (progress !== null && isCurveTooFar(progress)) return this.release(c, 'DEAD', curveTooFarReason('CURVE_TOO_FAR', progress), now);
     if (m.elapsedMs < this.opts.minMs) return hold(`holding: ${Math.ceil((this.opts.minMs - m.elapsedMs) / 1000)}s of the minimum left`);
 
     if (m.cumulativeNetInflowSol < 0) {
       return this.release(c, 'DEAD', `NET_OUTFLOW: cumulative net inflow ${m.cumulativeNetInflowSol.toFixed(4)} SOL is negative`, now);
     }
+    // B3: no HOT or READY while a seller's lookup may still answer "creator cluster"; at the window end the launch is judged without it
+    if (c.sellersPending.size > 0 && m.elapsedMs < this.opts.maxMs) return hold(`holding: waiting for the funder of ${c.sellersPending.size} seller(s)`);
+    this.sellerFunderStats.pendingAtWindowEnd += c.sellersPending.size; // only non-zero at the window end, where this evaluation releases
+    const unread = c.sellersPending.size + c.sellersUnreadable.size;
+    const unreadText = unread > 0 ? `; ${unread} seller funder(s) unread, buyers signal not counted` : '';
     const score = this.opts.scoreOf?.(mint) ?? null;
     const min = this.minScore();
     if (m.passingSignals >= HOT_MIN_SIGNALS && score !== null && score >= min) {
-      return this.release(c, 'HOT', `${m.passingSignals} strong signals and score ${score} (threshold ${min})`, now, score);
+      return this.release(c, 'HOT', `${m.passingSignals} strong signals and score ${score} (threshold ${min})${unreadText}`, now, score);
     }
     if (m.elapsedMs >= this.opts.maxMs) {
-      return this.release(c, 'READY', `window elapsed with ${m.passingSignals} strong signal(s)${score === null ? ', no score' : `, score ${score}`} (threshold ${min})`, now, score);
+      return this.release(c, 'READY', `window elapsed with ${m.passingSignals} strong signal(s)${score === null ? ', no score' : `, score ${score}`} (threshold ${min})${unreadText}`, now, score);
     }
     return hold(`watching: ${m.passingSignals}/${HOT_MIN_SIGNALS} strong signals`);
   }
@@ -351,6 +543,14 @@ export class WatchWindow extends EventEmitter {
   }
 
   /** Everything the board needs: live metrics for watched mints and the verdicts already given. */
+  /**
+   * B3b: how often a seller's funder ended up unread (the lookup failed after its retries or was refused, or was still pending at the
+   * window end), out of the seller lookups asked for. A growing share means the funder lookups need more RPC capacity.
+   */
+  public getSellerFunderStats(): { asked: number; unreadable: number; pendingAtWindowEnd: number } {
+    return { ...this.sellerFunderStats };
+  }
+
   public getSnapshot(now = Date.now()): { watching: Array<{ metrics: WatchMetrics; state: 'WATCHING' }>; released: WatchResult[]; capacity: { active: number; max: number; refusedFull: number; lastRefusedMint: string | null } } {
     return {
       capacity: { active: this.active.size, max: this.opts.maxCandidates, refusedFull: this.refusedFull, lastRefusedMint: this.lastRefusedMint },
@@ -359,12 +559,23 @@ export class WatchWindow extends EventEmitter {
     };
   }
 
-  /** Subscribe to a PumpFeedListener: create events start a watch, trade events feed it. */
+  /**
+   * P4.2 (R1-52): release every active candidate DEAD with `reason`. Used when the feed had a gap: a trade in it (a creator sell) may
+   * never arrive, so no candidate that was watched across it can be judged HOT or READY.
+   */
+  public releaseAllDead(reason: string, now = Date.now()): WatchResult[] {
+    return [...this.active.values()].map((c) => this.release(c, 'DEAD', reason, now));
+  }
+
+  /** Subscribe to a PumpFeedListener: create events start a watch, trade events feed it, a feed gap releases every candidate DEAD. */
   public attach(listener: EventEmitter): void {
     listener.on('create_event', (e: { mint: string; creator: string; user?: string }) => {
       this.watch(e.mint, e.creator, Date.now(), [e.user]);
     });
     listener.on('trade_event', (t: PumpTradeEvent) => this.onTrade(t));
+    listener.on('feed_gap', (g: { reason: string; at: number; detail?: string }) => {
+      this.releaseAllDead(`FEED_GAP: the log stream had a gap (${g.reason}); trades in it may be missing`, g.at);
+    });
   }
 
   public start(intervalMs = 2_000): void {

@@ -1,7 +1,7 @@
 /**
  * S187: the ONE confluence buy threshold. The watch window's HOT / READY gate and the aggregator's execution gate (manual snipes too)
- * both read it from here, so they cannot diverge. Order of precedence: the operator's value (POST /api/auto/threshold, kept in memory
- * until a restart like the other auto settings), then CONFLUENCE_MIN_SCORE from the environment, then 70.
+ * both read it from here, so they cannot diverge. Order of precedence: the operator's value (POST /api/auto/threshold, saved in the database
+ * and restored at startup by `autoSnipeController.restorePersisted`), then CONFLUENCE_MIN_SCORE from the environment, then 70.
  * MIN_CONFLUENCE_SCORE and HOT_MIN_SCORE stay exported as the built-in default (70) for code that names it; no gate compares against them.
  */
 export const CONFLUENCE_DEFAULT_THRESHOLD = 70;
@@ -9,6 +9,11 @@ export const CONFLUENCE_MIN_THRESHOLD = 0;
 export const CONFLUENCE_MAX_THRESHOLD = 100;
 /** Below this the screen warns plainly: more buys of weaker coins. */
 export const CONFLUENCE_WARN_BELOW = 50;
+/**
+ * P4.3 (R1-56): the threshold may be set down to 0, but a DEVNET_LIVE auto buy (real devnet SOL) never clears a score below this. The auto controller
+ * applies max(threshold, floor) to HOT and READY releases alike in DEVNET_LIVE; SHADOW, PAPER and manual snipes use the threshold as set.
+ */
+export const CONFLUENCE_DEVNET_LIVE_FLOOR = 50;
 
 export type ThresholdCheck = { ok: true; value: number } | { ok: false; reason: string };
 

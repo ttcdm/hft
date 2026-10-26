@@ -122,13 +122,14 @@ describe('C2: TradeEvent decoding and real signals', () => {
     l.destroy();
   });
 
-  it('a creator lookup that errors earns 0 creator-risk points and is not cached as a report', async () => {
+  it('a creator lookup that errors earns 0 creator-risk points and is cached only briefly, as missing data', async () => {
     const conn = fakeConn().conn;
     conn.getSignaturesForAddress = async () => { throw new Error('rpc down'); };
     const report = await creatorRiskScorer.evaluateCreator(conn, creator);
     expect(report.confluenceScore).toBe(0);
     expect(report.riskFlags).toContain('RPC_HISTORY_QUERY_FAILED');
-    expect(creatorRiskScorer.getCachedReport(creator.toBase58())).toBeUndefined();
+    // P4.1 (R1-53): failures are now cached (CREATOR_FAILURE_CACHE_TTL_MS, never pinned) so a re-score sees the failure, not a gap
+    expect(creatorRiskScorer.getCachedReport(creator.toBase58())?.riskFlags).toContain('RPC_HISTORY_QUERY_FAILED');
   });
 
   it('the aggregator no longer infers a "social call" from trending rank or volume, and unknown metrics are null', () => {

@@ -1,5 +1,6 @@
 import { setAutoMode, releaseHotCallouts } from './fixtures/auto';
 import { seedSurge, clearVelocity } from './fixtures/velocity';
+import { seedSeasonedCreator } from './fixtures/creator';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair, PublicKey } from '@solana/web3.js';
 import {
@@ -56,9 +57,9 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
       const metrics = evaluator.getMetrics(mint, 1000);
       expect(Number.isFinite(metrics.slotAcceleration)).toBe(true);
       expect(isNaN(metrics.slotAcceleration)).toBe(false);
-      // deltaSol > 0 on same slot sets acceleration to deltaSol (5.0)
-      expect(metrics.slotAcceleration).toBe(5.0);
-      expect(metrics.velocityScore).toBeGreaterThanOrEqual(6);
+      // P4.3 (R1-58): a same-slot pair says nothing about speed: acceleration 0 (it used to be the raw deltaSol, 5.0, worth the full 6 points)
+      expect(metrics.slotAcceleration).toBe(0);
+      expect(metrics.velocityScore).toBe(0);
 
       // Same-slot with negative deltaSol (sell on same slot)
       evaluator.recordTransition(mint, 500, 8.0, 1000);
@@ -680,7 +681,6 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
           followersCount: 50,
           totalVolumeDrivenUsd: 1000,
           reputationTier: 'EMERGING_CALLER',
-          isAutoSnipeSubscribed: false, // NOT subscribed
           topCallouts: [],
         },
         token: {
@@ -749,7 +749,6 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
           followersCount: 5000,
           totalVolumeDrivenUsd: 500_000,
           reputationTier: 'LEGENDARY_WHALE',
-          isAutoSnipeSubscribed: false, // NOT subscribed -> tests confluence path directly!
           topCallouts: [],
         },
         token: {
@@ -790,6 +789,9 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
       };
 
       seedSurge(highQualityCallout.token.mint); // C2: velocity must be measured
+      // P4.1 (R1-53): a known creator with no report now scores 0 (it used to borrow 5 points from dev holding), so the fixture's seasoned creator gets its report
+      highQualityCallout.token.creator = Keypair.generate().publicKey.toBase58(); // CREATOR_ADDR is not a valid public key
+      await seedSeasonedCreator(highQualityCallout.token.creator);
       (pumpfunService as any).hotCallouts = [highQualityCallout];
       const snipeSpy = vi.spyOn(memecoinAggregator, 'executeSnipe').mockResolvedValueOnce({
         success: true,

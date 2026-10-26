@@ -259,6 +259,7 @@ describe('Phase 4 Master Remediation Suite (B12 & B13)', () => {
         virtualSolReserves: 30_000_000_000n,
         virtualTokenReserves: 1_000_000_000_000_000n,
         realSolReserves: 5_000_000_000n,
+        realTokenReserves: 700_000_000_000_000n, // about 12% of the curve sold: a LIVE buy needs a readable progress
         marketDataTimestamp: Date.now(),
         isMintAuthorityRevoked: true,
         isFreezeAuthorityRevoked: true,
@@ -348,6 +349,7 @@ describe('Phase 4 Master Remediation Suite (B12 & B13)', () => {
         virtualSolReserves: 30_000_000_000n,
         virtualTokenReserves: 1_000_000_000_000_000n,
         realSolReserves: 5_000_000_000n,
+        realTokenReserves: 700_000_000_000_000n, // about 12% of the curve sold: a LIVE buy needs a readable progress
         marketDataTimestamp: Date.now(),
         isMintAuthorityRevoked: true,
         isFreezeAuthorityRevoked: true,

@@ -190,7 +190,8 @@ export class WorkstationDatabase {
       );
 
       -- S178: what the watch window saw, so the auto trader's rules can be replayed over real launches. One row per create event, trade,
-      -- or funder fact for a mint the watch window was scoring. kind: CREATE | TRADE | FUNDER (mint is '' for a funder fact).
+      -- or funder fact for a mint the watch window was scoring. kind: CREATE | TRADE | FUNDER (mint is '' for a funder fact) | END (5B: why
+      -- the launch's recording stopped, payload.reason TRADE_CAP | WINDOW | CURVE_COMPLETE; a launch with no END row is unresolved).
       CREATE TABLE IF NOT EXISTS launch_recording (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         ts INTEGER NOT NULL,
@@ -743,7 +744,7 @@ export class WorkstationDatabase {
   }
 
   /** S178: append one recorded event. Never throws: a recording failure must not touch trading. */
-  public recordLaunchEvent(ts: number, mint: string, kind: 'CREATE' | 'TRADE' | 'FUNDER', payload: Record<string, unknown>): boolean {
+  public recordLaunchEvent(ts: number, mint: string, kind: 'CREATE' | 'TRADE' | 'FUNDER' | 'END', payload: Record<string, unknown>): boolean {
     try {
       this.db.prepare('INSERT INTO launch_recording (ts, mint, kind, payload_json) VALUES (?, ?, ?, ?)').run(ts, mint, kind, JSON.stringify(payload));
       return true;

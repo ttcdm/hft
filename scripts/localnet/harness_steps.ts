@@ -111,7 +111,9 @@ async function run(info: { url: string; genesisHash: string }) {
   const steps: import('../devnet_e2e_steps').HarnessSteps = {
     coordinator, curve: PumpCurveService, db: workstationDb as any, riskLimits: () => riskEngine.getLimits(), mint: coin.mint,
     chainErr: async () => undefined, buildBuyRequest: async () => liveBuyRequest(coin.mint, 0.01, Date.now()),
-    rec, link: (sig) => sig.slice(0, 16), sleep, rpcUrl: info.url,
+    rec, link: (sig) => sig.slice(0, 16),
+    // the dry run injects only what the steps must ride out, so a SKIP here is a failure
+    skip: (step, detail) => rec(`${step} (a SKIP in the dry run)`, false, detail), sleep, rpcUrl: info.url,
     get connection() { return coordinator.getConnection() as any; },
   };
 
@@ -162,7 +164,14 @@ async function run(info: { url: string; genesisHash: string }) {
       await conn.requestAirdrop(w.publicKey, 2 * LAMPORTS_PER_SOL);
       await kit.buy(w, seeded.mint, 0.6);
     }
-    const nSteps = { ...steps, mint: seeded.mint, buildBuyRequest: async () => liveBuyRequest(seeded.mint, 0.01, Date.now()) } as typeof steps;
+    // Run 16 on devnet: a 429 on the balance sync right before the clearDailyLossLatch buy. The resume below has the validator answer the
+    // next two getBalance reads with HTTP 429 (under the kill switch's 3), and the step's next sync waits until the validator took that.
+    let failReads: Promise<unknown> | null = null;
+    const nSync = async () => { if (failReads) { await failReads; failReads = null; } return coordinator.syncRealWalletBalance(); };
+    const nCoordinator = new Proxy(coordinator, {
+      get: (t, k) => (k === 'syncRealWalletBalance' ? nSync : typeof (t as any)[k] === 'function' ? (t as any)[k].bind(t) : (t as any)[k]),
+    });
+    const nSteps = { ...steps, coordinator: nCoordinator, mint: seeded.mint, buildBuyRequest: async () => liveBuyRequest(seeded.mint, 0.01, Date.now()) } as typeof steps;
     for (let i = 0; i < 30 && !coordinator.isLiveArmed(); i++) { coordinator.armLiveTrading(true, 'CONFIRM_LIVE_TRADING_RISK'); if (!coordinator.isLiveArmed()) await sleep(1000); }
     if (await S.hasBudget(nSteps, '(n) 3C: net daily PnL floor', bal, 0.05, 'DEVNET_LOSS_FLOOR')) {
       const bn = await bal();
@@ -174,7 +183,13 @@ async function run(info: { url: string; genesisHash: string }) {
         dailyPnlSol: () => riskEngine.getDailyTotalPnLSol('LIVE'),
         latch: () => riskEngine.getDailyLossLatch('LIVE'),
         clearLatch: () => riskEngine.clearDailyLossLatch(),
-        resume: (o) => autoSnipeController.resume(o),
+        resume: (o) => {
+          if (o.clearDailyLossLatch) {
+            failReads = fetch(info.url, { method: 'POST', headers: { 'content-type': 'application/json' },
+              body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'localnet_failNextReads', params: [2, 'getBalance', null, 'http429'] }) }).then((r) => r.json());
+          }
+          return autoSnipeController.resume(o);
+        },
         orderSol: 0.01,
       });
       console.log(`INFO  (n) cost the harness wallet ${(bn - (await bal())).toFixed(5)} SOL`);

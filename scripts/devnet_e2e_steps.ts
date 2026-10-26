@@ -48,6 +48,8 @@ export interface HarnessSteps {
   mint: string;
   buildBuyRequest: () => Promise<ExecuteTradeRequest>;
   rec: (step: string, ok: boolean, detail: string) => void;
+  /** A check that could not be made for a reason outside the app under test (the RPC); printed as SKIP, neither a pass nor a FAIL. */
+  skip?: (step: string, detail: string) => void;
   link: (sig: string) => string;
   sleep: (ms: number) => Promise<unknown>;
   /** The coordinator's own Connection: (e'') wraps its `sendRawTransaction` for one call, (h) its `getMultipleAccountsInfo`. */
@@ -1453,18 +1455,50 @@ export async function lossFloorLatch(s: HarnessSteps, d: LossFloorDeps): Promise
   const realNow = Date.now;
   let lastTradeAt = Date.now();
   const buyRows = () => buyRowsFor(s).length;
+  const skip = (step: string, detail: string) => (s.skip ? s.skip(step, detail) : console.log(`SKIP  ${step}: ${detail}`));
+  /** The balance sync, retried after 0.5, 1, 2 and 4 s: true once one read answered. Run 16: a 429 on the sync just before a buy left the
+   * balance unknown, and the buy was refused INSUFFICIENT_SPENDABLE_BANKROLL before it reached the daily-loss gate. */
+  const syncWithRetry = async (): Promise<{ ok: boolean; failures: number }> => {
+    let failures = 0;
+    for (const ms of [0, 500, 1_000, 2_000, 4_000]) {
+      if (ms) await s.sleep(ms);
+      if ((await s.coordinator.syncRealWalletBalance()) != null) return { ok: true, failures };
+      failures++;
+    }
+    return { ok: false, failures };
+  };
+  /**
+   * A buy that must be refused by the floor: DAILY_LOSS_LIMIT, nothing sent, the latch set. A refusal before the floor's gate because the
+   * balance read was lost (INSUFFICIENT_SPENDABLE_BANKROLL) is retried, up to 3 times, after a fresh sync; it is never taken as the floor's.
+   * When the sync cannot recover (or its failures disarmed LIVE), the check is a SKIP with the reason, not a FAIL. Returns null on a SKIP.
+   */
   const refusedBuy = async (label: string, wantLatched: boolean) => {
-    await s.coordinator.syncRealWalletBalance();
-    const before = buyRows();
-    const r = await s.coordinator.executeTrade(await s.buildBuyRequest());
-    const sig = r.txSignature || r.signature || '';
-    const latched = /latched/.test(r.error ?? '');
-    s.rec(
-      `${L}: ${label}`,
-      !r.success && /^DAILY_LOSS_LIMIT: Net daily PnL floor/.test(r.error ?? '') && (!wantLatched || latched) && buyRows() === before && !sig && d.latch() !== null,
-      `${r.lifecycleState} ${r.error ?? ''}; BUY rows ${before} -> ${buyRows()}; latch ${d.latch() ? 'set' : 'not set'}`.slice(0, 400)
-    );
-    return r;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const sync = await syncWithRetry();
+      if (sync.ok && sync.failures) console.log(`INFO  ${L}: ${label}: the balance sync answered after ${sync.failures} failed read(s)`);
+      if (!sync.ok) { skip(`${L}: ${label}`, `the wallet balance could not be read (5 tries, 0.5 to 4 s apart; attempt ${attempt} of 3); the check was not made`); return null; }
+      const before = buyRows();
+      const r = await s.coordinator.executeTrade(await s.buildBuyRequest());
+      const sig = r.txSignature || r.signature || '';
+      const unsent = !r.success && buyRows() === before && !sig;
+      if (unsent && /^INSUFFICIENT_SPENDABLE_BANKROLL/.test(r.error ?? '')) {
+        if (attempt < 3) { console.log(`INFO  ${L}: ${label}: refused before the floor's gate (${(r.error ?? '').slice(0, 120)}); balance re-synced, buy retried`); continue; }
+        skip(`${L}: ${label}`, `refused INSUFFICIENT_SPENDABLE_BANKROLL on all 3 tries after a successful sync (the balance read keeps getting lost); the floor's gate was not reached`);
+        return null;
+      }
+      if (unsent && sync.failures > 0 && /not armed/i.test(r.error ?? '')) {
+        skip(`${L}: ${label}`, `${sync.failures} failed balance read(s) before this buy; LIVE was disarmed (consecutive RPC failures trip the kill switch): ${(r.error ?? '').slice(0, 120)}`);
+        return null;
+      }
+      const latched = /latched/.test(r.error ?? '');
+      s.rec(
+        `${L}: ${label}`,
+        !r.success && /^DAILY_LOSS_LIMIT: Net daily PnL floor/.test(r.error ?? '') && (!wantLatched || latched) && buyRows() === before && !sig && d.latch() !== null,
+        `${r.lifecycleState} ${r.error ?? ''}; BUY rows ${before} -> ${buyRows()}; latch ${d.latch() ? 'set' : 'not set'}${attempt > 1 ? `; try ${attempt}` : ''}`.slice(0, 400)
+      );
+      return r;
+    }
+    return null;
   };
   try {
     const usd = d.price().usd;
@@ -1503,7 +1537,7 @@ export async function lossFloorLatch(s: HarnessSteps, d: LossFloorDeps): Promise
     try {
       await d.refreshPrice();
       const r = await refusedBuy(`clock past the next 00:00 UTC (+${(jump / 3_600_000).toFixed(2)} h): still refused, latched`, true);
-      s.rec(`${L}: the refusal says when the oldest loss leaves the window`, /leaves it at|no realized loss is left/.test(r.error ?? ''), (r.error ?? '').slice(-160));
+      if (r) s.rec(`${L}: the refusal says when the oldest loss leaves the window`, /leaves it at|no realized loss is left/.test(r.error ?? ''), (r.error ?? '').slice(-160));
     } finally {
       Date.now = realNow;
       await d.refreshPrice(); // stamped with the real clock again

@@ -58,11 +58,17 @@ if (/mainnet|jito\.wtf/i.test(process.env.SOLANA_RPC_URL)) {
   process.exit(2);
 }
 
-const results: { step: string; ok: boolean; detail: string }[] = [];
+const results: { step: string; ok: boolean; detail: string; skipped?: true }[] = [];
 const rec = (step: string, ok: boolean, detail: string) => {
   detail = safe(detail);
   results.push({ step, ok, detail });
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${step}: ${detail}`);
+};
+// A check that could not be made for a reason outside the app (the RPC): SKIP, kept in results.json, neither a pass nor a FAIL.
+const skip = (step: string, detail: string) => {
+  detail = safe(detail);
+  results.push({ step, ok: true, detail, skipped: true });
+  console.log(`SKIP  ${step}: ${detail}`);
 };
 const solscan = (sig: string) => `https://solscan.io/tx/${sig}?cluster=devnet`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -366,7 +372,7 @@ async function main() {
   const steps: import('./devnet_e2e_steps').HarnessSteps = {
     coordinator, curve: PumpCurveService, db: workstationDb as any, riskLimits: () => riskEngine.getLimits(), mint: mint!,
     chainErr: (sig) => readChainErr(conn, sig),
-    buildBuyRequest, rec, link: solscan, sleep, rpcUrl: process.env.SOLANA_RPC_URL!,
+    buildBuyRequest, rec, skip, link: solscan, sleep, rpcUrl: process.env.SOLANA_RPC_URL!,
     // S257: read when a step runs, not once here. (g) points the coordinator at a proxy and back, which gives it a new Connection; (h) then
     // wrapped the old one, and the app's price read never reached the wrapper (runs 6 and 7: "no read of the curve in 10 s").
     get connection() { return coordinator.getConnection() as any; },
@@ -616,7 +622,9 @@ async function sellerNeverBoughtStep(steps: import('./devnet_e2e_steps').Harness
 
 function finish() {
   const bad = results.filter((r) => !r.ok);
-  console.log(`\n${results.length - bad.length}/${results.length} steps passed`);
+  const skipped = results.filter((r) => r.skipped).length;
+  const counted = results.length - skipped;
+  console.log(`\n${counted - bad.length}/${counted} steps passed${skipped ? `, ${skipped} skipped (see the SKIP lines)` : ''}`);
   fs.writeFileSync(path.join(scratch, 'results.json'), JSON.stringify(results, null, 2));
   process.exit(bad.length ? 1 : 0);
 }

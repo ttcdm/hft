@@ -269,8 +269,10 @@ describe('3I (u): a seller that never bought', () => {
 
 describe('3I (n): the net daily PnL floor step (3C)', () => {
   /** The app reduced to what (n) drives: one realized loss per round trip, gate 10 with its latch, and the resume flags. */
-  function harness(opts: { latchWorks?: boolean; throwOn?: number } = {}) {
+  function harness(opts: { latchWorks?: boolean; throwOn?: number; syncOk?: (n: number) => boolean; bankrollOn?: number[]; priceOn?: number } = {}) {
     const r = recorder();
+    const skips: Array<{ step: string; detail: string }> = [];
+    let syncs = 0;
     const rows: any[] = [];
     let floorUsd = 7;
     let pnl = 0;
@@ -279,12 +281,14 @@ describe('3I (n): the net daily PnL floor step (3C)', () => {
     let calls = 0;
     const clockSeen: number[] = [];
     const coordinator = {
-      syncRealWalletBalance: async () => undefined,
+      syncRealWalletBalance: async () => ((opts.syncOk ?? (() => true))(++syncs) ? 1 : null),
       closePosition: async (id: string) => { open = open.filter((p) => p.id !== id); pnl -= 0.0016; return { success: true }; },
       executeTrade: async () => {
         calls++;
         clockSeen.push(Date.now());
         if (opts.throwOn === calls) throw new Error('injected');
+        if (opts.bankrollOn?.includes(calls)) return { success: false, lifecycleState: 'RISK_REJECTED', error: 'INSUFFICIENT_SPENDABLE_BANKROLL: Spendable bankroll is 0.0000 SOL' };
+        if (opts.priceOn === calls) return { success: false, lifecycleState: 'RISK_REJECTED', error: 'SOL_PRICE_UNAVAILABLE: stale' };
         const floorSol = floorUsd / 150;
         if (latch && opts.latchWorks !== false) return { success: false, lifecycleState: 'RISK_REJECTED', error: 'DAILY_LOSS_LIMIT: Net daily PnL floor latched at x; the oldest loss in the 24 h window leaves it at y' };
         if (pnl <= -floorSol) { latch = { at: Date.now(), message: 'm' }; return { success: false, lifecycleState: 'RISK_REJECTED', error: 'DAILY_LOSS_LIMIT: Net daily PnL floor: reached; latched until an operator clears it' }; }
@@ -294,7 +298,7 @@ describe('3I (n): the net daily PnL floor step (3C)', () => {
       },
     };
     const s = {
-      ...r, coordinator, mint: 'MINT11111111', curve: {} as any,
+      ...r, skip: (step: string, detail: string) => skips.push({ step, detail }), coordinator, mint: 'MINT11111111', curve: {} as any,
       db: { loadTransactions: () => rows, loadPositions: () => open },
       riskLimits: () => ({ cooldownAfterFailedTradeMs: 15_000, cooldownPerMintMs: 0 }),
       buildBuyRequest: async () => ({ mint: 'MINT11111111' }),
@@ -307,7 +311,7 @@ describe('3I (n): the net daily PnL floor step (3C)', () => {
       resume: (o: { clearDailyLossLatch?: boolean }) => { if (o.clearDailyLossLatch) latch = null; return {}; },
       orderSol: 0.01,
     };
-    return { s, r, d, floor: () => floorUsd, latch: () => latch, open: () => open, clockSeen, restamps };
+    return { s, r, d, skips, calls: () => calls, floor: () => floorUsd, latch: () => latch, open: () => open, clockSeen, restamps };
   }
 
   it('an app with the floor and latch: every line passes; the floor, latch and clock are put back', async () => {
@@ -351,5 +355,39 @@ describe('3I (n): the net daily PnL floor step (3C)', () => {
     bootRefusesBadLimit(r, () => ({ status: 1, stdout: '', stderr: 'Error: MAX_POSITION_SIZE_SOL="abc" is not a number above 0. Fix it' }), '/nonexistent/x.db');
     bootRefusesBadLimit(r, () => ({ status: null, stdout: '', stderr: '[devnet-guard] allow   fetch http://127.0.0.1:9' }), '/nonexistent/x.db');
     expect(r.recs.map((x) => x.ok)).toEqual([true, false]);
+  });
+
+  it('run 16: a buy refused INSUFFICIENT_SPENDABLE_BANKROLL (balance read lost) is re-synced and retried, then must still latch', async () => {
+    // calls: 1 round-trip buy, 2 tight, 3 raised, 4 clock, 5 clearHalt, 6 clearDailyLossLatch (lost balance), 7 its retry
+    const h = harness({ bankrollOn: [6] });
+    await lossFloorLatch(h.s, h.d);
+    expect(h.r.recs.filter((x) => !x.ok)).toEqual([]);
+    expect(h.skips).toEqual([]);
+    expect(h.calls()).toBe(7);
+    expect(line(h.r.recs, 'refused and latched again')?.detail).toMatch(/try 2/);
+  });
+
+  it('a balance sync that never recovers: that check is a SKIP with the reason, not a FAIL; nothing is accepted in its place', async () => {
+    // syncs: 1 before the round trip, then 2.. for the refusal checks; from the 6th sync on, every read fails
+    const h = harness({ syncOk: (n) => n < 6 });
+    await lossFloorLatch(h.s, h.d);
+    expect(h.r.recs.filter((x) => !x.ok)).toEqual([]);
+    expect(h.skips.length).toBeGreaterThan(0);
+    expect(h.skips[0].detail).toMatch(/could not be read \(5 tries/);
+  });
+
+  it('a refusal that is neither the floor nor a lost balance (a stale price) still FAILs', async () => {
+    const h = harness({ priceOn: 6 });
+    await lossFloorLatch(h.s, h.d);
+    expect(line(h.r.recs, 'refused and latched again')?.ok).toBe(false);
+    expect(h.skips).toEqual([]);
+  });
+
+  it('INSUFFICIENT_SPENDABLE_BANKROLL on all 3 tries: SKIP, not FAIL', async () => {
+    const h = harness({ bankrollOn: [6, 7, 8] });
+    await lossFloorLatch(h.s, h.d);
+    expect(h.r.recs.filter((x) => !x.ok)).toEqual([]);
+    expect(h.skips).toHaveLength(1);
+    expect(h.skips[0].detail).toMatch(/all 3 tries/);
   });
 });

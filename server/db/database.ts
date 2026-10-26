@@ -43,6 +43,8 @@ export interface PersistedTransaction {
   error?: string;
   /** P2.1: the last block height at which this transaction's blockhash is valid. Past it, a signature with no status never landed. */
   lastValidBlockHeight?: number;
+  /** SELL rows: the exit reason it was sent for (TAKE_PROFIT_1, STOP_LOSS, ...), so a restart that applies a landed sell can advance the take-profit stage. */
+  exitReason?: string;
 }
 
 export class WorkstationDatabase {
@@ -250,6 +252,7 @@ export class WorkstationDatabase {
     this.ensureColumn('transactions', 'reconciliation_state', "TEXT NOT NULL DEFAULT 'PENDING'");
     this.ensureColumn('transactions', 'error', 'TEXT');
     this.ensureColumn('transactions', 'last_valid_block_height', 'INTEGER');
+    this.ensureColumn('transactions', 'exit_reason', 'TEXT');
 
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status);
@@ -510,8 +513,8 @@ export class WorkstationDatabase {
         INSERT INTO transactions (
           signature, bundle_id, order_id, correlation_id, mint, direction,
           submission_transport, submission_time, landing_slot, confirmation_time,
-          reconciliation_state, network_fee_lamports, jito_tip_lamports, execution_mode, error, last_valid_block_height
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          reconciliation_state, network_fee_lamports, jito_tip_lamports, execution_mode, error, last_valid_block_height, exit_reason
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(signature) DO UPDATE SET
           submission_transport = excluded.submission_transport,
           bundle_id = excluded.bundle_id,
@@ -521,7 +524,8 @@ export class WorkstationDatabase {
           network_fee_lamports = excluded.network_fee_lamports,
           jito_tip_lamports = excluded.jito_tip_lamports,
           error = excluded.error,
-          last_valid_block_height = COALESCE(excluded.last_valid_block_height, transactions.last_valid_block_height)
+          last_valid_block_height = COALESCE(excluded.last_valid_block_height, transactions.last_valid_block_height),
+          exit_reason = COALESCE(excluded.exit_reason, transactions.exit_reason)
       `);
       stmt.run(
         tx.signature,
@@ -539,7 +543,8 @@ export class WorkstationDatabase {
         tx.jitoTipLamports,
         tx.executionMode,
         tx.error || null,
-        tx.lastValidBlockHeight ?? null
+        tx.lastValidBlockHeight ?? null,
+        tx.exitReason ?? null
       );
       return true;
     } catch (err: any) {
@@ -596,24 +601,8 @@ export class WorkstationDatabase {
       const stmt = this.db.prepare(`
         SELECT * FROM transactions WHERE reconciliation_state = 'PENDING'
       `);
-      const rows = stmt.all() as any[];
-      return rows.map((r) => ({
-        signature: r.signature,
-        bundleId: r.bundle_id || undefined,
-        orderId: r.order_id,
-        correlationId: r.correlation_id,
-        mint: r.mint,
-        direction: r.direction as 'BUY' | 'SELL',
-        submissionTransport: r.submission_transport as 'SOLANA_RPC' | 'JITO' | 'PAPER',
-        submissionTime: r.submission_time,
-        landingSlot: r.landing_slot || undefined,
-        confirmationTime: r.confirmation_time || undefined,
-        reconciliationState: r.reconciliation_state,
-        networkFeeLamports: r.network_fee_lamports,
-        jitoTipLamports: r.jito_tip_lamports,
-        executionMode: r.execution_mode as ExecutionMode,
-        error: r.error || undefined,
-      }));
+      // the shared mapper: the hand-written copy here dropped exit_reason and last_valid_block_height, which startup recovery reads
+      return this.mapTransactions(stmt.all() as any[]);
     } catch {
       return [];
     }
@@ -797,6 +786,7 @@ export class WorkstationDatabase {
       executionMode: r.execution_mode as ExecutionMode,
       error: r.error || undefined,
       lastValidBlockHeight: r.last_valid_block_height ?? undefined,
+      exitReason: r.exit_reason ?? undefined,
     }));
   }
 

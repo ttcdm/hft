@@ -5,6 +5,12 @@ import { workstationDb } from '../db/database';
 import { Logger } from '../middleware/enterprise';
 import type { NormalizedPosition } from '../core/types';
 
+/**
+ * How long the panic waits for LIVE buys already past the risk gate (a manual buy, a callout or Telegram snipe) before it reads the positions
+ * to sell. A buy that is still unsettled after it is reported in `failed[]` as BUY_IN_FLIGHT, so the operator runs the panic again.
+ */
+export const PANIC_BUY_SETTLE_WAIT_MS = { value: 30_000 };
+
 /** The close reason of every panic sell: protective for the halt and for the dust check alike. */
 export const PANIC_CLOSE_REASON = 'EMERGENCY_PANIC_LIQUIDATION';
 
@@ -27,7 +33,8 @@ let running = 0;
  *
  *  1. the kill switch goes on (the risk gate refuses every buy not yet past it);
  *  2. auto is killed, which waits for a buy already in flight, so the position it opens is in the list read below; auto ends OFF;
- *  3. LIVE is disarmed;
+ *  3. LIVE is disarmed, and with `exitAll` the panic waits (PANIC_BUY_SETTLE_WAIT_MS) for every LIVE buy already past the risk gate, from any
+ *     route, so the position it opens is sold too; one still unsettled is reported in `failed[]`;
  *  4. with `exitAll`, every ACTIVE position of every mode is closed at 100% with EMERGENCY_PANIC_LIQUIDATION. A close that meets an exit
  *     already in flight (a take-profit partial) waits for it, re-reads the row and closes what is left. The ACTIVE rows are read once
  *     more after the loop, and any new one is closed too.
@@ -54,10 +61,19 @@ export async function emergencyStop(opts: { exitAll: boolean; reason?: string })
 
     const report: EmergencyStopReport = { attemptedCount: 0, succeeded: [], failed: [], totalRealizedPnLSol: 0, killSwitchActivated: true, autoStopped, autoStopError };
     if (opts.exitAll) {
+      const stillBuying = await executionCoordinator.waitForBuysInFlight(PANIC_BUY_SETTLE_WAIT_MS.value);
       const attempted = new Set<string>();
       for (const p of workstationDb.loadPositions(undefined, 'ACTIVE')) await closeForPanic(p, attempted, report);
       // a position opened while the loop ran (a manual buy that was already past the risk gate) is sold too
       for (const p of workstationDb.loadPositions(undefined, 'ACTIVE')) if (!attempted.has(p.id)) await closeForPanic(p, attempted, report);
+      if (stillBuying.length > 0) {
+        // a buy that settled while the sells ran may have opened a position since the read above
+        for (const p of workstationDb.loadPositions(undefined, 'ACTIVE')) if (!attempted.has(p.id)) await closeForPanic(p, attempted, report);
+      }
+      // a buy still unsettled may open a position after this report: say so instead of claiming nothing is open
+      for (const mint of await executionCoordinator.waitForBuysInFlight(0)) {
+        report.failed.push({ id: `buy-${mint}`, symbol: mint.slice(0, 6), error: `BUY_IN_FLIGHT: a LIVE buy of ${mint} was still being sent or confirmed when the panic ended; it may open a position. Run the panic again.` });
+      }
     }
     Logger.warn(`[EMERGENCY STOP] ${reason}: kill switch on, auto ${autoStopped ? 'OFF' : 'NOT stopped'}, LIVE disarmed${opts.exitAll ? `; attempted ${report.attemptedCount}, succeeded ${report.succeeded.length}, failed ${report.failed.length}` : ''}`);
     return report;

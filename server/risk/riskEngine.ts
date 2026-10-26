@@ -224,6 +224,18 @@ export class HardenedRiskEngine {
       );
     }
 
+    // 6b. R1-8, R1-36: a limit that is not a positive number (MAX_POSITION_SIZE_SOL=abc parses to NaN) makes every comparison below
+    // false, which approved any size, any exposure and any daily loss. Fail closed and name the setting.
+    const invalidLimits = [
+      ['maxPositionSol (MAX_POSITION_SIZE_SOL)', this.limits.maxPositionSol],
+      ['maxAggregateExposureSol', this.limits.maxAggregateExposureSol],
+      ['maxDailyLossSol', this.effectiveMaxDailyLossSol()],
+      ...(this.dailyLossLimitPinned ? [] : [['MAX_DAILY_LOSS_USD', executionConfig.getConfig().maxDailyLossUsd]]),
+    ].filter(([, v]) => !(Number.isFinite(v as number) && (v as number) > 0)).map(([name, v]) => `${name}=${String(v)}`);
+    if (invalidLimits.length > 0) {
+      return logAndReturn(false, 'RISK_LIMIT_INVALID', `Risk limit is not a positive number: ${invalidLimits.join(', ')}; fix the setting and restart`);
+    }
+
     // 7. Max Position Size
     if (req.orderSizeSol > this.limits.maxPositionSol) {
       return logAndReturn(

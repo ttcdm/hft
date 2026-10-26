@@ -864,7 +864,10 @@ export class MemecoinAggregatorService extends EventEmitter {
       provenance,
       liquidityUsd: pool.liquidityUsd,
       signalTimestamp: params.signalTimestamp,
-      executionMode: params.expectedMode,
+      // R1-10: a caller that names no mode (the operator routes, callout and Telegram snipes) gets the mode this call started in, checked
+      // before any await, where the route's live confirmation was checked too. A LIVE arm during the reads above must not turn a PAPER
+      // click into a LIVE send; the coordinator refuses it as MODE_CHANGED.
+      executionMode: params.expectedMode ?? executionMode,
     });
 
     if (!execRes.success) {

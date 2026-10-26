@@ -114,8 +114,31 @@ const ORPHAN_MAX_AGE_MS = 15 * 60_000;
 export const EXIT_SELL_WAIT_MS = 2_500;
 /** P1.1: a sell claim older than this is stale (longer than a sell takes end to end: build, send, confirm, reconcile). */
 const EXIT_CLAIM_STALE_MS = 2 * PENDING_SELL_WINDOW_MS;
-/** P1.1: a claim `<pid>:<nonce>` whose process has died is stale at once (a crash mid-sell must not hold the stop-loss off). */
-const exitClaimOwnerAlive = (owner: string): boolean => isPidAlive(Number(owner.split(':')[0]));
+/** One id per process run: a pid alone is reused, and in a container every restart of the app is PID 1 again. */
+const PROCESS_RUN_ID = crypto.randomUUID();
+/** The exit claim owner for one sell: `<pid>:<run id>:<nonce>`. */
+export const newExitClaimOwner = (): string => `${process.pid}:${PROCESS_RUN_ID}:${crypto.randomUUID()}`;
+/**
+ * P1.1: a claim whose process has died is stale at once (a crash mid-sell must not hold the stop-loss off). A claim with this process's pid
+ * but another run id (or the older `<pid>:<nonce>` form) was left by an earlier run that had the same pid, so it is dead too: after a
+ * container restart the app is PID 1 again, and `isPidAlive(1)` held the stop-loss off for EXIT_CLAIM_STALE_MS.
+ */
+export const exitClaimOwnerAlive = (owner: string): boolean => {
+  const [pidText, runId] = owner.split(':');
+  const pid = Number(pidText);
+  if (pid === process.pid) return owner.split(':').length === 3 && runId === PROCESS_RUN_ID;
+  return isPidAlive(pid);
+};
+
+/**
+ * The take-profit stage a filled exit leaves the position at: TAKE_PROFIT_1 and TAKE_PROFIT_2 advance it (never backwards), every other
+ * reason leaves it. Booked with the fill itself, and by startup recovery from the SELL row's reason, so a crash between the sell and a
+ * separate stage write cannot make the same take-profit fire again (R1-24, R1-91).
+ */
+export function exitStageAfterFill(reason: string | undefined, current: NormalizedPosition['exitStage']): NormalizedPosition['exitStage'] {
+  const reached = reason === 'TAKE_PROFIT_2' ? 2 : reason === 'TAKE_PROFIT_1' ? 1 : 0;
+  return Math.max(current ?? 0, reached) as NormalizedPosition['exitStage'];
+}
 
 /** A balance found in the wallet that this app never bought (cost basis unknown): watched with a hard stop, not a trade the app chose. */
 export const isRecoveredPosition = (p: { entryTxSignature?: string }): boolean => !!p.entryTxSignature?.startsWith('RECOVERED:');
@@ -756,7 +779,15 @@ export class ExecutionCoordinator {
     const issues: string[] = [];
 
     // 0. A reconcile never vouches for an RPC on the wrong cluster (it would otherwise make a mainnet-answering RPC armable).
-    if (!(await this.verifyCluster())) issues.push(`RPC is not on the allowed cluster: ${this.clusterProblem}`);
+    // A wrong-cluster RPC answers "no such signature" for every real one, so steps 4 and 5 would mark pending and orphaned rows TIMED_OUT
+    // (a landed sell then never gets its PnL, a landed buy its cost basis). While it is untrusted they wait, the pass is a mismatch, and
+    // it is tried again.
+    const clusterTrusted = await this.verifyCluster();
+    if (!clusterTrusted) {
+      issues.push(`RPC is not on the allowed cluster: ${this.clusterProblem}`);
+      mismatchesCount++;
+      this.scheduleReconcileRetry();
+    }
 
     // 1. Check signer status
     const signerStatus = localSigner.getStatus();
@@ -769,7 +800,9 @@ export class ExecutionCoordinator {
 
     // 4. Resolve pending transactions from previous runs with actual on-chain transaction verification
     const pendingTxs = workstationDb.getPendingTransactions();
-    if (pendingTxs.length > 0) {
+    if (pendingTxs.length > 0 && !clusterTrusted) {
+      issues.push(`${pendingTxs.length} pending transaction(s) left as they are until the RPC is on the allowed cluster`);
+    } else if (pendingTxs.length > 0) {
       Logger.info(`Found ${pendingTxs.length} pending transactions from previous session to reconcile.`);
       const walletPubkey = signerStatus === 'READY' ? localSigner.getPublicKey() : null;
 
@@ -851,6 +884,9 @@ export class ExecutionCoordinator {
                       }
 
                       targetPos.exitTxSignature = pTx.signature;
+                      // R1-24: a take-profit sell that landed before the crash keeps its stage, or the next pass sells the same take-profit again
+                      targetPos.exitStage = exitStageAfterFill(pTx.exitReason, targetPos.exitStage);
+                      if (pTx.exitReason) targetPos.exitReason = pTx.exitReason;
                       targetPos.exitTimestamp = recovery.blockTime ?? Date.now();
                       targetPos.exitSlot = recovery.slot ?? txDetails.slot;
                       targetPos.lastUpdatedTimestamp = Date.now();
@@ -882,8 +918,17 @@ export class ExecutionCoordinator {
               }
             }
             workstationDb.saveTransaction(pTx);
+          } else if (typeof pTx.lastValidBlockHeight === 'number' && pTx.lastValidBlockHeight > 0) {
+            // P2.1 here too: with no status, the row is decided by the chain's block height against its lastValidBlockHeight, not by its
+            // age (a slow RPC or a long restart said nothing about whether it can still land). Not expired yet: keep it and look again.
+            if (await this.blockhashExpired(pTx)) {
+              pTx.reconciliationState = 'TIMED_OUT';
+              workstationDb.saveTransaction(pTx);
+            } else {
+              this.scheduleReconcileRetry();
+            }
           } else if (Date.now() - pTx.submissionTime > 120000) {
-            pTx.reconciliationState = 'TIMED_OUT';
+            pTx.reconciliationState = 'TIMED_OUT'; // a row written before lastValidBlockHeight was stored
             workstationDb.saveTransaction(pTx);
           }
         } catch (err: any) {
@@ -1050,6 +1095,9 @@ export class ExecutionCoordinator {
     const candidates = workstationDb
       .loadTransactionsInStates(['RECONCILIATION_REQUIRED'])
       .filter((t) => t.direction === 'BUY' && t.executionMode === 'LIVE' && t.reconciliationState === 'RECONCILIATION_REQUIRED');
+    // On a wrong-cluster RPC every signature reads as "not found" and its block height means nothing: a row decided there could be
+    // TIMED_OUT although the buy landed. Leave them all for a pass on a trusted RPC (the background retries keep trying).
+    if (this.clusterProblem !== null) return { recovered, stillOrphaned: candidates.map((t) => t.signature) };
     for (const t of candidates) {
       try {
         if (workstationDb.loadPositions().some((p) => p.entryTxSignature === t.signature)) {
@@ -1531,6 +1579,7 @@ export class ExecutionCoordinator {
         executionMode: 'LIVE',
         // P2.1: past this height a signature with no status never landed; orphan recovery resolves the row on it instead of on wall-clock age.
         lastValidBlockHeight: txBuilder.lastValidBlockHeightOf((params.tx as any)?.message?.recentBlockhash),
+        exitReason: params.side === 'SELL' ? params.exitReason : undefined,
       };
       if (params.side === 'BUY') {
         // P1.1 (N-57): the check for another unresolved buy of this mint and this row are one database transaction, so a second process
@@ -1598,6 +1647,8 @@ export class ExecutionCoordinator {
     tokenProgram: PublicKey;
     preSnapshot: PreTradeSnapshot;
     jitoTipLamports: number;
+    /** SELL only: the exit reason, stored on the transaction row (see exitStageAfterFill). */
+    exitReason?: string;
   }): Promise<{
     success: boolean;
     signature: string;
@@ -2626,6 +2677,8 @@ export class ExecutionCoordinator {
       };
     }
     this.inFlightBuyMints.add(req.mint);
+    let buySettled!: () => void;
+    this.liveBuysInFlight.set(req.mint, new Promise<void>((r) => { buySettled = r; })); // waitForBuysInFlight awaits it
 
     // Acquire in-flight balance reservation
     this.inFlightReservedSol += requiredSol;
@@ -2946,6 +2999,8 @@ export class ExecutionCoordinator {
       // Always release in-flight balance reservation
       this.inFlightReservedSol = Math.max(0, this.inFlightReservedSol - requiredSol);
       this.inFlightBuyMints.delete(req.mint);
+      this.liveBuysInFlight.delete(req.mint);
+      buySettled();
     }
   }
 
@@ -2968,6 +3023,26 @@ export class ExecutionCoordinator {
     if (this.haltReason && this.isDefaultSingleton) workstationDb.logJournal('TRADING_HALT_CLEARED', 'halt', this.executionMode, {});
     this.haltReason = null;
     this.clearOperatorAlert('TRADING_HALTED');
+  }
+
+  /** One promise per LIVE buy past its reservation (any caller: auto, manual routes, Telegram); it resolves when the buy has settled. */
+  private liveBuysInFlight = new Map<string, Promise<void>>();
+
+  /**
+   * The emergency stop waits here before it reads the positions to sell: a LIVE buy already past the risk gate (a manual one included;
+   * auto's own buy is awaited by its kill) may still turn into a position. Resolves once no LIVE buy is in flight, or after `timeoutMs`
+   * with the mints still in flight. Never rejects.
+   */
+  public async waitForBuysInFlight(timeoutMs: number): Promise<string[]> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.liveBuysInFlight.size > 0) {
+      const left = deadline - Date.now();
+      if (left <= 0) break;
+      let timer: NodeJS.Timeout | undefined;
+      await Promise.race([Promise.allSettled([...this.liveBuysInFlight.values()]), new Promise<void>((r) => { timer = setTimeout(r, left); })]);
+      clearTimeout(timer);
+    }
+    return [...this.liveBuysInFlight.keys()];
   }
 
   /** Q8: true while a LIVE buy is being sent/reconciled or an exit is between its send and its journal row. */
@@ -3023,7 +3098,13 @@ export class ExecutionCoordinator {
       this.clearOperatorAlert('EXIT_FAILING', positionId);
       this.clearOperatorAlert('EXIT_QUOTE_FAILING', positionId);
       this.clearOperatorAlert('EXIT_RATE_LIMITED', positionId);
+      this.clearOperatorAlert('EXIT_NO_SIGNER', positionId);
       return;
+    }
+    if (mode === 'LIVE' && /^Signer is not configured/.test(res.error || '')) {
+      // A LIVE exit that cannot be signed sends nothing and costs nothing, so it is no attempt; but the position has no working stop-loss
+      // until a signer is back (a locked or missing key, or a read-only server over a database with LIVE rows), and the operator must know.
+      this.raiseOperatorAlert('EXIT_NO_SIGNER', `Exit for LIVE position ${positionId.slice(0, 8)} cannot be signed: ${isReadOnly() ? 'this server is read-only (APEX_READ_ONLY=true) and holds no key' : `the signer is ${localSigner.getStatus()}`}. Its stop-loss cannot sell until a signer is loaded; nothing was sent.`, positionId);
     }
     const quoteFailure = ExecutionCoordinator.isQuoteFailure(res.error);
     if (mode === 'LIVE' && /^RPC_RATE_LIMITED/.test(res.error || '')) {
@@ -3107,7 +3188,7 @@ export class ExecutionCoordinator {
     this.positionExitDone.set(positionId, new Promise<void>((r) => { exitDone = r; })); // P1.7: what waitForPositionExit awaits
     let claimed = false;
     let sendStarted = false;
-    const exitClaimOwner = `${process.pid}:${crypto.randomUUID()}`;
+    const exitClaimOwner = newExitClaimOwner();
 
     try {
       const positions = workstationDb.loadPositions();
@@ -3473,6 +3554,7 @@ export class ExecutionCoordinator {
         tokenProgram: tokenProgramToUse,
         preSnapshot,
         jitoTipLamports: expectedJitoTipLamports,
+        exitReason: reason,
       });
 
       if (!subRes.success || !subRes.signature) {
@@ -3512,6 +3594,7 @@ export class ExecutionCoordinator {
       filled.exitReason = reason;
       filled.exitTxSignature = subRes.signature;
       filled.lastUpdatedTimestamp = Date.now();
+      filled.exitStage = exitStageAfterFill(reason, filled.exitStage); // in the same write as the fill (R1-91)
 
       if (sellRecon.isFullyClosed || sellBps >= 10_000) {
         filled.status = 'CLOSED';

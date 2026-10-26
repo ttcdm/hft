@@ -26,3 +26,21 @@ export function hostOfService(service: string | undefined): string {
   const m = service?.match(/\(([^)]+)\)/);
   return m ? m[1] : 'unknown';
 }
+
+/** UI-1: the toast after a connectivity audit counts the services that answered, not the keys in the reply. */
+export function connectivityAuditSummary(res: { connections?: Record<string, { service?: string; testResult?: ProbeResult } | undefined> } | null | undefined): {
+  level: 'INFO' | 'WARNING';
+  title: string;
+  message: string;
+} {
+  const entries = Object.entries(res?.connections || {});
+  const down = entries.filter(([, c]) => !c?.testResult?.reachable).map(([k, c]) => c?.service?.split(' (')[0] || k);
+  const up = entries.length - down.length;
+  if (entries.length === 0) return { level: 'WARNING', title: 'CONNECTIVITY AUDIT: NO RESULTS', message: 'The server returned no probe results.' };
+  if (down.length === 0) return { level: 'INFO', title: 'CONNECTIVITY AUDIT COMPLETE', message: `All ${entries.length} external services answered.` };
+  return {
+    level: 'WARNING',
+    title: 'CONNECTIVITY AUDIT COMPLETE',
+    message: `${up} of ${entries.length} external services answered. Unreachable: ${down.join(', ')}.`,
+  };
+}

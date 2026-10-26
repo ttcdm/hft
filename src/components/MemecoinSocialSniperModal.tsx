@@ -13,7 +13,7 @@
  */
 import { signalFeedBadge } from '../utils/signalBadge';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
-import { probeBadge, probeLatency, hostOfService } from '../utils/probeBadge';
+import { probeBadge, probeLatency, hostOfService, connectivityAuditSummary } from '../utils/probeBadge';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
 import { useAutoStatus, AutoModeBadge, type AutoMode } from './AutoPanel';
 import { buildPoolSnipeRequest } from '../utils/poolSnipe';
@@ -233,11 +233,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
       setDiagnosticsResult(res);
       setShowDiagnosticsModal(true);
       hftAudio.playTradeFill(true);
-      onAlertTrigger?.(
-        'INFO',
-        'CONNECTIVITY AUDIT COMPLETE',
-        `Verified ${Object.keys(res?.connections || {}).length} external services & ${res?.marketMakerProfiles?.totalProfiles || 0} market maker profiles.`
-      );
+      const summary = connectivityAuditSummary(res);
+      onAlertTrigger?.(summary.level, summary.title, summary.message);
     } catch (e: any) {
       onAlertTrigger?.('CRITICAL', 'DIAGNOSTICS ERROR', e.message);
     } finally {
@@ -1596,7 +1593,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                       Endpoint: <code className="text-slate-300">https://api.telegram.org</code>
                     </div>
                     <div className="text-[11px] text-slate-300">
-                      Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.telegram.testResult.latencyMs}ms</strong> | Auth: {diagnosticsResult.connections.telegram.testResult.botAuthorized ? 'VALIDATED' : 'DEMO TOKEN (401)'}
+                      Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.telegram.testResult.latencyMs}ms</strong> | Auth: {diagnosticsResult.connections.telegram.testResult.botAuthorized ? 'VALIDATED' : diagnosticsResult.connections.telegram.testResult.reachable ? 'NOT AUTHORIZED' : 'not checked'}
                     </div>
                     <p className="text-slate-400 text-[10px] border-t border-slate-800 pt-1">
                       {diagnosticsResult.connections.telegram.testResult.diagnosis}
@@ -1645,7 +1642,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                       Endpoint: <code className="text-slate-300">frontend-api-v3.pump.fun/coins</code>
                     </div>
                     <div className="text-[11px] text-slate-300">
-                      Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.pumpFun.testResult.latencyMs}ms</strong> | Newest: {diagnosticsResult.connections.pumpFun.testResult.newestToken || 'Active'}
+                      Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.pumpFun.testResult.latencyMs}ms</strong> | Newest: {diagnosticsResult.connections.pumpFun.testResult.newestToken || '—'}
                     </div>
                     <p className="text-slate-400 text-[10px] border-t border-slate-800 pt-1">
                       Live Solana bonding curves streamed and processed every 5s.
@@ -1685,7 +1682,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                       Endpoint: <code className="text-slate-300">{hostOfService(diagnosticsResult.connections.solanaRpc.service)}</code>{diagnosticsResult.cluster ? <span className="ml-2 text-amber-300">cluster: {diagnosticsResult.cluster}</span> : null}
                     </div>
                     <div className="text-[11px] text-slate-300">
-                      Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.solanaRpc.testResult.latencyMs}ms</strong> | Cluster Slot: #{diagnosticsResult.connections.solanaRpc.testResult.slot}
+                      Latency: <strong className="text-cyan-400">{diagnosticsResult.connections.solanaRpc.testResult.latencyMs}ms</strong> | Cluster Slot: {diagnosticsResult.connections.solanaRpc.testResult.slot != null ? `#${diagnosticsResult.connections.solanaRpc.testResult.slot}` : '—'}
                     </div>
                     <p className="text-slate-400 text-[10px] border-t border-slate-800 pt-1">
                       Direct JSON-RPC slot verification for block leader schedules.

@@ -14,7 +14,7 @@ import { openRecorded, resolveSplit, type RecordedSource } from './recorded';
  * facts are passed to the replay. Entries come from replayLaunch (so the release and entry fill are the real replay's); the exit loop below is replay.ts's own
  * loop with the ExitEngine constants overridden per variant (stop loss, first take-profit, stale timeout) and a per-side haircut on the P&L.
  * Validation built in: with no haircut and the stock constants the loop must reproduce replayLaunch's own net P&L for every launch.
- * Train/test: --split-ts, else the 75th percentile of create times.
+ * Train/test: --split-ts, else the 70th percentile of create times (a 30% holdout).
  */
 type Variant = { stop: number; tp1: number; staleMin: number };
 const E = ExitEngine as unknown as Record<string, number>;

@@ -11,7 +11,7 @@ import { openRecorded, recordedToLaunch, resolveSplit, type Launch } from './rec
  * sold). Two exit sets: STOCK (the real ExitEngine as shipped) and TRAIL (take-profits off, hard stop and trailing stop kept, forced exit at the first trade 6 h
  * after entry). `side` is the all-in cost per side in percent. Recordings carry no graduation list, so the 'graduated before entry' exclusion is not applied
  * (graduationKnown:false in the output). A launch recorded for less than the checkpoint cannot be priced (counts.noTradeAfterCp): recordings made with the old
- * 30-minute window show nothing at a 30-minute mark. A control group (curve below the cut-off) is priced the same way. Train/test: --split-ts, else the 75th percentile of create times.
+ * 30-minute window show nothing at a 30-minute mark. A control group (curve below the cut-off) is priced the same way. Train/test: --split-ts, else the 70th percentile of create times (a 30% holdout).
  */
 const E = ExitEngine as unknown as Record<string, number>;
 const STOCK = { HARD_STOP_LOSS_PCT: E.HARD_STOP_LOSS_PCT, TP1_TRIGGER_PCT: E.TP1_TRIGGER_PCT, TP2_TRIGGER_PCT: E.TP2_TRIGGER_PCT, STALE_POSITION_HOLD_MS: E.STALE_POSITION_HOLD_MS };

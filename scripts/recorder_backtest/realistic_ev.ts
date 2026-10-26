@@ -9,7 +9,7 @@ import { runStudy, parseOptions, writeStudyFiles, fmtPct, DAY_MS, type StudyLaun
  * launch recordings. The core is shared with scripts/hfcorpus/realistic_ev.ts; this wrapper only supplies the data. Output files are labelled
  * "own recordings (not the 39-day corpus)" and are never merged with the corpus results.
  *   npx tsx scripts/recorder_backtest/realistic_ev.ts --recorded <paper.db | snapshot.jsonl> [--out-dir DIR] [--thresholds ...] [--sizes ...] [--limit n] [--sol-usd n] [--split-ts ms] [--block-hours 1]
- * Train/test: --split-ts, else the 75th percentile of create times. Recordings made with the old 30-minute window show short or truncated launches; launches whose
+ * Train/test: --split-ts, else the 70th percentile of create times (a 30% holdout). Recordings made with the old 30-minute window show short or truncated launches; launches whose
  * recording ended before the watch window gave a verdict simply never enter.
  */
 export const RECORDED_SOURCE = 'own recordings (not the 39-day corpus)';

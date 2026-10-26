@@ -233,3 +233,17 @@ describe('5A (R1-111): the Backtest screen shows realized and open apart and say
     expect(html).not.toMatch(/fee each side/);
   });
 });
+
+// ---- the recorder study's default holdout ----------------------------------------------------------------------------------------------
+import { resolveSplit } from '../scripts/recorder_backtest/recorded';
+
+describe('5A (R1-111): the own-recordings study holds out 30% by default', () => {
+  it('the default cut leaves the newest 30% of launches for test, exactly, also where 0.7 x n is not exact in floating point', () => {
+    for (const [n, testCount] of [[10, 3], [70, 21], [100, 30], [333, 100]]) {
+      const times = Array.from({ length: n }, (_, i) => 1_000 + i);
+      const { cut, note } = resolveSplit(undefined, { createTimes: () => times } as any);
+      expect(times.filter((t) => t >= cut).length).toBe(testCount);
+      expect(note).toMatch(/30% holdout/);
+    }
+  });
+});

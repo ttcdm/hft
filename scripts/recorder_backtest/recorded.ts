@@ -111,10 +111,10 @@ export function recordedToLaunch(rec: RecordedLaunch): Launch | null {
   return { mint: rec.mint, symbol: String(create.payload.symbol ?? ''), creator: String(create.payload.creator ?? ''), mayhem: String(create.payload.tokenTotalSupply) === '2000000000000000', t0: create.ts, graduated: false, trades };
 }
 
-/** The train/test boundary: --split-ts (unix ms) if given, otherwise the 75th percentile of create times (train = the older three quarters). */
+/** The train/test boundary: --split-ts (unix ms) if given, otherwise the 70th percentile of create times (5A: train = the older 70%, a 30% holdout). */
 export function resolveSplit(arg: string | undefined, recorded: RecordedSource): { cut: number; note: string } {
   if (arg !== undefined && arg !== '') { const n = Number(arg); if (!Number.isFinite(n) || n <= 0) throw new Error(`--split-ts must be a unix time in milliseconds, got "${arg}"`); return { cut: n, note: 'from --split-ts' }; }
   const t = recorded.createTimes();
   if (!t.length) return { cut: 0, note: 'no launches recorded' };
-  return { cut: t[Math.min(t.length - 1, Math.floor(t.length * 0.75))], note: '75th percentile of create times (pass --split-ts to choose)' };
+  return { cut: t[Math.min(t.length - 1, Math.floor((t.length * 7) / 10))], note: '70th percentile of create times: a 30% holdout (pass --split-ts to choose)' };
 }

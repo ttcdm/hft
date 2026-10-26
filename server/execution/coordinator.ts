@@ -3046,9 +3046,9 @@ export class ExecutionCoordinator {
    * with the mints still in flight. Never rejects.
    */
   public async waitForBuysInFlight(timeoutMs: number): Promise<string[]> {
-    const deadline = Date.now() + timeoutMs;
+    const deadline = performance.now() + timeoutMs; // monotonic: a wall clock set back cannot hold the emergency stop (S271 review)
     while (this.liveBuysInFlight.size > 0) {
-      const left = deadline - Date.now();
+      const left = deadline - performance.now();
       if (left <= 0) break;
       let timer: NodeJS.Timeout | undefined;
       await Promise.race([Promise.allSettled([...this.liveBuysInFlight.values()]), new Promise<void>((r) => { timer = setTimeout(r, left); })]);

@@ -3,7 +3,7 @@ import { replayLaunch, type RecordedLaunch } from '../../server/backtest/replay'
 import {
   COST_CASES, LATENCIES, VARIANTS, STOCK_VARIANT, latencyName, variantName, priceEntry, simulatePath, restoreStockEngine,
   type TradeRow, type CostCase, type Latency, type Variant,
-} from './ev_model';
+} from '../../server/backtest/costModel';
 
 /**
  * S229: the study loop behind realistic_ev.ts (39-day corpus) and scripts/recorder_backtest/realistic_ev.ts (own recordings).

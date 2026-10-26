@@ -213,3 +213,23 @@ describe('5A studies (R1-100): open marks are reported apart and never pick the 
     expect(raw.reduce((a, b) => (b.ev > a.ev ? b : a)).v.tp1).toBe(30);
   });
 });
+
+// ---- the Backtest screen and the README say what is charged --------------------------------------------------------------------------
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { ReplayBacktestView, type ReplayResponse } from '../src/components/BacktestModal';
+
+describe('5A (R1-111): the Backtest screen shows realized and open apart and says what is charged', () => {
+  afterEach(() => restoreStockEngine());
+  it('the open mark is its own line, the table marks it, and the gaps are split by direction', () => {
+    const { rows, at } = released();
+    const report = replayLaunches([toRecordedLaunch(launch([...rows, at(4_000, 1.35), at(10_000, 1.35)]), 150)], [], 150, GATE);
+    const data = { recorded: { launches: 1, events: rows.length + 3, oldestTs: T0, newestTs: T0 + 1 }, report, message: null, replayedLaunches: 1, replayCap: 5000 } as unknown as ReplayResponse;
+    const html = renderToStaticMarkup(React.createElement(ReplayBacktestView, { data }));
+    expect(html).toContain('data-testid="replay-open-mark"');
+    expect(html).toMatch(/\(mark\)/);
+    expect(html).toMatch(/look better than live/);
+    expect(html).toMatch(/fee on the buy and on every sell/);
+    expect(html).not.toMatch(/fee each side/);
+  });
+});

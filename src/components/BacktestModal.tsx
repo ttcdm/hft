@@ -8,10 +8,18 @@ export interface ReplayedLaunchRow {
   mint: string; symbol: string; trades: number; verdict: string; verdictReason: string; releasedAfterMs: number | null; score: number | null;
   entered: boolean; noEntryReason: string | null; outcome: 'NO_ENTRY' | 'CLOSED' | 'OPEN_AT_END'; entryPriceSol: number | null;
   exits: Array<{ reason: string; sellPct: number; priceSol: number; afterMs: number }>; holdMs: number | null; netPnlSol: number | null; openValueSol: number | null;
+  /** 5A: OPEN_AT_END marked at the last price (partial sells included, exit cost charged). Absent on an older server. */
+  openNetPnlSol?: number | null;
 }
 export interface ReplayReportData {
   rules: string[]; notReplayed: string[]; assumptions: Record<string, number>;
-  summary: { launches: number; released: Record<string, number>; entries: number; closed: number; openAtEnd: number; wins: number; losses: number; winRate: number | null; netPnlSol: number | null; avgHoldMs: number | null; exitReasons: Record<string, number> };
+  /** 5A: the gaps by the direction they move the result. Absent on an older server. */
+  notReplayedByDirection?: { optimistic: string[]; pessimistic: string[]; unknown: string[] };
+  summary: {
+    launches: number; released: Record<string, number>; entries: number; closed: number; openAtEnd: number; wins: number; losses: number; winRate: number | null; netPnlSol: number | null; avgHoldMs: number | null; exitReasons: Record<string, number>;
+    /** 5A: the open-at-end positions marked at the last price, kept out of netPnlSol. Absent on an older server. */
+    openMarkNetPnlSol?: number | null;
+  };
   launches: ReplayedLaunchRow[];
   /** S190. Absent on an older server. */
   peakAnalysis?: PeakAnalysisData;
@@ -109,7 +117,8 @@ export function ReplayBacktestView({ data, error }: { data: ReplayResponse | nul
               <span className="text-slate-500">Entered</span><span className="text-right">{s.entries}</span>
               <span className="text-slate-500">Closed / still open at end</span><span className="text-right">{s.closed} / {s.openAtEnd}</span>
               <span className="text-slate-500">Win rate (closed)</span><span className="text-right">{s.winRate === null ? '—' : `${(s.winRate * 100).toFixed(0)}% (${s.wins} of ${s.closed})`}</span>
-              <span className="text-slate-500">Net PnL after fees (closed)</span><span className="text-right">{sol(s.netPnlSol)}</span>
+              <span className="text-slate-500">Net PnL after fees (closed, realized)</span><span className="text-right">{sol(s.netPnlSol)}</span>
+              {s.openMarkNetPnlSol !== undefined && <><span className="text-slate-500">Still open at end, marked at the last price (not in the net above)</span><span className="text-right" data-testid="replay-open-mark">{sol(s.openMarkNetPnlSol)}{s.openAtEnd ? ` over ${s.openAtEnd}` : ''}</span></>}
               <span className="text-slate-500">Average hold</span><span className="text-right">{dur(s.avgHoldMs)}</span>
               <span className="text-slate-500">Exits by reason</span><span className="text-right">{Object.entries(s.exitReasons).map(([k, v]) => `${k} ${v}`).join(' · ') || '—'}</span>
             </div>
@@ -124,17 +133,34 @@ export function ReplayBacktestView({ data, error }: { data: ReplayResponse | nul
                     <td title={l.verdictReason}>{l.verdict}{l.releasedAfterMs !== null ? ` @${Math.round(l.releasedAfterMs / 1000)}s` : ''}</td>
                     <td>{l.score ?? '—'}</td>
                     <td>{l.entered ? `${l.outcome === 'OPEN_AT_END' ? 'open at end' : 'closed'}: ${l.exits.map((e) => e.reason).join(', ') || 'no exit yet'}` : (l.noEntryReason ?? '—')}</td>
-                    <td className={l.netPnlSol === null ? '' : l.netPnlSol >= 0 ? 'text-emerald-400' : 'text-red-400'}>{sol(l.netPnlSol)}</td>
+                    {l.outcome === 'OPEN_AT_END' && l.openNetPnlSol !== undefined && l.openNetPnlSol !== null
+                      ? <td className="text-slate-400" title="marked at the last recorded price, not realized">{sol(l.openNetPnlSol)} (mark)</td>
+                      : <td className={l.netPnlSol === null ? '' : l.netPnlSol >= 0 ? 'text-emerald-400' : 'text-red-400'}>{sol(l.netPnlSol)}</td>}
                   </tr>
                 ))}
               </tbody>
             </table>
             <h4 className="text-[11px] font-bold text-slate-300 mb-1">Rules replayed</h4>
             <ul className="mb-2 text-slate-400 list-disc pl-4" data-testid="replay-rules">{r.rules.map((x) => <li key={x}>{x}</li>)}</ul>
-            <h4 className="text-[11px] font-bold text-amber-300 mb-1">Not replayed (the result is optimistic by this much)</h4>
-            <ul className="mb-2 text-slate-400 list-disc pl-4" data-testid="replay-not-replayed">{r.notReplayed.map((x) => <li key={x}>{x}</li>)}</ul>
+            {r.notReplayedByDirection ? (
+              <div data-testid="replay-not-replayed">
+                <h4 className="text-[11px] font-bold text-amber-300 mb-1">Not replayed, makes the result look better than live</h4>
+                <ul className="mb-2 text-slate-400 list-disc pl-4">{r.notReplayedByDirection.optimistic.map((x) => <li key={x}>{x}</li>)}</ul>
+                <h4 className="text-[11px] font-bold text-slate-300 mb-1">Not replayed, makes it look worse</h4>
+                <ul className="mb-2 text-slate-400 list-disc pl-4">{r.notReplayedByDirection.pessimistic.map((x) => <li key={x}>{x}</li>)}</ul>
+                <h4 className="text-[11px] font-bold text-slate-300 mb-1">Not replayed, direction unknown</h4>
+                <ul className="mb-2 text-slate-400 list-disc pl-4">{r.notReplayedByDirection.unknown.map((x) => <li key={x}>{x}</li>)}</ul>
+              </div>
+            ) : (
+              <>
+                <h4 className="text-[11px] font-bold text-amber-300 mb-1">Not replayed</h4>
+                <ul className="mb-2 text-slate-400 list-disc pl-4" data-testid="replay-not-replayed">{r.notReplayed.map((x) => <li key={x}>{x}</li>)}</ul>
+              </>
+            )}
             <p className="text-[10px] text-slate-500" data-testid="replay-assumptions">
-              Assumed: order {r.assumptions.orderSol} SOL, buy lands {Math.round(r.assumptions.entryDelayMs)} ms after the release at the next recorded price, {r.assumptions.feePct}% fee each side, network fee {r.assumptions.networkFeeSol} SOL and tip {r.assumptions.tipSol} SOL per transaction.
+              {r.assumptions.exitDelayMs !== undefined
+                ? <>Assumed: order {r.assumptions.orderSol} SOL; the buy lands {Math.round(r.assumptions.entryDelayMs)} ms after the release and each sell {Math.round(r.assumptions.exitDelayMs)} ms after its decision, at the curve state then; {r.assumptions.feePct}% pump.fun fee on the buy and on every sell; per transaction: network fee {r.assumptions.networkFeeSol} SOL, priority fee {r.assumptions.priorityBuySol} SOL (buy) / {r.assumptions.prioritySellSol} SOL (sell), tip {r.assumptions.tipSol} SOL.</>
+                : <>Assumed: order {r.assumptions.orderSol} SOL, buy lands {Math.round(r.assumptions.entryDelayMs)} ms after the release, {r.assumptions.feePct}% fee, network fee {r.assumptions.networkFeeSol} SOL and tip {r.assumptions.tipSol} SOL (an older server: see its own notes for what it charges).</>}
             </p>
           </>
         );

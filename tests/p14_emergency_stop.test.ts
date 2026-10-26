@@ -183,8 +183,11 @@ describe('P1.4 N-11 / R1-119: Telegram /panic_sell sells the open LIVE position,
     const close = vi.spyOn(executionCoordinator, 'closePosition').mockResolvedValue({ success: true, pnlSol: 0.001, status: 'CLOSED' });
 
     const r = await socialScanner.processTelegramCommand('/panic_sell');
-    expect(arm).toHaveBeenCalledWith(false); // the stop disarms LIVE before it sells
+    expect(arm).toHaveBeenCalledWith(false);
     expect(close).toHaveBeenCalledWith(liveId, 100, 'EMERGENCY_PANIC_LIQUIDATION');
+    // the stop disarms LIVE before it sells (review 2026-10-24 #11: the order used to be only a comment)
+    const disarmedAt = arm.mock.invocationCallOrder[arm.mock.calls.findIndex((c) => c[0] === false)];
+    expect(disarmedAt).toBeLessThan(Math.min(...close.mock.invocationCallOrder));
     expect(close.mock.calls.map((c) => c[0])).not.toContain(paperId);
     expect(r.reply).toMatch(/EMERGENCY DUMP COMPLETE/);
     expect(r.reply).toMatch(/Closed 1: LIV/);
@@ -250,8 +253,16 @@ describe('P1.4 N-1: the HTTP panic waits for an auto buy in flight before it rea
 
 describe('P1.4 step 3: the emergency stop disarms LIVE', () => {
   // Audit 2026-10-22: with `armLiveTrading(false)` removed from emergencyStop, every test in this file still passed (two tests elsewhere
-  // caught it). The claim is pinned here, in the file named for it.
+  // caught it). The claim is pinned here, in the file named for it. Review 2026-10-24 #11: LIVE is really armed first (only the
+  // prerequisite check is stubbed), so the two state assertions below fail too when the stop does not disarm.
   it('emergencyStop({ exitAll: false }) calls armLiveTrading(false) and leaves the coordinator disarmed, in PAPER', async () => {
+    vi.stubEnv('ALLOW_LIVE_REAL_MONEY_TRADING', 'true');
+    vi.stubEnv('ALLOWED_CLUSTER', 'localnet');
+    vi.spyOn(executionCoordinator, 'canExecuteLive').mockReturnValue({ allowed: true, reasons: [], readiness: { components: { pumpFeed: { status: 'READY' } } } } as any);
+    const armed = executionCoordinator.armLiveTrading(true, 'CONFIRM_LIVE_TRADING_RISK');
+    expect(armed.success, armed.message).toBe(true);
+    expect(executionCoordinator.isLiveArmed()).toBe(true);
+    expect(executionCoordinator.getExecutionMode()).toBe('LIVE');
     const arm = vi.spyOn(executionCoordinator, 'armLiveTrading');
     const report = await emergencyStop({ exitAll: false, reason: 'p14 disarm' });
     expect(report.killSwitchActivated).toBe(true);

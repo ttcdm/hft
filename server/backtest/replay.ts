@@ -5,6 +5,7 @@ import { CurveVelocityEvaluator } from '../signals/curveVelocityEvaluator';
 import { OnChainPoolStats, tradePriceSol } from '../market/poolStats';
 import type { PumpTradeEvent } from '../solana/pumpFeedListener';
 import type { RecordedCreatorReport } from './launchRecorder';
+import { CREATOR_LOOKUP_FAILED_FLAG, type CreatorRiskReport } from '../signals/creatorRiskScorer';
 import { simulatePath, priceEntryParts, px, BASE_FEE_SOL, PRIORITY_BUY_SOL, PRIORITY_SELL_SOL, PUMP_FEE_SDK_PCT, type CostCase, type TradeRow } from './costModel';
 
 /**
@@ -243,6 +244,23 @@ export function analysePeaks(rows: ReplayedLaunch[]): PeakAnalysis {
   };
 }
 
+/**
+ * 5B-2 (A119): the creator report live held for this launch at `now`: the latest recorded one at or before it, rebuilt with the two things the
+ * confluence engine reads (the 0-5 score and the failed-lookup flag). Null (no report yet, or none recorded) scores 0, as live does.
+ * Live pins a watched launch's report until 60 s after the verdict, so a report, once recorded, holds for the rest of the replay.
+ */
+export function creatorReportAt(launch: Pick<RecordedLaunch, 'creatorReports'>, creator: string | undefined, now: number): CreatorRiskReport | null {
+  let r: RecordedCreatorReport | undefined;
+  for (const x of launch.creatorReports ?? []) if (x.ts <= now) r = x;
+  if (!r) return null;
+  const flags = r.failed && !r.riskFlags.includes(CREATOR_LOOKUP_FAILED_FLAG) ? [...r.riskFlags, CREATOR_LOOKUP_FAILED_FLAG] : r.riskFlags;
+  return {
+    creatorAddress: creator ?? '', riskScore: r.riskScore ?? 0, confluenceScore: r.failed ? 0 : r.confluenceScore, isBurner: r.isBurner ?? false,
+    isFreshWallet: false, signatureCount: 0, walletAgeSeconds: 0, hasDrainPattern: false, failedTxCount: 0, riskFlags: flags, evaluatedAt: r.ts,
+    details: 'recorded creator report (replay)',
+  };
+}
+
 export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solUsdFallback: number | null, optsIn: ReplayOptions = {}): ReplayedLaunch {
   const o = { ...REPLAY_DEFAULTS, ...optsIn };
   const minScore = optsIn.minScore ?? getConfluenceThreshold();
@@ -273,9 +291,9 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
     const metrics = velocity.getMetrics(launch.mint, now);
     const b = ConfluenceEngine.calculate({
       mint: launch.mint,
-      // 5C (R1-61): the creator is known, its wallet-history report is not recorded, so it scores as live does without one (0, P4.1).
-      // null keeps the running app's creator cache out of the replay.
-      creatorAddress: create.payload.creator || undefined, creatorRiskReport: null,
+      // 5C (R1-61) / 5B-2: the creator's report as live held it at this moment (the latest CREATOR row at or before `now`); without one it
+      // scores as live does without a report (0, P4.1). null keeps the running app's creator cache out of the replay.
+      creatorAddress: create.payload.creator || undefined, creatorRiskReport: creatorReportAt(launch, create.payload.creator, now),
       priceChange5mPct: m.priceChange5mPct,
       liquidityUsd: solUsd === null ? null : m.realSolReserves * solUsd * 2,
       top10HoldersPct: m.top10HoldersPct,
@@ -424,7 +442,7 @@ export const NOT_REPLAYED = {
     'Funder facts the live window would learn but the recording lacks (corpus replays have none); the direction was not measured',
     'Entry and exit latency are fixed assumptions (entry and exit delay), not the measured distribution',
     'The fee rate is the SDK default (0.95% + 0.30%); the live quote reads the real tier',
-    'Creator wallet history is not recorded: every creator scores 0 of its 5 points, as live does without a report; live adds up to 5 for an established wallet, so the replay can refuse a launch live buys',
+    'Creator wallet history: a launch recorded with its live creator report (CREATOR rows, 5B-2) scores the creator as live did from the moment the report landed; launches recorded without one (corpus replays, recordings made before 5B-2) score 0 of its 5 points, as live does without a report, so the replay can refuse a launch live buys',
     'Positions still open when the data ends are marked at the last recorded price, which may be the graduation top or a dead curve',
   ],
 };

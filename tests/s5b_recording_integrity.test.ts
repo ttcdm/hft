@@ -332,3 +332,32 @@ describe('5B-2: the own-recordings readers (SQLite and JSONL) give the same crea
     expect(err).not.toHaveBeenCalled(); // no CREATOR line is "skipped"
   });
 });
+
+describe('5B-2: the replay scores the creator with the report recorded for the launch', () => {
+  /** A released launch: 60 buys on the chain's curve maths (as tests/s5c_replay_parity.test.ts builds it). */
+  async function released(creatorReports?: any[]) {
+    const { toRecordedLaunch } = await import('../scripts/hfcorpus/replay');
+    let vSol = 30e9, vTok = 1.073e15;
+    const rows: any[] = [];
+    for (let i = 0; i < 60; i++) {
+      const sol = 0.3 + (i % 5) * 0.2; const k = vSol * vTok, nS = vSol + sol * 1e9, nT = k / nS;
+      rows.push([t0 + 1500 + i * 900, true, sol, (vTok - nT) / 1e6, 'w' + (i % 40), Math.round(nS), Math.round(nT), `w-${i}`]);
+      vSol = nS; vTok = nT;
+    }
+    const l = toRecordedLaunch({ mint: 'Mint5B2', symbol: 'FC', creator: wallet(), mayhem: false, t0, graduated: false, trades: rows } as any, 150);
+    return creatorReports ? { ...l, creatorReports } : l;
+  }
+  const GATE = { minScore: 0, readyGate: false, curveCap: false };
+  const report = (ts: number, confluenceScore: number, failed = false) => ({ ts, confluenceScore, failed, riskScore: 90, isBurner: false, riskFlags: [] });
+
+  it('a 5-point report recorded at the create scores 5 more than none; a failed one, or one recorded after the release, scores as none', async () => {
+    const { replayLaunch } = await import('../server/backtest/replay');
+    const none = replayLaunch(await released(), [], 150, GATE);
+    expect(none.score).not.toBeNull();
+    const five = replayLaunch(await released([report(t0, 5)]), [], 150, GATE);
+    expect(five.releasedAfterMs).toBe(none.releasedAfterMs);
+    expect((five.score as number) - (none.score as number)).toBe(5);
+    expect(replayLaunch(await released([report(t0, 5, true)]), [], 150, GATE).score).toBe(none.score);
+    expect(replayLaunch(await released([report(t0 + 10 * 60_000, 5)]), [], 150, GATE).score).toBe(none.score);
+  });
+});

@@ -2723,6 +2723,18 @@ export class ExecutionCoordinator {
         correlationId,
       };
     }
+    // P3.1 (R1-7): the Q16 check above used the positions read before the awaits; orphan recovery (or another path) may have saved a row
+    // for this mint since. freshOpen was read with no await before this point, so this check and the reservation below see the same rows.
+    if (freshOpen.some((p) => p.mint === req.mint)) {
+      workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'LIVE', { reason: 'POSITION_ALREADY_OPEN', mint: req.mint, stage: 'reservation' });
+      return {
+        success: false,
+        lifecycleState: 'RISK_REJECTED',
+        executionMode: 'LIVE',
+        error: `POSITION_ALREADY_OPEN: an open LIVE position in ${req.mint} exists; close it before buying the same mint again.`,
+        correlationId,
+      };
+    }
     this.inFlightBuyMints.add(req.mint);
     let buySettled!: () => void;
     this.liveBuysInFlight.set(req.mint, new Promise<void>((r) => { buySettled = r; })); // waitForBuysInFlight awaits it

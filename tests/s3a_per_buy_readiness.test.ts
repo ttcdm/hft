@@ -225,4 +225,24 @@ describe('3A: per-buy readiness and fail-closed buy checks (real coordinator, LI
     expect(build).not.toHaveBeenCalled();
   });
 
+  it('R1-7: a row for the same mint saved during the awaits (orphan recovery adopting it) is caught next to the reservation: POSITION_ALREADY_OPEN', async () => {
+    const req = buyReq();
+    // the tip-floor read is one of the awaits between the first same-mint check and the reservation
+    vi.spyOn(coordinator.getJitoTransport(), 'getTipFloorLamports').mockImplementation(async () => {
+      workstationDb.savePosition({
+        id: `adopted_${req.mint.slice(0, 6)}`, mint: req.mint, symbol: 'S3A', name: 'S3A', tokenDecimals: 6, tokenQuantityRaw: '5000',
+        entryPriceSol: 0.0001, currentPriceSol: 0.0001, currentValueSol: 0.0005, costBasisLamports: 500_000, realizedPnLSol: 0,
+        status: 'OPEN', venue: 'PUMP_BONDING_CURVE', executionMode: 'LIVE', entryTxSignature: `RECOVERED:${req.mint}`, entryTimestamp: Date.now(),
+        lastMarkTimestamp: Date.now(), recordUpdatedAt: Date.now(), updatedAt: Date.now(),
+      } as any);
+      return null as any;
+    });
+    const before = coordinator.getSpendableBankrollSol();
+    const res = await coordinator.executeTrade(req);
+    expect(res.lifecycleState).toBe('RISK_REJECTED');
+    expect(res.error).toMatch(/^POSITION_ALREADY_OPEN/);
+    expect(build).not.toHaveBeenCalled();
+    expect(coordinator.getSpendableBankrollSol()).toBe(before);
+  });
+
 });

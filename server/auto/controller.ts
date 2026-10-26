@@ -160,6 +160,8 @@ const MONITOR_INTERVAL_MS = 5_000;
 /** S222: keys in `app_settings`. */
 const SETTING_THRESHOLD = 'auto.confluenceThreshold';
 const SETTING_MODE = 'auto.mode';
+/** 3E: the last kill, `{ reason, ts }`, or null once an operator has set a trading mode again. Read back by `restorePersisted`. */
+const SETTING_KILL = 'auto.kill';
 /** S189: how long readiness must stay green before a PAPER session downgraded by READINESS_RED is put back. */
 export const READINESS_RESTORE_GREEN_MS = 60_000;
 
@@ -343,6 +345,7 @@ export class AutoSnipeController extends EventEmitter {
    * S222: bring back what the operator had set before a restart. The confluence threshold always. The mode only up to PAPER: a saved
    * DEVNET_LIVE comes back as SHADOW (nothing is sent) and needs a fresh arm and confirmation code, so a restart never resumes live
    * sending by itself. A mode that cannot be restored (AUTO_SNIPE_ENABLED not true, coordinator not in PAPER) leaves auto OFF.
+   * 3E: a kill saved by the last run (`auto.kill`) keeps auto OFF and `killed` with its reason, until an operator sets a mode.
    * Call once at startup, before `startMonitor`.
    */
   public async restorePersisted(): Promise<{ threshold: number | null; mode: AutoMode; note: string | null }> {
@@ -360,6 +363,18 @@ export class AutoSnipeController extends EventEmitter {
     if (holder && holder.pid !== process.pid) {
       note = `restart: auto mode not restored: process ${holder.pid} holds ${lock}; auto stays OFF and the saved mode is left as it is`;
       Logger.warn(`[AUTO] ${note}`);
+      return { threshold, mode: this.mode, note };
+    }
+    // 3E: a kill saved by the last run keeps auto OFF and killed, whatever mode is saved (a kill that saved OFF but crashed mid-way, or an
+    // older build that saved the mode only at the end of the kill). Only an operator setting a mode again clears it.
+    const savedKill = workstationDb.getSetting<{ reason?: unknown; ts?: unknown }>(SETTING_KILL);
+    if (savedKill && typeof savedKill === 'object') {
+      this.killed = true;
+      this.killReason = typeof savedKill.reason === 'string' && savedKill.reason ? savedKill.reason : 'kill before the restart (no reason saved)';
+      note = `restart: auto was killed before the restart (${this.killReason}); auto stays OFF until an operator sets a mode`;
+      if (workstationDb.getSetting<unknown>(SETTING_MODE) !== 'OFF') workstationDb.setSetting(SETTING_MODE, 'OFF');
+      Logger.warn(`[AUTO] ${note}`);
+      workstationDb.logDecision({ autoMode: this.mode, mint: '-', stage: 'auto', outcome: 'INFO', reason: note });
       return { threshold, mode: this.mode, note };
     }
     const saved = workstationDb.getSetting<unknown>(SETTING_MODE);
@@ -383,6 +398,13 @@ export class AutoSnipeController extends EventEmitter {
 
   /** S222: every mode change is saved, so `restorePersisted` can bring it back. */
   private persistMode = (): void => { workstationDb.setSetting(SETTING_MODE, this.mode); };
+
+  /** 3E: save OFF and the kill reason now, synchronously. A failed write is logged; the in-memory kill still holds for this process. */
+  private persistKill(): void {
+    const modeSaved = workstationDb.setSetting(SETTING_MODE, 'OFF');
+    const killSaved = workstationDb.setSetting(SETTING_KILL, { reason: this.killReason, ts: Date.now() });
+    if (!modeSaved || !killSaved) Logger.error(`[AUTO] kill: could not save auto OFF and the kill reason; a restart may not know auto was killed (${this.killReason})`);
+  }
 
   public getStatus(): AutoStatus {
     this.settleUnresolvedSpend();
@@ -491,6 +513,7 @@ export class AutoSnipeController extends EventEmitter {
     }
     this.killed = false;
     this.killReason = null;
+    workstationDb.setSetting(SETTING_KILL, null); // 3E: an operator setting a mode again is what clears a kill, here and after a restart
     this.downgradeReason = null;
     this.triggers = [];
     this.slippageBreaches = 0;
@@ -523,6 +546,9 @@ export class AutoSnipeController extends EventEmitter {
     this.autoRestore = null;
     this.killed = true;
     this.killReason = opts.reason || 'operator kill';
+    // 3E (R1-43): saved before the first await. The `mode` event below comes only after the wait and the closes, so a crash or a close that
+    // never returns used to leave the old mode saved, and restorePersisted brought it back on the next boot.
+    this.persistKill();
     this.clearPendingReleases(); // P1.4: a release queued behind the buy in flight is not bought after a kill
     // Q29: a buy already past the gates finishes (its position exists once it does); wait for it so its position is in the owned set below
     // and is sold by exitAll. Mode OFF already stops any new candidate.

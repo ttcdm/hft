@@ -158,6 +158,9 @@ export class PumpFeedListener extends EventEmitter {
     this.closeGap();
   };
   private unfollow: (() => void) | null = null;
+  /** B10: switches run one at a time, in order; a switch still waiting when a newer one is asked for is skipped (the newest wins). */
+  private switchChain: Promise<unknown> = Promise.resolve();
+  private switchTarget: Connection | null = null;
 
   constructor(connection?: Connection) {
     super();
@@ -710,8 +713,19 @@ export class PumpFeedListener extends EventEmitter {
    * RECONNECTING and 'feed_gap' (B7: before, the status went straight from DISCONNECTED to ACTIVE). The gap closes on the new
    * Connection's first slot, socket open or log. A listener that was not running only takes the new Connection. Creator lookups
    * (`scoreCreator`) use the same Connection, so they move with it.
+   *
+   * B10 (review 2026-10-24, finding 10): `follow` does not await a switch, and a switch awaits `stop()` before it takes the new
+   * Connection, so two quick `setRpcEndpoint` calls used to run interleaved: both saw the listener running, both called `start()`, and
+   * one subscription was left on an endpoint the listener no longer tracked. Switches are now queued, and only the newest one runs.
    */
-  public async switchConnection(conn: Connection): Promise<boolean> {
+  public switchConnection(conn: Connection): Promise<boolean> {
+    this.switchTarget = conn;
+    const run = this.switchChain.then(() => (this.switchTarget === conn ? this.switchNow(conn) : false));
+    this.switchChain = run.catch(() => undefined);
+    return run;
+  }
+
+  private async switchNow(conn: Connection): Promise<boolean> {
     if (conn === this.connection) return this.isActive();
     const wasRunning = this.subscriptionId !== null || this.reconnectTimer !== null;
     await this.stop();

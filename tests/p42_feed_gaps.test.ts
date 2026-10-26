@@ -406,3 +406,63 @@ describe('B7 (review 2026-10-24, finding 7): slot-jump and RPC-switch gaps show 
     await listener.stop();
   });
 });
+
+describe('B10 (review 2026-10-24, finding 10): two quick RPC switches leave one log subscription', () => {
+  /** A fake Connection that counts its live log subscriptions; unsubscribing takes a few ticks, as it does over a websocket. */
+  function countingConn(endpoint: string) {
+    const f = fakeConn(endpoint);
+    let live = 0;
+    let nextId = 100;
+    f.conn.onLogs = vi.fn(() => { live++; return nextId++; });
+    f.conn.removeOnLogsListener = vi.fn(async () => { await new Promise((r) => setTimeout(r, 5)); live--; });
+    f.conn.removeSlotChangeListener = vi.fn(async () => { await new Promise((r) => setTimeout(r, 5)); });
+    return { ...f, live: () => live };
+  }
+
+  it('switch to B then C without awaiting: one subscription, on C; B is never left subscribed', async () => {
+    const a = countingConn('http://127.0.0.1:18001');
+    const b = countingConn('http://127.0.0.1:18002');
+    const c = countingConn('http://127.0.0.1:18003');
+    const listener = new PumpFeedListener(a.conn);
+    expect(await listener.start()).toBe(true);
+    const first = listener.switchConnection(b.conn);
+    const second = listener.switchConnection(c.conn);
+    await Promise.all([first, second]);
+    // each Connection on its own: before B10, A was unsubscribed twice (-1) and B kept an orphaned subscription
+    expect([a.live(), b.live(), c.live()]).toEqual([0, 0, 1]);
+    expect(listener.getTelemetry().activeEndpoint).toBe('http://127.0.0.1:18003');
+    expect(listener.getTelemetry().subscriptionId).not.toBeNull();
+    await listener.stop();
+    expect([a.live(), b.live(), c.live()]).toEqual([0, 0, 0]);
+  });
+
+  it('follow(): two setRpcEndpoint announcements in a row end on the second Connection with one subscription', async () => {
+    const a = countingConn('http://127.0.0.1:18011');
+    const b = countingConn('http://127.0.0.1:18012');
+    const c = countingConn('http://127.0.0.1:18013');
+    const fns: Array<(conn: any) => void> = [];
+    const listener = new PumpFeedListener(a.conn);
+    listener.follow({ onConnectionChange: (fn) => { fns.push(fn); return () => undefined; } });
+    expect(await listener.start()).toBe(true);
+    fns[0](b.conn);
+    fns[0](c.conn);
+    await vi.waitFor(() => expect(c.live()).toBe(1));
+    await new Promise((r) => setTimeout(r, 30));
+    expect([a.live(), b.live(), c.live()]).toEqual([0, 0, 1]);
+    expect(listener.getTelemetry().activeEndpoint).toBe('http://127.0.0.1:18013');
+    listener.destroy();
+  });
+
+  it('a switch back to the Connection in use while a switch is still running ends on that Connection', async () => {
+    const a = countingConn('http://127.0.0.1:18021');
+    const b = countingConn('http://127.0.0.1:18022');
+    const listener = new PumpFeedListener(a.conn);
+    expect(await listener.start()).toBe(true);
+    const toB = listener.switchConnection(b.conn);
+    const backToA = listener.switchConnection(a.conn);
+    await Promise.all([toB, backToA]);
+    expect([a.live(), b.live()]).toEqual([1, 0]);
+    expect(listener.getTelemetry().activeEndpoint).toBe('http://127.0.0.1:18021');
+    await listener.stop();
+  });
+});

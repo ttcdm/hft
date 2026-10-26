@@ -299,11 +299,36 @@ export class WorkstationDatabase {
    * in app_settings); after that an RPC on another genesis is refused, so a devnet ledger is never reconciled against another cluster.
    * An in-memory database (tests, scratch tools) is never stamped. `ok: false` carries the stored hash.
    */
-  public checkClusterStamp(genesisHash: string): { ok: true; stamped: boolean } | { ok: false; stored: string } {
+  public checkClusterStamp(genesisHash: string): { ok: true; stamped: boolean } | { ok: false; stored: string; unreadable?: string } {
     if (!genesisHash || this.dbPath === ':memory:') return { ok: true, stamped: false };
-    const stored = this.getSetting<string>('cluster_genesis_hash');
-    if (!stored) return { ok: true, stamped: this.setSetting('cluster_genesis_hash', genesisHash) };
-    return stored === genesisHash ? { ok: true, stamped: false } : { ok: false, stored };
+    // S255 follow-up: not getSetting, which answers null for a failed read too. A failed read is not "unstamped": taking it for one wrote
+    // this RPC's genesis over the real stamp, and a ledger of another cluster then passed. Unreadable refuses, like a mismatch.
+    const read = (): { stored: string | null } | { unreadable: string } => {
+      try {
+        const row = this.db.prepare(`SELECT value_json FROM app_settings WHERE key = 'cluster_genesis_hash'`).get() as { value_json: string } | undefined;
+        if (!row) return { stored: null };
+        const v = JSON.parse(row.value_json);
+        return typeof v === 'string' && v ? { stored: v } : { unreadable: 'the stamp row holds no genesis hash' };
+      } catch (err: any) {
+        return { unreadable: String(err?.message ?? err) };
+      }
+    };
+    let r = read();
+    if ('stored' in r && r.stored === null) {
+      // insert only, so a stamp another process wrote meanwhile is compared below and never overwritten
+      try {
+        const res = this.db.prepare(`INSERT INTO app_settings (key, value_json, updated_at) VALUES ('cluster_genesis_hash', ?, ?) ON CONFLICT(key) DO NOTHING`)
+          .run(JSON.stringify(genesisHash), Date.now());
+        if (Number(res.changes) > 0) return { ok: true, stamped: true };
+      } catch (err: any) {
+        Logger.warn(`Cluster stamp could not be saved: ${err.message}`);
+        return { ok: true, stamped: false };
+      }
+      r = read();
+    }
+    if ('unreadable' in r) return { ok: false, stored: '', unreadable: r.unreadable };
+    if (r.stored === null || r.stored === genesisHash) return { ok: true, stamped: false };
+    return { ok: false, stored: r.stored };
   }
 
   /** The last recorded all-trading halt state: a halt survives a restart until an operator clears it. */
@@ -539,6 +564,30 @@ export class WorkstationDatabase {
         .run(Date.now(), landing.slot || null, landing.networkFeeLamports ?? null, signature);
     } catch (err: any) {
       Logger.error(`Failed to mark transaction ${signature} reconciled: ${err.message}`);
+    }
+  }
+
+  /**
+   * S258: a landed sell booked on its position (savePosition: realized PnL, quantity, status, exitTxSignature) and its ledger row marked
+   * RECONCILED, in one transaction. Written separately, a crash between the two left the row PENDING with the PnL already on the position;
+   * startup reconciliation matches a PENDING sell to its position by exitTxSignature only, so once a later sell had replaced that it booked
+   * the same sell again. Throws (nothing written) when either write fails.
+   */
+  public saveSellBooking(pos: NormalizedPosition, signature: string, landing: { slot?: number; networkFeeLamports?: number } = {}): void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.savePosition(pos);
+      this.db
+        .prepare(
+          `UPDATE transactions SET reconciliation_state = 'RECONCILED', confirmation_time = ?,
+             landing_slot = COALESCE(?, landing_slot), network_fee_lamports = COALESCE(?, network_fee_lamports)
+           WHERE signature = ?`
+        )
+        .run(Date.now(), landing.slot || null, landing.networkFeeLamports ?? null, signature);
+      this.db.exec('COMMIT');
+    } catch (err) {
+      try { this.db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+      throw err;
     }
   }
 

@@ -1338,6 +1338,8 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
         context: { slot: 280009000 },
         value: { amount: '0', decimals: 6, uiAmount: 0 },
       } as any);
+      // Review E (S259): an empty answer is checked against the mint's owning program first; these mints are SPL Token mints
+      vi.spyOn(Connection.prototype, 'getAccountInfo').mockResolvedValue({ owner: TOKEN_PROGRAM_ID, lamports: 1, data: Buffer.alloc(82), executable: false } as any);
 
       const res = await coordinator.startupReconciliation();
 

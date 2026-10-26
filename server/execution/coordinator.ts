@@ -306,6 +306,10 @@ export class ExecutionCoordinator {
       await this.jitoTransport.probe();
       this.startJitoProbeLoop();
       if (!(await clusterCheck)) {
+        // S254 (L3): reconciliation is skipped here, so the heartbeat must run it once the RPC verifies. Its own check can pass before this
+        // one fails (the two run at once at boot); it then sees no cluster problem and, without this flag, never reconciled, which left
+        // the exit pass skipping every LIVE position with an unresolved sell for good.
+        this.bootConnectFailed = true;
         Logger.warn(`Solana RPC is not on the allowed cluster: ${this.clusterProblem}. Staying DISCONNECTED; the heartbeat re-checks.`);
         return;
       }
@@ -332,6 +336,7 @@ export class ExecutionCoordinator {
       const { genesisHash } = await assertClusterAllowed(this.connection);
       // P2.2 (R1-89): the database remembers the cluster it was written for and refuses an RPC on another one.
       const stamp = workstationDb.checkClusterStamp(genesisHash);
+      if (!stamp.ok && stamp.unreadable) throw new Error(`DB_CLUSTER_STAMP_UNREADABLE: the cluster stamp of ${workstationDb.getDbPath()} could not be read (${stamp.unreadable}); refusing to reconcile or trade until it can`);
       if (!stamp.ok) throw new Error(`DB_CLUSTER_MISMATCH: ${workstationDb.getDbPath()} holds the ledger of genesis ${stamp.stored}, but the RPC is on ${genesisHash}; refusing to reconcile or trade against it`);
       rememberGenesisCheck(this.connection); // S208: readiness warms the send-path cache
       this.clusterProblem = null;
@@ -849,7 +854,8 @@ export class ExecutionCoordinator {
                       targetPos.exitTimestamp = recovery.blockTime ?? Date.now();
                       targetPos.exitSlot = recovery.slot ?? txDetails.slot;
                       targetPos.lastUpdatedTimestamp = Date.now();
-                      workstationDb.savePosition(targetPos);
+                      // S258: one write with the RECONCILED row; if it fails nothing is booked and the row stays PENDING for the next pass
+                      workstationDb.saveSellBooking(targetPos, pTx.signature, { slot: txDetails.slot, networkFeeLamports: pTx.networkFeeLamports });
                       pTx.reconciliationState = 'RECONCILED';
                       Logger.info(`Successfully recovered interrupted SELL trade for ${recovery.mint} (${pTx.signature})`);
                     } else if (workstationDb.loadPositions('LIVE').some((p) => p.mint === recovery.mint && p.status === 'CLOSED')) {
@@ -1062,7 +1068,7 @@ export class ExecutionCoordinator {
           t.reconciliationState = 'REVERTED';
           t.error = recovery.error;
           workstationDb.saveTransaction(t);
-        } else if (recovery.error && /not found on-chain/i.test(recovery.error) && (await this.blockhashExpired(t) || Date.now() - t.submissionTime > ORPHAN_MAX_AGE_MS)) {
+        } else if (recovery.error && /not found on-chain/i.test(recovery.error) && (await this.blockhashExpired(t) || Date.now() - t.submissionTime > ORPHAN_MAX_AGE_MS) && (await this.signatureUnseen(t.signature))) {
           // N6: a transaction that is still not on chain after its blockhash expired never landed. Any tokens it did buy would be
           // found by the wallet scan; leaving the row open would hold readiness at MISMATCH, and block buys of the mint, until a restart.
           // P2.1: decided by the chain's block height against the row's lastValidBlockHeight; the 15-minute age is only for rows without one.
@@ -1168,6 +1174,20 @@ export class ExecutionCoordinator {
     if (!(typeof t.lastValidBlockHeight === 'number' && t.lastValidBlockHeight > 0)) return false;
     try {
       return (await this.connection.getBlockHeight('confirmed')) > t.lastValidBlockHeight;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * S250: true only when the signature has no status, history included. getTransaction answers null both for a transaction that never
+   * landed and for one this node cannot return (pruned history, not indexed yet), so "not found" alone does not prove it never landed.
+   * A status, or a read that fails, is false: the row stays for the next pass.
+   */
+  private async signatureUnseen(signature: string): Promise<boolean> {
+    try {
+      const st = await this.connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
+      return Array.isArray(st?.value) && st.value.length === 1 && st.value[0] === null;
     } catch {
       return false;
     }
@@ -3211,24 +3231,35 @@ export class ExecutionCoordinator {
             target.costBasisLamports, Number(totalTokensRaw - onChain) / Number(totalTokensRaw), 0
           ).catch(() => null);
           const booked = !!adopted?.success && BigInt(adopted.actualTokensSoldRaw) > 0n;
-          if (booked) target.realizedPnLSol = (target.realizedPnLSol ?? 0) + Number(adopted!.actualRealizedPnLSol.toFixed(6));
-          target.exitReason = reason;
-          target.exitTxSignature = pendingSell.signature;
-          target.lastUpdatedTimestamp = Date.now();
+          // S258 (L2): book on the row as it is now, as the normal sell path does: `target` was loaded before the wallet and
+          // transaction reads above, and saving it would undo marks or exit state written meanwhile.
+          const filled = workstationDb.loadPositions().find((p) => p.id === positionId) ?? target;
+          filled.baseTokenProgram = target.baseTokenProgram; // S259: readHeldTokens may have corrected it
+          if (booked) filled.realizedPnLSol = (filled.realizedPnLSol ?? 0) + Number(adopted!.actualRealizedPnLSol.toFixed(6));
+          filled.exitReason = reason;
+          filled.exitTxSignature = pendingSell.signature;
+          filled.lastUpdatedTimestamp = Date.now();
           if (onChain === 0n) {
-            target.status = 'CLOSED';
-            target.tokenQuantityRaw = '0';
-            target.costBasisLamports = 0;
+            filled.status = 'CLOSED';
+            filled.tokenQuantityRaw = '0';
+            filled.costBasisLamports = 0;
           } else {
-            target.status = 'PARTIALLY_CLOSED';
-            target.costBasisLamports = Math.round(target.costBasisLamports * Number(onChain) / Number(totalTokensRaw));
-            target.tokenQuantityRaw = onChain.toString();
+            filled.status = 'PARTIALLY_CLOSED';
+            filled.costBasisLamports = Math.round(filled.costBasisLamports * Number(onChain) / Number(totalTokensRaw));
+            filled.tokenQuantityRaw = onChain.toString();
           }
-          workstationDb.savePosition(target);
+          target.status = filled.status;
           if (booked) {
-            workstationDb.markTransactionReconciled(pendingSell.signature, { slot: adopted!.slot, networkFeeLamports: adopted!.actualNetworkFeeLamports });
+            try {
+              workstationDb.saveSellBooking(filled, pendingSell.signature, { slot: adopted!.slot, networkFeeLamports: adopted!.actualNetworkFeeLamports });
+            } catch (err: any) {
+              // S258: nothing was written, so the sell is still pending; the next pass adopts it again
+              this.pendingSells.set(positionId, pendingSell);
+              return { success: false, pnlSol: 0, error: `SELL_BOOKING_FAILED: ${err?.message ?? err}; the landed sell ${pendingSell.signature.slice(0, 8)} is booked on the next pass`, notSent: true };
+            }
             this.raiseOperatorAlert('SELL_ADOPTED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed after its confirmation was missed. Its fill was read from the chain and booked (PnL ${adopted!.actualRealizedPnLSol.toFixed(6)} SOL); the position now matches the wallet.`, positionId);
           } else {
+            workstationDb.savePosition(filled);
             this.raiseOperatorAlert('SELL_ADOPTED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed but its fill could not be read. The position now matches the wallet; realized PnL for it was not recorded.`, positionId);
           }
           await this.syncRealWalletBalance();
@@ -3476,6 +3507,7 @@ export class ExecutionCoordinator {
       // P1.1 (N-52): book the fill on the row as it is NOW, not on `target`, which was loaded before several awaits (marks and exit
       // state written meanwhile would be undone, and the realized delta would be computed against a stale copy).
       const filled = workstationDb.loadPositions().find((p) => p.id === positionId) ?? target;
+      filled.baseTokenProgram = target.baseTokenProgram; // S259: readHeldTokens may have corrected it
       filled.realizedPnLSol = (filled.realizedPnLSol ?? 0) + Number(sellRecon.actualRealizedPnLSol.toFixed(6));
       filled.exitReason = reason;
       filled.exitTxSignature = subRes.signature;
@@ -3492,8 +3524,15 @@ export class ExecutionCoordinator {
       }
       target.status = filled.status;
 
-      workstationDb.savePosition(filled);
-      workstationDb.markTransactionReconciled(subRes.signature, { slot: sellRecon.slot, networkFeeLamports: sellRecon.actualNetworkFeeLamports });
+      try {
+        // S258: the position and its RECONCILED ledger row are one write, so a crash between them cannot leave a booked sell PENDING
+        // (startup reconciliation would book it a second time once a later sell had replaced exitTxSignature)
+        workstationDb.saveSellBooking(filled, subRes.signature, { slot: sellRecon.slot, networkFeeLamports: sellRecon.actualNetworkFeeLamports });
+      } catch (err: any) {
+        // nothing was written: the row still holds the sold tokens, so the sell is pending and the next pass adopts it from the wallet
+        this.pendingSells.set(positionId, { signature: subRes.signature, ts: Date.now(), lastValidBlockHeight: txBuilder.lastValidBlockHeightOf((v0Tx as any)?.message?.recentBlockhash) });
+        return { success: false, pnlSol: 0, error: `SELL_BOOKING_FAILED: ${err?.message ?? err}; the landed sell ${subRes.signature.slice(0, 8)} is booked on the next pass` };
+      }
       await this.syncRealWalletBalance();
 
       return {
@@ -3531,11 +3570,23 @@ export class ExecutionCoordinator {
       held = BigInt(bal?.value?.amount ?? '0');
       slot = bal?.context?.slot;
     } catch (e: any) {
-      if (!/could not find account|Invalid param/i.test(String(e?.message))) return { held: null, error: String(e?.message ?? e) };
+      // S259: only "could not find account" means the account is absent. Another "Invalid param" (an account that is not a token
+      // account of this program, say) says nothing about the balance, and a 0 here closes the row as an assumed loss.
+      if (!/could not find account/i.test(String(e?.message))) return { held: null, error: String(e?.message ?? e) };
       held = 0n;
       absent = true;
     }
     if (held > 0n) return { held };
+    // S259: a row written before base_token_program existed got the column default (SPL Token), so a Token-2022 mint's tokens sit in a
+    // token account this read did not look at. Before an empty answer decides anything, ask the mint which program owns it; on a mismatch
+    // read again with that program (and keep it on the row, saved with it).
+    const mintProgram = await this.mintOwnerProgram(mint);
+    if (mintProgram === 'UNREADABLE') return { held: null, error: `the empty balance was not checked: the mint account of ${mint.toBase58()} could not be read` };
+    if (mintProgram && !mintProgram.equals(tp)) {
+      Logger.warn(`[S259] ${target.symbol || target.mint}: the row says token program ${tp.toBase58()} but the mint is owned by ${mintProgram.toBase58()}; reading that token account`);
+      target.baseTokenProgram = mintProgram.toBase58();
+      return this.readHeldTokens(target, owner, mint);
+    }
     if (this.clusterProblem !== null) {
       return { held, untrusted: `CLUSTER_GUARD: the RPC is not trusted (${this.clusterProblem.replace(/^CLUSTER_GUARD: /, '')}); an empty wallet balance from it does not close the position` };
     }
@@ -3561,6 +3612,19 @@ export class ExecutionCoordinator {
       }
     }
     return { held };
+  }
+
+  /**
+   * S259: the program that owns the mint account (SPL Token or Token-2022), null when the account does not exist or is owned by another
+   * program (nothing to correct the row with), 'UNREADABLE' when the read failed.
+   */
+  private async mintOwnerProgram(mint: PublicKey): Promise<PublicKey | null | 'UNREADABLE'> {
+    try {
+      const owner = (await this.connection.getAccountInfo(mint, 'confirmed'))?.owner;
+      return owner && (owner.equals(TOKEN_PROGRAM_ID) || owner.equals(TOKEN_2022_PROGRAM_ID)) ? owner : null;
+    } catch {
+      return 'UNREADABLE';
+    }
   }
 
   /** Wallets whose pump volume accumulator is known to exist (it is never closed by this app), so the account is read once. */

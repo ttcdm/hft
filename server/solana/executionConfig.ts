@@ -123,7 +123,7 @@ export class ExecutionConfigManager {
       priorityFeeMicrolamports: parseInt(process.env.PRIORITY_FEE_MICROLAMPORTS || '25000', 10) || 25000,
       maxSlippageBps: parseInt(process.env.MAX_SLIPPAGE_BPS || '800', 10) || 800,
       capitalTier,
-      maxDailyLossUsd: parsePositiveLimit('MAX_DAILY_LOSS_USD', process.env.MAX_DAILY_LOSS_USD, capitalTier === 'MICRO_10' ? 2.5 : 250),
+      maxDailyLossUsd: parsePositiveLimit('MAX_DAILY_LOSS_USD', process.env.MAX_DAILY_LOSS_USD, capitalTier === 'MICRO_10' ? 7 : 250),
       maxPositionSizeSol: parsePositiveLimit('MAX_POSITION_SIZE_SOL', process.env.MAX_POSITION_SIZE_SOL, capitalTier === 'MICRO_10' ? 0.02 : 1.5),
       demoMode: process.env.DEMO_MODE === 'true',
       jitoMaxRetries: parseInt(process.env.JITO_MAX_RETRIES || '2', 10) || 2,

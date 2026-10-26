@@ -691,9 +691,10 @@ export class AutoSnipeController extends EventEmitter {
       .map((p) => p.realizedPnLSol ?? 0);
   }
 
-  /** Clear an all-trading halt. Does not turn auto trading back on: the operator still sets a mode. */
-  public resume(opts: { clearHalt?: boolean } = {}): { halted: boolean; mode: AutoMode } {
+  /** Clear an all-trading halt and/or the daily-loss latch (3C: separate flags). Does not turn auto trading back on. */
+  public resume(opts: { clearHalt?: boolean; clearDailyLossLatch?: boolean } = {}): { halted: boolean; mode: AutoMode } {
     if (opts.clearHalt) executionCoordinator.clearHalt();
+    if (opts.clearDailyLossLatch) riskEngine.clearDailyLossLatch();
     return { halted: executionCoordinator.getHaltReason() !== null, mode: this.mode };
   }
 

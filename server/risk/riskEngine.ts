@@ -34,6 +34,18 @@ export interface RiskEvaluationResult {
   details: Record<string, any>;
 }
 
+/** N-61 (3C): the loss gate looks back this far, not to UTC midnight, so a new calendar day does not reset the budget. */
+export const DAILY_LOSS_WINDOW_MS = 24 * 60 * 60_000;
+
+/**
+ * N-62 (3C): share of every open position and of the new order assumed lost when gate 10 asks "could this buy break the floor?".
+ * 1 = a rug to zero. The 20% hard stop is a target, not a bound: a curve can gap through it or a sell can fail to land.
+ */
+export const WORST_CASE_LOSS_FRACTION = 1;
+
+/** Q56: a SOL price older than this no longer converts the USD floor at full trust (see effectiveMaxDailyLossSol). */
+export const DAILY_LOSS_PRICE_MAX_AGE_MS = 60 * 60_000;
+
 export class HardenedRiskEngine {
   private limits: PreTradeRiskLimits;
 
@@ -49,8 +61,8 @@ export class HardenedRiskEngine {
     this.limits = {
       maxPositionSol: cfg.maxPositionSizeSol,
       maxAggregateExposureSol: cfg.maxPositionSizeSol * 3,
-      // C3: the SOL value of the USD daily-loss cap follows the live SOL price (see effectiveMaxDailyLossSol).
-      // Until a price is known this is the aggregate exposure cap, which is the most that can be at risk.
+      // C3: the SOL value of the USD floor follows the live SOL price (see effectiveMaxDailyLossSol). This field is only the upper
+      // bound of the no-price fallback, the aggregate exposure cap; it is not a safe default on its own (N-65).
       maxDailyLossSol: cfg.maxPositionSizeSol * 3,
       maxSimultaneousPositions: 3,
       maxSlippageBps: cfg.maxSlippageBps,
@@ -73,19 +85,55 @@ export class HardenedRiskEngine {
   /** True once an operator or test sets maxDailyLossSol explicitly; then the live-price derivation is not applied. */
   private dailyLossLimitPinned = false;
 
-  /** Daily loss stop in SOL: pinned value if set explicitly, else maxDailyLossUsd / live SOL price, else the safe default. */
+  /**
+   * Net daily PnL floor in SOL: the pinned value if one was set explicitly, else MAX_DAILY_LOSS_USD / SOL price read within the last
+   * hour. N-65 (3C): with an older price, or none, it is min(3 x maxPositionSol, MAX_DAILY_LOSS_USD / last known price), so a stale
+   * price can only tighten the floor, never loosen it to 3 full positions.
+   */
   public effectiveMaxDailyLossSol(): number {
     if (this.dailyLossLimitPinned) return this.limits.maxDailyLossSol;
-    // Q56: a price older than an hour no longer converts the USD limit; the fixed SOL default applies until a fresh one is read.
+    const usdCap = executionConfig.getConfig().maxDailyLossUsd;
     const reading = solPriceService.getPrice();
-    const px = reading.usd !== null && (reading.ageMs ?? Infinity) <= 60 * 60_000 ? reading.usd : null;
-    return px ? executionConfig.getConfig().maxDailyLossUsd / px : this.limits.maxDailyLossSol;
+    if (reading.usd !== null && (reading.ageMs ?? Infinity) <= DAILY_LOSS_PRICE_MAX_AGE_MS) return usdCap / reading.usd;
+    const exposureCap = this.limits.maxDailyLossSol;
+    return reading.usd !== null ? Math.min(exposureCap, usdCap / reading.usd) : exposureCap;
   }
 
   public updateLimits(partial: Partial<PreTradeRiskLimits>) {
     if (partial.maxDailyLossSol !== undefined) this.dailyLossLimitPinned = true;
-    this.limits = { ...this.limits, ...partial };
+    // N-65: the unpinned fallback is 3 x the position cap; keep it in step when the position cap changes.
+    const fallback = !this.dailyLossLimitPinned && partial.maxPositionSol !== undefined ? { maxDailyLossSol: partial.maxPositionSol * 3 } : {};
+    this.limits = { ...this.limits, ...partial, ...fallback };
     Logger.info('Risk engine limits updated', this.limits);
+  }
+
+  /**
+   * N-61 (3C): once the floor is reached, buys in that mode stay refused until an operator clears the latch, even after the losses
+   * leave the 24 h window. In memory only: after a restart the window still holds the losses and the next buy latches again.
+   */
+  private dailyLossLatch = new Map<ExecutionMode, { at: number; message: string }>();
+  private warnedCapBelowOrder = false;
+
+  public getDailyLossLatch(mode: ExecutionMode): { at: number; message: string } | null {
+    return this.dailyLossLatch.get(mode) ?? null;
+  }
+
+  /** Operator clear (POST /api/auto/resume with clearDailyLossLatch). Gate 10 still refuses while the window itself is below the floor. */
+  public clearDailyLossLatch(): void {
+    if (this.dailyLossLatch.size === 0) return;
+    Logger.warn(`Daily loss latch cleared by operator for ${[...this.dailyLossLatch.keys()].join(', ')}`);
+    this.dailyLossLatch.clear();
+  }
+
+  private dailyWindowStartMs(): number {
+    return Date.now() - DAILY_LOSS_WINDOW_MS;
+  }
+
+  /** When the oldest loss in the window leaves it, as text for refusal messages. */
+  private windowReleaseNote(mode: ExecutionMode): string {
+    const oldest = workstationDb.getOldestRealizedLossTs(mode, this.dailyWindowStartMs());
+    if (oldest === null) return 'no realized loss is left in the 24 h window';
+    return `the oldest loss in the 24 h window leaves it at ${new Date(oldest + DAILY_LOSS_WINDOW_MS).toISOString()}`;
   }
 
   public recordRpcFailure(): boolean {
@@ -141,8 +189,9 @@ export class HardenedRiskEngine {
     this.mintLastTradedMap.set(mint, Date.now());
   }
 
+  /** Net PnL over the last 24 h (N-61, 3C): realized, plus open unrealized, minus unbooked fees. */
   public getDailyTotalPnLSol(mode: ExecutionMode = 'LIVE'): number {
-    return workstationDb.getDailyTotalPnLSol(mode);
+    return workstationDb.getDailyTotalPnLSol(mode, this.dailyWindowStartMs());
   }
 
   public getDailyLossSol(mode: ExecutionMode = 'PAPER'): number {
@@ -270,17 +319,26 @@ export class HardenedRiskEngine {
       );
     }
 
-    // 10. Daily Total Loss Limit (B20: Closed PnL + Open Unrealized PnL - Fees)
-    const dailyTotalPnL = this.getDailyTotalPnLSol(req.executionMode);
-    const maxDailyLossSol = this.effectiveMaxDailyLossSol();
-    if (dailyTotalPnL <= -maxDailyLossSol) {
+    // 10. Net daily PnL floor (B20: Closed PnL + Open Unrealized PnL - Fees, over a rolling 24 h; 3C)
+    const latch = this.dailyLossLatch.get(req.executionMode);
+    if (latch) {
       return logAndReturn(
         false,
         'DAILY_LOSS_LIMIT',
-        `Daily total loss ${Math.abs(dailyTotalPnL).toFixed(4)} SOL reached daily stop limit ${maxDailyLossSol} SOL`
+        `Net daily PnL floor latched at ${new Date(latch.at).toISOString()} (${latch.message}); an operator must clear it (POST /api/auto/resume with clearDailyLossLatch); ${this.windowReleaseNote(req.executionMode)}`
       );
     }
-
+    const dailyTotalPnL = this.getDailyTotalPnLSol(req.executionMode);
+    const maxDailyLossSol = this.effectiveMaxDailyLossSol();
+    if (dailyTotalPnL <= -maxDailyLossSol) {
+      const message = `net PnL over the last 24 h ${dailyTotalPnL.toFixed(4)} SOL reached the floor of -${maxDailyLossSol.toFixed(4)} SOL`;
+      this.dailyLossLatch.set(req.executionMode, { at: now, message });
+      return logAndReturn(
+        false,
+        'DAILY_LOSS_LIMIT',
+        `Net daily PnL floor: ${message}; latched until an operator clears it; ${this.windowReleaseNote(req.executionMode)}`
+      );
+    }
     // 11. Slippage Limit
     if (req.slippageBps > this.limits.maxSlippageBps) {
       return logAndReturn(
@@ -317,6 +375,29 @@ export class HardenedRiskEngine {
         false,
         'EXPECTED_EDGE_BELOW_EXECUTION_COST',
         `Execution cost is ${feePct.toFixed(1)}% of trade size (Limit: ${this.limits.maxFeePctOfPosition}%)`
+      );
+    }
+
+    // 13b. N-62, the second half of gate 10 (after the fee gates, so an oversized fee keeps its own reason): the order and every open
+    // position could still go to zero, and that worst case must fit above the floor too. Unrealized PnL is already in dailyTotalPnL, so
+    // an open position is charged at its marked value (cost plus unrealized), not at cost plus its loss.
+    const openUnrealizedSol = workstationDb.getOpenUnrealizedPnLSol(req.executionMode);
+    const orderCostSol = req.orderSizeSol + totalFeeLamports / 1e9;
+    const atRiskSol = req.currentTotalExposureSol + openUnrealizedSol + orderCostSol;
+    const worstCasePnL = dailyTotalPnL - atRiskSol * WORST_CASE_LOSS_FRACTION;
+    if (worstCasePnL < -maxDailyLossSol) {
+      const capBelowOrder = orderCostSol * WORST_CASE_LOSS_FRACTION > maxDailyLossSol;
+      if (capBelowOrder && !this.warnedCapBelowOrder) {
+        this.warnedCapBelowOrder = true;
+        Logger.warn(`MAX_DAILY_LOSS_USD (${maxDailyLossSol.toFixed(4)} SOL at the current price) is smaller than one ${req.orderSizeSol} SOL order plus its costs; no buy of that size can pass the net daily PnL floor. Raise MAX_DAILY_LOSS_USD or lower MAX_POSITION_SIZE_SOL.`);
+      }
+      return logAndReturn(
+        false,
+        'DAILY_LOSS_LIMIT',
+        capBelowOrder
+          ? `Net daily PnL floor: MAX_DAILY_LOSS_USD (${maxDailyLossSol.toFixed(4)} SOL) is smaller than this ${orderCostSol.toFixed(4)} SOL order with its costs; raise MAX_DAILY_LOSS_USD or lower the order size`
+          : `Net daily PnL floor: if this order and the open positions (${atRiskSol.toFixed(4)} SOL at risk) went to zero, net PnL over 24 h would be ${worstCasePnL.toFixed(4)} SOL, below the floor of -${maxDailyLossSol.toFixed(4)} SOL`,
+        { worstCasePnL, atRiskSol, maxDailyLossSol }
       );
     }
 

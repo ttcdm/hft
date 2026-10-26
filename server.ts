@@ -1374,7 +1374,7 @@ app.get('/api/watch', requireOperatorAuth, (req, res) => {
 });
 
 app.post('/api/auto/resume', requireOperatorAuth, validateTradeBody(AutoResumeSchema), (req, res) => {
-  res.json({ success: true, ...autoSnipeController.resume({ clearHalt: req.body.clearHalt }), status: autoSnipeController.getStatus() });
+  res.json({ success: true, ...autoSnipeController.resume({ clearHalt: req.body.clearHalt, clearDailyLossLatch: req.body.clearDailyLossLatch }), status: autoSnipeController.getStatus() });
 });
 
 autoSnipeController.on('decision', (d) => broadcastWs({ type: 'AUTO_DECISION', data: d }));

@@ -211,9 +211,10 @@ export const AutoKillSchema = z.object({
   reason: z.string().trim().max(200).optional(),
 });
 
-/** POST /api/auto/resume (G3): clear an all-trading halt. It never turns auto trading back on. */
+/** POST /api/auto/resume (G3): clear an all-trading halt and/or the daily-loss latch (3C). It never turns auto trading back on. */
 export const AutoResumeSchema = z.object({
   clearHalt: z.boolean().optional(),
+  clearDailyLossLatch: z.boolean().optional(),
 });
 
 

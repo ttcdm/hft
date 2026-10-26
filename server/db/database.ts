@@ -1038,10 +1038,18 @@ export class WorkstationDatabase {
     );
   }
 
-  public getDailyRealizedPnLSol(mode: ExecutionMode = 'LIVE'): number {
+  private static utcMidnightMs(): number {
     const startOfDay = new Date();
     startOfDay.setUTCHours(0, 0, 0, 0);
-    const startMs = startOfDay.getTime();
+    return startOfDay.getTime();
+  }
+
+  /**
+   * Realized PnL since `sinceMs`. The default is UTC midnight (the figure the UI shows as "today"); the risk gate passes a rolling
+   * 24 h start instead (N-61, 3C), so a new calendar day does not hand out a fresh loss budget.
+   */
+  public getDailyRealizedPnLSol(mode: ExecutionMode = 'LIVE', sinceMs: number = WorkstationDatabase.utcMidnightMs()): number {
+    const startMs = sinceMs;
 
     const stmt = this.db.prepare(`
       SELECT COALESCE(SUM(delta_lamports), 0) as total_pnl_lamports
@@ -1052,22 +1060,31 @@ export class WorkstationDatabase {
     return (res?.total_pnl_lamports || 0) / 1e9;
   }
 
+  /** Unrealized PnL of the mode's OPEN and PARTIALLY_CLOSED positions at their last marks (3C: the risk gate's worst case uses it). */
+  public getOpenUnrealizedPnLSol(mode: ExecutionMode): number {
+    return this.loadPositions()
+      .filter((p) => p.executionMode === mode && (p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED'))
+      .reduce((sum, pos) => sum + (pos.unrealizedPnLSol ?? 0), 0);
+  }
+
+  /** 3C: time of the oldest losing realized event at or after `sinceMs`, or null. Tells the operator when the 24 h window can move. */
+  public getOldestRealizedLossTs(mode: ExecutionMode, sinceMs: number): number | null {
+    const res = this.db.prepare(`
+      SELECT MIN(ts) as oldest FROM realized_events WHERE execution_mode = ? AND ts >= ? AND delta_lamports < 0
+    `).get(mode, sinceMs) as any;
+    return typeof res?.oldest === 'number' ? res.oldest : null;
+  }
+
   /**
    * B20: Daily Total PnL (Realized Closed PnL + Open Unrealized PnL - Transaction Fees)
    * Prevents unrealized drawdown blindness by accounting for mark-to-market open position losses.
    */
-  public getDailyTotalPnLSol(mode: ExecutionMode = 'LIVE'): number {
-    const closedPnL = this.getDailyRealizedPnLSol(mode);
-    const openPositions = this.loadPositions().filter(
-      (p) => p.executionMode === mode && (p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED')
-    );
-    const openUnrealizedPnL = openPositions.reduce(
-      (sum, pos) => sum + (pos.unrealizedPnLSol ?? 0),
-      0
-    );
+  public getDailyTotalPnLSol(mode: ExecutionMode = 'LIVE', sinceMs: number = WorkstationDatabase.utcMidnightMs()): number {
+    const closedPnL = this.getDailyRealizedPnLSol(mode, sinceMs);
+    const openUnrealizedPnL = this.getOpenUnrealizedPnLSol(mode);
     // Q3: realized and unrealized PnL already contain every fee, tip and rent of the trades that produced a position (cost basis is the
     // whole wallet delta, proceeds are post-fee). Only the fee of a transaction that landed and failed has no position to sit in.
-    const unbookedFeesSol = this.getDailyUnbookedFeesLamports(mode) / 1e9;
+    const unbookedFeesSol = this.getDailyUnbookedFeesLamports(mode, sinceMs) / 1e9;
     return Number((closedPnL + openUnrealizedPnL - unbookedFeesSol).toFixed(6));
   }
 
@@ -1076,15 +1093,13 @@ export class WorkstationDatabase {
    * Their cost is in no position's basis. Pre-written PENDING rows, rows that never reached the chain and rows that became positions
    * are not counted. A revert path has to record the landing slot for its fee to show up here.
    */
-  public getDailyUnbookedFeesLamports(mode: ExecutionMode): number {
-    const startOfDay = new Date();
-    startOfDay.setUTCHours(0, 0, 0, 0);
+  public getDailyUnbookedFeesLamports(mode: ExecutionMode, sinceMs: number = WorkstationDatabase.utcMidnightMs()): number {
     try {
       const res = this.db.prepare(`
         SELECT COALESCE(SUM(network_fee_lamports), 0) as total_fees
         FROM transactions
         WHERE execution_mode = ? AND submission_time >= ? AND reconciliation_state = 'REVERTED' AND landing_slot IS NOT NULL AND landing_slot > 0
-      `).get(mode, startOfDay.getTime()) as any;
+      `).get(mode, sinceMs) as any;
       return res?.total_fees || 0;
     } catch {
       return 0;

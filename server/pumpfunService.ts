@@ -326,13 +326,21 @@ export function httpPollersAllowed(env: NodeJS.ProcessEnv = process.env): boolea
   return allowedCluster(env) === 'mainnet-beta';
 }
 
+/**
+ * 3H (P3.7): how long after the last feed event that brought data the board still reads ONLINE. The HTTP fallback polls every 5 s and the
+ * log stream counts as active for 60 s (initPolling), so a quiet minute means nothing is arriving.
+ */
+export const PUMP_FEED_ONLINE_WINDOW_MS = 60_000;
+export type PumpFeedStatus = 'NO_DATA' | 'ONLINE' | 'STALE';
+
 export class PumpFunService extends EventEmitter {
   private callers: PumpFunCaller[] = isDemoMode() ? [...INITIAL_CALLERS] : [];
   private hotCallouts: PumpFunHotCallout[] = [];
   private firstSeenMcap = new Map<string, { mcapUsd: number; priceUsd: number }>();
-  private lastSyncTimestamp: number = 0;
+  private lastSyncTimestamp: number = 0; // wall clock, for display
+  private lastSyncMonotonicMs: number | null = null; // performance.now() of the same event, for the age
   private lastSyncLatencyMs: number = 0;
-  private liveSource: string = 'frontend-api-v3.pump.fun + DexScreener v1';
+  private liveSource: string = 'none yet'; // 3H: named after the feed that last delivered data, never before one has
   private isPolling: boolean = false;
   private rawTokensCache: any[] = [];
   private snipedMints: Set<string> = new Set();
@@ -373,6 +381,7 @@ export class PumpFunService extends EventEmitter {
   public handleOnChainCreateEvent(event: PumpCreateEvent) {
     executionCoordinator.recordPumpFeedEvent('SOLANA_WS_LISTENER', event.mint);
     this.lastSyncTimestamp = Date.now();
+    this.lastSyncMonotonicMs = performance.now();
     this.lastSyncLatencyMs = Math.round(event.parseLatencyMs);
     this.liveSource = 'Solana WebSocket Logs (Pump.fun V2)';
 
@@ -499,8 +508,13 @@ export class PumpFunService extends EventEmitter {
       }
 
       this.rawTokensCache = pumpCoins;
-      this.lastSyncLatencyMs = Math.round(performance.now() - t0);
-      this.lastSyncTimestamp = Date.now();
+      // 3H: a poll counts as feed activity only when pump.fun returned coins; a failed or empty fetch used to move the sync time too.
+      if (pumpCoins.length > 0) {
+        this.lastSyncLatencyMs = Math.round(performance.now() - t0);
+        this.lastSyncTimestamp = Date.now();
+        this.lastSyncMonotonicMs = performance.now();
+        this.liveSource = 'frontend-api-v3.pump.fun + DexScreener v1 (HTTP poll)';
+      }
 
       // 4. Construct Live Hot Callouts feed with caller attribution & HFT decay
       this.rebuildHotCallouts(pumpCoins, pairMetricsMap, solanaBoostedMints, opts.evaluateTriggers !== false);
@@ -845,13 +859,30 @@ export class PumpFunService extends EventEmitter {
     return this.autoSnipeRules;
   }
 
-  public getStatus() {
+  /**
+   * 3H (P3.7): the feed status comes from real feed activity. It used to be a fixed 'ONLINE', with a 1970 sync time before any sync.
+   * NO_DATA: no feed event has brought data yet. ONLINE: the last one is at most PUMP_FEED_ONLINE_WINDOW_MS old. STALE: older than that.
+   */
+  public getStatus(): {
+    status: PumpFeedStatus;
+    liveSource: string;
+    syncLatencyMs: number;
+    lastSyncTimestamp: number;
+    lastSyncAgeMs: number | null;
+    lastSyncTimeStr: string | null;
+    tokensTrackedCount: number;
+    hotCalloutsCount: number;
+    topCallersCount: number;
+  } {
+    const ageMs = this.lastSyncMonotonicMs === null ? null : Math.max(0, Math.round(performance.now() - this.lastSyncMonotonicMs));
+    const status: PumpFeedStatus = ageMs === null ? 'NO_DATA' : ageMs <= PUMP_FEED_ONLINE_WINDOW_MS ? 'ONLINE' : 'STALE';
     return {
-      status: 'ONLINE',
+      status,
       liveSource: this.liveSource,
       syncLatencyMs: this.lastSyncLatencyMs,
       lastSyncTimestamp: this.lastSyncTimestamp,
-      lastSyncTimeStr: new Date(this.lastSyncTimestamp).toLocaleTimeString(),
+      lastSyncAgeMs: ageMs,
+      lastSyncTimeStr: this.lastSyncTimestamp > 0 ? new Date(this.lastSyncTimestamp).toLocaleTimeString() : null,
       tokensTrackedCount: this.rawTokensCache.length,
       hotCalloutsCount: this.hotCallouts.length,
       topCallersCount: this.callers.length,

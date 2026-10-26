@@ -976,6 +976,7 @@ app.get('/api/pumpfun/callouts', requireOperatorAuth, (req, res) => {
   const status = pumpFunService.getStatus();
   res.json({
     status: 'OK',
+    feedStatus: status.status, // 3H: NO_DATA / ONLINE / STALE from real feed activity
     liveSource: status.liveSource,
     syncLatencyMs: status.syncLatencyMs,
     lastUpdated: status.lastSyncTimestamp,

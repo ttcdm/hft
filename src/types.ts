@@ -278,6 +278,8 @@ export interface PumpFunHotCallout {
 
 export interface PumpFunHotCalloutsResponse {
   status: string;
+  /** 3H: NO_DATA / ONLINE / STALE, from real feed activity on the server */
+  feedStatus?: 'NO_DATA' | 'ONLINE' | 'STALE';
   liveSource: string;
   syncLatencyMs: number;
   lastUpdated: number;

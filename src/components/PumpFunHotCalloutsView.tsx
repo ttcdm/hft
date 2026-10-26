@@ -68,6 +68,16 @@ interface PumpFunHotCalloutsViewProps {
   onRefreshParent?: () => void;
 }
 
+/** 3H (P3.7): the feed status as the server measures it. It used to be implied by fixed "Live ingest" text whether or not anything arrived. */
+export function FeedStatusPill({ status }: { status: string | null }) {
+  const tone =
+    status === 'ONLINE' ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+      : status === 'STALE' ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
+        : 'bg-slate-700/40 text-slate-300 border-slate-600/50';
+  const text = status === 'ONLINE' ? 'FEED ONLINE' : status === 'STALE' ? 'FEED STALE (nothing in the last minute)' : status === 'NO_DATA' ? 'NO FEED DATA YET' : 'FEED STATUS UNKNOWN';
+  return <span data-testid="feed-status-pill" className={`px-1.5 py-0.5 rounded text-[9px] font-mono border ${tone}`}>{text}</span>;
+}
+
 export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   capitalTier = 'MICRO_10',
   onAlertTrigger,
@@ -79,16 +89,19 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   const [callouts, setCallouts] = useState<PumpFunHotCallout[]>([]);
   const [leaderboard, setLeaderboard] = useState<PumpFunCaller[]>([]);
   const [statusInfo, setStatusInfo] = useState<{
+    /** 3H: from the server's real feed activity (NO_DATA / ONLINE / STALE); null until it has answered */
+    feedStatus: string | null;
     liveSource: string;
     syncLatencyMs: number;
     tokensTrackedCount: number;
     /** null until the server has reported a sync time; never invented from the browser clock (S19) */
     lastUpdated: number | null;
   }>({
+    feedStatus: null,
     liveSource: '—',
     syncLatencyMs: 0,
     tokensTrackedCount: 0,
-    lastUpdated: Date.now(),
+    lastUpdated: null,
   });
 
   const [rules, setRules] = useState({
@@ -118,6 +131,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
         setCallouts(data.callouts);
         setLeaderboard(data.leaderboard || []);
         setStatusInfo({
+          feedStatus: data.feedStatus ?? null,
           liveSource: data.liveSource || '—',
           syncLatencyMs: data.syncLatencyMs ?? 0,
           tokensTrackedCount: data.tokensTrackedCount ?? 0,
@@ -142,6 +156,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
       if (data.leaderboard) setLeaderboard(data.leaderboard);
       if (data.status) {
         setStatusInfo({
+          feedStatus: data.status.status ?? null,
           liveSource: data.status.liveSource || '—',
           syncLatencyMs: data.status.syncLatencyMs ?? 0,
           tokensTrackedCount: data.status.tokensTrackedCount ?? 0,
@@ -275,18 +290,15 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <span className="text-xs font-bold text-white uppercase tracking-wider font-mono">
                 Pump.fun Hot Callouts & Caller Reputation Engine
               </span>
-              <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-slate-700/40 text-slate-300 border border-slate-600/50">
-                <span>pump.fun API v3</span>
-              </span>
               {isWsLive && (
                 <span className="px-1.5 py-0.5 rounded text-[9px] font-mono bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 flex items-center space-x-1">
                   <Radio className="w-2.5 h-2.5 text-cyan-400 animate-pulse" />
-                  <span>WS STREAMING</span>
+                  <span>SCREEN UPDATES LIVE</span>
                 </span>
               )}
             </div>
             <p className="text-[11px] text-slate-300 mt-0.5">
-              Live ingest: <span className="font-mono text-cyan-300">{statusInfo.liveSource}</span> • {statusInfo.tokensTrackedCount} on-chain tokens monitored • Latency: <span className="font-mono text-emerald-400">{statusInfo.syncLatencyMs > 0 ? `${statusInfo.syncLatencyMs}ms` : '—'}</span>
+              <FeedStatusPill status={statusInfo.feedStatus} /> Ingest: <span className="font-mono text-cyan-300">{statusInfo.liveSource}</span> • {statusInfo.tokensTrackedCount} on-chain tokens monitored • Latency: <span className="font-mono text-emerald-400">{statusInfo.syncLatencyMs > 0 ? `${statusInfo.syncLatencyMs}ms` : '—'}</span>
             </p>
           </div>
         </div>

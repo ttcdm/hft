@@ -1,6 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import React from 'react';
+import { renderToStaticMarkup } from 'react-dom/server';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { startApp, startRpcStub, scratchDir, LOCALNET_STUB_GENESIS, type AppHandle, type RpcStub } from './helpers/liveServer';
 import { connectivityAuditSummary, probeBadge } from '../src/utils/probeBadge';
 
@@ -121,4 +123,48 @@ describe('3H P3.7: the connectivity diagnostics are built from the probes that r
     expect(toast.title).toBe('CONNECTIVITY AUDIT: 4 OF 5 UNREACHABLE');
     expect(toast.title).not.toContain('COMPLETE');
   }, 180_000);
+});
+
+describe('3H P3.7: the pump.fun feed status comes from real feed activity', () => {
+  const createEvent = (mint: string) => ({
+    signature: 'sig', slot: 1, mint, bondingCurve: mint, user: mint, creator: mint, name: 'Feed Test', symbol: 'FEED', uri: '',
+    virtualTokenReserves: 1_073_000_000_000_000n, virtualSolReserves: 30_000_000_000n, realTokenReserves: 793_100_000_000_000n, realSolReserves: 0n,
+    tokenTotalSupply: 1_000_000_000_000_000n, initialPriceSol: 0.000000028, initialMarketCapSol: 28, receivedAt: Date.now(), parsedAt: Date.now(),
+    parseLatencyMs: 0.8, source: 'SOLANA_WS_LOGS' as const,
+  });
+
+  it('getStatus() with no sync is NO_DATA (never ONLINE), names no source and has no 1970 sync time', async () => {
+    const { PumpFunService } = await import('../server/pumpfunService');
+    const st = new PumpFunService().getStatus();
+    expect(st.status).toBe('NO_DATA');
+    expect(st.status).not.toBe('ONLINE');
+    expect(st.liveSource).toBe('none yet');
+    expect(st.lastSyncTimeStr).toBeNull();
+    expect(st.lastSyncAgeMs).toBeNull();
+  });
+
+  it('a log-stream create event makes it ONLINE; a minute with nothing after it makes it STALE', async () => {
+    const { PumpFunService, PUMP_FEED_ONLINE_WINDOW_MS } = await import('../server/pumpfunService');
+    const svc = new PumpFunService();
+    const t0 = performance.now();
+    const clock = vi.spyOn(performance, 'now').mockReturnValue(t0);
+    try {
+      svc.handleOnChainCreateEvent(createEvent('FeedStatusMint1111111111111111111111111111') as any);
+      expect(svc.getStatus()).toMatchObject({ status: 'ONLINE', liveSource: 'Solana WebSocket Logs (Pump.fun V2)', lastSyncAgeMs: 0 });
+      clock.mockReturnValue(t0 + PUMP_FEED_ONLINE_WINDOW_MS);
+      expect(svc.getStatus().status).toBe('ONLINE');
+      clock.mockReturnValue(t0 + PUMP_FEED_ONLINE_WINDOW_MS + 1);
+      expect(svc.getStatus().status).toBe('STALE');
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('the callouts screen shows that status, not a fixed "live" claim', async () => {
+    const { FeedStatusPill } = await import('../src/components/PumpFunHotCalloutsView');
+    expect(renderToStaticMarkup(React.createElement(FeedStatusPill, { status: 'NO_DATA' }))).toContain('NO FEED DATA YET');
+    expect(renderToStaticMarkup(React.createElement(FeedStatusPill, { status: 'STALE' }))).toContain('FEED STALE');
+    expect(renderToStaticMarkup(React.createElement(FeedStatusPill, { status: 'ONLINE' }))).toContain('FEED ONLINE');
+    expect(renderToStaticMarkup(React.createElement(FeedStatusPill, { status: null }))).toContain('UNKNOWN');
+  });
 });

@@ -840,14 +840,13 @@ describe('Empirical Adversarial Challenger Suite: Protocol & Execution Correctne
               executionMode: 'PAPER',
             });
 
-            // The production fee computation: fee = (inputLamports * totalBps) / 10000
+            // 5A (N-41): the program charges the fee on the curve input: net = (input - 1) x 1e4 / (1e4 + totalBps), fee = input - net
             const totalBps = BigInt(protocolBps + creatorBps);
-            const expectedFee = (solInputLamports * totalBps) / 10000n;
+            const net = solInputLamports > 1n ? ((solInputLamports - 1n) * 10000n) / (10000n + totalBps) : solInputLamports;
+            const expectedFee = totalBps > 0n ? solInputLamports - net : 0n;
 
-            // PumpCurveService's protocol fee must match integer arithmetic exactly
-            expect(BigInt(quote.protocolFeeLamports)).toBe(
-              (solInputLamports * BigInt(protocolBps)) / 10000n
-            );
+            // the creator share is ceil(net x bps / 1e4), as the SDK's getFee; the protocol takes the rest
+            expect(BigInt(quote.creatorFeeLamports)).toBe(creatorBps > 0 ? (net * BigInt(creatorBps) + 9999n) / 10000n : 0n);
             // Total fee (protocol + creator) must match the combined formula
             const quoteTotalFee = BigInt(quote.protocolFeeLamports) + BigInt(quote.creatorFeeLamports ?? 0);
             expect(quoteTotalFee).toBe(expectedFee);
@@ -874,7 +873,8 @@ describe('Empirical Adversarial Challenger Suite: Protocol & Execution Correctne
         executionMode: 'PAPER',
       });
 
-      const expectedFee = (solInputLamports * 105n) / 10000n;
+      // 5A (N-41): fee on the curve input: input - floor((input - 1) x 1e4 / 10105)
+      const expectedFee = solInputLamports - ((solInputLamports - 1n) * 10000n) / 10105n;
       expect(BigInt(quote.protocolFeeLamports + quote.creatorFeeLamports)).toBe(expectedFee);
       expect(BigInt(quote.tokenAmountRaw)).toBeGreaterThan(0n);
       expect(BigInt(quote.maxInputLamports)).toBeGreaterThanOrEqual(solInputLamports);

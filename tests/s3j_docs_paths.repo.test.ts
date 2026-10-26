@@ -4,13 +4,13 @@ import path from 'node:path';
 
 /**
  * 3J: repository-file checks on the documents, kept apart from s3j_docs_constants.test.ts because they read files and call no production
- * code (*.repo.test.ts, as the facade checker expects): every path docs/LATENCY.md and docs/RUNBOOK.md name exists, and every `file:line`
- * in LATENCY.md points inside its file at a non-blank line.
+ * code (*.repo.test.ts, as the facade checker expects): every path docs/LATENCY.md and docs/RUNBOOK.md name exists, and every code
+ * reference in LATENCY.md (a file and a piece of code in it) is still in that file.
  */
 const read = (f: string) => fs.readFileSync(f, 'utf8');
 const doc = { latency: read('docs/LATENCY.md'), runbook: read('docs/RUNBOOK.md') };
 
-describe('paths and file:line references in LATENCY.md and RUNBOOK.md', () => {
+describe('paths and code references in LATENCY.md and RUNBOOK.md', () => {
   const targets: Array<[string, string]> = [['docs/LATENCY.md', doc.latency], ['docs/RUNBOOK.md', doc.runbook]];
 
   for (const [name, text] of targets) {
@@ -28,14 +28,15 @@ describe('paths and file:line references in LATENCY.md and RUNBOOK.md', () => {
     });
   }
 
-  const refs = [...doc.latency.matchAll(/`([A-Za-z0-9_./-]+\.tsx?):(\d+)`/g)].map((m) => [m[1], Number(m[2])] as [string, number]);
-  it('LATENCY.md has file:line references to check', () => {
+  // A reference names a file and a piece of code in it, not a line number: lines move with every patch (3B shifted all of them).
+  const refs = [...doc.latency.matchAll(/`([A-Za-z0-9_./-]+\.tsx?)` \(`([^`]+)`\)/g)].map((m) => [m[1], m[2]] as [string, string]);
+  it('LATENCY.md has code references to check', () => {
     expect(refs.length).toBeGreaterThan(40);
+    expect(doc.latency).not.toMatch(/`[A-Za-z0-9_./-]+\.tsx?:\d+`/); // no file:line left
   });
-  it.each(refs)('%s:%i is inside the file and not blank', (file, line) => {
-    const lines = read(file).split('\n');
-    expect(line).toBeGreaterThan(0);
-    expect(line).toBeLessThanOrEqual(lines.length);
-    expect(lines[line - 1].trim().length, `${file}:${line} is blank`).toBeGreaterThan(0);
+  it.each(refs)('%s still contains %j', (file, anchor) => {
+    expect(read(file), `${file} no longer contains ${anchor}`).toContain(anchor);
   });
+
 });
+

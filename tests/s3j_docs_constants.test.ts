@@ -12,7 +12,7 @@ import { WorkstationDatabase } from '../server/db/database';
 import { DEFAULT_RPC_REQUEST_TIMEOUT_MS, RPC_READ_TRIES, SLOW_READ_TIMEOUT_MS, DEFAULT_RPC_LIMITER_MAX_WAIT_MS } from '../server/solana/rpcConnection';
 import {
   SELL_RATE_LIMIT_BACKOFF_MS, EXIT_RATE_LIMITED_WAIT_MS, EXIT_SELL_WAIT_MS, MARK_STALE_MS, MARK_RETRY_BASE_MS, MARK_RETRY_MAX_MS,
-  MARK_ALERT_AFTER_MS, EXIT_RETRY_BASE_MS, EXIT_RETRY_MAX_MS, SELL_SLIPPAGE_LADDER_BPS,
+  MARK_ALERT_AFTER_MS, EXIT_RETRY_BASE_MS, EXIT_RETRY_MAX_MS, SELL_SLIPPAGE_LADDER_BPS, LIVE_BUY_FILLED, ExecutionCoordinator,
 } from '../server/execution/coordinator';
 import { PANIC_BUY_SETTLE_WAIT_MS } from '../server/execution/emergencyStop';
 import { READINESS_RED_LIMIT_MS, WALLET_AUDIT_BASE_TOLERANCE_SOL } from '../server/auto/killSwitch';
@@ -23,7 +23,7 @@ import { LOGIN_RATE_LIMIT } from '../server/middleware/enterprise';
  * 3J: every constant that docs/LATENCY.md, docs/RUNBOOK.md and docs/ARCHITECTURE.md state a value for has that value in the code, and the
  * document still states it. A change to the constant fails the first check; a rewrite of the document that drops or changes the figure
  * fails the second. Constants that are not exported are read from the source text with a pattern that must match exactly once.
- * The checks that only read repository files (paths named in the documents, `file:line` references) are in s3j_docs_paths.repo.test.ts.
+ * The checks that only read repository files (paths named in the documents, code references in LATENCY.md) are in s3j_docs_paths.repo.test.ts.
  */
 const read = (f: string) => fs.readFileSync(f, 'utf8');
 const doc = { latency: read('docs/LATENCY.md'), runbook: read('docs/RUNBOOK.md'), arch: read('docs/ARCHITECTURE.md'), env: read('docs/ENV.md') };
@@ -118,5 +118,35 @@ describe('constants named in the docs have the value the docs state', () => {
   it.each(rows.map((r) => r[0]))('%s: the document still says it', (name) => {
     const [, , , which, phrase] = byName(name);
     expect(doc[which], `${which} should contain: ${phrase}`).toContain(phrase);
+  });
+});
+
+describe('3B and A3 statements in the documents', () => {
+  it('the journal row name ARCHITECTURE states is the one the code writes', () => {
+    expect(LIVE_BUY_FILLED).toBe('LIVE_BUY_FILLED');
+    expect(doc.arch).toContain("`outcome = 'LIVE_BUY_FILLED'`");
+    expect(doc.arch).toContain('journalLiveBuySolDelta');
+    expect(read('server/execution/coordinator.ts')).toContain('private journalLiveBuySolDelta(');
+  });
+  it('the unresolved-buy count and its refusal text exist in the code as documented', () => {
+    const coordinator = read('server/execution/coordinator.ts');
+    expect(coordinator).toContain('public getUnresolvedLiveBuys(');
+    expect(coordinator).toContain('UNRESOLVED_BUY: the ledger of unresolved LIVE buys could not be read');
+    expect(doc.arch).toContain('UNRESOLVED_BUY: the ledger of unresolved LIVE buys could not be read');
+    expect(doc.arch).toContain('`DEVNET_MAX_OPEN_POSITIONS`');
+    expect(DEVNET_MAX_OPEN_POSITIONS).toBeGreaterThan(0);
+  });
+  it('the failed-sell wait runs down on the monotonic clock, as ARCHITECTURE and KNOWN_RISKS say', () => {
+    expect(String(ExecutionCoordinator.prototype.exitRetryWaitMs)).toContain('performance.now()'); // the wait runs down on the monotonic clock
+    expect(doc.arch).toContain('`setAtMono`');
+    expect(read('KNOWN_RISKS.md')).toContain('Failed-sell retry waits (A3)');
+  });
+});
+
+describe('3E statements in the documents (the code is in the 3E patches)', () => {
+  it('state the figures 3E fixes: 20 trades, 10 s of unknown balance, the refusal and the request field', () => {
+    expect(READINESS_RED_LIMIT_MS).toBe(10_000);
+    for (const phrase of ['last 20', 'LOSS_TRIGGERS_NEED_ACK', 'ackLossTriggers', '10 s']) expect(doc.runbook).toContain(phrase);
+    for (const phrase of ['LOSS_TRIGGER_TRADES', 'auto.lossTriggerAck', 'auto.kill']) expect(doc.arch).toContain(phrase);
   });
 });

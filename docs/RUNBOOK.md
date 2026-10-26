@@ -34,7 +34,7 @@ There are five different stops. Only stopping the process stops the exits too.
 |---|---|---|---|---|
 | Kill switch: the KILL SWITCH button, or `POST /api/execution/kill-switch` `{"activate":true}` | yes, PAPER and LIVE; also disarms LIVE | no | OFF, saved once any buy in flight has finished | the switch: no (memory only); the auto OFF: yes |
 | Panic: `POST /api/wallet/panic-liquidate` (also WebSocket `PANIC_LIQUIDATE`, Telegram `/panic_sell`) | as the kill switch, then sells every active position | no | as the kill switch | as the kill switch |
-| Auto kill: `POST /api/auto/kill` `{"exitAll":false}` | auto only | no | OFF, saved once any buy in flight has finished | the OFF does |
+| Auto kill: `POST /api/auto/kill` `{"exitAll":false}` | auto only | no | OFF, saved with the kill reason before it waits for a buy in flight (3E) | the OFF does: after a restart `GET /api/auto/status` shows `mode` `OFF`, `killed` true and `killReason`; setting a mode clears it |
 | Halt (set by the DEVNET_LIVE wallet audit; no operator route sets it) | yes | take-profit and stale exits only | OFF | yes (saved in the database) |
 | Stop the process | yes | yes, all of them | n/a | n/a |
 
@@ -51,7 +51,7 @@ api $APEX/api/execution/can-arm                                      # reasons i
 api $APEX/api/auto/status                                            # expect mode OFF, killed: true
 ```
 
-The kill switch runs the shared emergency stop without the sells: kill switch on, auto killed and set OFF once a buy it already had in flight has finished, LIVE disarmed. The reply carries `autoMode`. The switch itself is cleared by a restart; the auto OFF is saved, so a restart comes back OFF. After such a restart the `KILL_SWITCH_WAS_ON` alert is raised and LIVE refuses to arm (can-arm lists it) until it is cleared with `POST /api/auto/resume {"clearHalt":true}`. Resetting the switch (`{"activate":false}`) turns nothing back on: auto stays OFF and LIVE stays disarmed until an operator sets them again (DEVNET_LIVE needs `CONFIRM_AUTO_DEVNET` again). A DEVNET_LIVE session that sees LIVE disarmed or the kill switch on by any other route also turns itself OFF. Exits keep running on open positions.
+The kill switch runs the shared emergency stop without the sells: kill switch on, auto killed (OFF and the kill reason are saved first, before it waits for a buy already in flight), LIVE disarmed. The reply carries `autoMode`. The switch itself is cleared by a restart; the auto OFF is saved, so a restart comes back OFF. After such a restart the `KILL_SWITCH_WAS_ON` alert is raised and LIVE refuses to arm (can-arm lists it) until it is cleared with `POST /api/auto/resume {"clearHalt":true}`. Resetting the switch (`{"activate":false}`) turns nothing back on: auto stays OFF and LIVE stays disarmed until an operator sets them again (DEVNET_LIVE needs `CONFIRM_AUTO_DEVNET` again). A DEVNET_LIVE session that sees LIVE disarmed or the kill switch on by any other route also turns itself OFF. Exits keep running on open positions.
 
 ### 1.2 Stop buying and sell everything
 
@@ -86,11 +86,11 @@ Find out which one:
 - `api $APEX/api/diagnostics/system`: `systemAudit.killSwitchActive` and `riskControls.circuitBreakerState`.
   - Kill switch on and breaker `OPEN`: three wallet-balance reads failed in a row, which opened the circuit breaker and set the kill switch. Every buy, PAPER included, is refused while it is open. To close it, fix the RPC, wait for a wallet-balance read to succeed (one runs every 10 s; System checks shows when the latest one succeeded), then reset the kill switch: `POST /api/execution/kill-switch` with `{"activate":false}`. A reset while the latest read still fails leaves the breaker `OPEN` and says why in `circuitBreakerReset.reason`.
   - Kill switch on, breaker `CLOSED`: the operator button or route, or a panic.
-- `api $APEX/api/auto/status`: an auto kill trigger (`DAILY_LOSS_LIMIT`, `NEGATIVE_EXPECTANCY`, `LOSS_STREAK`, `SLIPPAGE_BREACHES`, `READINESS_RED`, `WALLET_LOW`, `WALLET_UNKNOWN`) drops auto to SHADOW and, from DEVNET_LIVE, disarms LIVE. It does not set the risk-engine kill switch.
+- `api $APEX/api/auto/status`: an auto kill trigger (`DAILY_LOSS_LIMIT`, `NEGATIVE_EXPECTANCY`, `LOSS_STREAK`, `SLIPPAGE_BREACHES`, `READINESS_RED`, `WALLET_LOW`, `WALLET_UNKNOWN`) drops auto to SHADOW and, from DEVNET_LIVE, disarms LIVE. It does not set the risk-engine kill switch. `NEGATIVE_EXPECTANCY` and `LOSS_STREAK` judge the last 20 closed trades auto opened (in the same mode, across sessions and restarts, never a trade you opened by hand), so a new session does not wipe them; after one trips, setting PAPER or DEVNET_LIVE is refused until you acknowledge (section 6). `WALLET_UNKNOWN` fires only after no good wallet balance read for more than 10 s (`READINESS_RED_LIMIT_MS`).
 - A halt (`TRADING_HALTED` alert, "All trading is halted" in `can-arm`) is something else: section 3.
 
 Facts to keep in mind:
-- The kill switch lives in memory only. A restart clears it, and the saved auto mode (at most PAPER; a saved DEVNET_LIVE comes back as SHADOW) comes back with a fresh session.
+- The kill switch lives in memory only. A restart clears it, and the saved auto mode (at most PAPER; a saved DEVNET_LIVE comes back as SHADOW) comes back with a fresh session, except after a kill: a kill saved by the last run (`auto.kill`) keeps auto OFF and killed until you set a mode.
 - Resetting it closes an open circuit breaker only when the latest wallet-balance read succeeded, and never clears a halt; the reply carries `circuitBreaker`, `circuitBreakerReset` (whether it closed, and why not) and `haltReason` so you can see which are still set.
 
 To recover:
@@ -104,7 +104,7 @@ To recover:
 
 In DEVNET_LIVE the auto controller compares the wallet's SOL every 5 s with what the decision journal says moved. A difference above 0.0005 SOL plus allowances halts the coordinator and sets auto OFF. The halt refuses every buy and the take-profit and stale exits; stop-loss, trailing stop, manual close and panic still run (a LIVE manual close of a position too small to cover its fees is still refused as dust). The halt is saved in the database and survives a restart.
 
-It also fires on SOL moves the journal has no row for, which are not theft: for example a manual LIVE buy while DEVNET_LIVE runs.
+It also fires on SOL moves the journal has no row for, which are not theft: for example a SOL transfer you made by hand. Since 3B every landed LIVE buy, manual or auto, writes a `LIVE_BUY_FILLED` row with its whole wallet delta, so a buy no longer trips the audit, and while a LIVE buy is sent and unresolved a wallet drop up to its worst case is held as that buy's (no halt) until recovery journals it. A drop larger than that, or any rise, still halts.
 
 To recover:
 1. Do not move SOL or tokens by hand yet. Open positions are still protected by their stop-loss.
@@ -142,3 +142,13 @@ Every LIVE buy re-reads a short readiness list (section 3 of [`ARCHITECTURE.md`]
 | `DEMO_MODE=true (...)` | the demo switch is on | unset `DEMO_MODE` and restart; LIVE cannot be armed while it is on |
 
 `ENTRY_REVOKED: ... after the order was approved; nothing was sent` means one of these (or a disarm, a halt or the kill switch) happened between approval and the send; the signed transaction was dropped unsent. Sells are never refused for these reasons.
+
+## 6. Auto refuses PAPER or DEVNET_LIVE with LOSS_TRIGGERS_NEED_ACK (3E)
+
+`POST /api/auto/mode` answers 409 with an error starting `LOSS_TRIGGERS_NEED_ACK:` when the last 20 closed trades auto opened in that mode (PAPER, or LIVE for DEVNET_LIVE) trip `NEGATIVE_EXPECTANCY` or `LOSS_STREAK`. The restore of a saved mode at startup is refused the same way. Only auto's own trades count: positions in the current session, or with a `BOUGHT` journal row, closed after the last acknowledgement.
+
+1. Look at those trades (`api $APEX/api/auto/status`, the journal) and decide whether the losses are understood.
+2. Acknowledge: `api -X POST $APEX/api/auto/resume -d '{"ackLossTriggers":true}'`. The reply adds `lossTriggersAcked`; `false` means it could not be saved and nothing changed. Trades closed before now stop counting, in both modes; it is one timestamp (`app_settings` key `auto.lossTriggerAck`). It does not change the mode.
+3. Set the mode again (section 2, steps 4-5, for DEVNET_LIVE).
+
+There is no button for this in the UI yet (the 3E notes say so); the API is the only way. An acknowledgement that cannot be read back counts as none, so every trade counts.

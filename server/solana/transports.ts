@@ -270,6 +270,7 @@ export class SolanaRpcTransport implements ExecutionTransport {
     const hardStop = startTime + maxWaitMs + (lvbh !== undefined ? (opts.maxExtendMs ?? 60_000) : 0);
     const resendEveryMs = opts.resendEveryMs ?? 1_500;
     let lastResend = startTime;
+    let resendStopped = false;
     let lastPollError: string | null = null;
     let expired = false;
     const statusOf = async (history: boolean) => {
@@ -304,10 +305,17 @@ export class SolanaRpcTransport implements ExecutionTransport {
           lastPollError = hErr?.message ?? String(hErr); // an unreadable height is not expiry: keep watching until the hard stop
         }
       }
-      if (opts.rebroadcast && t - lastResend >= resendEveryMs) {
+      if (opts.rebroadcast && !resendStopped && t - lastResend >= resendEveryMs) {
         lastResend = t;
         // through submit, so the read-only and cluster guards run on every resend; a failed resend is logged there and only skips this round
-        await this.submit(opts.rebroadcast, { maxRetries: 0 });
+        try {
+          await this.submit(opts.rebroadcast, { maxRetries: 0 });
+        } catch (guardErr: any) {
+          // Review L1: a guard that throws before sending (read-only turned on, or the cluster refused, mid-watch) stops the resends only.
+          // The transaction may already have landed, so the watch goes on and settles the row as it would without resends.
+          resendStopped = true;
+          Logger.warn(`Resends of ${signature.slice(0, 8)} stopped, the watch goes on: ${guardErr?.message ?? String(guardErr)}`);
+        }
       }
       await confirmPacing.sleep(400);
     }

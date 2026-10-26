@@ -30,8 +30,8 @@ Values are read as strings. Booleans mean the exact text `true` unless the row s
 | `AUTO_MANAGE_RECOVERED` | off | `server/execution/coordinator.ts` | `true` lets the exit ladder manage positions rebuilt after a restart; otherwise they only get the hard stop. |
 | `CONFLUENCE_MIN_SCORE` | `70` | `server/signals/confluenceThreshold.ts` | Whole number 0 to 100. Starting value of the confluence buy threshold; the operator can change it at runtime. An invalid value is ignored with a warning. |
 | `MIN_LIQUIDITY_USD` | `2000` | `server/solana/executionConfig.ts` | Eligibility floor in USD. Devnet curves hold a few dollars, so a devnet run needs a lower value (the 2026-10-10 round trip used `5`). Honoured off mainnet only. |
-| `MAX_POSITION_SIZE_SOL` | `0.02` (MICRO_10) or `1.50` | `server/solana/executionConfig.ts` | Upper limit for one order, including the editable snipe amount and auto order size. |
-| `MAX_DAILY_LOSS_USD` | `2.50` (MICRO_10) or `250.00` | `server/solana/executionConfig.ts` | Daily loss limit in USD. (`MAX_DAILY_LOSS_SOL` appears in old notes and is not read.) |
+| `MAX_POSITION_SIZE_SOL` | `0.02` (MICRO_10) or `1.50` | `server/solana/executionConfig.ts` | Upper limit for one order, including the editable snipe amount and auto order size. When set it must be a plain number above 0 (`0.02`, not `$0.02`), or the server refuses to start. |
+| `MAX_DAILY_LOSS_USD` | `2.50` (MICRO_10) or `250.00` | `server/solana/executionConfig.ts` | Daily loss limit in USD. When set it must be a plain number above 0, or the server refuses to start. (`MAX_DAILY_LOSS_SOL` appears in old notes and is not read.) |
 | `MAX_SLIPPAGE_BPS` | `800` | `server/solana/executionConfig.ts` | Risk engine slippage cap (8%). |
 | `PRIORITY_FEE_MICROLAMPORTS` | `25000` | `server/solana/executionConfig.ts` | Priority fee on ordinary transactions. |
 | `CAPITAL_TIER` | `MICRO_10` | `server/solana/executionConfig.ts` | `MICRO_10`, `INSTITUTIONAL` or `CUSTOM`. Picks the defaults above. |

@@ -78,8 +78,28 @@ export function calculateDynamicJitoTipSol(tradeNotionalSol: number): number {
   return calculateDynamicJitoTip(tradeNotionalSol) / 1e9;
 }
 
+/**
+ * R1-8, R1-36 (3C): the two loss caps. A value that is set must be a plain finite number above 0, or startup stops: with bare
+ * parseFloat, "$0.02" or "abc" gave NaN, every comparison against NaN is false, and the position, exposure and daily-loss caps
+ * were all off. Unset or empty means the tier default.
+ */
+export function parsePositiveLimit(name: string, raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === '') return fallback;
+  const value = Number(raw.trim());
+  if (!Number.isFinite(value) || value <= 0) {
+    throw new Error(`${name}=${JSON.stringify(raw)} is not a number above 0. Fix it in the environment (for example ${name}=${fallback}) or unset it to use the tier default; refusing to start with the loss caps off.`);
+  }
+  return value;
+}
+
+function assertPositiveLimit(name: string, value: unknown) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+    throw new Error(`${name} must be a finite number above 0 (got ${String(value)})`);
+  }
+}
+
 // Single source of truth configuration parsed from environment with strict production defaults
-class ExecutionConfigManager {
+export class ExecutionConfigManager {
   private config: AuthoritativeExecutionConfig;
 
   constructor() {
@@ -103,8 +123,8 @@ class ExecutionConfigManager {
       priorityFeeMicrolamports: parseInt(process.env.PRIORITY_FEE_MICROLAMPORTS || '25000', 10) || 25000,
       maxSlippageBps: parseInt(process.env.MAX_SLIPPAGE_BPS || '800', 10) || 800,
       capitalTier,
-      maxDailyLossUsd: parseFloat(process.env.MAX_DAILY_LOSS_USD || (capitalTier === 'MICRO_10' ? '2.50' : '250.00')),
-      maxPositionSizeSol: parseFloat(process.env.MAX_POSITION_SIZE_SOL || (capitalTier === 'MICRO_10' ? '0.02' : '1.50')),
+      maxDailyLossUsd: parsePositiveLimit('MAX_DAILY_LOSS_USD', process.env.MAX_DAILY_LOSS_USD, capitalTier === 'MICRO_10' ? 2.5 : 250),
+      maxPositionSizeSol: parsePositiveLimit('MAX_POSITION_SIZE_SOL', process.env.MAX_POSITION_SIZE_SOL, capitalTier === 'MICRO_10' ? 0.02 : 1.5),
       demoMode: process.env.DEMO_MODE === 'true',
       jitoMaxRetries: parseInt(process.env.JITO_MAX_RETRIES || '2', 10) || 2,
       jitoRetryIntervalMs: parseInt(process.env.JITO_RETRY_INTERVAL_MS || '1000', 10) || 1000,
@@ -122,6 +142,8 @@ class ExecutionConfigManager {
   }
 
   public updateConfig(partial: Partial<AuthoritativeExecutionConfig>): AuthoritativeExecutionConfig {
+    if ('maxDailyLossUsd' in partial) assertPositiveLimit('maxDailyLossUsd', partial.maxDailyLossUsd);
+    if ('maxPositionSizeSol' in partial) assertPositiveLimit('maxPositionSizeSol', partial.maxPositionSizeSol);
     this.config = {
       ...this.config,
       ...partial,

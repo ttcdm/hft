@@ -156,6 +156,20 @@ describe('R1-121 / N-54: hermeticEnv mirrors the vitest sanitation', () => {
     expect(run.status, run.out).toBe(2);
   });
 
+  it('S267 (review 2026-10-24, finding 5): a hard link to the repo keypair, or its name in another case on a case-insensitive volume, is still refused', () => {
+    const d = fs.realpathSync(scratch());
+    keyFile(d, '.apex_trading_keypair.json');
+    const hard = path.join(fs.realpathSync(scratch()), 'hard-link.json');
+    fs.linkSync(path.join(d, '.apex_trading_keypair.json'), hard);
+    expect(sanitized({ SIGNER_KEYPAIR_PATH: hard }, d).problems).toHaveLength(1);
+    const upper = path.join(d, '.APEX_TRADING_KEYPAIR.json');
+    if (fs.existsSync(upper)) expect(sanitized({ SIGNER_KEYPAIR_PATH: upper }, d).problems).toHaveLength(1); // APFS/HFS+ default: case-insensitive
+    // a different file of the same name elsewhere is not the repo keypair
+    const other = fs.realpathSync(scratch());
+    keyFile(other, 'own-key.json');
+    expect(sanitized({ SIGNER_KEYPAIR_PATH: path.join(other, 'own-key.json') }, d).problems).toHaveLength(0);
+  });
+
   it('T9: an exported private key is removed, so it cannot beat SIGNER_KEYPAIR_PATH', () => {
     const d = scratch();
     const shellKey = bs58.encode(Keypair.generate().secretKey);

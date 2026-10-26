@@ -27,15 +27,29 @@ export function hermeticScriptEnv(env: NodeJS.ProcessEnv, cwd: string, repoRoot:
   if (env.APEX_SCRIPT_ALLOW_REPO_STATE === 'true') return [];
   // Symlinks are resolved on both sides (macOS: /var is /private/var, and process.cwd() reports the real path), so a link to the repo
   // file, or the same file named through a linked directory, is still the repo file.
+  // S267 (review 2026-10-24, finding 5): when both files exist they are also compared as files (device and inode), so a hard link, or a
+  // name that differs only in case on a case-insensitive volume (APFS by default), is still the repo file.
   const isRepoFile = (p: string, name: string) => {
-    const r = realPath(path.resolve(cwd, p));
-    return r === realPath(path.resolve(cwd, name)) || r === realPath(path.resolve(repoRoot, name));
+    const target = path.resolve(cwd, p);
+    const r = realPath(target);
+    return [path.resolve(cwd, name), path.resolve(repoRoot, name)].some((repo) => r === realPath(repo) || sameFile(target, repo));
   };
   const problems: string[] = [];
   const db = env.TEST_DB_PATH || env.APEX_DB_PATH;
   if (db !== ':memory:' && isRepoFile(db, 'apex_workstation.db')) problems.push(`the database would be the live ${db}`);
   if (isRepoFile(env.SIGNER_KEYPAIR_PATH, '.apex_trading_keypair.json')) problems.push(`the signer key would be the repo keypair ${env.SIGNER_KEYPAIR_PATH}`);
   return problems;
+}
+
+/** True when both paths exist and are the same file (same device and inode): links, hard links and case variants included. */
+function sameFile(a: string, b: string): boolean {
+  try {
+    const x = fs.statSync(a);
+    const y = fs.statSync(b);
+    return x.dev === y.dev && x.ino === y.ino;
+  } catch {
+    return false;
+  }
 }
 
 /** `p` with every symlink resolved; for a file that does not exist yet, its nearest existing parent is resolved instead. */

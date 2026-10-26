@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeAll, afterAll, afterEach } from 'vitest';
 import net from 'node:net';
+import WebSocket from 'ws';
 import type { Request, Response } from 'express';
 import { rateLimiter, LOGIN_RATE_LIMIT, WalletConfigSchema } from '../server/middleware/enterprise';
 import { authManager } from '../server/middleware/auth';
@@ -218,3 +219,52 @@ describe('3G N-10: /api/workstation/events clamps limit to 1..200', () => {
   });
 });
 
+describe('3G N-4: a WebSocket stays authenticated only while its token validates', () => {
+  async function authedSocket(sessionToken: string) {
+    const ws = new WebSocket(`${base.replace('http', 'ws')}/ws/engine`);
+    const frames: any[] = [];
+    ws.on('message', (m) => frames.push(JSON.parse(m.toString())));
+    const closed = new Promise<number>((r) => ws.once('close', (code) => r(code)));
+    await new Promise<void>((r, j) => { ws.once('open', () => r()); ws.once('error', j); });
+    ws.send(JSON.stringify({ action: 'AUTHENTICATE', sessionToken }));
+    await vi.waitFor(() => expect(frames.some((f) => f.type === 'AUTHENTICATED')).toBe(true));
+    return { ws, frames, closed };
+  }
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it('after a rotate, the old socket is closed with 4001 and gets no further broadcast', async () => {
+    const sock = await authedSocket(authManager.createSession('OPERATOR').token);
+    const r = await call('POST', '/api/auth/rotate');
+    expect(r.status).toBe(200);
+    token = r.json.token; // the rotate revoked every other token, ours included
+    const seen = sock.frames.length;
+    // a sensitive broadcast after the rotate
+    vi.spyOn(walletTrader, 'syncRpcBalance').mockResolvedValue(null);
+    walletTrader.emit('wallet_state_updated', walletTrader.getState());
+    expect(await sock.closed).toBe(4001);
+    expect(sock.frames.slice(seen).some((f) => f.type === 'WALLET_STATE_UPDATED')).toBe(false);
+  });
+
+  it('after a logout of its token, the socket is closed with 4001; a socket on another token stays open', async () => {
+    const mine = authManager.createSession('OPERATOR').token;
+    const gone = await authedSocket(mine);
+    const other = await authedSocket(token);
+    const r = await fetch(`${base}/api/auth/logout`, { method: 'POST', headers: { authorization: `Bearer ${mine}` } });
+    expect(r.status).toBe(200);
+    expect(await gone.closed).toBe(4001);
+    const seen = other.frames.length;
+    walletTrader.emit('wallet_state_updated', walletTrader.getState());
+    await vi.waitFor(() => expect(other.frames.slice(seen).some((f) => f.type === 'WALLET_STATE_UPDATED')).toBe(true));
+    expect(other.ws.readyState).toBe(WebSocket.OPEN);
+    other.ws.close();
+  });
+
+  it('an expired token is closed at the next broadcast', async () => {
+    const session = authManager.createSession('OPERATOR');
+    const sock = await authedSocket(session.token);
+    session.expiresAt = Date.now() - 1; // the session object the manager returned: expiry is its public field
+    walletTrader.emit('wallet_state_updated', walletTrader.getState());
+    expect(await sock.closed).toBe(4001);
+  });
+});

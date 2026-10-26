@@ -16,6 +16,7 @@ export class AuthManager {
   private sessions: Map<string, OperatorSession> = new Map();
   private primaryOperatorToken: string;
   private readonly sessionTtlMs = 24 * 60 * 60 * 1000; // 24 hours
+  private readonly revokeListeners = new Set<() => void>();
 
   constructor() {
     // Delete legacy .operator_session file if present to guarantee no credentials on disk
@@ -88,7 +89,23 @@ export class AuthManager {
       role: 'OPERATOR',
     });
     Logger.warn('Operator session rotated: all previous tokens revoked, new ephemeral token active.');
+    this.notifyRevoked();
     return newToken;
+  }
+
+  /**
+   * 3G (N-4): called after a rotate or a logout revokes tokens, so whatever holds a token outside a request (an authenticated
+   * WebSocket) can drop it at once instead of at its next use. Returns the unsubscribe function.
+   */
+  public onRevoke(fn: () => void): () => void {
+    this.revokeListeners.add(fn);
+    return () => { this.revokeListeners.delete(fn); };
+  }
+
+  private notifyRevoked() {
+    for (const fn of this.revokeListeners) {
+      try { fn(); } catch (err: any) { Logger.warn(`Token revoke listener failed: ${err?.message || err}`); }
+    }
   }
 
   public getPrimaryToken(): string {
@@ -150,7 +167,9 @@ export class AuthManager {
   }
 
   public revokeToken(token: string): boolean {
-    return this.sessions.delete(token);
+    const removed = this.sessions.delete(token);
+    if (removed) this.notifyRevoked();
+    return removed;
   }
 
   public getSession(token: string): OperatorSession | undefined {

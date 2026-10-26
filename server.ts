@@ -149,11 +149,33 @@ function safeJsonStringify(payload: any): string {
   }
 }
 
+/** WS close code for a socket whose operator token was rotated, revoked or expired after it authenticated (3G, N-4). */
+const WS_CLOSE_TOKEN_REVOKED = 4001;
+
+/**
+ * 3G (N-4): an authenticated socket keeps the token it authenticated with, and stays authenticated only while that token validates.
+ * It used to keep a flag set once, so a rotate, logout or expiry did not stop the sensitive broadcasts. Returns false (and closes the
+ * socket with 4001) when the token no longer validates.
+ */
+function wsTokenStillValid(client: WebSocket): boolean {
+  const c = client as any;
+  if (!c.isAuthenticated) return true;
+  if (verifyWsAuth(c.operatorToken)) return true;
+  c.isAuthenticated = false;
+  c.operatorToken = undefined;
+  try { client.close(WS_CLOSE_TOKEN_REVOKED, 'Operator token revoked'); } catch {}
+  return false;
+}
+
+// A rotate or logout closes the sockets it revoked right away, not at the next broadcast.
+authManager.onRevoke(() => wss.clients.forEach((client) => { wsTokenStillValid(client); }));
+
 // Helper to broadcast WS messages safely (default sensitiveOnly = true: requires operator auth)
 function broadcastWs(payload: any, sensitiveOnly: boolean = true) {
   const str = safeJsonStringify(payload);
   wss.clients.forEach((client) => {
     if (client.readyState === WebSocket.OPEN) {
+      if (!wsTokenStillValid(client)) return;
       if (sensitiveOnly && !(client as any).isAuthenticated) {
         return;
       }
@@ -208,6 +230,7 @@ wss.on('connection', (ws: WebSocket, req: any) => {
         const token = parsed.sessionToken || parsed.token;
         if (verifyWsAuth(token)) {
           (ws as any).isAuthenticated = true;
+          (ws as any).operatorToken = token; // 3G: checked again before every broadcast
           ws.send(JSON.stringify({ type: 'AUTHENTICATED', authenticated: true, timestamp: Date.now() }));
           ws.send(JSON.stringify({ type: 'AUTH_SUCCESS', authenticated: true }));
           // Emit telemetry and snapshots exclusively after successful authentication

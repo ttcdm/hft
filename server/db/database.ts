@@ -1,4 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
+import { statfsSync } from 'node:fs';
+import path from 'node:path';
 import { resolveDbPath } from './dbPath';
 import { NormalizedPosition, ExecutionMode } from '../core/types';
 import { Logger } from '../middleware/enterprise';
@@ -210,6 +212,13 @@ export class WorkstationDatabase {
         execution_mode TEXT NOT NULL,
         payload_json TEXT NOT NULL,
         created_at INTEGER NOT NULL
+      );
+
+      -- DBW: one row that isWritable() rewrites, so the writable check is a real committed write
+      CREATE TABLE IF NOT EXISTS db_health (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        probe_seq INTEGER NOT NULL,
+        probed_at INTEGER NOT NULL
       );
     `);
 
@@ -1188,13 +1197,41 @@ export class WorkstationDatabase {
     });
   }
 
+  /** DBW: below this much free space on the database's filesystem the database counts as not writable. */
+  public static readonly MIN_FREE_BYTES = 16 * 1024 * 1024;
+  /** DBW: a passed probe is reused this long, so a per-buy check does not commit (and fsync) on every call. A failure is never reused. */
+  public static readonly WRITABLE_CACHE_MS = 1000;
+  private lastWritableOkAt: number | null = null; // on performance.now()
+
+  /**
+   * DBW: true only when a real write commits and the filesystem has MIN_FREE_BYTES free. `BEGIN IMMEDIATE; ROLLBACK;` writes nothing, so it
+   * passed on a full disk and on read-only storage. The upsert alone is not enough either: on a full disk SQLite can still commit small
+   * writes into WAL frames and free pages it already holds, while the next larger write fails. Any error, including a failed free-space
+   * read, means not writable.
+   */
   public isWritable(): boolean {
+    const now = performance.now();
+    if (this.lastWritableOkAt !== null && now - this.lastWritableOkAt < WorkstationDatabase.WRITABLE_CACHE_MS) return true;
+    this.lastWritableOkAt = null;
     try {
-      this.db.exec('BEGIN IMMEDIATE; ROLLBACK;');
+      this.db
+        .prepare(
+          `INSERT INTO db_health (id, probe_seq, probed_at) VALUES (1, 1, ?)
+           ON CONFLICT(id) DO UPDATE SET probe_seq = probe_seq + 1, probed_at = excluded.probed_at`
+        )
+        .run(Date.now());
+      if (this.dbPath !== ':memory:' && this.freeBytes() < WorkstationDatabase.MIN_FREE_BYTES) return false;
+      this.lastWritableOkAt = performance.now();
       return true;
     } catch {
       return false;
     }
+  }
+
+  /** Free bytes on the filesystem holding the database file, as an unprivileged writer sees them. */
+  private freeBytes(): number {
+    const s = statfsSync(path.dirname(path.resolve(this.dbPath)));
+    return Number(s.bavail) * Number(s.bsize);
   }
 
   public getJournalMode(): string {

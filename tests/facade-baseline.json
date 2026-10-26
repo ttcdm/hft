@@ -177,5 +177,6 @@
 "tests/v1_ui_labels.test.ts::no 30 / 120 / 85 / 142 fallbacks for tokens monitored and latency",
 "tests/v1_ui_labels.test.ts::the wide-only nav badge and the AUTH label are hidden below their breakpoints",
 "tests/s3h_operator_text.test.ts::the route walk finds no /api/market/orderbook, /trades (without a mint), /ticker or /depth",
-"tests/s3h_operator_text.test.ts::no /api/export/packets route, and no screen asks for one"
+"tests/s3h_operator_text.test.ts::no /api/export/packets route, and no screen asks for one",
+"tests/s3h_operator_text.test.ts::none of the BTC market-maker shapes is exported"
 ]

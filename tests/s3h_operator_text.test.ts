@@ -28,3 +28,12 @@ describe('3H B2: the fake PCAP export route is gone', () => {
     for (const f of ui) expect(fs.readFileSync(`src/${f}`, 'utf8'), f).not.toContain('/api/export/packets');
   });
 });
+
+describe('3H B3: the exchange-era types are gone from src/types.ts', () => {
+  it('none of the BTC market-maker shapes is exported', () => {
+    const src = fs.readFileSync('src/types.ts', 'utf8');
+    for (const t of ['OrderSide', 'OrderStatus', 'OrderBookEntry', 'OrderBook', 'ExecutedTrade', 'LatencyTestSample', 'PublicMarketTrade', 'ActiveOrder', 'AccountBalance', 'ExchangeGatewayConfig', 'MarketTickerStats']) {
+      expect(src, t).not.toMatch(new RegExp(`export (interface|type) ${t}\\b`));
+    }
+  });
+});

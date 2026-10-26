@@ -83,14 +83,14 @@ Always pass `--url devnet`: the Solana CLI's default cluster is not devnet. The 
 
 Find out which one:
 - `api $APEX/api/diagnostics/system`: `systemAudit.killSwitchActive` and `riskControls.circuitBreakerState`.
-  - Kill switch on and breaker `OPEN`: three wallet-balance reads failed in a row, which opened the circuit breaker and set the kill switch. Every buy, PAPER included, is refused until a restart; no route closes the breaker.
+  - Kill switch on and breaker `OPEN`: three wallet-balance reads failed in a row, which opened the circuit breaker and set the kill switch. Every buy, PAPER included, is refused while it is open. To close it, fix the RPC, wait for a wallet-balance read to succeed (one runs every 10 s; System checks shows when the latest one succeeded), then reset the kill switch: `POST /api/execution/kill-switch` with `{"activate":false}`. A reset while the latest read still fails leaves the breaker `OPEN` and says why in `circuitBreakerReset.reason`.
   - Kill switch on, breaker `CLOSED`: the operator button or route, or a panic.
 - `api $APEX/api/auto/status`: an auto kill trigger (`DAILY_LOSS_LIMIT`, `NEGATIVE_EXPECTANCY`, `LOSS_STREAK`, `SLIPPAGE_BREACHES`, `READINESS_RED`, `WALLET_LOW`, `WALLET_UNKNOWN`) drops auto to SHADOW and, from DEVNET_LIVE, disarms LIVE. It does not set the risk-engine kill switch.
 - A halt (`TRADING_HALTED` alert, "All trading is halted" in `can-arm`) is something else: section 3.
 
 Facts to keep in mind:
 - The kill switch lives in memory only. A restart clears it, and the saved auto mode (at most PAPER; a saved DEVNET_LIVE comes back as SHADOW) comes back with a fresh session.
-- Resetting it does not close an open circuit breaker or clear a halt; the reply carries `circuitBreaker` and `haltReason` so you can see which are still set.
+- Resetting it closes an open circuit breaker only when the latest wallet-balance read succeeded, and never clears a halt; the reply carries `circuitBreaker`, `circuitBreakerReset` (whether it closed, and why not) and `haltReason` so you can see which are still set.
 
 To recover:
 1. Fix the cause (RPC, wallet balance, losses).

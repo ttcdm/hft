@@ -177,7 +177,7 @@ export default function App() {
       } else {
         // R26: the reset lifts only the kill switch. An open circuit breaker or an all-trading halt still refuses orders.
         const blockers: string[] = [];
-        if (body.circuitBreaker === 'OPEN') blockers.push('the circuit breaker is still OPEN');
+        if (body.circuitBreaker === 'OPEN') blockers.push(`the circuit breaker is still OPEN${body.circuitBreakerReset?.reason ? ` (${body.circuitBreakerReset.reason})` : ''}`);
         if (body.haltReason) blockers.push(`all trading is still halted (${body.haltReason})`);
         triggerAlert(
           blockers.length ? 'WARNING' : 'INFO',

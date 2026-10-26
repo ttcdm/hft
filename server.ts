@@ -1400,13 +1400,20 @@ app.post('/api/execution/kill-switch', requireOperatorAuth, asyncHandler(async (
   const { activate } = parsed.data;
   // P1.4 (N-0): tripping the switch is the shared emergency stop without the sells: kill switch, auto killed (OFF, after its buy in
   // flight) and LIVE disarmed. It used to leave auto in DEVNET_LIVE, which bought again once the switch was reset and LIVE re-armed.
+  // F2: a reset also closes an open circuit breaker, but only when the latest wallet-balance read succeeded (resetCircuitBreaker).
+  let breaker: ReturnType<typeof riskEngine.resetCircuitBreaker> | null = null;
   if (activate) await emergencyStop({ exitAll: false, reason: 'operator kill switch' });
-  else riskEngine.setKillSwitch(false);
+  else {
+    // The journal row says what the reset did to the breaker, next to G's KILL_SWITCH_TRIPPED reason.
+    breaker = riskEngine.resetCircuitBreaker();
+    riskEngine.setKillSwitch(false, `operator reset; circuit breaker ${breaker.state === 'CLOSED' ? 'closed' : `still open: ${breaker.reason}`}`);
+  }
   res.json({
     success: true,
     killSwitchActive: riskEngine.isKillSwitchActive(),
-    // R26: resetting the switch does not lift an open circuit breaker or an all-trading halt; say so, so the UI cannot claim "allowed again"
+    // R26: a reset does not lift an all-trading halt, and lifts an open circuit breaker only after a good balance read; say so, so the UI cannot claim "allowed again"
     circuitBreaker: riskEngine.getCircuitBreakerState(),
+    ...(breaker ? { circuitBreakerReset: breaker } : {}),
     haltReason: executionCoordinator.getHaltReason(),
     autoMode: autoSnipeController.getMode(),
     message: activate ? 'EMERGENCY KILL SWITCH TRIPPED. All trading halted, auto OFF, LIVE disarmed.' : 'Kill switch reset. Auto stays OFF and LIVE stays disarmed until an operator turns them on.',

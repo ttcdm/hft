@@ -144,7 +144,7 @@ Final Reconciliation & Ledger Audit
 What the code does, and where the limits are:
 
 - **CORS and WebSocket origins**: REST requests are allowed from `localhost`, `127.0.0.1`, the request's own host, and origins listed in `ALLOWED_ORIGINS` (`server/middleware/auth.ts`). Other origins get no CORS headers.
-- **Circuit breaker**: the risk engine opens the breaker and turns the kill switch on after 3 consecutive RPC failures (`server/risk/riskEngine.ts`), and also refuses trades past the daily loss limit.
+- **Circuit breaker**: the risk engine opens the breaker and turns the kill switch on after 3 consecutive failed wallet-balance reads (`server/risk/riskEngine.ts`), and also refuses trades past the daily loss limit. Only an operator closes it: a kill-switch reset closes it once the latest balance read has succeeded.
 - **Keypair file**: `.apex_trading_keypair.json` is written with POSIX `0600` permissions, and the app checks `.env` and the keypair for looser permissions. Use a throwaway devnet key only.
 - **Audit trail**: auto decisions and trade records are rows in the SQLite database; see [`KNOWN_RISKS.md`](KNOWN_RISKS.md) section 10 for its limits.
 

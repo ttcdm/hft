@@ -80,9 +80,18 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
     ? { id: 'halt', label: 'Wallet audit / halt', status: 'FAIL', value: 'ALL TRADING HALTED', detail: halt }
     : { id: 'halt', label: 'Wallet audit / halt', status: 'OK', value: walletAuditRuns ? 'audit running, no halt' : 'no halt', detail: walletAuditRuns ? 'The wallet balance is compared with the journal; an unexplained change halts every buy plus the take-profit and stale exits; stop-loss, trailing stop, manual close and panic still run.' : `The wallet audit only runs in DEVNET_LIVE (auto mode is ${auto.mode}).` });
 
+  const breakerOpen = riskEngine.getCircuitBreakerState() !== 'CLOSED';
+  const lastRead = riskEngine.getLastBalanceRead();
+  const triggerNote = auto.triggers.length ? `auto kill triggers: ${auto.triggers.map((t) => t.code).join(', ')}` : 'no auto kill trigger set';
+  // F2: an open breaker says how to close it: a kill-switch reset closes it once the latest wallet-balance read has succeeded
+  const breakerNote = !breakerOpen
+    ? ''
+    : lastRead?.ok
+      ? `The breaker opened after failed wallet-balance reads; the latest read succeeded ${sec(now - lastRead.at)} ago, so resetting the kill switch closes it. `
+      : `The breaker opened after failed wallet-balance reads and the latest read ${lastRead ? `failed ${sec(now - lastRead.at)} ago` : 'has not happened'}; it stays open until a read succeeds and the kill switch is reset. `;
   checks.push({
-    id: 'killswitch', label: 'Kill switch / circuit breaker', status: riskEngine.isKillSwitchActive() ? 'FAIL' : riskEngine.getCircuitBreakerState() === 'OPEN' ? 'FAIL' : 'OK',
-    value: `kill switch ${riskEngine.isKillSwitchActive() ? 'ON' : 'off'}, breaker ${riskEngine.getCircuitBreakerState()}`, detail: auto.triggers.length ? `auto kill triggers: ${auto.triggers.map((t) => t.code).join(', ')}` : 'no auto kill trigger set',
+    id: 'killswitch', label: 'Kill switch / circuit breaker', status: riskEngine.isKillSwitchActive() ? 'FAIL' : breakerOpen ? 'FAIL' : 'OK',
+    value: `kill switch ${riskEngine.isKillSwitchActive() ? 'ON' : 'off'}, breaker ${riskEngine.getCircuitBreakerState()}`, detail: `${breakerNote}${triggerNote}`,
   });
 
   const feedOk = feed.status === 'ACTIVE';

@@ -227,7 +227,9 @@ describe('G1: auto-snipe controller', () => {
     expect(remaining()).toBeCloseTo(start, 6);
     snipe.mockResolvedValueOnce({ success: false, message: 'UNCONFIRMED: did not confirm. The transaction was sent and may still land', txHash: '' });
     await autoSnipeController.submitCandidate(cand(newPool()));
-    expect(remaining()).toBeCloseTo(start - AUTO_DEVNET_ORDER_SOL, 6);
+    // 3B: counted at its worst case (the order plus slippage headroom and rent) until recovery journals what it took
+    expect(start - remaining()).toBeGreaterThan(AUTO_DEVNET_ORDER_SOL);
+    expect(start - remaining()).toBeLessThan(2 * AUTO_DEVNET_ORDER_SOL);
   });
 
   it('L2: every candidate re-checks the coordinator mode (PAPER auto with LIVE armed, DEVNET_LIVE with the coordinator in PAPER)', async () => {

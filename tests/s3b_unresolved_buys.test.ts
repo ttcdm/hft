@@ -323,4 +323,47 @@ describe('3B: unresolved LIVE buys count everywhere; the wallet audit knows them
     expect(halt).not.toHaveBeenCalled();
     expect(executionCoordinator.getHaltReason()).toBeNull();
   });
+
+  it('R1-127, R1-38: an auto DEVNET_LIVE buy counts its whole wallet delta (rent included) in spentSol, and journals it once', async () => {
+    await armAuto();
+    const delta = 5_000_000 + RENT + 1_346_200 + 15_000; // order, token-account rent, first-buy accumulator rent, fee and tip
+    confirmEdges(delta);
+    vi.spyOn(memecoinAggregator, 'executeSnipe').mockImplementation(async (p: any) => {
+      const r = await coordinator.executeTrade(buyReq(p.contractAddress));
+      return { success: r.success, message: r.error ?? 'ok', txHash: r.txSignature ?? '', amountSol: p.amountSolOverride, positionId: r.positionId, feesPaidLamports: r.feesPaidLamports };
+    });
+    const t0 = Date.now();
+    const { mint } = newPumpPool('HOT');
+    const d = await autoSnipeController.submitCandidate({ mint, symbol: 'S', source: 'TEST' as any, amountUsd: 0.7, provenance: 'REAL_ONCHAIN' });
+    expect(d.outcome, d.reason).toBe('BOUGHT');
+    expect(autoSnipeController.getStatus().session!.spentSol).toBeCloseTo(delta / SOL, 12);
+    // counted once: the coordinator's LIVE_BUY_FILLED row carries the delta, the controller's BOUGHT row none
+    const rows = workstationDb.loadDecisions({ mint, sinceTs: t0 });
+    expect(rows.filter((r) => r.solDelta !== null).map((r) => r.outcome)).toEqual([LIVE_BUY_FILLED]);
+    expect(rows.find((r) => r.outcome === 'BOUGHT')!.solDelta).toBeNull();
+    expect(workstationDb.sumDecisionSolDelta(t0 - 1, Date.now() + 1).delta).toBeCloseTo(-delta / SOL, 12);
+  });
+
+  it('R1-127: an auto buy that returns UNCONFIRMED counts its worst case, then the real delta once orphan recovery adopts it', async () => {
+    await armAuto();
+    const delta = 6_100_000;
+    build.mockImplementation(async () => signedTx(conn) as any);
+    vi.spyOn(conn, 'sendRawTransaction').mockRejectedValue(new Error('fetch failed'));
+    let sig = '';
+    vi.spyOn(memecoinAggregator, 'executeSnipe').mockImplementation(async (p: any) => {
+      const r = await coordinator.executeTrade(buyReq(p.contractAddress));
+      sig = r.txSignature ?? '';
+      return { success: false, message: r.error ?? '', txHash: '' };
+    });
+    const { mint } = newPumpPool('HOT');
+    const d = await autoSnipeController.submitCandidate({ mint, symbol: 'U', source: 'TEST' as any, amountUsd: 0.7, provenance: 'REAL_ONCHAIN' });
+    expect(d.outcome).toBe('REJECTED');
+    expect(d.reason).toMatch(/^UNCONFIRMED/);
+    const worst = autoSnipeController.getStatus().session!.spentSol;
+    expect(worst).toBeGreaterThan(AUTO_DEVNET_ORDER_SOL + (RENT + 1_346_200) / SOL); // order, slippage headroom and both rents
+
+    vi.spyOn(conn, 'getTransaction').mockResolvedValue(landedBuy(wallet.publicKey, new PublicKey(mint), delta) as any);
+    expect((await coordinator.recoverOrphanedBuys()).recovered).toEqual([sig]);
+    expect(autoSnipeController.getStatus().session!.spentSol).toBeCloseTo(delta / SOL, 12);
+  });
 });

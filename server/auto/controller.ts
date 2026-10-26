@@ -3,6 +3,7 @@ import { isReadOnly } from '../solana/readOnly';
 import { workstationDb } from '../db/database';
 import { traced } from '../observability/tracing';
 import { executionCoordinator, isRecoveredPosition, LIVE_BUY_FILLED } from '../execution/coordinator';
+import { CapitalSizer } from '../capital/capitalSizer';
 import { memecoinAggregator } from '../memecoinAggregator';
 import { solPriceService } from '../market/solPriceService';
 import { executionConfig } from '../solana/executionConfig';
@@ -12,7 +13,7 @@ import { Logger } from '../middleware/enterprise';
 import type { SignalProvenance } from '../core/types';
 import { computeJournalStats, type JournalStats } from './journalStats';
 import { evaluateKillTriggers, auditWalletChange, type KillTrigger } from './killSwitch';
-import { riskEngine } from '../risk/riskEngine';
+import { riskEngine, PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS } from '../risk/riskEngine';
 import { watchWindow, readyGate, type WatchResult, type WatchVerdict } from '../signals/watchWindow';
 import { checkConfluenceThreshold, getConfluenceThreshold, setConfluenceThreshold, confluenceThresholdInfo, CONFLUENCE_DEVNET_LIVE_FLOOR, type ConfluenceThresholdInfo } from '../signals/confluenceThreshold';
 import { isCurveTooFar, curveTooFarReason } from '../signals/curveProgressCap';
@@ -384,6 +385,7 @@ export class AutoSnipeController extends EventEmitter {
   private persistMode = (): void => { workstationDb.setSetting(SETTING_MODE, this.mode); };
 
   public getStatus(): AutoStatus {
+    this.settleUnresolvedSpend();
     this.enforceBudgets();
     this.dropDevnetLiveIfUnarmed(); // P1.4: the status never shows a DEVNET_LIVE session that can no longer trade
     let session: AutoStatus['session'] = null;
@@ -872,6 +874,7 @@ export class AutoSnipeController extends EventEmitter {
     // and then noticed on the next candidate.
     // DEVNET_LIVE only: the cap is a real-SOL cap (0.02), a paper $5 order (~0.033 SOL) would never fit it.
     if (this.session && mode === 'DEVNET_LIVE') {
+      this.settleUnresolvedSpend();
       const plannedSol = this.orderSol();
       if (this.session.spentSol + plannedSol > this.session.budgets.maxSpendSol) {
         return rec('REJECTED', 'budget', `would exceed the session spend limit (${this.session.spentSol.toFixed(4)} + ${plannedSol.toFixed(4)} > ${this.session.budgets.maxSpendSol} SOL)`);
@@ -886,6 +889,7 @@ export class AutoSnipeController extends EventEmitter {
     // belong to the mode and the session it started in.
     const startMode = this.mode;
     const startSession = this.session;
+    const startTs = Date.now();
     let retryable = false;
     try {
       const shadow = startMode === 'SHADOW';
@@ -923,8 +927,12 @@ export class AutoSnipeController extends EventEmitter {
       if (!res.success) {
         // R6: a buy that was sent and may have landed (unconfirmed, or landed with an unreadable fill) spent real SOL the cap must count.
         if (startSession && !shadow && /^(UNCONFIRMED|RECONCILIATION FAILED)/.test(res.message)) {
-          startSession.spentSol += startOrderSol;
-          workstationDb.logDecision({ autoMode: startMode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'budget', outcome: 'INFO', reason: `counted ${startOrderSol} SOL against the session cap: the buy was sent and may have landed`, inputs: watchInputs });
+          // 3B (R1-127): counted at its worst case (slippage headroom, token-account and first-buy accumulator rent) until orphan recovery
+          // journals what it really took; settleUnresolvedSpend then swaps in that figure.
+          const countedSol = startOrderSol * (1 + (params.slippagePct ?? 0) / 100) + (CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS + PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS) / 1e9;
+          startSession.spentSol += countedSol;
+          if (startMode === 'DEVNET_LIVE') this.unsettledBuys.push({ session: startSession, mint: c.mint, sinceTs: startTs, countedSol });
+          workstationDb.logDecision({ autoMode: startMode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'budget', outcome: 'INFO', reason: `counted ${countedSol.toFixed(6)} SOL against the session cap: the buy was sent and may have landed`, inputs: watchInputs });
         }
         retryable = RETRYABLE_REJECTION.test(res.message || '');
         return rec('REJECTED', classifyRejection(res.message), res.message, { mode: startMode, inputs: { confluenceScore: res.confluenceScore, dryRun: shadow, retryable } });
@@ -932,7 +940,12 @@ export class AutoSnipeController extends EventEmitter {
       if (shadow) return rec('WOULD_BUY', 'fill', res.message, { mode: startMode, amountSol: res.amountSol, inputs: { dryRun: true, confluenceScore: res.confluenceScore, gates: res.gates } });
       if (startSession) {
         startSession.buys += 1;
-        startSession.spentSol += (res.amountSol ?? 0) + (res.feesPaidLamports ?? 0) / 1e9;
+        // 3B (R1-127): a DEVNET_LIVE buy counts what it took from the wallet (its LIVE_BUY_FILLED row: curve spend, tip, fees and the
+        // token-account and accumulator rent). Without that row (the position was not saved; recovery journals it later) the order, fees
+        // and both rents are counted, which is never less than the buy took.
+        const journaled = startMode === 'DEVNET_LIVE' ? this.journaledBuySpendSol(c.mint, startTs, res.positionId) : null;
+        startSession.spentSol += journaled ?? (res.amountSol ?? 0) + (res.feesPaidLamports ?? 0) / 1e9
+          + (startMode === 'DEVNET_LIVE' ? (CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS + PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS) / 1e9 : 0);
         if (res.positionId) startSession.positionIds.push(res.positionId);
       }
       const feesSol = (res.feesPaidLamports ?? 0) / 1e9;
@@ -958,6 +971,34 @@ export class AutoSnipeController extends EventEmitter {
       settle();
       this.scheduleReleaseDrain();
     }
+  }
+
+  /** 3B: auto buys counted at their worst case because they returned unresolved; settled once orphan recovery journals the real spend. */
+  private unsettledBuys: Array<{ session: AutoSession; mint: string; sinceTs: number; countedSol: number }> = [];
+
+  /** 3B: SOL the LIVE buy of `mint` took from the wallet, from its LIVE_BUY_FILLED row journaled at or after `sinceTs`. null without one. */
+  private journaledBuySpendSol(mint: string, sinceTs: number, positionId?: string): number | null {
+    try {
+      const rows = workstationDb.loadDecisions({ mint, outcome: LIVE_BUY_FILLED, sinceTs, limit: 20 })
+        .filter((r) => r.solDelta !== null && (positionId === undefined || r.positionId === positionId));
+      return rows.length > 0 ? -(rows[0].solDelta as number) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * 3B (R1-127): swap the worst-case figure of an auto buy that returned unresolved for what it really took, once orphan recovery has adopted
+   * it and journaled LIVE_BUY_FILLED. A buy that never lands keeps its worst-case figure for the session (the cap errs high, never low).
+   */
+  private settleUnresolvedSpend(): void {
+    this.unsettledBuys = this.unsettledBuys.filter((u) => {
+      if (u.session !== this.session) return false; // a later session starts from 0
+      const spent = this.journaledBuySpendSol(u.mint, u.sinceTs);
+      if (spent === null) return true;
+      u.session.spentSol += spent - u.countedSol;
+      return false;
+    });
   }
 
   private queueRelease(c: AutoCandidate, notBefore = 0): boolean {

@@ -131,7 +131,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     telegramChatId: '',
     telegramWebhookActive: false,
   };
-  // C2: on by default. Operators can still switch it off explicitly with setConfluenceGating(false).
+  // C2: on by default. 3H (A14): no route, screen or production code calls setConfluenceGating, so in the running app it is always on (the
+  // safe direction) and a caller's enforceConfluence makes no difference. Tests use the setter to switch it off; that is its only use.
   private isConfluenceGatingEnabled: boolean = true;
 
   constructor() {

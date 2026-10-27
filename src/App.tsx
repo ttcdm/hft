@@ -20,6 +20,7 @@ import { CurvePanel } from './components/CurvePanel';
 import { AutoPanel } from './components/AutoPanel';
 import { usePolled } from './utils/usePolled';
 import { readServerAlerts, serverAlertEvents, alertsUnreadableEvent } from './utils/operatorAlerts';
+import { killSwitchPress } from './utils/killSwitchPress';
 
 
 export function makeEmptyKpis(startingEquity: number): PerformanceKPIs {
@@ -181,10 +182,19 @@ export default function App() {
 
   // Emergency kill switch: the server decides. The UI only shows "halted" after the server confirmed it.
   const killInFlight = useRef(false);
+  // R9-1: when the switch was last seen turning on (by this button or the poll), so a double tap does not resume trading.
+  const haltedSince = useRef<number | null>(null);
+  useEffect(() => {
+    if (isHalted && haltedSince.current === null) haltedSince.current = Date.now();
+    if (!isHalted) haltedSince.current = null;
+  }, [isHalted]);
   const toggleKillSwitch = async () => {
     if (killInFlight.current) return; // R33: a second click while the first request is out must not send the opposite value
+    // R9-1: send the intended state. RESUME needs a confirm, and a RESUME press right after the switch turned on is ignored.
+    const press = killSwitchPress(isHalted, haltedSince.current, Date.now(), (text) => window.confirm(text));
+    if (press.action === 'IGNORE') return;
     killInFlight.current = true;
-    const nextHalted = !isHalted;
+    const nextHalted = press.activate;
     try {
       const res = await authFetch('/api/execution/kill-switch', {
         method: 'POST',
@@ -195,6 +205,7 @@ export default function App() {
       if (!res.ok || body.killSwitchActive !== nextHalted) {
         throw new Error(body.error || `server answered HTTP ${res.status}`);
       }
+      if (nextHalted) haltedSince.current = Date.now();
       setIsHalted(nextHalted);
       hftAudio.playKillSwitch(); // R33: after the server confirmed, not before
       if (nextHalted) {

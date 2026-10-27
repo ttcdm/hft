@@ -40,6 +40,14 @@ describe('R6-1/R7-1: /api/system/checks serves the operator alerts', () => {
     const after = (await app.call('GET', '/api/system/checks')).json;
     expect(after.operatorAlerts.some((a: any) => a.code === 'TRADING_HALTED')).toBe(false);
   });
+
+  it('UI fix 5: /api/diagnostics/system names the key file the signer really uses, not a fixed .apex_trading_keypair.json', async () => {
+    const a = (await app.call('GET', '/api/diagnostics/system')).json.systemAudit;
+    expect(a.signerKeySource).toBe('FILE');
+    expect(a.signerKeyPath).toMatch(/r6-http-[^/]+\/throwaway\.json$/);
+    expect(a.keypairStorage).toContain(a.signerKeyPath);
+    expect(a.keypairStorage).not.toContain('.apex_trading_keypair.json');
+  });
 });
 
 describe('R6-4 / R6-2: kill auto reports refused sells; an open LIVE position shows while the server is in PAPER', () => {

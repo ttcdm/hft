@@ -62,6 +62,9 @@ interface SystemAudit {
   databaseFile: string;
   dbDriver: string;
   keypairStorage: string;
+  /** UI report fix 5: where the key came from and the file the signer reads; absent on an older server */
+  signerKeySource?: string;
+  signerKeyPath?: string | null;
   browserPrivateKeySecurity: string;
 }
 
@@ -73,6 +76,14 @@ interface RiskControls {
   dailyLossSoFarSol: number;
   circuitBreakerTripped: boolean;
   circuitBreakerState?: 'CLOSED' | 'OPEN' | 'HALF_OPEN';
+}
+
+/** UI report fix 5: where the server says its key is, from /api/diagnostics/system; never a fixed file name. */
+export function signerStorageText(a: { keypairStorage?: string; signerKeySource?: string; signerKeyPath?: string | null } | null | undefined): string {
+  if (!a) return 'unknown (no answer from the server yet)';
+  if (a.signerKeySource === 'ENVIRONMENT') return 'environment variable (not a file)';
+  if (a.signerKeyPath) return `${a.signerKeyPath} (mode 0600)${a.signerKeySource === 'NONE' ? ', no key loaded' : ''}`;
+  return a.keypairStorage ?? 'unknown';
 }
 
 export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = ({ isOpen, onClose }) => {
@@ -675,13 +686,13 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                   <span>Local Hot Wallet Signer</span>
                 </h3>
                 <p className="text-slate-400 text-xs">
-                  To execute live transactions without exposing private keys, Apex Workstation manages a local hot keypair stored in `.apex_trading_keypair.json` with strict POSIX 0600 file permissions.
+                  To execute live transactions without exposing private keys, Apex Workstation manages a local hot keypair in a file with POSIX 0600 permissions (SIGNER_KEYPAIR_PATH, default `.apex_trading_keypair.json` in the server's folder), or takes it from the environment.
                 </p>
 
                 <div className="p-3 rounded-lg bg-slate-900 border border-slate-800 font-mono text-xs text-slate-300 space-y-1">
                   <div>Status: <strong className="text-emerald-400">{systemAudit?.signerStatus}</strong></div>
                   <div>Public Key: <span className="text-amber-300">{systemAudit?.walletPubkey || 'None'}</span></div>
-                  <div>Storage Location: <span className="text-slate-400">.apex_trading_keypair.json (mode 0600)</span></div>
+                  <div>Storage Location: <span className="text-slate-400" data-testid="signer-storage">{signerStorageText(systemAudit)}</span></div>
                 </div>
 
                 <div className="flex items-center space-x-3 pt-2">

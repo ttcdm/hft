@@ -300,7 +300,7 @@ export class MemecoinAggregatorService extends EventEmitter {
       isMintRevoked: true,
       isFreezeRevoked: true,
       isLpBurned: false,
-      rugcheckScore: 'SAFE',
+      rugcheckScore: 'UNKNOWN', // R6-13: nothing has rated it; the eligibility filter reads the chain at execution
       createdAgo: 'Just now (WS)',
       trendingRank: 0,
     };
@@ -748,7 +748,7 @@ export class MemecoinAggregatorService extends EventEmitter {
             priceUsd,
             priceNative,
             marketCapUsd: t.currentMarketCapUsd || 0, // the feed's current figure, not a launch-time stand-in
-            liquidityUsd: 15000,
+            liquidityUsd: 0, // A144: the callout feed measures no liquidity; 0 is "unknown" (it was a made-up $15,000)
             bondingCurveProgress: t.bondingCurveProgress || 50,
             isMigrated: t.complete,
             volume5mUsd: t.volume5mUsd ?? 0,
@@ -758,13 +758,15 @@ export class MemecoinAggregatorService extends EventEmitter {
             priceChange1hPct: 0,
             buys5m: t.buys5m ?? 0,
             sells5m: t.sells5m ?? 0,
-            top10HoldersPct: t.top10HoldersPct ?? 15,
-            devHoldingPct: t.devHoldingPct ?? 0.8,
-            isMintRevoked: t.isMintRevoked ?? true,
-            isFreezeRevoked: t.isFreezeRevoked ?? true,
+            // A144 / R2-25: what the callout does not say is UNKNOWN (-1 for the holder shares; not revoked for the authorities, so the freeze
+            // gate refuses an unknown freeze authority), never a passing default (it was 15%, 0.8%, revoked, SAFE)
+            top10HoldersPct: t.top10HoldersPct ?? -1,
+            devHoldingPct: t.devHoldingPct ?? -1,
+            isMintRevoked: t.isMintRevoked ?? false,
+            isFreezeRevoked: t.isFreezeRevoked ?? false,
             authoritiesVerified: t.isMintRevoked != null && t.isFreezeRevoked != null,
             isLpBurned: false,
-            rugcheckScore: (t.rugcheckScore as any) || 'SAFE',
+            rugcheckScore: (t.rugcheckScore as any) || 'UNKNOWN',
             createdAgo: t.timeAgoStr || 'Just now',
             trendingRank: 1,
             unverified: true, // Q32
@@ -809,8 +811,9 @@ export class MemecoinAggregatorService extends EventEmitter {
       this.pools.unshift(pool);
     }
 
-    if (pool && params.noSyntheticPool && (DEMO_POOL_IDS.has(pool.id) || pool.id.startsWith('pool-simulated-'))) {
-      return { success: false, message: `MARKET_DATA_UNAVAILABLE: ${cleanCa} has only a simulated pool; the auto trader does not trade against one.`, txHash: '' };
+    // A144: a callout placeholder (`pool-callout-*`, made when the curve could not be read) is no more real than a simulated pool
+    if (pool && params.noSyntheticPool && (DEMO_POOL_IDS.has(pool.id) || pool.id.startsWith('pool-simulated-') || pool.id.startsWith('pool-callout-'))) {
+      return { success: false, message: `MARKET_DATA_UNAVAILABLE: ${cleanCa} has only a simulated or placeholder pool (${pool.id.replace(/-[^-]*$/, '')}); this order does not trade against one.`, txHash: '' };
     }
 
     if (!pool) {

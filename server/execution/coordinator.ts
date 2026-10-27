@@ -74,7 +74,7 @@ import { acquireLock, dbLockPath, isPidAlive, signerLockPath, updateHeldLock } f
 import crypto from 'node:crypto';
 import { createTradingConnection } from '../solana/rpcConnection';
 import { allowedCluster, assertClusterAllowed, assertClusterAllowedCached, assertSendClusterAllowed, blockhashCheckEnabled, ClusterGuardError, forgetGenesisCheck, rememberGenesisCheck, resolveRpcUrl, verifyBlockhashIndependently } from '../solana/clusterGuard';
-import { PumpCurveService, TradeQuote, PumpMarketState, fetchTokenHolderDistribution } from '../solana/pumpCurve';
+import { PumpCurveService, TradeQuote, PumpMarketState, fetchTokenHolderDistribution, RPC_SLOT_SKEW_TOLERANCE } from '../solana/pumpCurve';
 import { TradeReconciler, RealMarkPriceService, PreTradeSnapshot } from './reconciliation';
 export type { PreTradeSnapshot };
 import { CapitalSizer } from '../capital/capitalSizer';
@@ -834,7 +834,8 @@ export class ExecutionCoordinator {
       this.heartbeatSlot = { slot, firstSeenMono: now };
       return null;
     }
-    if (slot < prev.slot) return `slot ${slot} is behind slot ${prev.slot} already seen on this endpoint (a lagging node)`;
+    // a slot or two behind is another node of a load-balanced RPC, not a lagging one (RPC_SLOT_SKEW_TOLERANCE); the stall clock still runs
+    if (prev.slot - slot > RPC_SLOT_SKEW_TOLERANCE) return `slot ${slot} is more than ${RPC_SLOT_SKEW_TOLERANCE} slots behind slot ${prev.slot} already seen on this endpoint (a lagging node)`;
     const stalledMs = now - prev.firstSeenMono;
     return stalledMs > RPC_SLOT_STALL_MS ? `slot ${slot} has not advanced for ${Math.round(stalledMs / 1000)}s` : null;
   }

@@ -605,6 +605,15 @@ export async function fetchTokenHolderDistribution(
   };
 }
 
+/**
+ * R4-9: how many slots a read (or the RPC heartbeat) may be behind the highest slot already seen on the same endpoint and still be used.
+ * The nodes behind one load-balanced RPC URL are usually a slot or two apart, and two concurrent reads can answer out of order; refusing
+ * those made LIVE buys fail MARKET_DATA_UNAVAILABLE at random. A node further behind (seconds to minutes) is still refused. About 3 s.
+ */
+export const RPC_SLOT_SKEW_TOLERANCE = 8;
+/** R4-9: the time one slot stands for when a read a few slots behind is stamped (Solana's target slot time). */
+export const SLOT_TIME_ESTIMATE_MS = 400;
+
 export class PumpCurveService {
   public static cachedGlobal: any = null;
   /** R19: mints whose account is not owned by a token program, with the reason, so the mark path can alert instead of falling through to PumpSwap. */
@@ -626,20 +635,24 @@ export class PumpCurveService {
 
   /**
    * R4-9: per Connection, the highest context slot a curve read has answered from and the wall time it was first seen. Reads ask for
-   * at least that slot (`minContextSlot`), so a load-balanced backend that lags is refused rather than read, and a read whose slot is
-   * lower anyway is treated as failed. A read from the same slot is stamped with the time that slot was first seen, so a stalled node's
-   * marks age while wall time advances. Keyed by the Connection object, so a new endpoint (setRpcEndpoint) starts fresh.
+   * at least that slot less RPC_SLOT_SKEW_TOLERANCE (`minContextSlot`), so a node further behind is refused by the RPC rather than read,
+   * and a read whose slot is further behind anyway is treated as failed. A read from the same slot is stamped with the time that slot was
+   * first seen, so a stalled node's marks age while wall time advances; one a few slots behind is stamped that much older again.
+   * Keyed by the Connection object, so a new endpoint (setRpcEndpoint) starts fresh.
    */
   private static slotSeen = new WeakMap<object, { slot: number; firstSeenAt: number }>();
 
-  /** R4-9: the slot floor for the next read on this connection (undefined before the first). */
+  /** R4-9: the slot floor for the next read on this connection (undefined before the first): the highest slot seen less the skew bound. */
   public static minContextSlotFor(connection: Connection): number | undefined {
-    return this.slotSeen.get(connection as object)?.slot;
+    const seen = this.slotSeen.get(connection as object)?.slot;
+    return seen === undefined ? undefined : Math.max(1, seen - RPC_SLOT_SKEW_TOLERANCE);
   }
 
   /**
-   * R4-9: record a read's context slot; returns the wall time the data stands for, or null when the slot went backwards (the read is
-   * from an older state than one already seen, and must not be used).
+   * R4-9: record a read's context slot; returns the wall time the data stands for, or null when the slot is more than
+   * RPC_SLOT_SKEW_TOLERANCE behind one already seen (a lagging node, whose state must not be used). A read up to that many slots
+   * behind (the nodes of a load-balanced RPC are a slot or two apart, and two concurrent reads can answer out of order) is used,
+   * stamped SLOT_TIME_ESTIMATE_MS per slot older than the time the newest slot was first seen.
    */
   public static noteContextSlot(connection: Connection, slot: number | undefined, now: number = Date.now()): number | null {
     if (typeof slot !== 'number' || !Number.isFinite(slot) || slot <= 0) return now; // no context slot: the read time, as before
@@ -648,8 +661,9 @@ export class PumpCurveService {
       this.slotSeen.set(connection as object, { slot, firstSeenAt: now });
       return now;
     }
-    if (slot < prev.slot) return null;
-    return Math.min(now, prev.firstSeenAt);
+    const lag = prev.slot - slot;
+    if (lag > RPC_SLOT_SKEW_TOLERANCE) return null;
+    return Math.min(now, prev.firstSeenAt) - lag * SLOT_TIME_ESTIMATE_MS;
   }
 
   /**
@@ -745,9 +759,10 @@ export class PumpCurveService {
       const read = await connection.getMultipleAccountsInfoAndContext(accountsToFetch, minContextSlot ? { minContextSlot } : undefined);
       const accountInfos = read.value;
       const marketDataSlot: number | undefined = read.context?.slot;
+      const highestSeen = this.slotSeen.get(connection as object)?.slot;
       const marketDataTimestamp = this.noteContextSlot(connection, marketDataSlot);
       if (marketDataTimestamp === null) {
-        return fail('RPC_ERROR', `the RPC answered from slot ${marketDataSlot}, older than slot ${minContextSlot} already seen (a lagging node); not used`);
+        return fail('RPC_ERROR', `the RPC answered from slot ${marketDataSlot}, more than ${RPC_SLOT_SKEW_TOLERANCE} slots behind slot ${highestSeen} already seen (a lagging node); not used`);
       }
       const mintAccountInfo = accountInfos[0];
       const curveAccountInfo = accountInfos[1];

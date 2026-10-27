@@ -32,10 +32,11 @@ describe('Q1: recovery prices the entry like the live reconcile', () => {
 
   it('the recovered position enters at the curve price, so a flat mark does not stop it out', async () => {
     const r = await TradeReconciler.recoverInterruptedTransaction(connection, fixture.signature, WALLET);
-    const pos = (ExecutionCoordinator.prototype as any).positionFromRecoveredBuy.call({}, { signature: fixture.signature, mint: r.mint, jitoTipLamports: 0, executionMode: 'LIVE' }, r, fixture.slot);
+    const pos = (ExecutionCoordinator.prototype as any).positionFromRecoveredBuy.call({}, { signature: fixture.signature, mint: r.mint, jitoTipLamports: 0, executionMode: 'LIVE' }, r, fixture.slot, WALLET);
     const tokens = Number(r.tokenQuantityRaw) / 1e6;
     expect(pos.entryPriceSol).toBeCloseTo(0.01 / tokens, 15);
     expect(pos.costBasisLamports).toBe(12_902_540); // cost basis stays all-in
+    expect(pos.walletPubkey).toBe(WALLET.toBase58()); // R4-2: bound to the wallet whose fill was read
     const d = ExitEngine.evaluate({ entryPriceSol: pos.entryPriceSol, currentPriceSol: 1.045e-9, entryTimestamp: Date.now() - 1000 });
     expect(d.shouldExit).toBe(false);
   });

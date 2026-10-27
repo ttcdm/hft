@@ -21,6 +21,7 @@ describe('N5-N9: startup reconciliation does not wedge readiness on states that 
       currentValueSol: 0.1, costBasisLamports: status === 'OPEN' ? 100_000_000 : 0, realizedPnLSol: 0, status, venue: 'PUMP_BONDING_CURVE',
       executionMode: 'LIVE', entryTxSignature: `sig_${id}`, entryTimestamp: Date.now(), lastMarkTimestamp: Date.now(),
       recordUpdatedAt: Date.now(), updatedAt: Date.now(),
+      walletPubkey: localSigner.getPublicKey().toBase58(), // R4-2: bound to the test signer
     } as any);
   };
   const clearLedger = () => {

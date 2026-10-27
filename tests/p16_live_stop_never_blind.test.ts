@@ -47,6 +47,7 @@ function seedLive(over: Record<string, unknown> = {}): { id: string; mint: strin
     id, mint, symbol: 'P16', name: 'P16', tokenDecimals: 6, tokenQuantityRaw: '1000000000', costBasisLamports: 100_000_000,
     entryPriceSol: ENTRY, currentPriceSol: ENTRY, currentValueSol: 0.1, realizedPnLSol: 0, entryTxSignature: `sig-${id}`,
     entryTimestamp: Date.now() - 60_000, lastMarkTimestamp: Date.now(), executionMode: 'LIVE', status: 'OPEN', venue: 'PUMP_BONDING_CURVE',
+    walletPubkey: localSigner.getStatus() === 'READY' ? localSigner.getPublicKey().toBase58() : undefined, // R4-2: bound to the test signer
     ...over,
   } as any);
   seeded.push(id);

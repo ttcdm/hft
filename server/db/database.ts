@@ -254,6 +254,7 @@ export class WorkstationDatabase {
     this.ensureColumn('positions', 'record_updated_at', 'INTEGER NOT NULL DEFAULT 0');
     this.ensureColumn('positions', 'exit_claim', 'TEXT'); // P1.1: which process is selling this position (claimExit)
     this.ensureColumn('positions', 'exit_claim_at', 'INTEGER');
+    this.ensureColumn('positions', 'wallet_pubkey', 'TEXT'); // R4-2: the wallet that holds the position's tokens (NULL on older rows)
 
     // Rows that carry realized PnL from before realized_events existed: one event at their updated_at, which is what the daily figure used.
     try {
@@ -999,9 +1000,10 @@ export class WorkstationDatabase {
         priority_fee_lamports, jito_tip_lamports, execution_mode, status,
         exit_reason, exit_tx_signature, last_mark_timestamp, last_mark_source,
         venue, pool_address, migration_timestamp, high_water_mark_sol, trailing_stop_sol, exit_stage,
-        record_updated_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        record_updated_at, updated_at, wallet_pubkey
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
+        wallet_pubkey = COALESCE(positions.wallet_pubkey, excluded.wallet_pubkey),
         base_token_program = excluded.base_token_program,
         token_quantity_raw = excluded.token_quantity_raw,
         cost_basis_lamports = excluded.cost_basis_lamports,
@@ -1057,7 +1059,8 @@ export class WorkstationDatabase {
       pos.trailingStopSol ?? 0,
       pos.exitStage ?? 0,
       now,
-      now
+      now,
+      pos.walletPubkey ?? null
     );
     // Q2: selling an adopted balance returns money with no known cost; it is not a day's profit
     if (realizedDelta !== 0 && !pos.entryTxSignature?.startsWith('RECOVERED:')) {
@@ -1111,6 +1114,17 @@ export class WorkstationDatabase {
       WHERE id = ? AND status != 'CLOSED'
     `).run(pos.highWaterMarkSol ?? 0, pos.highWaterMarkSol ?? 0, pos.trailingStopSol ?? 0, pos.trailingStopSol ?? 0, pos.exitStage ?? 0, now, now, pos.id);
     return Number((r as any).changes) > 0;
+  }
+
+  /** R4-2: record the wallet of a row written before wallet_pubkey existed. Never overwrites a binding. False when nothing was written. */
+  public bindPositionWallet(positionId: string, walletPubkey: string): boolean {
+    try {
+      const r = this.db.prepare('UPDATE positions SET wallet_pubkey = ? WHERE id = ? AND wallet_pubkey IS NULL').run(walletPubkey, positionId);
+      return Number((r as any).changes) > 0;
+    } catch (err: any) {
+      Logger.error(`Failed to bind position ${positionId} to its wallet: ${err.message}`);
+      return false;
+    }
   }
 
   public loadPositions(mode?: ExecutionMode, status?: 'OPEN' | 'PARTIALLY_CLOSED' | 'CLOSED' | 'ACTIVE'): NormalizedPosition[] {
@@ -1185,6 +1199,7 @@ export class WorkstationDatabase {
         highWaterMarkSol: r.high_water_mark_sol ?? 0,
         trailingStopSol: r.trailing_stop_sol ?? 0,
         exitStage: r.exit_stage ?? 0,
+        walletPubkey: r.wallet_pubkey || undefined,
       };
     });
   }

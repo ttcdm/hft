@@ -19,6 +19,8 @@ export interface ReplayReportData {
     launches: number; released: Record<string, number>; entries: number; closed: number; openAtEnd: number; wins: number; losses: number; winRate: number | null; netPnlSol: number | null; avgHoldMs: number | null; exitReasons: Record<string, number>;
     /** 5A: the open-at-end positions marked at the last price, kept out of netPnlSol. Absent on an older server. */
     openMarkNetPnlSol?: number | null;
+    /** R6-11: every entry, closed at its realized result plus open-at-end marked at the last print. Absent on an older server. */
+    allEntries?: { entries: number; wins: number; losses: number; winRate: number | null; netPnlSol: number | null };
     /** 5C: the same figures by how each recording ended. Absent on an older server. */
     byRecording?: Record<'COMPLETE' | 'TRUNCATED' | 'GRADUATED' | 'UNRESOLVED', { launches: number; entries: number; closed: number; openAtEnd: number; netPnlSol: number | null; openMarkNetPnlSol: number | null }>;
   };
@@ -118,6 +120,7 @@ export function ReplayBacktestView({ data, error }: { data: ReplayResponse | nul
               <span className="text-slate-500">Verdicts</span><span className="text-right">{Object.entries(s.released).map(([k, v]) => `${k} ${v}`).join(' · ') || '—'}</span>
               <span className="text-slate-500">Entered</span><span className="text-right">{s.entries}</span>
               <span className="text-slate-500">Closed / still open at end</span><span className="text-right">{s.closed} / {s.openAtEnd}</span>
+              {s.allEntries && <><span className="text-slate-500">Net PnL after fees, every entry (closed + open marked at the last price)</span><span className="text-right" data-testid="replay-all-entries">{sol(s.allEntries.netPnlSol)}{s.allEntries.winRate === null ? '' : `, ${(s.allEntries.winRate * 100).toFixed(0)}% up (${s.allEntries.wins} of ${s.allEntries.entries})`}</span></>}
               <span className="text-slate-500">Win rate (closed)</span><span className="text-right">{s.winRate === null ? '—' : `${(s.winRate * 100).toFixed(0)}% (${s.wins} of ${s.closed})`}</span>
               <span className="text-slate-500">Net PnL after fees (closed, realized)</span><span className="text-right">{sol(s.netPnlSol)}</span>
               {s.openMarkNetPnlSol !== undefined && <><span className="text-slate-500">Still open at end, marked at the last price (not in the net above)</span><span className="text-right" data-testid="replay-open-mark">{sol(s.openMarkNetPnlSol)}{s.openAtEnd ? ` over ${s.openAtEnd}` : ''}</span></>}
@@ -126,7 +129,7 @@ export function ReplayBacktestView({ data, error }: { data: ReplayResponse | nul
             </div>
             {s.byRecording && (
               <p className="text-slate-400 mb-3" data-testid="replay-by-recording">
-                Recordings: {s.byRecording.COMPLETE.launches} recorded for the whole window, {s.byRecording.TRUNCATED.launches} cut by the trade cap, {s.byRecording.GRADUATED.launches} graduated, {s.byRecording.UNRESOLVED.launches} unresolved (no END row: still recording, stopped with the app, or recorded before END rows).
+                Recordings: {s.byRecording.COMPLETE.launches} recorded for the whole window, {s.byRecording.TRUNCATED.launches} cut (trade cap, restart or feed gap), {s.byRecording.GRADUATED.launches} graduated, {s.byRecording.UNRESOLVED.launches} unresolved (no END row: still recording, stopped with the app, or recorded before END rows).
                 {(['TRUNCATED', 'GRADUATED', 'UNRESOLVED'] as const).filter((k) => s.byRecording![k].entries > 0).map((k) => ` ${k}: ${s.byRecording![k].entries} entered, net ${sol(s.byRecording![k].netPnlSol)} closed, ${sol(s.byRecording![k].openMarkNetPnlSol)} open mark.`).join('')}
               </p>
             )}

@@ -181,7 +181,9 @@ describe('5C (R1-106): the replay labels truncated, graduated and unresolved lau
     const data = { recorded: { launches: 2, events: 10, oldestTs: T0, newestTs: T0 + 1 }, report, message: null, replayedLaunches: 2, replayCap: 5000 } as unknown as ReplayResponse;
     const html = renderToStaticMarkup(React.createElement(ReplayBacktestView, { data }));
     expect(html).toContain('data-testid="replay-by-recording"');
-    expect(html).toMatch(/1 cut by the trade cap, 0 graduated, 1 unresolved/);
+    expect(html).toMatch(/1 cut \(trade cap, restart or feed gap\), 0 graduated, 1 unresolved/);
+    // R6-11: the every-entry headline is shown with the closed-only figures
+    expect(html).toContain('data-testid="replay-all-entries"');
   });
 });
 

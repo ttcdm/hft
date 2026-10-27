@@ -1630,14 +1630,43 @@ export class ExecutionCoordinator {
     return { landed: false };
   }
 
-  /** true only when the cluster says this transaction's blockhash can no longer land. Unknown (RPC error) counts as not expired. */
-  private async isBlockhashExpired(tx: VersionedTransaction): Promise<boolean> {
+  /**
+   * true only when the cluster says this transaction can no longer land. Unknown (RPC error) counts as not expired.
+   * R3-2: decided at `confirmed`, as "landed" is (checkIfTransactionLanded) and as transports.ts and pendingSellCannotLand decide it: the
+   * confirmed block height is past the blockhash's lastValidBlockHeight (or, when the builder did not record that height, the blockhash
+   * is invalid at `confirmed`), and the signature has no status with history searched. A transaction already in a block that is not
+   * confirmed yet, near its last valid height, read "expired" at `processed`, and was retried or reported as never landed.
+   */
+  private async isBlockhashExpired(tx: VersionedTransaction, signature?: string): Promise<boolean> {
     try {
-      const res = await this.connection.isBlockhashValid(tx.message.recentBlockhash, { commitment: 'processed' });
-      return res?.value === false;
+      const lvbh = txBuilder.lastValidBlockHeightOf(tx.message.recentBlockhash);
+      if (typeof lvbh === 'number' && lvbh > 0) {
+        if ((await this.connection.getBlockHeight('confirmed')) <= lvbh) return false;
+      } else {
+        const res = await this.connection.isBlockhashValid(tx.message.recentBlockhash, { commitment: 'confirmed' });
+        if (res?.value !== false) return false;
+      }
+      const sig = signature || this.signatureOf(tx);
+      if (sig) {
+        const st = await this.connection.getSignatureStatuses([sig], { searchTransactionHistory: true });
+        if (!(Array.isArray(st?.value) && st.value.length === 1 && st.value[0] === null)) return false;
+      }
+      return true;
     } catch {
       return false;
     }
+  }
+
+  /**
+   * R1 #8, R3-28: why a signed BUY must not be sent (or resent) now: the kill switch is on, trading is halted, or (first send only) the
+   * send deadline set from the signal and market-data ages has passed. null when it may go. Never asked for a SELL: a protective exit is
+   * never held by the kill switch.
+   */
+  private buySendRefusal(notAfter?: number): string | null {
+    if (riskEngine.isKillSwitchActive()) return 'the kill switch was activated';
+    if (this.haltReason) return `trading was halted (${this.haltReason})`;
+    if (typeof notAfter === 'number' && Date.now() > notAfter) return `the signal or its market data is past the risk engine's age limit (send deadline ${new Date(notAfter).toISOString()})`;
+    return null;
   }
 
   // Idempotent, bounded Jito retry loop with pre-checks and zero-double-fill RPC fallback (R0.6)
@@ -1750,6 +1779,8 @@ export class ExecutionCoordinator {
     jitoTipLamports: number;
     /** SELL only: the exit reason, stored on the transaction row (see exitStageAfterFill). */
     exitReason?: string;
+    /** BUY only (R3-28): wall-clock ms after which the first send is refused (the signal or market data would be stale). */
+    buyNotAfter?: number;
   }): Promise<{
     success: boolean;
     signature: string;
@@ -1831,7 +1862,7 @@ export class ExecutionCoordinator {
         }
         // The same signed transaction is resent on each retry (same signature, so it cannot fill twice). Once its blockhash has
         // expired and it has not landed, every further resend is wasted time, so stop and let the caller build a new transaction.
-        if (await this.isBlockhashExpired(tx)) {
+        if (await this.isBlockhashExpired(tx, lastSignature)) {
           blockhashExpired = true;
           lastError = 'BLOCKHASH_EXPIRED: the transaction did not land and its blockhash is no longer valid; safe to retry with a new transaction';
           break;
@@ -1839,6 +1870,12 @@ export class ExecutionCoordinator {
         if (retryIntervalMs > 0) {
           await new Promise((r) => setTimeout(r, retryIntervalMs));
         }
+      }
+
+      // R1 #8: a kill or halt between signing and this send (or between two resends) stops the BUY here; a SELL is never held
+      if (side === 'BUY') {
+        const refused = this.buySendRefusal(lastSignature || lastBundleId ? undefined : params.buyNotAfter);
+        if (refused) return this.revokedBuyResult(refused, params, lastSignature, lastBundleId, 'JITO');
       }
 
       // Submit bundle to Jito
@@ -1936,7 +1973,7 @@ export class ExecutionCoordinator {
       }
 
       // Sending an expired transaction through the RPC fallback cannot land. Checked after the landed check above, so "expired and not landed" is definitive.
-      if (blockhashExpired || ((lastSignature || lastBundleId) && (await this.isBlockhashExpired(tx)))) {
+      if (blockhashExpired || ((lastSignature || lastBundleId) && (await this.isBlockhashExpired(tx, lastSignature)))) {
         return {
           success: false,
           signature: lastSignature,
@@ -1953,6 +1990,12 @@ export class ExecutionCoordinator {
           previousJitoSignature: lastSignature,
           previousJitoBundleId: lastBundleId,
         });
+      }
+
+      // R1 #8: the last look before the RPC send of a BUY (after the genesis check, any Jito probe and the Jito attempts)
+      if (side === 'BUY') {
+        const refused = this.buySendRefusal(lastSignature || lastBundleId ? undefined : params.buyNotAfter);
+        if (refused) return this.revokedBuyResult(refused, params, lastSignature, lastBundleId, 'SOLANA_RPC');
       }
 
       // S245: a rate-limited send was refused, not lost: a SELL is resent (same signed bytes) after short waits; a BUY is not.
@@ -2003,6 +2046,8 @@ export class ExecutionCoordinator {
       const rpcConfirm = await traced('tx.confirm', () => this.rpcTransport.confirm(rpcSubmit.signature, cfg.rpcFallbackTimeoutMs || 15000, undefined, {
         rebroadcast: tx,
         lastValidBlockHeight: txBuilder.lastValidBlockHeightOf((tx as any)?.message?.recentBlockhash),
+        // R1 #8: a kill or halt during the watch stops the resends of a BUY (the watch itself goes on); a SELL keeps every resend
+        ...(side === 'BUY' ? { stopResends: () => this.buySendRefusal() } : {}),
       }), { 'apex.transport': 'SOLANA_RPC', 'apex.side': side });
       if (rpcConfirm.confirmed) {
         return {
@@ -2057,6 +2102,29 @@ export class ExecutionCoordinator {
       lifecycleState: lastError?.includes('Failed to submit') ? 'SUBMIT_FAILED' : 'REVERTED',
       unconfirmed: !!lastSignature && !lastError?.includes('Failed to submit') && !lastConfirmDefinite,
     };
+  }
+
+  /**
+   * R1 #8: the result of a BUY stopped by buySendRefusal. Nothing sent yet: a plain refusal (nothing can land). Sent before: no more
+   * resends, but an earlier send may still land, so unless it is seen landed it is reported unconfirmed (the buy path keeps the row
+   * RECONCILIATION_REQUIRED, orphan recovery adopts the tokens, and the late-buy watch sells them).
+   */
+  private async revokedBuyResult(
+    why: string,
+    params: { owner: PublicKey; mintPubkey: PublicKey; tokenProgram: PublicKey; preSnapshot: PreTradeSnapshot; orderId: string; correlationId: string; mint: string },
+    lastSignature: string,
+    lastBundleId: string | undefined,
+    transport: 'JITO' | 'SOLANA_RPC'
+  ): Promise<{ success: boolean; signature: string; bundleId?: string; transport: 'JITO' | 'SOLANA_RPC'; slot?: number; error?: string; lifecycleState: 'CONFIRMED' | 'SUBMIT_FAILED' | 'REVERTED'; unconfirmed?: boolean }> {
+    workstationDb.logJournal('TRADE_REVOKED_BEFORE_SEND', params.correlationId, 'LIVE', { mint: params.mint, orderId: params.orderId, reason: why, alreadySent: !!(lastSignature || lastBundleId) });
+    if (!lastSignature && !lastBundleId) {
+      Logger.warn(`[R1 #8] BUY for order ${params.orderId} not sent: ${why}`);
+      return { success: false, signature: '', transport, error: `ENTRY_REVOKED: ${why} after the order was signed; nothing was sent.`, lifecycleState: 'SUBMIT_FAILED' };
+    }
+    Logger.warn(`[R1 #8] BUY for order ${params.orderId}: no more resends (${why}); an earlier send may still land`);
+    const check = await this.checkIfTransactionLanded(lastSignature, lastBundleId, params.owner, params.mintPubkey, params.tokenProgram, params.preSnapshot, 'BUY', params.orderId);
+    if (check.landed) return { success: true, signature: lastSignature, bundleId: lastBundleId, transport, slot: check.slot, lifecycleState: 'CONFIRMED' };
+    return { success: false, signature: lastSignature, bundleId: lastBundleId, transport, error: `ENTRY_REVOKED_AFTER_SEND: ${why}; not resent, and the earlier send may still land`, lifecycleState: 'REVERTED', unconfirmed: !!lastSignature };
   }
 
   /** Shared by LIVE and PAPER (C5): the same on-chain facts become the same eligibility inputs. */
@@ -2782,6 +2850,15 @@ export class ExecutionCoordinator {
       executionMode: 'LIVE',
     }));
 
+    // R3-28: the risk engine checked the signal and market-data ages once, here. Several awaits follow before the send (snapshot,
+    // build with a blockhash read, the optional blockhash check, signing, the cluster check), so the same limits become a send deadline
+    // that the pre-send re-check and the send itself enforce.
+    const riskLimits = riskEngine.getLimits();
+    const buySendDeadline = Math.min(
+      (req.signalTimestamp as number) + riskLimits.maxSignalAgeMs,
+      marketState.marketDataTimestamp + riskLimits.maxDataAgeMs
+    );
+
     if (!riskDecision.approved) {
       workstationDb.logJournal('TRADE_RISK_REJECTED', correlationId, 'LIVE', {
         reason: riskDecision.reasonCode,
@@ -2900,8 +2977,9 @@ export class ExecutionCoordinator {
       // kill switch may have happened in between; nothing is sent after any of them.
       // P3.1 (R1-0): the per-buy readiness checks run again here, for the same reason.
       const notReadyAtSend = this.liveBuyReadinessProblems();
-      if (!this.isLiveTradingArmed || this.executionMode !== 'LIVE' || this.haltReason || riskEngine.isKillSwitchActive() || notReadyAtSend.length > 0) {
-        const why = !this.isLiveTradingArmed || this.executionMode !== 'LIVE' ? 'live trading was disarmed' : this.haltReason ? `trading was halted (${this.haltReason})` : riskEngine.isKillSwitchActive() ? 'the kill switch was activated' : `live readiness failed (${notReadyAtSend.join('; ')})`;
+      const staleAtSend = !(Date.now() <= buySendDeadline); // R3-28 (a NaN deadline is stale too)
+      if (!this.isLiveTradingArmed || this.executionMode !== 'LIVE' || this.haltReason || riskEngine.isKillSwitchActive() || notReadyAtSend.length > 0 || staleAtSend) {
+        const why = !this.isLiveTradingArmed || this.executionMode !== 'LIVE' ? 'live trading was disarmed' : this.haltReason ? `trading was halted (${this.haltReason})` : riskEngine.isKillSwitchActive() ? 'the kill switch was activated' : notReadyAtSend.length > 0 ? `live readiness failed (${notReadyAtSend.join('; ')})` : `the signal or its market data went stale before the send (limits ${riskLimits.maxSignalAgeMs} ms and ${riskLimits.maxDataAgeMs} ms)`;
         workstationDb.logJournal('TRADE_REVOKED_BEFORE_SEND', correlationId, 'LIVE', { mint: req.mint, reason: why });
         return {
           success: false,
@@ -2947,6 +3025,7 @@ export class ExecutionCoordinator {
         tokenProgram: marketState.tokenProgram,
         preSnapshot,
         jitoTipLamports: resolvedTip.tipLamports,
+        buyNotAfter: buySendDeadline,
       });
 
       if (!subRes.success && subRes.unconfirmed && subRes.signature) {

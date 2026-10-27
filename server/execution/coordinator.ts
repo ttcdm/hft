@@ -423,10 +423,10 @@ export class ExecutionCoordinator {
     }
   }
 
-  /** S210: null when the order may be signed, else why not. See `verifyBlockhashIndependently`. A buy needs a clean pass; a sell is refused only on a definite "no". */
+  /** S210: null when the order may be signed, else why not. See `verifyBlockhashIndependently`. A buy needs a clean pass; a sell is refused only on a definite "no" after its longer re-checks (R3-6), and one that goes out unchecked raises SELL_BLOCKHASH_UNCHECKED. */
   private async blockhashProblem(tx: VersionedTransaction, side: 'BUY' | 'SELL'): Promise<string | null> {
     if (!blockhashCheckEnabled()) return null;
-    const verdict = await traced('guard.blockhash', () => verifyBlockhashIndependently(tx.message.recentBlockhash), { 'apex.side': side });
+    const verdict = await traced('guard.blockhash', () => verifyBlockhashIndependently(tx.message.recentBlockhash, process.env, {}, side), { 'apex.side': side });
     if (verdict.ok) {
       // S227: say so when the check really ran, so a run that has it on shows it; a skipped check (flag off, localnet) is silent.
       if (!('skipped' in verdict && verdict.skipped)) Logger.info(`[S210] independent blockhash check passed for the ${side}`);
@@ -434,6 +434,8 @@ export class ExecutionCoordinator {
     }
     if (side === 'SELL' && !verdict.definite) {
       Logger.warn(`[S210] SELL not blocked: ${verdict.reason}`);
+      // Round 1 #9: the guard did not run for this sell; say so where the operator looks, not only in the log.
+      this.raiseOperatorAlert('SELL_BLOCKHASH_UNCHECKED', `A SELL was sent without the independent blockhash check: ${verdict.reason}`);
       return null;
     }
     Logger.error(`[S210] ${side} blocked: ${verdict.reason}`);

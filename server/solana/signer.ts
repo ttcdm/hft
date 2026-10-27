@@ -24,6 +24,7 @@ export class LocalKeypairSigner implements TransactionSigner {
   private keypair: Keypair | null = null;
   private status: SignerStatus = 'NOT_CONFIGURED';
   private keypairPath: string = '';
+  private keyFromEnvironment = false;
   private nodePrivateKey: crypto.KeyObject | null = null;
 
   constructor() {
@@ -46,6 +47,7 @@ export class LocalKeypairSigner implements TransactionSigner {
         const secretKeyBytes = parseSecretKey(raw);
         if (secretKeyBytes.length === 64) {
           this.setKeypair(Keypair.fromSecretKey(secretKeyBytes));
+          this.keyFromEnvironment = true;
           Logger.info(`Local hot signer loaded securely from environment: ${this.keypair!.publicKey.toBase58().slice(0, 4)}...${this.keypair!.publicKey.toBase58().slice(-4)}`);
           return;
         } else {
@@ -185,6 +187,15 @@ export class LocalKeypairSigner implements TransactionSigner {
 
   public getStatus(): SignerStatus {
     return this.status;
+  }
+
+  /**
+   * UI report fix 5: where the loaded key came from, for the Signer tab (it used to print a fixed `.apex_trading_keypair.json`). The file
+   * path is the one this signer reads and would write (SIGNER_KEYPAIR_PATH or the default); null in read-only mode. Never the key itself.
+   */
+  public getKeyLocation(): { source: 'ENVIRONMENT' | 'FILE' | 'NONE'; path: string | null } {
+    const source = !this.keypair ? 'NONE' : this.keyFromEnvironment ? 'ENVIRONMENT' : 'FILE';
+    return { source, path: this.keypairPath || null };
   }
 
   public async signTransaction(transaction: VersionedTransaction): Promise<VersionedTransaction> {

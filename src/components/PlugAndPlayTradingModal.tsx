@@ -10,8 +10,11 @@
  * the server decides whether the prerequisites hold (`getLiveReadiness`). In read-only mode the server refuses to arm and to generate a key.
  */
 import { probeLatency } from '../utils/probeBadge';
+import { sellConfirmText } from '../utils/sellConfirm';
+import { journalEventDetail } from '../utils/exitWatch';
 import { ARMED_MESSAGE, PANIC_CONFIRM_TEXT, armRefusalText, panicOutcome } from '../utils/tradingCopy';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
+import { askConfirm, confirmLiveClick, confirmSell } from './ConfirmDialog';
 import React, { useState, useEffect } from 'react';
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { SnipeAmountControl } from './SnipeAmountControl';
@@ -38,9 +41,13 @@ import {
 } from 'lucide-react';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
 import { authFetch } from '../services/engineClient';
-import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
+import { useTradingMode, snipeBlockedReason, liveClickWarning, plugAndPlayModeView, killAndBreakerTile } from '../utils/tradingMode';
 import { positionPnlCell } from '../utils/positionPnl';
+import { closeOutcomeText } from '../utils/closeOutcome';
+import { fmtSol } from '../utils/numFormat';
+import { ageText, markIsStale } from '../utils/freshness';
 import { BELOW_HEADER_TOP } from '../utils/headerOffset';
+import { DialogFrame, KILL_SWITCH_ID } from './DialogFrame';
 
 interface PlugAndPlayTradingModalProps {
   isOpen: boolean;
@@ -60,6 +67,9 @@ interface SystemAudit {
   databaseFile: string;
   dbDriver: string;
   keypairStorage: string;
+  /** UI report fix 5: where the key came from and the file the signer reads; absent on an older server */
+  signerKeySource?: string;
+  signerKeyPath?: string | null;
   browserPrivateKeySecurity: string;
 }
 
@@ -71,6 +81,26 @@ interface RiskControls {
   dailyLossSoFarSol: number;
   circuitBreakerTripped: boolean;
   circuitBreakerState?: 'CLOSED' | 'OPEN' | 'HALF_OPEN';
+}
+
+/** UI report fix 5: where the server says its key is, from /api/diagnostics/system; never a fixed file name. */
+export function signerStorageText(a: { keypairStorage?: string; signerKeySource?: string; signerKeyPath?: string | null } | null | undefined): string {
+  if (!a) return 'unknown (no answer from the server yet)';
+  if (a.signerKeySource === 'ENVIRONMENT') return 'environment variable (not a file)';
+  if (a.signerKeyPath) return `${a.signerKeyPath} (mode 0600)${a.signerKeySource === 'NONE' ? ', no key loaded' : ''}`;
+  return a.keypairStorage ?? 'unknown';
+}
+
+/** R9-6: why each list could not be read, or null once it was; 'not read yet' before the first answer. */
+interface ReadProblems { diag: string | null; positions: string | null; events: string | null }
+const UNREAD: ReadProblems = { diag: 'not read yet', positions: 'not read yet', events: 'not read yet' };
+
+/** R9-6: an unread list is never shown as an empty one. */
+export function unreadText(what: string, why: string, haveOld: boolean): string {
+  if (why === UNREAD.positions) return `${what}: reading from the server...`;
+  return haveOld
+    ? `${what}: the last read failed (${why}). The list below is from an earlier read and may be out of date.`
+    : `${what} could not be read (${why}). This is not an empty list${/401/.test(why) ? ': sign in as operator to read it' : ''}.`;
 }
 
 export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = ({ isOpen, onClose }) => {
@@ -96,9 +126,15 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   const [selectedExternalToken, setSelectedExternalToken] = useState<any>(null);
 
   const tradingMode = useTradingMode();
+  const snipeBlocked = snipeBlockedReason(tradingMode); // UI report fix 7: grey the snipe buttons while the kill switch is on
+  const breakerTile = killAndBreakerTile(tradingMode.killSwitch, riskControls?.circuitBreakerState, !!riskControls);
+  const modeView = plugAndPlayModeView(tradingMode); // Round 1 #11: the shared, aging answer, never this modal's last good read
   const [isLoading, setIsLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ text: string; type: 'info' | 'success' | 'error' } | null>(null);
 
+  // R9-6: why each list could not be read (null once it was read). The lists start empty, so without this a 401 read as "No positions
+  // opened yet" / "No events logged yet" / "Public Key: None".
+  const [readProblem, setReadProblem] = useState<ReadProblems>(UNREAD);
   const fetchSystemData = async () => {
     try {
       const [diagRes, posRes, evRes] = await Promise.all([
@@ -106,24 +142,28 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
         authFetch('/api/workstation/positions'),
         authFetch('/api/workstation/events?limit=25'),
       ]);
+      const next: ReadProblems = { diag: null, positions: null, events: null };
 
       if (diagRes.ok) {
         const dJson = await diagRes.json();
         setSystemAudit(dJson.systemAudit);
         setRiskControls(dJson.riskControls);
-      }
+      } else next.diag = `HTTP ${diagRes.status}`;
 
       if (posRes.ok) {
         const pJson = await posRes.json();
         setPositions(pJson.positions || []);
-      }
+      } else next.positions = `HTTP ${posRes.status}`;
 
       if (evRes.ok) {
         const eJson = await evRes.json();
         setEvents(eJson.events || []);
-      }
-    } catch (err) {
+      } else next.events = `HTTP ${evRes.status}`;
+      setReadProblem(next);
+    } catch (err: any) {
       console.error('Failed to fetch system data:', err);
+      const why = `server not reachable (${err?.message || 'network error'})`;
+      setReadProblem({ diag: why, positions: why, events: why });
     }
   };
 
@@ -224,7 +264,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
     const amountSol = snipeAmount.parsed.sol;
     // S1: this button sends a real transaction while LIVE is armed, so it asks first and tells the server it asked
     const warning = liveClickWarning(tradingMode, `Sniping ${manualMint.trim().slice(0, 8)}… for ${formatSol(amountSol)}`);
-    if (warning && !window.confirm(warning)) return;
+    if (warning && !(await confirmLiveClick(warning))) return;
 
     try {
       setIsLoading(true);
@@ -237,7 +277,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
           slippagePct: Number(slippageBps) / 100,
           jitoTipSol: Number(jitoTipSol),
           callerHandle: '@manual_terminal',
-          confluenceScore: 100,
+          // R9-10: no confluenceScore. The server scores the token itself (and refuses a client-sent score).
           ...(tradingMode.live ? { confirmLive: true } : {}),
         }),
       });
@@ -260,6 +300,11 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   };
 
   const handleClosePosition = async (posId: string) => {
+    // R9-5: a sell asks first, with what it sells
+    const target = positions.find((p) => p.id === posId);
+    const held = target && /^\d+$/.test(String(target.tokenQuantityRaw ?? '')) ? Number(target.tokenQuantityRaw) / Math.pow(10, target.tokenDecimals ?? 6) : null;
+    const ask = sellConfirmText({ name: target?.symbol ? `$${target.symbol}` : 'this position', sellPct: 100, mode: target?.executionMode, tokensHeld: held, valueText: target ? fmtSol(target.currentValueSol) : null });
+    if (!(await confirmSell(ask))) return;
     try {
       const res = await authFetch('/api/wallet/close-position', {
         method: 'POST',
@@ -269,14 +314,18 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Close position failed');
       await fetchSystemData();
-      setStatusMessage({ text: `Position closed with PnL: ${data.data?.realizedPnLSol} SOL`, type: 'info' });
+      // R6-9: say what the close did: a sale, an adopted earlier sell (maybe partial), or an assumed loss on an empty wallet
+      const pos = positions.find((p) => p.id === posId);
+      const said = closeOutcomeText({ success: true, pnlSol: Number(data.data?.realizedPnLSol ?? 0), status: data.data?.status, outcome: data.data?.outcome }, 100, pos?.symbol ? `$${pos.symbol}` : 'the position');
+      setStatusMessage({ text: said.text, type: said.tone === 'info' ? 'info' : 'error' });
     } catch (err: any) {
       setStatusMessage({ text: err.message || 'Failed to close position', type: 'error' });
     }
   };
 
   const handlePanicLiquidate = async () => {
-    if (!confirm(PANIC_CONFIRM_TEXT)) return;
+    // R10-11: an in-page dialog, where Enter cannot accept (window.confirm took Enter as yes)
+    if (!(await askConfirm({ title: 'PANIC LIQUIDATE', body: PANIC_CONFIRM_TEXT, confirmLabel: 'Close everything now' }))) return;
     try {
       setIsLoading(true);
       const res = await authFetch('/api/wallet/panic-liquidate', { method: 'POST' });
@@ -295,7 +344,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   if (!isOpen) return null;
 
   return (
-    <div className={`fixed ${BELOW_HEADER_TOP} inset-x-0 bottom-0 z-40 flex items-start justify-center bg-black/85 backdrop-blur-md p-2 sm:p-4 overflow-y-auto font-sans`}>
+    <DialogFrame label="Plug & Play trading" className={`fixed ${BELOW_HEADER_TOP} inset-x-0 bottom-0 z-40 flex items-start justify-center bg-black/85 backdrop-blur-md p-2 sm:p-4 overflow-y-auto font-sans`} alsoReach={[KILL_SWITCH_ID]}>
       <div className="bg-slate-900 border border-slate-700/80 rounded-2xl w-full max-w-5xl shadow-2xl overflow-hidden my-2 sm:my-4">
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800 bg-slate-950/90 gap-3">
@@ -307,15 +356,16 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
               <div className="flex items-center space-x-2">
                 <h2 className="text-base sm:text-lg font-bold text-white tracking-wide">SOLANA TRADING WORKSTATION</h2>
                 <span
+                  data-testid="pnp-mode-badge"
                   className={`px-2 py-0.5 text-xs font-bold rounded ${
-                    !systemAudit
+                    modeView.tone === 'unknown'
                       ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
-                      : systemAudit.isLiveArmed
+                      : modeView.tone === 'live'
                         ? 'bg-rose-500/20 text-rose-400 border border-rose-500/40 animate-pulse'
                         : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
                   }`}
                 >
-                  {!systemAudit ? 'MODE UNKNOWN' : systemAudit.isLiveArmed ? 'LIVE BROADCAST ACTIVE' : 'PAPER TRADING'}
+                  {modeView.badge}
                 </span>
               </div>
               <p className="text-xs text-slate-400">
@@ -348,11 +398,11 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
             <div className="flex items-center space-x-1.5">
               <span
                 className={`w-2 h-2 rounded-full ${
-                  !systemAudit ? 'bg-slate-500' : systemAudit.isLiveArmed ? 'bg-rose-400 animate-ping' : 'bg-emerald-400'
+                  modeView.tone === 'unknown' ? 'bg-slate-500' : modeView.tone === 'live' ? 'bg-rose-400 animate-ping' : 'bg-emerald-400'
                 }`}
               />
-              <span className={`font-bold ${!systemAudit ? 'text-slate-400' : systemAudit.isLiveArmed ? 'text-rose-400' : 'text-emerald-400'}`}>
-                {systemAudit?.mode || 'UNKNOWN'}
+              <span className={`font-bold ${modeView.tone === 'unknown' ? 'text-slate-400' : modeView.tone === 'live' ? 'text-rose-400' : 'text-emerald-400'}`}>
+                {modeView.mode}
               </span>
             </div>
           </div>
@@ -376,15 +426,10 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
             </span>
           </div>
 
-          <div className="p-2.5 rounded-lg bg-slate-900/80 border border-slate-800">
-            <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-0.5">Circuit Breaker</span>
-            <span
-              className={`font-bold text-xs ${
-                riskControls?.circuitBreakerState === 'OPEN' ? 'text-rose-400' : riskControls?.circuitBreakerState === 'HALF_OPEN' ? 'text-amber-400' : 'text-emerald-400'
-              }`}
-            >
-              {riskControls?.circuitBreakerState === 'OPEN' ? 'TRIPPED (HALTED)' : riskControls?.circuitBreakerState === 'HALF_OPEN' ? 'RECOVERING (HALF-OPEN)' : riskControls ? 'NORMAL (ACTIVE)' : '—'}
-            </span>
+          <div className="p-2.5 rounded-lg bg-slate-900/80 border border-slate-800" data-testid="pnp-breaker-tile">
+            <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-0.5">Kill switch / breaker</span>
+            {/* R9-4: this tile was green "NORMAL (ACTIVE)" under the kill switch: it read the breaker only */}
+            <span className={`font-bold text-xs ${breakerTile.tone}`}>{breakerTile.text}</span>
           </div>
 
           <div className="p-2.5 rounded-lg bg-slate-900/80 border border-slate-800 flex items-center justify-between">
@@ -509,7 +554,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                     <span>Instant Token Snipe Terminal</span>
                   </span>
                   <span className="text-[10px] text-slate-400 font-mono">
-                    Mode: <strong className={systemAudit?.isLiveArmed ? 'text-rose-400' : 'text-emerald-400'}>{systemAudit?.mode}</strong>
+                    Mode: <strong className={modeView.tone === 'live' ? 'text-rose-400' : modeView.tone === 'unknown' ? 'text-amber-300' : 'text-emerald-400'}>{modeView.mode}</strong>
                   </span>
                 </h3>
 
@@ -526,11 +571,12 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                     <button
                       type="button"
                       onClick={handleManualSnipe}
-                      disabled={isLoading || !manualMint}
+                      disabled={isLoading || !manualMint || snipeBlocked !== null}
+                      title={snipeBlocked ?? undefined}
                       className="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white text-xs font-bold flex items-center space-x-1.5 transition"
                     >
                       <Zap className="w-3.5 h-3.5" />
-                      <span>{systemAudit?.isLiveArmed ? 'LIVE SNIPE' : 'PAPER SNIPE'}</span>
+                      <span>{modeView.snipe}</span>
                     </button>
                   </div>
                 </div>
@@ -551,10 +597,17 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                 />
               </div>
 
+              {readProblem.positions && (
+                <div data-testid="pnp-positions-unread" className="p-2 rounded-lg border border-amber-500/40 bg-amber-950/40 text-amber-200 text-[11px]">
+                  {unreadText('Positions', readProblem.positions, positions.length > 0)}
+                </div>
+              )}
               {positions.length === 0 ? (
+                readProblem.positions ? null : (
                 <div className="p-8 text-center text-slate-400 bg-slate-950/40 rounded-xl border border-slate-800">
                   No positions opened yet. Snipe a token to record honest execution in SQLite.
                 </div>
+                )
               ) : (
                 <div className="overflow-x-auto border border-slate-800 rounded-xl">
                   <table className="w-full text-left text-xs">
@@ -564,7 +617,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                         <th className="p-2.5">Mode</th>
                         <th className="p-2.5">Cost Basis</th>
                         <th className="p-2.5">Current Value</th>
-                        <th className="p-2.5">PnL</th>
+                        <th className="p-2.5" title="Open part at the curve spot price; exit fee, price impact and tip are not taken off">PnL (open at mark, before exit costs)</th>
                         <th className="p-2.5">Status</th>
                         <th className="p-2.5 text-right">Action</th>
                       </tr>
@@ -587,10 +640,17 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                                 {pos.executionMode}
                               </span>
                             </td>
-                            <td className="p-2.5 font-mono">{((pos.costBasisLamports ?? 0) / 1e9).toFixed(4)} SOL</td>
-                            <td className="p-2.5 font-mono">{(pos.currentValueSol ?? 0).toFixed(4)} SOL</td>
+                            <td className="p-2.5 font-mono">{fmtSol((pos.costBasisLamports ?? 0) / 1e9)}</td>
+                            <td className="p-2.5 font-mono">
+                              {fmtSol(pos.currentValueSol)}
+                              {(pos.status === 'OPEN' || pos.status === 'PARTIALLY_CLOSED') && (
+                                <span data-testid="blotter-mark-age" className={`block text-[10px] ${markIsStale(pos.lastMarkTimestamp, Date.now()) ? 'text-amber-300' : 'text-slate-500'}`}>
+                                  mark {ageText(pos.lastMarkTimestamp ? Date.now() - pos.lastMarkTimestamp : null)}{markIsStale(pos.lastMarkTimestamp, Date.now()) ? ' (STALE)' : ''}
+                                </span>
+                              )}
+                            </td>
                             <td className="p-2.5 font-mono font-bold">
-                              <span className={positionPnlCell(pos).positive ? 'text-emerald-400' : 'text-rose-400'}>
+                              <span className={{ up: 'text-emerald-400', down: 'text-rose-400', mixed: 'text-amber-300', flat: 'text-slate-300' }[positionPnlCell(pos).tone]}>
                                 {positionPnlCell(pos).text}
                               </span>
                             </td>
@@ -625,10 +685,17 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
           {activeTab === 'RISK_LOGS' && (
             <div className="space-y-3">
               <span className="font-bold text-white text-xs">Immutable Event Log (SQLite Journal)</span>
+              {readProblem.events && (
+                <div data-testid="pnp-events-unread" className="p-2 rounded-lg border border-amber-500/40 bg-amber-950/40 text-amber-200 text-[11px]">
+                  {unreadText('Events', readProblem.events, events.length > 0)}
+                </div>
+              )}
               {events.length === 0 ? (
+                readProblem.events ? null : (
                 <div className="p-8 text-center text-slate-400 bg-slate-950/40 rounded-xl border border-slate-800">
                   No events logged yet.
                 </div>
+                )
               ) : (
                 <div className="space-y-2">
                   {events.map((ev) => (
@@ -642,6 +709,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                         </span>
                         <span className="text-white font-mono">{ev.payload?.mint || ev.payload?.positionId || ''}</span>
                         <span className="text-slate-400">{ev.payload?.reason || ev.payload?.source || ''}</span>
+                        {journalEventDetail(ev) && <span className="text-slate-300 font-mono" data-testid="journal-sell-detail">{journalEventDetail(ev)}</span>}
                       </div>
                       <span className="text-slate-500 text-[10px] font-mono">
                         {new Date(ev.timestamp).toLocaleTimeString()}
@@ -661,13 +729,13 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                   <span>Local Hot Wallet Signer</span>
                 </h3>
                 <p className="text-slate-400 text-xs">
-                  To execute live transactions without exposing private keys, Apex Workstation manages a local hot keypair stored in `.apex_trading_keypair.json` with strict POSIX 0600 file permissions.
+                  To execute live transactions without exposing private keys, Apex Workstation manages a local hot keypair in a file with POSIX 0600 permissions (SIGNER_KEYPAIR_PATH, default `.apex_trading_keypair.json` in the server's folder), or takes it from the environment.
                 </p>
 
                 <div className="p-3 rounded-lg bg-slate-900 border border-slate-800 font-mono text-xs text-slate-300 space-y-1">
                   <div>Status: <strong className="text-emerald-400">{systemAudit?.signerStatus}</strong></div>
-                  <div>Public Key: <span className="text-amber-300">{systemAudit?.walletPubkey || 'None'}</span></div>
-                  <div>Storage Location: <span className="text-slate-400">.apex_trading_keypair.json (mode 0600)</span></div>
+                  <div>Public Key: <span className="text-amber-300">{systemAudit?.walletPubkey || (readProblem.diag ? `unknown (not read: ${readProblem.diag})` : 'None')}</span></div>
+                  <div>Storage Location: <span className="text-slate-400" data-testid="signer-storage">{signerStorageText(systemAudit)}</span></div>
                 </div>
 
                 <div className="flex items-center space-x-3 pt-2">
@@ -699,6 +767,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
             {/* Panic Liquidate / Trip Circuit Breaker */}
             <button
               onClick={handlePanicLiquidate}
+              data-testid="pnp-panic"
               className="px-3.5 py-2 rounded-lg bg-rose-950/60 hover:bg-rose-900/80 border border-rose-600/50 text-rose-300 font-bold text-xs flex items-center space-x-1.5"
             >
               <AlertTriangle className="w-3.5 h-3.5" />
@@ -717,7 +786,10 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
             ) : (
               <button
                 onClick={() => setShowArmConfirmModal(true)}
-                className="px-5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center space-x-1.5"
+                disabled={snipeBlocked !== null}
+                title={snipeBlocked ? 'KILL SWITCH ON: the server refuses to arm LIVE. Reset it from the header first.' : undefined}
+                data-testid="pnp-arm-live"
+                className="px-5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold text-xs flex items-center space-x-1.5"
               >
                 <Play className="w-3.5 h-3.5 fill-current" />
                 <span>ARM LIVE TRADING</span>
@@ -729,7 +801,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
 
       {/* Confirmation Modal to Arm Live Trading */}
       {showArmConfirmModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-4">
+        <DialogFrame label="Confirm live Solana broadcast" className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-4">
           <div className="bg-slate-900 border border-rose-500/60 rounded-2xl p-5 max-w-md w-full space-y-4 shadow-2xl">
             <div className="flex items-center space-x-2.5 text-rose-400 font-bold text-sm">
               <AlertTriangle className="w-5 h-5 flex-shrink-0" />
@@ -775,8 +847,8 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
               </button>
             </div>
           </div>
-        </div>
+        </DialogFrame>
       )}
-    </div>
+    </DialogFrame>
   );
 };

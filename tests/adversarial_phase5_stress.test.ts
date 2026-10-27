@@ -689,6 +689,7 @@ describe('Empirical Challenger: Phase 5 Adversarial & Boundary Stress Test Suite
         hftAction: 'INSTANT_SNIPE',
         decayWindowSecondsRemaining: 90,
         status: 'ACTIVE',
+        dataAsOfMs: Date.now(), // R6-6: a fresh feed snapshot
       };
 
       const snipeSpy = vi.spyOn(memecoinAggregator, 'executeSnipe').mockResolvedValue({

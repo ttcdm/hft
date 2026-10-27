@@ -1,5 +1,6 @@
 import { workstationDb } from './db/database';
-import { executionCoordinator } from './execution/coordinator';
+import { executionCoordinator, MARK_STALE_MS } from './execution/coordinator';
+import { riskEngine } from './risk/riskEngine';
 import { memecoinAggregator } from './memecoinAggregator';
 import { watchWindow } from './signals/watchWindow';
 import { ExitEngine } from './exits/exitEngine';
@@ -41,6 +42,17 @@ export function buildBoard(now = Date.now()) {
   const mode = executionCoordinator.getExecutionMode();
   const balance = executionCoordinator.getRealWalletBalanceSol();
   const sol = solPriceService.lastKnownPrice();
+  const solReading = solPriceService.getPrice();
+  // R6-8: the balance is cached (read at boot, after a trade, on an RPC switch and in the DEVNET_LIVE wallet audit); say how old it is
+  const balanceRead = riskEngine.getLastBalanceRead();
+
+  const snap = watchWindow.getSnapshot(now);
+  // R6-10: every WS launch carried the fixed text "Just now (WS)". The watch window knows how long it has watched each launch, which
+  // starts at the create event; a launch it is not watching has no measured age here.
+  const watchedAge = new Map<string, string>();
+  for (const r of snap.released) watchedAge.set(r.metrics.mint, `over ${Math.round(r.metrics.elapsedMs / 1000)}s (released)`);
+  for (const w of snap.watching) watchedAge.set(w.metrics.mint, `${Math.round(w.metrics.elapsedMs / 1000)}s`);
+  const launchAge = (mint: string, text: string | undefined): string | null => (text && text !== 'Just now (WS)' ? text : watchedAge.get(mint) ?? null);
 
   const launches = memecoinAggregator
     .getPools()
@@ -57,10 +69,9 @@ export function buildBoard(now = Date.now()) {
       // Q10d: a placeholder is not a fact; unknown goes out as null
       mintRevoked: p.authoritiesVerified === false ? null : p.isMintRevoked,
       freezeRevoked: p.authoritiesVerified === false ? null : p.isFreezeRevoked,
-      createdAgo: p.createdAgo || null,
+      createdAgo: launchAge(p.contractAddress, p.createdAgo),
     }));
 
-  const snap = watchWindow.getSnapshot(now);
   const watching = [
     ...snap.watching.map((w) => ({ mint: w.metrics.mint, state: 'WATCHING' as const, reason: null as string | null, metrics: w.metrics })),
     ...snap.released.map((r) => ({ mint: r.metrics.mint, state: r.state, reason: r.reason, metrics: r.metrics })),
@@ -76,6 +87,8 @@ export function buildBoard(now = Date.now()) {
       entryPriceSol: p.entryPriceSol > 0 ? p.entryPriceSol : null,
       markPriceSol: p.currentPriceSol > 0 ? p.currentPriceSol : null,
       markAgeMs: p.lastMarkTimestamp ? now - p.lastMarkTimestamp : null,
+      /** R6-7: older than the coordinator's MARK_STALE_MS (or never marked) */
+      markStale: !p.lastMarkTimestamp || now - p.lastMarkTimestamp > MARK_STALE_MS,
       costSol: p.costBasisLamports ? p.costBasisLamports / 1e9 : null,
       pnlSol: p.currentPriceSol > 0 && !String(p.entryTxSignature || '').startsWith('RECOVERED:') ? (p.realizedPnLSol ?? 0) + (p.unrealizedPnLSol ?? 0) : null,
       nextExit: nextExitFor(p),
@@ -91,6 +104,12 @@ export function buildBoard(now = Date.now()) {
       rentLockedSol: balance === null ? null : executionCoordinator.getRentLockedSol(),
       spendableSol: balance === null ? null : executionCoordinator.getSpendableBankrollSol(),
       solUsd: sol,
+      /** R6-7: age of the SOL/USD reading; stale past SOL_PRICE_MAX_AGE_MS (USD figures still use it, LIVE sizing refuses it) */
+      solUsdAgeMs: solReading.ageMs,
+      solUsdStale: solReading.stale,
+      /** R6-8: age of the last successful wallet balance read; null when none succeeded or the last read failed */
+      balanceAgeMs: balance !== null && balanceRead?.ok ? now - balanceRead.at : null,
+      balanceLastReadFailed: balanceRead ? !balanceRead.ok : false,
     },
     launches,
     watching,

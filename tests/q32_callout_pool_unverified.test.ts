@@ -11,7 +11,8 @@ describe('Q32: a pool built from a callout is a placeholder, not real evidence',
     const mint = Keypair.generate().publicKey.toBase58();
     memecoinAggregator.setConfluenceGating(false);
     vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('PAPER');
-    vi.spyOn(pumpFunService, 'getHotCallouts').mockReturnValue([{ token: { mint, symbol: 'Q32', name: 'Q32', complete: false, currentPriceUsd: 0.00005 } }] as any);
+    // A144: the callout states its authorities (an unknown freeze authority is now refused by the freeze gate before this point)
+    vi.spyOn(pumpFunService, 'getHotCallouts').mockReturnValue([{ token: { mint, symbol: 'Q32', name: 'Q32', complete: false, currentPriceUsd: 0.00005, isMintRevoked: true, isFreezeRevoked: true } }] as any);
     const trade = vi.spyOn(executionCoordinator, 'executeTrade').mockResolvedValue({ success: false, error: 'stub' } as any);
     await memecoinAggregator.executeSnipe({ contractAddress: mint, amountUsd: 5, provenance: 'REAL_ONCHAIN' });
     expect(trade.mock.calls[0][0].provenance).toBe('SYNTHETIC_TEST');

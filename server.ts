@@ -10,6 +10,7 @@ import http from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer, createLogger } from 'vite';
 import { secretPathGuard, viteDevServerOptions } from './server/security/secretPaths';
+import { defaultBundledToProduction, useDevMiddleware } from './server/system/runtimeMode';
 import { GoogleGenAI } from '@google/genai';
 import { socialScanner, isTelegramTradeCommand, xTwitterScopeEntry } from './server/socialScanner';
 import { memecoinAggregator } from './server/memecoinAggregator';
@@ -51,6 +52,7 @@ import {
   AutoOrderSizeSchema,
   AutoThresholdSchema,
   AutoKillSchema,
+  AlertAcknowledgeSchema,
   AutoResumeSchema,
   CalloutSnipeSchema,
   AutoSnipeRulesSchema,
@@ -76,6 +78,7 @@ import {
   isAllowedClientOrigin,
   isAllowedWsConnection,
   verifyWsAuth,
+  extractOperatorToken,
 } from './server/middleware/auth';
 import {
   findLoosePermissions,
@@ -90,6 +93,8 @@ import {
   errorHandler,
   rateLimiter,
   LOGIN_RATE_LIMIT,
+  EMERGENCY_RATE_LIMIT,
+  isEmergencyRoute,
   securityHeadersMiddleware,
   validateBody,
   WalletConfigSchema,
@@ -97,6 +102,8 @@ import {
   ClosePositionSchema, publicHealthBody } from './server/middleware/enterprise';
 
 
+// R5-14: `npm start` (dist/server.cjs) runs as production even with NODE_ENV unset; set before express() reads it
+{ const note = defaultBundledToProduction(); if (note) console.warn(note); }
 const app = express();
 // Defense in depth with the normalized auth gate: `/API/...` must not reach a route at all.
 app.set('case sensitive routing', true);
@@ -129,7 +136,16 @@ server.on('error', (err: any) => {
 });
 
 // WebSocket Server for High-Performance Engine Telemetry & Orders
-const wss = new WebSocketServer({ server, path: '/ws/engine' });
+/** R4-12: the largest frame the engine socket accepts (64 KiB; the ws default is 100 MiB). A larger one closes the socket with 1009. */
+export const WS_MAX_PAYLOAD_BYTES = 64 * 1024;
+/** R4-12: close code for a socket that sent anything but an AUTHENTICATE before it authenticated. */
+const WS_CLOSE_AUTH_FIRST = 4002;
+const WS_AUTH_ACTIONS = new Set(['AUTHENTICATE', 'AUTH']);
+/** True when the frame is an authentication command (any of the spellings the UI and older clients send). */
+function isWsAuthFrame(parsed: any): boolean {
+  return !!parsed && typeof parsed === 'object' && (WS_AUTH_ACTIONS.has(parsed.action) || WS_AUTH_ACTIONS.has(parsed.type));
+}
+const wss = new WebSocketServer({ server, path: '/ws/engine', maxPayload: WS_MAX_PAYLOAD_BYTES });
 
 wss.on('error', (err: any) => {
   Logger.warn(`WebSocketServer error: ${err?.message || err}`);
@@ -214,17 +230,21 @@ wss.on('connection', (ws: WebSocket, req: any) => {
   } catch {}
 
   ws.on('message', async (msg: any) => {
-    let parsed: any;
+    let parsed: any = null;
+    // R4-12: before it authenticates, a socket may send only AUTHENTICATE (frames are at most WS_MAX_PAYLOAD_BYTES). Anything else, or a
+    // frame that is not JSON, closes it; the UI authenticates on open and again after login, and reconnects on close.
+    if (!(ws as any).isAuthenticated) {
+      try { parsed = JSON.parse(msg.toString()); } catch { /* not JSON: closed below */ }
+      if (!isWsAuthFrame(parsed)) {
+        try { ws.close(WS_CLOSE_AUTH_FIRST, 'Authenticate first'); } catch {}
+        return;
+      }
+    }
     try {
-      parsed = JSON.parse(msg.toString());
+      parsed ??= JSON.parse(msg.toString());
 
       // Operator Authentication command
-      if (
-        parsed.action === 'AUTHENTICATE' ||
-        parsed.action === 'AUTH' ||
-        parsed.type === 'AUTH' ||
-        parsed.type === 'AUTHENTICATE'
-      ) {
+      if (isWsAuthFrame(parsed)) {
         const token = parsed.sessionToken || parsed.token;
         if (verifyWsAuth(token)) {
           (ws as any).isAuthenticated = true;
@@ -428,7 +448,10 @@ app.use(cors(corsPolicy));
 
 app.use(express.json());
 app.get('/favicon.ico', (req, res) => res.status(204).end());
-app.use('/api', rateLimiter({ maxTokens: Number(process.env.APEX_RATE_LIMIT_BURST) || 120, refillRatePerSec: 30 }));
+// R8-3: an authenticated emergency request (kill switch, panic, auto kill) has its own bucket, so other /api traffic cannot starve it
+const authedEmergency = (req: express.Request) => isEmergencyRoute(req) && authManager.isOperatorToken(extractOperatorToken(req));
+app.use('/api', rateLimiter({ maxTokens: Number(process.env.APEX_RATE_LIMIT_BURST) || 120, refillRatePerSec: 30, skip: authedEmergency }));
+app.use('/api', rateLimiter({ ...EMERGENCY_RATE_LIMIT, skip: (req) => !authedEmergency(req) }));
 // A1: deny-by-default. Only GET /api/health and POST /api/auth/login are reachable without an operator token.
 app.use(apiAuthGate);
 
@@ -1153,7 +1176,10 @@ app.get('/api/diagnostics/system', requireOperatorAuth, (req, res) => {
       rpcLatencyMs: diag.rpcLatencyMs,
       databaseFile: 'apex_workstation.db',
       dbDriver: 'node:sqlite (WAL mode enabled)',
-      keypairStorage: 'Local filesystem (mode 0600) at .apex_trading_keypair.json',
+      // UI report fix 5: the real key location, not a fixed `.apex_trading_keypair.json`
+      keypairStorage: (() => { const k = localSigner.getKeyLocation(); return k.source === 'ENVIRONMENT' ? 'Environment variable (OPERATOR_PRIVATE_KEY / SOLANA_PRIVATE_KEY), not a file' : k.path ? `Local file (mode 0600) at ${k.path}${k.source === 'NONE' ? ' (no key loaded)' : ''}` : 'none (read-only: no key is loaded)'; })(),
+      signerKeySource: localSigner.getKeyLocation().source,
+      signerKeyPath: localSigner.getKeyLocation().path,
       browserPrivateKeySecurity: 'Private keys are NEVER accepted via HTTP/WebSocket requests.',
     },
     riskControls: {
@@ -1172,6 +1198,15 @@ app.get('/api/diagnostics/system', requireOperatorAuth, (req, res) => {
 
 // System checks and measured latency: live reads, each from the component that owns the fact (see server/system/*).
 app.get('/api/system/checks', requireOperatorAuth, (req, res) => {
+  res.json({ success: true, ...buildSystemChecks() });
+});
+
+// A CRITICAL alert that reports a past event (POSITION_GONE, POSITION_BALANCE_MISSING, SELL_ADOPTED, LEDGER_WRITE_FAILED) stayed until a
+// restart. The operator acknowledges one here, by code and position, once it has been looked at. Any other code is refused (409): it
+// clears by itself when its condition does. 404 when no such alert is open.
+app.post('/api/system/alerts/acknowledge', requireOperatorAuth, validateTradeBody(AlertAcknowledgeSchema), (req, res) => {
+  const r = executionCoordinator.acknowledgeOperatorAlert(req.body.code, req.body.positionId);
+  if (!r.acknowledged) return res.status(/^NOT_FOUND/.test(r.error ?? '') ? 404 : 409).json({ success: false, error: r.error });
   res.json({ success: true, ...buildSystemChecks() });
 });
 
@@ -1215,10 +1250,10 @@ app.get('/api/backtest/replay', requireOperatorAuth, asyncHandler(async (req, re
     let running = replayInFlight.get(key);
     if (!running) {
       running = (async () => {
-        const { launches, funders } = workstationDb.loadLaunchRecording(cap);
-        // 5A: the recorder's window and trade cap tell the replay how far each recording reaches (a quiet coin's stale exit is then visible)
+        const { launches, funders, markers } = workstationDb.loadLaunchRecording(cap);
+        // R2-2: the recorder's restart and feed-gap markers cut the launches they fall in; the window and trade cap say which can be cut
         const rc = recorderConfig();
-        const report = await replayLaunchesAsync(launches, funders, solPriceService.lastKnownPrice(), { ...(minScore === undefined ? {} : { minScore }), recordedForMs: rc.mintMs, recordedMaxTrades: rc.maxTradesPerMint, maxDevHoldingPct, readAtTs: Date.now() });
+        const report = await replayLaunchesAsync(launches, funders, solPriceService.lastKnownPrice(), { ...(minScore === undefined ? {} : { minScore }), recordedForMs: rc.mintMs, recordedMaxTrades: rc.maxTradesPerMint, maxDevHoldingPct, markers });
         // S188: the replay covers the newest `cap` launches; the response says so, so a count below the recorder's is explained
         const body = { success: true, recorded: status, report, message: null, replayedLaunches: launches.length, replayCap: cap };
         replayCache = { key, at: Date.now(), body };
@@ -1279,7 +1314,7 @@ app.post('/api/auto/threshold', requireOperatorAuth, validateTradeBody(AutoThres
   res.status(result.ok ? 200 : 422).json({ success: result.ok, ...result, error: result.reason, status: autoSnipeController.getStatus() });
 });
 
-// G1: auto-snipe controller. The mode is saved; a restart brings it back up to PAPER (a saved DEVNET_LIVE returns as SHADOW).
+// G1: auto-snipe controller. The mode is saved but not restored: auto starts OFF at every start (3E).
 app.get('/api/auto/status', requireOperatorAuth, (req, res) => {
   res.json({ success: true, ...autoSnipeController.getStatus(), stats: autoSnipeController.getJournalStats(), decisions: autoSnipeController.getDecisions(100) });
 });
@@ -1292,7 +1327,16 @@ app.post('/api/auto/mode', requireOperatorAuth, validateTradeBody(AutoModeSchema
 
 app.post('/api/auto/kill', requireOperatorAuth, validateTradeBody(AutoKillSchema), asyncHandler(async (req, res) => {
   const result = await autoSnipeController.kill({ exitAll: req.body.exitAll, reason: req.body.reason });
-  res.json({ success: true, ...result, status: autoSnipeController.getStatus() });
+  // R6-4: auto is OFF either way, but "sell what it bought" succeeded only if every sell did and nothing auto bought is still open; a
+  // refused or failed sell, or a position still open, is success:false
+  const notSold = [...result.refused, ...result.failed];
+  const success = notSold.length === 0 && result.stillOpen === 0;
+  const partial = !success && result.closed > 0;
+  res.json({
+    success, partial, ...result,
+    ...(success ? {} : { error: `Auto is OFF, but ${notSold.length} of ${result.attempted} position(s) were NOT sold${notSold.length ? `: ${notSold.map((f) => `${f.symbol} (${f.error})`).join('; ')}` : ''}; ${result.stillOpen} auto position(s) are still open. Close them by hand.` }),
+    status: autoSnipeController.getStatus(),
+  });
 }));
 
 // H2: bonding-curve depth ladder and the selected mint's trade tape. When the source fails: 503, no generated rows.
@@ -1389,18 +1433,29 @@ app.post('/api/execution/kill-switch', requireOperatorAuth, asyncHandler(async (
 
 app.post('/api/execution/trade', requireOperatorAuth, requireLiveConfirmation, validateTradeBody(OperatorExecuteTradeSchema), asyncHandler(async (req, res) => {
   try {
-    // Provenance and source are set here. A client cannot choose them (the schema rejects them).
-    const result = await executionCoordinator.executeTrade({
-      ...req.body,
+    // R5-40: through executeSnipe, so this route runs the gates every other manual buy runs (confluence, pool checks, sizing refusals,
+    // no synthetic pool). The pool supplies price, liquidity, symbol and name; the client's are not used. Provenance and source are set
+    // here (the schema rejects client ones). The mode is read before any await and sent with the order, so a LIVE arm in between is
+    // refused MODE_CHANGED. The reply is the coordinator's result when the order reached it, as before.
+    const { mint, amountSol, slippageBps, jitoTipSol } = req.body;
+    const result = await memecoinAggregator.executeSnipe({
+      contractAddress: mint,
+      amountUsd: 0,
+      operatorAmountSol: amountSol,
+      slippagePct: slippageBps !== undefined ? slippageBps / 100 : undefined,
+      jitoTipSol,
+      provenance: OPERATOR_PROVENANCE,
       source: 'MANUAL',
       // The operator's request is the signal (K4a). The schema rejects a client-supplied signalTimestamp.
       signalTimestamp: Date.now(),
-      provenance: OPERATOR_PROVENANCE,
+      expectedMode: executionCoordinator.getExecutionMode(),
+      noSyntheticPool: true,
     });
-    if (!result.success) {
-      return res.status(400).json(result);
+    const body = result.execResult ?? { success: false, error: result.message };
+    if (!body.success) {
+      return res.status(400).json(body);
     }
-    res.json(result);
+    res.json(body);
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -1458,9 +1513,11 @@ app.post('/api/signer/generate', requireOperatorAuth, (req, res) => {
         error: 'Overwriting an existing keypair over HTTP is disabled. Back it up and replace it with: npm run signer:import',
       });
     }
-    // Q5: positions bought with the current key can only be sold with it
-    if (workstationDb.loadPositions('LIVE', 'ACTIVE').length > 0) {
-      return res.status(409).json({ success: false, error: 'A signing key already exists for the open LIVE positions; it is not replaced while they are open.' });
+    // Q5: positions bought with the current key can only be sold with it. R5-2: so can a LIVE buy that was sent and is not resolved yet (it
+    // may still become a position, and recovery reads its fill for the signer's wallet). An unreadable ledger is refused too.
+    const unresolvedBuys = workstationDb.loadUnresolvedLiveBuys();
+    if (workstationDb.loadPositions('LIVE', 'ACTIVE').length > 0 || unresolvedBuys === null || unresolvedBuys.length > 0) {
+      return res.status(409).json({ success: false, error: 'A signing key already exists for the open LIVE positions or unresolved LIVE buys (or the ledger could not be read); it is not replaced while they are open.' });
     }
     const pubkey = localSigner.generateNewKeypair(false);
     res.json({
@@ -1518,7 +1575,7 @@ async function startServer() {
   await tracingReady; // S209: instrumentation must be in place before any outbound connection is made
   assertReadOnlyStartup(); // S185: refuses to start next to a signing key in read-only mode
   { const p = envConfluenceProblem(); if (p) console.warn(`[APEX QUANT HFT] ${p}`); } // S187
-  if (process.env.NODE_ENV !== 'production') {
+  if (useDevMiddleware()) { // R5-14: never from the bundle
     const customLogger = createLogger();
     const originalError = customLogger.error.bind(customLogger);
     customLogger.error = (msg, options) => {
@@ -1573,7 +1630,7 @@ async function startServer() {
 async function startTrading() {
   try {
     executionCoordinator.start(); // takes the signer lock, then reconciliation, the exit loop and the feed heartbeat
-    await autoSnipeController.restorePersisted(); // S222: the confluence threshold, and the auto mode up to PAPER, come back after a restart
+    await autoSnipeController.restorePersisted(); // S222: the confluence threshold comes back; 3E: auto starts OFF (a saved kill stays killed)
     autoSnipeController.startMonitor(); // G3: kill-switch triggers and wallet audit (inert while the mode is OFF)
   } catch (err: any) {
     Logger.error(`[PROCESS] trading start refused, exiting: ${err?.message || err}`);

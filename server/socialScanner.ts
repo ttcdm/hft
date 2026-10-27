@@ -1,6 +1,7 @@
 import { PublicKey } from '@solana/web3.js';
 import { SocialSignal, SocialSource, AuthorTier, SignalPattern } from '../src/types';
 import { memecoinAggregator } from './memecoinAggregator';
+import { solPriceService } from './market/solPriceService';
 import { emergencyStop, type EmergencyStopReport } from './execution/emergencyStop';
 
 export interface TelegramConnectionTestResult {
@@ -300,15 +301,20 @@ export class SocialAlphaScanner {
           reply: `💼 No open memecoin sniper positions active.\nUse /signals to explore live opportunities or /snipe <CA> [amount] to enter.`,
         };
       }
-      const totalUnrealizedPnl = positions.reduce((acc, p) => acc + p.unrealizedPnlUsd, 0);
+      // R6-2: real LIVE rows are listed while the server is in PAPER (after a disarm) and labelled; their PnL is totalled apart from paper's
+      const label = (m?: string) => (m === 'LIVE' ? 'LIVE, real SOL' : m ?? 'unknown mode');
+      const sign = (v: number) => `${v >= 0 ? '+' : '-'}$${Math.abs(v).toFixed(2)}`;
       const posList = positions
         .map(
           (p) =>
-            `• $${p.tokenTicker} (${p.platform}): Entry $${p.entryPriceUsd.toFixed(6)} | Cur $${p.currentPriceUsd.toFixed(6)} | PnL: ${p.unrealizedPnlUsd >= 0 ? '+' : ''}$${p.unrealizedPnlUsd.toFixed(2)} (${p.unrealizedPnlPct >= 0 ? '+' : ''}${p.unrealizedPnlPct.toFixed(1)}%)`
+            `• [${label(p.executionMode)}] ${p.tokenTicker} (${p.platform}): Entry $${p.entryPriceUsd.toFixed(6)} | Cur $${p.currentPriceUsd.toFixed(6)} | PnL: ${sign(p.unrealizedPnlUsd)} (${p.unrealizedPnlPct >= 0 ? '+' : ''}${p.unrealizedPnlPct.toFixed(1)}%)`
         )
         .join('\n');
+      const totals = [...new Set(positions.map((p) => p.executionMode))]
+        .map((m) => `Total Unrealized PnL (${label(m)}): ${sign(positions.filter((p) => p.executionMode === m).reduce((acc, p) => acc + p.unrealizedPnlUsd, 0))}`)
+        .join('\n');
       return {
-        reply: `💼 ACTIVE MEMECOIN POSITIONS (${positions.length}):\n\n${posList}\n\nTotal Unrealized PnL: ${totalUnrealizedPnl >= 0 ? '+' : ''}$${totalUnrealizedPnl.toFixed(2)}`,
+        reply: `💼 ACTIVE MEMECOIN POSITIONS (${positions.length}):\n\n${posList}\n\n${totals}`,
       };
     }
 
@@ -368,12 +374,19 @@ export class SocialAlphaScanner {
         contractAddress: ca,
         amountUsd: amount,
         signalTimestamp: Date.now(), // an operator command is its own signal
+        // R5-42: an operator command, journaled as one (it was labelled REAL_ONCHAIN by default)
+        provenance: 'MANUAL_OPERATOR',
+        source: 'MANUAL',
       });
 
       if (snipeResult.success) {
         const pos = snipeResult.position;
+        // R5-42: say what was sent; the order is capped at 10% of the spendable bankroll, so it can be less than the requested USD
+        const sentSol = snipeResult.amountSol;
+        const price = solPriceService.lastKnownPrice();
+        const sent = sentSol === undefined ? 'unknown' : `${sentSol.toFixed(6)} SOL${price ? ` (~$${(sentSol * price).toFixed(2)})` : ''}`;
         return {
-          reply: `🚀 SNIPER ORDER FILLED via Telegram:\nToken: $${pos?.tokenTicker || 'TOKEN'}\nCA: ${ca}\nNotional: $${amount.toFixed(2)}\nExecution Price: $${(pos?.entryPriceUsd || 0).toFixed(6)}\nTx: ${snipeResult.txHash || 'none (paper fill)'}`,
+          reply: `🚀 SNIPER ORDER FILLED via Telegram:\nToken: $${pos?.tokenTicker || 'TOKEN'}\nCA: ${ca}\nRequested: $${amount.toFixed(2)}\nSent: ${sent}\nExecution Price: $${(pos?.entryPriceUsd || 0).toFixed(6)}\nTx: ${snipeResult.txHash || 'none (paper fill)'}`,
           actionTaken: 'SNIPED_FROM_TELEGRAM',
         };
       } else {

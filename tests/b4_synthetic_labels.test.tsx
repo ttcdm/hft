@@ -3,6 +3,7 @@ import fs from 'fs';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { BacktestModal } from '../src/components/BacktestModal';
+import { REPLAY_DEFAULTS } from '../server/backtest/replay';
 
 describe('B4: synthetic results are labelled as synthetic', () => {
   it('the Backtest view has no generator behind it: with no recording it says so and shows no result', () => {
@@ -12,14 +13,10 @@ describe('B4: synthetic results are labelled as synthetic', () => {
     expect(fs.existsSync('src/utils/backtestEngine.ts')).toBe(false);
   });
 
-  it('the benchmark output is renamed and carries a header note saying its inputs are hand-written', () => {
-    expect(fs.existsSync('benchmark_results.json')).toBe(false);
-    const j = JSON.parse(fs.readFileSync('synthetic_benchmark_results.json', 'utf8'));
-    expect(j._note).toMatch(/SYNTHETIC/);
-    expect(j._note).toMatch(/hand-written/);
-    const script = fs.readFileSync('scripts/run_benchmarks_and_evaluation.ts', 'utf8');
-    expect(script).toContain("'synthetic_benchmark_results.json'");
-    expect(script).not.toContain("'benchmark_results.json'");
+  it('decision 6: the synthetic benchmark script and its output are gone, and nothing live points at them', () => {
+    for (const f of ['scripts/run_benchmarks_and_evaluation.ts', 'synthetic_benchmark_results.json', 'benchmark_results.json']) expect(fs.existsSync(f), f).toBe(false);
+    expect(fs.readFileSync('package.json', 'utf8')).not.toMatch(/run_benchmarks_and_evaluation|synthetic_benchmark_results/);
+    expect(REPLAY_DEFAULTS.entryDelayMs).toBeGreaterThan(0); // the replay over recorded launches is the backtest that stays
   });
 
   it('STRATEGY_EVALUATION.md marks the PF 2.36 / +0.000677 SOL claims unverified', () => {

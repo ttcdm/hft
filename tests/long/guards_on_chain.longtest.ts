@@ -44,7 +44,7 @@ describe('(a) wrong cluster: the chain answers with a genesis the server does no
   beforeAll(async () => {
     ({ mint } = await market.seedCoin(6, 0.6));
     // The server is told devnet; the validator's genesis is its own random hash, so every check must fail closed.
-    app = await startLocalnetApp({ dir: scratch('long-guards-devnet-'), validator: v, signerKeyPath: signerPath, env: { ALLOWED_CLUSTER: 'devnet', LOCALNET_GENESIS_HASH: '' } });
+    app = await startLocalnetApp({ dir: scratch('long-guards-devnet-'), validator: v, signerKeyPath: signerPath, env: { ALLOWED_CLUSTER: 'devnet', LOCALNET_GENESIS_HASH: '' }, confluenceThreshold: 0 });
   }, 120_000);
   afterAll(() => app?.stop());
 
@@ -59,10 +59,15 @@ describe('(a) wrong cluster: the chain answers with a genesis the server does no
     expect((await app.call('GET', '/api/execution/mode')).json.mode).toBe('PAPER');
   });
 
-  it('a trade is a PAPER trade, no transaction reaches the chain, and the wallet holds nothing', async () => {
+  it('a trade is never LIVE: it is refused, no transaction reaches the chain, and the wallet holds nothing', async () => {
     const before = await sendsOf();
     const r = await app.call('POST', '/api/execution/trade', { mint: mint.toBase58(), symbol: 'LNG', name: 'LongTest', amountSol: 0.02, confirmLive: true });
-    expect(r.json.executionMode).toBe('PAPER');
+    // R5-40: the route runs executeSnipe's gates, and a PAPER buy needs a SOL/USD reading (C3). This server is told devnet with external
+    // feeds off, so it has none (LOCALNET_FIXED is read on localnet only): it is refused before any read. It used to fill as PAPER at the
+    // caller's price, which the route no longer takes.
+    expect(r.json.success, JSON.stringify(r.json)).toBe(false);
+    expect(r.json.executionMode).not.toBe('LIVE');
+    expect(r.json.error).toMatch(/SOL_PRICE_UNAVAILABLE/);
     expect(await sendsOf()).toBe(before);
     expect(await market.tokenBalance(trader.publicKey, mint)).toBeNull();
   });
@@ -82,7 +87,8 @@ describe('(a) wrong cluster: the chain answers with a genesis the server does no
 describe('(b)-(e) failures on the right cluster', () => {
   let app: LocalnetApp;
   beforeAll(async () => {
-    app = await startLocalnetApp({ dir, validator: v, signerKeyPath: signerPath });
+    app = await startLocalnetApp({ dir, validator: v, signerKeyPath: signerPath, confluenceThreshold: 0, holderFeed: true });
+    market.watchedBy(() => app); // R2-3: seeded coins wait until this app has looked up their holders
     await armLive(app);
   }, 180_000);
   afterAll(() => app?.stop());

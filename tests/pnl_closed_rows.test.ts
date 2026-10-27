@@ -10,7 +10,7 @@ describe('Plug & Play PnL column', () => {
   });
 
   it('a profitable CLOSED row is positive', () => {
-    expect(positionPnlCell({ status: 'CLOSED', realizedPnLSol: 0.021010009 })).toEqual({ text: '+0.021010 SOL realized', positive: true });
+    expect(positionPnlCell({ status: 'CLOSED', realizedPnLSol: 0.021010009 })).toMatchObject({ text: '+0.021010 SOL realized', positive: true, tone: 'up' });
   });
 
   it('a PARTIALLY_CLOSED row shows the open % and the realized SOL', () => {
@@ -20,6 +20,6 @@ describe('Plug & Play PnL column', () => {
   });
 
   it('an OPEN row keeps the unrealized %', () => {
-    expect(positionPnlCell({ status: 'OPEN', unrealizedPnLPct: 12.345 })).toEqual({ text: '+12.3%', positive: true });
+    expect(positionPnlCell({ status: 'OPEN', unrealizedPnLPct: 12.345 })).toMatchObject({ text: '+12.3%', positive: true, tone: 'up' });
   });
 });

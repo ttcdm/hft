@@ -254,6 +254,7 @@ export class WorkstationDatabase {
     this.ensureColumn('positions', 'record_updated_at', 'INTEGER NOT NULL DEFAULT 0');
     this.ensureColumn('positions', 'exit_claim', 'TEXT'); // P1.1: which process is selling this position (claimExit)
     this.ensureColumn('positions', 'exit_claim_at', 'INTEGER');
+    this.ensureColumn('positions', 'wallet_pubkey', 'TEXT'); // R4-2: the wallet that holds the position's tokens (NULL on older rows)
 
     // Rows that carry realized PnL from before realized_events existed: one event at their updated_at, which is what the daily figure used.
     try {
@@ -446,6 +447,20 @@ export class WorkstationDatabase {
     }
   }
 
+  /**
+   * R2-4: logDecision, unless a row with the same position id and outcome is already there (the check and the insert run with no await
+   * between, so a second writer in this process writes nothing). Used for the one LIVE_BUY_FILLED row each landed buy journals.
+   */
+  public logDecisionOnce(d: Parameters<WorkstationDatabase['logDecision']>[0] & { positionId: string }): void {
+    try {
+      const found = this.db.prepare('SELECT 1 FROM decisions WHERE position_id = ? AND outcome = ? LIMIT 1').get(d.positionId, d.outcome);
+      if (found) return;
+    } catch (err: any) {
+      Logger.error(`Decision lookup failed (${err.message}); writing the row anyway`);
+    }
+    this.logDecision(d);
+  }
+
   public loadDecisions(opts: { sinceTs?: number; mint?: string; stage?: string; outcome?: string; limit?: number } = {}): Array<{
     id: number; ts: number; autoMode: string; mint: string; symbol: string | null; source: string | null; stage: string;
     outcome: string; reason: string; inputs: any; positionId: string | null; solDelta: number | null; unverified: boolean;
@@ -485,9 +500,12 @@ export class WorkstationDatabase {
   public loadEvidenceClosedTrades(mode?: ExecutionMode): NormalizedPosition[] {
     const closed = this.loadPositions(mode, 'CLOSED');
     const unverified = this.getUnverifiedFillIds();
-    // Q2: adopted balances (no known cost) and rows closed because the wallet held nothing (cost 0, realized 0) say nothing about an edge.
+    // Q2: adopted balances (no known cost) say nothing about an edge. R5-11: a row closed because the wallet held nothing books its whole
+    // basis as a loss since P2.3 (its exit reason carries REALIZED_ASSUMED_LOSS), and that loss is evidence like any other, so the loss
+    // triggers and Kelly see it. Only the older zero-balance rows, closed with realized 0 and no loss, are still left out.
+    const zeroBalanceNoLoss = (p: NormalizedPosition) => !!p.exitReason?.startsWith('RECONCILED_ZERO_BALANCE') && !p.exitReason.includes('REALIZED_ASSUMED_LOSS');
     return closed
-      .filter((p) => !unverified.has(p.id) && !p.entryTxSignature?.startsWith('RECOVERED:') && !p.exitReason?.startsWith('RECONCILED_ZERO_BALANCE'))
+      .filter((p) => !unverified.has(p.id) && !p.entryTxSignature?.startsWith('RECOVERED:') && !zeroBalanceNoLoss(p))
       .sort((a, b) => (a.lastUpdatedTimestamp ?? 0) - (b.lastUpdatedTimestamp ?? 0)); // Q30: this sorted on a field that does not exist, so "the last 20" were the oldest 20
   }
 
@@ -643,15 +661,39 @@ export class WorkstationDatabase {
     }
   }
 
-  public getPendingTransactions(): PersistedTransaction[] {
+  /**
+   * Every PENDING transaction row. R5-4: null when the table cannot be read. An empty list would say "nothing is unresolved", and startup
+   * reconciliation would then close a position whose sell is still unsettled; null makes every caller treat the ledger as unknown.
+   */
+  /**
+   * R1 #4 / R5-28: a landed sell adopted with an unreadable fill. The position (its assumed loss already on realizedPnLSol) and the SELL row,
+   * left RECONCILIATION_REQUIRED with `tag` as its error so reconciliation adds the proceeds later, are written in one transaction.
+   * Throws (nothing written) when either write fails.
+   */
+  public saveUnreadSellAssumedLoss(pos: NormalizedPosition, signature: string, tag: string): void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.savePosition(pos);
+      this.db
+        .prepare(`UPDATE transactions SET reconciliation_state = 'RECONCILIATION_REQUIRED', error = ? WHERE signature = ? AND reconciliation_state IN ('PENDING', 'RECONCILIATION_REQUIRED')`)
+        .run(tag, signature);
+      this.db.exec('COMMIT');
+    } catch (err) {
+      try { this.db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+      throw err;
+    }
+  }
+
+  public getPendingTransactions(): PersistedTransaction[] | null {
     try {
       const stmt = this.db.prepare(`
         SELECT * FROM transactions WHERE reconciliation_state = 'PENDING'
       `);
       // the shared mapper: the hand-written copy here dropped exit_reason and last_valid_block_height, which startup recovery reads
       return this.mapTransactions(stmt.all() as any[]);
-    } catch {
-      return [];
+    } catch (err: any) {
+      Logger.error(`getPendingTransactions could not read the transactions table (${err?.message || err}); callers treat the ledger as unknown`);
+      return null;
     }
   }
 
@@ -699,6 +741,28 @@ export class WorkstationDatabase {
     } catch (err) {
       try { this.db.exec('ROLLBACK'); } catch { /* already rolled back */ }
       throw err;
+    }
+  }
+
+  /**
+   * R5-1: the mints among `mints` that this app ever sent a LIVE buy for (any state). null when the query cannot run: the caller cannot
+   * tell its own lost buy from a token anyone sent to the wallet, so it adopts nothing.
+   */
+  public loadLiveBuyMints(mints: string[]): Set<string> | null {
+    if (mints.length === 0) return new Set();
+    try {
+      const found = new Set<string>();
+      for (let i = 0; i < mints.length; i += 500) {
+        const chunk = mints.slice(i, i + 500);
+        const rows = this.db
+          .prepare(`SELECT DISTINCT mint FROM transactions WHERE direction = 'BUY' AND execution_mode = 'LIVE' AND mint IN (${chunk.map(() => '?').join(',')})`)
+          .all(...chunk) as Array<{ mint: string }>;
+        for (const r of rows) found.add(r.mint);
+      }
+      return found;
+    } catch (err: any) {
+      Logger.error(`loadLiveBuyMints could not read the transactions table (${err?.message || err}); nothing is adopted`);
+      return null;
     }
   }
 
@@ -768,7 +832,8 @@ export class WorkstationDatabase {
   /**
    * N18: the append-only audit tables (risk_decisions, decisions, system_journal) grew without bound. Rows older than the retention
    * window are deleted. Kept regardless of age because something still reads them: the halt journal (the latest row decides whether
-   * trading is halted after a restart) and PAPER_FILL_GATES / PAPER_SELL_FILLED (mark which old paper fills and exits are unverified or model-priced, for the closed-trade statistics).
+   * trading is halted after a restart) and PAPER_FILL_GATES / PAPER_SELL_FILLED (mark which old paper fills and exits are unverified or model-priced, for the closed-trade statistics);
+   * in decisions, every BOUGHT row and the LIVE_BUY_FILLED row of a position still open (R5-13).
    * Positions, orders and transactions are never pruned. Returns the number of rows deleted per table.
    */
   public pruneOldRows(retentionDays: number, now: number = Date.now()): { riskDecisions: number; decisions: number; journal: number } {
@@ -778,7 +843,10 @@ export class WorkstationDatabase {
     try {
       return {
         riskDecisions: run('DELETE FROM risk_decisions WHERE created_at < ?', cutoff),
-        decisions: run('DELETE FROM decisions WHERE ts < ?', cutoff),
+        // R5-13: BOUGHT rows are what auto's ownership (auto-kill "sell what it bought") and its loss-trigger evidence read, so they are
+        // never pruned (one row per auto buy); a LIVE_BUY_FILLED row of a position still open is kept with it.
+        decisions: run(`DELETE FROM decisions WHERE ts < ? AND outcome != 'BOUGHT'
+          AND NOT (outcome = 'LIVE_BUY_FILLED' AND position_id IN (SELECT id FROM positions WHERE status != 'CLOSED'))`, cutoff),
         journal: run(`DELETE FROM system_journal WHERE created_at < ? AND event_type NOT IN ('TRADING_HALTED','TRADING_HALT_CLEARED','KILL_SWITCH_TRIPPED','KILL_SWITCH_RESET','PAPER_FILL_GATES','PAPER_SELL_FILLED')`, cutoff),
       };
     } catch (e: any) {
@@ -788,13 +856,14 @@ export class WorkstationDatabase {
   }
 
   /** S178: append one recorded event. Never throws: a recording failure must not touch trading. */
-  public recordLaunchEvent(ts: number, mint: string, kind: 'CREATE' | 'TRADE' | 'FUNDER' | 'END' | 'CREATOR', payload: Record<string, unknown>): boolean {
+  /** R2-2: MARKER rows (mint '') are the recorder's gap and restart markers (server/backtest/launchRecorder.ts, `RecordingMarkerReason`). */
+  public recordLaunchEvent(ts: number, mint: string, kind: 'CREATE' | 'TRADE' | 'FUNDER' | 'END' | 'CREATOR' | 'MARKER', payload: Record<string, unknown>): boolean {
     try {
       this.db.prepare('INSERT INTO launch_recording (ts, mint, kind, payload_json) VALUES (?, ?, ?, ?)').run(ts, mint, kind, JSON.stringify(payload));
       const c = this.recCounts;
       if (c) {
         c.byKind[kind] = (c.byKind[kind] ?? 0) + 1;
-        if (kind !== 'FUNDER') { c.oldestTs = c.oldestTs === null ? ts : Math.min(c.oldestTs, ts); c.newestTs = c.newestTs === null ? ts : Math.max(c.newestTs, ts); }
+        if (kind !== 'FUNDER' && kind !== 'MARKER') { c.oldestTs = c.oldestTs === null ? ts : Math.min(c.oldestTs, ts); c.newestTs = c.newestTs === null ? ts : Math.max(c.newestTs, ts); }
         if (kind === 'CREATE') c.newestCreateTs = c.newestCreateTs === null ? ts : Math.max(c.newestCreateTs, ts);
       }
       return true;
@@ -808,8 +877,10 @@ export class WorkstationDatabase {
    * 5B: a launch with an END row carries `endTs` (when its recording stopped) and `endReason` (TRADE_CAP, WINDOW or CURVE_COMPLETE); the
    * replay's coverage then follows the recording that was really made, not the window the server runs with now. A launch without one is
    * unresolved and has neither.
+   * R2-2: `markers` are the recorder's MARKER rows (restarts and feed gaps), oldest first; the replay bounds a launch's coverage at the
+   * first one inside its recording. R6-11: a read error throws (the replay route answers 500); it used to read as an empty recording.
    */
-  public loadLaunchRecording(limit = 500): { launches: Array<{ mint: string; events: Array<{ ts: number; kind: 'CREATE' | 'TRADE'; payload: any }>; endTs?: number; endReason?: string; creatorReports?: RecordedCreatorReport[] }>; funders: Array<{ ts: number; wallet: string; funder: string | null }> } {
+  public loadLaunchRecording(limit = 500): { launches: Array<{ mint: string; events: Array<{ ts: number; kind: 'CREATE' | 'TRADE'; payload: any }>; endTs?: number; endReason?: string; creatorReports?: RecordedCreatorReport[] }>; funders: Array<{ ts: number; wallet: string; funder: string | null }>; markers: Array<{ ts: number; reason: string; detail?: string }> } {
     try {
       const mints = (this.db.prepare(`SELECT mint FROM launch_recording WHERE kind = 'CREATE' ORDER BY ts DESC LIMIT ?`).all(limit) as any[]).map((r) => r.mint as string).reverse();
       const q = this.db.prepare(`SELECT ts, kind, payload_json FROM launch_recording WHERE mint = ? AND kind IN ('CREATE','TRADE','END','CREATOR') ORDER BY ts ASC, id ASC`);
@@ -826,9 +897,11 @@ export class WorkstationDatabase {
       });
       const funders = (this.db.prepare(`SELECT ts, payload_json FROM launch_recording WHERE kind = 'FUNDER' ORDER BY ts ASC, id ASC`).all() as any[])
         .map((r) => ({ ts: r.ts as number, ...JSON.parse(r.payload_json) }));
-      return { launches, funders };
-    } catch {
-      return { launches: [], funders: [] };
+      const markers = (this.db.prepare(`SELECT ts, payload_json FROM launch_recording WHERE kind = 'MARKER' ORDER BY ts ASC, id ASC`).all() as any[])
+        .map((r) => { const p = JSON.parse(r.payload_json); return { ts: r.ts as number, reason: String(p?.reason), ...(p?.detail !== undefined ? { detail: String(p.detail) } : {}) }; });
+      return { launches, funders, markers };
+    } catch (err: any) {
+      throw new Error(`the launch recording could not be read: ${err?.message || err}`, { cause: err });
     }
   }
 
@@ -842,7 +915,7 @@ export class WorkstationDatabase {
       const c = this.launchCounts();
       const k = (kind: string) => c.byKind[kind] ?? 0;
       const events = Object.values(c.byKind).reduce((a, b) => a + b, 0);
-      return { launches: k('CREATE'), events, launchRows: events - k('FUNDER'), funderRows: k('FUNDER'), endedLaunches: k('END'), oldestTs: c.oldestTs, newestTs: c.newestTs, newestCreateTs: c.newestCreateTs };
+      return { launches: k('CREATE'), events, launchRows: events - k('FUNDER') - k('MARKER'), funderRows: k('FUNDER'), endedLaunches: k('END'), oldestTs: c.oldestTs, newestTs: c.newestTs, newestCreateTs: c.newestCreateTs };
     } catch {
       return { launches: 0, events: 0, launchRows: 0, funderRows: 0, endedLaunches: 0, oldestTs: null, newestTs: null, newestCreateTs: null };
     }
@@ -923,14 +996,18 @@ export class WorkstationDatabase {
     }
   }
 
-  /** N18: transactions in the given reconciliation states, read through idx_tx_reconciliation instead of scanning the whole table. */
-  public loadTransactionsInStates(states: string[]): PersistedTransaction[] {
+  /**
+   * N18: transactions in the given reconciliation states, read through idx_tx_reconciliation instead of scanning the whole table.
+   * R5-4: null when the query cannot run, never [] (which reads as "nothing unresolved"): callers must treat null as unknown and fail closed.
+   */
+  public loadTransactionsInStates(states: string[]): PersistedTransaction[] | null {
     if (states.length === 0) return [];
     try {
       const rows = this.db.prepare(`SELECT * FROM transactions WHERE reconciliation_state IN (${states.map(() => '?').join(',')})`).all(...states) as any[];
       return this.mapTransactions(rows);
-    } catch {
-      return [];
+    } catch (err: any) {
+      Logger.error(`loadTransactionsInStates could not read the transactions table (${err?.message || err}); callers treat the ledger as unknown`);
+      return null;
     }
   }
 
@@ -971,9 +1048,10 @@ export class WorkstationDatabase {
         priority_fee_lamports, jito_tip_lamports, execution_mode, status,
         exit_reason, exit_tx_signature, last_mark_timestamp, last_mark_source,
         venue, pool_address, migration_timestamp, high_water_mark_sol, trailing_stop_sol, exit_stage,
-        record_updated_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        record_updated_at, updated_at, wallet_pubkey
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO UPDATE SET
+        wallet_pubkey = COALESCE(positions.wallet_pubkey, excluded.wallet_pubkey),
         base_token_program = excluded.base_token_program,
         token_quantity_raw = excluded.token_quantity_raw,
         cost_basis_lamports = excluded.cost_basis_lamports,
@@ -1029,7 +1107,8 @@ export class WorkstationDatabase {
       pos.trailingStopSol ?? 0,
       pos.exitStage ?? 0,
       now,
-      now
+      now,
+      pos.walletPubkey ?? null
     );
     // Q2: selling an adopted balance returns money with no known cost; it is not a day's profit
     if (realizedDelta !== 0 && !pos.entryTxSignature?.startsWith('RECOVERED:')) {
@@ -1083,6 +1162,17 @@ export class WorkstationDatabase {
       WHERE id = ? AND status != 'CLOSED'
     `).run(pos.highWaterMarkSol ?? 0, pos.highWaterMarkSol ?? 0, pos.trailingStopSol ?? 0, pos.trailingStopSol ?? 0, pos.exitStage ?? 0, now, now, pos.id);
     return Number((r as any).changes) > 0;
+  }
+
+  /** R4-2: record the wallet of a row written before wallet_pubkey existed. Never overwrites a binding. False when nothing was written. */
+  public bindPositionWallet(positionId: string, walletPubkey: string): boolean {
+    try {
+      const r = this.db.prepare('UPDATE positions SET wallet_pubkey = ? WHERE id = ? AND wallet_pubkey IS NULL').run(walletPubkey, positionId);
+      return Number((r as any).changes) > 0;
+    } catch (err: any) {
+      Logger.error(`Failed to bind position ${positionId} to its wallet: ${err.message}`);
+      return false;
+    }
   }
 
   public loadPositions(mode?: ExecutionMode, status?: 'OPEN' | 'PARTIALLY_CLOSED' | 'CLOSED' | 'ACTIVE'): NormalizedPosition[] {
@@ -1157,6 +1247,7 @@ export class WorkstationDatabase {
         highWaterMarkSol: r.high_water_mark_sol ?? 0,
         trailingStopSol: r.trailing_stop_sol ?? 0,
         exitStage: r.exit_stage ?? 0,
+        walletPubkey: r.wallet_pubkey || undefined,
       };
     });
   }
@@ -1340,8 +1431,10 @@ export class WorkstationDatabase {
     });
   }
 
-  /** DBW: below this much free space on the database's filesystem the database counts as not writable. */
-  public static readonly MIN_FREE_BYTES = 16 * 1024 * 1024;
+  /** DBW: below this much free space on the database's filesystem the database counts as not writable (Mike chose 32 MiB over 16 MiB). */
+  public static readonly MIN_FREE_BYTES = 32 * 1024 * 1024;
+  /** Below this much free space the System checks database row is WARN and a DISK_SPACE_LOW alert is raised; buys go on until MIN_FREE_BYTES. */
+  public static readonly LOW_FREE_WARN_BYTES = 128 * 1024 * 1024;
   /** DBW: a passed probe is reused this long, so a per-buy check does not commit (and fsync) on every call. A failure is never reused. */
   public static readonly WRITABLE_CACHE_MS = 1000;
   private lastWritableOkAt: number | null = null; // on performance.now()
@@ -1368,6 +1461,16 @@ export class WorkstationDatabase {
       return true;
     } catch {
       return false;
+    }
+  }
+
+  /** Free bytes on the database's filesystem for the low-disk warning; null for a `:memory:` database or when the read fails. */
+  public getFreeBytes(): number | null {
+    if (this.dbPath === ':memory:') return null;
+    try {
+      return this.freeBytes();
+    } catch {
+      return null;
     }
   }
 

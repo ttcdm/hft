@@ -20,6 +20,11 @@ export const WALLET_AUDIT_GROSS_TOLERANCE = 0.05;
  */
 export const WALLET_AUDIT_RENT_ALLOWANCE_SOL = 0.0025;
 
+/** 3E: `app_settings` key of the operator's last acknowledgement of the loss triggers, `{ ts }`; trades closed at or before it no longer count. */
+export const LOSS_TRIGGER_ACK_SETTING = 'auto.lossTriggerAck';
+/** 3E: how many of the latest closed trades the expectancy and loss-streak triggers look at. */
+export const LOSS_TRIGGER_TRADES = Math.max(EXPECTANCY_WINDOW, MAX_CONSECUTIVE_LOSSES);
+
 export interface KillTrigger {
   code: string;
   message: string;
@@ -101,23 +106,38 @@ export function evaluateKillTriggers(ctx: KillContext): KillTrigger[] {
 
 /**
  * Compare a real balance change with what the journal says moved. Returns the part that no journaled fill explains.
- * A change with no fills at all is entirely unexplained, in either direction.
+ *
+ * R8-1: only an unexplained OUTFLOW (a drop beyond the tolerance) is a halt reason. SOL arriving that the journal does not explain (a
+ * deposit, the operator's own top-up, anyone's 0.0006 SOL transfer, the proceeds of a sell whose row is not written yet) is `explained`
+ * with `inflowSol` set, so the caller logs it and decides whether to re-baseline; it used to halt everything, which let anyone stop the bot
+ * for the price of one transfer.
  *
  * 3B (P3.2, R1-62): `unresolved` is the LIVE buys that were sent and are not resolved yet (UNCONFIRMED, or landed with an unread fill),
  * at the worst case each can still take. Such a buy may have landed with no journal row yet, so a DROP no larger than that worst case plus
  * one rent allowance per buy (the first-buy accumulator rent is not in the worst case) is held as theirs: explained, with `heldByUnresolved`
- * set so the caller keeps its old mark and the next look, after recovery journals the buy, spans both. A rise, or a larger drop, still is not.
+ * set so the caller keeps its old mark and the next look, after recovery journals the buy, spans both. A larger drop still is not.
  */
 export function auditWalletChange(
   prevSol: number,
   nowSol: number,
   journal: { delta: number; gross: number; count?: number },
   unresolved: { worstCaseSol: number; count: number } = { worstCaseSol: 0, count: 0 }
-): { explained: boolean; unexplainedSol: number; toleranceSol: number; heldByUnresolved: boolean } {
+): { explained: boolean; unexplainedSol: number; toleranceSol: number; heldByUnresolved: boolean; inflowSol: number } {
   const toleranceSol = WALLET_AUDIT_BASE_TOLERANCE_SOL + WALLET_AUDIT_GROSS_TOLERANCE * journal.gross + WALLET_AUDIT_RENT_ALLOWANCE_SOL * (journal.count ?? 0);
   const unexplainedSol = nowSol - prevSol - journal.delta;
-  if (Math.abs(unexplainedSol) <= toleranceSol) return { explained: true, unexplainedSol, toleranceSol, heldByUnresolved: false };
+  if (Math.abs(unexplainedSol) <= toleranceSol) return { explained: true, unexplainedSol, toleranceSol, heldByUnresolved: false, inflowSol: 0 };
+  if (unexplainedSol > 0) return { explained: true, unexplainedSol, toleranceSol, heldByUnresolved: false, inflowSol: unexplainedSol };
   const pendingSol = unresolved.count > 0 ? unresolved.worstCaseSol + WALLET_AUDIT_RENT_ALLOWANCE_SOL * unresolved.count : 0;
-  const held = pendingSol > 0 && unexplainedSol < 0 && -unexplainedSol <= pendingSol + toleranceSol;
-  return { explained: held, unexplainedSol, toleranceSol, heldByUnresolved: held };
+  const held = pendingSol > 0 && -unexplainedSol <= pendingSol + toleranceSol;
+  return { explained: held, unexplainedSol, toleranceSol, heldByUnresolved: held, inflowSol: 0 };
+}
+
+/**
+ * R8-8: the two triggers that judge trade results (NEGATIVE_EXPECTANCY, LOSS_STREAK), with the same thresholds as auto, over net PnL per
+ * closed trade, oldest first. Used as a refusal for every LIVE buy (manual included), where auto uses them to drop to SHADOW.
+ */
+export function lossTriggerHits(closedNetPnlSol: number[]): KillTrigger[] {
+  return evaluateKillTriggers({
+    mode: 'PAPER', closedNetPnlSol, dailyTotalPnlSol: 0, maxDailyLossSol: 0, slippageBreaches: 0, readinessRed: [], walletSol: null, reserveSol: 0, maxTradeSol: 0,
+  }).filter((h) => h.code === 'NEGATIVE_EXPECTANCY' || h.code === 'LOSS_STREAK');
 }

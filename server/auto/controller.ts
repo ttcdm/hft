@@ -11,21 +11,21 @@ import { checkSnipeAmountSol, SNIPE_AMOUNT_MIN_SOL } from '../execution/snipeAmo
 import { allowedCluster, assertClusterAllowed } from '../solana/clusterGuard';
 import { Logger } from '../middleware/enterprise';
 import type { SignalProvenance } from '../core/types';
-import { computeJournalStats, autoEvidencePnl, type JournalStats } from './journalStats';
-import { evaluateKillTriggers, auditWalletChange, EXPECTANCY_WINDOW, MAX_CONSECUTIVE_LOSSES, type KillTrigger } from './killSwitch';
+import { computeJournalStats, autoEvidencePnl, type JournalStatsReport } from './journalStats';
+import { evaluateKillTriggers, auditWalletChange, LOSS_TRIGGER_ACK_SETTING, LOSS_TRIGGER_TRADES as LOSS_TRIGGER_TRADES_ALL, type KillTrigger } from './killSwitch';
 import { riskEngine, PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS } from '../risk/riskEngine';
 import { watchWindow, readyGate, type WatchResult, type WatchVerdict } from '../signals/watchWindow';
 import { checkConfluenceThreshold, getConfluenceThreshold, setConfluenceThreshold, confluenceThresholdInfo, CONFLUENCE_DEVNET_LIVE_FLOOR, type ConfluenceThresholdInfo } from '../signals/confluenceThreshold';
 import { isCurveTooFar, curveTooFarReason } from '../signals/curveProgressCap';
 import { onChainPoolStats } from '../market/poolStats';
-import { dbLockPath, liveLockHolder } from '../system/instanceLock';
+import { dbLockPath, otherLiveLockHolder } from '../system/instanceLock';
 
 /**
  * G1: the only owner of auto trading.
  *
  * Both candidate sources (pumpfunService callouts, the memecoinAggregator sniper loop) hand candidates to
- * `submitCandidate`; neither may call execution directly. The mode is saved, and a restart brings it back up to PAPER
- * (a saved DEVNET_LIVE comes back as SHADOW and needs a fresh arm). There is no mainnet mode. Open positions stay under the exit engine in every mode.
+ * `submitCandidate`; neither may call execution directly. The mode is saved, but auto starts OFF at every start (3E); the
+ * saved mode is only reported. There is no mainnet mode. Open positions stay under the exit engine in every mode.
  *
  *   OFF         drop every candidate (manual trades still work)
  *   SHADOW      run every gate and journal "would buy"; nothing is sent or filled
@@ -80,6 +80,27 @@ export interface AutoCandidate {
 
 export type AutoOutcome = 'DROPPED' | 'WOULD_BUY' | 'BOUGHT' | 'REJECTED';
 
+/**
+ * R5-12: journal outcome of an auto buy that was sent and came back unresolved (UNCONFIRMED, or landed with an unread fill). Its positionId
+ * is the entry signature, which is the id orphan recovery gives the position if the buy lands, so the position is auto-owned from the moment
+ * it exists (kill "sell what it bought", the loss-trigger evidence and the panel stats). Carries no wallet delta.
+ */
+export const AUTO_SENT_UNRESOLVED = 'SENT_UNRESOLVED';
+
+/** R6-4: the result of KILL AUTO. `refused` sells sent nothing (the coordinator said so); `failed` sells did not close (one may have been sent). */
+export interface AutoKillResult {
+  mode: AutoMode;
+  closed: number;
+  /** Auto-owned positions a sell was tried for (0 when exitAll was not asked for). */
+  attempted: number;
+  /** Refused before anything was sent (closePosition notSent). */
+  refused: Array<{ positionId: string; mint: string; symbol: string; error: string }>;
+  /** Sent and failed, or threw. */
+  failed: Array<{ positionId: string; mint: string; symbol: string; error: string }>;
+  /** Auto-owned positions still ACTIVE after the sells; 0 when exitAll was not asked for (nothing was sold, nothing was counted). */
+  stillOpen: number;
+}
+
 export interface AutoDecision {
   ts: number;
   mode: AutoMode;
@@ -129,6 +150,8 @@ export interface AutoStatus {
 }
 
 const MAX_DECISIONS = 500;
+/** R6-3: the most journal rows one stats read takes (newest first). A read that hits it says so (`truncated`). */
+export const STATS_ROW_LIMIT = 20_000;
 /** Q27: the same unwatched / pending / dead mint from the same source is not journaled again for this long. */
 export const DROP_REPEAT_MS = 10 * 60_000;
 /** S4b: how many releases may wait behind a buy in flight, and how long a signal stays good (the watch window decides in 120 s; a release older than this is not acted on late). */
@@ -162,10 +185,16 @@ const SETTING_THRESHOLD = 'auto.confluenceThreshold';
 const SETTING_MODE = 'auto.mode';
 /** 3E: the last kill, `{ reason, ts }`, or null once an operator has set a trading mode again. Read back by `restorePersisted`. */
 const SETTING_KILL = 'auto.kill';
-/** 3E: `{ ts }` of the operator's last acknowledgement of the loss triggers; trades closed at or before it no longer count. */
-const SETTING_LOSS_ACK = 'auto.lossTriggerAck';
+/**
+ * A31/A71: the DEVNET_LIVE session's real-SOL spend, `{ startedAt, startingBankrollSol, buys, spentSol, positionIds }`. A DEVNET_LIVE session
+ * lasts SESSION_BUDGETS.maxDurationMs from its start, across mode changes, kills and restarts, so neither a setMode nor a restart hands out a
+ * fresh 0.02 SOL budget.
+ */
+const SETTING_LIVE_SESSION = 'auto.liveSession';
+/** 3E: `{ ts }` of the operator's last acknowledgement of the loss triggers; trades closed at or before it no longer count (R8-8: manual LIVE too). */
+const SETTING_LOSS_ACK = LOSS_TRIGGER_ACK_SETTING;
 /** 3E: how many of the latest auto-owned closed trades the expectancy and loss-streak triggers look at, across sessions. */
-export const LOSS_TRIGGER_TRADES = Math.max(EXPECTANCY_WINDOW, MAX_CONSECUTIVE_LOSSES);
+export const LOSS_TRIGGER_TRADES = LOSS_TRIGGER_TRADES_ALL;
 /** 3E: the triggers that judge trade results, and so need an operator acknowledgement before auto may buy again. */
 const LOSS_TRIGGER_CODES = new Set(['NEGATIVE_EXPECTANCY', 'LOSS_STREAK']);
 /** S189: how long readiness must stay green before a PAPER session downgraded by READINESS_RED is put back. */
@@ -188,7 +217,7 @@ export class AutoSnipeController extends EventEmitter {
     this.on('mode', () => this.persistMode());
   }
 
-  private mode: AutoMode = 'OFF'; // S222: restored from the last run at startup by `restorePersisted`, never above PAPER
+  private mode: AutoMode = 'OFF'; // 3E: OFF at every start; `restorePersisted` reports the last run's mode and does not restore it
   private killed = false;
   private killReason: string | null = null;
   private downgradeReason: string | null = null;
@@ -212,11 +241,34 @@ export class AutoSnipeController extends EventEmitter {
     return this.mode;
   }
 
-  /** Session stats straight from the decision journal. Journal rows since the current session started (or all rows when OFF). */
-  public getJournalStats(): JournalStats {
-    const rows = workstationDb.loadDecisions({ sinceTs: this.session?.startedAt, limit: 5000 });
-    const status = new Map(workstationDb.loadPositions().map((p) => [p.id, p.status as string]));
-    return computeJournalStats(rows, (id) => status.get(id));
+  /**
+   * Session stats straight from the decision journal and the position ledger (H3; R6-3). One auto mode only: the running session's
+   * (PAPER or DEVNET_LIVE), else the mode auto is in, else the last mode it ran in. The window is the session (since it started) or,
+   * with no session, the newest STATS_ROW_LIMIT rows. The report says which mode and window it covers and whether the read was cut.
+   */
+  public getJournalStats(opts: { mode?: 'SHADOW' | 'PAPER' | 'DEVNET_LIVE' } = {}): JournalStatsReport {
+    const windowEnd = Date.now();
+    const sinceTs = this.session?.startedAt;
+    const read = workstationDb.loadDecisions({ sinceTs, limit: STATS_ROW_LIMIT });
+    const autoModes = new Set(['SHADOW', 'PAPER', 'DEVNET_LIVE']);
+    let mode: JournalStatsReport['mode'] = opts.mode
+      ?? (this.session && this.sessionKind ? this.sessionKind : this.mode !== 'OFF' ? this.mode : null);
+    if (!mode) {
+      for (let i = read.length - 1; i >= 0; i--) if (autoModes.has(read[i].autoMode)) { mode = read[i].autoMode as JournalStatsReport['mode']; break; }
+    }
+    const rows = mode ? read.filter((r) => r.autoMode === mode) : [];
+    const positions = new Map(workstationDb.loadPositions().map((p) => [p.id, { status: p.status as string, realizedPnLSol: p.realizedPnLSol }]));
+    const base = computeJournalStats(rows, (id) => positions.get(id), AUTO_SENT_UNRESOLVED);
+    const truncated = read.length >= STATS_ROW_LIMIT;
+    const windowStart = rows.length === 0 ? (sinceTs ?? null) : truncated || sinceTs === undefined ? rows[0].ts : sinceTs;
+    const notes = [
+      `${mode ?? 'no'} auto rows only; other modes are left out`,
+      sinceTs !== undefined ? 'since the current session started' : 'no session running: the newest journal rows, across past sessions',
+      'net PnL and win rate: realized PnL of closed positions from the position ledger; open positions are not in it',
+      ...(truncated ? [`only the newest ${STATS_ROW_LIMIT} journal rows were read; older rows of the window are not counted`] : []),
+      ...(mode === 'SHADOW' ? ['SHADOW "would buy" skips the slot cap, the session budget and the re-entry guard; it is not what DEVNET_LIVE would do'] : []),
+    ];
+    return { ...base, mode, windowStart, windowEnd, rowsCounted: rows.length, rowsRead: read.length, rowLimit: STATS_ROW_LIMIT, truncated, pnlSource: 'position ledger realizedPnLSol', notes };
   }
 
   public getDecisions(limit = 100): AutoDecision[] {
@@ -287,6 +339,43 @@ export class AutoSnipeController extends EventEmitter {
 
   /** S189: which kind of session the budget editor is talking to. A running (or SHADOW-downgraded) PAPER session is PAPER; anything else gets the real-SOL cap. */
   private sessionKind: 'PAPER' | 'DEVNET_LIVE' | null = null;
+  /** A31/A71: the current DEVNET_LIVE session, kept (and saved) after a mode change or a kill until its time is up. */
+  private liveSession: AutoSession | null = null;
+
+  /** A31/A71: save the DEVNET_LIVE session's spend. Called on every change; a failed write is logged (the in-memory figure still holds). */
+  private saveLiveSession(s: AutoSession | null): void {
+    if (!s || s !== this.liveSession) return;
+    const ok = workstationDb.setSetting(SETTING_LIVE_SESSION, { startedAt: s.startedAt, startingBankrollSol: s.startingBankrollSol, buys: s.buys, spentSol: s.spentSol, positionIds: s.positionIds });
+    if (!ok) Logger.error(`[AUTO] the DEVNET_LIVE session spend (${s.spentSol} SOL) could not be saved; a restart would not know it`);
+  }
+
+  /**
+   * A31/A71: the DEVNET_LIVE session to continue, if one started less than SESSION_BUDGETS.maxDurationMs ago: the one in memory, else the
+   * saved one. null when none is running (a new session starts). A saved value that cannot be read is treated as a full session (fail closed).
+   */
+  private continuedLiveSession(budgets: SessionBudgets, now: number): AutoSession | null {
+    const fresh = (startedAt: number) => now - startedAt < SESSION_BUDGETS.maxDurationMs;
+    // The saved row is the record (it is written on every change); the in-memory object is reused when it is that same session, so the
+    // worst-case figures waiting in unsettledBuys still settle against it.
+    const saved = workstationDb.getSetting<Record<string, unknown>>(SETTING_LIVE_SESSION);
+    if (!saved || typeof saved !== 'object') return null;
+    const startedAt = Number(saved.startedAt);
+    if (Number.isFinite(startedAt) && !fresh(startedAt)) return null;
+    if (this.liveSession && this.liveSession.startedAt === startedAt) return this.liveSession;
+    const num = (v: unknown, fallback: number) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : fallback);
+    if (!Number.isFinite(startedAt)) {
+      Logger.warn('[AUTO] the saved DEVNET_LIVE session could not be read; its budget is treated as used until its time would be up');
+      return { startedAt: now, startingBankrollSol: 0, buys: budgets.maxBuys, spentSol: budgets.maxSpendSol, positionIds: [], budgets };
+    }
+    return {
+      startedAt,
+      startingBankrollSol: num(saved.startingBankrollSol, 0),
+      buys: num(saved.buys, budgets.maxBuys),
+      spentSol: num(saved.spentSol, budgets.maxSpendSol),
+      positionIds: Array.isArray(saved.positionIds) ? saved.positionIds.filter((x): x is string => typeof x === 'string') : [],
+      budgets,
+    };
+  }
   private spendCap(): { cap: number; kind: 'PAPER' | 'REAL'; note: string } {
     if (this.session && this.sessionKind === 'PAPER') {
       const cap = AutoSnipeController.maxPaperSessionSpendSol();
@@ -350,9 +439,8 @@ export class AutoSnipeController extends EventEmitter {
   }
 
   /**
-   * S222: bring back what the operator had set before a restart. The confluence threshold always. The mode only up to PAPER: a saved
-   * DEVNET_LIVE comes back as SHADOW (nothing is sent) and needs a fresh arm and confirmation code, so a restart never resumes live
-   * sending by itself. A mode that cannot be restored (AUTO_SNIPE_ENABLED not true, coordinator not in PAPER) leaves auto OFF.
+   * S222: bring back what the operator had set before a restart: the confluence threshold. 3E: the auto mode is not brought back; auto
+   * starts OFF at every start (the design rule), and the note says which mode the last run was in.
    * 3E: a kill saved by the last run (`auto.kill`) keeps auto OFF and `killed` with its reason, until an operator sets a mode.
    * Call once at startup, before `startMonitor`.
    */
@@ -367,8 +455,8 @@ export class AutoSnipeController extends EventEmitter {
     // P1.1 (N-59): another live process owns this database. Restoring here would start a second session on it and rewrite the mode that
     // process saved, out of reach of its kill switch. The instance lock normally stops a second server before this; this is the backstop.
     const lock = dbLockPath(workstationDb.getDbPath());
-    const holder = lock ? liveLockHolder(lock) : null;
-    if (holder && holder.pid !== process.pid) {
+    const holder = lock ? otherLiveLockHolder(lock) : null; // R4-1: by boot id, so another container's PID 1 counts
+    if (holder) {
       note = `restart: auto mode not restored: process ${holder.pid} holds ${lock}; auto stays OFF and the saved mode is left as it is`;
       Logger.warn(`[AUTO] ${note}`);
       return { threshold, mode: this.mode, note };
@@ -385,26 +473,19 @@ export class AutoSnipeController extends EventEmitter {
       workstationDb.logDecision({ autoMode: this.mode, mint: '-', stage: 'auto', outcome: 'INFO', reason: note });
       return { threshold, mode: this.mode, note };
     }
+    // 3E (design rule "OFF at every start", R1-118): the saved mode is reported, never restored. Auto starts OFF and an operator sets the
+    // mode again after looking at the state. The saved value is set to OFF so it says what is running.
     const saved = workstationDb.getSetting<unknown>(SETTING_MODE);
     if (saved === 'PAPER' || saved === 'SHADOW' || saved === 'DEVNET_LIVE') {
-      const target: AutoMode = saved === 'DEVNET_LIVE' ? 'SHADOW' : saved;
-      const res = await this.setMode(target);
-      if (res.ok) {
-        note = saved === 'DEVNET_LIVE'
-          ? 'restart: the last run was in DEVNET_LIVE; auto came back as SHADOW (nothing is sent). Arm LIVE and set DEVNET_LIVE again to trade.'
-          : `restart: auto mode ${target} restored from the last run`;
-        if (saved === 'DEVNET_LIVE') this.downgradeReason = note;
-        workstationDb.logDecision({ autoMode: this.mode, mint: '-', stage: 'auto', outcome: 'INFO', reason: note });
-      } else {
-        note = `restart: could not restore auto mode ${target} (${res.error}); auto stays OFF`;
-        Logger.warn(`[AUTO] ${note}`);
-      }
+      note = `restart: the last run was in ${saved}; auto starts OFF at every start. Set the mode again to trade${saved === 'DEVNET_LIVE' ? ' (DEVNET_LIVE needs LIVE armed and its confirmation code)' : ''}.`;
+      workstationDb.setSetting(SETTING_MODE, 'OFF');
+      workstationDb.logDecision({ autoMode: this.mode, mint: '-', stage: 'auto', outcome: 'INFO', reason: note });
     }
     if (note) Logger.info(`[AUTO] ${note}`);
     return { threshold, mode: this.mode, note };
   }
 
-  /** S222: every mode change is saved, so `restorePersisted` can bring it back. */
+  /** S222: every mode change is saved, so `restorePersisted` can report it (3E: it no longer brings it back). */
   private persistMode = (): void => { workstationDb.setSetting(SETTING_MODE, this.mode); };
 
   /** 3E: save OFF and the kill reason now, synchronously. A failed write is logged; the in-memory kill still holds for this process. */
@@ -513,6 +594,16 @@ export class AutoSnipeController extends EventEmitter {
         return { ok: false, mode: this.mode, error: `DEVNET_LIVE is refused: the saved session spend limit (${this.budgetOverride.maxSpendSol} SOL) is above the ${Number(realCap.toFixed(6))} SOL real-SOL cap. Lower it first (it was allowed because PAPER spends nothing).` };
       }
       if (opts.confirmationCode !== DEVNET_CONFIRMATION_CODE) return { ok: false, mode: this.mode, error: 'DEVNET_LIVE needs the confirmation code' };
+      // R3-1: a halt (an unexplained wallet change, for one) is cleared only on purpose (POST /api/auto/resume {clearHalt:true}); setting
+      // DEVNET_LIVE must not start buying again under it, nor reset the wallet baseline the halt was measured against.
+      const halt = executionCoordinator.getHaltReason();
+      if (halt) return { ok: false, mode: this.mode, error: `DEVNET_LIVE is refused: TRADING_HALTED: ${halt}. Look at why, then clear the halt (POST /api/auto/resume {clearHalt:true}) before setting DEVNET_LIVE.` };
+      // A31/A71: a session that has used its budget is not restarted by setting the mode again; it ends when its time is up.
+      const liveBudgets: SessionBudgets = this.budgetOverride ? { ...SESSION_BUDGETS, ...this.budgetOverride } : { ...SESSION_BUDGETS };
+      const cont = this.continuedLiveSession(liveBudgets, Date.now());
+      if (cont && (cont.buys >= liveBudgets.maxBuys || cont.spentSol + this.orderSol() > liveBudgets.maxSpendSol + 1e-9)) {
+        return { ok: false, mode: this.mode, error: `DEVNET_LIVE is refused: SESSION_BUDGET_USED: the DEVNET_LIVE session started ${new Date(cont.startedAt).toISOString()} has ${cont.buys} buy(s) and ${cont.spentSol.toFixed(6)} SOL spent of ${liveBudgets.maxBuys} buys / ${liveBudgets.maxSpendSol} SOL; it ends at ${new Date(cont.startedAt + SESSION_BUDGETS.maxDurationMs).toISOString()}. Setting the mode again does not reset it.` };
+      }
       try {
         await assertClusterAllowed(executionCoordinator.getConnection());
       } catch (e: any) {
@@ -548,7 +639,20 @@ export class AutoSnipeController extends EventEmitter {
         : { ...SESSION_BUDGETS };
       // S181: the operator's saved budget (buys and spend) replaces the defaults; loss and time limits stay fixed.
       const budgets: SessionBudgets = this.budgetOverride ? { ...base, ...this.budgetOverride } : base;
-      this.session = { startedAt: Date.now(), startingBankrollSol: bankroll, buys: 0, spentSol: 0, positionIds: [], budgets };
+      const now = Date.now();
+      const continued = next === 'DEVNET_LIVE' ? this.continuedLiveSession(budgets, now) : null;
+      if (continued) {
+        // A31/A71: same session (it started less than 4 h ago): its spend, buys and positions carry on; only the budgets in force are re-read.
+        continued.budgets = budgets;
+        if (continued.startingBankrollSol <= 0) continued.startingBankrollSol = bankroll;
+        this.session = continued;
+        this.liveSession = continued;
+        workstationDb.logDecision({ autoMode: next, mint: '-', stage: 'budget', outcome: 'INFO', reason: `DEVNET_LIVE continues the session started ${new Date(continued.startedAt).toISOString()}: ${continued.buys} buy(s), ${continued.spentSol.toFixed(6)} SOL spent so far` });
+      } else {
+        this.session = { startedAt: now, startingBankrollSol: bankroll, buys: 0, spentSol: 0, positionIds: [], budgets };
+        if (next === 'DEVNET_LIVE') this.liveSession = this.session;
+      }
+      this.saveLiveSession(this.session);
       this.sessionKind = next;
     } else {
       this.session = null;
@@ -557,8 +661,25 @@ export class AutoSnipeController extends EventEmitter {
     return { ok: true, mode: this.mode };
   }
 
+  /**
+   * R23 / R5-12: what the auto controller owns: this session's positions, every position the journal records as BOUGHT by auto, and every
+   * auto buy that was sent unresolved (its signature, which becomes the recovered position's id). A position the operator opened by hand is
+   * in none of these. Match a position with `isAutoOwned`.
+   */
+  private autoOwnedIds(): Set<string> {
+    const owned = new Set<string>(this.session?.positionIds ?? []);
+    for (const s of this.liveSession?.positionIds ?? []) owned.add(s);
+    for (const d of workstationDb.loadDecisions({ outcome: 'BOUGHT', limit: 5000 })) if (d.positionId) owned.add(d.positionId);
+    for (const d of workstationDb.loadDecisions({ outcome: AUTO_SENT_UNRESOLVED, limit: 5000 })) if (d.positionId) owned.add(d.positionId);
+    return owned;
+  }
+
+  private static isAutoOwned(owned: Set<string>, p: { id: string; entryTxSignature?: string }): boolean {
+    return owned.has(p.id) || (!!p.entryTxSignature && owned.has(p.entryTxSignature));
+  }
+
   /** Kill switch for auto trading: back to OFF now, optionally selling everything the session opened. Exits keep running otherwise. */
-  public async kill(opts: { exitAll?: boolean; reason?: string } = {}): Promise<{ mode: AutoMode; closed: number }> {
+  public async kill(opts: { exitAll?: boolean; reason?: string } = {}): Promise<AutoKillResult> {
     this.mode = 'OFF';
     this.autoRestore = null;
     this.killed = true;
@@ -570,22 +691,37 @@ export class AutoSnipeController extends EventEmitter {
     // Q29: a buy already past the gates finishes (its position exists once it does); wait for it so its position is in the owned set below
     // and is sold by exitAll. Mode OFF already stops any new candidate.
     await this.waitInflight('kill');
-    // R23: "sell what it bought" means the positions the auto controller opened: this session's, plus any the journal records as
-    // BOUGHT by auto (a restart empties the in-memory session). A position the operator opened by hand is never in either set.
-    const owned = new Set<string>(this.session?.positionIds ?? []);
-    for (const d of workstationDb.loadDecisions({ outcome: 'BOUGHT', limit: 5000 })) if (d.positionId) owned.add(d.positionId);
+    // R23: "sell what it bought" means the positions the auto controller opened (autoOwnedIds; a restart empties the in-memory session).
+    // R5-12: that includes an auto buy that was unresolved at kill time and was adopted by orphan recovery since.
+    const owned = this.autoOwnedIds();
     this.session = null;
     let closed = 0;
+    const refused: AutoKillResult['refused'] = [];
+    const failed: AutoKillResult['failed'] = [];
+    let attempted = 0;
     if (opts.exitAll) {
       for (const p of workstationDb.loadPositions(undefined, 'ACTIVE')) {
-        if (!owned.has(p.id)) continue;
-        const r = await executionCoordinator.closePosition(p.id, 100, 'MANUAL');
-        if (r.success) closed++;
+        if (!AutoSnipeController.isAutoOwned(owned, p)) continue;
+        attempted++;
+        // R6-4: a close that throws is listed and does not stop the rest
+        try {
+          const r = await executionCoordinator.closePosition(p.id, 100, 'MANUAL');
+          if (r.success) closed++;
+          else (r.notSent ? refused : failed).push({ positionId: p.id, mint: p.mint, symbol: p.symbol, error: r.error || 'close returned no reason' });
+        } catch (e: any) {
+          failed.push({ positionId: p.id, mint: p.mint, symbol: p.symbol, error: `ERROR: ${e?.message || e}` });
+        }
       }
     }
-    Logger.warn(`[AUTO] kill: ${this.killReason}; closed ${closed} position(s)`);
+    // R6-4: say what is still open, so "success" never reads as "all sold"
+    const stillOpen = opts.exitAll ? workstationDb.loadPositions(undefined, 'ACTIVE').filter((p) => AutoSnipeController.isAutoOwned(owned, p)).length : 0;
+    const notSold = [...refused, ...failed];
+    Logger.warn(`[AUTO] kill: ${this.killReason}; closed ${closed} of ${attempted} position(s), ${refused.length} refused, ${failed.length} failed, ${stillOpen} auto position(s) still open${notSold.length ? `; NOT closed: ${notSold.map((f) => `${f.symbol} (${f.error})`).join(', ')}` : ''}`);
+    if (refused.length + failed.length > 0) {
+      workstationDb.logDecision({ autoMode: 'OFF', mint: '-', stage: 'exit', outcome: 'INFO', reason: `kill: ${refused.length} sell(s) refused and ${failed.length} failed; ${stillOpen} auto position(s) still open`, inputs: { refused, failed } });
+    }
     this.emit('mode', { mode: this.mode, reason: this.killReason });
-    return { mode: this.mode, closed };
+    return { mode: this.mode, closed, attempted, refused, failed, stillOpen };
   }
 
   // ---- G3: kill switch ---------------------------------------------------------------------------------------
@@ -698,7 +834,7 @@ export class AutoSnipeController extends EventEmitter {
    * A change nothing in the journal explains (a drain, or an unknown spend) halts every buy plus the take-profit and stale exits;
    * stop-loss, trailing stop, manual close and panic still run (coordinator PROTECTIVE_EXIT_REASONS).
    */
-  public async auditWallet(now = Date.now()): Promise<{ explained: boolean; unexplainedSol: number } | null> {
+  public async auditWallet(now?: number): Promise<{ explained: boolean; unexplainedSol: number } | null> {
     if (this.mode !== 'DEVNET_LIVE') {
       this.walletMark = null;
       return null;
@@ -708,6 +844,8 @@ export class AutoSnipeController extends EventEmitter {
     if (this.busy || executionCoordinator.hasTradeInFlight()) return null;
     await executionCoordinator.syncRealWalletBalance();
     if (this.busy || executionCoordinator.hasTradeInFlight()) return null; // a trade started during the balance read
+    // R5-25: the window ends after the balance read, so a fill journaled while the read was out is inside it (it was outside, and read as a drain).
+    const ts = now ?? Date.now();
     const bal = executionCoordinator.getRealWalletBalanceSol();
     if (bal === null || bal === undefined) return null;
     // 3B (P3.2, R1-62): LIVE buys sent and still unresolved are in flight too, for as long as they stay unresolved (a buy that returned
@@ -715,22 +853,54 @@ export class AutoSnipeController extends EventEmitter {
     // orphan recovery journals the buy spans both. Unreadable: skip this look, keep the mark.
     const unresolved = executionCoordinator.getUnresolvedLiveBuys({ includeOwnInFlight: true });
     if (unresolved === null) return null;
+    // R7-5: LIVE sells sent whose outcome is unknown. Their proceeds can arrive before any journal row (adoption writes it later). Unreadable: skip.
+    const pendingSells = AutoSnipeController.pendingLiveSellCount();
+    if (pendingSells === null) return null;
     const prev = this.walletMark;
-    if (!prev || unresolved.mints.length === 0) this.walletMark = { sol: bal, ts: now };
-    if (!prev) return null;
-    const audit = auditWalletChange(prev.sol, bal, workstationDb.sumDecisionSolDelta(prev.ts, now), { worstCaseSol: unresolved.reservedSol, count: unresolved.mints.length });
+    if (!prev) {
+      this.walletMark = { sol: bal, ts };
+      return null;
+    }
+    const audit = auditWalletChange(prev.sol, bal, workstationDb.sumDecisionSolDelta(prev.ts, ts), { worstCaseSol: unresolved.reservedSol, count: unresolved.mints.length });
+    if (audit.inflowSol > 0) {
+      // R8-1: SOL arriving that the journal does not explain is logged, never a halt. With nothing pending it becomes the new baseline (a
+      // later drain is measured from it). With a sell or buy pending it may be that trade's proceeds, whose journal row comes later: keep the
+      // old mark, so the look after that row spans both and nets to zero (re-basing now would read the row as an outflow).
+      const held = pendingSells > 0 || unresolved.mints.length > 0;
+      const reason = `wallet received ${audit.inflowSol.toFixed(6)} SOL that the journal does not explain (tolerance ${audit.toleranceSol.toFixed(6)}); not a halt reason${held ? `; held while ${pendingSells} sell(s) and ${unresolved.mints.length} buy(s) are unresolved` : '; the audit baseline moves to the new balance'}`;
+      workstationDb.logDecision({ ts, autoMode: 'DEVNET_LIVE', mint: '-', stage: 'risk', outcome: 'WALLET_INFLOW', reason, inputs: { prevSol: prev.sol, nowSol: bal, inflowSol: audit.inflowSol, pendingSells, unresolvedBuys: unresolved.mints.length } });
+      Logger.warn(`[AUTO] ${reason}`);
+      if (!held) this.walletMark = { sol: bal, ts };
+      return { explained: true, unexplainedSol: audit.unexplainedSol };
+    }
+    if (audit.explained && !audit.heldByUnresolved && unresolved.mints.length === 0) this.walletMark = { sol: bal, ts };
     if (!audit.explained) {
       const reason = `wallet changed by an unexplained ${audit.unexplainedSol.toFixed(6)} SOL (tolerance ${audit.toleranceSol.toFixed(6)})`;
       executionCoordinator.haltAll(reason);
       this.mode = 'OFF';
       this.killed = true;
       this.killReason = reason;
+      // R3-1: like the S207 trip, the halt disarms LIVE and saves the kill, so neither a leftover arming nor a restart restarts buying.
+      executionCoordinator.armLiveTrading(false);
+      this.persistKill();
+      this.clearPendingReleases();
       this.session = null;
       workstationDb.logDecision({ autoMode: 'DEVNET_LIVE', mint: '-', stage: 'risk', outcome: 'HALT_ALL', reason, inputs: { prevSol: prev.sol, nowSol: bal } });
       Logger.error(`[AUTO] HALT ALL: ${reason}`);
       this.emit('mode', { mode: this.mode, reason });
     }
     return { explained: audit.explained, unexplainedSol: audit.unexplainedSol };
+  }
+
+  /** R7-5: LIVE SELL ledger rows still PENDING or RECONCILIATION_REQUIRED (a sell sent whose outcome is unknown). null when unreadable. */
+  private static pendingLiveSellCount(): number | null {
+    try {
+      const rows = workstationDb.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED']) as unknown as Array<{ direction: string; executionMode: string }> | null;
+      if (!rows) return null;
+      return rows.filter((t) => t.direction === 'SELL' && t.executionMode === 'LIVE').length;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -740,8 +910,7 @@ export class AutoSnipeController extends EventEmitter {
    * acknowledgement now does what that did (old losses stop re-tripping), but only on purpose. Positions the operator opened by hand never count.
    */
   private lossEvidencePnl(execMode: 'PAPER' | 'LIVE'): number[] {
-    const owned = new Set<string>(this.session?.positionIds ?? []);
-    for (const d of workstationDb.loadDecisions({ outcome: 'BOUGHT', limit: 5000 })) if (d.positionId) owned.add(d.positionId);
+    const owned = this.autoOwnedIds();
     return autoEvidencePnl(workstationDb.loadEvidenceClosedTrades(execMode), owned, { afterTs: this.lossTriggerAckTs(), n: LOSS_TRIGGER_TRADES });
   }
 
@@ -764,9 +933,23 @@ export class AutoSnipeController extends EventEmitter {
    * 3E: `ackLossTriggers` records the operator's acknowledgement of NEGATIVE_EXPECTANCY / LOSS_STREAK: auto trades closed until now stop
    * counting, so a mode can be set again. `lossTriggersAcked` is false when it could not be saved (nothing changes then).
    */
-  public resume(opts: { clearHalt?: boolean; clearDailyLossLatch?: boolean; ackLossTriggers?: boolean } = {}): { halted: boolean; mode: AutoMode; lossTriggersAcked?: boolean } {
-    if (opts.clearHalt) executionCoordinator.clearHalt();
-    if (opts.clearDailyLossLatch) riskEngine.clearDailyLossLatch();
+  public resume(opts: { clearHalt?: boolean; clearDailyLossLatch?: boolean | 'PAPER' | 'LIVE'; ackLossTriggers?: boolean } = {}): { halted: boolean; mode: AutoMode; lossTriggersAcked?: boolean; clearHaltRefused?: string; dailyLossLatchCleared?: 'PAPER' | 'LIVE' } {
+    let clearHaltRefused: string | undefined;
+    if (opts.clearHalt) {
+      // R5-17: a read-only server cannot trade, so it has nothing to resume; its TRADING_HALT_CLEARED row would make the next signed boot
+      // on this database forget a halt (a wallet-audit one, say) that nobody looked at with a signer present.
+      if (isReadOnly()) clearHaltRefused = 'READ_ONLY: APEX_READ_ONLY=true. A read-only server does not clear a trading halt; clear it from the server that signs.';
+      else executionCoordinator.clearHalt();
+    }
+    // R5-15: the latch is cleared for one mode only: the one named, or (`true`) the mode the coordinator is in now.
+    let dailyLossLatchCleared: 'PAPER' | 'LIVE' | undefined;
+    if (opts.clearDailyLossLatch) {
+      const mode: 'PAPER' | 'LIVE' = opts.clearDailyLossLatch === 'PAPER' || opts.clearDailyLossLatch === 'LIVE'
+        ? opts.clearDailyLossLatch
+        : executionCoordinator.getExecutionMode() === 'LIVE' ? 'LIVE' : 'PAPER';
+      riskEngine.clearDailyLossLatch(mode);
+      dailyLossLatchCleared = mode;
+    }
     let lossTriggersAcked: boolean | undefined;
     if (opts.ackLossTriggers) {
       const ts = Date.now();
@@ -776,7 +959,7 @@ export class AutoSnipeController extends EventEmitter {
         : 'operator acknowledgement of the loss triggers could not be saved; nothing changed';
       workstationDb.logDecision({ ts, autoMode: this.mode, mint: '-', stage: 'risk', outcome: 'INFO', reason });
     }
-    return { halted: executionCoordinator.getHaltReason() !== null, mode: this.mode, ...(lossTriggersAcked !== undefined ? { lossTriggersAcked } : {}) };
+    return { halted: executionCoordinator.getHaltReason() !== null, mode: this.mode, ...(lossTriggersAcked !== undefined ? { lossTriggersAcked } : {}), ...(clearHaltRefused ? { clearHaltRefused } : {}), ...(dailyLossLatchCleared ? { dailyLossLatchCleared } : {}) };
   }
 
   private watchListener: ((r: WatchResult) => void) | null = null;
@@ -1006,7 +1189,12 @@ export class AutoSnipeController extends EventEmitter {
           const countedSol = startOrderSol * (1 + (params.slippagePct ?? 0) / 100) + (CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS + PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS) / 1e9;
           startSession.spentSol += countedSol;
           if (startMode === 'DEVNET_LIVE') this.unsettledBuys.push({ session: startSession, mint: c.mint, sinceTs: startTs, countedSol });
+          this.saveLiveSession(startSession);
           workstationDb.logDecision({ autoMode: startMode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'budget', outcome: 'INFO', reason: `counted ${countedSol.toFixed(6)} SOL against the session cap: the buy was sent and may have landed`, inputs: watchInputs });
+        }
+        // R5-12: own the position before it exists. The recovered position's id is this signature, so kill, the loss evidence and the stats find it.
+        if (!shadow && res.txHash && /^(UNCONFIRMED|RECONCILIATION FAILED)/.test(res.message)) {
+          workstationDb.logDecision({ autoMode: startMode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'execute', outcome: AUTO_SENT_UNRESOLVED, reason: `auto buy sent and unresolved: ${res.message}`, positionId: res.txHash, inputs: { ...watchInputs, signature: res.txHash } });
         }
         retryable = RETRYABLE_REJECTION.test(res.message || '');
         return rec('REJECTED', classifyRejection(res.message), res.message, { mode: startMode, inputs: { confluenceScore: res.confluenceScore, dryRun: shadow, retryable } });
@@ -1021,6 +1209,7 @@ export class AutoSnipeController extends EventEmitter {
         startSession.spentSol += journaled ?? (res.amountSol ?? 0) + (res.feesPaidLamports ?? 0) / 1e9
           + (startMode === 'DEVNET_LIVE' ? (CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS + PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS) / 1e9 : 0);
         if (res.positionId) startSession.positionIds.push(res.positionId);
+        this.saveLiveSession(startSession);
       }
       const feesSol = (res.feesPaidLamports ?? 0) / 1e9;
       // Q7: a PAPER fill priced by the flat model (the curve could not be read) is not evidence of what a real fill would cost
@@ -1067,10 +1256,11 @@ export class AutoSnipeController extends EventEmitter {
    */
   private settleUnresolvedSpend(): void {
     this.unsettledBuys = this.unsettledBuys.filter((u) => {
-      if (u.session !== this.session) return false; // a later session starts from 0
+      if (u.session !== this.session && u.session !== this.liveSession) return false; // a later session starts from 0
       const spent = this.journaledBuySpendSol(u.mint, u.sinceTs);
       if (spent === null) return true;
       u.session.spentSol += spent - u.countedSol;
+      this.saveLiveSession(u.session);
       return false;
     });
   }

@@ -5,6 +5,7 @@ import { HardenedRiskEngine, RiskEvaluationRequest, riskEngine } from '../server
 import { SolPriceService, solPriceService } from '../server/market/solPriceService';
 import { workstationDb } from '../server/db/database';
 import { autoSnipeController } from '../server/auto/controller';
+import { executionCoordinator } from '../server/execution/coordinator';
 import { AutoResumeSchema } from '../server/execution/tradeInputs';
 
 /**
@@ -95,7 +96,7 @@ describe('3C N-61: a rolling 24 h window, latched until an operator clears it', 
     expect(latched.reasonCode).toBe('DAILY_LOSS_LIMIT');
     expect(latched.message).toMatch(/latched at 2030-01-10T23:58:00.000Z.*clearDailyLossLatch/);
 
-    r.clearDailyLossLatch();
+    r.clearDailyLossLatch('LIVE');
     expect(r.evaluateOrder(order()).approved).toBe(true);
   });
 
@@ -119,6 +120,8 @@ describe('3C N-61: a rolling 24 h window, latched until an operator clears it', 
     expect(riskEngine.evaluateOrder(order()).reasonCode).toBe('DAILY_LOSS_LIMIT');
     autoSnipeController.resume({ clearHalt: true });
     expect(riskEngine.getDailyLossLatch('LIVE')).not.toBeNull();
+    // R5-15: `true` clears the mode the coordinator is in, so this LIVE latch is cleared from LIVE
+    vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('LIVE');
     autoSnipeController.resume({ clearDailyLossLatch: true });
     expect(riskEngine.getDailyLossLatch('LIVE')).toBeNull();
   });

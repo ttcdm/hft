@@ -38,8 +38,11 @@ describe('S4a: a watched mint keeps its pool and its trade stats at feed rate', 
     stats.setPinned((m) => m === 'PINNED');
     stats.track('PINNED', { insiders: [] });
     for (let i = 0; i < 400; i++) stats.track(`m${i}`, { insiders: [] });
-    expect(stats.get('PINNED', Date.now())).toBeDefined();
-    expect(stats.get('m0', Date.now())).toBeNull();
+    // get() returns null for a mint with no trades whether it was kept or evicted, so ask the tracker itself
+    expect(stats.isTracking('PINNED')).toBe(true);
+    expect(stats.isTracking('m0')).toBe(false);
+    expect(stats.getEvictedCount()).toBeGreaterThan(0);
+    expect(stats.getTrackedCount()).toBeLessThanOrEqual(300);
   });
 
   it('wireWatchPins ties both caches to the real watch window', () => {

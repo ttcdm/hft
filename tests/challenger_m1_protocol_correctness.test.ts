@@ -894,10 +894,14 @@ describe('Empirical Adversarial Challenger Suite: Protocol & Execution Correctne
         executionMode: 'PAPER',
       });
 
-      expect(quote.expectedSolAmountLamports).toBeGreaterThan(0);
-      const totalFee = quote.protocolFeeLamports + quote.creatorFeeLamports;
-      expect(totalFee).toBeGreaterThan(0);
-      expect(quote.minOutputLamports).toBeLessThanOrEqual(quote.expectedSolAmountLamports);
+      // constant product: gross = floor(tokens * vSol / (vTokens + tokens)); fees round up; net = gross - fees
+      const gross = (tokensToSell * 32_000_000_000n) / (1_050_000_000_000_000n + tokensToSell);
+      const ceilBps = (bps: bigint) => (gross * bps + 9_999n) / 10_000n;
+      expect(BigInt(quote.protocolFeeLamports)).toBe(ceilBps(100n));
+      expect(BigInt(quote.creatorFeeLamports)).toBe(ceilBps(25n));
+      expect(BigInt(quote.expectedSolAmountLamports)).toBe(gross - ceilBps(100n) - ceilBps(25n));
+      // 100 bps slippage on the net
+      expect(BigInt(quote.minOutputLamports)).toBe((BigInt(quote.expectedSolAmountLamports) * 9_900n) / 10_000n);
     });
   });
 });

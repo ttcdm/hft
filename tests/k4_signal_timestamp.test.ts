@@ -102,9 +102,10 @@ describe('K4 #7: the auto controller passes the watch-window release time', () =
 describe('K4: every HTTP route that reaches executeTrade supplies the signal time', () => {
   // Found by the localnet end-to-end run: POST /api/execution/trade spread the body and never set signalTimestamp, so every
   // operator trade through it was rejected MISSING_SIGNAL_TIMESTAMP in LIVE. Cheap contract guard; the e2e is the real check.
-  it('each executionCoordinator.executeTrade( call in server.ts carries signalTimestamp', () => {
+  it('server.ts calls executeTrade nowhere directly (R5-40), and each executeSnipe( call carries signalTimestamp', () => {
     const src = fs.readFileSync('server.ts', 'utf8');
-    const calls = [...src.matchAll(/executionCoordinator\.executeTrade\(\{([\s\S]*?)\}\);/g)];
+    expect([...src.matchAll(/executionCoordinator\.executeTrade\(/g)]).toHaveLength(0);
+    const calls = [...src.matchAll(/memecoinAggregator\.executeSnipe\(\{([\s\S]*?)\}\);/g)];
     expect(calls.length).toBeGreaterThan(0);
     for (const c of calls) expect(c[1]).toMatch(/signalTimestamp/);
   });

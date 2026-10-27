@@ -51,7 +51,8 @@ describe('G D3: the panic sells what a manual LIVE buy in flight opens', () => {
     let opened = '';
     // a manual buy past the risk gate: it settles 50 ms into the panic and leaves a LIVE position (what executeTrade registers, see the D3 case in g_money_path_fixes)
     inFlight().set(m, new Promise<void>((r) => setTimeout(() => { opened = seedLive(m); inFlight().delete(m); r(); }, 50)));
-    const close = vi.spyOn(executionCoordinator, 'closePosition').mockResolvedValue({ success: true, pnlSol: 0, status: 'CLOSED' } as any);
+    // R5-9: a close that reports CLOSED also closes the row; the panic now reports a LIVE row still open after it
+    const close = vi.spyOn(executionCoordinator, 'closePosition').mockImplementation((async (pid: string) => { const p = workstationDb.loadPositions().find((x) => x.id === pid); if (p) workstationDb.savePosition({ ...p, status: 'CLOSED', tokenQuantityRaw: '0' } as any); return { success: true, pnlSol: 0, status: 'CLOSED' }; }) as any);
 
     const report = await emergencyStop({ exitAll: true, reason: 'g-d3' });
 

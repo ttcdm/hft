@@ -211,6 +211,12 @@ export const AutoKillSchema = z.object({
   reason: z.string().trim().max(200).optional(),
 });
 
+/** POST /api/system/alerts/acknowledge: clear one CRITICAL alert that reports a past event, by its code and the key it carries. */
+export const AlertAcknowledgeSchema = z.object({
+  code: z.string().trim().min(1).max(64),
+  positionId: z.string().trim().min(1).max(128).optional(),
+});
+
 /** POST /api/auto/resume (G3): clear an all-trading halt and/or the daily-loss latch (3C). It never turns auto trading back on. */
 export const AutoResumeSchema = z.object({
   clearHalt: z.boolean().optional(),

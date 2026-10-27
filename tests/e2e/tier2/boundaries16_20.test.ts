@@ -327,22 +327,20 @@ describe('Tier 2: Boundary & Corner Cases (Features 16 - 20)', () => {
       expect(residual).toBeGreaterThan(0);
     });
 
-    it('B20.3: partial sell percentage exceeding 100% (e.g. 150%) clamps to 100%', () => {
-      // ExitEngine evaluates stale exits at 100% — never exceeds 100%
+    it('B20.3: a stale-position exit sells exactly 100%', () => {
+      // ExitEngine.evaluate has no percentage input, so it cannot be handed 150. The clamp of a requested sell percentage to 1..100 lives in
+      // ExecutionCoordinator.closePosition and is tested in tests/p16_live_stop_never_blind.test.ts (R3-5).
       const engine = new ExitEngine();
       const stale = engine.evaluate({
         entryPriceSol: 0.0001,
-        currentPriceSol: 0.0001, // flat — no gain
-        entryTimestamp: Date.now() - 2_000_000, // way past 30-min stale threshold
+        currentPriceSol: 0.0001, // flat, no gain
+        entryTimestamp: Date.now() - 2_000_000, // way past the 30-min stale threshold
         highWaterMarkSol: 0.0001,
         trailingStopSol: 0,
         exitStage: 0,
       });
-      // Stale position exit should sell 100%, never more
-      expect(stale.sellPercentage).toBeLessThanOrEqual(100);
-      if (stale.shouldExit) {
-        expect(stale.sellPercentage).toBeGreaterThan(0);
-      }
+      expect(stale.shouldExit).toBe(true);
+      expect(stale.sellPercentage).toBe(100);
     });
 
     it('B20.5: stop loss boundary: price at or below -20% triggers ExitEngine STOP_LOSS exit', () => {

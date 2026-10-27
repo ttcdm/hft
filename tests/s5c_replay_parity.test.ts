@@ -151,18 +151,17 @@ describe('5C (R1-106): the replay labels truncated, graduated and unresolved lau
     const b = rep.summary.byRecording;
     expect([b.COMPLETE.launches, b.TRUNCATED.launches, b.GRADUATED.launches, b.UNRESOLVED.launches]).toEqual([1, 1, 0, 1]);
     expect(b.COMPLETE.closed).toBe(1); // recorded quiet to the window end: the stale exit closes it
-    expect(b.TRUNCATED.openAtEnd).toBe(1); // cut by the cap: nothing assumed past the cut
+    expect(b.TRUNCATED.entries).toBe(0); // cut by the cap: nothing assumed past the cut, so a buy landing after it is not entered (R7-12)
     expect(b.COMPLETE.closed + b.TRUNCATED.closed + b.UNRESOLVED.closed).toBe(rep.summary.closed);
     expect(b.COMPLETE.netPnlSol).toBeCloseTo(rep.launches[0].netPnlSol as number, 12);
   });
 
-  it('a launch with no END row is never assumed recorded past the moment the recording was read', () => {
+  it('a launch with no END row is never assumed recorded past its last row (R2-2)', () => {
     const W = { recordedForMs: 35 * 60_000 };
-    expect(replayLaunch(rec(), [], 150, { ...GATE, ...W }).outcome).toBe('CLOSED'); // the window alone: quiet to create + 35 min, stale exit
-    // read 5 minutes after the create: the launch may still be recording, so nothing after the read is assumed
-    expect(replayLaunch(rec(), [], 150, { ...GATE, ...W, readAtTs: T0 + 5 * 60_000 }).outcome).toBe('OPEN_AT_END');
+    // R2-2: the window alone no longer makes it quiet to create + 35 min (the process may have stopped); the buy lands after the last row
+    expect(replayLaunch(rec(), [], 150, { ...GATE, ...W }).outcome).toBe('NO_ENTRY');
     // an END row decides on its own
-    expect(replayLaunch(rec({ endTs: T0 + 35 * 60_000, endReason: 'WINDOW' }), [], 150, { ...GATE, ...W, readAtTs: T0 + 5 * 60_000 }).outcome).toBe('CLOSED');
+    expect(replayLaunch(rec({ endTs: T0 + 35 * 60_000, endReason: 'WINDOW' }), [], 150, { ...GATE, ...W }).outcome).toBe('CLOSED');
   });
 
   it('the label comes through from the database: an END/TRADE_CAP row read back by loadLaunchRecording', () => {
@@ -182,7 +181,9 @@ describe('5C (R1-106): the replay labels truncated, graduated and unresolved lau
     const data = { recorded: { launches: 2, events: 10, oldestTs: T0, newestTs: T0 + 1 }, report, message: null, replayedLaunches: 2, replayCap: 5000 } as unknown as ReplayResponse;
     const html = renderToStaticMarkup(React.createElement(ReplayBacktestView, { data }));
     expect(html).toContain('data-testid="replay-by-recording"');
-    expect(html).toMatch(/1 cut by the trade cap, 0 graduated, 1 unresolved/);
+    expect(html).toMatch(/1 cut \(trade cap, restart or feed gap\), 0 graduated, 1 unresolved/);
+    // R6-11: the every-entry headline is shown with the closed-only figures
+    expect(html).toContain('data-testid="replay-all-entries"');
   });
 });
 

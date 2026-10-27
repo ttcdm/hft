@@ -7,14 +7,14 @@ import { FUNDER_RETRY_DELAYS_MS, FUNDER_LOOKUP_CONCURRENCY, FUNDER_LOOKUP_MAX_PE
 import { RELEASE_RETRY_MS, PENDING_RELEASE_MAX_AGE_MS, DEVNET_MAX_OPEN_POSITIONS } from '../server/auto/controller';
 import { riskEngine, DAILY_LOSS_WINDOW_MS, DAILY_LOSS_PRICE_MAX_AGE_MS, WORST_CASE_LOSS_FRACTION } from '../server/risk/riskEngine';
 import { SOL_PRICE_MAX_AGE_MS, SOL_PRICE_ANCHOR_MAX_AGE_MS } from '../server/market/solPriceService';
-import { GENESIS_CHECK_TTL_MS } from '../server/solana/clusterGuard';
+import { GENESIS_CHECK_TTL_MS, BUY_BLOCKHASH_RECHECK_DELAYS_MS, SELL_BLOCKHASH_RECHECK_DELAYS_MS } from '../server/solana/clusterGuard';
 import { WorkstationDatabase } from '../server/db/database';
 import { DEFAULT_RPC_REQUEST_TIMEOUT_MS, RPC_READ_TRIES, SLOW_READ_TIMEOUT_MS, DEFAULT_RPC_LIMITER_MAX_WAIT_MS } from '../server/solana/rpcConnection';
 import {
   SELL_RATE_LIMIT_BACKOFF_MS, EXIT_RATE_LIMITED_WAIT_MS, EXIT_SELL_WAIT_MS, MARK_STALE_MS, MARK_RETRY_BASE_MS, MARK_RETRY_MAX_MS,
   MARK_ALERT_AFTER_MS, EXIT_RETRY_BASE_MS, EXIT_RETRY_MAX_MS, SELL_SLIPPAGE_LADDER_BPS, LIVE_BUY_FILLED, ExecutionCoordinator,
 } from '../server/execution/coordinator';
-import { PANIC_BUY_SETTLE_WAIT_MS } from '../server/execution/emergencyStop';
+import { PANIC_BUY_SETTLE_WAIT_MS, PANIC_PENDING_SELL_WAIT_MS } from '../server/execution/emergencyStop';
 import { READINESS_RED_LIMIT_MS, WALLET_AUDIT_BASE_TOLERANCE_SOL } from '../server/auto/killSwitch';
 import { CONFLUENCE_DEVNET_LIVE_FLOOR } from '../server/signals/confluenceThreshold';
 import { LOGIN_RATE_LIMIT } from '../server/middleware/enterprise';
@@ -61,9 +61,11 @@ const rows: Row[] = [
   ['DAILY_LOSS_PRICE_MAX_AGE_MS', DAILY_LOSS_PRICE_MAX_AGE_MS, 3_600_000, 'latency', 'older than 1 h'],
   ['WORST_CASE_LOSS_FRACTION', WORST_CASE_LOSS_FRACTION, 1, 'arch', '`WORST_CASE_LOSS_FRACTION` = 1'],
   ['GENESIS_CHECK_TTL_MS', GENESIS_CHECK_TTL_MS, 60_000, 'latency', '60 s per Connection'],
-  ['blockhash check retry', num(fromSource('server/solana/clusterGuard.ts', /await sleep\((\d+)\)/)), 500, 'latency', 'a second after 500 ms'],
+  ['BUY_BLOCKHASH_RECHECK_DELAYS_MS', [...BUY_BLOCKHASH_RECHECK_DELAYS_MS], [500], 'latency', 'a buy asks again once after 500 ms'],
+  ['SELL_BLOCKHASH_RECHECK_DELAYS_MS', [...SELL_BLOCKHASH_RECHECK_DELAYS_MS], [500, 1_000, 2_000, 3_000], 'latency', 'a sell asks again after 0.5, 1, 2 and 3 s (6.5 s in all)'],
   ['WRITABLE_CACHE_MS', WorkstationDatabase.WRITABLE_CACHE_MS, 1_000, 'latency', 'reused for 1 s'],
-  ['MIN_FREE_BYTES', WorkstationDatabase.MIN_FREE_BYTES, 16 * 1024 * 1024, 'latency', 'needs 16 MiB free'],
+  ['MIN_FREE_BYTES', WorkstationDatabase.MIN_FREE_BYTES, 32 * 1024 * 1024, 'latency', 'needs 32 MiB free'],
+  ['LOW_FREE_WARN_BYTES', WorkstationDatabase.LOW_FREE_WARN_BYTES, 128 * 1024 * 1024, 'latency', 'warns below 128 MiB free'],
   ['DEFAULT_RPC_REQUEST_TIMEOUT_MS', DEFAULT_RPC_REQUEST_TIMEOUT_MS, 1_500, 'latency', '1.5 s per request'],
   ['RPC_READ_TRIES', RPC_READ_TRIES, 2, 'latency', 'reads are tried twice'],
   ['SLOW_READ_TIMEOUT_MS', SLOW_READ_TIMEOUT_MS, 10_000, 'latency', 'slow reads 10 s'],
@@ -97,7 +99,8 @@ const rows: Row[] = [
   ['PumpSwap CACHE_TTL_MS', num(fromSource('server/solana/pumpSwapService.ts', /CACHE_TTL_MS = (\d+)/)), 15_000, 'latency', '15 s (`CACHE_TTL_MS`)'],
   ['PANIC_BUY_SETTLE_WAIT_MS', PANIC_BUY_SETTLE_WAIT_MS.value, 30_000, 'latency', '30 s (`PANIC_BUY_SETTLE_WAIT_MS`)'],
   ['PANIC_BUY_SETTLE_WAIT_MS (runbook)', PANIC_BUY_SETTLE_WAIT_MS.value, 30_000, 'runbook', 'up to 30 s (`PANIC_BUY_SETTLE_WAIT_MS`)'],
-  ['pending sell (runbook)', num(fromSource('server/execution/coordinator.ts', /const PENDING_SELL_WINDOW_MS = ([\d_]+)/)), 100_000, 'runbook', 'up to 100 s for a pending sell'],
+  // R5-9: the panic now retries a pending sell itself, so the runbook names that bound instead of the 100 s window
+  ['PANIC_PENDING_SELL_WAIT_MS (runbook)', PANIC_PENDING_SELL_WAIT_MS.value, 90_000, 'runbook', 'for up to 90 s (`PANIC_PENDING_SELL_WAIT_MS`'],
   ['WALLET_AUDIT_BASE_TOLERANCE_SOL', WALLET_AUDIT_BASE_TOLERANCE_SOL, 0.0005, 'runbook', 'A difference above 0.0005 SOL'],
   ['LOGIN_RATE_LIMIT attempts', LOGIN_RATE_LIMIT.maxTokens, 5, 'env', '5 attempts, then one every 12 s'],
   ['LOGIN_RATE_LIMIT refill', Math.round(1 / LOGIN_RATE_LIMIT.refillRatePerSec), 12, 'env', 'one every 12 s'],
@@ -164,5 +167,30 @@ describe('5A and 3H statements in the documents', () => {
     expect(PUMP_FEED_ONLINE_WINDOW_MS).toBe(60_000);
     expect(doc.arch).toContain('`PUMP_FEED_ONLINE_WINDOW_MS` (60 s');
     for (const status of ['NO_DATA', 'ONLINE', 'STALE']) expect(doc.arch).toContain(`\`${status}\``);
+  });
+});
+
+describe('3E: auto starts OFF at every start, and the documents say so', () => {
+  it('the controller starts OFF, restorePersisted returns the note the docs describe, and no document says a saved mode comes back', async () => {
+    const { autoSnipeController } = await import('../server/auto/controller');
+    const { workstationDb } = await import('../server/db/database');
+    const readme = read('README.md');
+    expect(autoSnipeController.getMode()).toBe('OFF');
+    workstationDb.setSetting('auto.mode', 'PAPER');
+    workstationDb.setSetting('auto.kill', null);
+    const r = await autoSnipeController.restorePersisted();
+    expect(r.mode).toBe('OFF');
+    expect(r.note).toContain('auto starts OFF at every start');
+    expect(workstationDb.getSetting('auto.mode')).toBe('OFF');
+    expect(readme).toContain('OFF at every start');
+    expect(doc.arch).toContain('Auto starts OFF at every start');
+    expect(doc.runbook).toContain('auto starts OFF at every start');
+    const stale = [/back up to PAPER/i, /comes back as SHADOW/i, /last mode and the confluence threshold come back/i, /restorePersisted, saved/];
+    for (const [name, text] of Object.entries({ readme, arch: doc.arch, runbook: doc.runbook })) {
+      for (const re of stale) expect(re.test(text), `${name}: ${re}`).toBe(false);
+    }
+    // the startup restore no longer exists, so it cannot be refused for loss triggers
+    expect(doc.runbook).not.toContain('The restore of a saved mode at startup is refused');
+    expect(doc.arch).not.toContain('and the startup restore are refused');
   });
 });

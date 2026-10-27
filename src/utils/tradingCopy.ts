@@ -6,12 +6,20 @@ export const ARMED_MESSAGE = (cluster?: string): string =>
 export const PANIC_CONFIRM_TEXT =
   'EMERGENCY: close ALL open positions now, trip the kill switch (blocks new entries), disarm live trading and stop auto mode? Positions that fail to close stay open and are listed afterwards.';
 
-export interface PanicResponseLite { success?: boolean; message?: string; error?: string }
+export interface PanicResponseLite {
+  success?: boolean; message?: string; error?: string;
+  /** The emergency-stop report. `failed` can hold STILL_OPEN rows (a position still open after the panic) and BUY_IN_FLIGHT rows. */
+  data?: { failed?: Array<{ id?: string; symbol?: string; error?: string }> };
+}
 
 /** Failures are an error banner that says positions may still be open, not the green/"sent" the old text gave. */
 export function panicOutcome(ok: boolean, status: number, data: PanicResponseLite): { text: string; type: 'success' | 'error' } {
   if (!ok) return { text: data.message || data.error || `Panic liquidate failed (HTTP ${status}). Positions may still be open.`, type: 'error' };
-  if (data.success === false) return { text: data.message || 'Panic liquidate finished with failures. Some positions may still be open.', type: 'error' };
+  const failed = Array.isArray(data.data?.failed) ? data.data!.failed! : [];
+  // a position the server lists as still open (or a buy still in flight) is never a success, whatever `success` says
+  const open = failed.filter((f) => /^(STILL_OPEN|BUY_IN_FLIGHT)/.test(String(f?.error ?? '')));
+  const openText = open.length ? ` STILL OPEN after the panic: ${open.map((f) => f.symbol || f.id || '?').join(', ')}. Run the panic again or close them by hand.` : '';
+  if (data.success === false || failed.length > 0) return { text: `${data.message || 'Panic liquidate finished with failures. Some positions may still be open.'}${openText}`, type: 'error' };
   return { text: data.message || 'Panic liquidate finished.', type: 'success' };
 }
 

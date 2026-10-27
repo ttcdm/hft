@@ -51,13 +51,14 @@ async function boot(tag: string, env: Record<string, string> = {}): Promise<void
   fs.mkdirSync(sub);
   const signer = await market.signerKeyFile(sub, 5);
   trader = signer.keypair;
-  app = await startLocalnetApp({ dir: sub, validator: v, signerKeyPath: signer.path, env });
+  app = await startLocalnetApp({ dir: sub, validator: v, signerKeyPath: signer.path, env, confluenceThreshold: 0, holderFeed: true });
   await armLive(app);
 }
 
 beforeAll(async () => {
   v = await startValidator(dir);
   market = await LocalMarket.connect(v);
+  market.watchedBy(() => app); // R2-3: seeded coins wait until this app has looked up their holders
 }, 120_000);
 
 afterEach(async () => {
@@ -72,9 +73,9 @@ afterAll(async () => {
 
 describe("P1.7: a held sell does not hold another position's stop-loss", () => {
   it("A's sell reply never comes (long timeout); B breaches its stop and B's sell lands while A is still held", async () => {
+    await boot('held', { RPC_REQUEST_TIMEOUT_MS: '120000' });
     const a = await market.seedCoin(14, 0.6);
     const b = await market.seedCoin(14, 0.6);
-    await boot('held', { RPC_REQUEST_TIMEOUT_MS: '120000' });
     const posA = await open(a.mint);
     const posB = await open(b.mint);
     const heldBefore = (await held()).length;
@@ -100,9 +101,9 @@ describe("P1.7: a held sell does not hold another position's stop-loss", () => {
   }, 300_000);
 
   it('with the default timeout the held send is aborted, watched and found landed: A closes with the held signature, and B stops out too', async () => {
+    await boot('default');
     const a = await market.seedCoin(14, 0.6);
     const b = await market.seedCoin(14, 0.6);
-    await boot('default');
     const posA = await open(a.mint);
     const posB = await open(b.mint);
     const heldBefore = (await held()).length;

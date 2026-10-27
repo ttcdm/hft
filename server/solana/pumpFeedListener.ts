@@ -4,6 +4,7 @@ import { EventEmitter } from 'events';
 import { PUMP_FUN_PROGRAM_ID } from './programs';
 import { Logger } from '../middleware/enterprise';
 import { executionCoordinator } from '../execution/coordinator';
+import { createTradingConnection } from './rpcConnection';
 import { curveVelocityEvaluator } from '../signals/curveVelocityEvaluator';
 import { creatorRiskScorer } from '../signals/creatorRiskScorer';
 
@@ -27,8 +28,24 @@ export const FEED_SLOT_SILENCE_MS = 10_000;
 export const FEED_HEARTBEAT_CHECK_MS = 2_000;
 export const FEED_SLOT_JUMP_MAX = 25;
 
-/** Why the log stream may have missed logs. SOCKET_CLOSED and SLOT_* come from the socket and the heartbeat, ENDPOINT_SWITCH from setRpcEndpoint. */
-export type FeedGapReason = 'SOCKET_CLOSED' | 'SLOT_SILENCE' | 'SLOT_JUMP' | 'ENDPOINT_SWITCH';
+/**
+ * Devnet run 25: after an endpoint switch the log subscription went silently deaf. Status ACTIVE, no gap, nothing delivered (not the
+ * harness's own launches, not anyone's), for every later step. Nothing watched for a subscription that never delivers: the slot
+ * silence above arms only after a first slot. The watchdog: when nothing arrived on the subscriptions (no log, no slot) for
+ * FEED_NO_DELIVERY_MS since they were made, the socket reopened or the last delivery, and either the log subscription was never
+ * confirmed by the server or the slot subscription was (so silence means deaf, not quiet), a NO_DELIVERY gap is opened and the
+ * subscription is moved to a fresh Connection to the same endpoint (a new socket). Each try that delivers nothing doubles the wait, up
+ * to FEED_NO_DELIVERY_MAX_WAIT_MS, and from the FEED_NO_DELIVERY_TRIES_BEFORE_ERROR-th try the status is ERROR until something arrives.
+ */
+export const FEED_NO_DELIVERY_MS = 15_000;
+export const FEED_NO_DELIVERY_MAX_WAIT_MS = 300_000;
+export const FEED_NO_DELIVERY_TRIES_BEFORE_ERROR = 3;
+
+/**
+ * Why the log stream may have missed logs. SOCKET_CLOSED and SLOT_* come from the socket and the heartbeat, ENDPOINT_SWITCH from
+ * setRpcEndpoint, NO_DELIVERY from the delivery watchdog (FEED_NO_DELIVERY_MS).
+ */
+export type FeedGapReason = 'SOCKET_CLOSED' | 'SLOT_SILENCE' | 'SLOT_JUMP' | 'ENDPOINT_SWITCH' | 'NO_DELIVERY';
 
 /** Emitted as 'feed_gap' when logs may have been lost. Every watch candidate active at that moment is released DEAD with FEED_GAP. */
 export interface FeedGapEvent {
@@ -118,6 +135,10 @@ export interface PumpFeedListenerTelemetry {
   lastFeedGap: FeedGapEvent | null;
   /** P4.2 (R1-64): launches not emitted because their quote mint is not SOL. */
   nonSolQuoteSkipped: number;
+  /** Run 25: the server confirmed the log subscription (or a log arrived on it). Until then the status is CONNECTING, not ACTIVE. */
+  subscriptionConfirmed: boolean;
+  /** Run 25: delivery-watchdog tries since the last delivery (each one moved the subscription to a fresh Connection). */
+  noDeliveryTries: number;
 }
 
 /**
@@ -151,12 +172,28 @@ export class PumpFeedListener extends EventEmitter {
   private nonSolQuoteSkipped = 0;
   private nonSolMints = new Set<string>();
   private socket: SocketEvents | null = null;
-  private readonly onSocketClose = () => this.openGap('SOCKET_CLOSED', 'the websocket closed; logs sent before it reconnects are never redelivered');
+  private readonly onSocketClose = () => {
+    this.logsConfirmed = !this.canConfirm; // web3.js resubscribes after the reconnect; confirmed again when the server answers
+    this.openGap('SOCKET_CLOSED', 'the websocket closed; logs sent before it reconnects are never redelivered');
+  };
   private readonly onSocketOpen = () => {
     this.lastSlot = null; // the first slot after a reconnect is not a jump: the gap is already open
     if (this.lastSlotAt > 0) this.lastSlotAt = Date.now(); // the silence clock restarts, but only once a heartbeat was ever seen
-    this.closeGap();
+    this.lastDeliveryAt = Date.now(); // the delivery watchdog gives the new socket its full wait
+    if (this.gapReason !== 'NO_DELIVERY') this.closeGap(); // an open socket is not a delivery: NO_DELIVERY closes on the first log or slot
   };
+  // Run 25: the delivery watchdog (FEED_NO_DELIVERY_MS)
+  /** The Connection can report the log subscription's server state (web3.js's `_onSubscriptionStateChange`); a fake without it is never CONNECTING. */
+  private canConfirm = false;
+  private logsConfirmed = false;
+  private slotConfirmed = false;
+  private stateUnhooks: Array<() => void> = [];
+  /** Made, armed, socket reopened, or the last log or slot: the watchdog's clock. */
+  private lastDeliveryAt = 0;
+  private noDeliveryTries = 0;
+  /** A Connection the watchdog made (not the coordinator's): its socket is closed for good when the listener leaves it. */
+  private ownConnection: Connection | null = null;
+  private watchdogBusy = false;
   private unfollow: (() => void) | null = null;
   /** B10: switches run one at a time, in order; a switch still waiting when a newer one is asked for is skipped (the newest wins). */
   private switchChain: Promise<unknown> = Promise.resolve();
@@ -534,7 +571,9 @@ export class PumpFeedListener extends EventEmitter {
         PUMP_FUN_PROGRAM_ID,
         (logs: Logs, ctx: Context) => {
           this.eventsReceived++;
-          if (this.gapReason === 'ENDPOINT_SWITCH') this.closeGap(); // the new subscription is delivering
+          this.delivered();
+          this.logsConfirmed = true; // a log on it is the best confirmation there is
+          if (this.gapReason === 'ENDPOINT_SWITCH' || this.gapReason === 'NO_DELIVERY') this.closeGap(); // the new subscription is delivering
           const handlerStart = performance.now();
           try {
             const trades = this.parseTradeLogs(logs, ctx);
@@ -582,8 +621,16 @@ export class PumpFeedListener extends EventEmitter {
         'processed'
       );
 
-      this.status = 'ACTIVE';
+      // Run 25: ACTIVE only once the server confirmed the subscription (CONNECTING until then); a Connection that cannot say is ACTIVE now
+      this.canConfirm = typeof (this.connection as any)._onSubscriptionStateChange === 'function' &&
+        (this.connection as any)._subscriptionHashByClientSubscriptionId?.[this.subscriptionId] !== undefined;
+      this.logsConfirmed = !this.canConfirm;
+      this.status = this.logsConfirmed ? 'ACTIVE' : 'CONNECTING';
       this.armGapDetection(this.connection);
+      this.onServerState(this.connection, this.subscriptionId, (ok) => {
+        this.logsConfirmed = ok;
+        if (ok && !this.gapOpen && this.subscriptionId !== null && this.status === 'CONNECTING') this.status = 'ACTIVE';
+      });
       Logger.info(`PumpFeedListener connected to Solana WebSocket logs (subId: ${this.subscriptionId})`);
       return true;
     } catch (err: any) {
@@ -623,12 +670,15 @@ export class PumpFeedListener extends EventEmitter {
     this.gapOpen = false;
     this.lastSlot = null;
     this.lastSlotAt = 0;
+    this.lastDeliveryAt = Date.now();
+    this.slotConfirmed = false;
     this.socket = socketOf(conn);
     this.socket?.on('close', this.onSocketClose);
     this.socket?.on('open', this.onSocketOpen);
     if (typeof (conn as any).onSlotChange === 'function') {
       try {
         this.slotSubscriptionId = conn.onSlotChange((info: SlotInfo) => this.onSlot(info));
+        this.onServerState(conn, this.slotSubscriptionId, (ok) => { if (ok) this.slotConfirmed = true; });
       } catch (err: any) {
         Logger.warn(`PumpFeedListener: no slot heartbeat (${err?.message || err}); gaps are seen through the socket only`);
       }
@@ -640,6 +690,7 @@ export class PumpFeedListener extends EventEmitter {
   private async disarmGapDetection(conn: Connection | null): Promise<void> {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     this.heartbeatTimer = null;
+    for (const unhook of this.stateUnhooks.splice(0)) unhook();
     const off = (ev: string, fn: () => void) => {
       if (!this.socket) return;
       if (typeof this.socket.off === 'function') this.socket.off(ev, fn);
@@ -657,6 +708,8 @@ export class PumpFeedListener extends EventEmitter {
   }
 
   private onSlot(info: SlotInfo): void {
+    this.delivered();
+    this.slotConfirmed = true;
     const prev = this.lastSlot;
     this.lastSlot = info.slot;
     this.lastSlotAt = Date.now();
@@ -669,10 +722,95 @@ export class PumpFeedListener extends EventEmitter {
   }
 
   private checkHeartbeat(now = Date.now()): void {
+    this.checkDelivery(now);
     if (this.status !== 'ACTIVE' || this.lastSlotAt === 0) return;
     if (now - this.lastSlotAt > FEED_SLOT_SILENCE_MS) {
       this.openGap('SLOT_SILENCE', `no slot notification for ${now - this.lastSlotAt} ms (limit ${FEED_SLOT_SILENCE_MS} ms)`);
     }
+  }
+
+  /** Something arrived on the subscriptions (a log or a slot): the watchdog's clock restarts and its tries are forgiven. */
+  private delivered(): void {
+    this.lastDeliveryAt = Date.now();
+    if (this.noDeliveryTries > 0) {
+      Logger.info(`PumpFeedListener: delivering again after ${this.noDeliveryTries} NO_DELIVERY resubscribe(s)`);
+      this.noDeliveryTries = 0;
+      if (this.status === 'ERROR' && this.subscriptionId !== null) this.status = this.gapOpen ? 'RECONNECTING' : 'ACTIVE';
+    }
+  }
+
+  /** Calls `fn(true)` when the server confirms subscription `id` on `conn`, `fn(false)` when it is pending again (web3.js internals; absent on fakes). */
+  private onServerState(conn: Connection, id: number | null, fn: (confirmed: boolean) => void): void {
+    const hook = (conn as any)._onSubscriptionStateChange;
+    if (id === null || typeof hook !== 'function') return;
+    try {
+      const unhook = hook.call(conn, id, (state: string) => {
+        if (state === 'subscribed') fn(true);
+        else if (state === 'pending' || state === 'subscribing') fn(false);
+      });
+      if (typeof unhook === 'function') this.stateUnhooks.push(unhook);
+      // Shared with an earlier identical subscription that is already live: no state change will come, so read the state now
+      const hash = (conn as any)._subscriptionHashByClientSubscriptionId?.[id];
+      if (hash !== undefined && (conn as any)._subscriptionsByHash?.[hash]?.state === 'subscribed') fn(true);
+    } catch { /* the state cannot be read: the watchdog's silence clock still runs */ }
+  }
+
+  /**
+   * Run 25: the delivery watchdog (FEED_NO_DELIVERY_MS). Judged only when silence means deaf: the server never confirmed the log
+   * subscription, or it confirmed the slot subscription (slots come about every 400 ms). With the log subscription confirmed and no slot
+   * heartbeat, a quiet feed cannot be told from a deaf one, so nothing is done (a quiet devnet goes minutes without a pump log).
+   */
+  private checkDelivery(now = Date.now()): void {
+    if (this.subscriptionId === null || this.watchdogBusy || this.isDestroyed) return;
+    if (this.logsConfirmed && !this.slotConfirmed) return;
+    const waitMs = Math.min(FEED_NO_DELIVERY_MS * 2 ** this.noDeliveryTries, FEED_NO_DELIVERY_MAX_WAIT_MS);
+    const silentMs = now - this.lastDeliveryAt;
+    if (silentMs <= waitMs) return;
+    const old = this.connection;
+    const fresh = old ? this.freshConnectionFor(old) : null;
+    this.noDeliveryTries++;
+    const detail = `nothing delivered on the log subscription for ${Math.round(silentMs / 1000)} s (${this.logsConfirmed ? 'the server confirmed it' : 'the server never confirmed it'}); ` +
+      (fresh ? `resubscribing on a fresh Connection (try ${this.noDeliveryTries})` : 'no fresh Connection could be made');
+    if (!fresh) {
+      this.lastDeliveryAt = now; // the next try waits its full (doubled) time
+      if (!this.gapOpen) this.openGap('NO_DELIVERY', detail);
+      else Logger.warn(`PumpFeedListener NO_DELIVERY: ${detail}`);
+      if (this.noDeliveryTries >= FEED_NO_DELIVERY_TRIES_BEFORE_ERROR) this.status = 'ERROR';
+      return;
+    }
+    this.watchdogBusy = true;
+    this.switchConnection(fresh, 'NO_DELIVERY', detail)
+      .then(() => {
+        if (this.noDeliveryTries >= FEED_NO_DELIVERY_TRIES_BEFORE_ERROR && this.subscriptionId !== null) {
+          this.status = 'ERROR';
+          Logger.error(`PumpFeedListener: ${this.noDeliveryTries} resubscribes delivered nothing; status ERROR until a log or slot arrives (next try in ${Math.round(Math.min(FEED_NO_DELIVERY_MS * 2 ** this.noDeliveryTries, FEED_NO_DELIVERY_MAX_WAIT_MS) / 1000)} s)`);
+        }
+      })
+      .catch((err: any) => Logger.warn(`PumpFeedListener could not resubscribe after NO_DELIVERY: ${err?.message || err}`))
+      .finally(() => { this.watchdogBusy = false; });
+  }
+
+  /** A new Connection to the same endpoints as `conn` (a new socket), built like the coordinator's; null when `conn` names no endpoint. */
+  private freshConnectionFor(conn: Connection): Connection | null {
+    const endpoint = (conn as any).rpcEndpoint ?? (conn as any)._rpcEndpoint;
+    if (typeof endpoint !== 'string' || endpoint === '') return null;
+    const wsEndpoint = (conn as any)._rpcWsEndpoint;
+    try {
+      return createTradingConnection(endpoint, typeof wsEndpoint === 'string' && wsEndpoint ? { wsEndpoint } : {});
+    } catch {
+      return null;
+    }
+  }
+
+  /** Close the socket of a Connection the watchdog made, for good (web3.js has no public close; it would otherwise redial a dead endpoint forever). */
+  private closeOwnSocket(conn: Connection | null): void {
+    if (!conn || conn !== this.ownConnection) return;
+    this.ownConnection = null;
+    const ws = (conn as any)._rpcWebSocket;
+    try {
+      ws?.setAutoReconnect?.(false);
+      ws?.close?.();
+    } catch { /* already closed */ }
   }
 
   /**
@@ -691,7 +829,7 @@ export class PumpFeedListener extends EventEmitter {
     if (!this.gapOpen) return;
     this.gapOpen = false;
     this.gapReason = null;
-    if (this.subscriptionId !== null) this.status = 'ACTIVE';
+    if (this.subscriptionId !== null) this.status = this.logsConfirmed ? 'ACTIVE' : 'CONNECTING';
     Logger.info('PumpFeedListener: log stream delivering again after a gap');
   }
 
@@ -718,23 +856,27 @@ export class PumpFeedListener extends EventEmitter {
    * Connection, so two quick `setRpcEndpoint` calls used to run interleaved: both saw the listener running, both called `start()`, and
    * one subscription was left on an endpoint the listener no longer tracked. Switches are now queued, and only the newest one runs.
    */
-  public switchConnection(conn: Connection): Promise<boolean> {
+  public switchConnection(conn: Connection, reason: 'ENDPOINT_SWITCH' | 'NO_DELIVERY' = 'ENDPOINT_SWITCH', detail = 'the RPC endpoint was switched; logs between the two subscriptions are not seen'): Promise<boolean> {
     this.switchTarget = conn;
-    const run = this.switchChain.then(() => (this.switchTarget === conn ? this.switchNow(conn) : false));
+    const run = this.switchChain.then(() => (this.switchTarget === conn ? this.switchNow(conn, reason, detail) : false));
     this.switchChain = run.catch(() => undefined);
     return run;
   }
 
-  private async switchNow(conn: Connection): Promise<boolean> {
+  /** Run 25: also the delivery watchdog's move to a fresh Connection (reason NO_DELIVERY), queued with the endpoint switches. */
+  private async switchNow(conn: Connection, reason: 'ENDPOINT_SWITCH' | 'NO_DELIVERY', detail: string): Promise<boolean> {
     if (conn === this.connection) return this.isActive();
     const wasRunning = this.subscriptionId !== null || this.reconnectTimer !== null;
+    const old = this.connection;
     await this.stop();
+    this.closeOwnSocket(old);
     this.connection = conn;
+    if (reason === 'NO_DELIVERY') this.ownConnection = conn;
+    else this.noDeliveryTries = 0; // a new endpoint starts the watchdog over
     if (!wasRunning || this.isDestroyed) return false;
-    const detail = 'the RPC endpoint was switched; logs between the two subscriptions are not seen';
     const started = await this.start();
-    if (started) this.openGap('ENDPOINT_SWITCH', detail);
-    else this.emitGap('ENDPOINT_SWITCH', detail); // not subscribed (status ERROR or RECONNECTING): watched launches are still released
+    if (started) this.openGap(reason, detail);
+    else this.emitGap(reason, detail); // not subscribed (status ERROR or RECONNECTING): watched launches are still released
     return started;
   }
 
@@ -786,6 +928,8 @@ export class PumpFeedListener extends EventEmitter {
       feedGaps: this.feedGaps,
       lastFeedGap: this.lastFeedGap,
       nonSolQuoteSkipped: this.nonSolQuoteSkipped,
+      subscriptionConfirmed: this.subscriptionId !== null && this.logsConfirmed,
+      noDeliveryTries: this.noDeliveryTries,
     };
   }
 
@@ -793,7 +937,8 @@ export class PumpFeedListener extends EventEmitter {
     this.isDestroyed = true;
     this.unfollow?.();
     this.unfollow = null;
-    this.stop().catch(() => {});
+    const conn = this.connection;
+    this.stop().then(() => this.closeOwnSocket(conn), () => {});
     this.removeAllListeners();
   }
 }

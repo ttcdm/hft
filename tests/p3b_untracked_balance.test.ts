@@ -52,10 +52,17 @@ describe('P3b: untracked wallet token balances', () => {
 
   const posFor = (mint: PublicKey) => workstationDb.loadPositions().find((p) => p.mint === mint.toBase58() && p.status !== 'CLOSED');
   const mark = (mint: PublicKey, price: number) => { marks[mint.toBase58()] = { priceSol: price, source: 'ON_CHAIN_BONDING_CURVE', timestamp: Date.now() }; };
+  // R5-1: only a mint this app sent a LIVE buy for is adopted (here a buy whose record was lost: it timed out, yet its tokens arrived)
+  const bought = (mint: PublicKey) => workstationDb.saveTransaction({
+    signature: `p3b_buy_${mint.toBase58().slice(0, 8)}_${Math.random().toString(36).slice(2)}`, orderId: 'o', correlationId: 'c', mint: mint.toBase58(),
+    direction: 'BUY', submissionTransport: 'SOLANA_RPC', submissionTime: Date.now() - 60_000, reconciliationState: 'TIMED_OUT',
+    networkFeeLamports: 5000, jitoTipLamports: 0, executionMode: 'LIVE',
+  });
 
   it('adopts a priced untracked SPL balance: OPEN position, entry price = mark, cost basis unknown, alert raised', async () => {
     const mint = Keypair.generate().publicKey;
     listing.spl.push(acct(mint, '5000000000'));
+    bought(mint);
     mark(mint, 0.00002);
     const r = await coordinator.scanUntrackedWalletTokens();
     expect(r.adopted).toEqual([mint.toBase58()]);
@@ -73,6 +80,7 @@ describe('P3b: untracked wallet token balances', () => {
   it('a Token-2022 balance keeps its token program', async () => {
     const mint = Keypair.generate().publicKey;
     listing.t22.push(acct(mint, '777', 9));
+    bought(mint);
     mark(mint, 0.001);
     await coordinator.scanUntrackedWalletTokens();
     const p = posFor(mint)!;
@@ -103,6 +111,7 @@ describe('P3b: untracked wallet token balances', () => {
   it('a balance with no readable pump price is alerted but never turned into a position', async () => {
     const mint = Keypair.generate().publicKey;
     listing.spl.push(acct(mint, '123'));
+    bought(mint);
     const r = await coordinator.scanUntrackedWalletTokens();
     expect(r.untracked).toEqual([mint.toBase58()]);
     expect(r.adopted).toEqual([]);
@@ -113,6 +122,7 @@ describe('P3b: untracked wallet token balances', () => {
   it('is idempotent: a second scan finds the adopted position and adds nothing', async () => {
     const mint = Keypair.generate().publicKey;
     listing.spl.push(acct(mint, '42'));
+    bought(mint);
     mark(mint, 0.5);
     await coordinator.scanUntrackedWalletTokens();
     const second = await coordinator.scanUntrackedWalletTokens();
@@ -123,6 +133,7 @@ describe('P3b: untracked wallet token balances', () => {
   it('the adopted position is covered by the exit engine: a -50% mark triggers STOP_LOSS', async () => {
     const mint = Keypair.generate().publicKey;
     listing.spl.push(acct(mint, '1000000'));
+    bought(mint);
     mark(mint, 0.001);
     await coordinator.scanUntrackedWalletTokens();
     vi.spyOn(coordinator as any, 'updatePositionMarkPrices').mockResolvedValue(undefined);
@@ -139,6 +150,7 @@ describe('P3b: untracked wallet token balances', () => {
     const setup = async () => {
       const mint = Keypair.generate().publicKey;
       listing.spl.push(acct(mint, '1000000'));
+      bought(mint);
       mark(mint, 0.001);
       await coordinator.scanUntrackedWalletTokens();
       vi.spyOn(coordinator as any, 'updatePositionMarkPrices').mockResolvedValue(undefined);
@@ -185,6 +197,7 @@ describe('P3b: untracked wallet token balances', () => {
   it('startup reconciliation runs the scan and mentions it', async () => {
     const mint = Keypair.generate().publicKey;
     listing.spl.push(acct(mint, '31337'));
+    bought(mint);
     mark(mint, 0.003);
     const res = await coordinator.startupReconciliation();
     expect(posFor(mint)?.status).toBe('OPEN');

@@ -24,7 +24,7 @@ afterEach(async () => {
   workstationDb.setSetting('auto.kill', null); // 3E: a kill is saved too, and keeps auto OFF across the next restore
 });
 
-describe('S222: the operator\'s threshold and auto mode survive a restart', () => {
+describe('S222: the operator\'s threshold survives a restart; 3E: the auto mode does not (OFF at every start)', () => {
   it('the confluence threshold is saved and comes back', async () => {
     expect(autoSnipeController.setConfluenceThreshold(60).ok).toBe(true);
     expect(workstationDb.getSetting('auto.confluenceThreshold')).toBe(60);
@@ -44,21 +44,24 @@ describe('S222: the operator\'s threshold and auto mode survive a restart', () =
     expect(getConfluenceThreshold()).toBe(70);
   });
 
-  it('PAPER comes back as PAPER', async () => {
+  it('3E: a saved PAPER is reported and auto starts OFF; the saved value is set to OFF', async () => {
     await setAutoMode('PAPER');
     expect(workstationDb.getSetting('auto.mode')).toBe('PAPER');
     simulateRestart();
     expect(autoSnipeController.getMode()).toBe('OFF');
     const r = await autoSnipeController.restorePersisted();
-    expect(r.mode).toBe('PAPER');
-    expect(autoSnipeController.getMode()).toBe('PAPER');
+    expect(r.mode).toBe('OFF');
+    expect(r.note).toMatch(/last run was in PAPER; auto starts OFF/);
+    expect(autoSnipeController.getMode()).toBe('OFF');
+    expect(workstationDb.getSetting('auto.mode')).toBe('OFF');
   });
 
-  it('SHADOW comes back as SHADOW, and a kill (OFF) comes back OFF', async () => {
+  it('3E: a saved SHADOW starts OFF too, and a kill (OFF) comes back OFF', async () => {
     await setAutoMode('SHADOW');
     simulateRestart();
     await autoSnipeController.restorePersisted();
-    expect(autoSnipeController.getMode()).toBe('SHADOW');
+    expect(autoSnipeController.getMode()).toBe('OFF');
+    await setAutoMode('SHADOW');
     await autoSnipeController.kill({ reason: 'test' });
     expect(workstationDb.getSetting('auto.mode')).toBe('OFF');
     simulateRestart();
@@ -66,16 +69,16 @@ describe('S222: the operator\'s threshold and auto mode survive a restart', () =
     expect(autoSnipeController.getMode()).toBe('OFF');
   });
 
-  it('a saved DEVNET_LIVE comes back as SHADOW, never as live sending, and says why', async () => {
+  it('3E: a saved DEVNET_LIVE starts OFF, never as live sending, and says why', async () => {
     vi.stubEnv('AUTO_SNIPE_ENABLED', 'true');
     workstationDb.setSetting('auto.mode', 'DEVNET_LIVE');
     simulateRestart();
     const r = await autoSnipeController.restorePersisted();
-    expect(r.mode).toBe('SHADOW');
-    expect(autoSnipeController.getMode()).toBe('SHADOW');
+    expect(r.mode).toBe('OFF');
+    expect(autoSnipeController.getMode()).toBe('OFF');
     expect(executionCoordinator.isLiveArmed()).toBe(false);
-    expect(autoSnipeController.getStatus().downgradeReason).toMatch(/DEVNET_LIVE.*SHADOW/);
-    expect(workstationDb.getSetting('auto.mode')).toBe('SHADOW'); // and the saved value no longer says DEVNET_LIVE
+    expect(r.note).toMatch(/last run was in DEVNET_LIVE.*confirmation code/);
+    expect(workstationDb.getSetting('auto.mode')).toBe('OFF'); // and the saved value no longer says DEVNET_LIVE
   });
 
   it('without AUTO_SNIPE_ENABLED=true the mode is not restored', async () => {
@@ -84,7 +87,7 @@ describe('S222: the operator\'s threshold and auto mode survive a restart', () =
     simulateRestart();
     const r = await autoSnipeController.restorePersisted();
     expect(r.mode).toBe('OFF');
-    expect(r.note).toMatch(/could not restore/);
+    expect(r.note).toMatch(/auto starts OFF/);
   });
 
   it('a kill trigger that drops PAPER to SHADOW is what comes back', async () => {

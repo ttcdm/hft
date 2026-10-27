@@ -1,10 +1,12 @@
 import { MemecoinPool, SniperPosition, SniperBotConfig } from '../src/types';
+import { closeOutcomeText } from '../src/utils/closeOutcome';
 import { EventEmitter } from 'events';
 import { PublicKey } from '@solana/web3.js';
 import { traced } from './observability/tracing';
-import { PumpCurveService } from './solana/pumpCurve';
-import { executionCoordinator } from './execution/coordinator';
+import { PumpCurveService, type MarketStateFailure } from './solana/pumpCurve';
+import { executionCoordinator, isRecoveredPosition, type CloseOutcome } from './execution/coordinator';
 import { solPriceService } from './market/solPriceService';
+import { riskEngine } from './risk/riskEngine';
 import { workstationDb } from './db/database';
 import { evaluateTokenSafety } from './risk/tokenSafety';
 import { pumpFeedListener, PumpCreateEvent, PumpTradeEvent } from './solana/pumpFeedListener';
@@ -15,6 +17,7 @@ import { ConfluenceEngine, isConfluencePassed } from './signals/confluenceEngine
 import { getConfluenceThreshold } from './signals/confluenceThreshold';
 import { curveVelocityEvaluator } from './signals/curveVelocityEvaluator';
 import { checkSnipeAmountSol } from './execution/snipeAmount';
+import { lossTriggerHits, LOSS_TRIGGER_ACK_SETTING, LOSS_TRIGGER_TRADES } from './auto/killSwitch';
 
 const INITIAL_POOLS: MemecoinPool[] = [
   {
@@ -218,7 +221,8 @@ export class MemecoinAggregatorService extends EventEmitter {
 
       const mode = executionCoordinator.getExecutionMode();
       const activePositions = executionCoordinator.getPositions(mode, 'ACTIVE');
-      if (activePositions.length >= 3) return;
+      // R5-1: a RECOVERED row (a balance found in the wallet, not a trade auto chose) does not take one of the 3 slots
+      if (activePositions.filter((p) => !isRecoveredPosition(p)).length >= 3) return;
 
       try {
         const { pumpFunService, calloutProvenance } = await import('./pumpfunService');
@@ -299,7 +303,7 @@ export class MemecoinAggregatorService extends EventEmitter {
       isMintRevoked: true,
       isFreezeRevoked: true,
       isLpBurned: false,
-      rugcheckScore: 'SAFE',
+      rugcheckScore: 'UNKNOWN', // R6-13: nothing has rated it; the eligibility filter reads the chain at execution
       createdAgo: 'Just now (WS)',
       trendingRank: 0,
     };
@@ -387,7 +391,8 @@ export class MemecoinAggregatorService extends EventEmitter {
   // Canonical positions mapped from single authoritative SQLite store via ExecutionCoordinator
   public getPositions(): SniperPosition[] {
     const mode = executionCoordinator.getExecutionMode();
-    const rawPositions = executionCoordinator.getPositions(mode);
+    // R6-2: after a disarm the mode is PAPER while real LIVE positions stay open; list those too (each row says its executionMode)
+    const rawPositions = mode === 'LIVE' ? executionCoordinator.getPositions(mode) : [...executionCoordinator.getPositions(mode), ...executionCoordinator.getPositions('LIVE', 'ACTIVE')];
 
     return rawPositions.map((p) => {
       const tokenQty = Number(p.tokenQuantityRaw) / Math.pow(10, p.tokenDecimals);
@@ -417,6 +422,7 @@ export class MemecoinAggregatorService extends EventEmitter {
         openedAt: p.entryTimestamp,
         status: p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED' ? 'OPEN' : 'CLOSED',
         txHash: p.entryTxSignature,
+        executionMode: p.executionMode,
       };
     });
   }
@@ -491,6 +497,33 @@ export class MemecoinAggregatorService extends EventEmitter {
     };
   }
 
+  /**
+   * R8-8: why a LIVE buy is refused on recent results, or null. (1) NEGATIVE_EXPECTANCY / LOSS_STREAK over the last LOSS_TRIGGER_TRADES LIVE
+   * closed trades (manual and auto) since the operator's last acknowledgement, with auto's thresholds; cleared by
+   * POST /api/auto/resume {ackLossTriggers:true}, as for auto. (2) Past the cold start, a raw Kelly at or below zero over the last
+   * CapitalSizer.KELLY_RECENT_WINDOW closed LIVE trades.
+   */
+  private recentEvidenceRefusal(lifetimeTradeCount: number): string | null {
+    const ack = workstationDb.getSetting<{ ts?: unknown }>(LOSS_TRIGGER_ACK_SETTING);
+    const ackTs = ack && typeof ack === 'object' && typeof ack.ts === 'number' && Number.isFinite(ack.ts) ? ack.ts : null;
+    const evidence = workstationDb.loadEvidenceClosedTrades('LIVE')
+      .filter((p) => ackTs === null || (p.lastUpdatedTimestamp ?? 0) > ackTs)
+      .slice(-LOSS_TRIGGER_TRADES)
+      .map((p) => p.realizedPnLSol ?? 0);
+    const hits = lossTriggerHits(evidence);
+    if (hits.length > 0) {
+      return `REJECTED: LOSS_TRIGGERS: ${hits.map((h) => `${h.code} (${h.message})`).join('; ')}, over the last LIVE trades (manual and auto). Check them, then acknowledge with POST /api/auto/resume {ackLossTriggers:true}; trades closed before that no longer count.`;
+    }
+    if (lifetimeTradeCount >= CapitalSizer.SHRINKAGE_PRIOR_WEIGHT) {
+      const recent = CapitalSizer.getHistoricalTradeStats('LIVE', { lastN: CapitalSizer.KELLY_RECENT_WINDOW });
+      const kelly = CapitalSizer.calculateRawKelly(recent.winRate, recent.winLossRatio);
+      if (!(kelly > 0)) {
+        return `REJECTED: Capital sizing failed (NEGATIVE_RECENT_EXPECTANCY: raw Kelly ${kelly.toFixed(4)} over the last ${recent.tradeCount} closed LIVE trades, win rate ${(recent.winRate * 100).toFixed(1)}%, payoff ${recent.winLossRatio.toFixed(2)})`;
+      }
+    }
+    return null;
+  }
+
   // Execution routed STRICTLY through authoritative ExecutionCoordinator
   public async executeSnipe(params: {
     contractAddress: string;
@@ -514,6 +547,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     signalTimestamp?: number;
     /** R5: the coordinator mode the caller checked before its awaits; the coordinator refuses the trade if the mode has changed since. */
     expectedMode?: ExecutionMode;
+    /** R5-40: who placed the order, for the ledger and journal. The auto loop and callout snipes are AUTO_SNIPER (the default); an operator route says MANUAL. */
+    source?: 'AUTO_SNIPER' | 'MANUAL';
   }): Promise<{
     success: boolean;
     message: string;
@@ -529,6 +564,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     fillPriceSol?: number;
     slippageBps?: number;
     gates?: Record<string, unknown>;
+    /** R5-40: the coordinator's own result when the order reached it (the operator trade route answers with it, as it did before it ran these gates). */
+    execResult?: Awaited<ReturnType<typeof executionCoordinator.executeTrade>>;
   }> {
     const cleanCa = params.contractAddress.trim();
 
@@ -538,6 +575,21 @@ export class MemecoinAggregatorService extends EventEmitter {
 
     // Sizing via CapitalSizer (B12): determine spendable bankroll and 10% ceiling
     const executionMode = executionCoordinator.getExecutionMode();
+    // R5-40: the operator trade route reaches the coordinator only through here, and the price, sizing and curve checks below come first.
+    // A kill switch or a halt refuses every buy whatever those say, so it is reported as itself (as the route did before R5-40), not
+    // shadowed by SOL_PRICE_UNAVAILABLE or MARKET_DATA_UNAVAILABLE. The coordinator still checks both; these refusals only come earlier.
+    if (!params.dryRun) {
+      if (riskEngine.isKillSwitchActive()) return { success: false, message: 'KILL_SWITCH_ACTIVE: Emergency kill switch is active', txHash: '' };
+      const halt = executionCoordinator.getHaltReason();
+      if (halt) return { success: false, message: `TRADING_HALTED: ${halt}`, txHash: '' };
+    }
+    // R5-40: the curve read below comes first in this path. On an RPC the
+    // heartbeat found on another cluster (a new ledger behind the same URL) that read fails as a lagging slot or a missing curve, which
+    // hid the real reason the coordinator gave before (CLUSTER_GUARD). Refuse with it here, before anything is read.
+    if (executionMode === 'LIVE') {
+      const clusterProblem = executionCoordinator.getClusterStatus().problem;
+      if (clusterProblem) return { success: false, message: `CLUSTER_GUARD: the RPC is not on the allowed cluster (${clusterProblem.replace(/^CLUSTER_GUARD: /, '')}); nothing was read or sent`, txHash: '' };
+    }
     // C3: LIVE needs a fresh SOL/USD price (fail closed). PAPER may use the last known one, but not none.
     if (executionMode === 'LIVE') {
       try {
@@ -576,6 +628,12 @@ export class MemecoinAggregatorService extends EventEmitter {
         message: `REJECTED: Capital sizing failed (${sizingResult.rejectionReason})`,
         txHash: '',
       };
+    }
+    if (executionMode === 'LIVE') {
+      // R8-8: manual LIVE had no expectancy or loss-streak check (auto's triggers run only inside auto) and Kelly approval read the lifetime
+      // figures only. Both are refusals here, for every LIVE buy: they add a reason to refuse and never approve anything the checks above refuse.
+      const recentRefusal = this.recentEvidenceRefusal(historicalStats.tradeCount);
+      if (recentRefusal) return { success: false, message: recentRefusal, txHash: '' };
     }
 
     // A LIVE buy sized against a bankroll with nothing spendable would skip the 10% cap below (it only applies when spendable > 0)
@@ -620,6 +678,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     const jitoTipSol = params.jitoTipSol || this.config.jitoTipSol || undefined;
 
     let pool = this.pools.find((p) => p.contractAddress.toLowerCase() === cleanCa.toLowerCase());
+    /** Why the on-chain curve read gave no state (P1.6 failure out-param), for the MARKET_DATA_UNAVAILABLE reason below. */
+    const curveFailure: Partial<MarketStateFailure> = {};
 
     if (!pool) {
       try {
@@ -629,6 +689,7 @@ export class MemecoinAggregatorService extends EventEmitter {
           connection: executionCoordinator.getConnection(),
           mint: mintPubkey,
           executionMode: currentMode,
+          failure: curveFailure,
         });
         // the feed may have created this mint's pool while the curve was being read; use it instead of adding a second entry
         pool = this.pools.find((p) => p.contractAddress.toLowerCase() === cleanCa.toLowerCase());
@@ -710,7 +771,7 @@ export class MemecoinAggregatorService extends EventEmitter {
             priceUsd,
             priceNative,
             marketCapUsd: t.currentMarketCapUsd || 0, // the feed's current figure, not a launch-time stand-in
-            liquidityUsd: 15000,
+            liquidityUsd: 0, // A144: the callout feed measures no liquidity; 0 is "unknown" (it was a made-up $15,000)
             bondingCurveProgress: t.bondingCurveProgress || 50,
             isMigrated: t.complete,
             volume5mUsd: t.volume5mUsd ?? 0,
@@ -720,13 +781,15 @@ export class MemecoinAggregatorService extends EventEmitter {
             priceChange1hPct: 0,
             buys5m: t.buys5m ?? 0,
             sells5m: t.sells5m ?? 0,
-            top10HoldersPct: t.top10HoldersPct ?? 15,
-            devHoldingPct: t.devHoldingPct ?? 0.8,
-            isMintRevoked: t.isMintRevoked ?? true,
-            isFreezeRevoked: t.isFreezeRevoked ?? true,
+            // A144 / R2-25: what the callout does not say is UNKNOWN (-1 for the holder shares; not revoked for the authorities, so the freeze
+            // gate refuses an unknown freeze authority), never a passing default (it was 15%, 0.8%, revoked, SAFE)
+            top10HoldersPct: t.top10HoldersPct ?? -1,
+            devHoldingPct: t.devHoldingPct ?? -1,
+            isMintRevoked: t.isMintRevoked ?? false,
+            isFreezeRevoked: t.isFreezeRevoked ?? false,
             authoritiesVerified: t.isMintRevoked != null && t.isFreezeRevoked != null,
             isLpBurned: false,
-            rugcheckScore: (t.rugcheckScore as any) || 'SAFE',
+            rugcheckScore: (t.rugcheckScore as any) || 'UNKNOWN',
             createdAgo: t.timeAgoStr || 'Just now',
             trendingRank: 1,
             unverified: true, // Q32
@@ -736,49 +799,18 @@ export class MemecoinAggregatorService extends EventEmitter {
       } catch {}
     }
 
-    if (!pool && !params.noSyntheticPool && executionCoordinator.getExecutionMode() === 'PAPER') {
-      const priceUsd = 0.000045;
-      const priceNative = priceUsd / this.solPriceUsd;
-      pool = {
-        id: `pool-simulated-${cleanCa.slice(0, 8)}`,
-        platform: 'PUMP_FUN',
-        chain: 'SOLANA',
-        symbol: cleanCa.slice(0, 5).toUpperCase(),
-        name: `Token ${cleanCa.slice(0, 4)}...${cleanCa.slice(-4)}`,
-        contractAddress: cleanCa,
-        priceUsd,
-        priceNative,
-        marketCapUsd: 45000,
-        liquidityUsd: 15000,
-        bondingCurveProgress: 45,
-        isMigrated: false,
-        volume5mUsd: 12000,
-        volume1hUsd: 35000,
-        volume24hUsd: 95000,
-        priceChange5mPct: 4.2,
-        priceChange1hPct: 12.0,
-        buys5m: 35,
-        sells5m: 6,
-        top10HoldersPct: 12,
-        devHoldingPct: 0.5,
-        isMintRevoked: true,
-        isFreezeRevoked: true,
-        isLpBurned: false,
-        rugcheckScore: 'SAFE',
-        createdAgo: 'Simulated Paper',
-        trendingRank: 1,
-      };
-      this.pools.unshift(pool);
-    }
-
-    if (pool && params.noSyntheticPool && (DEMO_POOL_IDS.has(pool.id) || pool.id.startsWith('pool-simulated-'))) {
-      return { success: false, message: `MARKET_DATA_UNAVAILABLE: ${cleanCa} has only a simulated pool; the auto trader does not trade against one.`, txHash: '' };
+    // R10-8: an unknown mint used to get an invented PAPER pool here (price $0.000045, MC $45,000, mint and freeze revoked, SAFE) that
+    // then showed in the Aggregator with green badges and a live Snipe button; one wrong character in a pasted mint was enough. A mint
+    // with no feed pool, no readable curve and no callout is refused below (MARKET_DATA_UNAVAILABLE), in PAPER as in LIVE.
+    // A144: a callout placeholder (`pool-callout-*`, made when the curve could not be read) is no more real than a simulated pool
+    if (pool && params.noSyntheticPool && (DEMO_POOL_IDS.has(pool.id) || pool.id.startsWith('pool-simulated-') || pool.id.startsWith('pool-callout-'))) {
+      return { success: false, message: `MARKET_DATA_UNAVAILABLE: ${cleanCa} has only a simulated or placeholder pool (${pool.id.replace(/-[^-]*$/, '')}); this order does not trade against one.`, txHash: '' };
     }
 
     if (!pool) {
       return {
         success: false,
-        message: `MARKET_DATA_UNAVAILABLE: Token pool ${cleanCa} not found and real on-chain bonding curve could not be resolved. Sniping without real market state is rejected.`,
+        message: `MARKET_DATA_UNAVAILABLE: Token pool ${cleanCa} not found and real on-chain bonding curve could not be resolved${curveFailure.reason ? ` (${curveFailure.reason}: ${curveFailure.message ?? ''})` : ''}. Sniping without real market state is rejected.`,
         txHash: '',
       };
     }
@@ -861,7 +893,7 @@ export class MemecoinAggregatorService extends EventEmitter {
       currentPriceSol: pool.priceNative,
       slippageBps,
       jitoTipSol,
-      source: 'AUTO_SNIPER',
+      source: params.source ?? 'AUTO_SNIPER',
       provenance,
       liquidityUsd: pool.liquidityUsd,
       signalTimestamp: params.signalTimestamp,
@@ -875,8 +907,10 @@ export class MemecoinAggregatorService extends EventEmitter {
       return {
         success: false,
         message: execRes.error || 'Execution rejected by pipeline',
-        txHash: '',
+        // R5-12: a buy that was sent and is unresolved carries its signature, so the caller can recognise the position orphan recovery opens for it
+        txHash: execRes.txSignature || '',
         confluenceScore: confluenceEval.score,
+        execResult: execRes,
       };
     }
 
@@ -902,6 +936,7 @@ export class MemecoinAggregatorService extends EventEmitter {
       fillPriceSol: execRes.fillPriceSol,
       slippageBps,
       gates: execRes.gates,
+      execResult: execRes,
     };
   }
 
@@ -909,13 +944,12 @@ export class MemecoinAggregatorService extends EventEmitter {
   public async closePosition(
     positionId: string,
     sellPct: number = 100
-  ): Promise<{ success: boolean; realizedPnl: number; message: string }> {
+  ): Promise<{ success: boolean; realizedPnl: number; message: string; outcome?: CloseOutcome; status?: string; remainingTokensRaw?: string }> {
     const res = await executionCoordinator.closePosition(positionId, sellPct, 'Aggregator Close');
 
     const pnlUsd = res.pnlSol * this.solPriceUsd;
-    const message = res.success
-      ? `Closed ${sellPct}% of position ${positionId.slice(0, 8)}... Realized PnL: ${res.pnlSol >= 0 ? '+' : ''}${res.pnlSol.toFixed(5)} SOL ($${pnlUsd.toFixed(2)})`
-      : `Failed to close position: ${res.error}`;
+    // R6-9: an adopted earlier sell or an empty wallet (assumed loss) is not reported as "Closed 100%"
+    const message = closeOutcomeText(res, sellPct, `position ${positionId.slice(0, 8)}...`).text + (res.success ? ` ($${pnlUsd.toFixed(2)})` : '');
 
     this.emit('position_closed', { positionId, pnl: pnlUsd, message });
 
@@ -923,6 +957,10 @@ export class MemecoinAggregatorService extends EventEmitter {
       success: res.success,
       realizedPnl: pnlUsd,
       message,
+      // R6-9: what the close really did (an adopted earlier sell, an assumed loss), and what an adopted partial left open
+      outcome: res.outcome,
+      status: res.status,
+      ...(res.remainingTokensRaw !== undefined ? { remainingTokensRaw: res.remainingTokensRaw } : {}),
     };
   }
 

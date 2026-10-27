@@ -43,6 +43,7 @@ describe('N1-N3: exit-loop single flight, unconfirmed sends, uncertain sells', (
       costBasisLamports: 100_000_000, realizedPnLSol: 0, status: 'OPEN', venue: 'PUMP_BONDING_CURVE',
       executionMode: mode, entryTxSignature: `sig_${id}`, entryTimestamp: Date.now(), lastMarkTimestamp: Date.now(),
       recordUpdatedAt: Date.now(), updatedAt: Date.now(),
+      walletPubkey: mode === 'LIVE' ? localSigner.getPublicKey().toBase58() : undefined, // R4-2: bound to the test signer
     } as any);
     return id;
   };

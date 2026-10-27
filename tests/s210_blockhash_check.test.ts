@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { Connection, Keypair } from '@solana/web3.js';
-import { blockhashCheckEnabled, verifyBlockhashIndependently } from '../server/solana/clusterGuard';
+import { blockhashCheckEnabled, verifyBlockhashIndependently, SELL_BLOCKHASH_RECHECK_DELAYS_MS } from '../server/solana/clusterGuard';
 import { ExecutionCoordinator } from '../server/execution/coordinator';
 import { localSigner } from '../server/solana/signer';
 import { workstationDb } from '../server/db/database';
@@ -83,11 +83,11 @@ describe('S210: a LIVE sell with the check on', () => {
     vi.useFakeTimers({ toFake: ['setTimeout'] });
     try {
       const pending = c.closePosition(id, 100, 'STOP_LOSS');
-      await vi.advanceTimersByTimeAsync(600); // the one retry waits 500 ms
+      await vi.advanceTimersByTimeAsync(SELL_BLOCKHASH_RECHECK_DELAYS_MS.reduce((a, b) => a + b, 0) + 100); // R3-6: a SELL re-checks for 6.5 s
       const res = await pending;
       expect(res.success).toBe(false);
       expect(res.error).toMatch(/CLUSTER_GUARD/);
-      expect(ask).toHaveBeenCalledTimes(2);
+      expect(ask).toHaveBeenCalledTimes(SELL_BLOCKHASH_RECHECK_DELAYS_MS.length + 1);
       expect(sign).not.toHaveBeenCalled();
     } finally { vi.useRealTimers(); cleanup(c, mockRpc); }
   });

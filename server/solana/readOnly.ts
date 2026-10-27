@@ -1,7 +1,7 @@
 import fs from 'fs';
 
 /**
- * S185: read-only mode (APEX_READ_ONLY=true). The app watches a cluster and paper trades against what it sees; it cannot sign or send
+ * S185: read-only mode (APEX_READ_ONLY=true; R2-7: also 1 or yes, any case, see `parseReadOnlyFlag`). The app watches a cluster and paper trades against what it sees; it cannot sign or send
  * anything. It is strictly additive: with the flag off nothing here changes behaviour, and no existing cluster rule is relaxed.
  *
  * What it guarantees while on:
@@ -21,8 +21,22 @@ export class ReadOnlyError extends Error {
   }
 }
 
+/**
+ * R2-7: the accepted spellings of APEX_READ_ONLY, matched after trimming and ignoring case. On: true, 1, yes. Off: unset, empty, false,
+ * 0, no. Anything else (a typo such as `ture` or `on`) is `'invalid'`: the server refuses to start (`readOnlyStartupProblems`), and
+ * `isReadOnly` treats it as on, so nothing can sign or send on a value nobody can read.
+ */
+export const READ_ONLY_TRUE_VALUES: readonly string[] = ['true', '1', 'yes'];
+export const READ_ONLY_FALSE_VALUES: readonly string[] = ['', 'false', '0', 'no'];
+export function parseReadOnlyFlag(raw: string | undefined): boolean | 'invalid' {
+  const v = (raw ?? '').trim().toLowerCase();
+  if (READ_ONLY_TRUE_VALUES.includes(v)) return true;
+  if (READ_ONLY_FALSE_VALUES.includes(v)) return false;
+  return 'invalid';
+}
+
 export function isReadOnly(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.APEX_READ_ONLY === 'true';
+  return parseReadOnlyFlag(env.APEX_READ_ONLY) !== false; // R2-7: an unreadable value fails closed (on)
 }
 
 /** Throws ReadOnlyError while read-only mode is on. Called at every point that could sign or send. */
@@ -34,6 +48,9 @@ export function assertNotReadOnly(what: string, env: NodeJS.ProcessEnv = process
 export function readOnlyStartupProblems(env: NodeJS.ProcessEnv = process.env, cwd: string = process.cwd()): string[] {
   if (!isReadOnly(env)) return [];
   const problems: string[] = [];
+  if (parseReadOnlyFlag(env.APEX_READ_ONLY) === 'invalid') {
+    problems.push(`APEX_READ_ONLY=${JSON.stringify(String(env.APEX_READ_ONLY).slice(0, 40))} is not a value it accepts. Use true, 1 or yes for read-only, or false, 0, no or leave it empty for off (case does not matter).`);
+  }
   for (const name of ['OPERATOR_PRIVATE_KEY', 'SOLANA_PRIVATE_KEY', 'SIGNER_KEYPAIR_PATH'] as const) {
     if ((env[name] ?? '').trim() !== '') problems.push(`${name} is set. Remove it: a read-only server must not have a signing key anywhere it can read.`);
   }

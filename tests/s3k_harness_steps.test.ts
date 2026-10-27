@@ -3,6 +3,7 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import {
   hasBudget, sessionSpendMatchesWallet, killSurvivesRestart, startSendHoldingRelay, freshMintIfExited, mintNeedsReplacing, reentryBlockedAfterExit,
+  creatorClusterOnChain, releaseGatesOnChain,
   type HarnessSteps,
   type SessionSpendDeps, type KillRestartDeps, type ChildApp, type ChainKit,
 } from '../scripts/devnet_e2e_steps';
@@ -30,13 +31,13 @@ const line = (recs: Rec[], part: string) => recs.find((r) => r.step.includes(par
 
 const RENT = 2_039_280;
 const FEE = 5_000;
-function fakeSessionApp(o: { countRent?: boolean; refuseAt?: number; loseReadAt?: number; makeThrows?: boolean } = {}) {
+function fakeSessionApp(o: { countRent?: boolean; refuseAt?: number; loseReadAt?: number; makeThrows?: boolean; lossTriggersPending?: boolean; ackNotSaved?: boolean; recentKellyNegative?: boolean; lifetimeKellyNegative?: boolean } = {}) {
   let lamports = 1_000_000_000;
   let reads = 0;
   const state = {
     mode: 'OFF', gating: true, budgets: { maxBuys: 5, maxSpendSol: 0.02 }, order: 0.005,
     session: null as null | { buys: number; spentSol: number }, open: [] as Array<{ id: string; mint: string; status: string }>,
-    candidates: 0, cleaned: 0, closes: 0,
+    candidates: 0, cleaned: 0, closes: 0, acks: 0, ackedBeforeFirstBuy: false,
   };
   const watch = { getVerdict: (_m: string): any => null };
   const origVerdict = watch.getVerdict;
@@ -52,8 +53,21 @@ function fakeSessionApp(o: { countRent?: boolean; refuseAt?: number; loseReadAt?
       getStatus: () => ({ mode: state.mode, budgets: { ...state.budgets }, session: state.session ? { ...state.session } : null }),
       orderSol: () => state.order,
       setOrderSol: (sol) => { state.order = sol; return { ok: true }; },
+      resume: (r) => {
+        if (!r.ackLossTriggers) return { halted: false, mode: state.mode };
+        state.acks++;
+        if (state.candidates === 0) state.ackedBeforeFirstBuy = true;
+        return { halted: false, mode: state.mode, lossTriggersAcked: !o.ackNotSaved };
+      },
       submitCandidate: async (c) => {
         const i = state.candidates++;
+        // R8-8: the scratch DB's earlier harness trades trip the loss triggers until the operator acknowledges them
+        if (o.lossTriggersPending && !(state.acks > 0 && !o.ackNotSaved)) {
+          return { outcome: 'REJECTED', stage: 'execute', reason: 'REJECTED: LOSS_TRIGGERS: LOSS_STREAK (20 losses in a row (bug detector)), over the last LIVE trades (manual and auto). Check them, then acknowledge with POST /api/auto/resume {ackLossTriggers:true}' };
+        }
+        // the lifetime Kelly refusal as the run of 2026-10-27 saw it (executeSnipe's CapitalSizer check, 25+ closed LIVE trades in the scratch DB)
+        if (o.lifetimeKellyNegative) return { outcome: 'REJECTED', stage: 'size', reason: 'REJECTED: Capital sizing failed (NEGATIVE_OR_ZERO_EXPECTANCY)' };
+        if (o.recentKellyNegative) return { outcome: 'REJECTED', stage: 'execute', reason: 'REJECTED: Capital sizing failed (NEGATIVE_RECENT_EXPECTANCY: raw Kelly -4.0000 over the last 25 closed LIVE trades, win rate 0.0%, payoff 0.25)' };
         if (o.refuseAt === i) return { outcome: 'REJECTED', stage: 'eligibility', reason: 'ELIGIBILITY_CHECK_FAILED' };
         const v = watch.getVerdict(c.mint);
         if (v?.state !== 'HOT' || state.gating) return { outcome: 'DROPPED', stage: 'watch', reason: 'not wrapped' };
@@ -86,6 +100,42 @@ describe('3K (m): a 5-buy DEVNET_LIVE session, spentSol against the wallet (3B)'
     expect(line(r.recs, "spentSol equals the wallet's drop")?.ok).toBe(true);
     expect(f.watch.getVerdict).toBe(f.origVerdict);
     expect(f.state).toMatchObject({ gating: true, mode: 'OFF', budgets: { maxBuys: 5, maxSpendSol: 0.02 }, order: 0.005, cleaned: 1, closes: 5 });
+  });
+  it('earlier losing harness trades in the reused scratch DB (R8-8): the step acknowledges the loss triggers first, through the operator route, and every line passes', async () => {
+    const r = recorder();
+    const f = fakeSessionApp({ lossTriggersPending: true });
+    await sessionSpendMatchesWallet({ ...r, coordinator: f.coordinator }, f.deps);
+    expect(fails(r.recs), JSON.stringify(r.recs, null, 1)).toEqual([]);
+    expect(f.state.ackedBeforeFirstBuy).toBe(true);
+    expect(line(r.recs, 'loss triggers acknowledged')?.ok).toBe(true);
+    expect(r.recs.filter((x) => x.step.includes('BOUGHT'))).toHaveLength(5);
+  });
+  it('an acknowledgement that could not be saved: a FAIL line, nothing bought, everything put back', async () => {
+    const r = recorder();
+    const f = fakeSessionApp({ lossTriggersPending: true, ackNotSaved: true });
+    await sessionSpendMatchesWallet({ ...r, coordinator: f.coordinator }, f.deps);
+    expect(line(r.recs, 'loss triggers acknowledged')?.ok).toBe(false);
+    expect(f.state).toMatchObject({ candidates: 0, gating: true, mode: 'OFF', order: 0.005, cleaned: 1 });
+  });
+  it('the recent-window Kelly refusal (R8-8, no operator acknowledgement) on the first buy: a SKIP naming it, not a FAIL', async () => {
+    const r = recorder();
+    const f = fakeSessionApp({ recentKellyNegative: true });
+    await sessionSpendMatchesWallet({ ...r, coordinator: f.coordinator }, f.deps);
+    expect(fails(r.recs), JSON.stringify(r.recs, null, 1)).toEqual([]);
+    const sk = r.recs.find((x) => x.skip);
+    expect(sk?.detail).toMatch(/NEGATIVE_RECENT_EXPECTANCY/);
+    expect(sk?.detail).toMatch(/APEX_E2E_SCRATCH/);
+    expect(f.state).toMatchObject({ candidates: 1, gating: true, mode: 'OFF', cleaned: 1 });
+  });
+  it('the lifetime Kelly refusal (NEGATIVE_OR_ZERO_EXPECTANCY, no operator acknowledgement) on the first buy: a SKIP naming it, not a FAIL', async () => {
+    const r = recorder();
+    const f = fakeSessionApp({ lifetimeKellyNegative: true });
+    await sessionSpendMatchesWallet({ ...r, coordinator: f.coordinator }, f.deps);
+    expect(fails(r.recs), JSON.stringify(r.recs, null, 1)).toEqual([]);
+    const sk = r.recs.find((x) => x.skip);
+    expect(sk?.detail).toMatch(/Capital sizing failed \(NEGATIVE_OR_ZERO_EXPECTANCY\)/);
+    expect(sk?.detail).toMatch(/APEX_E2E_SCRATCH/);
+    expect(f.state).toMatchObject({ candidates: 1, gating: true, mode: 'OFF', cleaned: 1 });
   });
   it('an app whose spentSol leaves out the token account rent (3B missing): the spentSol line FAILs with the gap', async () => {
     const r = recorder();
@@ -130,7 +180,7 @@ describe('3K (m): a 5-buy DEVNET_LIVE session, spentSol against the wallet (3B)'
 
 /** A server whose saved state lives on a fake disk across boots. `persistBeforeAwait` is 3E's change. */
 function fakeServers(o: { persistBeforeAwait: boolean; neverSells?: boolean; cleanupThrows?: boolean }) {
-  const disk = { mode: 'OFF', killed: false, killReason: null as string | null, tripped: false, planted: [] as string[], positions: 0 };
+  const disk = { mode: 'OFF', killed: false, killReason: null as string | null, tripped: false, planted: [] as string[], positions: 0, threshold: 70 };
   const log: string[] = [];
   let onSend: (() => void) | null = null;
   let held = false;
@@ -154,6 +204,8 @@ function fakeServers(o: { persistBeforeAwait: boolean; neverSells?: boolean; cle
         if (!me.alive) throw new Error('server gone');
         if (route === '/api/execution/can-arm') return { status: 200, json: { allowed: !alert, reasons: alert ? ['The kill switch was on before the restart; clear KILL_SWITCH_WAS_ON with POST /api/auto/resume {clearHalt:true} before arming'] : [] } };
         if (route === '/api/execution/arm') return { status: 200, json: { success: !alert, message: 'armed' } };
+        if (route === '/api/auto/threshold') { disk.threshold = body.threshold; return { status: 200, json: { success: true, value: body.threshold } }; } // R5-40: (o) sets 0 before its hand buy
+        if (route === '/api/execution/trade' && disk.threshold > 0) return { status: 400, json: { success: false, error: `REJECTED: Confluence score 0/100 failed minimum threshold of ${disk.threshold}` } }; // a fresh coin scores 0
         if (route === '/api/execution/trade') { disk.positions++; return { status: 200, json: { success: true, lifecycleState: 'CONFIRMED', positionId: `pos${disk.positions}` } }; }
         if (route === '/api/auto/mode') { mode = body.mode; disk.mode = mode; return { status: 200, json: { success: true, mode } }; }
         if (route === '/api/auto/status') return { status: 200, json: { success: true, mode, killed, killReason } };
@@ -358,5 +410,113 @@ describe('3K (p): no re-entry after an exit (3F)', () => {
     await reentryBlockedAfterExit(f.steps, f.deps);
     expect(f.positions).toEqual([]);
     expect(f.r.recs).toEqual([]);
+  });
+});
+
+// ---- run 27: (i) sends a 429'd buyer buy again; (k) makes a pair again after a feed gap ---------------------------------------------------
+
+/** (i) against a feed that judges everything as expected; buyer `slow`'s first buy of coin B is refused with the RPC's 429. */
+function clusterKit(o: { heldAfter429: bigint }) {
+  const buys: string[] = [];
+  let n = 0;
+  const kit = {
+    newWallet: () => { const id = ++n; return { publicKey: { toBase58: () => `w${id}` }, id }; },
+    transfer: async () => 'sig',
+    create: async (_c: any, symbol: string) => ({ mint: symbol === 'P41A' ? 'A' : 'B', curve: 'c' }),
+    buy: async (w: any, mint: string) => {
+      buys.push(`${w.id}:${mint}`);
+      if (mint === 'B' && w.id === 5 && buys.filter((b) => b === '5:B').length === 1) throw new Error('429 Too Many Requests: {"error":{"code":-32429}}');
+      return 'sig';
+    },
+    sellAll: async () => null,
+    tokenBalance: async () => o.heldAfter429,
+    refund: async () => undefined,
+  } as unknown as ChainKit;
+  const feed = {
+    snapshot: () => ({
+      watching: [{ metrics: { mint: 'B', tradeCount: 5, rawUniqueBuyers: 5, funderCoverage: 1, uniqueBuyers: 1 } }],
+      released: [{ state: 'DEAD', reason: 'CREATOR_SOLD: a wallet the creator funded sold', metrics: { mint: 'A', tradeCount: 1 } }],
+      capacity: { active: 1, max: 60 },
+    }),
+  };
+  return { kit, feed, buys };
+}
+
+describe('run 27: (i) sends a buyer buy that got a 429 again, only when the wallet holds none of the coin', () => {
+  it('the buyer holds nothing after the 429: the buy is sent again and 5/5 land', async () => {
+    const r = recorder();
+    const { kit, feed, buys } = clusterKit({ heldAfter429: 0n });
+    await creatorClusterOnChain({ ...r, link: (x: string) => x } as unknown as HarnessSteps, kit, feed as any, { publicKey: { toBase58: () => 'payer' } }, { sellAfterMs: 0, waitMs: 1_000 });
+    expect(line(r.recs, '5 wallets from one funder bought together')).toMatchObject({ ok: true, detail: '5/5 buys confirmed' });
+    expect(buys.filter((b) => b === '5:B')).toHaveLength(2);
+    expect(fails(r.recs)).toEqual([]);
+  });
+
+  it('the buyer already holds the coin (the buy landed under the 429): not sent again, counted as landed', async () => {
+    const r = recorder();
+    const { kit, feed, buys } = clusterKit({ heldAfter429: 1_000n });
+    await creatorClusterOnChain({ ...r, link: (x: string) => x } as unknown as HarnessSteps, kit, feed as any, { publicKey: { toBase58: () => 'payer' } }, { sellAfterMs: 0, waitMs: 1_000 });
+    expect(line(r.recs, '5 wallets from one funder bought together')?.ok).toBe(true);
+    expect(buys.filter((b) => b === '5:B')).toHaveLength(1);
+  });
+});
+
+/** (k) with launches that a feed gap releases DEAD `gaps` times before they are released READY. */
+function gatesHarness(gaps: number) {
+  const r = recorder();
+  let made = 0;
+  let gapLeft = gaps;
+  const verdict = new Map<string, { state: string; reason: string }>();
+  const kit = {
+    newWallet: () => ({ publicKey: { toBase58: () => 'w' } }),
+    transfer: async () => 'sig',
+    create: async () => {
+      const mint = `M${++made}`;
+      // a pair is two creates; a gap releases both of the pair
+      const gapped = gapLeft > 0;
+      verdict.set(mint, gapped ? { state: 'DEAD', reason: 'FEED_GAP: the log stream had a gap (SLOT_SILENCE); trades in it may be missing' } : { state: 'READY', reason: 'READY: 4 signals' });
+      if (gapped && made % 2 === 0) gapLeft--;
+      return { mint, curve: 'c' };
+    },
+    buy: async () => 'sig',
+    sellAll: async () => null,
+    refund: async () => undefined,
+  } as unknown as ChainKit;
+  const feed = { snapshot: () => ({ watching: [], released: [...verdict].map(([mint, v]) => ({ ...v, metrics: { mint } })), capacity: { active: 0, max: 60 } }) };
+  const rows = (m: string) => verdict.get(m)?.state === 'READY' ? [{ autoMode: 'X', stage: 'execute', outcome: 'WOULD_BUY', reason: 'ok', inputs: { passingSignals: 4 } }] : [{ autoMode: 'X', stage: 'watch', outcome: 'DROPPED', reason: 'WATCH_DEAD: FEED_GAP', inputs: { passingSignals: 0 } }];
+  const s = {
+    ...r, link: (x: string) => x,
+    stop: { arm: () => ({ success: true, message: '' }), auto: { setMode: async (mode: string) => ({ ok: true, mode }), getStatus: () => ({ mode: 'OFF' }) } },
+  } as unknown as HarnessSteps;
+  const deps = { decisions: rows, curveState: async () => null, progressPct: () => null, capPct: 60, buildBuyRequestFor: async () => ({}) as any, balanceSol: async () => 10, isLiveArmed: () => false };
+  return { r, s, kit, feed, deps, made: () => made };
+}
+
+describe('run 27: (k) makes a pair again when a feed gap released it, and SKIPs after a second gap', () => {
+  it('one gap in SHADOW: the pair is made again, then SHADOW and PAPER are judged and match', async () => {
+    const h = gatesHarness(1);
+    await releaseGatesOnChain(h.s, h.kit, h.feed as any, {}, h.deps as any, { buyers: 2, waitMs: 1_000 });
+    expect(h.made()).toBe(6); // SHADOW twice, PAPER once
+    expect(line(h.r.recs, 'SHADOW and PAPER decision rows match')?.ok).toBe(true);
+    expect(fails(h.r.recs)).toEqual([]);
+  });
+
+  it('a gap twice in SHADOW: a SKIP, not a FAIL, and PAPER is not run', async () => {
+    const h = gatesHarness(2);
+    await releaseGatesOnChain(h.s, h.kit, h.feed as any, {}, h.deps as any, { buyers: 2, waitMs: 1_000 });
+    expect(h.made()).toBe(4);
+    expect(h.r.recs.find((x) => x.skip)?.detail).toMatch(/a feed gap again: .*FEED_GAP/);
+    expect(fails(h.r.recs)).toEqual([]);
+  });
+});
+
+describe('(k) a buy from a temp wallet that fails says why', () => {
+  it('9/10 confirmed names the first failure, so a devnet run tells a rate limit or a refused read from a lost confirm', async () => {
+    const h = gatesHarness(0);
+    let n = 0;
+    (h.kit as any).buy = async () => { if (n++ === 1) throw new Error('no curve state for M1'); return 'sig'; };
+    await releaseGatesOnChain(h.s, h.kit, h.feed as any, {}, h.deps as any, { buyers: 2, waitMs: 1_000 });
+    const l = h.r.recs.find((x) => /equal buys/.test(x.step) && !x.ok);
+    expect(l?.detail).toMatch(/^1\/2 confirmed; first failure: no curve state for M1/);
   });
 });

@@ -13,6 +13,12 @@ import type { PumpTradeEvent } from '../solana/pumpFeedListener';
  *
  * The creator cluster (the creator, the create signer, and every wallet the creator funded) is not demand: its trades are left out of
  * velocity, flow and net inflow (P4.1, R1-55), and a sell by any wallet in it is CREATOR_SOLD. It still counts in concentration.
+ * R2-1: "funded" is any SOL source the funder lookup found in the wallet's history (FunderLookup reads a short history in full), not only the first.
+ *
+ * R8-2: every buyer count is a count of clusters: wallets joined through any shared SOL source (a union over wallet -> source links,
+ * allowlisted public funders left out). A wallet whose history was not read in full (`verified: false`, or no funder found at all) is not an
+ * independent buyer: all such wallets together count as one in uniqueBuyers. Velocity counts each cluster's net inflow up to
+ * VELOCITY_MAX_SOL_PER_WALLET_30S and needs VELOCITY_MIN_DISTINCT_WALLETS clusters buying; flow compares buying and selling clusters, not trades.
  *
  * Release states:
  *   DEAD   cumulative organic net inflow negative once the minimum hold has passed, or ANY creator-cluster sell (instant; also when the
@@ -39,6 +45,12 @@ export const WATCH_BUCKET_MS = 10_000;
 export const HOT_MIN_VELOCITY_SOL_PER_MIN = 1.5;
 export const HOT_MIN_UNIQUE_BUYERS = 25;
 export const HOT_MAX_LARGEST_BUYER_SHARE = 0.15;
+/** R8-2: velocity passes only when at least this many distinct clusters had a positive net inflow in the last 30 s. */
+export const VELOCITY_MIN_DISTINCT_WALLETS = 5;
+/** R8-2: one cluster's net inflow counts toward velocity up to this much SOL per 30 s window (a third of the 0.75 SOL a pass needs). */
+export const VELOCITY_MAX_SOL_PER_WALLET_30S = 0.25;
+/** R8-2: flow passes only with at least this many distinct buying clusters, and more of them than selling clusters. */
+export const FLOW_MIN_DISTINCT_BUYERS = 5;
 /**
  * P4.1 (R1-60): funder coverage is measured over the largest this-many buyers by buy volume, not over every raw buyer. A launch with more
  * buyers than the lookup will serve per mint (FUNDER_LOOKUP_MAX_PER_MINT, 150) could never reach coverage 1 before. The first this-many
@@ -65,14 +77,15 @@ const MAX_FUNDERS_KEPT = 20_000;
 export type WatchState = 'WATCHING' | 'HOT' | 'READY' | 'DEAD';
 
 export interface WatchSignals {
-  /** Organic net inflow (creator cluster left out) over the last 30s, scaled to SOL/min, and whether it beats the 30s before it. null before 20s of data. */
-  velocity: { solPerMin: number; rising: boolean; pass: boolean } | null;
+  /** Organic net inflow (creator cluster left out) over the last 30s, scaled to SOL/min, and whether it beats the 30s before it. null before 20s of data.
+   *  R8-2: `solPerMin` counts each cluster up to VELOCITY_MAX_SOL_PER_WALLET_30S (`rawSolPerMin` does not); `distinctWallets` is the clusters buying in the window. */
+  velocity: { solPerMin: number; rawSolPerMin: number; distinctWallets: number; rising: boolean; pass: boolean } | null;
   /** De-clustered unique buyers; only passes when the funder of every buyer in the sample (the largest WATCH_FUNDER_SAMPLE_BUYERS by volume) is known. */
   buyers: { count: number; funderCoverage: number; pass: boolean } | null;
   /** Largest cluster's share of buy volume. */
   concentration: { share: number; pass: boolean } | null;
-  /** Organic buys (creator cluster left out) outnumber organic sells. */
-  flow: { buyCount: number; sellCount: number; pass: boolean } | null;
+  /** Organic buys (creator cluster left out) outnumber organic sells. R8-2: counted in clusters (`buyWallets`, `sellWallets`), trades reported apart. */
+  flow: { buyCount: number; sellCount: number; buyWallets: number; sellWallets: number; pass: boolean } | null;
 }
 
 export interface WatchMetrics {
@@ -184,6 +197,10 @@ export class WatchWindow extends EventEmitter {
   private released = new Map<string, WatchResult>();
   private opts: Required<Pick<WatchWindowOptions, 'maxCandidates' | 'minMs' | 'maxMs'>> & Pick<WatchWindowOptions, 'funderOf' | 'scoreOf' | 'minScore' | 'progressOf'>;
   private funders = new Map<string, string>();
+  /** R2-1: the other SOL sources the lookup found for a wallet (besides `funders`). */
+  private alsoFundedBy = new Map<string, string[]>();
+  /** R2-1: wallets whose history was not read in full: their funder is known but they are not independent buyers. */
+  private unverified = new Set<string>();
   private publicFunders: Set<string>;
   /** Wallets whose funder was looked up and does not exist / is out of reach: they count as known, in a cluster of their own. */
   private noFunder = new Set<string>();
@@ -212,15 +229,34 @@ export class WatchWindow extends EventEmitter {
   /**
    * Record a wallet's funder (the sender of its earliest incoming transfer). P4.1: when that puts a wallet that already sold a watched
    * mint into the mint's creator cluster, the mint is released DEAD CREATOR_SOLD now (the sell came before its funder was known).
+   * R2-1: `alsoFundedBy` are the other SOL sources found in its history (any of them can put it in the creator cluster); `verified` false
+   * (its history was longer than the lookup reads in full) keeps it out of the independent buyers. Default: verified, no other source.
    */
-  public setFunder(wallet: string, funder: string, at = Date.now()): void {
-    this.emit('funder', { wallet, funder });
+  public setFunder(wallet: string, funder: string, at = Date.now(), opts: { alsoFundedBy?: string[]; verified?: boolean } = {}): void {
+    const also = (opts.alsoFundedBy ?? []).filter((x) => x && x !== funder && x !== wallet);
+    const verified = opts.verified !== false;
+    this.emit('funder', { wallet, funder, alsoFundedBy: also, verified });
     this.funders.set(wallet, funder);
     if (this.funders.size > MAX_FUNDERS_KEPT) this.funders.delete(this.funders.keys().next().value as string);
+    if (also.length) this.alsoFundedBy.set(wallet, also); else this.alsoFundedBy.delete(wallet);
+    if (this.alsoFundedBy.size > MAX_FUNDERS_KEPT) this.alsoFundedBy.delete(this.alsoFundedBy.keys().next().value as string);
+    if (verified) this.unverified.delete(wallet); else this.unverified.add(wallet);
+    if (this.unverified.size > MAX_FUNDERS_KEPT) this.unverified.delete(this.unverified.values().next().value as string);
     this.sellerAnswered(wallet);
     for (const c of [...this.active.values()]) {
-      if (!c.creatorSold && c.sellers.has(wallet) && this.clusterOf(c, wallet) === CREATOR_CLUSTER) this.releaseCreatorSold(c, wallet, at);
+      if (!c.creatorSold && c.sellers.has(wallet) && this.inCreatorCluster(c, wallet)) this.releaseCreatorSold(c, wallet, at);
     }
+  }
+
+  /**
+   * R2-3: what the window knows of a wallet's funding, for the holder gate (server/signals/holderCluster.ts). null: never looked up.
+   * `verified` is true only when its whole short history was read and a source was found.
+   */
+  public funderFacts(wallet: string): { sources: string[]; verified: boolean } | null {
+    const sources = this.sourcesOf(wallet);
+    if (sources.length > 0) return { sources, verified: !this.unverified.has(wallet) };
+    if (this.noFunder.has(wallet)) return { sources: [], verified: false };
+    return null;
   }
 
   private releaseCreatorSold(c: Candidate, wallet: string, at: number): void {
@@ -229,7 +265,7 @@ export class WatchWindow extends EventEmitter {
     this.release(c, 'DEAD', `CREATOR_SOLD: ${who}, instant reject`, at);
   }
 
-  /** Q6b: record that a wallet's funder was looked up and there is none to cluster it with. */
+  /** Q6b: record that a wallet's funder was looked up and there is none to cluster it with. R2-1: it counts as known, but not as an independent buyer. */
   public setNoFunder(wallet: string): void {
     this.emit('funder', { wallet, funder: null });
     this.noFunder.add(wallet);
@@ -276,6 +312,26 @@ export class WatchWindow extends EventEmitter {
 
   private funderFor(wallet: string): string | null {
     return this.funders.get(wallet) ?? this.opts.funderOf?.(wallet) ?? null;
+  }
+
+  /** R2-1: every SOL source known for a wallet: its first funder, then the others the lookup found. */
+  private sourcesOf(wallet: string): string[] {
+    const f = this.funderFor(wallet);
+    if (!f) return [];
+    const also = this.alsoFundedBy.get(wallet);
+    return also ? [f, ...also] : [f];
+  }
+
+  /** R2-1: an insider, or a wallet any of whose known SOL sources is an insider. */
+  private inCreatorCluster(c: Candidate, wallet: string): boolean {
+    if (c.insiders.has(wallet)) return true;
+    for (const s of this.sourcesOf(wallet)) if (c.insiders.has(s)) return true;
+    return false;
+  }
+
+  /** R2-1 / R8-2: an independent buyer: a funder found and its whole short history read (not `unverified`, not a no-funder wallet). */
+  private isVerified(wallet: string): boolean {
+    return !!this.funderFor(wallet) && !this.unverified.has(wallet);
   }
 
   /** Start watching a mint. False when the window is full or the mint is already watched/released. */
@@ -350,7 +406,7 @@ export class WatchWindow extends EventEmitter {
       c.sellVolumeSol += sol;
       c.sellers.add(trade.user);
       // P4.1 (R1-55): any creator-cluster wallet, not only the literal creator and create signer
-      if (!c.creatorSold && this.clusterOf(c, trade.user) === CREATOR_CLUSTER) this.releaseCreatorSold(c, trade.user, at);
+      if (!c.creatorSold && this.inCreatorCluster(c, trade.user)) this.releaseCreatorSold(c, trade.user, at);
       else if (!this.funderKnown(c, trade.user)) this.askSellerFunder(c, trade.user);
     }
   }
@@ -362,45 +418,63 @@ export class WatchWindow extends EventEmitter {
     return all.sort((a, b) => b[1] - a[1]).slice(0, WATCH_FUNDER_SAMPLE_BUYERS).map(([w]) => w);
   }
 
-  private clusterOf(c: Candidate, wallet: string): string {
-    if (c.insiders.has(wallet)) return CREATOR_CLUSTER;
-    const f = this.funderFor(wallet);
-    if (!f) return `wallet:${wallet}`;
-    if (f && c.insiders.has(f)) return CREATOR_CLUSTER;
-    // S4d: an allowlisted public funder does not tie its wallets together. The creator check above still wins.
-    if (this.publicFunders.has(f)) return `wallet:${wallet}`;
-    return `funder:${f}`;
+  /**
+   * R8-2: the cluster key of every wallet that traded this mint: CREATOR_CLUSTER for the creator cluster, else the root of a union over
+   * wallet -> SOL source links (any shared source joins two wallets, and a funder that buys joins the wallets it funded). S4d: an allowlisted
+   * public funder ties nothing together. A wallet with no known source is a cluster of its own.
+   */
+  private clusterKeys(c: Candidate): (wallet: string) => string {
+    const parent = new Map<string, string>();
+    const find = (x: string): string => {
+      let r = x;
+      while (parent.has(r) && parent.get(r) !== r) r = parent.get(r)!;
+      let y = x; // path compression
+      while (y !== r) { const n = parent.get(y)!; parent.set(y, r); y = n; }
+      return r;
+    };
+    const union = (a: string, b: string): void => {
+      const ra = find(a), rb = find(b);
+      if (ra !== rb) parent.set(rb < ra ? ra : rb, rb < ra ? rb : ra); // the smaller key is the root: the result does not depend on order
+    };
+    const creator = new Map<string, boolean>();
+    const isCreator = (w: string): boolean => {
+      let v = creator.get(w);
+      if (v === undefined) creator.set(w, (v = this.inCreatorCluster(c, w)));
+      return v;
+    };
+    const wallets = new Set<string>([...c.buyVolumeByWallet.keys(), ...c.flow.map((f) => f.wallet)]);
+    for (const w of wallets) {
+      if (isCreator(w)) continue;
+      for (const src of this.sourcesOf(w)) if (!this.publicFunders.has(src)) union(w, src);
+    }
+    return (w: string) => (isCreator(w) ? CREATOR_CLUSTER : `cluster:${find(w)}`);
   }
 
   public computeMetrics(c: Candidate, now: number): WatchMetrics {
     const first = c.firstTradeAt;
     const elapsedMs = first === null ? 0 : Math.max(0, now - first);
     const buyVolume = [...c.buyVolumeByWallet.values()].reduce((a, b) => a + b, 0);
-    const clusterCache = new Map<string, string>();
-    const clusterOf = (wallet: string): string => {
-      let k = clusterCache.get(wallet);
-      if (k === undefined) clusterCache.set(wallet, (k = this.clusterOf(c, wallet)));
-      return k;
-    };
+    const clusterOf = this.clusterKeys(c);
 
     // P4.1 (R1-55): the creator cluster's trades are not demand. Flow, velocity and net inflow count the organic trades only.
     const buckets: number[] = [];
-    const organic: Array<{ at: number; sol: number }> = [];
+    const organic: Array<{ at: number; sol: number; key: string }> = [];
     let buyCount = 0, sellCount = 0, creatorClusterBuySol = 0, creatorClusterSellSol = 0;
+    const buyClusters = new Set<string>(), sellClusters = new Set<string>();
     for (const f of c.flow) {
-      if (clusterOf(f.wallet) === CREATOR_CLUSTER) {
+      const key = clusterOf(f.wallet);
+      if (key === CREATOR_CLUSTER) {
         if (f.buy) creatorClusterBuySol += f.sol; else creatorClusterSellSol -= f.sol;
         continue;
       }
-      organic.push(f);
-      if (f.buy) buyCount++; else sellCount++;
+      organic.push({ at: f.at, sol: f.sol, key });
+      if (f.buy) { buyCount++; buyClusters.add(key); } else { sellCount++; sellClusters.add(key); }
       const idx = Math.max(0, Math.floor((f.at - (first ?? f.at)) / WATCH_BUCKET_MS));
       while (buckets.length <= idx) buckets.push(0);
       buckets[idx] += f.sol;
     }
     const cumulative = buckets.reduce((a, b) => a + b, 0);
 
-    // A funder that is itself a buyer shares its cluster with the wallets it funded.
     const clusters = new Map<string, number>();
     for (const [wallet, vol] of c.buyVolumeByWallet) {
       const k = clusterOf(wallet);
@@ -409,15 +483,6 @@ export class WatchWindow extends EventEmitter {
     // P4.1 (R1-60): coverage over the largest buyers by volume, so a launch with hundreds of small buyers can still be measured
     const sample = this.fundersSample(c);
     const known = sample.filter((w) => this.funderKnown(c, w)).length;
-    // Merge a buyer's own cluster into the cluster of wallets it funded
-    for (const wallet of c.buyVolumeByWallet.keys()) {
-      const own = `wallet:${wallet}`;
-      const funded = `funder:${wallet}`;
-      if (clusters.has(own) && clusters.has(funded)) {
-        clusters.set(funded, clusters.get(funded)! + clusters.get(own)!);
-        clusters.delete(own);
-      }
-    }
     const rawUnique = c.buyVolumeByWallet.size;
     // B3: a seller whose funder lookup is outstanding or failed, and who is not in the sample, counts as one more unknown funder
     const inSample = new Set(sample);
@@ -427,30 +492,50 @@ export class WatchWindow extends EventEmitter {
 
     let velocity: WatchSignals['velocity'] = null;
     if (first !== null && elapsedMs >= this.opts.minMs) {
-      const now30 = organic.filter((f) => f.at > now - 30_000 && f.at <= now).reduce((a, f) => a + f.sol, 0);
-      const prev30 = organic.filter((f) => f.at > now - 60_000 && f.at <= now - 30_000).reduce((a, f) => a + f.sol, 0);
-      const solPerMin = now30 * 2;
-      const rising = now30 > prev30;
-      velocity = { solPerMin, rising, pass: solPerMin >= HOT_MIN_VELOCITY_SOL_PER_MIN && rising };
+      // R8-2: each cluster's net inflow in a window counts up to the per-cluster cap; the clusters with a positive net are its distinct buyers
+      const windowed = (from: number, to: number) => {
+        const net = new Map<string, number>();
+        let raw = 0;
+        for (const f of organic) {
+          if (f.at > from && f.at <= to) { net.set(f.key, (net.get(f.key) ?? 0) + f.sol); raw += f.sol; }
+        }
+        let capped = 0, distinct = 0;
+        for (const v of net.values()) { capped += Math.min(v, VELOCITY_MAX_SOL_PER_WALLET_30S); if (v > 0) distinct++; }
+        return { raw, capped, distinct };
+      };
+      const now30 = windowed(now - 30_000, now);
+      const prev30 = windowed(now - 60_000, now - 30_000);
+      const solPerMin = now30.capped * 2;
+      const rising = now30.capped > prev30.capped;
+      velocity = {
+        solPerMin, rawSolPerMin: now30.raw * 2, distinctWallets: now30.distinct, rising,
+        pass: solPerMin >= HOT_MIN_VELOCITY_SOL_PER_MIN && rising && now30.distinct >= VELOCITY_MIN_DISTINCT_WALLETS,
+      };
     }
     // S264 (review 2026-10-24, finding 3): buyers outside the funder sample whose funder was never looked up used to count as one cluster
     // each, so on a launch with more than WATCH_FUNDER_SAMPLE_BUYERS buyers a swarm of small wallets from one funder could pass the
     // unique-buyer gate while coverage (measured over the sample) read 1. They now count as one cluster together; concentration still sees
     // each of them on its own, so a busy launch is not rejected for a cluster it cannot measure.
+    // R2-1 / R8-2: likewise every cluster made only of wallets that are not independent (no funder found, or a history not read in full)
+    // counts as one together: a set of self-funded or long-history sybils is one buyer, not many.
     const sampled = new Set(sample);
     let unknownOutside = false;
-    const countedClusters = new Set<string>();
+    const counted = new Set<string>(), unverifiedOnly = new Set<string>();
     for (const wallet of c.buyVolumeByWallet.keys()) {
       if (!sampled.has(wallet) && !this.funderKnown(c, wallet)) { unknownOutside = true; continue; }
       const k = clusterOf(wallet);
-      countedClusters.add(clusters.has(k) ? k : `funder:${wallet}`); // a buyer merged into the cluster of the wallets it funded
+      if (k === CREATOR_CLUSTER || !this.funderKnown(c, wallet) || this.isVerified(wallet)) counted.add(k); else unverifiedOnly.add(k);
     }
-    const uniqueBuyers = countedClusters.size + (unknownOutside ? 1 : 0);
+    const lumped = [...unverifiedOnly].some((k) => !counted.has(k));
+    const uniqueBuyers = counted.size + (unknownOutside ? 1 : 0) + (lumped ? 1 : 0);
     const signals: WatchSignals = {
       velocity,
       buyers: rawUnique === 0 ? null : { count: uniqueBuyers, funderCoverage, pass: uniqueBuyers >= HOT_MIN_UNIQUE_BUYERS && funderCoverage === 1 },
       concentration: largestShare === null ? null : { share: largestShare, pass: largestShare < HOT_MAX_LARGEST_BUYER_SHARE },
-      flow: c.tradeCount === 0 ? null : { buyCount, sellCount, pass: buyCount > sellCount },
+      flow: c.tradeCount === 0 ? null : {
+        buyCount, sellCount, buyWallets: buyClusters.size, sellWallets: sellClusters.size,
+        pass: buyClusters.size > sellClusters.size && buyClusters.size >= FLOW_MIN_DISTINCT_BUYERS,
+      },
     };
     const passingSignals = Object.values(signals).filter((s) => s && s.pass).length;
 

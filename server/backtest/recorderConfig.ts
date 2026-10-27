@@ -18,7 +18,15 @@ export interface RecorderConfig {
   maxTradesPerMint: number;
   retentionDays: number;
   maxRows: number;
+  /** R4-5: below this much free space on the database's filesystem the recorder stops writing (unset: RECORD_DEFAULT_MIN_FREE_MB). */
+  minFreeBytes?: number;
 }
+
+/**
+ * R4-5: the recorder writes into the trading database, so it stops below its own free-space floor, well above the 32 MiB below which
+ * buys are refused (WorkstationDatabase.MIN_FREE_BYTES) and the 128 MiB low-disk warning: the last space is kept for sells and exit state.
+ */
+export const RECORD_DEFAULT_MIN_FREE_MB = 256;
 
 export const RECORD_DEFAULT_MINT_MINUTES = 35;
 export const RECORD_READ_ONLY_MINT_MINUTES = 180;
@@ -43,6 +51,7 @@ export function recorderConfig(env: NodeJS.ProcessEnv = process.env): RecorderCo
     maxTradesPerMint: intIn(env.APEX_RECORD_MAX_TRADES_PER_MINT, 100, 1_000_000) ?? Math.max(RECORD_TRADES_PER_30_MIN, Math.ceil(minutes / 30) * RECORD_TRADES_PER_30_MIN),
     retentionDays: intIn(env.APEX_RECORD_RETENTION_DAYS, 1, 365) ?? RECORD_DEFAULT_RETENTION_DAYS,
     maxRows: intIn(env.APEX_RECORD_MAX_ROWS, 10_000, 200_000_000) ?? (ro ? RECORD_READ_ONLY_MAX_ROWS : RECORD_DEFAULT_MAX_ROWS),
+    minFreeBytes: (intIn(env.APEX_RECORD_MIN_FREE_MB, 64, 1_048_576) ?? RECORD_DEFAULT_MIN_FREE_MB) * 1024 * 1024,
   };
 }
 
@@ -57,6 +66,7 @@ export function recorderConfigProblems(env: NodeJS.ProcessEnv = process.env): st
   check('APEX_RECORD_MAX_TRADES_PER_MINT', 100, 1_000_000);
   check('APEX_RECORD_RETENTION_DAYS', 1, 365);
   check('APEX_RECORD_MAX_ROWS', 10_000, 200_000_000);
+  check('APEX_RECORD_MIN_FREE_MB', 64, 1_048_576);
   return out;
 }
 
@@ -68,6 +78,9 @@ export interface RecorderRuntime {
   firstPruneAt: number | null;
   lastPruneAt: number | null;
   lastPruneRows: number;
+  /** R4-5: recording is stopped because free space fell below the floor (since this time), and how many writes it skipped meanwhile. */
+  pausedForSpaceSince?: number | null;
+  skippedForSpace?: number;
 }
 let runtime: RecorderRuntime | null = null;
 export function setRecorderRuntime(r: RecorderRuntime | null): void { runtime = r; }

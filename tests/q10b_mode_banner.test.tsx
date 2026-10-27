@@ -61,7 +61,9 @@ describe('Q10b: mode, cluster and confirmation', () => {
   it('the screens no longer claim PAPER (SAFE) by default or describe live snipes as a simulation', () => {
     const pnp = fs.readFileSync('src/components/PlugAndPlayTradingModal.tsx', 'utf8');
     expect(pnp).not.toContain('PAPER TRADING (SAFE)');
-    expect(pnp).toContain("'MODE UNKNOWN'");
+    // Round 1 #11: the Plug & Play label comes from the shared poller's plugAndPlayModeView, which says MODE UNKNOWN
+    expect(pnp).toContain('plugAndPlayModeView(tradingMode)');
+    expect(fs.readFileSync('src/utils/tradingMode.ts', 'utf8')).toContain("badge: 'MODE UNKNOWN'");
     const callouts = fs.readFileSync('src/components/PumpFunHotCalloutsView.tsx', 'utf8');
     expect(callouts).not.toContain('use paper trading simulation');
   });

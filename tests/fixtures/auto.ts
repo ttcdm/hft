@@ -1,5 +1,6 @@
 import { vi } from 'vitest';
 import { autoSnipeController, AutoMode } from '../../server/auto/controller';
+import { workstationDb } from '../../server/db/database';
 
 /** Put the real auto-snipe controller into a mode for a test (the env flag is a controller input). */
 export async function setAutoMode(mode: AutoMode): Promise<void> {
@@ -10,6 +11,8 @@ export async function setAutoMode(mode: AutoMode): Promise<void> {
 
 export async function resetAuto(): Promise<void> {
   await autoSnipeController.setMode('OFF');
+  // A31/A71: a DEVNET_LIVE session's spend is saved and carries over to the next setMode for 4 h; each test starts its own session.
+  workstationDb.setSetting('auto.liveSession', null);
 }
 
 import { Keypair } from '@solana/web3.js';

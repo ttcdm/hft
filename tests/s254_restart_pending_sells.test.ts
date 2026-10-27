@@ -32,7 +32,7 @@ describe('S254: restart safety for sells sent before the restart', () => {
   };
   const cleanup = () => {
     for (const p of workstationDb.loadPositions()) if (p.mint === mint || p.mint === otherMint) workstationDb.savePosition({ ...p, status: 'CLOSED', tokenQuantityRaw: '0', costBasisLamports: 0 } as any);
-    for (const t of workstationDb.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED'])) if (t.mint === mint || t.mint === otherMint) workstationDb.saveTransaction({ ...t, reconciliationState: 'REVERTED' });
+    for (const t of workstationDb.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED'])!) if (t.mint === mint || t.mint === otherMint) workstationDb.saveTransaction({ ...t, reconciliationState: 'REVERTED' });
   };
 
   beforeEach(() => {

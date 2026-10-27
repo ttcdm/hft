@@ -3,6 +3,8 @@
  * tests/k2_release_hygiene.test.ts against the real secret file names (env.txt, .apex_trading_keypair.json, *.db, ...).
  * The previous zip globs missed env.txt and .apex_trading_keypair.json.
  */
+import path from 'node:path';
+
 export const DENY_DIRS = ['.git', '.agents', '.antigravity', '.overnight', 'node_modules', 'dist', 'coverage', 'target', 'build'];
 
 /** Basename globs (`*` only). A leading `!` re-allows a name that an earlier glob denied. */
@@ -16,7 +18,8 @@ export const DENY_FILE_GLOBS = [
 ];
 export const ALLOW_FILE_GLOBS = ['.env.example'];
 
-const toRegex = (glob: string) => new RegExp('^' + glob.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$');
+// R8-4: matched ignoring case. On macOS and Windows `/.ENV` or `/Trader-KEYPAIR.json` opens the same file as the lower-case name.
+const toRegex = (glob: string) => new RegExp('^' + glob.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*') + '$', 'i');
 const denyRes = DENY_FILE_GLOBS.map(toRegex);
 const allowRes = ALLOW_FILE_GLOBS.map(toRegex);
 
@@ -33,7 +36,7 @@ function allowedPath(relPath: string, denyDirs: string[]): boolean {
   // the directory rules apply only to the part of the path before it; the file-name rules still apply to everything.
   const nm = denyDirs.includes('node_modules') ? -1 : parts.indexOf('node_modules');
   const dirParts = nm >= 0 ? parts.slice(0, nm) : parts.slice(0, -1);
-  if (dirParts.some((d) => denyDirs.includes(d))) return false;
+  if (dirParts.some((d) => denyDirs.includes(d.toLowerCase()))) return false; // R8-4: `.GIT`, `.Overnight` too
   const base = parts[parts.length - 1];
   if (allowRes.some((r) => r.test(base))) return true;
   return !denyRes.some((r) => r.test(base));
@@ -47,6 +50,30 @@ export function isShippable(relPath: string): boolean {
 /** true when the dev server may serve `relPath`: same secret-file rules, but node_modules is allowed (F2). */
 export function isServableInDev(relPath: string): boolean {
   return allowedPath(relPath, DEV_DENY_DIRS);
+}
+
+/**
+ * R2-8: the secret files this server is configured with, as absolute paths: the signing key (SIGNER_KEYPAIR_PATH), the database
+ * (APEX_DB_PATH, which also covers its -wal, -shm and .lock files) and the env file (APEX_ENV_FILE, else `.env`). Their names need not
+ * match any glob (`SIGNER_KEYPAIR_PATH=./trader.json`), so the dev server denies them by path.
+ */
+export function configuredSecretFiles(root: string = process.cwd(), env: NodeJS.ProcessEnv = process.env): string[] {
+  const out: string[] = [];
+  const add = (p: string | undefined) => { if (p && p.trim() !== '') out.push(path.resolve(root, p.trim())); };
+  add(env.SIGNER_KEYPAIR_PATH);
+  add(env.APEX_DB_PATH);
+  add(env.TEST_DB_PATH && env.TEST_DB_PATH !== ':memory:' ? env.TEST_DB_PATH : undefined);
+  add(env.APEX_ENV_FILE !== undefined ? env.APEX_ENV_FILE : '.env');
+  return out;
+}
+
+/** Forward slashes, no leading slash, lower case: the form `secretPathGuard` compares paths in (R8-4: case-insensitive). */
+const pathKey = (p: string) => p.replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase();
+
+/** R2-8: true when the absolute path is one of `secretFiles`, or one of them plus a `-` or `.` suffix (a database's -wal, -shm and .lock files). */
+function isConfiguredSecret(absPath: string, secretFiles: string[]): boolean {
+  const k = pathKey(absPath);
+  return secretFiles.some((f) => { const fk = pathKey(f); return k === fk || (k.startsWith(fk) && /^[-.]/.test(k.slice(fk.length))); });
 }
 
 /** Lines for `.dockerignore`, generated from the same lists so the two cannot drift. */
@@ -70,6 +97,8 @@ export function viteFsDeny(root: string = process.cwd()): string[] {
     ...DEV_DENY_DIRS.filter((d) => !ROOT_ONLY_DIRS.includes(d)).map((d) => `**/${d}/**`),
     ...ROOT_ONLY_DIRS.filter((d) => DEV_DENY_DIRS.includes(d)).map((d) => `${rootPosix}/${d}/**`),
     ...DENY_FILE_GLOBS.filter((g) => !ALLOW_FILE_GLOBS.includes(g)).map((g) => `**/${g}`),
+    // R2-8: the configured key, database and env file by path (secretPathGuard also matches these ignoring case)
+    ...configuredSecretFiles(root).flatMap((f) => { const e = escapeGlob(f.replace(/\\/g, '/')); return [e, `${e}-*`, `${e}.*`]; }),
   ];
 }
 
@@ -79,10 +108,11 @@ export function viteDevServerOptions(root: string = process.cwd()) {
 
 /**
  * Express middleware placed BEFORE the Vite dev middleware: answers 404 for any URL whose path is a secret or state file
- * (decoded up to twice, backslashes and `/@fs/` prefixes handled), whatever Vite's own deny list does.
+ * (decoded up to twice, backslashes and `/@fs/` prefixes handled), whatever Vite's own deny list does. R2-8, R8-4: the configured
+ * key, database and env file (`configuredSecretFiles`) are denied by path, and every match ignores case.
  * `npm run dev` serves the project root, and the /api auth gate does not cover static paths.
  */
-export function secretPathGuard(root: string) {
+export function secretPathGuard(root: string, secretFiles: string[] = configuredSecretFiles(root)) {
   const rootPosix = root.replace(/\\/g, '/').replace(/\/+$/, '');
   return (req: { url?: string }, res: { statusCode: number; end: (s?: string) => void }, next: () => void) => {
     let p = (req.url || '/').split('?')[0].split('#')[0];
@@ -91,11 +121,15 @@ export function secretPathGuard(root: string) {
     }
     p = p.replace(/\\/g, '/');
     if (p.startsWith('/@fs/')) p = p.slice(4);
-    if (p.startsWith(rootPosix + '/')) p = p.slice(rootPosix.length);
+    const absolute = p.toLowerCase().startsWith(rootPosix.toLowerCase() + '/'); // an /@fs/ path or a full path under the root
+    if (absolute) p = p.slice(rootPosix.length);
     const segments = p.split('/').filter((s) => s && s !== '.');
     const normalized: string[] = [];
     for (const s of segments) { if (s === '..') normalized.pop(); else normalized.push(s); }
-    if (normalized.length > 0 && !isServableInDev(normalized.join('/'))) {
+    const rel = normalized.join('/');
+    // R2-8: also the configured key, database and env file, by path under the root (and, for an /@fs/ path outside it, as given)
+    const denied = normalized.length > 0 && (!isServableInDev(rel) || isConfiguredSecret(`${rootPosix}/${rel}`, secretFiles) || isConfiguredSecret(`/${rel}`, secretFiles));
+    if (denied) {
       res.statusCode = 404;
       res.end('Not found');
       return;

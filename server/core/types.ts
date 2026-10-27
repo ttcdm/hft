@@ -217,6 +217,11 @@ export interface NormalizedPosition {
   highWaterMarkSol?: number;
   trailingStopSol?: number;
   exitStage?: number;
+  /**
+   * R4-2: the wallet (base58 pubkey) that holds this position's tokens, set when a LIVE position is opened. A zero balance read for any
+   * other signer proves nothing, so it never closes the row. Absent on rows written before the column existed.
+   */
+  walletPubkey?: string;
 }
 
 /** The result of `getLiveReadiness`: `ready` only when `reasons` is empty, plus per-subsystem health. */

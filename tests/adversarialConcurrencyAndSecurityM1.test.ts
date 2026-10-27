@@ -11,7 +11,7 @@ import { localSigner } from '../server/solana/signer';
 import { PumpCurveService, TradeQuote } from '../server/solana/pumpCurve';
 import { riskEngine } from '../server/risk/riskEngine';
 import { workstationDb } from '../server/db/database';
-import { authManager, requireOperatorAuth, verifyWsAuth, isAllowedClientOrigin } from '../server/middleware/auth';
+import { authManager, requireOperatorAuth } from '../server/middleware/auth';
 import { NormalizedPosition, TokenEligibilityReport } from '../server/core/types';
 import { TOKEN_PROGRAM_ID } from '../server/solana/programs';
 import { EligibilityFilter } from '../server/signals/eligibilityFilter';
@@ -766,198 +766,12 @@ describe('Adversarial Challenge M1.2: Concurrency, Invariants & Security Barrier
   describe('Mission 4: WebSocket Authentication & Query-String Credential Rejection', () => {
     let validSessionToken: string;
 
-    class MockWsClient {
-      public readyState: number = 1; // WebSocket.OPEN
-      public isAuthenticated: boolean = false;
-      public sentMessages: any[] = [];
-      public closedCode?: number;
-      public closedReason?: string;
-      private listeners: Map<string, ((...args: any[]) => void)[]> = new Map();
-
-      on(event: string, fn: (...args: any[]) => void) {
-        if (!this.listeners.has(event)) this.listeners.set(event, []);
-        this.listeners.get(event)!.push(fn);
-      }
-
-      emit(event: string, ...args: any[]) {
-        const list = this.listeners.get(event) || [];
-        for (const fn of list) fn(...args);
-      }
-
-      send(data: string) {
-        this.sentMessages.push(JSON.parse(data));
-      }
-
-      close(code?: number, reason?: string) {
-        this.closedCode = code;
-        this.closedReason = reason;
-        this.readyState = 3; // WebSocket.CLOSED
-      }
-    }
-
-    // Exact connection handler logic matching server.ts lines 61-128
-    function attachWsHandler(ws: MockWsClient, req: any) {
-      const origin = (req?.headers?.origin || '') as string;
-      const host = (req?.headers?.host || '') as string;
-      if (origin && !isAllowedClientOrigin(origin, host)) {
-        ws.close(4003, 'Unauthorized WebSocket Origin');
-        return;
-      }
-
-      ws.isAuthenticated = false;
-      ws.send(JSON.stringify({
-        type: 'AUTH_REQUIRED',
-        message: 'Operator session authentication required before receiving engine telemetry and market snapshots.',
-        timestamp: Date.now(),
-      }));
-
-      ws.on('message', (data: any) => {
-        try {
-          const parsed = typeof data === 'string' ? JSON.parse(data) : data;
-          if (parsed.action === 'AUTHENTICATE' || parsed.action === 'AUTH') {
-            const token = parsed.sessionToken || parsed.token;
-            if (authManager.validateToken(token)) {
-              ws.isAuthenticated = true;
-              ws.send(JSON.stringify({ type: 'AUTHENTICATED', authenticated: true, timestamp: Date.now() }));
-              ws.send(JSON.stringify({ type: 'TELEMETRY', data: { status: 'LIVE_STREAM', feed: 'ACTIVE' } }));
-            } else {
-              ws.send(JSON.stringify({ type: 'AUTH_ERROR', error: 'INVALID_OPERATOR_TOKEN' }));
-            }
-          }
-        } catch {}
-      });
-    }
-
-    // Exact broadcast logic matching server.ts lines 47-59
-    function broadcastWs(clients: MockWsClient[], payload: any, sensitiveOnly: boolean = true) {
-      const str = JSON.stringify(payload);
-      clients.forEach((client) => {
-        if (client.readyState === 1) {
-          if (sensitiveOnly && !client.isAuthenticated) {
-            return;
-          }
-          client.send(str);
-        }
-      });
-    }
-
-    // Exact route handler logic matching server.ts lines 804-810
-    const handleAccountBalance = (req: any, res: any) => {
-      if (req.query.secret || req.query.apiSecret || req.query.apiKey) {
-        return res.status(400).json({
-          error: 'CRITICAL_SECURITY_VIOLATION',
-          message: 'Credentials must NEVER be passed via URL query parameters. Use HTTP headers (x-mbx-apikey, x-mbx-apisecret).',
-        });
-      }
-      const apiKey = req.headers['x-mbx-apikey'];
-      const apiSecret = req.headers['x-mbx-apisecret'] || req.headers['x-api-secret'];
-      return res.status(200).json({ success: true, balance: 1.5, authenticated: Boolean(apiKey && apiSecret) });
-    };
+    // 4.1 to 4.4 (AUTH_REQUIRED, forged token, valid token + broadcast, foreign origin) ran against a copy of the handler and now run against
+    // the real server.ts in tests/ws_auth_real_server.test.ts. 4.5 to 4.7 exercised a copy of /api/account/balance, a route that was removed (Q57).
 
     beforeEach(() => {
       const session = authManager.createSession('OPERATOR');
       validSessionToken = session.token;
-    });
-
-    it('4.1: unauthenticated WebSocket client receives AUTH_REQUIRED and cannot receive trade streams', () => {
-      const client = new MockWsClient();
-      attachWsHandler(client, { headers: { host: '127.0.0.1' } });
-
-      // Initial message must be AUTH_REQUIRED
-      expect(client.sentMessages.length).toBe(1);
-      expect(client.sentMessages[0].type).toBe('AUTH_REQUIRED');
-      expect(client.isAuthenticated).toBe(false);
-
-      // Attempt broadcast of sensitive telemetry
-      broadcastWs([client], { type: 'ORDER_STREAM', order: { mint: testMintStr, amount: 0.1 } }, true);
-
-      // Unauthenticated client MUST NOT receive the broadcast
-      expect(client.sentMessages.length).toBe(1);
-      expect(client.sentMessages.some((m) => m.type === 'ORDER_STREAM')).toBe(false);
-    });
-
-    it('4.2: rejects invalid auth token on WebSocket with AUTH_ERROR', () => {
-      const client = new MockWsClient();
-      attachWsHandler(client, { headers: { host: '127.0.0.1' } });
-
-      // Send invalid authentication
-      client.emit('message', JSON.stringify({ action: 'AUTHENTICATE', token: 'forged_token_0000' }));
-
-      const authErrorMsg = client.sentMessages.find((m) => m.type === 'AUTH_ERROR');
-      expect(authErrorMsg).toBeDefined();
-      expect(authErrorMsg.error).toBe('INVALID_OPERATOR_TOKEN');
-      expect(client.isAuthenticated).toBe(false);
-    });
-
-    it('4.3: authenticates client with valid operator session and streams private telemetry', () => {
-      const client = new MockWsClient();
-      attachWsHandler(client, { headers: { host: '127.0.0.1' } });
-
-      // Send valid authentication
-      client.emit('message', JSON.stringify({ action: 'AUTHENTICATE', token: validSessionToken }));
-
-      const authenticatedMsg = client.sentMessages.find((m) => m.type === 'AUTHENTICATED');
-      expect(authenticatedMsg).toBeDefined();
-      expect(authenticatedMsg.authenticated).toBe(true);
-      expect(client.isAuthenticated).toBe(true);
-
-      const telemetryMsg = client.sentMessages.find((m) => m.type === 'TELEMETRY');
-      expect(telemetryMsg).toBeDefined();
-      expect(telemetryMsg.data.status).toBe('LIVE_STREAM');
-
-      // Now broadcast sensitive trade stream
-      broadcastWs([client], { type: 'TRADE_STREAM', trade: { mint: testMintStr, pnlSol: 0.05 } }, true);
-      const tradeStreamMsg = client.sentMessages.find((m) => m.type === 'TRADE_STREAM');
-      expect(tradeStreamMsg).toBeDefined();
-      expect(tradeStreamMsg.trade.pnlSol).toBe(0.05);
-    });
-
-    it('4.4: WebSocket closes with 4003 on unauthorized origin', () => {
-      const client = new MockWsClient();
-      attachWsHandler(client, { headers: { origin: 'https://evil-attacker-site.com', host: '127.0.0.1' } });
-
-      expect(client.closedCode).toBe(4003);
-      expect(client.closedReason).toBe('Unauthorized WebSocket Origin');
-    });
-
-    it('4.5: query-string credential rejection — rejects requests containing secret in query params', () => {
-      let statusCode = 0;
-      let body: any = null;
-      const res = {
-        status: (s: number) => { statusCode = s; return { json: (b: any) => { body = b; } }; },
-      };
-
-      handleAccountBalance({ query: { secret: 'my-leaked-secret' }, headers: {} }, res);
-
-      expect(statusCode).toBe(400);
-      expect(body.error).toBe('CRITICAL_SECURITY_VIOLATION');
-      expect(body.message).toContain('Credentials must NEVER be passed via URL query parameters');
-    });
-
-    it('4.6: query-string credential rejection — rejects requests containing apiKey in query params', () => {
-      let statusCode = 0;
-      let body: any = null;
-      const res = {
-        status: (s: number) => { statusCode = s; return { json: (b: any) => { body = b; } }; },
-      };
-
-      handleAccountBalance({ query: { apiKey: 'my-leaked-api-key' }, headers: {} }, res);
-
-      expect(statusCode).toBe(400);
-      expect(body.error).toBe('CRITICAL_SECURITY_VIOLATION');
-    });
-
-    it('4.7: query-string credential rejection — rejects requests containing apiSecret in query params', () => {
-      let statusCode = 0;
-      let body: any = null;
-      const res = {
-        status: (s: number) => { statusCode = s; return { json: (b: any) => { body = b; } }; },
-      };
-
-      handleAccountBalance({ query: { apiSecret: 'my-leaked-secret' }, headers: {} }, res);
-
-      expect(statusCode).toBe(400);
-      expect(body.error).toBe('CRITICAL_SECURITY_VIOLATION');
     });
 
     it('4.8: requireOperatorAuth rejects session token passed via query param instead of header', () => {

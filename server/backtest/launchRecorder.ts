@@ -4,7 +4,7 @@ import type { WatchWindow } from '../signals/watchWindow';
 import type { WorkstationDatabase } from '../db/database';
 import { CREATOR_LOOKUP_FAILED_FLAG, type CreatorRiskReport } from '../signals/creatorRiskScorer';
 import { Logger } from '../middleware/enterprise';
-import { recorderConfig, setRecorderRuntime, RECORD_DEFAULT_MINT_MINUTES, RECORD_TRADES_PER_30_MIN, RECORD_DEFAULT_RETENTION_DAYS, RECORD_DEFAULT_MAX_ROWS, type RecorderConfig, type RecorderRuntime } from './recorderConfig';
+import { recorderConfig, setRecorderRuntime, RECORD_DEFAULT_MIN_FREE_MB, RECORD_DEFAULT_MINT_MINUTES, RECORD_TRADES_PER_30_MIN, RECORD_DEFAULT_RETENTION_DAYS, RECORD_DEFAULT_MAX_ROWS, type RecorderConfig, type RecorderRuntime } from './recorderConfig';
 
 /**
  * How long, and how much, of one launch is recorded: see recorderConfig.ts (env-configurable; 30 minutes on a normal server, 180 read-only).
@@ -31,7 +31,16 @@ const END_SWEEP_EVERY_MS = 60_000;
  */
 export type RecordingEndReason = 'TRADE_CAP' | 'WINDOW' | 'CURVE_COMPLETE';
 
-type Db = Pick<WorkstationDatabase, 'recordLaunchEvent' | 'pruneLaunchRecording'>;
+type Db = Pick<WorkstationDatabase, 'recordLaunchEvent' | 'pruneLaunchRecording'> & Partial<Pick<WorkstationDatabase, 'getFreeBytes'>>;
+/** R4-5: how often the recorder reads the free space (a statfs) while it records. */
+export const RECORD_SPACE_CHECK_MS = 5_000;
+
+/**
+ * R2-2: why the recording has a hole, as a MARKER row (mint ''). RECORDER_START: the recorder was attached, so a process that stopped lost
+ * the in-memory state of every launch it was recording (their later trades were never saved). FEED_GAP: the pump feed reported a gap, and
+ * live released every watched launch DEAD across it. The replay bounds a launch's coverage at the first marker inside its recording.
+ */
+export type RecordingMarkerReason = 'RECORDER_START' | 'FEED_GAP';
 
 /** BigInt-safe JSON form of a decoded pump event (all u64 fields as decimal strings). */
 export function eventToJson(e: object): Record<string, unknown> {
@@ -84,9 +93,11 @@ export class LaunchRecorder {
   private lastEndSweep = 0;
   private creatorReports: CreatorReportSource | null = null;
   private runtime: RecorderRuntime;
+  private lastSpaceCheck = -Infinity;
+  private pausedForSpace = false;
 
   constructor(private db: Db, private window: Pick<WatchWindow, 'isWatching'> & EventEmitter, private solUsd: () => number | null = () => null, private now: () => number = Date.now, private config: RecorderConfig = recorderConfig()) {
-    this.runtime = { config: this.config, prunedRows: 0, prunings: 0, firstPruneAt: null, lastPruneAt: null, lastPruneRows: 0 };
+    this.runtime = { config: this.config, prunedRows: 0, prunings: 0, firstPruneAt: null, lastPruneAt: null, lastPruneRows: 0, pausedForSpaceSince: null, skippedForSpace: 0 };
     setRecorderRuntime(this.runtime);
   }
 
@@ -98,11 +109,19 @@ export class LaunchRecorder {
     const onCreate = (e: PumpCreateEvent) => this.onCreate(e);
     const onTrade = (t: PumpTradeEvent) => this.onTrade(t);
     const onFunder = (f: { wallet: string; funder: string | null }) => this.onFunder(f);
+    const onGap = (g: { reason?: string; at?: number }) => this.marker('FEED_GAP', g?.reason);
     feed.on('create_event', onCreate);
     feed.on('trade_event', onTrade);
+    feed.on('feed_gap', onGap);
     this.window.on('funder', onFunder);
     const offReports = creatorReports?.onReport((c, r) => this.onCreatorReport(c, r));
-    this.attachedTo.push({ off: () => { feed.off('create_event', onCreate); feed.off('trade_event', onTrade); this.window.off('funder', onFunder); offReports?.(); } });
+    this.attachedTo.push({ off: () => { feed.off('create_event', onCreate); feed.off('trade_event', onTrade); feed.off('feed_gap', onGap); this.window.off('funder', onFunder); offReports?.(); } });
+    this.marker('RECORDER_START');
+  }
+
+  /** R2-2: one MARKER row, on the recorder's clock. A failed write is swallowed like every recording write. */
+  public marker(reason: RecordingMarkerReason, detail?: string): void {
+    this.db.recordLaunchEvent(this.now(), '', 'MARKER', { reason, ...(detail !== undefined ? { detail: String(detail) } : {}) });
   }
 
   public detach(): void {
@@ -111,6 +130,7 @@ export class LaunchRecorder {
   }
 
   public onCreate(e: PumpCreateEvent): void {
+    if (this.pausedForSpace) return; // R4-5: stopped for disk space; its trades would not be kept
     const ts = this.now();
     this.pending.set(e.mint, { ts, event: e, solUsd: this.solUsd(), creatorReports: [] });
     // 5B-2: a report the scorer already holds for this creator (a cache hit stores nothing, so no report event follows) applies from the create
@@ -119,8 +139,43 @@ export class LaunchRecorder {
     if (this.pending.size > PENDING_CREATES_MAX) this.pending.delete(this.pending.keys().next().value as string);
   }
 
+  /**
+   * R4-5: false while free space on the database's filesystem is below the recorder's floor (read at most every RECORD_SPACE_CHECK_MS).
+   * Stopping logs once; every launch being recorded is dropped from tracking with no END row (it reads as unresolved, since its trades
+   * have a gap), and pending creates are forgotten. Recording resumes, with new launches only, once space is back, and that logs once too.
+   * A database with no free-space reading (`:memory:`, or a read that failed) records.
+   */
+  private spaceOk(now: number): boolean {
+    if (now - this.lastSpaceCheck < RECORD_SPACE_CHECK_MS) return this.skipIfPaused();
+    this.lastSpaceCheck = now;
+    const floor = this.config.minFreeBytes ?? RECORD_DEFAULT_MIN_FREE_MB * 1024 * 1024;
+    const free = this.db.getFreeBytes?.() ?? null;
+    const low = free !== null && free < floor;
+    const mib = (b: number) => Math.round(b / (1024 * 1024));
+    if (low && !this.pausedForSpace) {
+      this.pausedForSpace = true;
+      this.runtime.pausedForSpaceSince = now;
+      for (const r of this.recorded.values()) r.ended = true; // no END row: their recording has a gap, so they stay unresolved
+      this.pending.clear();
+      Logger.warn(`[RECORDER] stopped recording: ${mib(free!)} MiB free on the database's disk, below the recorder's ${mib(floor)} MiB floor (APEX_RECORD_MIN_FREE_MB). The space is left for trading writes; recording resumes when space is back.`);
+    } else if (!low && this.pausedForSpace) {
+      this.pausedForSpace = false;
+      this.runtime.pausedForSpaceSince = null;
+      this.pending.clear(); // a launch created during the stop may have traded unrecorded: only launches created from now on are kept
+      Logger.info(`[RECORDER] recording resumed: ${free === null ? 'free space unreadable' : `${mib(free)} MiB free`} (floor ${mib(floor)} MiB); ${this.runtime.skippedForSpace ?? 0} event(s) were not recorded meanwhile`);
+    }
+    return this.skipIfPaused();
+  }
+
+  private skipIfPaused(): boolean {
+    if (!this.pausedForSpace) return true;
+    this.runtime.skippedForSpace = (this.runtime.skippedForSpace ?? 0) + 1;
+    return false;
+  }
+
   public onTrade(t: PumpTradeEvent): void {
     const at = this.now();
+    if (!this.spaceOk(at)) return; // R4-5
     this.sweepEnded(at);
     let rec = this.recorded.get(t.mint);
     if (!rec) {
@@ -165,13 +220,16 @@ export class LaunchRecorder {
    */
   public onCreatorReport(creator: string, report: CreatorRiskReport): void {
     const at = this.now();
+    if (!this.spaceOk(at)) return; // R4-5
     const payload = creatorPayload(creator, report);
     for (const p of this.pending.values()) if (p.event.creator === creator) p.creatorReports.push({ ts: at, payload });
     for (const [mint, r] of this.recorded) if (r.creator === creator && !r.ended) this.db.recordLaunchEvent(at, mint, 'CREATOR', payload);
   }
 
   public onFunder(f: { wallet: string; funder: string | null }): void {
-    this.db.recordLaunchEvent(this.now(), '', 'FUNDER', { wallet: f.wallet, funder: f.funder });
+    const at = this.now();
+    if (!this.spaceOk(at)) return; // R4-5
+    this.db.recordLaunchEvent(at, '', 'FUNDER', { wallet: f.wallet, funder: f.funder });
   }
 
   private trimTracked(now: number): void {

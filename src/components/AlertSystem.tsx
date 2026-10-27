@@ -1,11 +1,19 @@
 import React, { useState } from 'react';
 import { AlertCircle, AlertTriangle, ShieldCheck, X } from 'lucide-react';
 import { AlertEvent } from '../types';
+import { orderAlerts } from '../utils/operatorAlerts';
 
 /**
  * UI-2: alerts used to pile up three deep in the bottom-right corner and stay until dismissed, covering the Plug & Play footer
  * (ARM LIVE TRADING, PAPER SNIPE). INFO and WARNING now expire on their own; CRITICAL stays until the operator dismisses it.
- * The stack shows the newest alert only, with "Show all" for the rest.
+ * The stack shows one alert, with "Show all" for the rest. R6-19: the one shown is the most severe (CRITICAL, then WARNING, then INFO),
+ * newest first within a level, so a later INFO cannot hide a CRITICAL. R6-1: the server's operator alerts are in the same stack; a
+ * sticky one (a server CRITICAL) has no dismiss button and leaves only when the server clears it.
+ * R9-3: the stack was fixed over the bottom-right corner, on top of KILL AUTO, and a sticky CRITICAL cannot be dismissed, so it could
+ * hold the auto emergency control under it for good. It is now docked in the page flow (sticky to the bottom of the screen, on the left,
+ * with its own space at the end of the page, so scrolling always uncovers what is under it), and it can be minimized to its one-line
+ * bar whatever it holds. A server CRITICAL that reports a past event (POSITION_GONE, SELL_ADOPTED, ...) used to stay until a restart;
+ * it has an Acknowledge button that clears it on the server.
  */
 export const ALERT_TTL_MS: Record<AlertEvent['level'], number | null> = { INFO: 8_000, WARNING: 20_000, CRITICAL: null };
 
@@ -15,36 +23,51 @@ export function isAlertExpired(alert: Pick<AlertEvent, 'level' | 'timestamp'>, n
 }
 
 export const COLLAPSED_ALERTS = 1;
-export const EXPANDED_ALERTS = 3;
+/** R10-9: "Show all" shows all of them (it was capped at 3 while the counter said "+8"); the list scrolls inside the dock. */
+export const EXPANDED_ALERTS = Infinity;
 
 interface AlertSystemProps {
   alerts: AlertEvent[];
   onDismissAlert: (id: string) => void;
   onClearAll: () => void;
+  /** A server alert with `serverAck` (one only the operator clears) gets an Acknowledge button that calls this. */
+  onAcknowledgeAlert?: (alert: AlertEvent) => void;
 }
 
 export const AlertSystem: React.FC<AlertSystemProps> = ({
   alerts,
   onDismissAlert,
   onClearAll,
+  onAcknowledgeAlert,
 }) => {
   const [expanded, setExpanded] = useState(false);
+  const [minimized, setMinimized] = useState(false);
   if (alerts.length === 0) return null;
-  const shown = alerts.slice(0, expanded ? EXPANDED_ALERTS : COLLAPSED_ALERTS);
+  const ordered = orderAlerts(alerts);
+  const shown = minimized ? [] : expanded ? ordered : ordered.slice(0, COLLAPSED_ALERTS);
   const hidden = alerts.length - shown.length;
+  const critical = alerts.filter((a) => a.level === 'CRITICAL').length;
 
   return (
     <div
       id="alerts-notification-panel"
-      className="fixed bottom-4 right-4 z-50 max-w-sm w-full space-y-2 pointer-events-none"
+      data-testid="alerts-dock"
+      className="sticky bottom-0 z-50 self-start max-w-sm w-full p-4 pt-0 space-y-2 pointer-events-none"
     >
       <div className="flex items-center justify-between pointer-events-auto bg-[#0D131F] border border-[#1E293B] px-3 py-1.5 rounded-lg shadow-xl text-[11px] font-mono">
         <span className="text-amber-400 font-bold flex items-center space-x-1">
           <AlertTriangle className="w-3.5 h-3.5 mr-1" />
-          <span>Active Risk Alerts ({alerts.length})</span>
+          <span>Active Risk Alerts ({alerts.length}{critical ? `, ${critical} critical` : ''})</span>
         </span>
         <span className="flex items-center space-x-3">
-          {alerts.length > COLLAPSED_ALERTS && (
+          <button
+            onClick={() => setMinimized(!minimized)}
+            className="text-slate-400 hover:text-white text-[10px]"
+            data-testid="alerts-minimize"
+          >
+            {minimized ? 'Show' : 'Minimize'}
+          </button>
+          {!minimized && alerts.length > COLLAPSED_ALERTS && (
             <button
               onClick={() => setExpanded(!expanded)}
               className="text-slate-400 hover:text-white text-[10px]"
@@ -62,6 +85,7 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
         </span>
       </div>
 
+      <div data-testid="alerts-list" className="space-y-2 max-h-[60vh] overflow-y-auto pointer-events-auto">
       {shown.map((alert) => (
         <div
           key={alert.id}
@@ -86,6 +110,7 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
               <div className="font-bold text-[11px] uppercase tracking-wider flex items-center space-x-2">
                 <span>{alert.title}</span>
                 <span className="text-[9px] opacity-70">[{alert.timeStr}]</span>
+                {alert.source === 'server' && <span className="text-[9px] opacity-70">server</span>}
               </div>
               <p className="text-[11px] opacity-90 mt-0.5 leading-tight">
                 {alert.message}
@@ -93,14 +118,36 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
             </div>
           </div>
 
-          <button
-            onClick={() => onDismissAlert(alert.id)}
-            className="text-slate-400 hover:text-white p-0.5 ml-2"
-          >
-            <X className="w-3.5 h-3.5" />
-          </button>
+          <div className="flex items-start ml-2 space-x-1">
+            {alert.serverAck && onAcknowledgeAlert && (
+              <button
+                onClick={() => onAcknowledgeAlert(alert)}
+                className="text-[9px] border border-current/60 rounded px-1.5 py-0.5 whitespace-nowrap opacity-90 hover:opacity-100"
+                data-testid="alert-acknowledge"
+                title="It reports something that already happened; acknowledging clears it on the server"
+              >
+                Acknowledge
+              </button>
+            )}
+            {alert.sticky ? (
+              !(alert.serverAck && onAcknowledgeAlert) && (
+                <span className="text-[9px] text-red-300/80 whitespace-nowrap" data-testid="alert-sticky" title="Held by the server: it leaves when the server clears it">
+                  until cleared
+                </span>
+              )
+            ) : (
+              <button
+                onClick={() => onDismissAlert(alert.id)}
+                className="text-slate-400 hover:text-white p-0.5"
+                aria-label="Dismiss alert"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
         </div>
       ))}
+      </div>
     </div>
   );
 };

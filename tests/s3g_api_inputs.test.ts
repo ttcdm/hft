@@ -78,7 +78,7 @@ describe('3G N-67: a wallet config save changes only the limits it sends', () =>
   it('a save that leaves the cap out does not push a limit to the risk engine', async () => {
     vi.spyOn(walletTrader, 'syncRpcBalance').mockResolvedValue(null);
     const push = vi.spyOn(riskEngine, 'updateLimits');
-    expect((await call('POST', '/api/wallet/config', { riskLimits: { stopLossPct: 25 } })).status).toBe(200);
+    expect((await call('POST', '/api/wallet/config', { riskLimits: { stopLossPct: 25 } })).status).toBe(200); // a key removed in decision 2: an old body still saves
     expect(push).not.toHaveBeenCalled();
   });
 

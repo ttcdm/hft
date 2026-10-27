@@ -2,6 +2,7 @@ import React from 'react';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { X, RefreshCw } from 'lucide-react';
 import { usePolled } from '../utils/usePolled';
+import { DialogFrame } from './DialogFrame';
 
 export interface SystemCheckRow { id: string; label: string; status: 'OK' | 'WARN' | 'FAIL' | 'UNKNOWN'; value: string; detail: string }
 export interface SystemChecksData { checkedAt: number; cluster: string; mode: string; checks: SystemCheckRow[] }
@@ -43,7 +44,7 @@ export const SystemChecksModal: React.FC<{ isOpen: boolean; onClose: () => void 
   useEscapeToClose(isOpen, onClose);
   if (!isOpen) return null;
   return (
-    <div className="fixed inset-0 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 z-50 font-mono">
+    <DialogFrame label="System checks" className="fixed inset-0 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 z-50 font-mono">
       <div className="bg-[#0D131F] border border-[#1E293B] rounded-xl p-5 max-w-2xl w-full shadow-2xl max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between mb-3">
           <h3 className="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2"><RefreshCw className="w-4 h-4 text-cyan-400" /> System checks</h3>
@@ -52,6 +53,6 @@ export const SystemChecksModal: React.FC<{ isOpen: boolean; onClose: () => void 
         <p className="text-[10px] text-slate-500 mb-3">Live results from the running server, refreshed every 5 s. A check that cannot be read says UNKNOWN, never OK.</p>
         <SystemChecksView data={data} error={error} />
       </div>
-    </div>
+    </DialogFrame>
   );
 };

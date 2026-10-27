@@ -10,6 +10,8 @@ export interface SystemAuditLite {
   /** S185: APEX_READ_ONLY=true on the server */
   readOnly?: boolean;
   rpcEndpoint?: string;
+  /** UI report fix 7: the server's kill switch */
+  killSwitchActive?: boolean;
 }
 
 export interface TradingModeInfo {
@@ -24,6 +26,8 @@ export interface TradingModeInfo {
   readOnly: boolean;
   rpcHost: string | null;
   ageMs: number | null;
+  /** UI report fix 7: true when the server's kill switch is on (every order is refused); null when unknown or stale */
+  killSwitch: boolean | null;
 }
 
 export const MODE_STALE_MS = 15_000;
@@ -39,14 +43,15 @@ const hostOf = (url?: string): string | null => {
  */
 export function describeTradingMode(audit: SystemAuditLite | null | undefined, fetchedAt: number | null, now = Date.now()): TradingModeInfo {
   if (!audit || fetchedAt === null) {
-    return { known: false, stale: false, live: false, label: 'MODE UNKNOWN', cluster: null, readOnly: false, rpcHost: null, ageMs: null };
+    return { known: false, stale: false, live: false, label: 'MODE UNKNOWN', cluster: null, readOnly: false, rpcHost: null, ageMs: null, killSwitch: null };
   }
   const ageMs = Math.max(0, now - fetchedAt);
   const stale = ageMs > MODE_STALE_MS;
   const armed = audit.isLiveArmed === true;
   const mode = String(audit.mode ?? '').toUpperCase();
   const label: TradingModeInfo['label'] = stale ? 'MODE UNKNOWN' : armed ? 'LIVE ARMED' : mode === 'LIVE' ? 'LIVE (NOT ARMED)' : 'PAPER';
-  return { known: !stale, stale, live: armed && !stale, label, cluster: audit.allowedCluster ?? null, readOnly: audit.readOnly === true, rpcHost: hostOf(audit.rpcEndpoint), ageMs };
+  const killSwitch = stale || typeof audit.killSwitchActive !== 'boolean' ? null : audit.killSwitchActive;
+  return { known: !stale, stale, live: armed && !stale, label, cluster: audit.allowedCluster ?? null, readOnly: audit.readOnly === true, rpcHost: hostOf(audit.rpcEndpoint), ageMs, killSwitch };
 }
 
 // One poller shared by every component that shows the mode.
@@ -102,4 +107,34 @@ export function readOnlyBannerText(m: Pick<TradingModeInfo, 'readOnly' | 'cluste
   if (!m.readOnly) return null;
   const c = m.cluster === 'mainnet-beta' || m.cluster === 'mainnet' ? 'MAINNET' : (m.cluster ?? 'UNKNOWN CLUSTER').toUpperCase();
   return `${c} · READ-ONLY · PAPER`;
+}
+
+/**
+ * Round 1 #11: the Plug & Play mode badge, mode tile and snipe button, from the shared poller (15 s staleness) instead of the modal's own
+ * last good /api/diagnostics/system answer, which never aged out and kept saying PAPER TRADING while the banner said MODE UNKNOWN.
+ */
+export function plugAndPlayModeView(m: TradingModeInfo): { badge: string; tone: 'unknown' | 'live' | 'paper'; mode: string; snipe: string } {
+  if (!m.known) return { badge: 'MODE UNKNOWN', tone: 'unknown', mode: 'UNKNOWN', snipe: 'SNIPE (MODE UNKNOWN)' };
+  if (m.live) return { badge: 'LIVE BROADCAST ACTIVE', tone: 'live', mode: 'LIVE (ARMED)', snipe: 'LIVE SNIPE' };
+  return { badge: 'PAPER TRADING', tone: 'paper', mode: m.label, snipe: 'PAPER SNIPE' };
+}
+
+/**
+ * UI report fix 7: why a snipe button is greyed out, or null when it may be pressed. With the kill switch on the server refuses every
+ * order anyway; the button now says so instead of looking live.
+ */
+export function snipeBlockedReason(m: Pick<TradingModeInfo, 'killSwitch'>): string | null {
+  return m.killSwitch === true ? 'KILL SWITCH ON: the server refuses every order. Reset it from the header first.' : null;
+}
+
+/**
+ * R9-4: the Plug & Play "Circuit Breaker" tile read the breaker only, so it stayed green "NORMAL (ACTIVE)" under the kill switch. It
+ * now leads with the kill switch, and says "unknown" when the kill-switch state is (killSwitch null: no fresh answer).
+ */
+export function killAndBreakerTile(killSwitch: boolean | null, breaker: 'CLOSED' | 'OPEN' | 'HALF_OPEN' | undefined, haveRisk: boolean): { text: string; tone: string } {
+  if (killSwitch === true) return { text: 'KILL SWITCH ON (orders refused)', tone: 'text-rose-400' };
+  if (breaker === 'OPEN') return { text: 'BREAKER TRIPPED (orders refused)', tone: 'text-rose-400' };
+  if (breaker === 'HALF_OPEN') return { text: 'RECOVERING (HALF-OPEN)', tone: 'text-amber-400' };
+  if (killSwitch === null) return { text: 'kill switch unknown (no fresh server answer)', tone: 'text-amber-400' };
+  return haveRisk ? { text: 'kill switch off, breaker closed', tone: 'text-emerald-400' } : { text: '—', tone: 'text-slate-400' };
 }

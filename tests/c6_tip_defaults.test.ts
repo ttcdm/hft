@@ -8,17 +8,21 @@ import { solPriceService } from '../server/market/solPriceService';
 import { PumpCurveService } from '../server/solana/pumpCurve';
 import { OperatorSnipeSchema, CalloutSnipeSchema } from '../server/execution/tradeInputs';
 import { MINT_A } from './fixtures/socialFeeds';
+import { curveFixture } from './fixtures/curve';
 
 describe('C6: one source for Jito tip defaults', () => {
   beforeEach(() => {
     memecoinAggregator.setConfluenceGating(false); // C2: gating is on by default; this test is about something else
   });
+  // R10-8: an unknown mint has no invented pool any more; for executeSnipe the mint's curve is read (stubbed at the RPC boundary)
+  const curveReadable = () => vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockResolvedValue(curveFixture());
   afterEach(() => vi.restoreAllMocks());
 
   it('executeSnipe with no operator tip passes NO explicit tip to the coordinator', async () => {
     solPriceService.setPrice(150, 'TEST');
     vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('PAPER');
     const exec = vi.spyOn(executionCoordinator, 'executeTrade').mockResolvedValue({ success: false, error: 'stub' } as any);
+    curveReadable();
     await memecoinAggregator.executeSnipe({ contractAddress: MINT_A, amountUsd: 5 });
     expect(exec).toHaveBeenCalled();
     expect(exec.mock.calls[0][0].jitoTipSol).toBeUndefined();
@@ -28,6 +32,7 @@ describe('C6: one source for Jito tip defaults', () => {
     solPriceService.setPrice(150, 'TEST');
     vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('PAPER');
     const exec = vi.spyOn(executionCoordinator, 'executeTrade').mockResolvedValue({ success: false, error: 'stub' } as any);
+    curveReadable();
     await memecoinAggregator.executeSnipe({ contractAddress: MINT_A, amountUsd: 5, jitoTipSol: 0.003 });
     expect(exec.mock.calls[0][0].jitoTipSol).toBe(0.003);
   });
@@ -36,11 +41,15 @@ describe('C6: one source for Jito tip defaults', () => {
     solPriceService.setPrice(150, 'TEST');
     vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('PAPER');
     const resolver = vi.spyOn(executionConfig, 'resolveDynamicJitoTip');
-    await executionCoordinator.executeTrade({
+    // A rejection here is a real failure of the test: it is not swallowed any more.
+    const res = await executionCoordinator.executeTrade({
       mint: MINT_A, symbol: 'T', name: 'T', amountSol: 0.02, currentPriceSol: 0.0000001, slippageBps: 800, liquidityUsd: 50000,
-    } as any).catch(() => undefined);
+    } as any);
+    expect(res).toBeDefined();
     expect(resolver).toHaveBeenCalled();
     expect(resolver.mock.calls[0][0].explicitTipSol).toBeUndefined();
+    const resolved = await resolver.mock.results[0].value;
+    expect(resolved).toBeDefined();
   });
 
   it('request schemas no longer inject a tip default', () => {

@@ -15,12 +15,12 @@ import { signalFeedBadge } from '../utils/signalBadge';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { usePolled } from '../utils/usePolled';
 import { probeBadge, probeBadgeClass, probeLatency, hostOfService, connectivityAuditSummary } from '../utils/probeBadge';
-import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
+import { useTradingMode, snipeBlockedReason, liveClickWarning } from '../utils/tradingMode';
 import { useAutoStatus, AutoModeBadge, type AutoMode } from './AutoPanel';
 import { buildPoolSnipeRequest } from '../utils/poolSnipe';
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { SnipeAmountControl } from './SnipeAmountControl';
-import { mainnetLinksAvailable, isMainnetDataProvenance, sanitizeExternalUrl, sanitizeTelegramUrl, formatPctChange } from '../utils/tokenLinks';
+import { mainnetLinksAvailable, isMainnetDataProvenance, sanitizeXProfileUrl, sanitizeTelegramUrl, formatPctChange } from '../utils/tokenLinks';
 import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
 import React, { useState, useEffect } from 'react';
 import {
@@ -64,10 +64,15 @@ import {
   MemecoinPlatform,
 } from '../types';
 import { engineClient } from '../services/engineClient';
+import { fmtRank, fmtSmall, fmtUsdPrice } from '../utils/numFormat';
+import { sellConfirmText, sellDoneTitle } from '../utils/sellConfirm';
 import { hftAudio } from '../utils/audio';
 import { PumpFunHotCalloutsView } from './PumpFunHotCalloutsView';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
 import { BELOW_HEADER_TOP } from '../utils/headerOffset';
+import { DecimalBox } from './DecimalBox';
+import { DialogFrame, KILL_SWITCH_ID } from './DialogFrame';
+import { confirmLiveClick, confirmSell } from './ConfirmDialog';
 
 /**
  * P1.4 (N-12): the sniper tab's header. The auto mode shown is the auto controller's own (GET /api/auto/status), read-only: the
@@ -206,6 +211,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const [sendPingMsg, setSendPingMsg] = useState(false);
   const [isTestingDiagnostics, setIsTestingDiagnostics] = useState(false);
   const tradingMode = useTradingMode();
+  const snipeBlocked = snipeBlockedReason(tradingMode); // UI report fix 7: grey the snipe buttons while the kill switch is on
   const autoStatus = useAutoStatus(); // P1.4 (N-12): the sniper tab mirrors the auto controller's mode; it does not set it
   // 3H (A3): the Jito card and tip label say what the transport does, from GET /api/execution/readiness
   const readiness = usePolled<{ components?: { jito?: { status?: string } } }>('/api/execution/readiness', 15_000, isOpen);
@@ -259,6 +265,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   };
 
   const [isWsLive, setIsWsLive] = useState(engineClient.isWsConnected());
+  const [signalsRead, setSignalsRead] = useState<'pending' | 'ok' | 'failed'>('pending');
 
   // Deduplicate pools by CA and ID to guarantee unique React keys
   const deduplicatePools = (poolList: MemecoinPool[]): MemecoinPool[] => {
@@ -279,7 +286,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     setIsRefreshing(true);
     try {
       const sigData = await engineClient.getSocialSignals();
-      if (sigData?.signals) setSignals(sigData.signals);
+      // R9-6: a refused read (401) is "not read", never "0 Live"
+      if (sigData?.status !== 'ERROR' && Array.isArray(sigData?.signals)) { setSignals(sigData.signals); setSignalsRead('ok'); } else setSignalsRead('failed');
 
       const poolData = await engineClient.getMemecoinPools(selectedPlatform, selectedChain);
       if (poolData?.pools) setPools(deduplicatePools(poolData.pools));
@@ -341,7 +349,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     const amount = snipeAmount.parsed.sol;
     // Q10b: while LIVE is armed this click sends a real transaction; say so and ask first
     const warning = liveClickWarning(tradingMode, `Sniping ${sig.tokenTicker} for ${formatSol(amount)}`);
-    if (warning && !window.confirm(warning)) return;
+    if (warning && !(await confirmLiveClick(warning))) return;
     hftAudio.playOrderFill();
     const res = await engineClient.snipeSocialSignal(sig.id, amount, sniperConfig.jitoTipSol, sniperConfig.maxSlippagePct, tradingMode.live);
     
@@ -371,7 +379,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     if (!snipeAmount.parsed.ok) { onAlertTrigger?.('WARNING', 'SNIPE NOT SENT', snipeAmount.parsed.reason); return; }
     const amount = snipeAmount.parsed.sol;
     const warning = liveClickWarning(tradingMode, `Sniping $${pool.symbol} for ${formatSol(amount)}`);
-    if (warning && !window.confirm(warning)) return;
+    if (warning && !(await confirmLiveClick(warning))) return;
     hftAudio.playOrderFill();
     const res = await engineClient.executeMemecoinSnipe(buildPoolSnipeRequest(pool, amount, sniperConfig), tradingMode.live);
     const r = res?.result ?? res?.tradeResult;
@@ -389,12 +397,19 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
   // Close / Take profit on open position
   const handleClosePosition = async (posId: string, sellPct: number = 100) => {
+    // R9-5: a sell asks first, with what it sells
+    const pos = positions.find((p) => p.id === posId);
+    const ask = sellConfirmText({
+      name: pos ? (pos.tokenTicker.startsWith('$') ? pos.tokenTicker : `$${pos.tokenTicker}`) : 'this position', sellPct, mode: pos?.executionMode,
+      tokensHeld: pos?.quantityTokens, valueText: pos && Number.isFinite(pos.currentValueUsd) ? `$${pos.currentValueUsd.toFixed(2)}` : null,
+    });
+    if (!(await confirmSell(ask))) return;
     hftAudio.playOrderFill();
     const res = await engineClient.closeSniperPosition(posId, sellPct);
     if (res?.result?.success) {
       onAlertTrigger?.(
         'INFO',
-        'POSITION CLOSED',
+        sellDoneTitle(sellPct),
         res.result.message
       );
       refreshData();
@@ -430,7 +445,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     // S1: a manual snipe by address is a one-click trade too
     if (!snipeAmount.parsed.ok) { onAlertTrigger?.('WARNING', 'SNIPE NOT SENT', snipeAmount.parsed.reason); return; }
     const warning = liveClickWarning(tradingMode, `Sniping ${manualSnipeCa.trim().slice(0, 8)}… for ${formatSol(snipeAmount.parsed.sol)}`);
-    if (warning && !window.confirm(warning)) return;
+    if (warning && !(await confirmLiveClick(warning))) return;
     setManualSnipeLoading(true);
     hftAudio.playOrderFill();
     try {
@@ -470,7 +485,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   });
 
   return (
-    <div className={`fixed ${BELOW_HEADER_TOP} inset-x-0 bottom-0 z-40 flex items-start justify-center bg-black/85 backdrop-blur-md p-2 sm:p-4 overflow-y-auto`}>
+    <DialogFrame label="Memecoin social sniper" className={`fixed ${BELOW_HEADER_TOP} inset-x-0 bottom-0 z-40 flex items-start justify-center bg-black/85 backdrop-blur-md p-2 sm:p-4 overflow-y-auto`} alsoReach={[KILL_SWITCH_ID]}>
       <div className="relative w-full max-w-7xl bg-[#0B101D] border border-[#1E293B] rounded-2xl shadow-2xl flex flex-col my-2 sm:my-3 text-slate-200">
         {/* HEADER BAR */}
         <div className="px-5 py-4 border-b border-[#1E293B] bg-[#0E1526] flex flex-wrap items-center justify-between gap-3">
@@ -548,7 +563,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
               <Send className="w-3.5 h-3.5 text-blue-400" />
               <span>Alpha Signals Detected</span>
             </span>
-            <span className="font-bold text-cyan-300">{signals.length} Live</span>
+            <span className="font-bold text-cyan-300" data-testid="signals-count">{signalsRead === 'failed' ? 'not read' : signalsRead === 'pending' ? '—' : `${signals.length} Live`}</span>
           </div>
           <div className="p-3 border-r border-[#1E293B] flex items-center justify-between">
             <span className="text-slate-400 flex items-center space-x-1.5">
@@ -812,7 +827,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                             {/* X.com Link */}
                             <a
                               href={
-                                sanitizeExternalUrl(sig.socials?.twitter) ||
+                                sanitizeXProfileUrl(sig.socials?.twitter) ||
                                 (sig.source === 'X_TWITTER' && sig.authorHandle.startsWith('@')
                                   ? `https://x.com/${sig.authorHandle.replace('@', '')}`
                                   : `https://x.com/search?q=%24${sig.tokenTicker.replace('$', '')}+solana`)
@@ -821,15 +836,15 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                               rel="noreferrer"
                               className="px-2 py-0.5 rounded bg-sky-500/10 hover:bg-sky-500/20 text-sky-300 border border-sky-500/30 text-[10px] font-mono flex items-center space-x-1 transition"
                               title={
-                                sanitizeExternalUrl(sig.socials?.twitter)
-                                  ? `Token X link (creator-supplied, unverified): ${sanitizeExternalUrl(sig.socials?.twitter)}`
+                                sanitizeXProfileUrl(sig.socials?.twitter)
+                                  ? `Token X link (creator-supplied, unverified): ${sanitizeXProfileUrl(sig.socials?.twitter)}`
                                   : sig.source === 'X_TWITTER'
                                   ? `View Author @${sig.authorHandle} on X`
                                   : `Search $${sig.tokenTicker} on X.com`
                               }
                             >
                               <span className="font-bold text-[11px]">𝕏</span>
-                              <span>{sanitizeExternalUrl(sig.socials?.twitter) ? 'Token 𝕏' : sig.source === 'X_TWITTER' ? 'KOL 𝕏' : 'Search 𝕏'}</span>
+                              <span>{sanitizeXProfileUrl(sig.socials?.twitter) ? 'Token 𝕏' : sig.source === 'X_TWITTER' ? 'KOL 𝕏' : 'Search 𝕏'}</span>
                               <ExternalLink className="w-2 h-2 text-sky-400" />
                             </a>
 
@@ -878,7 +893,9 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                           ) : (
                             <button
                               onClick={() => handleSnipeSignal(sig)}
-                              className="px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs shadow-md shadow-emerald-950/40 flex items-center space-x-1.5 transition active:scale-95"
+                              disabled={snipeBlocked !== null}
+                              title={snipeBlocked ?? undefined}
+                              className="disabled:opacity-40 disabled:cursor-not-allowed px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs shadow-md shadow-emerald-950/40 flex items-center space-x-1.5 transition active:scale-95"
                             >
                               <Zap className="w-3.5 h-3.5" />
                               <span>Snipe {snipeAmount.parsed.ok ? formatSol(snipeAmount.parsed.sol) : '(set amount)'} ({tradingMode.label})</span>
@@ -956,7 +973,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                           {/* Token Name & CA */}
                           <td className="p-3">
                             <div className="flex items-center space-x-2">
-                              <span className="text-slate-500 font-bold">#{pool.trendingRank}</span>
+                              <span className="text-slate-500 font-bold" title="Trending rank from the feed; — when it gives none">{fmtRank(pool.trendingRank)}</span>
                               <div>
                                 <div className="font-bold text-white text-sm flex items-center space-x-1">
                                   <span>${pool.symbol}</span>
@@ -1007,7 +1024,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                           {/* Price & Change */}
                           <td className="p-3">
                             <div className="font-bold text-slate-200">
-                              ${pool.priceUsd < 0.001 ? pool.priceUsd.toFixed(6) : pool.priceUsd.toFixed(4)}
+                              {fmtUsdPrice(pool.priceUsd)}
                             </div>
                             <div className={`text-[11px] font-bold flex items-center space-x-0.5 ${isPositive ? 'text-emerald-400' : 'text-rose-400'}`}>
                               {isPositive ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
@@ -1068,7 +1085,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                 );
                               })}
                               <div className="text-slate-400">
-                                Top 10: <strong className="text-slate-200">{holderPct(pool.top10HoldersPct)}</strong>
+                                <span title="Share of the tokens off the bonding curve held by the 10 largest holders (not share of total supply)">Top 10 (off-curve):</span> <strong className="text-slate-200">{holderPct(pool.top10HoldersPct)}</strong>
                               </div>
                             </div>
                           </td>
@@ -1079,7 +1096,9 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                               onClick={() => {
                                 handleSnipePool(pool);
                               }}
-                              className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow transition active:scale-95 flex items-center space-x-1 ml-auto"
+                              disabled={snipeBlocked !== null}
+                              title={snipeBlocked ?? undefined}
+                              className="disabled:opacity-40 disabled:cursor-not-allowed px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow transition active:scale-95 flex items-center space-x-1 ml-auto"
                             >
                               <Zap className="w-3 h-3" />
                               <span>Snipe {snipeAmount.parsed.ok ? formatSol(snipeAmount.parsed.sol) : '(set amount)'}</span>
@@ -1111,30 +1130,14 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                     <label className="block text-slate-400 text-[10px] mb-1" data-testid="jito-tip-label">
                       {jitoUseText(jitoStatus).tipLabel}
                     </label>
-                    <input
-                      type="number"
-                      step="0.001"
-                      value={sniperConfig.jitoTipSol}
-                      onChange={(e) =>
-                        setSniperConfig({ ...sniperConfig, jitoTipSol: Number(e.target.value) })
-                      }
+                    <DecimalBox testId="sniper-jito-tip" ariaLabel="Jito tip (SOL)" value={sniperConfig.jitoTipSol} onValue={(n) => setSniperConfig({ ...sniperConfig, jitoTipSol: n })}
                       className="w-full bg-[#141B2D] border border-[#1E293B] rounded p-2 text-white font-mono outline-none focus:border-cyan-400"
                     />
                   </div>
 
-                  <div>
-                    <label className="block text-slate-400 text-[10px] mb-1">
-                      Take-Profit Target (%) (not used by exits)
-                    </label>
-                    <input
-                      type="number"
-                      value={sniperConfig.takeProfitPct}
-                      onChange={(e) =>
-                        setSniperConfig({ ...sniperConfig, takeProfitPct: Number(e.target.value) })
-                      }
-                      className="w-full bg-[#141B2D] border border-[#1E293B] rounded p-2 text-white font-mono outline-none focus:border-cyan-400"
-                    />
-                  </div>
+                  {/* UI report fix 4: a take-profit percentage box was here. Its value was read only by the box itself: this screen never
+                      posts the config, and the exits use the fixed ExitEngine rules (shown by ExitRulesNote), so it was removed. The Jito tip
+                      box stays: its value is sent with every snipe from this screen. */}
                 </div>
               </div>
 
@@ -1159,7 +1162,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
                 <button
                   onClick={handleManualSnipe}
-                  disabled={manualSnipeLoading || !manualSnipeCa}
+                  disabled={manualSnipeLoading || !manualSnipeCa || snipeBlocked !== null}
+                  title={snipeBlocked ?? undefined}
                   className="px-5 py-2 rounded-lg bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 text-black font-bold text-xs font-mono flex items-center space-x-1.5 transition active:scale-95"
                 >
                   <Zap className="w-4 h-4" />
@@ -1169,7 +1173,9 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
               {/* ACTIVE POSITIONS TABLE */}
               {(() => {
-                const filteredPositions = positions.filter((pos) => {
+                // R9-13: this card holds open positions only. Closed rows were counted as "N Open" and kept live Take/Dump buttons.
+                const openPositions = positions.filter((pos) => pos.status === 'OPEN');
+                const filteredPositions = openPositions.filter((pos) => {
                   if (!positionSearchQuery.trim()) return true;
                   const q = positionSearchQuery.toLowerCase().trim();
                   const ticker = (pos.tokenTicker || '').toLowerCase();
@@ -1188,7 +1194,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                           <span>Active Sniper Holdings &amp; Real-Time P&amp;L</span>
                         </span>
                         <span className="px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px] font-bold">
-                          {positions.length} Open
+                          {openPositions.length} Open
                         </span>
                       </div>
 
@@ -1217,7 +1223,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                       </div>
                     </div>
 
-                    {positions.length === 0 ? (
+                    {openPositions.length === 0 ? (
                       <div className="p-8 text-center text-slate-500 border border-[#1E293B] rounded-xl bg-[#0E1526] text-xs font-mono">
                         No active sniper positions. Use manual snipe or enable Autonomous Sniper to auto-enter high-conviction signals.
                       </div>
@@ -1260,6 +1266,15 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                         <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-800/80 text-cyan-300 border border-slate-700">
                                           {pos.chain}
                                         </span>
+                                        {pos.executionMode && (
+                                          <span
+                                            data-testid="position-mode"
+                                            title={pos.executionMode === 'LIVE' ? 'Real SOL position. Its exits keep running while the server is disarmed.' : 'Simulated position: no SOL moves.'}
+                                            className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${pos.executionMode === 'LIVE' ? 'bg-rose-950/80 text-rose-300 border-rose-500/50' : 'bg-slate-800/80 text-slate-300 border-slate-700'}`}
+                                          >
+                                            {pos.executionMode === 'LIVE' ? 'LIVE (real SOL)' : pos.executionMode}
+                                          </span>
+                                        )}
                                       </div>
 
                                       {pos.contractAddress && (
@@ -1290,11 +1305,12 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                     </div>
                                   </td>
                                   <td className="p-3 text-slate-300">{pos.platform}</td>
-                                  <td className="p-3 text-slate-300">${(pos.entryPriceUsd ?? 0).toFixed(6)}</td>
-                                  <td className="p-3 font-bold text-cyan-300">${(pos.currentPriceUsd ?? 0).toFixed(6)}</td>
+                                  <td className="p-3 text-slate-300">{fmtUsdPrice(pos.entryPriceUsd)}</td>
+                                  <td className="p-3 font-bold text-cyan-300">{fmtUsdPrice(pos.currentPriceUsd)}</td>
                                   <td className="p-3 text-slate-200">
                                     ${(pos.currentValueUsd ?? 0).toFixed(2)}{' '}
                                     <span className="text-slate-500 text-[10px]">(${(pos.costBasisUsd ?? 0).toFixed(2)} cost)</span>
+                                    <span className="block text-slate-500 text-[10px]" data-testid="holding-qty">{fmtSmall(pos.quantityTokens, 0)} tokens held</span>
                                   </td>
                                   <td className="p-3">
                                     <span
@@ -1344,10 +1360,11 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                 <div className="p-3 bg-[#0E1526] border-b border-[#1E293B] flex items-center justify-between">
                   <div className="flex items-center space-x-2 text-xs">
                     <Send className="w-4 h-4 text-blue-400" />
-                    <span className="font-bold text-white">@ApexQuantHftSniperBot (Telegram Webhook Stream)</span>
+                    <span className="font-bold text-white">Local command console (not connected to Telegram)</span>
                   </div>
-                  <span className="text-[10px] text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/30">
-                    STATUS: POLLING ACTIVE
+                  {/* UI report fix 3: nothing polls Telegram (getUpdates and setWebhook are not implemented), so the badge says that */}
+                  <span data-testid="telegram-status-badge" title="Commands typed here run on this server only. Telegram messages are never fetched, so /panic_sell from a phone does nothing; use the PANIC button here." className="text-[10px] text-amber-300 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/30">
+                    STATUS: NOT POLLING TELEGRAM (local console)
                   </span>
                 </div>
 
@@ -1525,7 +1542,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
       {/* COMPREHENSIVE OUTSIDE WORLD CONNECTIVITY & SIMULATION AUDIT MODAL */}
       {showDiagnosticsModal && diagnosticsResult && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-6">
+        <DialogFrame label="Connectivity audit" className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-6">
           <div className="bg-[#0A0E1A] border border-[#1E293B] rounded-2xl max-w-4xl w-full max-h-[90vh] flex flex-col shadow-2xl overflow-hidden font-mono">
             {/* Modal Header */}
             <div className="p-4 border-b border-[#1E293B] bg-[#0E1424] flex items-center justify-between">
@@ -1769,7 +1786,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
               </div>
             </div>
           </div>
-        </div>
+        </DialogFrame>
       )}
 
       {/* External Token Explorer & Web Platform Modal */}
@@ -1778,6 +1795,6 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
         onClose={() => setSelectedExternalToken(null)}
         tokenData={selectedExternalToken}
       />
-    </div>
+    </DialogFrame>
   );
 };

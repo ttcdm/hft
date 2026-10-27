@@ -46,8 +46,16 @@ export const WORST_CASE_LOSS_FRACTION = 1;
 /** Q56: a SOL price older than this no longer converts the USD floor at full trust (see effectiveMaxDailyLossSol). */
 export const DAILY_LOSS_PRICE_MAX_AGE_MS = 60 * 60_000;
 
+/** R3-3 (R7-6): `app_settings` key holding the daily-loss latch per mode, `{ LIVE?: { at, message }, PAPER?: { at, message } }`. */
+export const DAILY_LOSS_LATCH_SETTING = 'risk.dailyLossLatch';
+
 export class HardenedRiskEngine {
   private limits: PreTradeRiskLimits;
+  /**
+   * R3-3: true for the process-wide engine (the `riskEngine` singleton): it restores the daily-loss latch at construction and saves every
+   * change. Engines a test or script builds on its own keep their state in memory, so they never latch (or unlatch) the next real boot.
+   */
+  private readonly persistent: boolean;
 
   private circuitBreakerState: CircuitBreakerState = 'CLOSED';
   private killSwitchActive = false;
@@ -56,7 +64,8 @@ export class HardenedRiskEngine {
   private consecutiveRpcFailures = 0;
   private readonly maxConsecutiveRpcFailures = 3;
 
-  constructor() {
+  constructor(opts: { persistent?: boolean } = {}) {
+    this.persistent = opts.persistent === true;
     const cfg = executionConfig.getConfig();
     this.limits = {
       maxPositionSol: cfg.maxPositionSizeSol,
@@ -76,6 +85,7 @@ export class HardenedRiskEngine {
       cooldownAfterFailedTradeMs: 15000,
       cooldownPerMintMs: 30000,
     };
+    if (this.persistent) this.restoreDailyLossLatch();
   }
 
   public getLimits(): PreTradeRiskLimits {
@@ -109,7 +119,8 @@ export class HardenedRiskEngine {
 
   /**
    * N-61 (3C): once the floor is reached, buys in that mode stay refused until an operator clears the latch, even after the losses
-   * leave the 24 h window. In memory only: after a restart the window still holds the losses and the next buy latches again.
+   * leave the 24 h window. R3-3: the process-wide engine saves it (DAILY_LOSS_LATCH_SETTING, plus a journal row) and restores it at boot,
+   * so a restart does not release it either.
    */
   private dailyLossLatch = new Map<ExecutionMode, { at: number; message: string }>();
   private warnedCapBelowOrder = false;
@@ -118,11 +129,46 @@ export class HardenedRiskEngine {
     return this.dailyLossLatch.get(mode) ?? null;
   }
 
-  /** Operator clear (POST /api/auto/resume with clearDailyLossLatch). Gate 10 still refuses while the window itself is below the floor. */
-  public clearDailyLossLatch(): void {
-    if (this.dailyLossLatch.size === 0) return;
-    Logger.warn(`Daily loss latch cleared by operator for ${[...this.dailyLossLatch.keys()].join(', ')}`);
-    this.dailyLossLatch.clear();
+  /**
+   * Operator clear (POST /api/auto/resume with clearDailyLossLatch), for ONE mode (R5-15: a PAPER clear must never release a LIVE latch).
+   * Gate 10 still refuses while the window itself is below the floor. Returns false when the clear could not be saved (it holds in memory).
+   */
+  public clearDailyLossLatch(mode: ExecutionMode): boolean {
+    if (!this.dailyLossLatch.has(mode)) return true;
+    Logger.warn(`Daily loss latch cleared by operator for ${mode}`);
+    this.dailyLossLatch.delete(mode);
+    if (!this.persistent) return true;
+    workstationDb.logJournal('DAILY_LOSS_LATCH_CLEARED', 'daily-loss', mode, {});
+    return this.saveDailyLossLatch();
+  }
+
+  private setDailyLossLatch(mode: ExecutionMode, latch: { at: number; message: string }): void {
+    this.dailyLossLatch.set(mode, latch);
+    if (!this.persistent) return;
+    workstationDb.logJournal('DAILY_LOSS_LATCHED', 'daily-loss', mode, latch);
+    if (!this.saveDailyLossLatch()) Logger.error(`Daily loss latch for ${mode} could not be saved; it holds until this process restarts`);
+  }
+
+  private saveDailyLossLatch(): boolean {
+    return workstationDb.setSetting(DAILY_LOSS_LATCH_SETTING, Object.fromEntries(this.dailyLossLatch));
+  }
+
+  /** R3-3: bring back the latches saved by the last run. A malformed entry is skipped with a warning; nothing is latched from nothing. */
+  private restoreDailyLossLatch(): void {
+    const saved = workstationDb.getSetting<Record<string, unknown>>(DAILY_LOSS_LATCH_SETTING);
+    if (!saved || typeof saved !== 'object') return;
+    for (const mode of ['LIVE', 'PAPER'] as ExecutionMode[]) {
+      const v = saved[mode] as { at?: unknown; message?: unknown } | undefined;
+      if (!v) continue;
+      if (typeof v.at === 'number' && Number.isFinite(v.at)) {
+        this.dailyLossLatch.set(mode, { at: v.at, message: typeof v.message === 'string' ? v.message : 'latched before the restart' });
+        Logger.warn(`Daily loss latch for ${mode} restored from before the restart (latched at ${new Date(v.at).toISOString()})`);
+      } else {
+        // Fail closed: an entry we cannot read still says a latch was set, so keep it latched from now.
+        this.dailyLossLatch.set(mode, { at: Date.now(), message: 'a latch saved before the restart could not be read' });
+        Logger.warn(`Daily loss latch for ${mode}: saved entry unreadable; latched until an operator clears it`);
+      }
+    }
   }
 
   private dailyWindowStartMs(): number {
@@ -359,7 +405,7 @@ export class HardenedRiskEngine {
     const maxDailyLossSol = this.effectiveMaxDailyLossSol();
     if (dailyTotalPnL <= -maxDailyLossSol) {
       const message = `net PnL over the last 24 h ${dailyTotalPnL.toFixed(4)} SOL reached the floor of -${maxDailyLossSol.toFixed(4)} SOL`;
-      this.dailyLossLatch.set(req.executionMode, { at: now, message });
+      this.setDailyLossLatch(req.executionMode, { at: now, message });
       return logAndReturn(
         false,
         'DAILY_LOSS_LIMIT',
@@ -443,7 +489,7 @@ export class HardenedRiskEngine {
   }
 }
 
-export const riskEngine = new HardenedRiskEngine();
+export const riskEngine = new HardenedRiskEngine({ persistent: true });
 
 /** Max share of an order that may go to round-trip execution cost before the entry is refused. */
 export const MAX_ROUND_TRIP_COST_FRACTION = 0.2;

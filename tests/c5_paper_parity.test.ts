@@ -154,8 +154,8 @@ describe('C5: PAPER runs the same gate as LIVE', () => {
     (live as any).inFlightBuyMints.add('SOME_OTHER_MINT_IN_FLIGHT');
     (live as any).inFlightReservedSol = 0.0001;
     const spy = vi.spyOn(riskEngine, 'evaluateOrder');
-    await live.executeTrade(req(MINT, known(MINT), 0.003));
-    expect(spy).toHaveBeenCalled();
+    const r = await live.executeTrade(req(MINT, known(MINT), 0.005)); // R8-6: 0.003 SOL no longer covers the three-sell round trip
+    expect(spy, r.error).toHaveBeenCalled();
     const arg = spy.mock.calls[0][0];
     expect(arg.currentOpenPositionsCount).toBeGreaterThanOrEqual(1); // the in-flight buy counts as a position
     expect(arg.currentTotalExposureSol).toBeGreaterThanOrEqual(0.0001); // and its reserved SOL as exposure

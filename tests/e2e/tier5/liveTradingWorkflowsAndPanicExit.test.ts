@@ -400,12 +400,20 @@ describe('Tier 5 [mock-level]: Live Trading Workflows, Token Safety & Panic Exit
         correlationId: 'corr-123',
       });
 
+      // R5-40: the Plug & Play buy runs executeSnipe's gates (a real pool, a SOL price, the confluence gate, off for this routing check)
+      const { solPriceService } = await import('../../../server/market/solPriceService');
+      const { memecoinAggregator } = await import('../../../server/memecoinAggregator');
+      const { newPumpPool } = await import('../../fixtures/auto');
+      solPriceService.setPrice(150, 'TEST_FIXTURE');
+      memecoinAggregator.setConfluenceGating(false);
+      const { mint } = newPumpPool('NONE');
       const res = await walletTrader.executeLiveSnipe({
-        mint: VALID_PUMP_MINT_1.toBase58(),
+        mint,
         symbol: 'SNIPE',
         name: 'Snipe Coin',
         amountSol: 0.005,
       });
+      memecoinAggregator.setConfluenceGating(true);
 
       expect(coordSpy).toHaveBeenCalled();
       expect(res.success).toBe(true);
@@ -465,10 +473,11 @@ describe('Tier 5 [mock-level]: Live Trading Workflows, Token Safety & Panic Exit
       executionCoordinator.armLiveTrading(true, 'CONFIRM_LIVE_TRADING_RISK');
 
       // Mock singleton closePosition for panic liquidate
-      const closeSpy = vi.spyOn(executionCoordinator, 'closePosition').mockResolvedValue({
-        success: true,
-        pnlSol: 0.02,
-        status: 'CLOSED',
+      // the stub closes the row as a real full sell would: the panic reports any LIVE row still open afterwards as STILL_OPEN
+      const closeSpy = vi.spyOn(executionCoordinator, 'closePosition').mockImplementation(async (id: string) => {
+        const row = workstationDb.loadPositions().find((p) => p.id === id);
+        if (row) workstationDb.savePosition({ ...row, status: 'CLOSED', tokenQuantityRaw: '0' } as any);
+        return { success: true, pnlSol: 0.02, status: 'CLOSED' };
       });
 
       const report = await walletTrader.panicLiquidateAll();

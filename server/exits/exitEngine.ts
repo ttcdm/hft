@@ -38,7 +38,7 @@ export class ExitEngine {
    * on a round trip (and is far below the ~25% a 0.005 SOL order needs to cover its fixed per-wallet costs, which no ratio can fix).
    */
   public static readonly TRAILING_STOP_MIN_ENTRY_MULTIPLE = 1.03;
-  public static readonly STAGE_2_TRAILING_RATIO = 0.90;      // 10% below HWM for remaining 34%
+  public static readonly STAGE_2_TRAILING_RATIO = 0.90;      // 10% below HWM for what is left after TP2 (about 45% of the original)
   public static readonly TP1_TRIGGER_PCT = 30.0;
   public static readonly TP1_SELL_PCT = 33;
   public static readonly TP2_TRIGGER_PCT = 60.0;
@@ -51,10 +51,11 @@ export class ExitEngine {
    * 1. Profit percentage: ((currentPrice - entryPrice) / entryPrice) * 100
    * 2. High-Water Mark: max(highWaterMarkSol, currentPriceSol)
    * 3. Monotonic trailing stop: ratchets to max(HWM * 0.85, entry * 1.03) once profit >= +15%
-   * 4. 3-stage take-profit ladder:
-   *    - Stage 0 -> 1: sell 33% @ +30%
-   *    - Stage 1 -> 2: sell 33% @ +60%
-   *    - Stage 2: remaining 34% trails with HWM * 0.90
+   * 4. 3-stage take-profit ladder. Every sell percentage is a share of what the position holds at that moment (closePosition, the
+   *    paper engine and the backtest replay all apply it to the current quantity), not of the original buy (R2-6):
+   *    - Stage 0 -> 1: sell 33% of the holding @ +30% (67% of the original left)
+   *    - Stage 1 -> 2: sell 33% of what is left @ +60% (about 22% of the original; about 45% left)
+   *    - Stage 2: the rest (about 45% of the original) trails with HWM * 0.90
    * 5. Stale position exit: sell 100% after 30 min if profit < 5%
    * 6. Hard stop loss: sell 100% if profit <= -20%
    */
@@ -77,7 +78,7 @@ export class ExitEngine {
     // Calculate candidate trailing stop
     let candidateStop = 0;
     if (stage >= 2) {
-      // Stage 2: Remaining 34% trails with a 10% stop below HWM (candidateStop = newHwm * 0.90)
+      // Stage 2: the rest (about 45% of the original, see the ladder above) trails with a 10% stop below HWM (candidateStop = newHwm * 0.90)
       candidateStop = newHwm * ExitEngine.STAGE_2_TRAILING_RATIO;
     } else if (profitPct >= ExitEngine.TRAILING_STOP_TRIGGER_PCT) {
       // Ratchets to newHwm * 0.85 once profit >= +15%, but never below entry * 1.03 (S3)
@@ -117,7 +118,7 @@ export class ExitEngine {
 
     // 3. Take Profit Ladder
     if (stage === 0 && profitPct >= ExitEngine.TP1_TRIGGER_PCT) {
-      // Stage 0 -> Stage 1: sell 33%, exitStage = 1
+      // Stage 0 -> Stage 1: sell 33% of the holding, exitStage = 1
       return {
         shouldExit: true,
         sellPercentage: ExitEngine.TP1_SELL_PCT,
@@ -131,7 +132,7 @@ export class ExitEngine {
     }
 
     if (stage === 1 && profitPct >= ExitEngine.TP2_TRIGGER_PCT) {
-      // Stage 1 -> Stage 2: sell 33%, exitStage = 2; trailing stop ratchets to 10% below HWM
+      // Stage 1 -> Stage 2: sell 33% of what is left (about 22% of the original), exitStage = 2; trailing stop ratchets to 10% below HWM
       const stage2Stop = newHwm * ExitEngine.STAGE_2_TRAILING_RATIO;
       newTrailingStop = Math.max(newTrailingStop, stage2Stop);
       return {

@@ -75,7 +75,8 @@ describe('H3: every stats number traces to a journal row', () => {
       { stage: 'exit', outcome: 'EXIT', positionId: 'a', solDelta: 0.007, inputs: null },
       { stage: 'fill', outcome: 'BOUGHT', positionId: 'b', solDelta: -0.0055, inputs: { feesSol: 0.0005 } },
     ];
-    const s = computeJournalStats(rows, (id) => (id === 'a' ? 'CLOSED' : 'OPEN'));
+    // R6-3: net PnL is the position ledger's realized PnL, not the journaled deltas (a PAPER exit writes none)
+    const s = computeJournalStats(rows, (id) => (id === 'a' ? { status: 'CLOSED', realizedPnLSol: 0.0015 } : { status: 'OPEN' }));
     expect(s).toEqual({ seen: 3, rejectedByStage: { watch: 1 }, wouldBuy: 0, bought: 2, open: 1, closed: 1, netPnlSol: expect.closeTo(0.0015, 9), feesPaidSol: expect.closeTo(0.001, 9), winRate: 1 });
   });
 
@@ -91,8 +92,11 @@ describe('H3: every stats number traces to a journal row', () => {
     expect(after.bought - before.bought).toBe(1);
     expect(after.closed - before.closed).toBe(1);
     const rows = workstationDb.loadDecisions({ mint });
-    const delta = rows.reduce((a, r) => a + (r.solDelta ?? 0), 0);
-    expect(after.netPnlSol - before.netPnlSol).toBeCloseTo(delta, 12);
+    // R6-3: the PAPER exit's realized PnL from the position ledger (PAPER journals no SOL delta, so the old sum was always 0)
+    const realized = workstationDb.loadPositions().find((p) => p.id === d.positionId)!.realizedPnLSol ?? 0;
+    expect(realized).not.toBe(0);
+    expect(after.netPnlSol - before.netPnlSol).toBeCloseTo(realized, 12);
+    expect(after.mode).toBe('PAPER');
     const fee = rows.find((r) => r.outcome === 'BOUGHT')!.inputs.feesSol;
     expect(after.feesPaidSol - before.feesPaidSol).toBeCloseTo(fee, 12);
   });

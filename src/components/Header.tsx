@@ -178,12 +178,14 @@ export const Header: React.FC<HeaderProps> = ({
     }
   };
 
-  // UI-6: below 1024 px the header wraps onto more rows instead of running off the right edge, so the nav and KILL SWITCH stay reachable
+  // UI-6 / R9-8: the header wraps onto more rows at every width instead of running off the right edge (at 1024 px it did not wrap and
+  // KILL SWITCH sat past the edge). The right-hand group wraps too, and KILL SWITCH never shrinks, so it is always on screen.
   return (
     <header
       ref={headerRef}
       id="apex-header"
-      className="min-h-16 lg:h-16 border-b border-[#1E293B] bg-[#0A0E17]/98 backdrop-blur px-3 sm:px-4 lg:px-6 py-2 lg:py-0 flex flex-wrap lg:flex-nowrap gap-y-2 items-center justify-between sticky top-0 z-50 w-full"
+      data-testid="apex-header"
+      className="min-h-16 border-b border-[#1E293B] bg-[#0A0E17]/98 backdrop-blur px-3 sm:px-4 lg:px-6 py-2 flex flex-wrap gap-y-2 items-center justify-between sticky top-0 z-50 w-full max-w-full"
     >
       {/* 1. BRAND & FEED SELECTOR */}
       <div className="flex items-center space-x-2.5 sm:space-x-3 flex-shrink-0">
@@ -262,14 +264,14 @@ export const Header: React.FC<HeaderProps> = ({
       </nav>
 
       {/* 3. RIGHT CONTROLS: AUTO-PROFIT PILL, QUANT SUITE, DEPLOY, KILL SWITCH */}
-      <div className="flex items-center space-x-1.5 sm:space-x-2 flex-shrink-0">
+      <div data-testid="header-right" className="flex flex-wrap items-center justify-end gap-1.5 sm:gap-2 min-w-0 ml-auto">
         <LiveOpenChip live={profitSummary?.live} />
         {/* Q35: today's realized and the open positions' marked P&L, as the server reports them (a dash when it cannot say) */}
         <button
           id="btn-auto-profit-ticker"
           onClick={() => handleNavClick('PLUG_AND_PLAY')}
           title="Realized profit today (net of fees) and the open positions' profit at the curve spot price (exit fee, price impact and tip NOT taken off), in USD at today's SOL price, from the server. Click for the wallet positions."
-          className={`hidden min-[1500px]:flex items-center space-x-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-mono transition ${
+          className={`hidden sm:flex items-center space-x-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-mono transition ${
             { up: 'bg-emerald-950/70 border-emerald-500/40 text-emerald-300', down: 'bg-rose-950/70 border-rose-500/40 text-rose-300', flat: 'bg-slate-900 border-slate-700 text-slate-300', unknown: 'bg-slate-900 border-slate-700 text-slate-500' }[isStale(profitAt, profitFailed, nowTick, PILL_STALE_MS) ? 'unknown' : pillTone(profitSummary)]
           }`}
         >
@@ -433,7 +435,7 @@ export const Header: React.FC<HeaderProps> = ({
         <button
           id="btn-emergency-kill-switch"
           onClick={onToggleKillSwitch}
-          className={`px-2.5 sm:px-3 py-1 rounded-lg border text-xs font-black font-mono tracking-wider transition flex items-center space-x-1 ${
+          className={`flex-shrink-0 whitespace-nowrap px-2.5 sm:px-3 py-1 rounded-lg border text-xs font-black font-mono tracking-wider transition flex items-center space-x-1 ${
             isHalted
               ? 'bg-emerald-500/15 hover:bg-emerald-500/25 border-emerald-500/50 text-emerald-400 shadow-lg shadow-emerald-500/15'
               : 'bg-red-500/15 hover:bg-red-500/25 border-red-500/50 text-red-400 shadow-lg shadow-red-500/15 animate-pulse'

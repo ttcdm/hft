@@ -1,6 +1,6 @@
 import { EventEmitter } from 'events';
 import { Logger, endpointOrigin } from './middleware/enterprise';
-import { executionCoordinator } from './execution/coordinator';
+import { executionCoordinator, type CloseOutcome } from './execution/coordinator';
 import { localSigner } from './solana/signer';
 import { workstationDb } from './db/database';
 import { riskEngine } from './risk/riskEngine';
@@ -191,7 +191,7 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     positionId: string,
     sellPct = 100,
     reason = 'Manual Close'
-  ): Promise<{ success: boolean; realizedPnLSol: number; status?: string; error?: string; adoptedPendingSell?: boolean; adoptedPartial?: boolean; remainingTokensRaw?: string }> {
+  ): Promise<{ success: boolean; realizedPnLSol: number; status?: string; error?: string; outcome?: CloseOutcome; solMoved?: number; remainingTokensRaw?: string }> {
     const res = await executionCoordinator.closePosition(positionId, sellPct, reason);
     this.emit('wallet_state_updated', this.getState());
     return {
@@ -199,9 +199,9 @@ class PlugAndPlayWalletTrader extends EventEmitter {
       realizedPnLSol: res.pnlSol,
       status: res.status,
       error: res.error,
-      // R6-9: the close only booked an earlier sell that had landed unseen; with adoptedPartial the position is still open
-      ...(res.adoptedPendingSell ? { adoptedPendingSell: true } : {}),
-      ...(res.adoptedPartial ? { adoptedPartial: true, remainingTokensRaw: res.remainingTokensRaw } : {}),
+      outcome: res.outcome, // R6-9: adopted an earlier sell, or an assumed loss on an empty wallet
+      solMoved: res.solMoved,
+      ...(res.remainingTokensRaw !== undefined ? { remainingTokensRaw: res.remainingTokensRaw } : {}), // an adopted partial: still held
     };
   }
 

@@ -35,6 +35,8 @@ export const EXIT_LADDER_SELL_COUNT = 3;
 export const EXIT_LOOP_ALERT_AFTER = 3;
 
 export const MARK_STALE_MS = 15_000;
+/** R6-9: a close that did something other than sell now: adopted an earlier landed sell, or found the wallet empty and booked an assumed loss. */
+export type CloseOutcome = 'ADOPTED_EARLIER_SELL' | 'ADOPTED_EARLIER_SELL_FILL_UNREAD' | 'ASSUMED_LOSS_EMPTY_WALLET';
 /** C4: if a direct read still fails after this long, raise an operator alert. */
 export const MARK_ALERT_AFTER_MS = 60_000;
 export const MARK_RETRY_BASE_MS = 60_000;
@@ -92,9 +94,11 @@ export interface ExecuteTradeRequest {
 }
 
 /**
- * What closePosition did. R5-7/R6-9: `adoptedPendingSell` is set when the call sent nothing and instead booked an earlier sell of this
- * position that had landed unseen; `adoptedPartial` (with `remainingTokensRaw`) when that earlier sell was a partial, so the position is
- * still open (PARTIALLY_CLOSED) although the call asked for more. A caller that asked for 100% must not report it as closed.
+ * What closePosition did. R5-7/R6-9: `outcome` is set when the call sold nothing now: ADOPTED_EARLIER_SELL (it booked an earlier sell of
+ * this position that had landed unseen), ADOPTED_EARLIER_SELL_FILL_UNREAD (the same, but the fill could not be read, so the sold share of
+ * the basis is booked as an assumed loss until reconciliation reads it), or ASSUMED_LOSS_EMPTY_WALLET (the wallet held none of the token).
+ * After an adopted sell that was a partial, status is PARTIALLY_CLOSED and `remainingTokensRaw` is what is still held: the position is
+ * still open although the call asked for more, and a caller that asked for 100% must not report it as closed.
  */
 export interface ClosePositionResult {
   success: boolean;
@@ -103,9 +107,18 @@ export interface ClosePositionResult {
   error?: string;
   solMoved?: number;
   notSent?: boolean;
-  adoptedPendingSell?: boolean;
-  adoptedPartial?: boolean;
+  outcome?: CloseOutcome;
   remainingTokensRaw?: string;
+}
+
+/** The close only booked an earlier sell (nothing was sent now). */
+export function isAdoptedClose(r: { outcome?: CloseOutcome }): boolean {
+  return r.outcome === 'ADOPTED_EARLIER_SELL' || r.outcome === 'ADOPTED_EARLIER_SELL_FILL_UNREAD';
+}
+
+/** The close only booked an earlier partial sell, so the position is still open. */
+export function isAdoptedPartialClose(r: { outcome?: CloseOutcome; status?: string }): boolean {
+  return isAdoptedClose(r) && r.status === 'PARTIALLY_CLOSED';
 }
 
 export interface ExecutionResponse {
@@ -4062,11 +4075,12 @@ export class ExecutionCoordinator {
           await this.syncRealWalletBalance();
           // S2: with no readable fill this call moved nothing it can account for. P2.3: with one, it reports the earlier sell's net proceeds,
           // which reached the wallet unjournaled, so the wallet audit can explain them.
-          // R6-9: say that this call only adopted the earlier sell, and whether the position is still open after it
-          const adoptedInfo = { adoptedPendingSell: true, ...(target.status === 'PARTIALLY_CLOSED' ? { adoptedPartial: true, remainingTokensRaw: onChain!.toString() } : {}) };
+          // R6-9: `outcome` says this call sent nothing and only adopted the earlier sell; with status PARTIALLY_CLOSED that sell was a
+          // partial and the position is still open (remainingTokensRaw says how much is left)
+          const adoptedInfo = target.status === 'PARTIALLY_CLOSED' ? { remainingTokensRaw: onChain!.toString() } : {};
           return booked
-            ? { success: true, pnlSol: adopted!.actualRealizedPnLSol, status: target.status, solMoved: adopted!.actualNetSolProceedsLamports / 1e9, ...adoptedInfo }
-            : { success: true, pnlSol: -unreadLossSol, status: target.status, solMoved: 0, ...adoptedInfo };
+            ? { success: true, pnlSol: adopted!.actualRealizedPnLSol, status: target.status, solMoved: adopted!.actualNetSolProceedsLamports / 1e9, outcome: 'ADOPTED_EARLIER_SELL' as const, ...adoptedInfo }
+            : { success: true, pnlSol: -unreadLossSol, status: target.status, solMoved: 0, outcome: 'ADOPTED_EARLIER_SELL_FILL_UNREAD' as const, ...adoptedInfo };
         }
         // P2.1: the window is only an upper bound. Once the blockhash has expired and the signature has no status, the sell can never land,
         // so the next pass (a stop-loss included) may sell at once instead of waiting out the rest of the 100 s.
@@ -4111,7 +4125,7 @@ export class ExecutionCoordinator {
             target.exitReason = 'RECONCILED_ZERO_BALANCE: the wallet held no tokens when the sell was prepared (REALIZED_ASSUMED_LOSS)';
             workstationDb.savePosition(target);
             this.raiseOperatorAlert('POSITION_BALANCE_MISSING', `${target.symbol || target.mint} was closed without a sell: the wallet held none of it. Booked as a loss of its cost basis (${assumedLossSol.toFixed(6)} SOL), since no sell was found.`, positionId);
-            return { success: true, pnlSol: -assumedLossSol, status: 'CLOSED', solMoved: 0 }; // S2: nothing was sent, so nothing moved
+            return { success: true, pnlSol: -assumedLossSol, status: 'CLOSED', solMoved: 0, outcome: 'ASSUMED_LOSS_EMPTY_WALLET' }; // S2: nothing was sent, so nothing moved; R6-9: the PnL is assumed
           }
           target.costBasisLamports = Math.round(target.costBasisLamports * Number(held) / Number(totalTokensRaw));
           target.tokenQuantityRaw = held.toString();
@@ -4626,7 +4640,7 @@ export class ExecutionCoordinator {
   private dispatchExit(pos: NormalizedPosition, sellPct: number, reason: string, priorExitStage: NormalizedPosition['exitStage'], newExitStage: NormalizedPosition['exitStage']): Promise<void> {
     return this.closePosition(pos.id, sellPct, reason).then((exitRes) => {
       // R5-7: an exit that only adopted an earlier landed sell sold nothing for this decision; the adoption booked that sell's own stage
-      if (exitRes.success && !exitRes.adoptedPendingSell && newExitStage !== priorExitStage) {
+      if (exitRes.success && !isAdoptedClose(exitRes) && newExitStage !== priorExitStage) {
         const after = workstationDb.loadPositions(undefined, 'ACTIVE').find((p) => p.id === pos.id);
         if (after) {
           after.exitStage = newExitStage;

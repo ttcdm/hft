@@ -31,7 +31,7 @@ const line = (recs: Rec[], part: string) => recs.find((r) => r.step.includes(par
 
 const RENT = 2_039_280;
 const FEE = 5_000;
-function fakeSessionApp(o: { countRent?: boolean; refuseAt?: number; loseReadAt?: number; makeThrows?: boolean; lossTriggersPending?: boolean; ackNotSaved?: boolean; recentKellyNegative?: boolean } = {}) {
+function fakeSessionApp(o: { countRent?: boolean; refuseAt?: number; loseReadAt?: number; makeThrows?: boolean; lossTriggersPending?: boolean; ackNotSaved?: boolean; recentKellyNegative?: boolean; lifetimeKellyNegative?: boolean } = {}) {
   let lamports = 1_000_000_000;
   let reads = 0;
   const state = {
@@ -65,6 +65,8 @@ function fakeSessionApp(o: { countRent?: boolean; refuseAt?: number; loseReadAt?
         if (o.lossTriggersPending && !(state.acks > 0 && !o.ackNotSaved)) {
           return { outcome: 'REJECTED', stage: 'execute', reason: 'REJECTED: LOSS_TRIGGERS: LOSS_STREAK (20 losses in a row (bug detector)), over the last LIVE trades (manual and auto). Check them, then acknowledge with POST /api/auto/resume {ackLossTriggers:true}' };
         }
+        // the lifetime Kelly refusal as the run of 2026-10-27 saw it (executeSnipe's CapitalSizer check, 25+ closed LIVE trades in the scratch DB)
+        if (o.lifetimeKellyNegative) return { outcome: 'REJECTED', stage: 'size', reason: 'REJECTED: Capital sizing failed (NEGATIVE_OR_ZERO_EXPECTANCY)' };
         if (o.recentKellyNegative) return { outcome: 'REJECTED', stage: 'execute', reason: 'REJECTED: Capital sizing failed (NEGATIVE_RECENT_EXPECTANCY: raw Kelly -4.0000 over the last 25 closed LIVE trades, win rate 0.0%, payoff 0.25)' };
         if (o.refuseAt === i) return { outcome: 'REJECTED', stage: 'eligibility', reason: 'ELIGIBILITY_CHECK_FAILED' };
         const v = watch.getVerdict(c.mint);
@@ -122,6 +124,16 @@ describe('3K (m): a 5-buy DEVNET_LIVE session, spentSol against the wallet (3B)'
     expect(fails(r.recs), JSON.stringify(r.recs, null, 1)).toEqual([]);
     const sk = r.recs.find((x) => x.skip);
     expect(sk?.detail).toMatch(/NEGATIVE_RECENT_EXPECTANCY/);
+    expect(sk?.detail).toMatch(/APEX_E2E_SCRATCH/);
+    expect(f.state).toMatchObject({ candidates: 1, gating: true, mode: 'OFF', cleaned: 1 });
+  });
+  it('the lifetime Kelly refusal (NEGATIVE_OR_ZERO_EXPECTANCY, no operator acknowledgement) on the first buy: a SKIP naming it, not a FAIL', async () => {
+    const r = recorder();
+    const f = fakeSessionApp({ lifetimeKellyNegative: true });
+    await sessionSpendMatchesWallet({ ...r, coordinator: f.coordinator }, f.deps);
+    expect(fails(r.recs), JSON.stringify(r.recs, null, 1)).toEqual([]);
+    const sk = r.recs.find((x) => x.skip);
+    expect(sk?.detail).toMatch(/Capital sizing failed \(NEGATIVE_OR_ZERO_EXPECTANCY\)/);
     expect(sk?.detail).toMatch(/APEX_E2E_SCRATCH/);
     expect(f.state).toMatchObject({ candidates: 1, gating: true, mode: 'OFF', cleaned: 1 });
   });

@@ -1876,9 +1876,10 @@ export interface SessionSpendDeps {
  * R8-8: every LIVE buy is refused while NEGATIVE_EXPECTANCY or LOSS_STREAK holds over the last 20 closed LIVE trades since the operator's
  * acknowledgement, and APEX_E2E_SCRATCH (the harness DB) is reused on purpose, so the harness's own earlier test trades (every one loses
  * its fees) trip both. The step first acknowledges them as the operator does (POST /api/auto/resume {ackLossTriggers:true}, RUNBOOK
- * section 6; the same `resume` the route calls); an acknowledgement that cannot be saved is a FAIL and nothing is bought. The recent-window
- * Kelly refusal (NEGATIVE_RECENT_EXPECTANCY, the last 25 closed LIVE trades) has no acknowledgement: on the first buy it is a SKIP naming
- * it (the gate works; the scratch DB's history is what it judges), and a fresh APEX_E2E_SCRATCH runs the step.
+ * section 6; the same `resume` the route calls); an acknowledgement that cannot be saved is a FAIL and nothing is bought. The two Kelly
+ * refusals have no acknowledgement: the lifetime one ("Capital sizing failed (NEGATIVE_OR_ZERO_EXPECTANCY)", every closed LIVE trade once
+ * there are 25) and R8-8's recent window (NEGATIVE_RECENT_EXPECTANCY, the last 25). Either on the first buy is a SKIP naming it (the gate
+ * works; the scratch DB's history is what it judges), and a fresh APEX_E2E_SCRATCH runs the step.
  */
 export async function sessionSpendMatchesWallet(s: Pick<HarnessSteps, 'rec' | 'skip' | 'sleep' | 'coordinator'>, d: SessionSpendDeps, opts: { buys?: number; orderSol?: number } = {}): Promise<number> {
   const L = '(m) 3B: DEVNET_LIVE session spend';
@@ -1927,8 +1928,10 @@ export async function sessionSpendMatchesWallet(s: Pick<HarnessSteps, 'rec' | 's
       const after = await readWithRetry(d.balanceLamports, s.sleep);
       const open = d.openLive();
       maxOpen = Math.max(maxOpen, open.length);
-      if (bought === 0 && dec.outcome !== 'BOUGHT' && /NEGATIVE_RECENT_EXPECTANCY/.test(dec.reason)) {
-        skip(`${L}: ${n} auto buys`, `the first auto buy was refused on the recent-window Kelly (R8-8, no operator acknowledgement exists for it): ${dec.reason.slice(0, 200)}; the scratch DB's last closed LIVE trades are the harness's own losing test trades. Run with a fresh APEX_E2E_SCRATCH to run this step`);
+      const kelly = /Capital sizing failed \((NEGATIVE_RECENT_EXPECTANCY|NEGATIVE_OR_ZERO_EXPECTANCY)/.exec(dec.reason);
+      if (bought === 0 && dec.outcome !== 'BOUGHT' && kelly) {
+        const which = kelly[1] === 'NEGATIVE_RECENT_EXPECTANCY' ? "the recent-window Kelly (R8-8, the last 25 closed LIVE trades)" : 'the lifetime Kelly (every closed LIVE trade)';
+        skip(`${L}: ${n} auto buys`, `the first auto buy was refused on ${which}; no operator acknowledgement exists for it: ${dec.reason.slice(0, 200)}; the scratch DB's closed LIVE trades are the harness's own losing test trades. Run with a fresh APEX_E2E_SCRATCH to run this step`);
         return lastTradeAt;
       }
       const drop = before !== null && after !== null ? (before - after) / 1e9 : null;

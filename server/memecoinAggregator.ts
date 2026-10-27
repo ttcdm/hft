@@ -514,6 +514,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     signalTimestamp?: number;
     /** R5: the coordinator mode the caller checked before its awaits; the coordinator refuses the trade if the mode has changed since. */
     expectedMode?: ExecutionMode;
+    /** R5-40: who placed the order, for the ledger and journal. The auto loop and callout snipes are AUTO_SNIPER (the default); an operator route says MANUAL. */
+    source?: 'AUTO_SNIPER' | 'MANUAL';
   }): Promise<{
     success: boolean;
     message: string;
@@ -529,6 +531,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     fillPriceSol?: number;
     slippageBps?: number;
     gates?: Record<string, unknown>;
+    /** R5-40: the coordinator's own result when the order reached it (the operator trade route answers with it, as it did before it ran these gates). */
+    execResult?: Awaited<ReturnType<typeof executionCoordinator.executeTrade>>;
   }> {
     const cleanCa = params.contractAddress.trim();
 
@@ -861,7 +865,7 @@ export class MemecoinAggregatorService extends EventEmitter {
       currentPriceSol: pool.priceNative,
       slippageBps,
       jitoTipSol,
-      source: 'AUTO_SNIPER',
+      source: params.source ?? 'AUTO_SNIPER',
       provenance,
       liquidityUsd: pool.liquidityUsd,
       signalTimestamp: params.signalTimestamp,
@@ -878,6 +882,7 @@ export class MemecoinAggregatorService extends EventEmitter {
         // R5-12: a buy that was sent and is unresolved carries its signature, so the caller can recognise the position orphan recovery opens for it
         txHash: execRes.txSignature || '',
         confluenceScore: confluenceEval.score,
+        execResult: execRes,
       };
     }
 
@@ -903,6 +908,7 @@ export class MemecoinAggregatorService extends EventEmitter {
       fillPriceSol: execRes.fillPriceSol,
       slippageBps,
       gates: execRes.gates,
+      execResult: execRes,
     };
   }
 

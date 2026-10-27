@@ -113,6 +113,13 @@ class PlugAndPlayWalletTrader extends EventEmitter {
   }
 
   // Authoritative snipe dispatch strictly through ExecutionCoordinator
+  /**
+   * The Plug & Play buy (POST /api/wallet/snipe). R5-40: it runs the same gates as every other manual buy, through
+   * memecoinAggregator.executeSnipe: the confluence gate, the freeze-authority and dev-holding pool checks, the capital sizing and
+   * recent-expectancy refusals, and the synthetic-pool refusal (an invented pool is never traded, PAPER included). The mode is taken here,
+   * before any await, and sent with the order, so a LIVE arm during the reads is refused MODE_CHANGED. A client-sent confluenceScore is
+   * refused: the score is the server's to compute.
+   */
   public async executeLiveSnipe(order: {
     mint: string;
     symbol?: string;
@@ -126,21 +133,22 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     liquidityUsd?: number;
     signalTimestamp?: number;
   }): Promise<{ success: boolean; positionId?: string; txSignature?: string; error?: string }> {
-    // UI-3: a mint the board already lists keeps the board's symbol and name; only an unknown mint falls back to its prefix
-    const known = memecoinAggregator.getPools().find((p) => p.contractAddress === order.mint);
-    const res = await executionCoordinator.executeTrade({
-      mint: order.mint,
-      symbol: order.symbol || known?.symbol || order.mint.slice(0, 6).toUpperCase(),
-      name: order.name || known?.name || `Solana Token (${order.mint.slice(0, 4)}...${order.mint.slice(-4)})`,
-      amountSol: order.amountSol,
-      currentPriceSol: order.currentPriceSol, // No invented fallback price! Coordinator queries on-chain bonding curve
-      slippageBps: Math.round((order.slippagePct || 8.0) * 100),
+    if (order.confluenceScore !== undefined) {
+      return { success: false, error: 'REJECTED: confluenceScore is computed by the server and cannot be supplied by a client' };
+    }
+    const expectedMode = executionCoordinator.getExecutionMode();
+    const res = await memecoinAggregator.executeSnipe({
+      contractAddress: order.mint,
+      amountUsd: 0,
+      operatorAmountSol: order.amountSol, // checked (refused, never clamped) by executeSnipe, as on the other operator routes
+      slippagePct: order.slippagePct || 8.0,
       jitoTipSol: order.jitoTipSol || this.config.jitoTipSol,
-      source: 'MANUAL',
       // Only the operator route calls this; it does not carry an on-chain signal of its own.
       provenance: 'MANUAL_OPERATOR',
-      liquidityUsd: order.liquidityUsd,
+      source: 'MANUAL',
       signalTimestamp: order.signalTimestamp,
+      expectedMode,
+      noSyntheticPool: true,
     });
 
     if (res.success) {
@@ -148,14 +156,13 @@ class PlugAndPlayWalletTrader extends EventEmitter {
       return {
         success: true,
         positionId: res.positionId,
-        txSignature: res.txSignature,
-      };
-    } else {
-      return {
-        success: false,
-        error: res.error,
+        txSignature: res.execResult?.txSignature ?? (res.txHash || undefined),
       };
     }
+    return {
+      success: false,
+      error: res.message,
+    };
   }
 
   // Authoritative close position dispatch through ExecutionCoordinator

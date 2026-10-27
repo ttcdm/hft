@@ -400,12 +400,20 @@ describe('Tier 5 [mock-level]: Live Trading Workflows, Token Safety & Panic Exit
         correlationId: 'corr-123',
       });
 
+      // R5-40: the Plug & Play buy runs executeSnipe's gates (a real pool, a SOL price, the confluence gate, off for this routing check)
+      const { solPriceService } = await import('../../../server/market/solPriceService');
+      const { memecoinAggregator } = await import('../../../server/memecoinAggregator');
+      const { newPumpPool } = await import('../../fixtures/auto');
+      solPriceService.setPrice(150, 'TEST_FIXTURE');
+      memecoinAggregator.setConfluenceGating(false);
+      const { mint } = newPumpPool('NONE');
       const res = await walletTrader.executeLiveSnipe({
-        mint: VALID_PUMP_MINT_1.toBase58(),
+        mint,
         symbol: 'SNIPE',
         name: 'Snipe Coin',
         amountSol: 0.005,
       });
+      memecoinAggregator.setConfluenceGating(true);
 
       expect(coordSpy).toHaveBeenCalled();
       expect(res.success).toBe(true);

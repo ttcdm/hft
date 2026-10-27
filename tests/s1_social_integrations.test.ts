@@ -240,7 +240,8 @@ describe('S1: Telegram / social integrations', () => {
       const tg = await new SocialAlphaScanner().processTelegramCommand(`/snipe ${MINT_A} 5`);
       const direct = await memecoinAggregator.executeSnipe({ contractAddress: MINT_A, amountUsd: 5, provenance: 'REAL_SOCIAL' });
       expect(exec).toHaveBeenCalled();
-      for (const call of exec.mock.calls) expect(call[0].source).toBe('AUTO_SNIPER');
+      // R5-42: the Telegram command is an operator trade (MANUAL); the direct aggregator call keeps the default AUTO_SNIPER
+      expect(exec.mock.calls.map((c) => c[0].source)).toEqual(['MANUAL', 'AUTO_SNIPER']);
       expect(tg.reply).toContain('gate said no');
       expect(direct.success).toBe(false);
     });

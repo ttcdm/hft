@@ -1,6 +1,7 @@
 import { PublicKey } from '@solana/web3.js';
 import { SocialSignal, SocialSource, AuthorTier, SignalPattern } from '../src/types';
 import { memecoinAggregator } from './memecoinAggregator';
+import { solPriceService } from './market/solPriceService';
 import { emergencyStop, type EmergencyStopReport } from './execution/emergencyStop';
 
 export interface TelegramConnectionTestResult {
@@ -368,12 +369,19 @@ export class SocialAlphaScanner {
         contractAddress: ca,
         amountUsd: amount,
         signalTimestamp: Date.now(), // an operator command is its own signal
+        // R5-42: an operator command, journaled as one (it was labelled REAL_ONCHAIN by default)
+        provenance: 'MANUAL_OPERATOR',
+        source: 'MANUAL',
       });
 
       if (snipeResult.success) {
         const pos = snipeResult.position;
+        // R5-42: say what was sent; the order is capped at 10% of the spendable bankroll, so it can be less than the requested USD
+        const sentSol = snipeResult.amountSol;
+        const price = solPriceService.lastKnownPrice();
+        const sent = sentSol === undefined ? 'unknown' : `${sentSol.toFixed(6)} SOL${price ? ` (~$${(sentSol * price).toFixed(2)})` : ''}`;
         return {
-          reply: `🚀 SNIPER ORDER FILLED via Telegram:\nToken: $${pos?.tokenTicker || 'TOKEN'}\nCA: ${ca}\nNotional: $${amount.toFixed(2)}\nExecution Price: $${(pos?.entryPriceUsd || 0).toFixed(6)}\nTx: ${snipeResult.txHash || 'none (paper fill)'}`,
+          reply: `🚀 SNIPER ORDER FILLED via Telegram:\nToken: $${pos?.tokenTicker || 'TOKEN'}\nCA: ${ca}\nRequested: $${amount.toFixed(2)}\nSent: ${sent}\nExecution Price: $${(pos?.entryPriceUsd || 0).toFixed(6)}\nTx: ${snipeResult.txHash || 'none (paper fill)'}`,
           actionTaken: 'SNIPED_FROM_TELEGRAM',
         };
       } else {

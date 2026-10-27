@@ -126,13 +126,38 @@ export function CalloutSnapshotAge({ dataAsOfMs, now = Date.now() }: { dataAsOfM
   );
 }
 
+/** R10-7: a 1 s clock, so ages on this screen keep counting between feed syncs (they froze at the last snapshot's text). */
+export function useNow(intervalMs = 1000): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), intervalMs); return () => clearInterval(t); }, [intervalMs]);
+  return now;
+}
+
+/** R10-7: the time since the token's last trade, counted from the callout's timestamp on this clock; the server's text only without one. */
+export function calloutAgeText(calloutTimestamp: number | undefined, fallback: string, now: number): string {
+  if (typeof calloutTimestamp !== 'number' || !Number.isFinite(calloutTimestamp) || calloutTimestamp <= 0) return fallback;
+  const s = Math.max(0, Math.floor((now - calloutTimestamp) / 1000));
+  return `${Math.floor(s / 60)}m ${s % 60}s ago`;
+}
+
+export function CalloutAge({ calloutTimestamp, fallback }: { calloutTimestamp?: number; fallback: string }) {
+  const now = useNow();
+  return <span data-testid="callout-age" title="Time since the token's last trade, counted on this screen">{calloutAgeText(calloutTimestamp, fallback, now)}</span>;
+}
+
+export function LiveCalloutSnapshotAge({ dataAsOfMs }: { dataAsOfMs?: number }) {
+  const now = useNow();
+  return <CalloutSnapshotAge dataAsOfMs={dataAsOfMs} now={now} />;
+}
+
 /** 3H (P3.7): the feed status as the server measures it. It used to be implied by fixed "Live ingest" text whether or not anything arrived. */
 export function FeedStatusPill({ status }: { status: string | null }) {
   const tone =
     status === 'ONLINE' ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
       : status === 'STALE' ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
         : 'bg-slate-700/40 text-slate-300 border-slate-600/50';
-  const text = status === 'ONLINE' ? 'FEED ONLINE' : status === 'STALE' ? 'FEED STALE (nothing in the last minute)' : status === 'NO_DATA' ? 'NO FEED DATA YET' : 'FEED STATUS UNKNOWN';
+  // R10-7: this is the callout list's own sync, not the Pump.fun event feed System checks reports; say which
+  const text = status === 'ONLINE' ? 'CALLOUT FEED ONLINE' : status === 'STALE' ? 'CALLOUT FEED STALE (no callout sync in the last minute; the Pump.fun event feed in System checks is separate)' : status === 'NO_DATA' ? 'NO FEED DATA YET' : 'CALLOUT FEED STATUS UNKNOWN';
   return <span data-testid="feed-status-pill" className={`px-1.5 py-0.5 rounded text-[9px] font-mono border ${tone}`}>{text}</span>;
 }
 
@@ -670,10 +695,10 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                         {/* Time elapsed */}
                         <div className="px-2 py-1 rounded bg-[#090D16] border border-[#1E293B] text-[11px] font-mono text-slate-300 flex items-center space-x-1">
                           <Clock className="w-3 h-3 text-slate-500" />
-                          <span title="Time since the token's last trade, as of the snapshot below">{c.token.timeAgoStr}</span>
+                          <CalloutAge calloutTimestamp={c.calloutTimestamp} fallback={c.token.timeAgoStr} />
                         </div>
                         {/* R6-6: curve %, market cap, price and multiple are a snapshot; say how old */}
-                        <CalloutSnapshotAge dataAsOfMs={c.dataAsOfMs} />
+                        <LiveCalloutSnapshotAge dataAsOfMs={c.dataAsOfMs} />
                       </div>
                     </div>
 

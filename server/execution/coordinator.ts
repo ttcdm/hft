@@ -83,6 +83,23 @@ export interface ExecuteTradeRequest {
   executionMode?: ExecutionMode;
 }
 
+/**
+ * What closePosition did. R5-7/R6-9: `adoptedPendingSell` is set when the call sent nothing and instead booked an earlier sell of this
+ * position that had landed unseen; `adoptedPartial` (with `remainingTokensRaw`) when that earlier sell was a partial, so the position is
+ * still open (PARTIALLY_CLOSED) although the call asked for more. A caller that asked for 100% must not report it as closed.
+ */
+export interface ClosePositionResult {
+  success: boolean;
+  pnlSol: number;
+  status?: string;
+  error?: string;
+  solMoved?: number;
+  notSent?: boolean;
+  adoptedPendingSell?: boolean;
+  adoptedPartial?: boolean;
+  remainingTokensRaw?: string;
+}
+
 export interface ExecutionResponse {
   success: boolean;
   lifecycleState: ExecutionLifecycleState;
@@ -3401,7 +3418,7 @@ export class ExecutionCoordinator {
     positionId: string,
     sellPct: number = 100,
     reason: string = 'Manual Close'
-  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number; notSent?: boolean }> {
+  ): Promise<ClosePositionResult> {
     return traced('exit.close', () => this.closePositionUntraced(positionId, sellPct, reason), { 'apex.reason': reason, 'apex.sellPct': sellPct });
   }
 
@@ -3409,7 +3426,7 @@ export class ExecutionCoordinator {
     positionId: string,
     sellPct: number = 100,
     reason: string = 'Manual Close'
-  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number; notSent?: boolean }> {
+  ): Promise<ClosePositionResult> {
     // A halt stops entries and discretionary exits. It never stops the exits that protect the wallet: stop-loss, trailing stop,
     // an operator's manual close and panic liquidation (a halt that froze a losing position would be the opposite of its purpose).
     if (this.haltReason && !PROTECTIVE_EXIT_REASONS.test(reason)) {
@@ -3450,7 +3467,7 @@ export class ExecutionCoordinator {
     positionId: string,
     sellPct: number,
     reason: string
-  ): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; solMoved?: number; notSent?: boolean }> {
+  ): Promise<ClosePositionResult> {
     if (this.inFlightPositionExits.has(positionId)) {
       return { success: false, pnlSol: 0, error: 'EXIT_IN_PROGRESS: An exit transaction for this position is already in progress.' };
     }
@@ -3463,7 +3480,7 @@ export class ExecutionCoordinator {
 
     try {
       const positions = workstationDb.loadPositions();
-      const target = positions.find((p) => p.id === positionId && (p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED'));
+      let target = positions.find((p) => p.id === positionId && (p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED'));
 
       if (!target) {
         return { success: false, pnlSol: 0, error: 'Position not found or already closed' };
@@ -3553,6 +3570,14 @@ export class ExecutionCoordinator {
     }
     claimed = true;
 
+    // R7-11: `target` was read before the claim (and before the tip-floor await); a sell that finished in between (this process's own
+    // exit that just released its claim, or another process's) changed the quantity. Compute the sale from the row as it is now.
+    const claimedRow = workstationDb.loadPositions().find((p) => p.id === positionId && (p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED'));
+    if (!claimedRow) {
+      return { success: false, pnlSol: 0, error: 'Position not found or already closed', notSent: true };
+    }
+    target = claimedRow;
+
     const seller = localSigner.getPublicKey();
     const mintPubkey = new PublicKey(target.mint);
 
@@ -3570,8 +3595,23 @@ export class ExecutionCoordinator {
         // an unreadable ATA balance after a sell that closed the account means it is gone; P1.6: only when the read is trusted
         const read = await this.readHeldTokens(target, seller, mintPubkey);
         if (read.untrusted) return { success: false, pnlSol: 0, error: read.untrusted, notSent: true };
-        const onChain = read.held;
-        if (onChain !== null && onChain < totalTokensRaw) {
+        let onChain = read.held;
+        // R5-8: the pending sell's own signature decides first. The wallet balance alone is defeated by a transfer that tops it back up.
+        const sigState = await this.pendingSellSignatureState(pendingSell.signature);
+        if (sigState === 'LANDED' && onChain !== null && onChain >= totalTokensRaw) {
+          const sold = await this.landedSellTokensSold(pendingSell.signature, seller, mintPubkey, target, totalTokensRaw);
+          if (sold !== null) {
+            onChain = totalTokensRaw - sold; // what the row keeps; tokens sent in from outside stay untracked
+            this.raiseOperatorAlert('SELL_LANDED_WALLET_TOPPED_UP', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed, but the wallet holds at least as many tokens as before it (tokens were sent in). Booked from the transaction: ${sold} sold.`, positionId);
+          } else if (sellBps >= 10_000) {
+            // a full exit sells what the wallet holds (clamped below), so it cannot double-sell a partial; the earlier sell's fill stays unbooked
+            this.pendingSells.delete(positionId);
+            this.raiseOperatorAlert('SELL_LANDED_UNBOOKED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed but its fill could not be read and the wallet was topped up since; the full exit sells what the wallet holds. Realized PnL of the earlier sell is not recorded.`, positionId);
+          } else {
+            return { success: false, pnlSol: 0, error: `SELL_PENDING_VERIFICATION: sell ${pendingSell.signature.slice(0, 8)} landed but the amount it sold cannot be read yet; not selling again` };
+          }
+        }
+        if (this.pendingSells.has(positionId) && sigState !== 'FAILED' && onChain !== null && onChain < totalTokensRaw) {
           this.pendingSells.delete(positionId);
           // P2.3 (R1-21, R1-22, R1-86): the earlier sell landed. Read its transaction and book the chain's numbers (proceeds, PnL, the row
           // RECONCILED) instead of 0, so the daily loss, the realized events and the DEVNET_LIVE wallet audit see the SOL it moved.
@@ -3580,7 +3620,7 @@ export class ExecutionCoordinator {
           const adopted = await TradeReconciler.reconcileSellTransaction(
             this.connection, pendingSell.signature, seller, mintPubkey, adoptedTp,
             { walletSolLamports: 0, tokenBalanceRaw: totalTokensRaw.toString(), tokenDecimals: target.tokenDecimals ?? 6, timestamp: Date.now() },
-            target.costBasisLamports, Number(totalTokensRaw - onChain) / Number(totalTokensRaw), 0
+            target.costBasisLamports, Number(totalTokensRaw - onChain!) / Number(totalTokensRaw), 0
           ).catch(() => null);
           const booked = !!adopted?.success && BigInt(adopted.actualTokensSoldRaw) > 0n;
           // S258 (L2): book on the row as it is now, as the normal sell path does: `target` was loaded before the wallet and
@@ -3588,7 +3628,7 @@ export class ExecutionCoordinator {
           const filled = workstationDb.loadPositions().find((p) => p.id === positionId) ?? target;
           filled.baseTokenProgram = target.baseTokenProgram; // S259: readHeldTokens may have corrected it
           if (booked) filled.realizedPnLSol = (filled.realizedPnLSol ?? 0) + Number(adopted!.actualRealizedPnLSol.toFixed(6));
-          filled.exitReason = reason;
+          filled.exitReason = pendingSell.reason ?? reason; filled.exitStage = exitStageAfterFill(pendingSell.reason, filled.exitStage); // R5-7: the stage of the sell that landed
           filled.exitTxSignature = pendingSell.signature;
           filled.lastUpdatedTimestamp = Date.now();
           if (onChain === 0n) {
@@ -3617,17 +3657,27 @@ export class ExecutionCoordinator {
           await this.syncRealWalletBalance();
           // S2: with no readable fill this call moved nothing it can account for. P2.3: with one, it reports the earlier sell's net proceeds,
           // which reached the wallet unjournaled, so the wallet audit can explain them.
+          // R6-9: say that this call only adopted the earlier sell, and whether the position is still open after it
+          const adoptedInfo = { adoptedPendingSell: true, ...(target.status === 'PARTIALLY_CLOSED' ? { adoptedPartial: true, remainingTokensRaw: onChain!.toString() } : {}) };
           return booked
-            ? { success: true, pnlSol: adopted!.actualRealizedPnLSol, status: target.status, solMoved: adopted!.actualNetSolProceedsLamports / 1e9 }
-            : { success: true, pnlSol: 0, status: target.status, solMoved: 0 };
+            ? { success: true, pnlSol: adopted!.actualRealizedPnLSol, status: target.status, solMoved: adopted!.actualNetSolProceedsLamports / 1e9, ...adoptedInfo }
+            : { success: true, pnlSol: 0, status: target.status, solMoved: 0, ...adoptedInfo };
         }
         // P2.1: the window is only an upper bound. Once the blockhash has expired and the signature has no status, the sell can never land,
         // so the next pass (a stop-loss included) may sell at once instead of waiting out the rest of the 100 s.
         // S271 review: a send time ahead of now means the wall clock was set back since; the window restarts from now (bounded), rather
         // than holding the position until the clock catches up (hours, for a sell with no lastValidBlockHeight to prove it expired).
+        // R1 #2, R4-8: the hold is released only when the sell is proven unable to land: it failed on chain, or its blockhash expired
+        // (confirmed block height past lastValidBlockHeight) with no signature status. The clock alone never releases it, and neither does
+        // a wallet read that failed (held === null is unknown). Only a sell recorded with no lastValidBlockHeight (a ledger row from before
+        // P2.1) falls back to the window, and then only on a wallet read that succeeded and a signature with no status.
         if (pendingSell.ts > Date.now()) pendingSell.ts = Date.now();
-        if (Date.now() - pendingSell.ts < PENDING_SELL_WINDOW_MS && !(await this.pendingSellCannotLand(pendingSell))) {
-          return { success: false, pnlSol: 0, error: `SELL_PENDING_VERIFICATION: sell ${pendingSell.signature.slice(0, 8)} was sent and is not confirmed or expired yet; not selling again` };
+        if (this.pendingSells.has(positionId) && sigState !== 'FAILED' && !(await this.pendingSellCannotLand(pendingSell))) {
+          const noHeight = !(typeof pendingSell.lastValidBlockHeight === 'number' && pendingSell.lastValidBlockHeight > 0);
+          const legacyExpired = noHeight && Date.now() - pendingSell.ts >= PENDING_SELL_WINDOW_MS && onChain !== null && sigState === 'UNSEEN';
+          if (!legacyExpired) {
+            return { success: false, pnlSol: 0, error: `SELL_PENDING_VERIFICATION: sell ${pendingSell.signature.slice(0, 8)} was sent and is not confirmed or proven expired yet; not selling again` };
+          }
         }
         this.pendingSells.delete(positionId);
       }
@@ -3658,6 +3708,28 @@ export class ExecutionCoordinator {
           this.raiseOperatorAlert('POSITION_BALANCE_CLAMPED', `${target.symbol || target.mint}: the position said ${totalTokensRaw} but the wallet holds ${held}; selling what the wallet holds.`, positionId);
           totalTokensRaw = held;
           amountTokensToSell = held;
+        }
+      }
+
+      // A95 (R7-11): a partial sells its share of what the wallet holds, as a 100% sell does above. When the row says more than the
+      // wallet has (a partial that landed with no pending record, tokens moved out), the row is scaled to the wallet first, so the share
+      // is never computed from tokens that are not there. An empty wallet sends nothing here; the stop-loss path closes such a row.
+      if (sellBps < 10_000) {
+        const read = await this.readHeldTokens(target, seller, mintPubkey);
+        if (read.untrusted) return { success: false, pnlSol: 0, error: read.untrusted, notSent: true };
+        const held = read.held;
+        if (held !== null && held < totalTokensRaw) {
+          if (held === 0n) {
+            return { success: false, pnlSol: 0, error: 'Calculated sell quantity is zero: the wallet holds none of this token; a partial sell sends nothing', notSent: true };
+          }
+          target.costBasisLamports = Math.round(target.costBasisLamports * Number(held) / Number(totalTokensRaw));
+          target.tokenQuantityRaw = held.toString();
+          target.lastUpdatedTimestamp = Date.now();
+          workstationDb.savePosition(target);
+          this.raiseOperatorAlert('POSITION_BALANCE_CLAMPED', `${target.symbol || target.mint}: the position said ${totalTokensRaw} but the wallet holds ${held}; the ${safeSellPct}% sell is a share of what the wallet holds.`, positionId);
+          totalTokensRaw = held;
+          amountTokensToSell = (held * BigInt(sellBps)) / 10_000n;
+          if (amountTokensToSell <= 0n) return { success: false, pnlSol: 0, error: 'Calculated sell quantity is zero', notSent: true };
         }
       }
 
@@ -3832,12 +3904,17 @@ export class ExecutionCoordinator {
       });
 
       if (!subRes.success || !subRes.signature) {
-        if (subRes.unconfirmed && subRes.signature) this.pendingSells.set(positionId, { signature: subRes.signature, ts: Date.now(), lastValidBlockHeight: txBuilder.lastValidBlockHeightOf((v0Tx as any)?.message?.recentBlockhash) });
+        if (subRes.unconfirmed && subRes.signature) this.pendingSells.set(positionId, { signature: subRes.signature, ts: Date.now(), lastValidBlockHeight: txBuilder.lastValidBlockHeightOf((v0Tx as any)?.message?.recentBlockhash), reason });
         // S245: a sell the RPC rate-limited past every resend was never accepted: no pending sell (unconfirmed is false), no fee, and not a
         // slippage failure, so it is reported as not sent and the ladder does not widen.
         const rateLimited = /^RPC_RATE_LIMITED/.test(subRes.error || '');
         return { success: false, pnlSol: 0, error: subRes.error || 'Failed to submit or confirm sell bundle', ...(rateLimited ? { notSent: true } : {}) };
       }
+
+      // R4-7: the sell landed. From here until its booking is written, the position holds it as a pending sell, so a read or write below
+      // that throws (the reconcile, the row reload, the booking) cannot leave the row at its old quantity and stage with nothing to say
+      // that a sell landed: the next pass adopts it instead of selling (or taking the same profit) again. Cleared only after the booked write.
+      this.pendingSells.set(positionId, { signature: subRes.signature, ts: Date.now(), lastValidBlockHeight: txBuilder.lastValidBlockHeightOf((v0Tx as any)?.message?.recentBlockhash), reason });
 
       // S2: the basis being sold, AFTER any clamp to the wallet balance above (target.costBasisLamports was scaled there)
       const costSoldSol = (target.costBasisLamports / 1e9) * fraction;
@@ -3856,8 +3933,7 @@ export class ExecutionCoordinator {
       ), { 'apex.side': 'SELL' });
 
       if (!sellRecon.success) {
-        this.pendingSells.set(positionId, { signature: subRes.signature, ts: Date.now() });
-        return { success: false, pnlSol: 0, error: sellRecon.error };
+        return { success: false, pnlSol: 0, error: sellRecon.error }; // R4-7: the pending sell set above stays
       }
 
       // P1.1 (N-52): book the fill on the row as it is NOW, not on `target`, which was loaded before several awaits (marks and exit
@@ -3886,10 +3962,10 @@ export class ExecutionCoordinator {
         // (startup reconciliation would book it a second time once a later sell had replaced exitTxSignature)
         workstationDb.saveSellBooking(filled, subRes.signature, { slot: sellRecon.slot, networkFeeLamports: sellRecon.actualNetworkFeeLamports });
       } catch (err: any) {
-        // nothing was written: the row still holds the sold tokens, so the sell is pending and the next pass adopts it from the wallet
-        this.pendingSells.set(positionId, { signature: subRes.signature, ts: Date.now(), lastValidBlockHeight: txBuilder.lastValidBlockHeightOf((v0Tx as any)?.message?.recentBlockhash) });
+        // nothing was written: the row still holds the sold tokens, so the sell stays pending (set above) and the next pass adopts it
         return { success: false, pnlSol: 0, error: `SELL_BOOKING_FAILED: ${err?.message ?? err}; the landed sell ${subRes.signature.slice(0, 8)} is booked on the next pass` };
       }
+      this.pendingSells.delete(positionId); // R4-7: booked
       await this.syncRealWalletBalance();
 
       return {
@@ -4137,7 +4213,8 @@ export class ExecutionCoordinator {
    */
   private dispatchExit(pos: NormalizedPosition, sellPct: number, reason: string, priorExitStage: NormalizedPosition['exitStage'], newExitStage: NormalizedPosition['exitStage']): Promise<void> {
     return this.closePosition(pos.id, sellPct, reason).then((exitRes) => {
-      if (exitRes.success && newExitStage !== priorExitStage) {
+      // R5-7: an exit that only adopted an earlier landed sell sold nothing for this decision; the adoption booked that sell's own stage
+      if (exitRes.success && !exitRes.adoptedPendingSell && newExitStage !== priorExitStage) {
         const after = workstationDb.loadPositions(undefined, 'ACTIVE').find((p) => p.id === pos.id);
         if (after) {
           after.exitStage = newExitStage;
@@ -4149,7 +4226,8 @@ export class ExecutionCoordinator {
     });
   }
 
-  private pendingSells = new Map<string, { signature: string; ts: number; lastValidBlockHeight?: number }>();
+  /** A sell of the position that was sent and is not booked yet. `reason` is its exit reason (R5-7: an adoption books its stage). */
+  private pendingSells = new Map<string, { signature: string; ts: number; lastValidBlockHeight?: number; reason?: string }>();
   /** P2.2: set when the first startup reconciliation run ends, whatever its result. */
   private firstReconciliationDone = false;
 
@@ -4190,7 +4268,7 @@ export class ExecutionCoordinator {
         if (!pos) continue;
         const known = this.pendingSells.get(pos.id);
         if (known && known.ts >= t.submissionTime) continue; // keep the latest sell of the position
-        this.pendingSells.set(pos.id, { signature: t.signature, ts: t.submissionTime, lastValidBlockHeight: t.lastValidBlockHeight });
+        this.pendingSells.set(pos.id, { signature: t.signature, ts: t.submissionTime, lastValidBlockHeight: t.lastValidBlockHeight, reason: t.exitReason });
       }
       if (this.pendingSells.size > 0) Logger.warn(`[P2.2] ${this.pendingSells.size} sell(s) sent before the restart are unresolved; their positions check the wallet before selling again`);
     } catch (err: any) {
@@ -4211,6 +4289,38 @@ export class ExecutionCoordinator {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * R5-8: what the cluster says about a pending sell's signature (history included). LANDED is confirmed or finalized with no error;
+   * FAILED is processed with an error (it can never land); SEEN is processed but not confirmed yet; UNSEEN is no status at all;
+   * UNREADABLE is a failed read. Only LANDED and FAILED decide anything on their own.
+   */
+  private async pendingSellSignatureState(signature: string): Promise<'LANDED' | 'FAILED' | 'SEEN' | 'UNSEEN' | 'UNREADABLE'> {
+    try {
+      const st = await this.connection.getSignatureStatuses([signature], { searchTransactionHistory: true });
+      if (!Array.isArray(st?.value) || st.value.length !== 1) return 'UNREADABLE';
+      const v = st.value[0];
+      if (v === null || v === undefined) return 'UNSEEN';
+      if (v.err) return 'FAILED';
+      return v.confirmationStatus === 'confirmed' || v.confirmationStatus === 'finalized' ? 'LANDED' : 'SEEN';
+    } catch {
+      return 'UNREADABLE';
+    }
+  }
+
+  /** R5-8: how many tokens a landed sell took from the wallet, read from its transaction; null when that cannot be read. */
+  private async landedSellTokensSold(signature: string, seller: PublicKey, mint: PublicKey, target: NormalizedPosition, totalTokensRaw: bigint): Promise<bigint | null> {
+    const tp = target.baseTokenProgram ? new PublicKey(target.baseTokenProgram) : TOKEN_PROGRAM_ID;
+    const r = await TradeReconciler.reconcileSellTransaction(
+      this.connection, signature, seller, mint, tp,
+      { walletSolLamports: 0, tokenBalanceRaw: totalTokensRaw.toString(), tokenDecimals: target.tokenDecimals ?? 6, timestamp: Date.now() },
+      0, 0, 0
+    ).catch(() => null);
+    if (!r?.success) return null;
+    let sold: bigint;
+    try { sold = BigInt(r.actualTokensSoldRaw); } catch { return null; }
+    return sold > 0n && sold <= totalTokensRaw ? sold : null;
   }
 
   // N1: one pass at a time. A pass waits (up to EXIT_SELL_WAIT_MS) for sells that can outlast the 3s timer; an overlapping pass would see the same

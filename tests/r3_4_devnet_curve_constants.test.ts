@@ -26,20 +26,17 @@ describe('R3-4: the curve fixtures are internally consistent', () => {
     expect(s.realTokenReserves).toBe(CURVE_INITIAL_REAL_TOKENS);
   });
 
-  it('the devnet fixture is consistent with a 1 SOL initial virtual reserve', () => {
-    expect(curveIsConsistent(devnetCurveFixture(), DEVNET_CURVE)).toBe(true);
-  });
 });
 
 describe('R3-4: tokens-out against the real devnet buy 5tVXiM', () => {
-  it('the fixture spent 10,000,000 lamports and the curve received 9,876,542 (the order net of a 1.25% fee)', () => {
+  it('the production quote, over reserves rebuilt from the pre-trade curve token account, gives the tokens the chain gave (within 1e-6)', () => {
+    // the chain side: the curve received 9,876,542 lamports of the 0.01 SOL order (net of 1.25%) and gave TOKENS_OUT_RAW
     expect(fixture.postBalances[CURVE_INDEX] - fixture.preBalances[CURVE_INDEX]).toBe(9_876_542);
     expect(tokenBalance(fixture.preTokenBalances, CURVE_ATA_INDEX) - tokenBalance(fixture.postTokenBalances, CURVE_ATA_INDEX)).toBe(TOKENS_OUT_RAW);
-  });
-
-  it('the production quote, over reserves rebuilt from the pre-trade curve token account, gives the tokens the chain gave (within 1e-6)', () => {
     const state = devnetCurveFixture({ curveAtaTokensRaw: tokenBalance(fixture.preTokenBalances, CURVE_ATA_INDEX), protocolFeeBps: 95, creatorFeeBps: 30 });
+    expect(curveIsConsistent(state, DEVNET_CURVE)).toBe(true);
     const q = quote(state, 10_000_000);
+    expect(10_000_000 - (q.protocolFeeLamports + q.creatorFeeLamports)).toBe(9_876_542); // the quote's curve input is the chain's
     const got = BigInt(q.tokenAmountRaw);
     const rel = Math.abs(Number(got - TOKENS_OUT_RAW)) / Number(TOKENS_OUT_RAW);
     expect(rel).toBeLessThan(1e-6);

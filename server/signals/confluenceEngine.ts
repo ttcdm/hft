@@ -31,6 +31,8 @@ export interface ConfluenceFactorsInput {
   liquidityUsd: number | null;
   top10HoldersPct: number | null;
   bondingCurveProgress: number | null;
+  /** R2-12: buyers and sellers in the last 5 minutes. From the measured pool (OnChainPoolStats) these are distinct wallets, so one wallet
+   *  making many small buys is one buyer; a DexScreener pair reports transactions. */
   buys5m: number | null;
   sells5m: number | null;
   devHoldingPct: number | null;
@@ -116,7 +118,7 @@ export class ConfluenceEngine {
     }
 
     // 5. Buy/Sell Imbalance Score (0 - 20)
-    // Higher buy ratio (> 75% buys) gives max points
+    // Higher buy ratio (> 75% buys) gives max points. R2-12: more than 10 participants (distinct wallets from the measured pool) are needed.
     let imbalanceScore = 0;
     const totalTx = known(input.buys5m) && known(input.sells5m) ? (input.buys5m as number) + (input.sells5m as number) : 0;
     if (totalTx > 10) {

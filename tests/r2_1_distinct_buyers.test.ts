@@ -158,3 +158,38 @@ describe('R8-2 / R2-12: velocity and flow count distinct wallets, not trades', (
     expect(v.pass).toBe(false);
   });
 });
+
+// ---- R2-12: the confluence order flow counts wallets -----------------------------------------------------------------------------------
+import { OnChainPoolStats } from '../server/market/poolStats';
+import { ConfluenceEngine } from '../server/signals/confluenceEngine';
+
+describe('R2-12: confluence order flow from the measured pool counts distinct wallets', () => {
+  const base = { priceChange5mPct: null, liquidityUsd: null, top10HoldersPct: null, bondingCurveProgress: null, devHoldingPct: null, hasVerifiedSocialCall: false, socialCallCount: 0 };
+  const orderFlow = (steps: Step[]) => {
+    const stats = new OnChainPoolStats();
+    const mint = mintKey();
+    stats.track(mint, { insiders: [wallet()] });
+    for (const { trade, at } of replay(mint, T0, steps)) stats.record(trade, at);
+    const m = stats.get(mint, T0 + 60_000)!;
+    return { m, score: ConfluenceEngine.calculate({ ...base, buys5m: m.buys5m, sells5m: m.sells5m }).buySellImbalanceScore };
+  };
+
+  it('one wallet making 11 tiny buys scores no order-flow points (it scored 20 of 20)', () => {
+    const w = wallet();
+    const { m, score } = orderFlow(Array.from({ length: 11 }, (_, i): Step => [i, w, 'buy', 0.001]));
+    expect([m.buys5m, m.sells5m, m.buyTrades5m, m.sellTrades5m]).toEqual([1, 0, 11, 0]);
+    expect(score).toBe(0);
+  });
+
+  it('wash round trips put the same wallet on both sides', () => {
+    const ws = Array.from({ length: 6 }, wallet);
+    const { m, score } = orderFlow(ws.flatMap((w, i): Step[] => [[i, w, 'buy', 0.1], [i + 0.5, w, 'sell', 0.1]]));
+    expect([m.buys5m, m.sells5m]).toEqual([6, 6]);
+    expect(score).toBe(10); // a round trip adds nothing to the buy side
+  });
+
+  it('eleven distinct buyers still score the full 20', () => {
+    const { score } = orderFlow(Array.from({ length: 11 }, (_, i): Step => [i, wallet(), 'buy', 0.01]));
+    expect(score).toBe(20);
+  });
+});

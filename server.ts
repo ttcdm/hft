@@ -1175,7 +1175,10 @@ app.get('/api/diagnostics/system', requireOperatorAuth, (req, res) => {
       rpcLatencyMs: diag.rpcLatencyMs,
       databaseFile: 'apex_workstation.db',
       dbDriver: 'node:sqlite (WAL mode enabled)',
-      keypairStorage: 'Local filesystem (mode 0600) at .apex_trading_keypair.json',
+      // UI report fix 5: the real key location, not a fixed `.apex_trading_keypair.json`
+      keypairStorage: (() => { const k = localSigner.getKeyLocation(); return k.source === 'ENVIRONMENT' ? 'Environment variable (OPERATOR_PRIVATE_KEY / SOLANA_PRIVATE_KEY), not a file' : k.path ? `Local file (mode 0600) at ${k.path}${k.source === 'NONE' ? ' (no key loaded)' : ''}` : 'none (read-only: no key is loaded)'; })(),
+      signerKeySource: localSigner.getKeyLocation().source,
+      signerKeyPath: localSigner.getKeyLocation().path,
       browserPrivateKeySecurity: 'Private keys are NEVER accepted via HTTP/WebSocket requests.',
     },
     riskControls: {

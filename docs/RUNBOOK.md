@@ -71,6 +71,8 @@ Read the reply: `Failed` lists the positions still open, for example one with a 
 
 **Tokens in the wallet with no position (`UNTRACKED_TOKEN_BALANCE`, `UNKNOWN_TOKEN_BALANCE`).** The startup wallet scan adopts a balance as a RECOVERED position (hard stop only, cost basis unknown) only when this app once sent a LIVE buy of that mint, so its record was lost. A token the app never bought (anyone can send any token to the wallet) is listed in one `UNKNOWN_TOKEN_BALANCE` alert and is never adopted or traded; sell it by hand if you want it gone. RECOVERED positions do not count toward the auto loop's open-position cap and do not drive the position mark feed's health.
 
+**A sell that landed with its fill unread (`SELL_ADOPTED`, "booked as an assumed loss").** When a sell whose confirmation was missed is found to have landed but its transaction cannot be read, the sold share of the cost basis is booked at once as a realized loss (so the daily loss cap counts it) and the sell's row is kept `RECONCILIATION_REQUIRED`. Reconciliation (at start, on Reconcile, and on its own retry) adds the proceeds once the fill can be read, once; until then readiness reports it.
+
 The WebSocket `PANIC_LIQUIDATE` action and Telegram `/panic_sell` run the same stop. Do not rely on Telegram for it: Telegram cannot deliver the command (no webhook is registered with Telegram and nothing polls for updates); it runs only when something posts it to `POST /api/telegram/webhook` with the operator token.
 
 ### 1.3 Stop all sending, exits included

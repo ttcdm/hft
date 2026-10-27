@@ -662,6 +662,25 @@ export class WorkstationDatabase {
    * Every PENDING transaction row. R5-4: null when the table cannot be read. An empty list would say "nothing is unresolved", and startup
    * reconciliation would then close a position whose sell is still unsettled; null makes every caller treat the ledger as unknown.
    */
+  /**
+   * R1 #4 / R5-28: a landed sell adopted with an unreadable fill. The position (its assumed loss already on realizedPnLSol) and the SELL row,
+   * left RECONCILIATION_REQUIRED with `tag` as its error so reconciliation adds the proceeds later, are written in one transaction.
+   * Throws (nothing written) when either write fails.
+   */
+  public saveUnreadSellAssumedLoss(pos: NormalizedPosition, signature: string, tag: string): void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.savePosition(pos);
+      this.db
+        .prepare(`UPDATE transactions SET reconciliation_state = 'RECONCILIATION_REQUIRED', error = ? WHERE signature = ? AND reconciliation_state IN ('PENDING', 'RECONCILIATION_REQUIRED')`)
+        .run(tag, signature);
+      this.db.exec('COMMIT');
+    } catch (err) {
+      try { this.db.exec('ROLLBACK'); } catch { /* already rolled back */ }
+      throw err;
+    }
+  }
+
   public getPendingTransactions(): PersistedTransaction[] | null {
     try {
       const stmt = this.db.prepare(`

@@ -788,13 +788,14 @@ export class WorkstationDatabase {
   }
 
   /** S178: append one recorded event. Never throws: a recording failure must not touch trading. */
-  public recordLaunchEvent(ts: number, mint: string, kind: 'CREATE' | 'TRADE' | 'FUNDER' | 'END' | 'CREATOR', payload: Record<string, unknown>): boolean {
+  /** R2-2: MARKER rows (mint '') are the recorder's gap and restart markers (server/backtest/launchRecorder.ts, `RecordingMarkerReason`). */
+  public recordLaunchEvent(ts: number, mint: string, kind: 'CREATE' | 'TRADE' | 'FUNDER' | 'END' | 'CREATOR' | 'MARKER', payload: Record<string, unknown>): boolean {
     try {
       this.db.prepare('INSERT INTO launch_recording (ts, mint, kind, payload_json) VALUES (?, ?, ?, ?)').run(ts, mint, kind, JSON.stringify(payload));
       const c = this.recCounts;
       if (c) {
         c.byKind[kind] = (c.byKind[kind] ?? 0) + 1;
-        if (kind !== 'FUNDER') { c.oldestTs = c.oldestTs === null ? ts : Math.min(c.oldestTs, ts); c.newestTs = c.newestTs === null ? ts : Math.max(c.newestTs, ts); }
+        if (kind !== 'FUNDER' && kind !== 'MARKER') { c.oldestTs = c.oldestTs === null ? ts : Math.min(c.oldestTs, ts); c.newestTs = c.newestTs === null ? ts : Math.max(c.newestTs, ts); }
         if (kind === 'CREATE') c.newestCreateTs = c.newestCreateTs === null ? ts : Math.max(c.newestCreateTs, ts);
       }
       return true;
@@ -808,8 +809,10 @@ export class WorkstationDatabase {
    * 5B: a launch with an END row carries `endTs` (when its recording stopped) and `endReason` (TRADE_CAP, WINDOW or CURVE_COMPLETE); the
    * replay's coverage then follows the recording that was really made, not the window the server runs with now. A launch without one is
    * unresolved and has neither.
+   * R2-2: `markers` are the recorder's MARKER rows (restarts and feed gaps), oldest first; the replay bounds a launch's coverage at the
+   * first one inside its recording. R6-11: a read error throws (the replay route answers 500); it used to read as an empty recording.
    */
-  public loadLaunchRecording(limit = 500): { launches: Array<{ mint: string; events: Array<{ ts: number; kind: 'CREATE' | 'TRADE'; payload: any }>; endTs?: number; endReason?: string; creatorReports?: RecordedCreatorReport[] }>; funders: Array<{ ts: number; wallet: string; funder: string | null }> } {
+  public loadLaunchRecording(limit = 500): { launches: Array<{ mint: string; events: Array<{ ts: number; kind: 'CREATE' | 'TRADE'; payload: any }>; endTs?: number; endReason?: string; creatorReports?: RecordedCreatorReport[] }>; funders: Array<{ ts: number; wallet: string; funder: string | null }>; markers: Array<{ ts: number; reason: string; detail?: string }> } {
     try {
       const mints = (this.db.prepare(`SELECT mint FROM launch_recording WHERE kind = 'CREATE' ORDER BY ts DESC LIMIT ?`).all(limit) as any[]).map((r) => r.mint as string).reverse();
       const q = this.db.prepare(`SELECT ts, kind, payload_json FROM launch_recording WHERE mint = ? AND kind IN ('CREATE','TRADE','END','CREATOR') ORDER BY ts ASC, id ASC`);
@@ -826,9 +829,11 @@ export class WorkstationDatabase {
       });
       const funders = (this.db.prepare(`SELECT ts, payload_json FROM launch_recording WHERE kind = 'FUNDER' ORDER BY ts ASC, id ASC`).all() as any[])
         .map((r) => ({ ts: r.ts as number, ...JSON.parse(r.payload_json) }));
-      return { launches, funders };
-    } catch {
-      return { launches: [], funders: [] };
+      const markers = (this.db.prepare(`SELECT ts, payload_json FROM launch_recording WHERE kind = 'MARKER' ORDER BY ts ASC, id ASC`).all() as any[])
+        .map((r) => { const p = JSON.parse(r.payload_json); return { ts: r.ts as number, reason: String(p?.reason), ...(p?.detail !== undefined ? { detail: String(p.detail) } : {}) }; });
+      return { launches, funders, markers };
+    } catch (err: any) {
+      throw new Error(`the launch recording could not be read: ${err?.message || err}`, { cause: err });
     }
   }
 
@@ -842,7 +847,7 @@ export class WorkstationDatabase {
       const c = this.launchCounts();
       const k = (kind: string) => c.byKind[kind] ?? 0;
       const events = Object.values(c.byKind).reduce((a, b) => a + b, 0);
-      return { launches: k('CREATE'), events, launchRows: events - k('FUNDER'), funderRows: k('FUNDER'), endedLaunches: k('END'), oldestTs: c.oldestTs, newestTs: c.newestTs, newestCreateTs: c.newestCreateTs };
+      return { launches: k('CREATE'), events, launchRows: events - k('FUNDER') - k('MARKER'), funderRows: k('FUNDER'), endedLaunches: k('END'), oldestTs: c.oldestTs, newestTs: c.newestTs, newestCreateTs: c.newestCreateTs };
     } catch {
       return { launches: 0, events: 0, launchRows: 0, funderRows: 0, endedLaunches: 0, oldestTs: null, newestTs: null, newestCreateTs: null };
     }

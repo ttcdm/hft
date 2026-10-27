@@ -56,3 +56,40 @@ describe('R7-12: no entry at a print taken before the recording ended', () => {
     expect(simulatePath(rows, last, { entryMs: 1_500, exitMs: 1_500 }, null)).not.toBeNull();
   });
 });
+
+// ---- the database side: markers come back, a read error is an error -----------------------------------------------------------------
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { vi } from 'vitest';
+import { WorkstationDatabase } from '../server/db/database';
+
+describe('R2-2 / R6-11: loadLaunchRecording returns the recorder markers and throws on a read error', () => {
+  afterEach(() => vi.restoreAllMocks());
+  const withDb = (fn: (db: WorkstationDatabase) => void) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'r22-'));
+    try { fn(new WorkstationDatabase(path.join(dir, 'r.db'))); } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  };
+
+  it('MARKER rows come back oldest first and are not launch rows', () => {
+    withDb((db) => {
+      for (const e of toRecordedLaunch(launch(quiet()), 150).events) db.recordLaunchEvent(e.ts, 'MintR22', e.kind, e.payload);
+      db.recordLaunchEvent(T0 + 50_000, '', 'MARKER', { reason: 'FEED_GAP', detail: 'reconnect' });
+      db.recordLaunchEvent(T0 - 1, '', 'MARKER', { reason: 'RECORDER_START' });
+      const { markers, launches } = db.loadLaunchRecording();
+      expect(markers).toEqual([{ ts: T0 - 1, reason: 'RECORDER_START' }, { ts: T0 + 50_000, reason: 'FEED_GAP', detail: 'reconnect' }]);
+      expect(launches).toHaveLength(1);
+      const st = db.getLaunchRecordingStatus();
+      expect(st.launchRows).toBe(launches[0].events.length);
+      expect(st.oldestTs).toBe(T0);
+    });
+  });
+
+  it('a read error throws instead of reading as an empty recording', () => {
+    withDb((db) => {
+      db.recordLaunchEvent(T0, 'MintR22', 'CREATE', { mint: 'MintR22' });
+      vi.spyOn((db as any).db, 'prepare').mockImplementation(() => { throw new Error('SQLITE_IOERR: disk I/O error'); });
+      expect(() => db.loadLaunchRecording()).toThrow(/could not be read: SQLITE_IOERR/);
+    });
+  });
+});

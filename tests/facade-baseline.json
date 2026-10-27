@@ -148,6 +148,8 @@
 "tests/r10_11_keyboard_safety.test.tsx::KILL AUTO: the dialog opens on Cancel, Enter on confirm does nothing, Escape cancels, a click sells",
 "tests/r10_11_keyboard_safety.test.tsx::PANIC: the same dialog, Cancel sends nothing, a click on confirm sends it",
 "tests/r10_11_keyboard_safety.test.tsx::an open modal is a dialog and Tab wraps inside it (Plug & Play also reaches the header KILL SWITCH)",
+"tests/r10_11b_no_window_confirm.test.tsx::header RESUME: the dialog opens on Cancel, Enter does not accept, a click resumes",
+"tests/r10_11b_no_window_confirm.test.tsx::src has no window.confirm or bare confirm() call",
 "tests/r10_1_kill_alert_follows_state.test.tsx::RESUME in this tab removes ENGAGED, also after the RESET notice expires",
 "tests/r10_2_kill_state_unknown.test.tsx::a refused state read (logged out) shows UNKNOWN; a press tries to engage and says it was not confirmed",
 "tests/r10_6_pill_colours.test.tsx::realized red, open neutral \"$0.00\"",

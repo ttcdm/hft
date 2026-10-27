@@ -80,6 +80,23 @@ export interface AutoCandidate {
 
 export type AutoOutcome = 'DROPPED' | 'WOULD_BUY' | 'BOUGHT' | 'REJECTED';
 
+/**
+ * R5-12: journal outcome of an auto buy that was sent and came back unresolved (UNCONFIRMED, or landed with an unread fill). Its positionId
+ * is the entry signature, which is the id orphan recovery gives the position if the buy lands, so the position is auto-owned from the moment
+ * it exists (kill "sell what it bought", the loss-trigger evidence and the panel stats). Carries no wallet delta.
+ */
+export const AUTO_SENT_UNRESOLVED = 'SENT_UNRESOLVED';
+
+/** R6-4: the result of KILL AUTO. `refused` sells sent nothing (the coordinator said so); `failed` sells did not close (one may have been sent). */
+export interface AutoKillResult {
+  mode: AutoMode;
+  closed: number;
+  refused: Array<{ positionId: string; mint: string; error: string }>;
+  failed: Array<{ positionId: string; mint: string; error: string }>;
+  /** Auto-owned positions still ACTIVE after the sells (0 when exitAll was not asked for and none was open). */
+  stillOpen: number;
+}
+
 export interface AutoDecision {
   ts: number;
   mode: AutoMode;
@@ -615,8 +632,25 @@ export class AutoSnipeController extends EventEmitter {
     return { ok: true, mode: this.mode };
   }
 
+  /**
+   * R23 / R5-12: what the auto controller owns: this session's positions, every position the journal records as BOUGHT by auto, and every
+   * auto buy that was sent unresolved (its signature, which becomes the recovered position's id). A position the operator opened by hand is
+   * in none of these. Match a position with `isAutoOwned`.
+   */
+  private autoOwnedIds(): Set<string> {
+    const owned = new Set<string>(this.session?.positionIds ?? []);
+    for (const s of this.liveSession?.positionIds ?? []) owned.add(s);
+    for (const d of workstationDb.loadDecisions({ outcome: 'BOUGHT', limit: 5000 })) if (d.positionId) owned.add(d.positionId);
+    for (const d of workstationDb.loadDecisions({ outcome: AUTO_SENT_UNRESOLVED, limit: 5000 })) if (d.positionId) owned.add(d.positionId);
+    return owned;
+  }
+
+  private static isAutoOwned(owned: Set<string>, p: { id: string; entryTxSignature?: string }): boolean {
+    return owned.has(p.id) || (!!p.entryTxSignature && owned.has(p.entryTxSignature));
+  }
+
   /** Kill switch for auto trading: back to OFF now, optionally selling everything the session opened. Exits keep running otherwise. */
-  public async kill(opts: { exitAll?: boolean; reason?: string } = {}): Promise<{ mode: AutoMode; closed: number }> {
+  public async kill(opts: { exitAll?: boolean; reason?: string } = {}): Promise<AutoKillResult> {
     this.mode = 'OFF';
     this.autoRestore = null;
     this.killed = true;
@@ -628,22 +662,33 @@ export class AutoSnipeController extends EventEmitter {
     // Q29: a buy already past the gates finishes (its position exists once it does); wait for it so its position is in the owned set below
     // and is sold by exitAll. Mode OFF already stops any new candidate.
     await this.waitInflight('kill');
-    // R23: "sell what it bought" means the positions the auto controller opened: this session's, plus any the journal records as
-    // BOUGHT by auto (a restart empties the in-memory session). A position the operator opened by hand is never in either set.
-    const owned = new Set<string>(this.session?.positionIds ?? []);
-    for (const d of workstationDb.loadDecisions({ outcome: 'BOUGHT', limit: 5000 })) if (d.positionId) owned.add(d.positionId);
+    // R23: "sell what it bought" means the positions the auto controller opened (autoOwnedIds; a restart empties the in-memory session).
+    // R5-12: that includes an auto buy that was unresolved at kill time and was adopted by orphan recovery since.
+    const owned = this.autoOwnedIds();
     this.session = null;
     let closed = 0;
+    const refused: AutoKillResult['refused'] = [];
+    const failed: AutoKillResult['failed'] = [];
     if (opts.exitAll) {
       for (const p of workstationDb.loadPositions(undefined, 'ACTIVE')) {
-        if (!owned.has(p.id)) continue;
-        const r = await executionCoordinator.closePosition(p.id, 100, 'MANUAL');
-        if (r.success) closed++;
+        if (!AutoSnipeController.isAutoOwned(owned, p)) continue;
+        try {
+          const r = await executionCoordinator.closePosition(p.id, 100, 'MANUAL');
+          if (r.success) closed++;
+          else (r.notSent ? refused : failed).push({ positionId: p.id, mint: p.mint, error: r.error || 'close returned no reason' });
+        } catch (e: any) {
+          failed.push({ positionId: p.id, mint: p.mint, error: `ERROR: ${e?.message || e}` });
+        }
       }
     }
-    Logger.warn(`[AUTO] kill: ${this.killReason}; closed ${closed} position(s)`);
+    // R6-4: say what is still open, so "success" never reads as "all sold"
+    const stillOpen = workstationDb.loadPositions(undefined, 'ACTIVE').filter((p) => AutoSnipeController.isAutoOwned(owned, p)).length;
+    Logger.warn(`[AUTO] kill: ${this.killReason}; closed ${closed} position(s), ${refused.length} refused, ${failed.length} failed, ${stillOpen} auto position(s) still open`);
+    if (refused.length + failed.length > 0) {
+      workstationDb.logDecision({ autoMode: 'OFF', mint: '-', stage: 'exit', outcome: 'INFO', reason: `kill: ${refused.length} sell(s) refused and ${failed.length} failed; ${stillOpen} auto position(s) still open`, inputs: { refused, failed } });
+    }
     this.emit('mode', { mode: this.mode, reason: this.killReason });
-    return { mode: this.mode, closed };
+    return { mode: this.mode, closed, refused, failed, stillOpen };
   }
 
   // ---- G3: kill switch ---------------------------------------------------------------------------------------
@@ -832,8 +877,7 @@ export class AutoSnipeController extends EventEmitter {
    * acknowledgement now does what that did (old losses stop re-tripping), but only on purpose. Positions the operator opened by hand never count.
    */
   private lossEvidencePnl(execMode: 'PAPER' | 'LIVE'): number[] {
-    const owned = new Set<string>(this.session?.positionIds ?? []);
-    for (const d of workstationDb.loadDecisions({ outcome: 'BOUGHT', limit: 5000 })) if (d.positionId) owned.add(d.positionId);
+    const owned = this.autoOwnedIds();
     return autoEvidencePnl(workstationDb.loadEvidenceClosedTrades(execMode), owned, { afterTs: this.lossTriggerAckTs(), n: LOSS_TRIGGER_TRADES });
   }
 
@@ -1114,6 +1158,10 @@ export class AutoSnipeController extends EventEmitter {
           if (startMode === 'DEVNET_LIVE') this.unsettledBuys.push({ session: startSession, mint: c.mint, sinceTs: startTs, countedSol });
           this.saveLiveSession(startSession);
           workstationDb.logDecision({ autoMode: startMode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'budget', outcome: 'INFO', reason: `counted ${countedSol.toFixed(6)} SOL against the session cap: the buy was sent and may have landed`, inputs: watchInputs });
+        }
+        // R5-12: own the position before it exists. The recovered position's id is this signature, so kill, the loss evidence and the stats find it.
+        if (!shadow && res.txHash && /^(UNCONFIRMED|RECONCILIATION FAILED)/.test(res.message)) {
+          workstationDb.logDecision({ autoMode: startMode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'execute', outcome: AUTO_SENT_UNRESOLVED, reason: `auto buy sent and unresolved: ${res.message}`, positionId: res.txHash, inputs: { ...watchInputs, signature: res.txHash } });
         }
         retryable = RETRYABLE_REJECTION.test(res.message || '');
         return rec('REJECTED', classifyRejection(res.message), res.message, { mode: startMode, inputs: { confluenceScore: res.confluenceScore, dryRun: shadow, retryable } });

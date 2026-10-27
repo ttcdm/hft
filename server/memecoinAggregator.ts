@@ -875,7 +875,8 @@ export class MemecoinAggregatorService extends EventEmitter {
       return {
         success: false,
         message: execRes.error || 'Execution rejected by pipeline',
-        txHash: '',
+        // R5-12: a buy that was sent and is unresolved carries its signature, so the caller can recognise the position orphan recovery opens for it
+        txHash: execRes.txSignature || '',
         confluenceScore: confluenceEval.score,
       };
     }

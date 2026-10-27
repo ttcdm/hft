@@ -61,6 +61,22 @@ export function endpointOrigin(url: string | undefined | null): string {
   try { const u = new URL(url); return `${u.protocol}//${u.host}`; } catch { return '[unparseable endpoint]'; }
 }
 
+/** The public Solana Foundation RPC hosts: naming one in a log tells nothing about an account. */
+const PUBLIC_SOLANA_RPC_HOSTS: ReadonlySet<string> = new Set(['api.devnet.solana.com', 'api.testnet.solana.com', 'api.mainnet-beta.solana.com']);
+
+/**
+ * An RPC endpoint as a log line names it: the origin of a public Solana RPC or a loopback one (a local validator, the harness's relays),
+ * and `[custom RPC]` for any other host. A provider's host can itself name the account (a QuickNode endpoint's subdomain does), so it is
+ * not logged; the path and query, where most keys are, never are.
+ */
+export function rpcEndpointLabel(url: string | undefined | null): string {
+  if (!url) return '';
+  let host: string;
+  try { host = new URL(url).hostname.toLowerCase(); } catch { return '[unparseable endpoint]'; }
+  const loopback = host === 'localhost' || host === '[::1]' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
+  return loopback || PUBLIC_SOLANA_RPC_HOSTS.has(host) ? endpointOrigin(url) : '[custom RPC]';
+}
+
 const SENSITIVE_QUERY_PARAM = /secret|key|token|signature|sig|password|passwd|auth|credential|private|mnemonic|seed/i;
 
 /** URL safe to log: values of query parameters whose names look like credentials are replaced with [REDACTED]. */

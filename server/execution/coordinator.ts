@@ -68,7 +68,7 @@ import { paperEngine, PaperExecutionEngine } from './paperEngine';
 import { workstationDb, WorkstationDatabase, type PersistedTransaction } from '../db/database';
 import { getRandomJitoTipAccount, TOKEN_2022_PROGRAM_ID } from '../solana/programs';
 import { executionConfig } from '../solana/executionConfig';
-import { Logger, endpointOrigin } from '../middleware/enterprise';
+import { Logger, endpointOrigin, rpcEndpointLabel } from '../middleware/enterprise';
 import { traced } from '../observability/tracing';
 import { acquireLock, dbLockPath, isPidAlive, signerLockPath, updateHeldLock } from '../system/instanceLock';
 import crypto from 'node:crypto';
@@ -723,7 +723,7 @@ export class ExecutionCoordinator {
         try { fn(newConn); } catch (e: any) { Logger.warn(`RPC switch listener failed: ${e?.message || e}`); }
       }
 
-      Logger.info(`Switched Solana RPC endpoint to ${endpointOrigin(newEndpoint)} (${latency}ms)`);
+      Logger.info(`Switched Solana RPC endpoint to ${rpcEndpointLabel(newEndpoint)} (${latency}ms)`);
       await this.syncRealWalletBalance();
       return { success: true, latencyMs: latency };
     } catch (err: any) {

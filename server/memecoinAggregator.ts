@@ -909,11 +909,14 @@ export class MemecoinAggregatorService extends EventEmitter {
   public async closePosition(
     positionId: string,
     sellPct: number = 100
-  ): Promise<{ success: boolean; realizedPnl: number; message: string }> {
+  ): Promise<{ success: boolean; realizedPnl: number; message: string; adoptedPartial?: boolean; remainingTokensRaw?: string }> {
     const res = await executionCoordinator.closePosition(positionId, sellPct, 'Aggregator Close');
 
     const pnlUsd = res.pnlSol * this.solPriceUsd;
-    const message = res.success
+    // R6-9: a close that only adopted an earlier partial sold nothing now, and the position is still open
+    const message = res.success && res.adoptedPartial
+      ? `Nothing sold now: an earlier partial sell of position ${positionId.slice(0, 8)}... had landed and was booked (PnL ${res.pnlSol >= 0 ? '+' : ''}${res.pnlSol.toFixed(5)} SOL); ${res.remainingTokensRaw} raw tokens are still open. Close again to sell the rest.`
+      : res.success
       ? `Closed ${sellPct}% of position ${positionId.slice(0, 8)}... Realized PnL: ${res.pnlSol >= 0 ? '+' : ''}${res.pnlSol.toFixed(5)} SOL ($${pnlUsd.toFixed(2)})`
       : `Failed to close position: ${res.error}`;
 
@@ -923,6 +926,7 @@ export class MemecoinAggregatorService extends EventEmitter {
       success: res.success,
       realizedPnl: pnlUsd,
       message,
+      ...(res.adoptedPartial ? { adoptedPartial: true, remainingTokensRaw: res.remainingTokensRaw } : {}),
     };
   }
 

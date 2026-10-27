@@ -29,12 +29,16 @@ export const EXIT_RETRY_MAX_MS = 30_000;
 export const EXIT_RATE_LIMITED_WAIT_MS = 6_000;
 /** Consecutive failed exits before an operator alert is raised. */
 export const EXIT_FAILURE_ALERT_AFTER = 4;
+/** R4-6: consecutive exit passes that threw before EXIT_LOOP_FAILING is raised (and LIVE buys are refused): 3 passes, about 9 s. */
+export const EXIT_LOOP_ALERT_AFTER = 3;
 
 export const MARK_STALE_MS = 15_000;
 /** C4: if a direct read still fails after this long, raise an operator alert. */
 export const MARK_ALERT_AFTER_MS = 60_000;
 export const MARK_RETRY_BASE_MS = 60_000;
 export const MARK_RETRY_MAX_MS = 10 * 60_000;
+/** R5-10: at most this many direct stale-mark reads run at once in one exit pass. */
+export const STALE_REFRESH_CONCURRENCY = 4;
 /** At most this many PAPER positions get a direct stale-mark read in one exit pass; LIVE positions are never capped. */
 export const PAPER_STALE_REFRESH_PER_PASS = 5;
 /** PAPER positions with no price get their own alert up to this many per pass; the rest share one alert with a count. */
@@ -196,6 +200,10 @@ export class ExecutionCoordinator {
   private readonly startupGracePeriodMs: number = parseInt(process.env.STARTUP_GRACE_PERIOD_MS || '300000', 10); // 5-minute initialization grace period (B02)
   private positionMarkHealth: 'HEALTHY' | 'DEGRADED' | 'STALE' = 'HEALTHY';
   private lastPositionMarkTimestamp: number = 0;
+  /** R4-3: performance.now() at the time of lastPositionMarkTimestamp (0 with it); every age of the mark feed is measured on this clock. */
+  private lastPositionMarkMono: number = 0;
+  /** R4-3: per position, the wall stamp of the last mark this process applied and the monotonic time it stands for. */
+  private markMono = new Map<string, { wall: number; mono: number }>();
   private realWalletBalanceSol: number | null = null;
   private lastRpcSyncTimestamp: number = 0;
   private jitoTransport: JitoTransport;
@@ -334,8 +342,8 @@ export class ExecutionCoordinator {
       } catch {
         liveOpen = true; // cannot tell: keep the clock running rather than hide a dead feed
       }
-      if (!liveOpen) this.lastPositionMarkTimestamp = 0;
-      const markAge = this.lastPositionMarkTimestamp > 0 ? now - this.lastPositionMarkTimestamp : 0;
+      if (!liveOpen) this.setPositionMarkClock(0);
+      const markAge = this.positionMarkAgeMs() ?? 0; // R4-3: monotonic
       if (markAge > 90000) {
         this.positionMarkHealth = 'STALE';
       } else if (markAge > 45000) {
@@ -446,7 +454,7 @@ export class ExecutionCoordinator {
   public getFeedAges(now: number = Date.now()): { pumpFeedAgeMs: number | null; positionMarkAgeMs: number | null } {
     return {
       pumpFeedAgeMs: this.lastPumpFeedTimestamp > 0 ? now - this.lastPumpFeedTimestamp : null,
-      positionMarkAgeMs: this.lastPositionMarkTimestamp > 0 ? now - this.lastPositionMarkTimestamp : null,
+      positionMarkAgeMs: this.positionMarkAgeMs(),
     };
   }
 
@@ -516,7 +524,7 @@ export class ExecutionCoordinator {
       );
     }
 
-    const markAgeMs = this.lastPositionMarkTimestamp > 0 ? now - this.lastPositionMarkTimestamp : Infinity;
+    const markAgeMs = this.positionMarkAgeMs() ?? Infinity; // R4-3: monotonic
     const markFeedHealthy = this.positionMarkHealth === 'HEALTHY' && (this.lastPositionMarkTimestamp === 0 || markAgeMs <= 120000);
     if (!markFeedHealthy || this.positionMarkHealth === 'STALE') {
       reasons.push(
@@ -526,6 +534,10 @@ export class ExecutionCoordinator {
 
     if (this.haltReason) {
       reasons.push(`All trading is halted: ${this.haltReason}`);
+    }
+
+    if (this.isExitLoopFailing()) {
+      reasons.push(`The exit loop is failing (${this.exitPassFailures} passes in a row threw; stop-loss and take-profit are not running)`);
     }
 
     if (riskEngine.isKillSwitchActive()) {
@@ -625,6 +637,7 @@ export class ExecutionCoordinator {
     const breaker = riskEngine.getCircuitBreakerState();
     if (breaker !== 'CLOSED') problems.push(`the risk circuit breaker is ${breaker}`);
     if (this.positionMarkHealth === 'STALE') problems.push('the position mark feed is STALE');
+    if (this.isExitLoopFailing()) problems.push(`the exit loop is failing (${this.exitPassFailures} passes in a row; EXIT_LOOP_FAILING)`);
     if (process.env.DEMO_MODE === 'true') problems.push('DEMO_MODE=true (demo prices and callers are loaded)');
     return problems;
   }
@@ -761,8 +774,39 @@ export class ExecutionCoordinator {
   }
 
   public recordPositionMarkEvent() {
-    this.lastPositionMarkTimestamp = Date.now();
+    this.setPositionMarkClock(Date.now());
     this.positionMarkHealth = 'HEALTHY';
+  }
+
+  /**
+   * R4-3: set the mark-feed clock to a wall time (0 resets it), with the monotonic time it stands for, so its age is measured on
+   * performance.now() and a wall clock set back cannot make a dead feed look fresh.
+   */
+  private setPositionMarkClock(wall: number): void {
+    this.lastPositionMarkTimestamp = wall;
+    this.lastPositionMarkMono = wall > 0 ? performance.now() - Math.max(0, Date.now() - wall) : 0;
+  }
+
+  /** R4-3: age of the mark-feed clock in ms (monotonic), null when it is not running. A stamp set without its monotonic time ages on the wall clock, and one ahead of it is never fresh. */
+  private positionMarkAgeMs(): number | null {
+    if (this.lastPositionMarkTimestamp <= 0) return null;
+    if (this.lastPositionMarkMono > 0) return Math.max(0, performance.now() - this.lastPositionMarkMono);
+    const wall = Date.now() - this.lastPositionMarkTimestamp;
+    return wall < 0 ? Infinity : wall;
+  }
+
+  /**
+   * R4-3: how old a position's mark is, for the exit pass. A mark this process applied is aged on the monotonic clock. A mark from the
+   * row only (written before a restart) is aged on the wall clock; a stamp ahead of the wall clock (the clock was set back) counts as
+   * stale, so the position gets a direct read rather than a stop-loss blinded for the size of the step.
+   */
+  private markAgeMs(pos: NormalizedPosition): number {
+    const wallStamp = pos.lastMarkTimestamp || pos.entryTimestamp || 0;
+    const m = this.markMono.get(pos.id);
+    if (m && pos.lastMarkTimestamp && m.wall === pos.lastMarkTimestamp) return Math.max(0, performance.now() - m.mono);
+    if (!wallStamp) return 0;
+    const wall = Date.now() - wallStamp;
+    return wall < 0 ? MARK_STALE_MS + 1 : wall;
   }
 
   public getStartedAt(): number {
@@ -1531,6 +1575,7 @@ export class ExecutionCoordinator {
         : 0;
     pos.lastMarkTimestamp = timestamp;
     pos.markAgeMs = Math.max(0, Date.now() - timestamp);
+    this.markMono.set(pos.id, { wall: timestamp, mono: performance.now() - pos.markAgeMs }); // R4-3
     pos.markSource = source as DataSource;
     pos.highWaterMarkSol = Math.max(pos.highWaterMarkSol ?? 0, priceSol);
 
@@ -4442,13 +4487,38 @@ export class ExecutionCoordinator {
 
   // N1: one pass at a time. A pass waits (up to EXIT_SELL_WAIT_MS) for sells that can outlast the 3s timer; an overlapping pass would see the same
   // ACTIVE row and sell it again, or write back its stale copy over a position the first pass already closed.
+  // R4-6: a pass that throws (a DB read in it failing) is caught here, never left to the process-wide unhandledRejection handler; after
+  // EXIT_LOOP_ALERT_AFTER failed passes in a row EXIT_LOOP_FAILING is raised and LIVE buys are refused until a pass completes again.
   public evaluateAndProcessExits(): Promise<void> {
     if (this.exitPassInFlight) return this.exitPassInFlight;
-    const run = this.runExitPass().finally(() => {
+    const run = this.runExitPass().then(() => this.noteExitPassOutcome(null), (err) => this.noteExitPassOutcome(err)).finally(() => {
       if (this.exitPassInFlight === run) this.exitPassInFlight = null;
     });
     this.exitPassInFlight = run;
     return run;
+  }
+
+  /** R4-6: consecutive exit passes that threw; 0 after a pass that completed. */
+  private exitPassFailures = 0;
+
+  /** R4-6: true while the exit loop is failing (EXIT_LOOP_ALERT_AFTER passes in a row threw): stop-loss and take-profit are not running. */
+  public isExitLoopFailing(): boolean {
+    return this.exitPassFailures >= EXIT_LOOP_ALERT_AFTER;
+  }
+
+  private noteExitPassOutcome(err: unknown): void {
+    if (err === null) {
+      if (this.exitPassFailures > 0) Logger.info(`[R4-6] exit pass completed again after ${this.exitPassFailures} failed pass(es)`);
+      this.exitPassFailures = 0;
+      this.clearOperatorAlert('EXIT_LOOP_FAILING');
+      return;
+    }
+    this.exitPassFailures++;
+    const msg = String((err as any)?.message ?? err).slice(0, 200);
+    Logger.error(`[R4-6] exit pass failed (${this.exitPassFailures} in a row): ${msg}`);
+    if (this.isExitLoopFailing()) {
+      this.raiseOperatorAlert('EXIT_LOOP_FAILING', `The exit loop has failed ${this.exitPassFailures} passes in a row (last: ${msg}). Stop-loss, trailing stop and take-profit are NOT running and LIVE buys are refused until it recovers; close positions by hand or run the panic if this persists.`);
+    }
   }
 
   private async runExitPass(): Promise<void> {
@@ -4466,118 +4536,75 @@ export class ExecutionCoordinator {
     const loadedQty = new Map(positions.map((p) => [p.id, p.tokenQuantityRaw]));
     // N17: failure counters only matter for positions still open; drop the rest so the map cannot grow forever.
     for (const k of [...this.exitFailures.keys()]) if (!loadedQty.has(ExecutionCoordinator.exitFailurePositionId(k))) this.exitFailures.delete(k);
+    for (const id of [...this.markMono.keys()]) if (!loadedQty.has(id)) this.markMono.delete(id);
     // Nothing LIVE is open, so there is no mark to be stale (see the feed heartbeat): reset the clock here too.
     if (!positions.some((p) => p.executionMode === 'LIVE')) {
-      this.lastPositionMarkTimestamp = 0;
+      this.setPositionMarkClock(0);
       this.positionMarkHealth = 'HEALTHY';
     }
 
     let paperRefreshes = 0;
     let paperAlertsThisPass = 0;
     const paperNoMark: Array<{ pos: NormalizedPosition; ageMs: number }> = [];
-    const exits: Array<{ pos: NormalizedPosition; decision: ReturnType<typeof ExitEngine.evaluate>; priorExitStage: NormalizedPosition['exitStage'] }> = [];
+    const sells: Promise<void>[] = [];
+    // R5-10 / R7-10 (P1.7): an exit decided on a fresh mark is sent at once, before any stale-mark read in this pass, and the stale reads
+    // run STALE_REFRESH_CONCURRENCY at a time; each position is evaluated (and its exit sent) as soon as its own read returns. A decided
+    // stop-loss no longer waits behind every other position's direct read.
+    const stale: Array<{ pos: NormalizedPosition; markAge: number; skipRead: boolean }> = [];
     for (const pos of positions) {
-      // R1-32: each position's clock is read when it is evaluated, not when the pass started (a stale-mark read above can take a while).
-      const posNow = Date.now();
       // C4: staleness is measured from the last real mark only. lastUpdatedTimestamp is rewritten on every tick
-      // and would hide a dead feed, so it is never a fallback; a never-marked position ages from its entry.
-      const markAge = posNow - (pos.lastMarkTimestamp || pos.entryTimestamp || posNow);
-      let staleStopOnly = false;
+      // and would hide a dead feed, so it is never a fallback; a never-marked position ages from its entry. R4-3: on the monotonic clock.
+      const markAge = this.markAgeMs(pos);
       if (markAge > MARK_STALE_MS) {
         // Before skipping, read this position's curve/pool directly. A fresh read lets the stop-loss run.
         // PAPER positions cost no more than PAPER_STALE_REFRESH_PER_PASS direct reads per pass; LIVE positions always get theirs.
         const skipRead = pos.executionMode !== 'LIVE' && ++paperRefreshes > PAPER_STALE_REFRESH_PER_PASS;
-        const refreshed = skipRead ? false : await this.refreshStaleMark(pos);
-        if (!refreshed) {
-          // Missing data is never "safe": exits cannot be priced, so say so loudly once the gap is long enough.
-          if (markAge > MARK_ALERT_AFTER_MS && pos.executionMode !== 'LIVE' && ++paperAlertsThisPass > PAPER_INDIVIDUAL_ALERTS) {
-            paperNoMark.push({ pos, ageMs: markAge }); // past the first few: one alert with a count for the rest, below
-          } else if (markAge > MARK_ALERT_AFTER_MS) {
-            this.raiseOperatorAlert(
-              'POSITION_MARK_UNAVAILABLE',
-              `No price for ${pos.symbol || pos.mint} for ${Math.round(markAge / 1000)}s and a direct curve/pool read failed. Stop-loss and take-profit cannot fire until a mark returns; consider closing manually.`,
-              pos.id
-            );
-          }
-          // A position nobody can price must age the mark feed from its entry, or an empty history would read as healthy.
-          if (pos.executionMode === 'LIVE' && this.lastPositionMarkTimestamp === 0) this.lastPositionMarkTimestamp = pos.entryTimestamp || posNow;
-          // P1.6: a LIVE position whose last known mark is already past the hard stop still gets its STOP_LOSS (and nothing else): the
-          // sell re-reads the curve or pool before it is built, so it does not trade on the stale price. Every other exit waits for a mark.
-          if (pos.executionMode !== 'LIVE' || !(pos.currentPriceSol > 0)) continue;
-          staleStopOnly = true;
-        }
-        if (!staleStopOnly) {
-          this.clearOperatorAlert('POSITION_MARK_UNAVAILABLE', pos.id);
-          if (pos.executionMode === 'LIVE') this.recordPositionMarkEvent();
-        }
-      } else if (pos.executionMode === 'LIVE') {
-        this.recordPositionMarkEvent(); // a real mark within the staleness window
+        stale.push({ pos, markAge, skipRead });
+        continue;
       }
-
-      let decision = ExitEngine.evaluate({
-        positionId: pos.id,
-        entryPriceSol: pos.entryPriceSol,
-        currentPriceSol: pos.currentPriceSol,
-        highWaterMarkSol: pos.highWaterMarkSol,
-        trailingStopSol: pos.trailingStopSol,
-        exitStage: pos.exitStage,
-        entryTimestamp: pos.entryTimestamp,
-        currentTimestamp: posNow,
-      });
-      // P1.6: no price, and not past the hard stop. R5-21: the trailing stop is protective too (PROTECTIVE_EXIT_REASONS), so it goes as well
-      if (staleStopOnly && !(decision.shouldExit && (decision.reason === 'STOP_LOSS' || decision.reason === 'TRAILING_STOP'))) continue;
-
-      // A RECOVERED position (a balance found in the wallet that this app never bought) has an entry price that is just the mark at
-      // adoption, so take-profit, trailing and stale exits would sell whatever lands in the wallet on an invented schedule. Only the
-      // hard stop applies, unless the operator opts in with AUTO_MANAGE_RECOVERED=true.
-      const ladderSuppressed = isRecoveredPosition(pos) && process.env.AUTO_MANAGE_RECOVERED !== 'true';
-      if (decision.shouldExit && decision.reason !== 'STOP_LOSS' && ladderSuppressed) {
-        decision = { ...decision, shouldExit: false, newExitStage: pos.exitStage ?? 0 };
-      }
-      if (ladderSuppressed) {
-        // R15: while the ladder is off, the high-water mark and trailing stop must not keep ratcheting up, or enabling
-        // AUTO_MANAGE_RECOVERED later would fire a trailing stop built from days of suppressed history at once.
-        decision = { ...decision, newHighWaterMarkSol: pos.highWaterMarkSol ?? decision.newHighWaterMarkSol, newTrailingStopSol: pos.trailingStopSol ?? decision.newTrailingStopSol };
-      }
-
-      // Persist high_water_mark_sol and trailing_stop_sol to SQLite (B13). The exit stage only advances after the
-      // sell actually fills: advancing it first would skip a take-profit stage when the sell reverts or is refused.
-      const priorExitStage = pos.exitStage;
-      pos.highWaterMarkSol = decision.newHighWaterMarkSol;
-      pos.trailingStopSol = decision.newTrailingStopSol;
-      pos.exitStage = decision.shouldExit ? priorExitStage : decision.newExitStage;
-      pos.lastUpdatedTimestamp = posNow;
-      // N1: this row was loaded before the awaits above (and before earlier positions' sells in this pass). If a manual
-      // close, partial sell or reconcile changed it since, writing the stale copy back would resurrect a sold position
-      // or undo a partial; skip it and let the next pass re-evaluate from the current row.
-      const current = workstationDb.loadPositions(undefined, undefined).find((p) => p.id === pos.id);
-      if (!current || current.status === 'CLOSED' || current.tokenQuantityRaw !== loadedQty.get(pos.id)) continue;
-      try {
-        workstationDb.saveExitState(pos); // S11: only the exit engine's fields, so a stale copy cannot undo a sell; Q56: a failing write must not stop the exits in this pass
-      } catch (err: any) {
-        Logger.error(`[B13 ExitEngine] could not persist the trailing state of ${pos.symbol || pos.mint}: ${err.message}. Exit evaluation continues.`);
-      }
-
-      if (decision.shouldExit) {
-        if (this.exitRetryWaitMs(pos.id, posNow, decision.reason) > 0) continue; // R2-5: this reason backing off after a failed attempt (a TP's wait never holds the stop)
-        if (this.inFlightPositionExits.has(pos.id)) continue; // P1.7: its sell from an earlier pass is still running; it must not be sent twice
-        if (this.panicActive && !PROTECTIVE_EXIT_REASONS.test(decision.reason)) {
-          Logger.warn(`[B13 ExitEngine] ${decision.reason} for ${pos.symbol || pos.mint} refused: panic liquidation is running`);
-          continue;
-        }
-        exits.push({ pos, decision, priorExitStage });
-      }
+      if (pos.executionMode === 'LIVE') this.recordPositionMarkEvent(); // a real mark within the staleness window
+      this.decideAndDispatchExit(pos, false, loadedQty, sells);
     }
 
-    // P1.7 (R1-71): every decision above was made before any sell started. Now start the sells together, so a slow or hung sell of one
-    // position cannot hold another position's stop-loss. The pass waits for them at most EXIT_SELL_WAIT_MS; a sell still running after
-    // that keeps going in the background, its position stays in inFlightPositionExits (no second send), and the next pass evaluates the rest.
-    const sells = exits.map(({ pos, decision, priorExitStage }) => {
-      Logger.info(
-        `[B13 ExitEngine] ${decision.reason} triggered for ${pos.symbol || pos.mint} (Sell ${decision.sellPercentage}%, PnL: ${decision.profitPct.toFixed(2)}%)`
-      );
-      return this.dispatchExit(pos, decision.sellPercentage, decision.reason, priorExitStage, decision.newExitStage);
-    });
+    const afterRefresh = (pos: NormalizedPosition, markAge: number, refreshed: boolean): void => {
+      let staleStopOnly = false;
+      if (!refreshed) {
+        // Missing data is never "safe": exits cannot be priced, so say so loudly once the gap is long enough.
+        if (markAge > MARK_ALERT_AFTER_MS && pos.executionMode !== 'LIVE' && ++paperAlertsThisPass > PAPER_INDIVIDUAL_ALERTS) {
+          paperNoMark.push({ pos, ageMs: markAge }); // past the first few: one alert with a count for the rest, below
+        } else if (markAge > MARK_ALERT_AFTER_MS) {
+          this.raiseOperatorAlert(
+            'POSITION_MARK_UNAVAILABLE',
+            `No price for ${pos.symbol || pos.mint} for ${Math.round(markAge / 1000)}s and a direct curve/pool read failed. Stop-loss and take-profit cannot fire until a mark returns; consider closing manually.`,
+            pos.id
+          );
+        }
+        // A position nobody can price must age the mark feed from its entry, or an empty history would read as healthy.
+        if (pos.executionMode === 'LIVE' && this.lastPositionMarkTimestamp === 0) this.setPositionMarkClock(pos.entryTimestamp || Date.now());
+        // P1.6: a LIVE position whose last known mark is already past the hard stop still gets its STOP_LOSS (and nothing else): the
+        // sell re-reads the curve or pool before it is built, so it does not trade on the stale price. Every other exit waits for a mark.
+        if (pos.executionMode !== 'LIVE' || !(pos.currentPriceSol > 0)) return;
+        staleStopOnly = true;
+      }
+      if (!staleStopOnly) {
+        this.clearOperatorAlert('POSITION_MARK_UNAVAILABLE', pos.id);
+        if (pos.executionMode === 'LIVE') this.recordPositionMarkEvent();
+      }
+      this.decideAndDispatchExit(pos, staleStopOnly, loadedQty, sells);
+    };
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < stale.length) {
+        const { pos, markAge, skipRead } = stale[next++];
+        const refreshed = skipRead ? false : await this.refreshStaleMark(pos);
+        afterRefresh(pos, markAge, refreshed);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(STALE_REFRESH_CONCURRENCY, stale.length) }, () => worker()));
+
+    // P1.7 (R1-71): the sells run together, so a slow or hung sell of one position cannot hold another position's stop-loss. The pass waits
+    // for them at most EXIT_SELL_WAIT_MS; a sell still running after that keeps going in the background, its position stays in
+    // inFlightPositionExits (no second send), and the next pass evaluates the rest.
     if (sells.length > 0) {
       let timer: NodeJS.Timeout | undefined;
       const deadline = new Promise<void>((r) => { timer = setTimeout(r, EXIT_SELL_WAIT_MS); });
@@ -4599,6 +4626,71 @@ export class ExecutionCoordinator {
     } else {
       this.clearOperatorAlert('PAPER_MARKS_UNAVAILABLE');
     }
+  }
+
+  /**
+   * One position's exit decision in the exit pass, and its sell started at once when there is one (pushed to `sells`, not awaited).
+   * Synchronous: the row re-read, the exit-state write and the gates (backoff of this reason, a sell already running, a panic) run with
+   * no await between them and the start of the sell.
+   */
+  private decideAndDispatchExit(pos: NormalizedPosition, staleStopOnly: boolean, loadedQty: Map<string, string>, sells: Promise<void>[]): void {
+    // R1-32: each position's clock is read when it is evaluated, not when the pass started (a stale-mark read can take a while).
+    const posNow = Date.now();
+    let decision = ExitEngine.evaluate({
+      positionId: pos.id,
+      entryPriceSol: pos.entryPriceSol,
+      currentPriceSol: pos.currentPriceSol,
+      highWaterMarkSol: pos.highWaterMarkSol,
+      trailingStopSol: pos.trailingStopSol,
+      exitStage: pos.exitStage,
+      entryTimestamp: pos.entryTimestamp,
+      currentTimestamp: posNow,
+    });
+    // P1.6: no price, and not past the hard stop. R5-21: the trailing stop is protective too (PROTECTIVE_EXIT_REASONS), so it goes as well
+    if (staleStopOnly && !(decision.shouldExit && (decision.reason === 'STOP_LOSS' || decision.reason === 'TRAILING_STOP'))) return;
+
+    // A RECOVERED position (a balance found in the wallet that this app never bought) has an entry price that is just the mark at
+    // adoption, so take-profit, trailing and stale exits would sell whatever lands in the wallet on an invented schedule. Only the
+    // hard stop applies, unless the operator opts in with AUTO_MANAGE_RECOVERED=true.
+    const ladderSuppressed = isRecoveredPosition(pos) && process.env.AUTO_MANAGE_RECOVERED !== 'true';
+    if (decision.shouldExit && decision.reason !== 'STOP_LOSS' && ladderSuppressed) {
+      decision = { ...decision, shouldExit: false, newExitStage: pos.exitStage ?? 0 };
+    }
+    if (ladderSuppressed) {
+      // R15: while the ladder is off, the high-water mark and trailing stop must not keep ratcheting up, or enabling
+      // AUTO_MANAGE_RECOVERED later would fire a trailing stop built from days of suppressed history at once.
+      decision = { ...decision, newHighWaterMarkSol: pos.highWaterMarkSol ?? decision.newHighWaterMarkSol, newTrailingStopSol: pos.trailingStopSol ?? decision.newTrailingStopSol };
+    }
+
+    // Persist high_water_mark_sol and trailing_stop_sol to SQLite (B13). The exit stage only advances after the
+    // sell actually fills: advancing it first would skip a take-profit stage when the sell reverts or is refused.
+    const priorExitStage = pos.exitStage;
+    pos.highWaterMarkSol = decision.newHighWaterMarkSol;
+    pos.trailingStopSol = decision.newTrailingStopSol;
+    pos.exitStage = decision.shouldExit ? priorExitStage : decision.newExitStage;
+    pos.lastUpdatedTimestamp = posNow;
+    // N1: this row was loaded before the awaits above (and before earlier positions' sells in this pass). If a manual
+    // close, partial sell or reconcile changed it since, writing the stale copy back would resurrect a sold position
+    // or undo a partial; skip it and let the next pass re-evaluate from the current row.
+    const current = workstationDb.loadPositions(undefined, undefined).find((p) => p.id === pos.id);
+    if (!current || current.status === 'CLOSED' || current.tokenQuantityRaw !== loadedQty.get(pos.id)) return;
+    try {
+      workstationDb.saveExitState(pos); // S11: only the exit engine's fields, so a stale copy cannot undo a sell; Q56: a failing write must not stop the exits in this pass
+    } catch (err: any) {
+      Logger.error(`[B13 ExitEngine] could not persist the trailing state of ${pos.symbol || pos.mint}: ${err.message}. Exit evaluation continues.`);
+    }
+
+    if (!decision.shouldExit) return;
+    if (this.exitRetryWaitMs(pos.id, posNow, decision.reason) > 0) return; // R2-5: this reason backing off after a failed attempt (a TP's wait never holds the stop)
+    if (this.inFlightPositionExits.has(pos.id)) return; // P1.7: its sell from an earlier pass is still running; it must not be sent twice
+    if (this.panicActive && !PROTECTIVE_EXIT_REASONS.test(decision.reason)) {
+      Logger.warn(`[B13 ExitEngine] ${decision.reason} for ${pos.symbol || pos.mint} refused: panic liquidation is running`);
+      return;
+    }
+    Logger.info(
+      `[B13 ExitEngine] ${decision.reason} triggered for ${pos.symbol || pos.mint} (Sell ${decision.sellPercentage}%, PnL: ${decision.profitPct.toFixed(2)}%)`
+    );
+    sells.push(this.dispatchExit(pos, decision.sellPercentage, decision.reason, priorExitStage, decision.newExitStage));
   }
 
   // Periodic Auto Position Monitor driven by ExitEngine (B13)

@@ -10,6 +10,7 @@
  * the server decides whether the prerequisites hold (`getLiveReadiness`). In read-only mode the server refuses to arm and to generate a key.
  */
 import { probeLatency } from '../utils/probeBadge';
+import { sellConfirmText } from '../utils/sellConfirm';
 import { ARMED_MESSAGE, PANIC_CONFIRM_TEXT, armRefusalText, panicOutcome } from '../utils/tradingCopy';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import React, { useState, useEffect } from 'react';
@@ -276,6 +277,11 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   };
 
   const handleClosePosition = async (posId: string) => {
+    // R9-5: a sell asks first, with what it sells
+    const target = positions.find((p) => p.id === posId);
+    const held = target && /^\d+$/.test(String(target.tokenQuantityRaw ?? '')) ? Number(target.tokenQuantityRaw) / Math.pow(10, target.tokenDecimals ?? 6) : null;
+    const ask = sellConfirmText({ name: target?.symbol ? `$${target.symbol}` : 'this position', sellPct: 100, mode: target?.executionMode, tokensHeld: held, valueText: target ? fmtSol(target.currentValueSol) : null });
+    if (!window.confirm(ask)) return;
     try {
       const res = await authFetch('/api/wallet/close-position', {
         method: 'POST',

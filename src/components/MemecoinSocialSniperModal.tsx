@@ -64,7 +64,8 @@ import {
   MemecoinPlatform,
 } from '../types';
 import { engineClient } from '../services/engineClient';
-import { fmtRank, fmtUsdPrice } from '../utils/numFormat';
+import { fmtRank, fmtSmall, fmtUsdPrice } from '../utils/numFormat';
+import { sellConfirmText, sellDoneTitle } from '../utils/sellConfirm';
 import { hftAudio } from '../utils/audio';
 import { PumpFunHotCalloutsView } from './PumpFunHotCalloutsView';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
@@ -391,12 +392,19 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
   // Close / Take profit on open position
   const handleClosePosition = async (posId: string, sellPct: number = 100) => {
+    // R9-5: a sell asks first, with what it sells
+    const pos = positions.find((p) => p.id === posId);
+    const ask = sellConfirmText({
+      name: pos ? (pos.tokenTicker.startsWith('$') ? pos.tokenTicker : `$${pos.tokenTicker}`) : 'this position', sellPct, mode: pos?.executionMode,
+      tokensHeld: pos?.quantityTokens, valueText: pos && Number.isFinite(pos.currentValueUsd) ? `$${pos.currentValueUsd.toFixed(2)}` : null,
+    });
+    if (typeof window !== 'undefined' && !window.confirm(ask)) return;
     hftAudio.playOrderFill();
     const res = await engineClient.closeSniperPosition(posId, sellPct);
     if (res?.result?.success) {
       onAlertTrigger?.(
         'INFO',
-        'POSITION CLOSED',
+        sellDoneTitle(sellPct),
         res.result.message
       );
       refreshData();
@@ -1301,6 +1309,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                   <td className="p-3 text-slate-200">
                                     ${(pos.currentValueUsd ?? 0).toFixed(2)}{' '}
                                     <span className="text-slate-500 text-[10px]">(${(pos.costBasisUsd ?? 0).toFixed(2)} cost)</span>
+                                    <span className="block text-slate-500 text-[10px]" data-testid="holding-qty">{fmtSmall(pos.quantityTokens, 0)} tokens held</span>
                                   </td>
                                   <td className="p-3">
                                     <span

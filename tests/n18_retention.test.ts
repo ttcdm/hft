@@ -55,7 +55,7 @@ describe('N18: retention for the audit tables, and indexed transaction lookups',
     const db = new WorkstationDatabase(':memory:');
     const base = { orderId: 'o', correlationId: 'c', mint, direction: 'BUY' as const, submissionTransport: 'JITO' as const, submissionTime: 1, networkFeeLamports: 0, jitoTipLamports: 0, executionMode: 'LIVE' as const };
     for (const [sig, st] of [['a', 'PENDING'], ['b', 'RECONCILED'], ['c', 'RECONCILIATION_REQUIRED'], ['d', 'REVERTED']] as const) db.saveTransaction({ ...base, signature: sig, reconciliationState: st } as any);
-    expect(db.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED']).map((t) => t.signature).sort()).toEqual(['a', 'c']);
+    expect(db.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED'])!.map((t) => t.signature).sort()).toEqual(['a', 'c']);
     expect(db.loadTransactionsInStates([])).toEqual([]);
     const plan = (db as any).db.prepare("EXPLAIN QUERY PLAN SELECT * FROM transactions WHERE reconciliation_state IN (?, ?)").all('PENDING', 'X').map((r: any) => r.detail).join(' ');
     expect(plan).toMatch(/idx_tx_reconciliation/);

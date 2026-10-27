@@ -944,7 +944,15 @@ export class ExecutionCoordinator {
     await this.syncRealWalletBalance();
 
     // 4. Resolve pending transactions from previous runs with actual on-chain transaction verification
-    const pendingTxs = workstationDb.getPendingTransactions();
+    // R5-4: an unreadable transactions table is unknown, not empty. Nothing is resolved, step 4b closes nothing, and the pass is a mismatch.
+    const pendingRead = workstationDb.getPendingTransactions();
+    const ledgerUnreadable = pendingRead === null;
+    if (ledgerUnreadable) {
+      mismatchesCount++;
+      issues.push('The transactions table could not be read; no pending transaction was resolved and no position was closed');
+      this.scheduleReconcileRetry();
+    }
+    const pendingTxs = pendingRead ?? [];
     if (pendingTxs.length > 0 && !clusterTrusted) {
       issues.push(`${pendingTxs.length} pending transaction(s) left as they are until the RPC is on the allowed cluster`);
     } else if (pendingTxs.length > 0) {
@@ -1094,7 +1102,16 @@ export class ExecutionCoordinator {
       // S10: a SELL that step 4 could not settle (the RPC failed, or the signature is confirmed but its details are not readable yet) is
       // still PENDING here. Its position shows an empty wallet precisely BECAUSE the sell landed, and closing it now would zero the cost
       // basis; the retry would then find the position closed and drop the sell as "already applied", so its realized PnL is lost for good.
-      const unsettledSellMints = new Map(workstationDb.getPendingTransactions().filter((t) => t.direction === 'SELL').map((t) => [t.mint, t.signature]));
+      // R5-4: when the ledger cannot be read, no sell can be ruled out, so no position is closed on a zero balance in this pass.
+      const pendingAfterStep4 = ledgerUnreadable ? null : workstationDb.getPendingTransactions();
+      const unsettledSellMints = pendingAfterStep4 === null
+        ? null
+        : new Map(pendingAfterStep4.filter((t) => t.direction === 'SELL').map((t) => [t.mint, t.signature]));
+      if (unsettledSellMints === null && !ledgerUnreadable) {
+        mismatchesCount++;
+        issues.push('The transactions table could not be read after resolving pending rows; no position was closed on a zero balance');
+        this.scheduleReconcileRetry();
+      }
 
       for (const pos of activeLivePositions) {
         try {
@@ -1110,9 +1127,12 @@ export class ExecutionCoordinator {
             mismatchesCount++; // unknown is not zero: the row stays open and readiness stays at MISMATCH until a trusted read
             issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) shows no tokens, but the read is not trusted (${read.untrusted}); left open`);
             this.scheduleReconcileRetry();
-          } else if (onChainAmount <= 0n && unsettledSellMints.has(pos.mint)) {
+          } else if (onChainAmount <= 0n && unsettledSellMints === null) {
             mismatchesCount++;
-            issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) shows no tokens but its sell ${String(unsettledSellMints.get(pos.mint)).slice(0, 8)}... is not settled yet; left open so the fill and its PnL can be applied`);
+            issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) shows no tokens, but the ledger could not be read to rule out an unsettled sell; left open`);
+          } else if (onChainAmount <= 0n && unsettledSellMints?.has(pos.mint)) {
+            mismatchesCount++;
+            issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) shows no tokens but its sell ${String(unsettledSellMints?.get(pos.mint)).slice(0, 8)}... is not settled yet; left open so the fill and its PnL can be applied`);
             this.scheduleReconcileRetry();
           } else if (onChainAmount <= 0n) {
             // The tokens are gone (sold or moved outside this app). Left OPEN this position blocks arming until someone edits the DB,
@@ -1139,6 +1159,10 @@ export class ExecutionCoordinator {
     // 5. Landed LIVE buys whose fill could not be read earlier (RECONCILIATION_REQUIRED) still hold tokens with no stop-loss.
     if (signerStatus === 'READY') {
       const orphans = await this.recoverOrphanedBuys();
+      if (orphans.ledgerUnreadable) {
+        mismatchesCount++;
+        issues.push('Landed buys could not be checked: the transactions table could not be read');
+      }
       if (orphans.stillOrphaned.length > 0) {
         mismatchesCount += orphans.stillOrphaned.length;
         issues.push(`${orphans.stillOrphaned.length} landed buy(s) have no position record: ${orphans.stillOrphaned.map((x) => x.slice(0, 8)).join(',')}`);
@@ -1257,13 +1281,15 @@ export class ExecutionCoordinator {
    * at RECONCILIATION_REQUIRED with tokens in the wallet and no position, hence no stop-loss. Re-read each such signature and open the position.
    * Idempotent: a signature that already has a position is just marked RECONCILED.
    */
-  public async recoverOrphanedBuys(): Promise<{ recovered: string[]; stillOrphaned: string[] }> {
+  public async recoverOrphanedBuys(): Promise<{ recovered: string[]; stillOrphaned: string[]; ledgerUnreadable?: boolean }> {
     const recovered: string[] = [];
     const stillOrphaned: string[] = [];
     if (localSigner.getStatus() !== 'READY') return { recovered, stillOrphaned };
     const wallet = localSigner.getPublicKey();
-    const candidates = workstationDb
-      .loadTransactionsInStates(['RECONCILIATION_REQUIRED'])
+    const rows = workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED']);
+    // R5-4: an unreadable ledger is not "no orphans": the caller counts it as unresolved and keeps retrying.
+    if (rows === null) return { recovered, stillOrphaned, ledgerUnreadable: true };
+    const candidates = rows
       .filter((t) => t.direction === 'BUY' && t.executionMode === 'LIVE' && t.reconciliationState === 'RECONCILIATION_REQUIRED');
     // On a wrong-cluster RPC every signature reads as "not found" and its block height means nothing: a row decided there could be
     // TIMED_OUT although the buy landed. Leave them all for a pass on a trusted RPC (the background retries keep trying).
@@ -1335,8 +1361,11 @@ export class ExecutionCoordinator {
       workstationDb.loadPositions('LIVE', 'ACTIVE').map((p) => p.mint)
     );
     // A buy still waiting for recovery (RECONCILIATION_REQUIRED / PENDING) owns its mint: recoverOrphanedBuys handles it.
+    const unresolvedRows = workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED', 'PENDING']);
+    // R5-4: with the ledger unreadable no balance can be told apart from a buy in recovery; the caller counts the thrown scan as a mismatch.
+    if (unresolvedRows === null) throw new Error('the transactions table could not be read, so a buy still in recovery cannot be ruled out');
     const inRecovery = new Set(
-      workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED', 'PENDING'])
+      unresolvedRows
         .filter((t) => t.direction === 'BUY' && t.executionMode === 'LIVE' && (t.reconciliationState === 'RECONCILIATION_REQUIRED' || t.reconciliationState === 'PENDING'))
         .map((t) => t.mint)
     );
@@ -1426,7 +1455,7 @@ export class ExecutionCoordinator {
     const timer = setTimeout(async () => {
       try {
         const r = await this.recoverOrphanedBuys();
-        if (r.stillOrphaned.length > 0) this.scheduleOrphanRecovery(rest);
+        if (r.stillOrphaned.length > 0 || r.ledgerUnreadable) this.scheduleOrphanRecovery(rest);
       } catch (e: any) {
         Logger.warn(`Background orphan recovery error: ${e.message}`);
         this.scheduleOrphanRecovery(rest);
@@ -4448,13 +4477,11 @@ export class ExecutionCoordinator {
     return lossSol;
   }
 
-  /** P2.2: mints with a LIVE SELL row still PENDING or RECONCILIATION_REQUIRED. */
-  private unresolvedLiveSellMints(): Set<string> {
-    return new Set(
-      workstationDb.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED'])
-        .filter((t) => t.direction === 'SELL' && t.executionMode === 'LIVE')
-        .map((t) => t.mint)
-    );
+  /** P2.2: mints with a LIVE SELL row still PENDING or RECONCILIATION_REQUIRED. R5-4: null when the ledger cannot be read (unknown). */
+  private unresolvedLiveSellMints(): Set<string> | null {
+    const rows = workstationDb.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED']);
+    if (rows === null) return null;
+    return new Set(rows.filter((t) => t.direction === 'SELL' && t.executionMode === 'LIVE').map((t) => t.mint));
   }
 
   /**
@@ -4466,7 +4493,10 @@ export class ExecutionCoordinator {
   private seedPendingSellsFromLedger(): void {
     try {
       const active = workstationDb.loadPositions(undefined, 'ACTIVE').filter((p) => p.executionMode === 'LIVE');
-      const rows = workstationDb.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED']).filter((t) => t.direction === 'SELL' && t.executionMode === 'LIVE');
+      const read = workstationDb.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED']);
+      if (read === null) throw new Error('the transactions table could not be read'); // R5-4: the exit pass holds LIVE exits until a seed succeeds
+      this.pendingSellSeedFailed = false;
+      const rows = read.filter((t) => t.direction === 'SELL' && t.executionMode === 'LIVE');
       for (const t of rows) {
         const pos = active.find((p) => p.mint === t.mint);
         if (!pos) continue;
@@ -4476,9 +4506,13 @@ export class ExecutionCoordinator {
       }
       if (this.pendingSells.size > 0) Logger.warn(`[P2.2] ${this.pendingSells.size} sell(s) sent before the restart are unresolved; their positions check the wallet before selling again`);
     } catch (err: any) {
+      this.pendingSellSeedFailed = true;
       Logger.warn(`[P2.2] could not seed pending sells from the ledger: ${err.message}`);
     }
   }
+
+  /** R5-4: the last seedPendingSellsFromLedger could not read the ledger, so a sell sent before the restart may be unknown to pendingSells. */
+  private pendingSellSeedFailed = false;
 
   /**
    * P2.1: true only when the pending sell's blockhash has expired (confirmed block height past its lastValidBlockHeight) AND its signature
@@ -4571,9 +4605,15 @@ export class ExecutionCoordinator {
     let positions = workstationDb.loadPositions(undefined, 'ACTIVE');
     // P2.2 (R1-23, R1-83, R1-115): until the first startup reconciliation has applied the SELL rows from before a restart, a LIVE position
     // with an unresolved sell is not evaluated: its earlier sell may have landed, and selling again could sell a partial twice.
-    if (!this.firstReconciliationDone) {
+    // R5-4: a ledger that cannot be read (here, or when pendingSells was seeded) is unknown: every LIVE position is held, since any of
+    // them may have an unsettled sell that a second sell would double.
+    if (this.pendingSellSeedFailed) this.seedPendingSellsFromLedger();
+    if (!this.firstReconciliationDone || this.pendingSellSeedFailed) {
       const held = this.unresolvedLiveSellMints();
-      if (held.size > 0) positions = positions.filter((p) => !(p.executionMode === 'LIVE' && held.has(p.mint)));
+      if (held === null || this.pendingSellSeedFailed) {
+        positions = positions.filter((p) => p.executionMode !== 'LIVE');
+        this.raiseOperatorAlert('LEDGER_UNREADABLE', 'The transactions table could not be read, so sells sent earlier cannot be ruled out. LIVE exits are held until it can be read.');
+      } else if (held.size > 0) positions = positions.filter((p) => !(p.executionMode === 'LIVE' && held.has(p.mint)));
     }
     const loadedQty = new Map(positions.map((p) => [p.id, p.tokenQuantityRaw]));
     // N17: failure counters only matter for positions still open; drop the rest so the map cannot grow forever.

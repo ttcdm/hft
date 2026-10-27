@@ -643,15 +643,20 @@ export class WorkstationDatabase {
     }
   }
 
-  public getPendingTransactions(): PersistedTransaction[] {
+  /**
+   * Every PENDING transaction row. R5-4: null when the table cannot be read. An empty list would say "nothing is unresolved", and startup
+   * reconciliation would then close a position whose sell is still unsettled; null makes every caller treat the ledger as unknown.
+   */
+  public getPendingTransactions(): PersistedTransaction[] | null {
     try {
       const stmt = this.db.prepare(`
         SELECT * FROM transactions WHERE reconciliation_state = 'PENDING'
       `);
       // the shared mapper: the hand-written copy here dropped exit_reason and last_valid_block_height, which startup recovery reads
       return this.mapTransactions(stmt.all() as any[]);
-    } catch {
-      return [];
+    } catch (err: any) {
+      Logger.error(`getPendingTransactions could not read the transactions table (${err?.message || err}); callers treat the ledger as unknown`);
+      return null;
     }
   }
 
@@ -928,14 +933,18 @@ export class WorkstationDatabase {
     }
   }
 
-  /** N18: transactions in the given reconciliation states, read through idx_tx_reconciliation instead of scanning the whole table. */
-  public loadTransactionsInStates(states: string[]): PersistedTransaction[] {
+  /**
+   * N18: transactions in the given reconciliation states, read through idx_tx_reconciliation instead of scanning the whole table.
+   * R5-4: null when the query cannot run, never [] (which reads as "nothing unresolved"): callers must treat null as unknown and fail closed.
+   */
+  public loadTransactionsInStates(states: string[]): PersistedTransaction[] | null {
     if (states.length === 0) return [];
     try {
       const rows = this.db.prepare(`SELECT * FROM transactions WHERE reconciliation_state IN (${states.map(() => '?').join(',')})`).all(...states) as any[];
       return this.mapTransactions(rows);
-    } catch {
-      return [];
+    } catch (err: any) {
+      Logger.error(`loadTransactionsInStates could not read the transactions table (${err?.message || err}); callers treat the ledger as unknown`);
+      return null;
     }
   }
 

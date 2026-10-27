@@ -116,10 +116,10 @@ describe('P4: sell preflight, slippage ladder and retry backoff', () => {
       signature: sig, orderId: `o_${posId}`, correlationId: `c_${posId}`, mint: VALID_PUMP_MINT_1.toBase58(), direction: 'SELL',
       submissionTransport: 'SOLANA_RPC', submissionTime: Date.now(), reconciliationState: 'PENDING', networkFeeLamports: 5000, jitoTipLamports: 0, executionMode: 'LIVE',
     });
-    expect(workstationDb.getPendingTransactions().some((t) => t.signature === sig)).toBe(true);
+    expect(workstationDb.getPendingTransactions()!.some((t) => t.signature === sig)).toBe(true);
     const res = await coordinator.closePosition(posId, 100, 'MANUAL');
     expect(res.success).toBe(true);
-    expect(workstationDb.getPendingTransactions().some((t) => t.signature === sig)).toBe(false);
+    expect(workstationDb.getPendingTransactions()!.some((t) => t.signature === sig)).toBe(false);
     const row = workstationDb.loadTransactions(`o_${posId}`).find((t) => t.signature === sig)!;
     expect(row.reconciliationState).toBe('RECONCILED');
     expect(row.landingSlot).toBe(6);

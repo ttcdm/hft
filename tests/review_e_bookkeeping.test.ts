@@ -346,7 +346,7 @@ describe('Review E: S250 orphan recovery asks the signature status before TIMED_
     submissionTime: Date.now() - 90_000, reconciliationState: 'RECONCILIATION_REQUIRED', networkFeeLamports: 5000, jitoTipLamports: 0,
     executionMode: 'LIVE', error: 'UNCONFIRMED', lastValidBlockHeight: 1_000,
   });
-  const stateOf = (sig: string) => workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED', 'TIMED_OUT']).find((t) => t.signature === sig)?.reconciliationState;
+  const stateOf = (sig: string) => workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED', 'TIMED_OUT'])!.find((t) => t.signature === sig)?.reconciliationState;
 
   beforeEach(() => {
     vi.spyOn(localSigner, 'getStatus').mockReturnValue('READY');
@@ -357,7 +357,7 @@ describe('Review E: S250 orphan recovery asks the signature status before TIMED_
     conn.getBlockHeight = vi.fn(async () => 1_001); // past the blockhash window
   });
   afterEach(() => {
-    for (const t of workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED', 'PENDING'])) if (t.mint === mint) workstationDb.saveTransaction({ ...t, reconciliationState: 'REVERTED' });
+    for (const t of workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED', 'PENDING'])!) if (t.mint === mint) workstationDb.saveTransaction({ ...t, reconciliationState: 'REVERTED' });
     coordinator.cleanup();
     vi.restoreAllMocks();
   });

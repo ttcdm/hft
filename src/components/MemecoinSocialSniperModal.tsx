@@ -1174,7 +1174,9 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
               {/* ACTIVE POSITIONS TABLE */}
               {(() => {
-                const filteredPositions = positions.filter((pos) => {
+                // R9-13: this card holds open positions only. Closed rows were counted as "N Open" and kept live Take/Dump buttons.
+                const openPositions = positions.filter((pos) => pos.status === 'OPEN');
+                const filteredPositions = openPositions.filter((pos) => {
                   if (!positionSearchQuery.trim()) return true;
                   const q = positionSearchQuery.toLowerCase().trim();
                   const ticker = (pos.tokenTicker || '').toLowerCase();
@@ -1193,7 +1195,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                           <span>Active Sniper Holdings &amp; Real-Time P&amp;L</span>
                         </span>
                         <span className="px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-[10px] font-bold">
-                          {positions.length} Open
+                          {openPositions.length} Open
                         </span>
                       </div>
 
@@ -1222,7 +1224,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                       </div>
                     </div>
 
-                    {positions.length === 0 ? (
+                    {openPositions.length === 0 ? (
                       <div className="p-8 text-center text-slate-500 border border-[#1E293B] rounded-xl bg-[#0E1526] text-xs font-mono">
                         No active sniper positions. Use manual snipe or enable Autonomous Sniper to auto-enter high-conviction signals.
                       </div>

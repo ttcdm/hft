@@ -505,6 +505,10 @@ export class AutoSnipeController extends EventEmitter {
         return { ok: false, mode: this.mode, error: `DEVNET_LIVE is refused: the saved session spend limit (${this.budgetOverride.maxSpendSol} SOL) is above the ${Number(realCap.toFixed(6))} SOL real-SOL cap. Lower it first (it was allowed because PAPER spends nothing).` };
       }
       if (opts.confirmationCode !== DEVNET_CONFIRMATION_CODE) return { ok: false, mode: this.mode, error: 'DEVNET_LIVE needs the confirmation code' };
+      // R3-1: a halt (an unexplained wallet change, for one) is cleared only on purpose (POST /api/auto/resume {clearHalt:true}); setting
+      // DEVNET_LIVE must not start buying again under it, nor reset the wallet baseline the halt was measured against.
+      const halt = executionCoordinator.getHaltReason();
+      if (halt) return { ok: false, mode: this.mode, error: `DEVNET_LIVE is refused: TRADING_HALTED: ${halt}. Look at why, then clear the halt (POST /api/auto/resume {clearHalt:true}) before setting DEVNET_LIVE.` };
       try {
         await assertClusterAllowed(executionCoordinator.getConnection());
       } catch (e: any) {
@@ -717,6 +721,10 @@ export class AutoSnipeController extends EventEmitter {
       this.mode = 'OFF';
       this.killed = true;
       this.killReason = reason;
+      // R3-1: like the S207 trip, the halt disarms LIVE and saves the kill, so neither a leftover arming nor a restart restarts buying.
+      executionCoordinator.armLiveTrading(false);
+      this.persistKill();
+      this.clearPendingReleases();
       this.session = null;
       workstationDb.logDecision({ autoMode: 'DEVNET_LIVE', mint: '-', stage: 'risk', outcome: 'HALT_ALL', reason, inputs: { prevSol: prev.sol, nowSol: bal } });
       Logger.error(`[AUTO] HALT ALL: ${reason}`);
@@ -756,8 +764,14 @@ export class AutoSnipeController extends EventEmitter {
    * 3E: `ackLossTriggers` records the operator's acknowledgement of NEGATIVE_EXPECTANCY / LOSS_STREAK: auto trades closed until now stop
    * counting, so a mode can be set again. `lossTriggersAcked` is false when it could not be saved (nothing changes then).
    */
-  public resume(opts: { clearHalt?: boolean; clearDailyLossLatch?: boolean; ackLossTriggers?: boolean } = {}): { halted: boolean; mode: AutoMode; lossTriggersAcked?: boolean } {
-    if (opts.clearHalt) executionCoordinator.clearHalt();
+  public resume(opts: { clearHalt?: boolean; clearDailyLossLatch?: boolean; ackLossTriggers?: boolean } = {}): { halted: boolean; mode: AutoMode; lossTriggersAcked?: boolean; clearHaltRefused?: string } {
+    let clearHaltRefused: string | undefined;
+    if (opts.clearHalt) {
+      // R5-17: a read-only server cannot trade, so it has nothing to resume; its TRADING_HALT_CLEARED row would make the next signed boot
+      // on this database forget a halt (a wallet-audit one, say) that nobody looked at with a signer present.
+      if (isReadOnly()) clearHaltRefused = 'READ_ONLY: APEX_READ_ONLY=true. A read-only server does not clear a trading halt; clear it from the server that signs.';
+      else executionCoordinator.clearHalt();
+    }
     if (opts.clearDailyLossLatch) riskEngine.clearDailyLossLatch();
     let lossTriggersAcked: boolean | undefined;
     if (opts.ackLossTriggers) {
@@ -768,7 +782,7 @@ export class AutoSnipeController extends EventEmitter {
         : 'operator acknowledgement of the loss triggers could not be saved; nothing changed';
       workstationDb.logDecision({ ts, autoMode: this.mode, mint: '-', stage: 'risk', outcome: 'INFO', reason });
     }
-    return { halted: executionCoordinator.getHaltReason() !== null, mode: this.mode, ...(lossTriggersAcked !== undefined ? { lossTriggersAcked } : {}) };
+    return { halted: executionCoordinator.getHaltReason() !== null, mode: this.mode, ...(lossTriggersAcked !== undefined ? { lossTriggersAcked } : {}), ...(clearHaltRefused ? { clearHaltRefused } : {}) };
   }
 
   private watchListener: ((r: WatchResult) => void) | null = null;

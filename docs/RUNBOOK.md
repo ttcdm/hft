@@ -104,14 +104,14 @@ To recover:
 
 ## 3. All trading halted (wallet audit)
 
-In DEVNET_LIVE the auto controller compares the wallet's SOL every 5 s with what the decision journal says moved. A difference above 0.0005 SOL plus allowances halts the coordinator and sets auto OFF. The halt refuses every buy and the take-profit and stale exits; stop-loss, trailing stop, manual close and panic still run (a LIVE manual close of a position too small to cover its fees is still refused as dust). The halt is saved in the database and survives a restart.
+In DEVNET_LIVE the auto controller compares the wallet's SOL every 5 s with what the decision journal says moved. A difference above 0.0005 SOL plus allowances halts the coordinator, sets auto OFF, disarms LIVE and saves the kill (so a restart comes back OFF and disarmed). While the halt is set, `POST /api/auto/mode` refuses `DEVNET_LIVE` (`TRADING_HALTED`). The halt refuses every buy and the take-profit and stale exits; stop-loss, trailing stop, manual close and panic still run (a LIVE manual close of a position too small to cover its fees is still refused as dust). The halt is saved in the database and survives a restart.
 
 It also fires on SOL moves the journal has no row for, which are not theft: for example a SOL transfer you made by hand. Since 3B every landed LIVE buy, manual or auto, writes a `LIVE_BUY_FILLED` row with its whole wallet delta, so a buy no longer trips the audit, and while a LIVE buy is sent and unresolved a wallet drop up to its worst case is held as that buy's (no halt) until recovery journals it. A drop larger than that, or any rise, still halts.
 
 To recover:
 1. Do not move SOL or tokens by hand yet. Open positions are still protected by their stop-loss.
 2. Compare the wallet's history on a devnet explorer (`?cluster=devnet`) with what the app recorded. Explain every move.
-3. If every move is explained: `api -X POST $APEX/api/auto/resume -d '{"clearHalt":true}'`. It clears the halt only and never turns auto back on. Then arm and set the mode (section 2 steps 4-5).
+3. If every move is explained: `api -X POST $APEX/api/auto/resume -d '{"clearHalt":true}'`. It clears the halt only and never turns auto back on. A read-only server (`APEX_READ_ONLY=true`) refuses it (`clearHaltRefused` in the reply): clear the halt from the server that signs. Then arm and set the mode (section 2 steps 4-5).
 4. If a move is not explained, treat the key as compromised: panic (1.2), stop the process (1.3), move what is left (1.4) and generate a new throwaway devnet key.
 
 ## 4. Buys refused with DAILY_LOSS_LIMIT (the net daily PnL floor)

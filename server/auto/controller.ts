@@ -91,8 +91,12 @@ export const AUTO_SENT_UNRESOLVED = 'SENT_UNRESOLVED';
 export interface AutoKillResult {
   mode: AutoMode;
   closed: number;
-  refused: Array<{ positionId: string; mint: string; error: string }>;
-  failed: Array<{ positionId: string; mint: string; error: string }>;
+  /** Auto-owned positions a sell was tried for (0 when exitAll was not asked for). */
+  attempted: number;
+  /** Refused before anything was sent (closePosition notSent). */
+  refused: Array<{ positionId: string; mint: string; symbol: string; error: string }>;
+  /** Sent and failed, or threw. */
+  failed: Array<{ positionId: string; mint: string; symbol: string; error: string }>;
   /** Auto-owned positions still ACTIVE after the sells; 0 when exitAll was not asked for (nothing was sold, nothing was counted). */
   stillOpen: number;
 }
@@ -694,26 +698,30 @@ export class AutoSnipeController extends EventEmitter {
     let closed = 0;
     const refused: AutoKillResult['refused'] = [];
     const failed: AutoKillResult['failed'] = [];
+    let attempted = 0;
     if (opts.exitAll) {
       for (const p of workstationDb.loadPositions(undefined, 'ACTIVE')) {
         if (!AutoSnipeController.isAutoOwned(owned, p)) continue;
+        attempted++;
+        // R6-4: a close that throws is listed and does not stop the rest
         try {
           const r = await executionCoordinator.closePosition(p.id, 100, 'MANUAL');
           if (r.success) closed++;
-          else (r.notSent ? refused : failed).push({ positionId: p.id, mint: p.mint, error: r.error || 'close returned no reason' });
+          else (r.notSent ? refused : failed).push({ positionId: p.id, mint: p.mint, symbol: p.symbol, error: r.error || 'close returned no reason' });
         } catch (e: any) {
-          failed.push({ positionId: p.id, mint: p.mint, error: `ERROR: ${e?.message || e}` });
+          failed.push({ positionId: p.id, mint: p.mint, symbol: p.symbol, error: `ERROR: ${e?.message || e}` });
         }
       }
     }
     // R6-4: say what is still open, so "success" never reads as "all sold"
     const stillOpen = opts.exitAll ? workstationDb.loadPositions(undefined, 'ACTIVE').filter((p) => AutoSnipeController.isAutoOwned(owned, p)).length : 0;
-    Logger.warn(`[AUTO] kill: ${this.killReason}; closed ${closed} position(s), ${refused.length} refused, ${failed.length} failed, ${stillOpen} auto position(s) still open`);
+    const notSold = [...refused, ...failed];
+    Logger.warn(`[AUTO] kill: ${this.killReason}; closed ${closed} of ${attempted} position(s), ${refused.length} refused, ${failed.length} failed, ${stillOpen} auto position(s) still open${notSold.length ? `; NOT closed: ${notSold.map((f) => `${f.symbol} (${f.error})`).join(', ')}` : ''}`);
     if (refused.length + failed.length > 0) {
       workstationDb.logDecision({ autoMode: 'OFF', mint: '-', stage: 'exit', outcome: 'INFO', reason: `kill: ${refused.length} sell(s) refused and ${failed.length} failed; ${stillOpen} auto position(s) still open`, inputs: { refused, failed } });
     }
     this.emit('mode', { mode: this.mode, reason: this.killReason });
-    return { mode: this.mode, closed, refused, failed, stillOpen };
+    return { mode: this.mode, closed, attempted, refused, failed, stillOpen };
   }
 
   // ---- G3: kill switch ---------------------------------------------------------------------------------------

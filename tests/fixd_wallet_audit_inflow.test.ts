@@ -38,7 +38,10 @@ describe('R8-1 / R7-5 / R5-25: the DEVNET_LIVE wallet audit', () => {
     vi.spyOn(executionCoordinator, 'getUnresolvedLiveBuys').mockReturnValue({ mints: [], reservedSol: 0 });
     pendingSells = [];
     const real = workstationDb.loadTransactionsInStates.bind(workstationDb);
-    vi.spyOn(workstationDb, 'loadTransactionsInStates').mockImplementation((states: string[]) => [...real(states), ...(pendingSells as any)]);
+    vi.spyOn(workstationDb, 'loadTransactionsInStates').mockImplementation((states: string[]) => {
+      const rows = real(states);
+      return rows === null ? null : [...rows, ...(pendingSells as any)]; // R5-4: null is an unreadable ledger; keep it null
+    });
     bal = vi.spyOn(executionCoordinator, 'getRealWalletBalanceSol').mockReturnValue(1);
     const ok = await autoSnipeController.setMode('DEVNET_LIVE', { confirmationCode: DEVNET_CONFIRMATION_CODE });
     expect(ok.ok, ok.error).toBe(true);

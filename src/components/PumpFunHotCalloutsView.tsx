@@ -87,6 +87,19 @@ export function TokenImage({ uri, symbol }: { uri: string; symbol: string }) {
   return <img src={uri} alt={symbol} className="w-11 h-11 rounded-lg border border-slate-700 object-cover flex-shrink-0" onError={() => setBroken(true)} />;
 }
 
+/** R6-10: what the callout action badge means. INSTANT_SNIPE used to read as a prime entry; it is the pump.fun list plus a paid boost. */
+export function calloutActionLabel(a: string): string {
+  return a === 'INSTANT_SNIPE' ? 'LISTED + BOOSTED' : a.replace(/_/g, ' ');
+}
+export function calloutActionTitle(a: string): string {
+  return a === 'INSTANT_SNIPE'
+    ? 'Near the top of the pump.fun HTTP list AND on DexScreener\'s paid boost list, multiple at most 2.5x and under 3 minutes old. A paid boost is promotion, not a verified signal.'
+    : 'Derived from the pump.fun HTTP feed (curve %, market cap multiple, age).';
+}
+export const InventedCallerTag = () => (
+  <span data-testid="invented-caller" title="DEMO_MODE=true: this caller and its stats are invented" className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-rose-950 text-rose-300 border border-rose-500/50">INVENTED (DEMO)</span>
+);
+
 /** R6-6: the age of the feed snapshot behind a callout card. Past CALLOUT_SNAPSHOT_MAX_AGE_MS the server's auto-snipe check skips it too. */
 export const CALLOUT_SNAPSHOT_STALE_MS = 15_000;
 export function CalloutSnapshotAge({ dataAsOfMs, now = Date.now() }: { dataAsOfMs?: number; now?: number }) {
@@ -582,6 +595,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                               <span>@{c.caller.userId}</span>
                               <Eye className="w-3 h-3 text-slate-500" />
                             </span>
+                            {c.caller.invented && <InventedCallerTag />}
 
                             {/* REPUTATION TIER BADGE */}
                             <span
@@ -598,16 +612,16 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
 
                             {/* MULTI-CALLER CONFLUENCE BADGE */}
                             {isConfluence && (
-                              <span className="px-2 py-0.5 rounded text-[10px] font-mono font-black bg-rose-500 text-white animate-pulse shadow-sm flex items-center space-x-1">
+                              <span className="px-2 py-0.5 rounded text-[10px] font-mono font-black bg-rose-500 text-white shadow-sm flex items-center space-x-1">
                                 <Sparkles className="w-3 h-3" />
-                                <span>{c.confluenceCount}x CONFLUENCE HIT</span>
+                                <span title="Counted from the pump.fun HTTP list position, DexScreener's PAID boost list and 5-minute order flow; not from independent callers">{c.confluenceCount} feed signals (incl. paid DexScreener boost)</span>
                               </span>
                             )}
                           </div>
 
                           <div className="text-[10px] font-mono text-slate-400 flex items-center space-x-2 mt-0.5">
                             <span>
-                              Win Rate (2x+): <span className="text-emerald-400 font-bold">{c.caller.winRate2x}%</span>
+                              {c.caller.invented ? 'Invented win rate (2x+): ' : 'Win Rate (2x+): '}<span className="text-emerald-400 font-bold">{c.caller.winRate2x}%</span>
                             </span>
                             <span>•</span>
                             <span>
@@ -634,7 +648,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                           }`}
                         >
                           <Zap className="w-3.5 h-3.5" />
-                          <span>{c.hftAction.replace('_', ' ')}</span>
+                          <span title={calloutActionTitle(c.hftAction)}>{calloutActionLabel(c.hftAction)}</span>
                         </div>
 
                         {/* Time elapsed */}
@@ -817,7 +831,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                         {/* Security check badges */}
                         <div className="flex items-center space-x-2 text-[10px] font-mono text-slate-400">
                           {(() => {
-                            const b = authorityBadge('Mint', c.token.isMintRevoked as boolean | null);
+                            const b = authorityBadge('Mint', c.token.isMintRevoked as boolean | null, 'the pump.fun feed');
                             return (
                               <span className={`${authorityTone[b.tone]} flex items-center`}>
                                 <ShieldCheck className="w-3 h-3 mr-0.5" /> {b.text}
@@ -900,7 +914,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                       {c.otherCallers && c.otherCallers.length > 0 && (
                         <div className="flex items-center space-x-1 text-[10px] font-mono text-slate-400">
                           <Users className="w-3 h-3 text-rose-400" />
-                          <span>Also called by:</span>
+                          <span>{c.caller.invented ? 'Also "called" by (invented DEMO callers):' : 'Also called by:'}</span>
                           <span className="text-rose-300 font-bold">{c.otherCallers.join(', ')}</span>
                         </div>
                       )}
@@ -921,8 +935,12 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
           <div className="p-3 rounded-lg bg-[#0F1524] border border-[#1E293B] text-xs font-mono flex items-center justify-between">
             <div className="flex items-center space-x-2 text-slate-300">
               <Award className="w-4 h-4 text-amber-400" />
-              <span className="font-bold">Pump.fun Official Top Caller Rankings</span>
-              <span className="text-slate-500">• Verifiable on-chain track records</span>
+              <span className="font-bold">Caller leaderboard</span>
+              {leaderboard.some((c) => c.invented) ? (
+                <span data-testid="leaderboard-invented" className="text-rose-300 font-bold">• DEMO_MODE: these callers and their win rates are INVENTED, not real track records</span>
+              ) : (
+                <span className="text-slate-500">• no caller source is wired; this list is empty outside DEMO_MODE</span>
+              )}
             </div>
 
             <div className="text-[11px] text-slate-400">

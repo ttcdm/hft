@@ -1068,7 +1068,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                 );
                               })}
                               <div className="text-slate-400">
-                                Top 10: <strong className="text-slate-200">{holderPct(pool.top10HoldersPct)}</strong>
+                                <span title="Share of the tokens off the bonding curve held by the 10 largest holders (not share of total supply)">Top 10 (off-curve):</span> <strong className="text-slate-200">{holderPct(pool.top10HoldersPct)}</strong>
                               </div>
                             </div>
                           </td>

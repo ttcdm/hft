@@ -211,6 +211,8 @@ export interface TopCalloutRecord {
 }
 
 export interface PumpFunCaller {
+  /** R6-10: a DEMO_MODE caller: the handle, win rates and history are invented, not a real track record. */
+  invented?: boolean;
   userId: string;
   userUuid: string;
   primaryWallet: string;

@@ -356,7 +356,8 @@ export const PUMP_FEED_ONLINE_WINDOW_MS = 60_000;
 export type PumpFeedStatus = 'NO_DATA' | 'ONLINE' | 'STALE';
 
 export class PumpFunService extends EventEmitter {
-  private callers: PumpFunCaller[] = isDemoMode() ? [...INITIAL_CALLERS] : [];
+  // R6-10: DEMO_MODE callers carry invented=true, so the UI never shows them as a real track record
+  private callers: PumpFunCaller[] = isDemoMode() ? INITIAL_CALLERS.map((c) => ({ ...c, invented: true })) : [];
   private hotCallouts: PumpFunHotCallout[] = [];
   private firstSeenMcap = new Map<string, { mcapUsd: number; priceUsd: number }>();
   private lastSyncTimestamp: number = 0; // wall clock, for display

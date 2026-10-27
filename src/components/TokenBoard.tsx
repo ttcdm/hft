@@ -101,7 +101,7 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
       {!board && <div className="p-6 text-sm text-slate-500">Loading… (sign in as operator to read the board)</div>}
       {board && tab === 'launches' && (
         <table className="w-full text-xs">
-          <thead><tr><th className={headLeft}>Token</th><th className={head}>Price (SOL)</th><th className={head}>Curve</th><th className={head}>Top10 %</th><th className={head}>Creator %</th><th className={head}>Age</th></tr></thead>
+          <thead><tr><th className={headLeft}>Token</th><th className={head}>Price (SOL)</th><th className={head}>Curve</th><th className={head} title="Share of the tokens OFF the bonding curve held by the 10 largest holders. The holder gate uses share of total supply, a different figure.">Top10 % (off-curve)</th><th className={head}>Creator %</th><th className={head} title="Time since the launch entered the watch window; — when it is not being watched">Age</th></tr></thead>
           <tbody>
             {board.launches.length === 0 && <tr><td colSpan={6} className="p-6 text-center text-slate-500">No launches seen yet. The board fills from the Pump.fun create-event stream.</td></tr>}
             {board.launches.map((l) => (

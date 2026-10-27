@@ -46,6 +46,14 @@ export function buildBoard(now = Date.now()) {
   // R6-8: the balance is cached (read at boot, after a trade, on an RPC switch and in the DEVNET_LIVE wallet audit); say how old it is
   const balanceRead = riskEngine.getLastBalanceRead();
 
+  const snap = watchWindow.getSnapshot(now);
+  // R6-10: every WS launch carried the fixed text "Just now (WS)". The watch window knows how long it has watched each launch, which
+  // starts at the create event; a launch it is not watching has no measured age here.
+  const watchedAge = new Map<string, string>();
+  for (const r of snap.released) watchedAge.set(r.metrics.mint, `over ${Math.round(r.metrics.elapsedMs / 1000)}s (released)`);
+  for (const w of snap.watching) watchedAge.set(w.metrics.mint, `${Math.round(w.metrics.elapsedMs / 1000)}s`);
+  const launchAge = (mint: string, text: string | undefined): string | null => (text && text !== 'Just now (WS)' ? text : watchedAge.get(mint) ?? null);
+
   const launches = memecoinAggregator
     .getPools()
     .filter((p) => p.id.startsWith('pool-onchain-')) // demo/simulated/callout-derived pools are not launches
@@ -61,10 +69,9 @@ export function buildBoard(now = Date.now()) {
       // Q10d: a placeholder is not a fact; unknown goes out as null
       mintRevoked: p.authoritiesVerified === false ? null : p.isMintRevoked,
       freezeRevoked: p.authoritiesVerified === false ? null : p.isFreezeRevoked,
-      createdAgo: p.createdAgo || null,
+      createdAgo: launchAge(p.contractAddress, p.createdAgo),
     }));
 
-  const snap = watchWindow.getSnapshot(now);
   const watching = [
     ...snap.watching.map((w) => ({ mint: w.metrics.mint, state: 'WATCHING' as const, reason: null as string | null, metrics: w.metrics })),
     ...snap.released.map((r) => ({ mint: r.metrics.mint, state: r.state, reason: r.reason, metrics: r.metrics })),

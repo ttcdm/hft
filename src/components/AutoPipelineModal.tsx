@@ -1,3 +1,4 @@
+import { SHADOW_TEST_NOTE } from './AutoPanel';
 import React from 'react';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { X, Cpu } from 'lucide-react';
@@ -25,7 +26,7 @@ export function AutoPipelineView({ auto, watch, error }: { auto: AutoStatusData 
           </p>
           <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 mb-3" data-testid="pipeline-stats">
             <span className="text-slate-500">Candidates seen</span><span className="text-right">{auto.stats.seen}</span>
-            <span className="text-slate-500">Would buy (shadow)</span><span className="text-right">{auto.stats.wouldBuy}</span>
+            <span className="text-slate-500" data-testid="shadow-would-buy" title={SHADOW_TEST_NOTE}>Would buy (SHADOW, looser test)</span><span className="text-right">{auto.stats.wouldBuy}</span>
             <span className="text-slate-500">Bought</span><span className="text-right">{auto.stats.bought}</span>
             <span className="text-slate-500">Open / closed</span><span className="text-right">{auto.stats.open} / {auto.stats.closed}</span>
           </div>

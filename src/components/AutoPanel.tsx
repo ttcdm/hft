@@ -25,6 +25,12 @@ export interface AutoStatusData {
   stats: { seen: number; rejectedByStage: Record<string, number>; wouldBuy: number; bought: number; open: number; closed: number; netPnlSol: number; feesPaidSol: number; winRate: number | null };
 }
 
+/**
+ * R6-5: SHADOW's "would buy" is not the test PAPER and DEVNET_LIVE apply: it skips the slot cap, the session budget and the re-entry guard,
+ * and uses its own size and a fixed fee estimate, so it overstates what a real session would buy.
+ */
+export const SHADOW_TEST_NOTE = 'SHADOW is a looser test than a real buy: it skips the open-slot cap, the session budget and the re-entry guard, and uses its own order size and a fixed fee estimate. Do not read it as what PAPER or DEVNET_LIVE would have bought.';
+
 const MODE_STYLE: Record<AutoMode, string> = {
   OFF: 'bg-slate-800 text-slate-300', SHADOW: 'bg-cyan-900/60 text-cyan-200', PAPER: 'bg-emerald-900/60 text-emerald-200', DEVNET_LIVE: 'bg-amber-900/70 text-amber-200',
 };
@@ -187,7 +193,7 @@ export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOr
       </div>
       <div className="border-t border-slate-800 pt-2 grid grid-cols-2 gap-x-3 gap-y-0.5 font-mono" data-testid="auto-stats">
         <span className="text-slate-500">Seen</span><span className="text-right">{s.seen}</span>
-        <span className="text-slate-500">Would buy (shadow)</span><span className="text-right">{s.wouldBuy}</span>
+        <span className="text-slate-500" data-testid="shadow-would-buy" title={SHADOW_TEST_NOTE}>Would buy (SHADOW, looser test)</span><span className="text-right">{s.wouldBuy}</span>
         <span className="text-slate-500">Bought</span><span className="text-right">{s.bought}</span>
         <span className="text-slate-500">Open / closed</span><span className="text-right">{s.open} / {s.closed}</span>
         <span className="text-slate-500">Net PnL after fees</span><span className={`text-right ${s.closed === 0 ? '' : s.netPnlSol >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>{s.closed === 0 ? '—' : `${s.netPnlSol.toFixed(5)} SOL`}</span>

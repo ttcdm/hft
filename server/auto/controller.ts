@@ -11,7 +11,7 @@ import { checkSnipeAmountSol, SNIPE_AMOUNT_MIN_SOL } from '../execution/snipeAmo
 import { allowedCluster, assertClusterAllowed } from '../solana/clusterGuard';
 import { Logger } from '../middleware/enterprise';
 import type { SignalProvenance } from '../core/types';
-import { computeJournalStats, autoEvidencePnl, type JournalStats } from './journalStats';
+import { computeJournalStats, autoEvidencePnl, type JournalStatsReport } from './journalStats';
 import { evaluateKillTriggers, auditWalletChange, EXPECTANCY_WINDOW, MAX_CONSECUTIVE_LOSSES, type KillTrigger } from './killSwitch';
 import { riskEngine, PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS } from '../risk/riskEngine';
 import { watchWindow, readyGate, type WatchResult, type WatchVerdict } from '../signals/watchWindow';
@@ -146,6 +146,8 @@ export interface AutoStatus {
 }
 
 const MAX_DECISIONS = 500;
+/** R6-3: the most journal rows one stats read takes (newest first). A read that hits it says so (`truncated`). */
+export const STATS_ROW_LIMIT = 20_000;
 /** Q27: the same unwatched / pending / dead mint from the same source is not journaled again for this long. */
 export const DROP_REPEAT_MS = 10 * 60_000;
 /** S4b: how many releases may wait behind a buy in flight, and how long a signal stays good (the watch window decides in 120 s; a release older than this is not acted on late). */
@@ -235,11 +237,34 @@ export class AutoSnipeController extends EventEmitter {
     return this.mode;
   }
 
-  /** Session stats straight from the decision journal. Journal rows since the current session started (or all rows when OFF). */
-  public getJournalStats(): JournalStats {
-    const rows = workstationDb.loadDecisions({ sinceTs: this.session?.startedAt, limit: 5000 });
-    const status = new Map(workstationDb.loadPositions().map((p) => [p.id, p.status as string]));
-    return computeJournalStats(rows, (id) => status.get(id));
+  /**
+   * Session stats straight from the decision journal and the position ledger (H3; R6-3). One auto mode only: the running session's
+   * (PAPER or DEVNET_LIVE), else the mode auto is in, else the last mode it ran in. The window is the session (since it started) or,
+   * with no session, the newest STATS_ROW_LIMIT rows. The report says which mode and window it covers and whether the read was cut.
+   */
+  public getJournalStats(opts: { mode?: 'SHADOW' | 'PAPER' | 'DEVNET_LIVE' } = {}): JournalStatsReport {
+    const windowEnd = Date.now();
+    const sinceTs = this.session?.startedAt;
+    const read = workstationDb.loadDecisions({ sinceTs, limit: STATS_ROW_LIMIT });
+    const autoModes = new Set(['SHADOW', 'PAPER', 'DEVNET_LIVE']);
+    let mode: JournalStatsReport['mode'] = opts.mode
+      ?? (this.session && this.sessionKind ? this.sessionKind : this.mode !== 'OFF' ? this.mode : null);
+    if (!mode) {
+      for (let i = read.length - 1; i >= 0; i--) if (autoModes.has(read[i].autoMode)) { mode = read[i].autoMode as JournalStatsReport['mode']; break; }
+    }
+    const rows = mode ? read.filter((r) => r.autoMode === mode) : [];
+    const positions = new Map(workstationDb.loadPositions().map((p) => [p.id, { status: p.status as string, realizedPnLSol: p.realizedPnLSol }]));
+    const base = computeJournalStats(rows, (id) => positions.get(id), AUTO_SENT_UNRESOLVED);
+    const truncated = read.length >= STATS_ROW_LIMIT;
+    const windowStart = rows.length === 0 ? (sinceTs ?? null) : truncated || sinceTs === undefined ? rows[0].ts : sinceTs;
+    const notes = [
+      `${mode ?? 'no'} auto rows only; other modes are left out`,
+      sinceTs !== undefined ? 'since the current session started' : 'no session running: the newest journal rows, across past sessions',
+      'net PnL and win rate: realized PnL of closed positions from the position ledger; open positions are not in it',
+      ...(truncated ? [`only the newest ${STATS_ROW_LIMIT} journal rows were read; older rows of the window are not counted`] : []),
+      ...(mode === 'SHADOW' ? ['SHADOW "would buy" skips the slot cap, the session budget and the re-entry guard; it is not what DEVNET_LIVE would do'] : []),
+    ];
+    return { ...base, mode, windowStart, windowEnd, rowsCounted: rows.length, rowsRead: read.length, rowLimit: STATS_ROW_LIMIT, truncated, pnlSource: 'position ledger realizedPnLSol', notes };
   }
 
   public getDecisions(limit = 100): AutoDecision[] {

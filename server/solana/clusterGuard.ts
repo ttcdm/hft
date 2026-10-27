@@ -213,26 +213,41 @@ async function referenceIsValid(blockhash: string): Promise<boolean> {
 }
 
 /**
+ * R3-6: how long a SELL waits on a "no" before calling it definite. The public reference node can lag the configured RPC by a few slots
+ * (a fresh blockhash is a slot or two old), and a definite "no" refuses the sell, a stop-loss included. So a SELL asks again after each of
+ * these delays (6.5 s in all, bounded) and is refused only if every answer is "no". A BUY keeps the single retry after 500 ms: refusing
+ * a buy costs nothing.
+ */
+export const SELL_BLOCKHASH_RECHECK_DELAYS_MS = [500, 1000, 2000, 3000] as const;
+const BUY_BLOCKHASH_RECHECK_DELAYS_MS = [500] as const;
+
+/**
  * Asks an INDEPENDENT RPC (the public devnet endpoint, not the configured one) whether the order's blockhash exists on devnet. An RPC that
  * claims devnet but is really mainnet hands out blockhashes devnet has never seen, so this catches it where the genesis check cannot. A "no"
- * is retried once after 500 ms, because the public node can lag a few slots behind the configured one.
+ * is asked again (once after 500 ms for a BUY; for a SELL after each of SELL_BLOCKHASH_RECHECK_DELAYS_MS, R3-6), because the public node can
+ * lag a few slots behind the configured one. A lookup that fails is never definite.
  * Skipped when the flag is off, on localnet (its blockhashes are local) and on mainnet-beta (sends are refused before this point).
  */
 export async function verifyBlockhashIndependently(
   blockhash: string,
   env: NodeJS.ProcessEnv = process.env,
-  deps: BlockhashCheckDeps = {}
+  deps: BlockhashCheckDeps = {},
+  side: 'BUY' | 'SELL' = 'BUY'
 ): Promise<BlockhashVerdict> {
   if (!blockhashCheckEnabled(env)) return { ok: true, skipped: 'APEX_VERIFY_BLOCKHASH is not true' };
   const cluster = allowedCluster(env);
   if (cluster !== 'devnet') return { ok: true, skipped: `not checked on ${cluster}` };
   const isValid = deps.isValid ?? referenceIsValid;
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const delays = side === 'SELL' ? SELL_BLOCKHASH_RECHECK_DELAYS_MS : BUY_BLOCKHASH_RECHECK_DELAYS_MS;
   try {
     if (await isValid(blockhash)) return { ok: true };
-    await sleep(500);
-    if (await isValid(blockhash)) return { ok: true };
-    return { ok: false, definite: true, reason: `blockhash ${blockhash} is not known to the independent devnet RPC; the configured RPC may not be on devnet` };
+    for (const ms of delays) {
+      await sleep(ms);
+      if (await isValid(blockhash)) return { ok: true };
+    }
+    const waitedMs = delays.reduce((a, b) => a + b, 0);
+    return { ok: false, definite: true, reason: `blockhash ${blockhash} is not known to the independent devnet RPC after ${delays.length + 1} checks over ${waitedMs} ms; the configured RPC may not be on devnet` };
   } catch (err: any) {
     return { ok: false, definite: false, reason: `could not ask the independent devnet RPC about the blockhash (${err?.message ?? 'unknown error'})` };
   }

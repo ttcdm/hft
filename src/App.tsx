@@ -18,6 +18,8 @@ import { engineClient, getOperatorSessionToken, authFetch } from './services/eng
 import { TokenBoard } from './components/TokenBoard';
 import { CurvePanel } from './components/CurvePanel';
 import { AutoPanel } from './components/AutoPanel';
+import { usePolled } from './utils/usePolled';
+import { readServerAlerts, serverAlertEvents, alertsUnreadableEvent } from './utils/operatorAlerts';
 
 
 export function makeEmptyKpis(startingEquity: number): PerformanceKPIs {
@@ -137,6 +139,22 @@ export default function App() {
     }, 1000);
     return () => clearInterval(t);
   }, []);
+
+  // R6-1: the server's operator alerts (exit failing, position gone, halt not saved, ...) join the stack. A CRITICAL one stays until the
+  // server clears it; a WARNING or INFO one can be hidden in this browser.
+  const checksPoll = usePolled<any>('/api/system/checks', 5000, isOperatorAuthenticated);
+  const [hiddenServerAlerts, setHiddenServerAlerts] = useState<Set<string>>(new Set());
+  const serverAlerts = serverAlertEvents(readServerAlerts(checksPoll.data), hiddenServerAlerts);
+  const unreadable = isOperatorAuthenticated && checksPoll.error ? [alertsUnreadableEvent(checksPoll.error, checksPoll.at ?? Date.now())] : [];
+  const shownAlerts = [...unreadable, ...serverAlerts, ...alerts];
+  const seenServerAlerts = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    for (const a of serverAlerts) {
+      if (seenServerAlerts.current.has(a.id)) continue;
+      seenServerAlerts.current.add(a.id);
+      hftAudio.playAlertBeep(a.level === 'CRITICAL' ? 'CRITICAL' : 'WARNING');
+    }
+  });
 
   // Q36: a refused WebSocket command is shown, not dropped.
   useEffect(() => {
@@ -262,9 +280,15 @@ export default function App() {
 
       {/* 3. ALERT SYSTEM POPUPS */}
       <AlertSystem
-        alerts={alerts}
-        onDismissAlert={(id) => setAlerts((prev) => prev.filter((a) => a.id !== id))}
-        onClearAll={() => setAlerts([])}
+        alerts={shownAlerts}
+        onDismissAlert={(id) => {
+          if (id.startsWith('server-')) setHiddenServerAlerts((prev) => new Set(prev).add(id));
+          else setAlerts((prev) => prev.filter((a) => a.id !== id));
+        }}
+        onClearAll={() => {
+          setAlerts([]);
+          setHiddenServerAlerts((prev) => { const next = new Set(prev); for (const a of serverAlerts) if (!a.sticky) next.add(a.id); return next; });
+        }}
       />
 
       {/* 4. MODALS */}

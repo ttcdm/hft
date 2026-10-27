@@ -1,11 +1,14 @@
 import React, { useState } from 'react';
 import { AlertCircle, AlertTriangle, ShieldCheck, X } from 'lucide-react';
 import { AlertEvent } from '../types';
+import { orderAlerts } from '../utils/operatorAlerts';
 
 /**
  * UI-2: alerts used to pile up three deep in the bottom-right corner and stay until dismissed, covering the Plug & Play footer
  * (ARM LIVE TRADING, PAPER SNIPE). INFO and WARNING now expire on their own; CRITICAL stays until the operator dismisses it.
- * The stack shows the newest alert only, with "Show all" for the rest.
+ * The stack shows one alert, with "Show all" for the rest. R6-19: the one shown is the most severe (CRITICAL, then WARNING, then INFO),
+ * newest first within a level, so a later INFO cannot hide a CRITICAL. R6-1: the server's operator alerts are in the same stack; a
+ * sticky one (a server CRITICAL) has no dismiss button and leaves only when the server clears it.
  */
 export const ALERT_TTL_MS: Record<AlertEvent['level'], number | null> = { INFO: 8_000, WARNING: 20_000, CRITICAL: null };
 
@@ -30,8 +33,10 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
 }) => {
   const [expanded, setExpanded] = useState(false);
   if (alerts.length === 0) return null;
-  const shown = alerts.slice(0, expanded ? EXPANDED_ALERTS : COLLAPSED_ALERTS);
+  const ordered = orderAlerts(alerts);
+  const shown = ordered.slice(0, expanded ? EXPANDED_ALERTS : COLLAPSED_ALERTS);
   const hidden = alerts.length - shown.length;
+  const critical = alerts.filter((a) => a.level === 'CRITICAL').length;
 
   return (
     <div
@@ -41,7 +46,7 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
       <div className="flex items-center justify-between pointer-events-auto bg-[#0D131F] border border-[#1E293B] px-3 py-1.5 rounded-lg shadow-xl text-[11px] font-mono">
         <span className="text-amber-400 font-bold flex items-center space-x-1">
           <AlertTriangle className="w-3.5 h-3.5 mr-1" />
-          <span>Active Risk Alerts ({alerts.length})</span>
+          <span>Active Risk Alerts ({alerts.length}{critical ? `, ${critical} critical` : ''})</span>
         </span>
         <span className="flex items-center space-x-3">
           {alerts.length > COLLAPSED_ALERTS && (
@@ -86,6 +91,7 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
               <div className="font-bold text-[11px] uppercase tracking-wider flex items-center space-x-2">
                 <span>{alert.title}</span>
                 <span className="text-[9px] opacity-70">[{alert.timeStr}]</span>
+                {alert.source === 'server' && <span className="text-[9px] opacity-70">server</span>}
               </div>
               <p className="text-[11px] opacity-90 mt-0.5 leading-tight">
                 {alert.message}
@@ -93,12 +99,19 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
             </div>
           </div>
 
-          <button
-            onClick={() => onDismissAlert(alert.id)}
-            className="text-slate-400 hover:text-white p-0.5 ml-2"
-          >
-            <X className="w-3.5 h-3.5" />
-          </button>
+          {alert.sticky ? (
+            <span className="text-[9px] text-red-300/80 ml-2 whitespace-nowrap" data-testid="alert-sticky" title="Held by the server: it leaves when the server clears it">
+              until cleared
+            </span>
+          ) : (
+            <button
+              onClick={() => onDismissAlert(alert.id)}
+              className="text-slate-400 hover:text-white p-0.5 ml-2"
+              aria-label="Dismiss alert"
+            >
+              <X className="w-3.5 h-3.5" />
+            </button>
+          )}
         </div>
       ))}
     </div>

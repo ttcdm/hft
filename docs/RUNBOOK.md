@@ -16,7 +16,7 @@ Where to look:
 
 | Route | Shows |
 |---|---|
-| `GET /api/system/checks` | cluster, signer, RPC, reconciliation, halt, kill switch and circuit breaker, feed, marks, database, and the open operator alerts (`TRADING_HALTED`, `HALT_NOT_PERSISTED`, `KILL_SWITCH_WAS_ON`, `EXIT_FAILING`, `EXIT_QUOTE_FAILING`, `EXIT_RATE_LIMITED`, `RPC_AUTH_REJECTED`, `EXIT_NO_SIGNER`, `SELL_ADOPTED`, `UNTRACKED_TOKEN_BALANCE`, `POSITION_NOT_PERSISTED`, `POSITION_MARK_UNAVAILABLE`, ...). The capacity row also shows how many seller funder lookups ended unread |
+| `GET /api/system/checks` | cluster, signer, RPC, reconciliation, halt, kill switch and circuit breaker, feed, marks, database, and, in `operatorAlerts` (with a `level`, CRITICAL first) and the `alerts` row, every open operator alert (`TRADING_HALTED`, `HALT_NOT_PERSISTED`, `KILL_SWITCH_WAS_ON`, `EXIT_FAILING`, `EXIT_QUOTE_FAILING`, `EXIT_RATE_LIMITED`, `EXIT_NO_SIGNER`, `SELL_ADOPTED`, `UNTRACKED_TOKEN_BALANCE`, `POSITION_NOT_PERSISTED`, `POSITION_MARK_UNAVAILABLE`, `RPC_AUTH_REJECTED`, `EXIT_LOOP_FAILING`, `SELL_LANDED_UNBOOKED`, `SELL_BLOCKHASH_UNCHECKED`, ...; a code with no listed level counts as CRITICAL; a `POSITION_MARK_UNAVAILABLE` for a position that is no longer open is left out of the list and the marks row). The capacity row also shows how many seller funder lookups ended unread |
 | `GET /api/execution/can-arm` | `allowed`, plus every reason arming would fail |
 | `GET /api/execution/mode` | coordinator mode and `isLiveArmed` |
 | `GET /api/execution/readiness` | every readiness component, the same list `can-arm` is built from |
@@ -24,7 +24,7 @@ Where to look:
 | `GET /api/diagnostics/system` | `systemAudit.killSwitchActive`, `riskControls.circuitBreakerState`, wallet balance, RPC host and latency |
 | `GET /api/workstation/positions` | positions; add `?status=ACTIVE` and `&mode=LIVE` to filter |
 
-Operator alerts live in memory only; a restart forgets them (the journal keeps the events).
+Operator alerts live in memory only; a restart forgets them (the journal keeps the events). The UI alert stack shows the same list; a CRITICAL alert stays on screen until the server clears it. To read them from a shell: `api "$APEX/api/system/checks" | jq '.operatorAlerts'`.
 
 ## 1. Stop everything
 
@@ -34,7 +34,7 @@ There are five different stops. Only stopping the process stops the exits too.
 |---|---|---|---|---|
 | Kill switch: the KILL SWITCH button, or `POST /api/execution/kill-switch` `{"activate":true}` | yes, PAPER and LIVE; also disarms LIVE | no | OFF, saved before it waits for any buy in flight | the switch: no (memory only); the auto OFF: yes |
 | Panic: `POST /api/wallet/panic-liquidate` (also WebSocket `PANIC_LIQUIDATE`, Telegram `/panic_sell`) | as the kill switch, then sells every active position | no | as the kill switch | as the kill switch |
-| Auto kill: `POST /api/auto/kill` `{"exitAll":false}` | auto only | no | OFF, saved with the kill reason before it waits for a buy in flight (3E) | the OFF does: after a restart `GET /api/auto/status` shows `mode` `OFF`, `killed` true and `killReason`; setting a mode clears it |
+| Auto kill: `POST /api/auto/kill` `{"exitAll":false}` | auto only | no | OFF, saved with the kill reason before it waits for a buy in flight (3E) | the OFF does: after a restart `GET /api/auto/status` shows `mode` `OFF`, `killed` true and `killReason`; setting a mode clears it. With `exitAll:true` the reply has `attempted`, `closed` and `failed`; `success` is false when any of those sells was refused or failed, and those positions are still open |
 | Halt (set by the DEVNET_LIVE wallet audit; no operator route sets it) | yes | take-profit and stale exits only | OFF | yes (saved in the database) |
 | Stop the process | yes | yes, all of them | n/a | n/a |
 

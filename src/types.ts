@@ -27,6 +27,10 @@ export interface AlertEvent {
   title: string;
   message: string;
   acknowledged: boolean;
+  /** R6-1: 'server' for an operator alert the server holds (it leaves when the server clears it). */
+  source?: 'local' | 'server';
+  /** No dismiss button: it stays until the server clears it. */
+  sticky?: boolean;
 }
 
 // ---------------- SOCIAL SCANNER & ALPHA INTELLIGENCE ----------------

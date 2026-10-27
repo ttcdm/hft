@@ -1,4 +1,5 @@
 import { executionCoordinator } from '../execution/coordinator';
+import type { OperatorAlert } from '../core/types';
 import { autoSnipeController } from '../auto/controller';
 import { pumpFeedListener } from '../solana/pumpFeedListener';
 import { workstationDb, WorkstationDatabase } from '../db/database';
@@ -22,7 +23,57 @@ export interface SystemCheck {
   /** what it was measured from, or why it is not OK */
   detail: string;
 }
-export interface SystemChecksResult { checkedAt: number; cluster: string; mode: string; checks: SystemCheck[] }
+export interface SystemChecksResult { checkedAt: number; cluster: string; mode: string; checks: SystemCheck[]; operatorAlerts: OperatorAlertView[] }
+
+/**
+ * R6-1 / R7-1: the coordinator's open operator alerts, as the UI and the runbook read them from GET /api/system/checks. Each carries a
+ * level: CRITICAL means money may be at risk or a record is wrong (an exit that cannot run, a position the wallet does not hold, a halt
+ * that did not persist); the UI keeps those on screen until the server clears them. A code not listed here is CRITICAL (fail closed).
+ */
+export type OperatorAlertLevel = 'CRITICAL' | 'WARNING' | 'INFO';
+export interface OperatorAlertView extends OperatorAlert { level: OperatorAlertLevel }
+export const OPERATOR_ALERT_LEVELS: Record<string, OperatorAlertLevel> = {
+  TRADING_HALTED: 'CRITICAL',
+  HALT_NOT_PERSISTED: 'CRITICAL',
+  KILL_SWITCH_WAS_ON: 'CRITICAL',
+  EXIT_FAILING: 'CRITICAL',
+  EXIT_NO_SIGNER: 'CRITICAL',
+  EXIT_QUOTE_FAILING: 'CRITICAL',
+  POSITION_GONE: 'CRITICAL',
+  POSITION_BALANCE_MISSING: 'CRITICAL',
+  POSITION_NOT_PERSISTED: 'CRITICAL',
+  POSITION_MARK_UNAVAILABLE: 'CRITICAL',
+  LEDGER_WRITE_FAILED: 'CRITICAL',
+  LATE_BUY_NOT_SOLD: 'CRITICAL',
+  UNTRACKED_TOKEN_BALANCE: 'CRITICAL',
+  EXIT_RATE_LIMITED: 'WARNING',
+  SELL_ADOPTED: 'WARNING',
+  POSITION_BALANCE_CLAMPED: 'WARNING',
+  MARK_MINT_REJECTED: 'WARNING',
+  PAPER_MARKS_UNAVAILABLE: 'WARNING',
+  DISK_SPACE_LOW: 'WARNING',
+  LATE_BUY_SOLD: 'INFO',
+};
+export const operatorAlertLevel = (code: string): OperatorAlertLevel => OPERATOR_ALERT_LEVELS[code] ?? 'CRITICAL';
+const LEVEL_RANK: Record<OperatorAlertLevel, number> = { CRITICAL: 0, WARNING: 1, INFO: 2 };
+
+/** Every open alert with its level, CRITICAL first, newest first within a level. */
+export function operatorAlertViews(alerts: OperatorAlert[]): OperatorAlertView[] {
+  return alerts
+    .map((a) => ({ ...a, level: operatorAlertLevel(a.code) }))
+    .sort((a, b) => LEVEL_RANK[a.level] - LEVEL_RANK[b.level] || b.lastSeenAt - a.lastSeenAt);
+}
+
+/** The System checks row for the alerts: FAIL with any CRITICAL open, WARN with any other, OK with none. */
+export function operatorAlertsCheck(views: OperatorAlertView[]): SystemCheck {
+  const crit = views.filter((a) => a.level === 'CRITICAL').length;
+  const codes = [...new Set(views.map((a) => a.code))].join(', ');
+  return {
+    id: 'alerts', label: 'Operator alerts', status: crit ? 'FAIL' : views.length ? 'WARN' : 'OK',
+    value: views.length ? `${views.length} open (${crit} critical): ${codes}` : 'none open',
+    detail: views.length ? views.slice(0, 3).map((a) => `${a.code}: ${a.message}`).join(' | ') : 'No operator alert is open. Alerts live in memory only; a restart forgets them (the journal keeps the events).',
+  };
+}
 
 /** B3b: the capacity check warns when more than this share of seller funder lookups ended up unread, once this many were asked for. */
 export const SELLER_FUNDER_UNREAD_WARN_SHARE = 0.05;
@@ -125,9 +176,12 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
     detail: markAlerts.length ? markAlerts.map((a) => a.message).slice(0, 3).join(' | ') : `${diag.openPositionsCount} open position(s); no stale-mark alert.`,
   });
 
+  const operatorAlerts = operatorAlertViews(alerts);
+  checks.push(operatorAlertsCheck(operatorAlerts));
+
   checks.push(databaseCheck(diag.sqliteJournalOk));
 
-  return { checkedAt: now, cluster: cluster.allowed, mode: `${diag.executionMode}${diag.liveTradingActive ? ' (LIVE armed)' : ''}`, checks };
+  return { checkedAt: now, cluster: cluster.allowed, mode: `${diag.executionMode}${diag.liveTradingActive ? ' (LIVE armed)' : ''}`, checks, operatorAlerts };
 }
 
 /**

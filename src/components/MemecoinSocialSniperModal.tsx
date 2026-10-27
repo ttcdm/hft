@@ -1353,10 +1353,11 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                 <div className="p-3 bg-[#0E1526] border-b border-[#1E293B] flex items-center justify-between">
                   <div className="flex items-center space-x-2 text-xs">
                     <Send className="w-4 h-4 text-blue-400" />
-                    <span className="font-bold text-white">@ApexQuantHftSniperBot (Telegram Webhook Stream)</span>
+                    <span className="font-bold text-white">Local command console (not connected to Telegram)</span>
                   </div>
-                  <span className="text-[10px] text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/30">
-                    STATUS: POLLING ACTIVE
+                  {/* UI report fix 3: nothing polls Telegram (getUpdates and setWebhook are not implemented), so the badge says that */}
+                  <span data-testid="telegram-status-badge" title="Commands typed here run on this server only. Telegram messages are never fetched, so /panic_sell from a phone does nothing; use the PANIC button here." className="text-[10px] text-amber-300 bg-amber-500/10 px-2 py-0.5 rounded border border-amber-500/30">
+                    STATUS: NOT POLLING TELEGRAM (local console)
                   </span>
                 </div>
 

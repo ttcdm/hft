@@ -134,13 +134,26 @@ export function ConfluenceThresholdEditor({ confluence, onSave, busy }: { conflu
  */
 export interface KillReport { ok: boolean; text: string }
 export function killReportFor(j: any): KillReport | null {
-  if (!j || typeof j !== 'object' || typeof j.attempted !== 'number') return null;
-  const failed: Array<{ symbol?: string; error?: string }> = Array.isArray(j.failed) ? j.failed : [];
+  if (!j || typeof j !== 'object') return null;
+  // Two server shapes: { attempted, closed, failed[] } and { closed, refused[], failed[], stillOpen } (no `attempted`). Anything else is
+  // not a kill report.
+  const hasAttempted = typeof j.attempted === 'number';
+  const hasStillOpen = typeof j.stillOpen === 'number';
+  if (!hasAttempted && !hasStillOpen) return null;
+  const list = (x: unknown): Array<{ symbol?: string; mint?: string; error?: string }> => (Array.isArray(x) ? x : []);
+  const failed = [...list(j.refused).map((f) => ({ ...f, error: f.error ?? 'refused, nothing sent' })), ...list(j.failed)];
   const closed = typeof j.closed === 'number' ? j.closed : 0;
-  if (j.attempted === 0) return { ok: true, text: 'Auto is OFF. It had no open position to sell.' };
-  if (failed.length === 0 && j.success === true) return { ok: true, text: `Auto is OFF. Sold ${closed} of ${j.attempted} position(s) it bought.` };
-  const names = failed.map((f) => `${f.symbol ?? '?'} (${f.error ?? 'refused'})`).join('; ');
-  return { ok: false, text: `Auto is OFF, but only ${closed} of ${j.attempted} position(s) were sold; ${failed.length} refused or failed and are STILL OPEN: ${names}. Close them by hand.` };
+  const stillOpen = hasStillOpen ? j.stillOpen : 0;
+  const ok = failed.length === 0 && stillOpen === 0 && j.success !== false;
+  if (ok) {
+    if (closed === 0 && (!hasAttempted || j.attempted === 0)) return { ok: true, text: 'Auto is OFF. It had no open position to sell.' };
+    return { ok: true, text: hasAttempted ? `Auto is OFF. Sold ${closed} of ${j.attempted} position(s) it bought.` : `Auto is OFF. Sold ${closed} position(s) it bought; none is still open.` };
+  }
+  const names = failed.map((f) => `${f.symbol ?? (f.mint ? `${f.mint.slice(0, 6)}...` : '?')} (${f.error ?? 'refused'})`).join('; ');
+  const sold = hasAttempted ? `only ${closed} of ${j.attempted} position(s) were sold` : `${closed} position(s) were sold`;
+  const open = hasStillOpen ? ` ${stillOpen} auto position(s) are still open.` : '';
+  const why = failed.length ? `; ${failed.length} refused or failed and are STILL OPEN: ${names}.` : '; some are STILL OPEN.';
+  return { ok: false, text: `Auto is OFF, but ${sold}${why}${open} Close them by hand.` };
 }
 
 export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOrderSize, onThreshold, code, onCode, busy, error, killReport }: {

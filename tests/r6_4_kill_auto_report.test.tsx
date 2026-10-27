@@ -49,3 +49,16 @@ describe('R6-4: a kill that leaves positions open says so', () => {
     expect(renderToStaticMarkup(<AutoPanelView status={status} killReport={bad} />)).toContain('STILL OPEN');
   });
 });
+
+describe('R6-4: the KILL AUTO report reads the { closed, refused, failed, stillOpen } shape too', () => {
+  it('a refused sell, a failed sell or a position still open is not success', () => {
+    const r = killReportFor({ success: true, mode: 'OFF', closed: 1, refused: [{ positionId: 'p1', mint: 'AAAAAAAAAAAA', error: 'CLUSTER_GUARD' }], failed: [], stillOpen: 1 })!;
+    expect(r.ok).toBe(false);
+    expect(r.text).toMatch(/1 refused or failed and are STILL OPEN: AAAAAA\.\.\. \(CLUSTER_GUARD\)\. 1 auto position\(s\) are still open/);
+    const open = killReportFor({ success: true, mode: 'OFF', closed: 0, refused: [], failed: [], stillOpen: 2 })!;
+    expect(open.ok).toBe(false);
+    expect(open.text).toMatch(/2 auto position\(s\) are still open/);
+    expect(killReportFor({ success: true, mode: 'OFF', closed: 2, refused: [], failed: [], stillOpen: 0 })).toEqual({ ok: true, text: 'Auto is OFF. Sold 2 position(s) it bought; none is still open.' });
+    expect(killReportFor({ success: true, mode: 'OFF', closed: 0, refused: [], failed: [], stillOpen: 0 })!.text).toBe('Auto is OFF. It had no open position to sell.');
+  });
+});

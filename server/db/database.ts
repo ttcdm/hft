@@ -500,9 +500,12 @@ export class WorkstationDatabase {
   public loadEvidenceClosedTrades(mode?: ExecutionMode): NormalizedPosition[] {
     const closed = this.loadPositions(mode, 'CLOSED');
     const unverified = this.getUnverifiedFillIds();
-    // Q2: adopted balances (no known cost) and rows closed because the wallet held nothing (cost 0, realized 0) say nothing about an edge.
+    // Q2: adopted balances (no known cost) say nothing about an edge. R5-11: a row closed because the wallet held nothing books its whole
+    // basis as a loss since P2.3 (its exit reason carries REALIZED_ASSUMED_LOSS), and that loss is evidence like any other, so the loss
+    // triggers and Kelly see it. Only the older zero-balance rows, closed with realized 0 and no loss, are still left out.
+    const zeroBalanceNoLoss = (p: NormalizedPosition) => !!p.exitReason?.startsWith('RECONCILED_ZERO_BALANCE') && !p.exitReason.includes('REALIZED_ASSUMED_LOSS');
     return closed
-      .filter((p) => !unverified.has(p.id) && !p.entryTxSignature?.startsWith('RECOVERED:') && !p.exitReason?.startsWith('RECONCILED_ZERO_BALANCE'))
+      .filter((p) => !unverified.has(p.id) && !p.entryTxSignature?.startsWith('RECOVERED:') && !zeroBalanceNoLoss(p))
       .sort((a, b) => (a.lastUpdatedTimestamp ?? 0) - (b.lastUpdatedTimestamp ?? 0)); // Q30: this sorted on a field that does not exist, so "the last 20" were the oldest 20
   }
 
@@ -829,7 +832,8 @@ export class WorkstationDatabase {
   /**
    * N18: the append-only audit tables (risk_decisions, decisions, system_journal) grew without bound. Rows older than the retention
    * window are deleted. Kept regardless of age because something still reads them: the halt journal (the latest row decides whether
-   * trading is halted after a restart) and PAPER_FILL_GATES / PAPER_SELL_FILLED (mark which old paper fills and exits are unverified or model-priced, for the closed-trade statistics).
+   * trading is halted after a restart) and PAPER_FILL_GATES / PAPER_SELL_FILLED (mark which old paper fills and exits are unverified or model-priced, for the closed-trade statistics);
+   * in decisions, every BOUGHT row and the LIVE_BUY_FILLED row of a position still open (R5-13).
    * Positions, orders and transactions are never pruned. Returns the number of rows deleted per table.
    */
   public pruneOldRows(retentionDays: number, now: number = Date.now()): { riskDecisions: number; decisions: number; journal: number } {
@@ -839,7 +843,10 @@ export class WorkstationDatabase {
     try {
       return {
         riskDecisions: run('DELETE FROM risk_decisions WHERE created_at < ?', cutoff),
-        decisions: run('DELETE FROM decisions WHERE ts < ?', cutoff),
+        // R5-13: BOUGHT rows are what auto's ownership (auto-kill "sell what it bought") and its loss-trigger evidence read, so they are
+        // never pruned (one row per auto buy); a LIVE_BUY_FILLED row of a position still open is kept with it.
+        decisions: run(`DELETE FROM decisions WHERE ts < ? AND outcome != 'BOUGHT'
+          AND NOT (outcome = 'LIVE_BUY_FILLED' AND position_id IN (SELECT id FROM positions WHERE status != 'CLOSED'))`, cutoff),
         journal: run(`DELETE FROM system_journal WHERE created_at < ? AND event_type NOT IN ('TRADING_HALTED','TRADING_HALT_CLEARED','KILL_SWITCH_TRIPPED','KILL_SWITCH_RESET','PAPER_FILL_GATES','PAPER_SELL_FILLED')`, cutoff),
       };
     } catch (e: any) {

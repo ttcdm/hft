@@ -177,6 +177,8 @@ const ownedByTokenProgram = (owner: PublicKey | undefined): boolean => !owner ||
 /** 3B: the decision-journal outcome of a landed LIVE buy (any caller); its row carries the buy's wallet SOL delta. */
 export const LIVE_BUY_FILLED = 'LIVE_BUY_FILLED';
 export const isRecoveredPosition = (p: { entryTxSignature?: string }): boolean => !!p.entryTxSignature?.startsWith('RECOVERED:');
+/** R1 #4: the `error` tag of a landed SELL row whose fill could not be read when it was adopted (its basis share is booked as a loss). */
+export const UNREAD_SELL_FILL_TAG = 'SELL_FILL_UNREAD_ASSUMED_LOSS';
 
 // Q11: the reasons the operator routes actually pass ('Manual user order' from POST /api/wallet/close, 'Aggregator Close' from the WS
 // CLOSE_POSITION / aggregator close route, 'Operator close' from POST /api/execution/close) count as manual closes, as the halt alert promises.
@@ -253,12 +255,12 @@ export class ExecutionCoordinator {
         Logger.error(`[HALT] Trading is still halted from before the restart: ${persisted}`);
         this.raiseOperatorAlert('TRADING_HALTED', `All trading is halted (restored after a restart): ${persisted}. Protective exits (stop-loss, trailing stop, manual close, panic) still run; clear it with POST /api/auto/resume {clearHalt:true}.`);
       }
-      // The kill switch is in memory and off after a restart (by decision: LIVE boots disarmed, auto's OFF persists). An operator who
+      // The kill switch is in memory and off after a restart (by decision: LIVE boots disarmed, auto starts OFF at every boot). An operator who
       // tripped it must still hear that it no longer holds. The reset row makes the alert fire on this boot only.
       const killSwitchTrip = workstationDb.getKillSwitchTripBeforeRestart();
       if (killSwitchTrip) {
         Logger.warn(`[KILL SWITCH] It was on before the restart (${killSwitchTrip}) and is off now`);
-        this.raiseOperatorAlert('KILL_SWITCH_WAS_ON', `The kill switch was on before the restart (${killSwitchTrip}) and is off now. LIVE is disarmed and auto keeps its persisted mode (a panic left it OFF); check why it was tripped before arming. Cleared by POST /api/auto/resume {clearHalt:true}.`);
+        this.raiseOperatorAlert('KILL_SWITCH_WAS_ON', `The kill switch was on before the restart (${killSwitchTrip}) and is off now. LIVE is disarmed and auto is OFF (it starts OFF at every boot); check why it was tripped before arming or setting a mode. Cleared by POST /api/auto/resume {clearHalt:true}.`);
         workstationDb.logJournal('KILL_SWITCH_RESET', 'kill-switch', 'PAPER', { reason: 'process restart' });
       }
     }
@@ -342,7 +344,8 @@ export class ExecutionCoordinator {
       // and a PAPER position that cannot be priced (e.g. a mainnet-only mint on devnet) never turns the feed red.
       let liveOpen: boolean;
       try {
-        liveOpen = workstationDb.loadPositions('LIVE', 'ACTIVE').length > 0;
+        // R5-1: an adopted RECOVERED balance (often one nobody can price) does not own the clock, or it would hold the feed STALE for good
+        liveOpen = workstationDb.loadPositions('LIVE', 'ACTIVE').some((p) => !isRecoveredPosition(p));
       } catch {
         liveOpen = true; // cannot tell: keep the clock running rather than hide a dead feed
       }
@@ -545,6 +548,8 @@ export class ExecutionCoordinator {
     if (this.isExitLoopFailing()) {
       reasons.push(`The exit loop is failing (${this.exitPassFailures} passes in a row threw; stop-loss and take-profit are not running)`);
     }
+    const unrecoveredBuys = this.unrecoveredLandedBuysProblem();
+    if (unrecoveredBuys) reasons.push(unrecoveredBuys);
 
     if (riskEngine.isKillSwitchActive()) {
       reasons.push('Emergency risk kill switch is active');
@@ -626,6 +631,13 @@ export class ExecutionCoordinator {
     };
   }
 
+  /** R7-3: a landed LIVE buy with no position has no stop-loss; while one is unresolved readiness is not green and LIVE buys are refused. */
+  private unrecoveredLandedBuysProblem(): string | null {
+    const n = this.unrecoveredLandedBuys.length;
+    if (n === 0) return null;
+    return `${n} LIVE buy(s) sent earlier are not resolved and may hold tokens with no stop-loss (${this.unrecoveredLandedBuys.map((s) => s.slice(0, 8)).join(',')}); orphan recovery keeps retrying`;
+  }
+
   /**
    * P3.1 (R1-0): the cheap readiness checks every LIVE buy runs, not only the arm. canExecuteLive runs once, when LIVE is armed; a database
    * that turns read-only, a reconciliation mismatch, a tripped breaker or a stale mark feed after that must still stop the next buy. Direct
@@ -646,6 +658,8 @@ export class ExecutionCoordinator {
     if (this.positionMarkHealth === 'STALE') problems.push('the position mark feed is STALE');
     if (this.isExitLoopFailing()) problems.push(`the exit loop is failing (${this.exitPassFailures} passes in a row; EXIT_LOOP_FAILING)`);
     if (process.env.DEMO_MODE === 'true') problems.push('DEMO_MODE=true (demo prices and callers are loaded)');
+    const unrecovered = this.unrecoveredLandedBuysProblem();
+    if (unrecovered) problems.push(unrecovered);
     return problems;
   }
 
@@ -976,6 +990,7 @@ export class ExecutionCoordinator {
       this.scheduleReconcileRetry();
     }
     const pendingTxs = pendingRead ?? [];
+    const readInStep4 = new Set<string>(); // BUY rows step 4 already read this pass; step 5 does not read them again
     if (pendingTxs.length > 0 && !clusterTrusted) {
       issues.push(`${pendingTxs.length} pending transaction(s) left as they are until the RPC is on the allowed cluster`);
     } else if (pendingTxs.length > 0) {
@@ -983,6 +998,7 @@ export class ExecutionCoordinator {
       const walletPubkey = signerStatus === 'READY' ? localSigner.getPublicKey() : null;
 
       for (const pTx of pendingTxs) {
+        if (pTx.direction === 'BUY') readInStep4.add(pTx.signature);
         try {
           const txStatus = await this.connection.getSignatureStatuses([pTx.signature], {
             searchTransactionHistory: true,
@@ -1017,8 +1033,16 @@ export class ExecutionCoordinator {
               const existingPos = workstationDb
                 .loadPositions()
                 .find((p) => (pTx.direction === 'SELL' ? p.exitTxSignature === pTx.signature : p.entryTxSignature === pTx.signature));
+              const unreadSell = pTx.direction === 'SELL' ? /^SELL_FILL_UNREAD_ASSUMED_LOSS position=(\S+)/.exec(pTx.error ?? '') : null;
 
-              if (existingPos) {
+              if (unreadSell) {
+                // R1 #4: its basis share was booked as an assumed loss when it was adopted; add the proceeds now if the fill can be read.
+                if (!(await this.settleUnreadSellFill(pTx, unreadSell[1], walletPubkey, txDetails.slot))) {
+                  mismatchesCount++;
+                  issues.push(`SELL ${pTx.signature.slice(0, 8)}... landed and its basis share is booked as an assumed loss, but its proceeds cannot be read yet; retrying`);
+                  this.scheduleReconcileRetry();
+                }
+              } else if (existingPos) {
                 pTx.reconciliationState = 'RECONCILED';
               } else if (walletPubkey) {
                 // Recover interrupted transaction directly from confirmed on-chain data
@@ -1029,9 +1053,11 @@ export class ExecutionCoordinator {
                   pTx.jitoTipLamports
                 );
 
-                if (recovery.recovered && recovery.mint) {
+                if (recovery.recovered && recovery.mint && recovery.type === 'BUY' && workstationDb.loadPositions().some((p) => p.entryTxSignature === pTx.signature)) {
+                  pTx.reconciliationState = 'RECONCILED'; // R2-4: another writer saved it during the read above
+                } else if (recovery.recovered && recovery.mint) {
                   if (recovery.type === 'BUY' && recovery.tokenQuantityRaw) {
-                    const adopted = this.positionFromRecoveredBuy(pTx, recovery, txDetails.slot);
+                    const adopted = this.positionFromRecoveredBuy(pTx, recovery, txDetails.slot, walletPubkey);
                     workstationDb.savePosition(adopted);
                     pTx.reconciliationState = 'RECONCILED';
                     this.journalLiveBuySolDelta(adopted, recovery.solSpentLamports ?? 0, 'STARTUP_RECONCILIATION', 'RECOVERED'); // 3B (R1-38)
@@ -1119,9 +1145,16 @@ export class ExecutionCoordinator {
             workstationDb.saveTransaction(pTx);
           }
         } catch (err: any) {
+          // R5-5: a failed read is unknown, not fine. The row stays as it is, the pass is a mismatch and is tried again.
           Logger.warn(`Failed to reconcile pending transaction ${pTx.signature}: ${err.message}`);
+          mismatchesCount++;
+          issues.push(`Transaction ${pTx.signature.slice(0, 8)}... could not be checked (${String(err.message).slice(0, 60)}); retrying`);
+          this.scheduleReconcileRetry();
         }
       }
+      // R5-5: a BUY step 4 could not settle may have landed with no position (no stop-loss); background recovery keeps trying it.
+      const unsettledBuys = workstationDb.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED']);
+      if (unsettledBuys === null || unsettledBuys.some((t) => readInStep4.has(t.signature))) this.scheduleOrphanRecovery();
     }
 
     // 4b. (Q18: after the pending transactions, not before.) Verify ALL active LIVE positions (OPEN and PARTIALLY_CLOSED) against on-chain token accounts
@@ -1146,6 +1179,7 @@ export class ExecutionCoordinator {
       }
 
       for (const pos of activeLivePositions) {
+        let walletRefusal: string | null;
         try {
           const mintPubkey = new PublicKey(pos.mint);
           // N5: "the account does not exist" is a confirmed zero; any other RPC failure is unknown and must not close a position.
@@ -1166,6 +1200,11 @@ export class ExecutionCoordinator {
             mismatchesCount++;
             issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) shows no tokens but its sell ${String(unsettledSellMints?.get(pos.mint)).slice(0, 8)}... is not settled yet; left open so the fill and its PnL can be applied`);
             this.scheduleReconcileRetry();
+          } else if (onChainAmount <= 0n && (walletRefusal = await this.walletBindingProblem(pos, walletPubkey)) !== null) {
+            // R4-2: an empty balance in another wallet (a changed key, a copied database) proves nothing about this position.
+            mismatchesCount++;
+            issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) shows no tokens in this wallet, but ${walletRefusal}`);
+            this.raiseOperatorAlert('POSITION_WALLET_MISMATCH', walletRefusal, pos.id);
           } else if (onChainAmount <= 0n) {
             // The tokens are gone (sold or moved outside this app). Left OPEN this position blocks arming until someone edits the DB,
             // while the exit loop keeps trying to sell an empty account. Close it with the reason on the record, and say so.
@@ -1190,11 +1229,13 @@ export class ExecutionCoordinator {
 
     // 5. Landed LIVE buys whose fill could not be read earlier (RECONCILIATION_REQUIRED) still hold tokens with no stop-loss.
     if (signerStatus === 'READY') {
-      const orphans = await this.recoverOrphanedBuys();
+      const orphans = await this.recoverOrphanedBuys({ skip: readInStep4 });
       if (orphans.ledgerUnreadable) {
         mismatchesCount++;
         issues.push('Landed buys could not be checked: the transactions table could not be read');
       }
+      // R5-5 / R7-3: whatever this pass could not adopt is retried in the background, not only at the next restart or click.
+      if ((orphans.stillOrphaned.length > 0 || orphans.ledgerUnreadable) && !this.orphanRecoveryTimer) this.scheduleOrphanRecovery();
       if (orphans.stillOrphaned.length > 0) {
         mismatchesCount += orphans.stillOrphaned.length;
         issues.push(`${orphans.stillOrphaned.length} landed buy(s) have no position record: ${orphans.stillOrphaned.map((x) => x.slice(0, 8)).join(',')}`);
@@ -1255,7 +1296,9 @@ export class ExecutionCoordinator {
    */
   private journalLiveBuySolDelta(pos: NormalizedPosition, walletDeltaLamports: number, source: string, how: 'CONFIRMED' | 'RECOVERED'): void {
     if (pos.executionMode !== 'LIVE') return;
-    workstationDb.logDecision({
+    // R2-4: keyed on the buy's signature (the position id): a second writer of the same buy (two recovery passes, startup step 4 and a
+    // background pass) writes nothing, so the wallet audit never sees the same SOL twice.
+    workstationDb.logDecisionOnce({
       autoMode: 'n/a',
       mint: pos.mint,
       symbol: pos.symbol,
@@ -1273,7 +1316,8 @@ export class ExecutionCoordinator {
   private positionFromRecoveredBuy(
     pTx: { signature: string; mint: string; jitoTipLamports: number; executionMode: ExecutionMode },
     recovery: Awaited<ReturnType<typeof TradeReconciler.recoverInterruptedTransaction>>,
-    fallbackSlot: number
+    fallbackSlot: number,
+    wallet: PublicKey
   ): NormalizedPosition {
     const tokenQty = Number(recovery.tokenQuantityRaw) / Math.pow(10, recovery.tokenDecimals ?? 6);
     const spent = recovery.solSpentLamports ?? 0;
@@ -1305,6 +1349,7 @@ export class ExecutionCoordinator {
       executionMode: pTx.executionMode,
       status: 'OPEN',
       lastUpdatedTimestamp: Date.now(),
+      walletPubkey: wallet.toBase58(), // R4-2: the fill was read for this wallet
     };
   }
 
@@ -1313,19 +1358,46 @@ export class ExecutionCoordinator {
    * at RECONCILIATION_REQUIRED with tokens in the wallet and no position, hence no stop-loss. Re-read each such signature and open the position.
    * Idempotent: a signature that already has a position is just marked RECONCILED.
    */
-  public async recoverOrphanedBuys(): Promise<{ recovered: string[]; stillOrphaned: string[]; ledgerUnreadable?: boolean }> {
+  public recoverOrphanedBuys(opts: { skip?: Set<string> } = {}): Promise<{ recovered: string[]; stillOrphaned: string[]; ledgerUnreadable?: boolean }> {
+    // `skip`: signatures the caller has just read itself (startup step 4); a call that joins a pass in progress gets that pass's answer.
+    // R2-4: single-flight. Every failed buy used to start its own timer chain, and two passes could both adopt the same buy and journal
+    // its SOL twice. A call made while a pass runs joins it; the retry schedule picks up anything written after that pass read the ledger.
+    if (!this.orphanRecoveryInFlight) {
+      const run = this.runOrphanRecovery(opts.skip).finally(() => {
+        if (this.orphanRecoveryInFlight === run) this.orphanRecoveryInFlight = null;
+      });
+      this.orphanRecoveryInFlight = run;
+    }
+    return this.orphanRecoveryInFlight;
+  }
+
+  private orphanRecoveryInFlight: Promise<{ recovered: string[]; stillOrphaned: string[]; ledgerUnreadable?: boolean }> | null = null;
+  /** R7-3: landed LIVE buys the last recovery pass could not give a position (no stop-loss yet). Readiness refuses LIVE buys while any remain. */
+  private unrecoveredLandedBuys: string[] = [];
+
+  private async runOrphanRecovery(skip?: Set<string>): Promise<{ recovered: string[]; stillOrphaned: string[]; ledgerUnreadable?: boolean }> {
     const recovered: string[] = [];
     const stillOrphaned: string[] = [];
     if (localSigner.getStatus() !== 'READY') return { recovered, stillOrphaned };
     const wallet = localSigner.getPublicKey();
-    const rows = workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED']);
+    const rows = workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED', 'PENDING']);
     // R5-4: an unreadable ledger is not "no orphans": the caller counts it as unresolved and keeps retrying.
     if (rows === null) return { recovered, stillOrphaned, ledgerUnreadable: true };
-    const candidates = rows
-      .filter((t) => t.direction === 'BUY' && t.executionMode === 'LIVE' && t.reconciliationState === 'RECONCILIATION_REQUIRED');
+    // R4-4 / R5-5: a landed buy can also be left PENDING (its position and its ledger row were both refused, or a status read failed at
+    // startup). Those are recovered the same way, except the buys this process is sending right now, which their own path settles.
+    // A PENDING row whose order already has another row in a later state was superseded: that order's outcome is recorded under the other
+    // signature (only when a send answers with a signature other than the one signed; never on a real cluster, where they are the same).
+    const superseded = (t: PersistedTransaction) =>
+      !!t.orderId && workstationDb.loadTransactions(t.orderId).some((o) => o.signature !== t.signature && o.reconciliationState !== 'PENDING');
+    const candidates = rows.filter((t) => t.direction === 'BUY' && t.executionMode === 'LIVE' && !skip?.has(t.signature) &&
+      (t.reconciliationState === 'RECONCILIATION_REQUIRED' ||
+        (t.reconciliationState === 'PENDING' && !this.inFlightBuyMints.has(t.mint) && !superseded(t))));
     // On a wrong-cluster RPC every signature reads as "not found" and its block height means nothing: a row decided there could be
     // TIMED_OUT although the buy landed. Leave them all for a pass on a trusted RPC (the background retries keep trying).
-    if (this.clusterProblem !== null) return { recovered, stillOrphaned: candidates.map((t) => t.signature) };
+    if (this.clusterProblem !== null) {
+      this.unrecoveredLandedBuys = candidates.map((t) => t.signature);
+      return { recovered, stillOrphaned: candidates.map((t) => t.signature) };
+    }
     for (const t of candidates) {
       try {
         if (workstationDb.loadPositions().some((p) => p.entryTxSignature === t.signature)) {
@@ -1334,8 +1406,14 @@ export class ExecutionCoordinator {
           continue;
         }
         const recovery = await TradeReconciler.recoverInterruptedTransaction(this.connection, t.signature, wallet, t.jitoTipLamports);
+        // R2-4: the read above awaited; another writer (startup step 4, or the buy's own path) may have saved the position meanwhile.
+        if (workstationDb.loadPositions().some((p) => p.entryTxSignature === t.signature)) {
+          t.reconciliationState = 'RECONCILED';
+          workstationDb.saveTransaction(t);
+          continue;
+        }
         if (recovery.recovered && recovery.type === 'BUY' && recovery.mint && recovery.tokenQuantityRaw) {
-          const adopted = this.positionFromRecoveredBuy(t, recovery, t.landingSlot ?? 0);
+          const adopted = this.positionFromRecoveredBuy(t, recovery, t.landingSlot ?? 0, wallet);
           workstationDb.savePosition(adopted);
           t.reconciliationState = 'RECONCILED';
           workstationDb.saveTransaction(t);
@@ -1365,11 +1443,13 @@ export class ExecutionCoordinator {
         stillOrphaned.push(t.signature);
       }
     }
+    this.unrecoveredLandedBuys = stillOrphaned;
     return { recovered, stillOrphaned };
   }
 
   /**
-   * Scan the wallet's SPL and Token-2022 accounts for non-zero balances that no active LIVE position covers. Each one that has a readable
+   * Scan the wallet's SPL and Token-2022 accounts for non-zero balances that no active LIVE position covers. R5-1: only a mint this app sent
+   * a LIVE buy for is considered (anything else is one UNKNOWN_TOKEN_BALANCE alert and is never adopted). Each such one that has a readable
    * pump curve / PumpSwap price gets a position flagged RECOVERED (entry price = current mark, cost basis unknown = 0) so stop-loss and
    * trailing-stop run on it; every one raises an UNTRACKED_TOKEN_BALANCE alert. Balances with no pump price are only alerted, never traded.
    */
@@ -1401,7 +1481,17 @@ export class ExecutionCoordinator {
         .filter((t) => t.direction === 'BUY' && t.executionMode === 'LIVE' && (t.reconciliationState === 'RECONCILIATION_REQUIRED' || t.reconciliationState === 'PENDING'))
         .map((t) => t.mint)
     );
-    const missing = [...held.keys()].filter((m) => !active.has(m) && !inRecovery.has(m));
+    const unexplained = [...held.keys()].filter((m) => !active.has(m) && !inRecovery.has(m));
+    if (unexplained.length === 0) return { untracked, adopted };
+    // R5-1: anyone can send the wallet any token. Only a mint this app sent a LIVE buy for (a lost buy record) is adopted; anything else is
+    // reported once, in one alert, and never becomes a position, a slot or a stop-loss to watch.
+    const bought = workstationDb.loadLiveBuyMints(unexplained);
+    if (bought === null) throw new Error('the transactions table could not be read, so a lost buy cannot be told apart from a token sent to the wallet');
+    const neverBought = unexplained.filter((m) => !bought.has(m));
+    if (neverBought.length > 0) {
+      this.raiseOperatorAlert('UNKNOWN_TOKEN_BALANCE', `${neverBought.length} token balance(s) in the wallet were never bought by this app (an airdrop or a manual transfer), so they are not adopted, traded or stop-lossed; sell them by hand if wanted: ${neverBought.slice(0, 5).join(', ')}${neverBought.length > 5 ? ', ...' : ''}`);
+    }
+    const missing = unexplained.filter((m) => bought.has(m));
     if (missing.length === 0) return { untracked, adopted };
     let marks: Record<string, { priceSol: number; source: string; timestamp: number; poolAddress?: string }> = {};
     try {
@@ -1409,15 +1499,25 @@ export class ExecutionCoordinator {
     } catch (e: any) {
       Logger.warn(`Mark read for untracked balances failed: ${e.message}`);
     }
+    // R5-27: the mark read awaited. A buy of the same mint may have started, landed or entered recovery meanwhile; it owns the mint, and
+    // adopting too would leave two OPEN rows for one balance.
+    const activeNow = new Set(workstationDb.loadPositions('LIVE', 'ACTIVE').map((p) => p.mint));
+    const unresolvedNow = workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED', 'PENDING']);
+    if (unresolvedNow === null) throw new Error('the transactions table could not be read, so a buy still in recovery cannot be ruled out');
+    const inRecoveryNow = new Set(unresolvedNow.filter((t) => t.direction === 'BUY' && t.executionMode === 'LIVE').map((t) => t.mint));
     for (const mint of missing) {
+      if (activeNow.has(mint) || inRecoveryNow.has(mint) || this.inFlightBuyMints.has(mint)) continue;
       untracked.push(mint);
       const h = held.get(mint)!;
       const mark = marks[mint];
       if (mark && mark.priceSol > 0) {
         const now = Date.now();
         const qty = Number(h.raw) / Math.pow(10, h.decimals);
+        // R8-22: a closed adopted row keeps its realized PnL and exit signature; a balance found again is a new row.
+        const baseId = `recovered-${mint}`;
+        const recoveredId = workstationDb.loadPositions('LIVE').some((p) => p.id === baseId) ? `${baseId}-${now}` : baseId;
         workstationDb.savePosition({
-          id: `recovered-${mint}`,
+          id: recoveredId,
           mint,
           symbol: mint.slice(0, 5).toUpperCase(),
           name: 'RECOVERED untracked wallet balance',
@@ -1441,9 +1541,10 @@ export class ExecutionCoordinator {
           executionMode: 'LIVE',
           status: 'OPEN',
           lastUpdatedTimestamp: now,
+          walletPubkey: wallet.toBase58(), // R4-2: found in this wallet
         } as NormalizedPosition);
         adopted.push(mint);
-        this.raiseOperatorAlert('UNTRACKED_TOKEN_BALANCE', `Wallet held ${h.raw} raw of ${mint} with no position. Adopted as RECOVERED with entry price = current mark; stop-loss now applies. Cost basis unknown.`, `recovered-${mint}`);
+        this.raiseOperatorAlert('UNTRACKED_TOKEN_BALANCE', `Wallet held ${h.raw} raw of ${mint}, a mint this app bought, with no position. Adopted as RECOVERED with entry price = current mark; stop-loss now applies. Cost basis unknown.`, recoveredId);
       } else {
         this.raiseOperatorAlert('UNTRACKED_TOKEN_BALANCE', `Wallet holds ${h.raw} raw of ${mint} with no position and no readable pump price. Not traded; sell manually if unwanted.`, `untracked-${mint}`);
       }
@@ -1478,22 +1579,36 @@ export class ExecutionCoordinator {
     }
   }
 
-  /** Delays (ms) at which a failed live-buy reconciliation is retried in the background. Tests set [] . */
+  /**
+   * Delays (ms) at which a failed live-buy reconciliation is retried in the background. Tests set [] . R7-3: after the last step the last
+   * delay repeats for as long as a landed buy is unresolved (the ladder used to stop after about 8 minutes, leaving the tokens with no
+   * stop-loss until a restart).
+   */
   public orphanRecoveryDelaysMs: number[] = [5_000, 15_000, 45_000, 120_000, 300_000];
+  private orphanRecoveryTimer: NodeJS.Timeout | null = null;
+  private orphanRecoveryStep = 0;
 
-  private scheduleOrphanRecovery(delays: number[] = this.orphanRecoveryDelaysMs): void {
+  /** One background retry chain per coordinator (R2-4). A new failed buy restarts the ladder from its first step. */
+  private scheduleOrphanRecovery(restart: boolean = true): void {
+    const delays = this.orphanRecoveryDelaysMs;
     if (delays.length === 0) return;
-    const [next, ...rest] = delays;
+    if (this.orphanRecoveryTimer) {
+      if (!restart) return;
+      clearTimeout(this.orphanRecoveryTimer);
+    }
+    this.orphanRecoveryStep = restart ? 0 : Math.min(this.orphanRecoveryStep + 1, delays.length - 1);
     const timer = setTimeout(async () => {
+      if (this.orphanRecoveryTimer === timer) this.orphanRecoveryTimer = null;
       try {
         const r = await this.recoverOrphanedBuys();
-        if (r.stillOrphaned.length > 0 || r.ledgerUnreadable) this.scheduleOrphanRecovery(rest);
+        if (r.stillOrphaned.length > 0 || r.ledgerUnreadable) this.scheduleOrphanRecovery(false);
       } catch (e: any) {
         Logger.warn(`Background orphan recovery error: ${e.message}`);
-        this.scheduleOrphanRecovery(rest);
+        this.scheduleOrphanRecovery(false);
       }
-    }, next);
+    }, delays[this.orphanRecoveryStep]);
     (timer as any).unref?.();
+    this.orphanRecoveryTimer = timer;
   }
 
   public async syncRealWalletBalance(): Promise<number | null> {
@@ -1861,8 +1976,10 @@ export class ExecutionCoordinator {
           workstationDb.logJournal('TRADE_REJECTED_UNRESOLVED_BUY', params.correlationId, 'LIVE', { mint: params.mint, orderId: params.orderId, at: 'submit' });
           return { success: false, signature: '', transport: 'SOLANA_RPC', error: `UNRESOLVED_BUY: another buy of ${params.mint} was sent and is not reconciled yet; nothing was sent`, lifecycleState: 'SUBMIT_FAILED' };
         }
-      } else {
-        workstationDb.saveTransaction(pendingRow);
+      } else if (!workstationDb.saveTransaction(pendingRow)) {
+        // R1 #3: as for a BUY, a sell is never sent without its durable record: dying after the send would leave nothing that names the
+        // signature (pendingSells is memory only, and the restart seed reads these rows), so the position could be sold twice.
+        return { success: false, signature: '', transport: 'SOLANA_RPC', error: 'PENDING_WRITE_FAILED: the SELL could not be recorded before sending; nothing was sent', lifecycleState: 'SUBMIT_FAILED' };
       }
     }
     const res = await this.submitAndConfirmInner(params);
@@ -3316,6 +3433,7 @@ export class ExecutionCoordinator {
         executionMode: 'LIVE',
         status: 'OPEN',
         lastUpdatedTimestamp: Date.now(),
+        walletPubkey: buyer.toBase58(), // R4-2: the ledger row is bound to the wallet that bought it
       };
 
       // N11: the tokens are in the wallet. If the database refuses the position the buy must not turn into a "chain error" with an
@@ -3326,7 +3444,7 @@ export class ExecutionCoordinator {
       } catch (err: any) {
         positionPersisted = false;
         Logger.error(`Position write failed after a landed buy ${subRes.signature}: ${err.message}`);
-        this.raiseOperatorAlert('POSITION_NOT_PERSISTED', `A buy of ${req.symbol || req.mint} landed (${subRes.signature.slice(0, 8)}) but the database refused the position (${String(err.message).slice(0, 80)}). Recovery will rebuild it from chain data; until then it has no stop-loss.`, subRes.signature);
+        this.raiseOperatorAlert('POSITION_NOT_PERSISTED', `A buy of ${req.symbol || req.mint} landed (${subRes.signature.slice(0, 8)}) but the database refused the position (${String(err.message).slice(0, 80)}). Orphan recovery retries in the background (every 5 minutes at most, until it succeeds) to rebuild it from chain data; until then it has no stop-loss and LIVE buys are refused. Close it by hand if it stays unresolved.`, subRes.signature);
         this.lateBuyWatch.set(subRes.signature, stopSeqAtGate);
         this.scheduleOrphanRecovery();
       }
@@ -3896,6 +4014,7 @@ export class ExecutionCoordinator {
           filled.exitReason = pendingSell.reason ?? reason; filled.exitStage = exitStageAfterFill(pendingSell.reason, filled.exitStage); // R5-7: the stage of the sell that landed
           filled.exitTxSignature = pendingSell.signature;
           filled.lastUpdatedTimestamp = Date.now();
+          const basisBefore = filled.costBasisLamports;
           if (onChain === 0n) {
             filled.status = 'CLOSED';
             filled.tokenQuantityRaw = '0';
@@ -3906,6 +4025,7 @@ export class ExecutionCoordinator {
             filled.tokenQuantityRaw = onChain.toString();
           }
           target.status = filled.status;
+          let unreadLossSol = 0;
           if (booked) {
             try {
               workstationDb.saveSellBooking(filled, pendingSell.signature, { slot: adopted!.slot, networkFeeLamports: adopted!.actualNetworkFeeLamports });
@@ -3916,8 +4036,28 @@ export class ExecutionCoordinator {
             }
             this.raiseOperatorAlert('SELL_ADOPTED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed after its confirmation was missed. Its fill was read from the chain and booked (PnL ${adopted!.actualRealizedPnLSol.toFixed(6)} SOL); the position now matches the wallet.`, positionId);
           } else {
-            workstationDb.savePosition(filled);
-            this.raiseOperatorAlert('SELL_ADOPTED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed but its fill could not be read. The position now matches the wallet; realized PnL for it was not recorded.`, positionId);
+            // R5-2: the balance drop is evidence only when it was read for the position's own wallet.
+            const walletProblem = await this.walletBindingProblem(target, seller);
+            if (walletProblem) {
+              this.pendingSells.set(positionId, pendingSell);
+              this.raiseOperatorAlert('POSITION_WALLET_MISMATCH', walletProblem, positionId);
+              return { success: false, pnlSol: 0, error: walletProblem, notSent: true };
+            }
+            // R1 #4 / R5-28: the sold share of the basis is booked now as an assumed loss, so the daily-loss gate sees it, and the SELL row is
+            // left RECONCILIATION_REQUIRED (tagged) for reconciliation, which adds the proceeds once the fill can be read, in the same write
+            // that marks the row RECONCILED (settleUnreadSellFill), so nothing is booked twice.
+            const soldBasisLamports = Math.max(0, basisBefore - filled.costBasisLamports);
+            unreadLossSol = soldBasisLamports / 1e9;
+            filled.realizedPnLSol = Number(((filled.realizedPnLSol ?? 0) - unreadLossSol).toFixed(9));
+            try {
+              workstationDb.saveUnreadSellAssumedLoss(filled, pendingSell.signature, `${UNREAD_SELL_FILL_TAG} position=${positionId} basis=${soldBasisLamports}`);
+            } catch (err: any) {
+              this.pendingSells.set(positionId, pendingSell);
+              return { success: false, pnlSol: 0, error: `SELL_BOOKING_FAILED: ${err?.message ?? err}; the landed sell ${pendingSell.signature.slice(0, 8)} is booked on the next pass`, notSent: true };
+            }
+            if (unreadLossSol > 0) workstationDb.logJournal('REALIZED_ASSUMED_LOSS', `assumed-loss-${positionId.slice(0, 8)}`, filled.executionMode, { positionId, mint: filled.mint, lossSol: unreadLossSol, where: 'a landed sell whose fill could not be read', signature: pendingSell.signature });
+            this.scheduleReconcileRetry();
+            this.raiseOperatorAlert('SELL_ADOPTED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed but its fill could not be read. The position now matches the wallet; the sold share of its cost basis (${unreadLossSol.toFixed(6)} SOL) is booked as an assumed loss, and the proceeds are added when reconciliation can read the fill.`, positionId);
           }
           await this.syncRealWalletBalance();
           // S2: with no readable fill this call moved nothing it can account for. P2.3: with one, it reports the earlier sell's net proceeds,
@@ -3926,7 +4066,7 @@ export class ExecutionCoordinator {
           const adoptedInfo = { adoptedPendingSell: true, ...(target.status === 'PARTIALLY_CLOSED' ? { adoptedPartial: true, remainingTokensRaw: onChain!.toString() } : {}) };
           return booked
             ? { success: true, pnlSol: adopted!.actualRealizedPnLSol, status: target.status, solMoved: adopted!.actualNetSolProceedsLamports / 1e9, ...adoptedInfo }
-            : { success: true, pnlSol: 0, status: target.status, solMoved: 0, ...adoptedInfo };
+            : { success: true, pnlSol: -unreadLossSol, status: target.status, solMoved: 0, ...adoptedInfo };
         }
         // P2.1: the window is only an upper bound. Once the blockhash has expired and the signature has no status, the sell can never land,
         // so the next pass (a stop-loss included) may sell at once instead of waiting out the rest of the 100 s.
@@ -3958,6 +4098,12 @@ export class ExecutionCoordinator {
         if (held !== null && held < totalTokensRaw) {
           target.lastUpdatedTimestamp = Date.now();
           if (held === 0n) {
+            // R5-2: an empty wallet closes the row only when this signer is the position's wallet (a key change reads a stranger's empty account)
+            const walletProblem = await this.walletBindingProblem(target, seller);
+            if (walletProblem) {
+              this.raiseOperatorAlert('POSITION_WALLET_MISMATCH', walletProblem, positionId);
+              return { success: false, pnlSol: 0, error: walletProblem, notSent: true };
+            }
             const assumedLossSol = this.bookAssumedLoss(target, 'an exit found an empty wallet'); // P2.3 (N-28)
             target.status = 'CLOSED';
             target.tokenQuantityRaw = '0';
@@ -4173,7 +4319,8 @@ export class ExecutionCoordinator {
         // S245: a sell the RPC rate-limited past every resend was never accepted: no pending sell (unconfirmed is false), no fee, and not a
         // slippage failure, so it is reported as not sent and the ladder does not widen.
         const rateLimited = /^RPC_RATE_LIMITED/.test(subRes.error || '');
-        return { success: false, pnlSol: 0, error: subRes.error || 'Failed to submit or confirm sell bundle', ...(rateLimited ? { notSent: true } : {}) };
+        const notRecorded = /^PENDING_WRITE_FAILED/.test(subRes.error || ''); // R1 #3: refused before the send
+        return { success: false, pnlSol: 0, error: subRes.error || 'Failed to submit or confirm sell bundle', ...(rateLimited || notRecorded ? { notSent: true } : {}) };
       }
 
       // R4-7: the sell landed. From here until its booking is written, the position holds it as a pending sell, so a read or write below
@@ -4497,6 +4644,67 @@ export class ExecutionCoordinator {
   private firstReconciliationDone = false;
 
   /**
+   * R1 #4 / R5-28: a landed sell adopted with an unreadable fill had the sold share of its basis booked as an assumed loss. Once its fill can
+   * be read, the net proceeds are added to the position's realized PnL in one write with the row marked RECONCILED (saveSellBooking), so the
+   * result is proceeds minus basis, booked once. False when it cannot be settled yet (no signer, no position, fill still unreadable).
+   */
+  private async settleUnreadSellFill(pTx: PersistedTransaction, positionId: string, wallet: PublicKey | null, slot: number): Promise<boolean> {
+    if (!wallet || !workstationDb.loadPositions('LIVE').some((p) => p.id === positionId)) return false;
+    const recovery = await TradeReconciler.recoverInterruptedTransaction(this.connection, pTx.signature, wallet, pTx.jitoTipLamports);
+    if (!(recovery.recovered && recovery.type === 'SELL')) return false;
+    const pos = workstationDb.loadPositions('LIVE').find((p) => p.id === positionId); // read again: the await above may have let a write in
+    if (!pos) return false;
+    const proceedsLamports = recovery.solReceivedLamports ?? 0;
+    pos.realizedPnLSol = Number(((pos.realizedPnLSol ?? 0) + proceedsLamports / 1e9).toFixed(9));
+    pos.lastUpdatedTimestamp = Date.now();
+    workstationDb.saveSellBooking(pos, pTx.signature, { slot, networkFeeLamports: pTx.networkFeeLamports });
+    workstationDb.logJournal('REALIZED_ASSUMED_LOSS_SETTLED', `assumed-loss-${positionId.slice(0, 8)}`, pos.executionMode, { positionId, signature: pTx.signature, proceedsSol: proceedsLamports / 1e9 });
+    pTx.reconciliationState = 'RECONCILED';
+    pTx.error = `${pTx.error}; settled: ${proceedsLamports} lamports of proceeds booked`;
+    return true;
+  }
+
+  /**
+   * R4-2 / R5-2: null when the signer is proven to be the wallet that holds this LIVE position, else why a zero balance read with it proves
+   * nothing and must not close the row. The binding is the row's walletPubkey; a row written before that column existed is bound on the
+   * spot to the fee payer of its own buy transaction (read from chain), when that can be read. Unknown is refused, like a mismatch.
+   */
+  private async walletBindingProblem(pos: NormalizedPosition, signer: PublicKey): Promise<string | null> {
+    if (pos.executionMode !== 'LIVE') return null;
+    let bound = pos.walletPubkey;
+    if (!bound && !isRecoveredPosition(pos) && pos.entryTxSignature) {
+      bound = (await this.buyFeePayer(pos.entryTxSignature)) ?? undefined;
+      if (bound) {
+        workstationDb.bindPositionWallet(pos.id, bound);
+        pos.walletPubkey = bound;
+      }
+    }
+    const me = signer.toBase58();
+    if (!bound) {
+      return `WALLET_BINDING_UNKNOWN: ${pos.symbol || pos.mint} has no recorded wallet and its buy transaction could not be read, so an empty balance in ${me} does not prove the tokens are gone; the position is left open`;
+    }
+    if (bound !== me) {
+      return `WALLET_MISMATCH: ${pos.symbol || pos.mint} was bought by wallet ${bound}, but the signer is ${me}; its tokens are not in this wallet, so the position is left open (load the key of ${bound} to manage it)`;
+    }
+    return null;
+  }
+
+  /** R4-2: the fee payer (first account key) of a confirmed transaction, or null when it cannot be read. */
+  private async buyFeePayer(signature: string): Promise<string | null> {
+    try {
+      const tx: any = await this.connection.getTransaction(signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
+      const msg = tx?.transaction?.message;
+      if (!msg || tx?.meta?.err) return null;
+      const keys = msg.staticAccountKeys ?? msg.accountKeys ?? (typeof msg.getAccountKeys === 'function' ? msg.getAccountKeys().staticAccountKeys : undefined);
+      const payer = keys?.[0];
+      if (!payer) return null;
+      return typeof payer === 'string' ? payer : typeof payer.toBase58 === 'function' ? payer.toBase58() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * P2.3 (N-28): a position closed because the wallet holds none of it, with no sell found, loses its whole remaining cost basis.
    * Adds that loss to `pos.realizedPnLSol` (the caller's savePosition writes the realized_events delta) and journals
    * REALIZED_ASSUMED_LOSS. Returns the loss in SOL (0 for a RECOVERED position, whose basis is unknown and stored as 0).
@@ -4528,7 +4736,8 @@ export class ExecutionCoordinator {
       const read = workstationDb.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED']);
       if (read === null) throw new Error('the transactions table could not be read'); // R5-4: the exit pass holds LIVE exits until a seed succeeds
       this.pendingSellSeedFailed = false;
-      const rows = read.filter((t) => t.direction === 'SELL' && t.executionMode === 'LIVE');
+      // R1 #4: a tagged row was already adopted (its position matches the wallet); seeding it would only hold the next exit for the window
+      const rows = read.filter((t) => t.direction === 'SELL' && t.executionMode === 'LIVE' && !t.error?.startsWith(UNREAD_SELL_FILL_TAG));
       for (const t of rows) {
         const pos = active.find((p) => p.mint === t.mint);
         if (!pos) continue;
@@ -4652,7 +4861,7 @@ export class ExecutionCoordinator {
     for (const k of [...this.exitFailures.keys()]) if (!loadedQty.has(ExecutionCoordinator.exitFailurePositionId(k))) this.exitFailures.delete(k);
     for (const id of [...this.markMono.keys()]) if (!loadedQty.has(id)) this.markMono.delete(id);
     // Nothing LIVE is open, so there is no mark to be stale (see the feed heartbeat): reset the clock here too.
-    if (!positions.some((p) => p.executionMode === 'LIVE')) {
+    if (!positions.some((p) => p.executionMode === 'LIVE' && !isRecoveredPosition(p))) { // R5-1: RECOVERED rows do not own the mark clock
       this.setPositionMarkClock(0);
       this.positionMarkHealth = 'HEALTHY';
     }
@@ -4676,7 +4885,7 @@ export class ExecutionCoordinator {
         stale.push({ pos, markAge, skipRead });
         continue;
       }
-      if (pos.executionMode === 'LIVE') this.recordPositionMarkEvent(); // a real mark within the staleness window
+      if (pos.executionMode === 'LIVE' && !isRecoveredPosition(pos)) this.recordPositionMarkEvent(); // a real mark within the staleness window
       this.decideAndDispatchExit(pos, false, loadedQty, sells);
     }
 
@@ -4694,7 +4903,7 @@ export class ExecutionCoordinator {
           );
         }
         // A position nobody can price must age the mark feed from its entry, or an empty history would read as healthy.
-        if (pos.executionMode === 'LIVE' && this.lastPositionMarkTimestamp === 0) this.setPositionMarkClock(pos.entryTimestamp || Date.now());
+        if (pos.executionMode === 'LIVE' && !isRecoveredPosition(pos) && this.lastPositionMarkTimestamp === 0) this.setPositionMarkClock(pos.entryTimestamp || Date.now());
         // P1.6: a LIVE position whose last known mark is already past the hard stop still gets its STOP_LOSS (and nothing else): the
         // sell re-reads the curve or pool before it is built, so it does not trade on the stale price. Every other exit waits for a mark.
         if (pos.executionMode !== 'LIVE' || !(pos.currentPriceSol > 0)) return;
@@ -4702,7 +4911,7 @@ export class ExecutionCoordinator {
       }
       if (!staleStopOnly) {
         this.clearOperatorAlert('POSITION_MARK_UNAVAILABLE', pos.id);
-        if (pos.executionMode === 'LIVE') this.recordPositionMarkEvent();
+        if (pos.executionMode === 'LIVE' && !isRecoveredPosition(pos)) this.recordPositionMarkEvent();
       }
       this.decideAndDispatchExit(pos, staleStopOnly, loadedQty, sells);
     };
@@ -4903,6 +5112,10 @@ export class ExecutionCoordinator {
   public cleanup() {
     this.offRpcAuthRejected?.();
     this.offRpcAuthRejected = null;
+    if (this.orphanRecoveryTimer) {
+      clearTimeout(this.orphanRecoveryTimer);
+      this.orphanRecoveryTimer = null;
+    }
     if (this.reconcileRetryTimer) {
       clearTimeout(this.reconcileRetryTimer);
       this.reconcileRetryTimer = null;

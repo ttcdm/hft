@@ -446,6 +446,20 @@ export class WorkstationDatabase {
     }
   }
 
+  /**
+   * R2-4: logDecision, unless a row with the same position id and outcome is already there (the check and the insert run with no await
+   * between, so a second writer in this process writes nothing). Used for the one LIVE_BUY_FILLED row each landed buy journals.
+   */
+  public logDecisionOnce(d: Parameters<WorkstationDatabase['logDecision']>[0] & { positionId: string }): void {
+    try {
+      const found = this.db.prepare('SELECT 1 FROM decisions WHERE position_id = ? AND outcome = ? LIMIT 1').get(d.positionId, d.outcome);
+      if (found) return;
+    } catch (err: any) {
+      Logger.error(`Decision lookup failed (${err.message}); writing the row anyway`);
+    }
+    this.logDecision(d);
+  }
+
   public loadDecisions(opts: { sinceTs?: number; mint?: string; stage?: string; outcome?: string; limit?: number } = {}): Array<{
     id: number; ts: number; autoMode: string; mint: string; symbol: string | null; source: string | null; stage: string;
     outcome: string; reason: string; inputs: any; positionId: string | null; solDelta: number | null; unverified: boolean;

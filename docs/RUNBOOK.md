@@ -65,6 +65,8 @@ Read the reply: `Failed` lists the positions still open, for example one with a 
 
 **A buy that lands after a panic or kill switch is sold at once.** A LIVE buy that was already past the risk gate when the panic or kill switch ran (a manual buy, a callout or Telegram snipe, or auto's own), and whose position is saved after it (it confirmed late, or it came back UNCONFIRMED and orphan recovery adopted it later), is sold 100% right away through the normal sell path with `EMERGENCY_PANIC_LIQUIDATION`. The kill switch does not hold this sell (it blocks buys, not exits). The journal gets a `LATE_BUY_EXIT` row and the alert `LATE_BUY_SOLD` is raised; if the sell fails, `LATE_BUY_NOT_SOLD` is raised and the position stays open with its stop-loss, so run the panic again or close it by hand. This lives in memory: a buy adopted after a restart is not sold this way.
 
+**A landed buy with no position (`POSITION_NOT_PERSISTED`, or a buy left unresolved by a restart).** Its tokens have no stop-loss until orphan recovery rebuilds the position from chain data. Recovery retries in the background (5, 15, 45, 120 and 300 s, then every 300 s while it stays unresolved), and covers buys left `PENDING` as well as `RECONCILIATION_REQUIRED`. While any is unresolved, LIVE readiness names it and LIVE buys are refused. If it does not clear, run Reconcile; if the transaction can never be read, sell the tokens by hand.
+
 The WebSocket `PANIC_LIQUIDATE` action and Telegram `/panic_sell` run the same stop. Do not rely on Telegram for it: Telegram cannot deliver the command (no webhook is registered with Telegram and nothing polls for updates); it runs only when something posts it to `POST /api/telegram/webhook` with the operator token.
 
 ### 1.3 Stop all sending, exits included

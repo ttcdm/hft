@@ -36,7 +36,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
-import { dbLockPath, liveLockHolder, signerLockPath } from '../server/system/instanceLock';
+import { dbLockPath, otherLiveLockHolder, signerLockPath } from '../server/system/instanceLock';
 import { resolveDbPath } from '../server/db/dbPath';
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, ComputeBudgetProgram } from '@solana/web3.js';
 
@@ -446,12 +446,12 @@ export interface MakeFunderOptions {
  * or the database's saved auto mode is anything but OFF. The database is opened read-only and never written.
  */
 export function assertAppIdle(appDbPath: string | null, walletPubkey: string): void {
-  const signerHolder = liveLockHolder(signerLockPath(walletPubkey));
-  if (signerHolder && signerHolder.pid !== process.pid) throw new SeedGuardError(`process ${signerHolder.pid} is signing with the app wallet (${signerLockPath(walletPubkey)}); stop the server first`);
+  const signerHolder = otherLiveLockHolder(signerLockPath(walletPubkey)); // R4-1: by boot id, so another container's PID 1 counts
+  if (signerHolder) throw new SeedGuardError(`process ${signerHolder.pid} is signing with the app wallet (${signerLockPath(walletPubkey)}); stop the server first`);
   if (appDbPath === null) return;
   const lock = dbLockPath(appDbPath);
-  const holder = lock ? liveLockHolder(lock) : null;
-  if (holder && holder.pid !== process.pid) throw new SeedGuardError(`process ${holder.pid} holds the app database ${appDbPath}; stop the server first`);
+  const holder = lock ? otherLiveLockHolder(lock) : null;
+  if (holder) throw new SeedGuardError(`process ${holder.pid} holds the app database ${appDbPath}; stop the server first`);
   if (!fs.existsSync(appDbPath)) return; // no database yet: the app has never run here, so no auto mode is saved
   let saved: unknown = null;
   const db = new DatabaseSync(appDbPath, { readOnly: true });

@@ -510,7 +510,7 @@ async function main() {
   const lockPaths = [IL.dbLockPath(workstationDb.getDbPath()), IL.signerLockPath(kp.publicKey.toBase58())].filter((p): p is string => !!p);
   if (!(await S.handOverToChildPhases(steps, {
     stopTrading: () => coordinator.cleanup(), isLiveArmed: () => coordinator.isLiveArmed(), disarm: () => coordinator.armLiveTrading(false),
-    releaseAllLocks: IL.releaseAllLocks, holdsLock: (p) => IL.readLock(p)?.pid === process.pid, lockPaths,
+    releaseAllLocks: IL.releaseAllLocks, holdsLock: (p) => IL.isOwnLock(IL.readLock(p)), lockPaths,
     // the coordinator has no public handle on its running exit pass; the harness reads the private field it keeps (read only)
     exitPassDone: () => (coordinator as any).exitPassInFlight ?? Promise.resolve(),
   }))) return finish();

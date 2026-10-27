@@ -3404,34 +3404,61 @@ export class ExecutionCoordinator {
     return { mints: [...mints], reservedSol: reservedLamports / 1e9 };
   }
 
+  /**
+   * Failed exits, one entry per position AND exit reason (R5-6, R2-5): key `<positionId>|<reason>`. A take-profit that keeps failing no
+   * longer widens the slippage of the stop-loss that follows, and its backoff no longer holds the stop-loss or the trailing stop, which
+   * keep counters and waits of their own. `count` steps the slippage ladder; `waitMs` is the backoff (0 after a failure that sent nothing
+   * and spent no fee, such as a failed simulation).
+   */
   private exitFailures = new Map<string, { count: number; nextAttemptAt: number; lastError: string; waitMs?: number; setAtMono?: number }>();
 
+  private static exitFailureKey(positionId: string, reason?: string): string {
+    return `${positionId}|${reason ?? ''}`;
+  }
+
+  /** The entries for one reason, or (no reason given) every entry of the position. */
+  private exitFailureEntries(positionId: string, reason?: string): Array<{ count: number; nextAttemptAt: number; lastError: string; waitMs?: number; setAtMono?: number }> {
+    if (reason !== undefined) {
+      const f = this.exitFailures.get(ExecutionCoordinator.exitFailureKey(positionId, reason));
+      return f ? [f] : [];
+    }
+    const out: Array<{ count: number; nextAttemptAt: number; lastError: string; waitMs?: number; setAtMono?: number }> = [];
+    for (const [k, f] of this.exitFailures) if (k === positionId || k.startsWith(`${positionId}|`)) out.push(f);
+    return out;
+  }
+
+  private static exitFailurePositionId(key: string): string {
+    const bar = key.indexOf('|');
+    return bar < 0 ? key : key.slice(0, bar);
+  }
+
   /**
-   * Sell slippage for the next attempt on this position: starts at 800 bps and widens after each consecutive failure.
+   * Sell slippage for the next attempt of this exit reason on this position: starts at 800 bps and widens after each consecutive failure
+   * of that reason (no reason: the widest of the position's reasons, for display).
    * T2: never above MAX_SELL_SLIPPAGE_BPS (default 4000, the last step), so an operator can keep a stop-loss from accepting 40% less.
    */
-  public exitSlippageBps(positionId: string): number {
-    const n = this.exitFailures.get(positionId)?.count ?? 0;
+  public exitSlippageBps(positionId: string, reason?: string): number {
+    const n = Math.max(0, ...this.exitFailureEntries(positionId, reason).map((f) => f.count));
     const step = SELL_SLIPPAGE_LADDER_BPS[Math.min(n, SELL_SLIPPAGE_LADDER_BPS.length - 1)];
     return Math.min(step, executionConfig.getConfig().maxSellSlippageBps);
   }
 
-  /** ms until the auto-exit loop may try this position again (0 when free). */
-  public exitRetryWaitMs(positionId: string, now: number = Date.now()): number {
-    const f = this.exitFailures.get(positionId);
-    if (!f) return 0;
-    // S271 review: never more than the backoff that was set. nextAttemptAt is wall-clock time; set under a clock that was later set back
-    // (devnet harness, NTP), it would hold this position's exits, its stop-loss included, for the size of the jump.
-    // A3: and a wall clock set back after that never stretches it either: the wait also runs down on the monotonic clock, which ignores
-    // wall-clock steps, so the cap alone (which left the full wait on every poll) cannot hold the position past waitMs of real time.
-    const left = f.nextAttemptAt - now;
-    if (f.waitMs === undefined) return Math.max(0, left);
-    const monoLeft = f.setAtMono === undefined ? f.waitMs : Math.ceil(f.waitMs - (performance.now() - f.setAtMono));
-    return Math.max(0, Math.min(left, f.waitMs, monoLeft));
+  /** ms until the auto-exit loop may try this exit reason on this position again (0 when free; no reason: the longest wait of any reason). */
+  public exitRetryWaitMs(positionId: string, now: number = Date.now(), reason?: string): number {
+    return Math.max(0, ...this.exitFailureEntries(positionId, reason).map((f) => {
+      // S271 review: never more than the backoff that was set. nextAttemptAt is wall-clock time; set under a clock that was later set back
+      // (devnet harness, NTP), it would hold this position's exits, its stop-loss included, for the size of the jump.
+      // A3: and a wall clock set back after that never stretches it either: the wait also runs down on the monotonic clock, which ignores
+      // wall-clock steps, so the cap alone (which left the full wait on every poll) cannot hold the position past waitMs of real time.
+      const left = f.nextAttemptAt - now;
+      if (f.waitMs === undefined) return Math.max(0, left);
+      const monoLeft = f.setAtMono === undefined ? f.waitMs : Math.ceil(f.waitMs - (performance.now() - f.setAtMono));
+      return Math.max(0, Math.min(left, f.waitMs, monoLeft));
+    }));
   }
 
-  public getExitFailureCount(positionId: string): number {
-    return this.exitFailures.get(positionId)?.count ?? 0;
+  public getExitFailureCount(positionId: string, reason?: string): number {
+    return Math.max(0, ...this.exitFailureEntries(positionId, reason).map((f) => f.count));
   }
 
   /**
@@ -3455,10 +3482,13 @@ export class ExecutionCoordinator {
     return !!error && /^(OFFICIAL_PUMP_QUOTE_FAILED|DYNAMIC_FEE_CALCULATION_FAILED|FEE_RECIPIENT_UNRESOLVED|UNSUPPORTED_QUOTE_MINT|Cannot fetch market state|QUOTE_MATH_DISCREPANCY|BONDING_CURVE_MIGRATED|Invalid curve state|PUMPSWAP_|UNSUPPORTED_PUMPSWAP_QUOTE_MINT|CURVE_READ_FAILED)/.test(error);
   }
 
-  private recordExitOutcome(positionId: string, res: { success: boolean; error?: string; notSent?: boolean }, mode?: string): void {
+  private recordExitOutcome(positionId: string, res: { success: boolean; error?: string; notSent?: boolean }, mode?: string, reason?: string): void {
+    const key = ExecutionCoordinator.exitFailureKey(positionId, reason);
     if (res.success) {
-      this.exitFailures.delete(positionId);
+      // a sell went through (or a landed one was adopted): every reason of the position starts again at the base step
+      for (const k of [...this.exitFailures.keys()]) if (ExecutionCoordinator.exitFailurePositionId(k) === positionId) this.exitFailures.delete(k);
       this.clearOperatorAlert('EXIT_FAILING', positionId);
+      this.clearOperatorAlert('EXIT_NO_ROUTE', positionId);
       this.clearOperatorAlert('EXIT_QUOTE_FAILING', positionId);
       this.clearOperatorAlert('EXIT_RATE_LIMITED', positionId);
       this.clearOperatorAlert('EXIT_NO_SIGNER', positionId);
@@ -3475,19 +3505,27 @@ export class ExecutionCoordinator {
       this.raiseOperatorAlert('EXIT_RATE_LIMITED', `Exit for position ${positionId.slice(0, 8)} was refused by the RPC's rate limit after ${SELL_RATE_LIMIT_BACKOFF_MS.length} resends; nothing was sent. Retrying in ${EXIT_RATE_LIMITED_WAIT_MS / 1000}s; set RPC_MAX_REQUESTS_PER_SEC or use a private RPC if this persists.`, positionId);
       // T6: wait before the next try, keeping the failure count (and so the slippage step) as it was. waitMs caps it as A2 caps every
       // exit wait, so a wall clock set back cannot stretch it.
-      const prev = this.exitFailures.get(positionId);
-      this.exitFailures.set(positionId, { count: prev?.count ?? 0, nextAttemptAt: Date.now() + EXIT_RATE_LIMITED_WAIT_MS, lastError: res.error || 'RPC_RATE_LIMITED', waitMs: EXIT_RATE_LIMITED_WAIT_MS, setAtMono: performance.now() });
+      const prev = this.exitFailures.get(key);
+      this.exitFailures.set(key, { count: prev?.count ?? 0, nextAttemptAt: Date.now() + EXIT_RATE_LIMITED_WAIT_MS, lastError: res.error || 'RPC_RATE_LIMITED', waitMs: EXIT_RATE_LIMITED_WAIT_MS, setAtMono: performance.now() });
     }
     if (mode === 'LIVE' && (quoteFailure || (res.notSent && !ExecutionCoordinator.isNonAttemptExitError(res.error)))) {
       // No fee was spent and the ladder must not advance, but a stop-loss that cannot be priced or built is exactly what an operator must hear about.
       this.raiseOperatorAlert('EXIT_QUOTE_FAILING', `Exit for position ${positionId.slice(0, 8)} cannot be quoted or built, so nothing is being sent (${String(res.error).slice(0, 140)}). Retrying every tick; close it manually if this persists.`, positionId);
     }
+    if (mode === 'LIVE' && /^(UNKNOWN_TRADING_VENUE|Trading venue for mint)/.test(res.error || '')) {
+      // R8-5: no sellable route was found, so nothing was built or sent. The slippage ladder does not move (it is not a price problem), the
+      // exit is retried every pass at the step it was at, and the operator hears that this position cannot be sold by the app right now.
+      this.raiseOperatorAlert('EXIT_NO_ROUTE', `Exit for LIVE position ${positionId.slice(0, 8)} has no sellable route (${String(res.error).slice(0, 140)}); nothing was sent. Retrying every pass; check the mint and close it by hand if this persists.`, positionId);
+    }
     if (mode !== 'LIVE' || res.notSent || ExecutionCoordinator.isNonAttemptExitError(res.error)) return;
-    const count = (this.exitFailures.get(positionId)?.count ?? 0) + 1;
-    const wait = Math.min(EXIT_RETRY_MAX_MS, EXIT_RETRY_BASE_MS * 2 ** (count - 1));
-    this.exitFailures.set(positionId, { count, nextAttemptAt: Date.now() + wait, lastError: res.error || 'unknown', waitMs: wait, setAtMono: performance.now() });
+    const count = (this.exitFailures.get(key)?.count ?? 0) + 1;
+    // R2-5: a failed simulation sent nothing and spent no fee, so it steps the slippage ladder (that is what a slippage breach needs) but
+    // sets no backoff; the next pass retries at the wider step. A send that failed did cost a fee and backs off as before.
+    const simulationOnly = /^SELL_SIMULATION_FAILED/.test(res.error || '');
+    const wait = simulationOnly ? 0 : Math.min(EXIT_RETRY_MAX_MS, EXIT_RETRY_BASE_MS * 2 ** (count - 1));
+    this.exitFailures.set(key, { count, nextAttemptAt: Date.now() + wait, lastError: res.error || 'unknown', waitMs: wait, setAtMono: performance.now() });
     if (count >= EXIT_FAILURE_ALERT_AFTER) {
-      this.raiseOperatorAlert('EXIT_FAILING', `Exit for position ${positionId.slice(0, 8)} failed ${count} times in a row (last: ${res.error}). Retrying every ${Math.round(wait / 1000)}s with wider slippage; consider closing manually.`, positionId);
+      this.raiseOperatorAlert('EXIT_FAILING', `Exit (${reason ?? 'exit'}) for position ${positionId.slice(0, 8)} failed ${count} times in a row (last: ${res.error}). Retrying ${wait > 0 ? `every ${Math.round(wait / 1000)}s` : 'every pass'} with wider slippage; consider closing manually.`, positionId);
     }
   }
 
@@ -3516,7 +3554,7 @@ export class ExecutionCoordinator {
     this.exitsInFlight++;
     try {
       const res = await this.closePositionImpl(positionId, sellPct, reason);
-      this.recordExitOutcome(positionId, res, before?.executionMode);
+      this.recordExitOutcome(positionId, res, before?.executionMode, reason);
       if (res.success && before) {
         workstationDb.logDecision({
           autoMode: 'n/a',
@@ -3854,7 +3892,7 @@ export class ExecutionCoordinator {
         };
       }
 
-      const sellSlippageBps = this.exitSlippageBps(positionId);
+      const sellSlippageBps = this.exitSlippageBps(positionId, reason); // R5-6: this reason's own step
       let v0Tx: any;
       let expectedJitoTipLamports = resolvedTip.tipLamports;
       const jitoTipAccount = executionConfig.getJitoTipAccountPublicKey();
@@ -4427,7 +4465,7 @@ export class ExecutionCoordinator {
     }
     const loadedQty = new Map(positions.map((p) => [p.id, p.tokenQuantityRaw]));
     // N17: failure counters only matter for positions still open; drop the rest so the map cannot grow forever.
-    for (const id of this.exitFailures.keys()) if (!loadedQty.has(id)) this.exitFailures.delete(id);
+    for (const k of [...this.exitFailures.keys()]) if (!loadedQty.has(ExecutionCoordinator.exitFailurePositionId(k))) this.exitFailures.delete(k);
     // Nothing LIVE is open, so there is no mark to be stale (see the feed heartbeat): reset the clock here too.
     if (!positions.some((p) => p.executionMode === 'LIVE')) {
       this.lastPositionMarkTimestamp = 0;
@@ -4486,7 +4524,8 @@ export class ExecutionCoordinator {
         entryTimestamp: pos.entryTimestamp,
         currentTimestamp: posNow,
       });
-      if (staleStopOnly && !(decision.shouldExit && decision.reason === 'STOP_LOSS')) continue; // P1.6: no price, and not past the hard stop
+      // P1.6: no price, and not past the hard stop. R5-21: the trailing stop is protective too (PROTECTIVE_EXIT_REASONS), so it goes as well
+      if (staleStopOnly && !(decision.shouldExit && (decision.reason === 'STOP_LOSS' || decision.reason === 'TRAILING_STOP'))) continue;
 
       // A RECOVERED position (a balance found in the wallet that this app never bought) has an entry price that is just the mark at
       // adoption, so take-profit, trailing and stale exits would sell whatever lands in the wallet on an invented schedule. Only the
@@ -4520,7 +4559,7 @@ export class ExecutionCoordinator {
       }
 
       if (decision.shouldExit) {
-        if (this.exitRetryWaitMs(pos.id, posNow) > 0) continue; // backing off after a failed attempt; the next tick past the deadline retries
+        if (this.exitRetryWaitMs(pos.id, posNow, decision.reason) > 0) continue; // R2-5: this reason backing off after a failed attempt (a TP's wait never holds the stop)
         if (this.inFlightPositionExits.has(pos.id)) continue; // P1.7: its sell from an earlier pass is still running; it must not be sent twice
         if (this.panicActive && !PROTECTIVE_EXIT_REASONS.test(decision.reason)) {
           Logger.warn(`[B13 ExitEngine] ${decision.reason} for ${pos.symbol || pos.mint} refused: panic liquidation is running`);

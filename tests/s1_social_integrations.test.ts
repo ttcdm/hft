@@ -1,3 +1,5 @@
+import { curveFixture } from './fixtures/curve';
+import { PumpCurveService } from '../server/solana/pumpCurve';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { SocialAlphaScanner } from '../server/socialScanner';
 import { PumpFunService } from '../server/pumpfunService';
@@ -234,6 +236,8 @@ describe('S1: Telegram / social integrations', () => {
 
   describe('a social signal can never trade without the execution gates', () => {
     it('every social/callout/telegram entry funnels through executeSnipe -> ExecutionCoordinator.executeTrade', async () => {
+      // R10-8: an unknown mint has no invented pool any more; the mint's curve is read (stubbed at the RPC boundary)
+      vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockResolvedValue(curveFixture());
       const exec = vi.spyOn(executionCoordinator, 'executeTrade').mockResolvedValue({
         success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'PAPER', error: 'gate said no', correlationId: 'c',
       } as any);

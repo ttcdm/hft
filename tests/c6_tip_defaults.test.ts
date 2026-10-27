@@ -8,17 +8,21 @@ import { solPriceService } from '../server/market/solPriceService';
 import { PumpCurveService } from '../server/solana/pumpCurve';
 import { OperatorSnipeSchema, CalloutSnipeSchema } from '../server/execution/tradeInputs';
 import { MINT_A } from './fixtures/socialFeeds';
+import { curveFixture } from './fixtures/curve';
 
 describe('C6: one source for Jito tip defaults', () => {
   beforeEach(() => {
     memecoinAggregator.setConfluenceGating(false); // C2: gating is on by default; this test is about something else
   });
+  // R10-8: an unknown mint has no invented pool any more; for executeSnipe the mint's curve is read (stubbed at the RPC boundary)
+  const curveReadable = () => vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockResolvedValue(curveFixture());
   afterEach(() => vi.restoreAllMocks());
 
   it('executeSnipe with no operator tip passes NO explicit tip to the coordinator', async () => {
     solPriceService.setPrice(150, 'TEST');
     vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('PAPER');
     const exec = vi.spyOn(executionCoordinator, 'executeTrade').mockResolvedValue({ success: false, error: 'stub' } as any);
+    curveReadable();
     await memecoinAggregator.executeSnipe({ contractAddress: MINT_A, amountUsd: 5 });
     expect(exec).toHaveBeenCalled();
     expect(exec.mock.calls[0][0].jitoTipSol).toBeUndefined();
@@ -28,6 +32,7 @@ describe('C6: one source for Jito tip defaults', () => {
     solPriceService.setPrice(150, 'TEST');
     vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('PAPER');
     const exec = vi.spyOn(executionCoordinator, 'executeTrade').mockResolvedValue({ success: false, error: 'stub' } as any);
+    curveReadable();
     await memecoinAggregator.executeSnipe({ contractAddress: MINT_A, amountUsd: 5, jitoTipSol: 0.003 });
     expect(exec.mock.calls[0][0].jitoTipSol).toBe(0.003);
   });

@@ -44,7 +44,7 @@ describe('(a) wrong cluster: the chain answers with a genesis the server does no
   beforeAll(async () => {
     ({ mint } = await market.seedCoin(6, 0.6));
     // The server is told devnet; the validator's genesis is its own random hash, so every check must fail closed.
-    app = await startLocalnetApp({ dir: scratch('long-guards-devnet-'), validator: v, signerKeyPath: signerPath, env: { ALLOWED_CLUSTER: 'devnet', LOCALNET_GENESIS_HASH: '' } });
+    app = await startLocalnetApp({ dir: scratch('long-guards-devnet-'), validator: v, signerKeyPath: signerPath, env: { ALLOWED_CLUSTER: 'devnet', LOCALNET_GENESIS_HASH: '' }, confluenceThreshold: 0 });
   }, 120_000);
   afterAll(() => app?.stop());
 
@@ -87,7 +87,7 @@ describe('(a) wrong cluster: the chain answers with a genesis the server does no
 describe('(b)-(e) failures on the right cluster', () => {
   let app: LocalnetApp;
   beforeAll(async () => {
-    app = await startLocalnetApp({ dir, validator: v, signerKeyPath: signerPath });
+    app = await startLocalnetApp({ dir, validator: v, signerKeyPath: signerPath, confluenceThreshold: 0 });
     await armLive(app);
   }, 180_000);
   afterAll(() => app?.stop());

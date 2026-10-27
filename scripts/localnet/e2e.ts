@@ -299,6 +299,11 @@ async function main() {
   const arm = await call('POST', '/api/execution/arm', { arm: true, confirmationCode: 'CONFIRM_LIVE_TRADING_RISK' });
   rec('POST /api/execution/arm', arm.status === 200 && arm.body?.success, JSON.stringify(arm.body).slice(0, 300));
   if (!arm.body?.success) return finish();
+  // R5-40: the trade route runs executeSnipe's gates. A coin seeded a moment ago has no feed history, so its confluence score is 0/100
+  // ("missing data") and the default threshold 70 refuses it. The operator's threshold (saved in this run's scratch DB) is set to 0, so the
+  // gate still runs (`score < threshold`) and passes; every other gate is unchanged. See scripts/DEVNET_E2E_README.md.
+  const threshold = await call('POST', '/api/auto/threshold', { threshold: 0 });
+  rec('POST /api/auto/threshold 0 (fresh localnet coins have no feed history to score)', threshold.status === 200 && threshold.body?.value === 0, JSON.stringify(threshold.body?.error ?? threshold.body?.value).slice(0, 200));
 
   // ---- (a) BUY through the HTTP API ----
   const buy = await call('POST', '/api/execution/trade', { mint: mint.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02, confirmLive: true });

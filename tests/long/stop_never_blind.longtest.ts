@@ -35,7 +35,7 @@ async function boot(tag: string): Promise<void> {
   fs.mkdirSync(sub);
   const signer = await market.signerKeyFile(sub, 5);
   trader = signer.keypair;
-  app = await startLocalnetApp({ dir: sub, validator: v, signerKeyPath: signer.path });
+  app = await startLocalnetApp({ dir: sub, validator: v, signerKeyPath: signer.path, confluenceThreshold: 0 });
   await armLive(app);
 }
 

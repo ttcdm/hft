@@ -2154,6 +2154,12 @@ export async function killSurvivesRestart(s: Pick<HarnessSteps, 'rec' | 'sleep'>
     // 1. a LIVE position, made auto-owned
     app = await d.boot();
     if (!(await armWhenReady(app, 'boot 1'))) return;
+    // R5-40: the trade route runs executeSnipe's gates, and the step's coin was made a moment ago: no feed history, confluence 0/100
+    // ("missing data"), refused at the default 70. The operator threshold is set to 0 on this step's own scratch DB (saved there, so the
+    // later boots keep it); the gate still runs (`score < threshold`) and every other gate is unchanged. See scripts/DEVNET_E2E_README.md.
+    const threshold = await app.call('POST', '/api/auto/threshold', { threshold: 0 });
+    s.rec(`${L}: boot 1: confluence threshold 0 for a fresh coin`, threshold.status === 200 && threshold.json?.value === 0, `${threshold.status} ${threshold.json?.error ?? threshold.json?.value ?? ''}`.slice(0, 200));
+    if (threshold.json?.value !== 0) return;
     const buy = await app.call('POST', '/api/execution/trade', d.buyBody);
     const posId: string | undefined = buy.json?.positionId;
     s.rec(`${L}: boot 1: a LIVE position`, buy.json?.success === true && !!posId, `${buy.status} ${buy.json?.lifecycleState ?? ''} ${buy.json?.error ?? ''} ${posId ?? 'no position id'}`.slice(0, 300));

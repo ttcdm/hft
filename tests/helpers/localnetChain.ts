@@ -152,6 +152,13 @@ export interface AppOptions {
   /** Same operator token across restarts, so a stored session keeps working. */
   token?: string;
   env?: Record<string, string>;
+  /**
+   * Sets the confluence buy threshold through the operator route (POST /api/auto/threshold, saved in this app's own scratch DB) right
+   * after boot. Tests that buy fresh localnet coins by hand pass 0: since R5-40 POST /api/execution/trade runs executeSnipe's gates, and a
+   * coin seeded a moment ago has no feed history to score (confluence 0/100, "missing data"), so the default 70 refuses it. The gate
+   * still runs (0 < 0 is false, it compares `score < threshold`); every other gate (pool, freeze, sizing, risk, cluster) is unchanged.
+   */
+  confluenceThreshold?: number;
 }
 
 /**
@@ -210,6 +217,13 @@ export async function startLocalnetApp(o: AppOptions): Promise<LocalnetApp> {
     child.kill(signal);
     if (signal !== 'SIGKILL') setTimeout(() => child.kill('SIGKILL'), 3000).unref();
   });
+  if (o.confluenceThreshold !== undefined) {
+    const t = await call('POST', '/api/auto/threshold', { threshold: o.confluenceThreshold });
+    if (t.status !== 200 || t.json?.value !== o.confluenceThreshold) {
+      child.kill('SIGKILL');
+      throw new Error(`could not set the confluence threshold to ${o.confluenceThreshold}: ${t.status} ${JSON.stringify(t.json)}`);
+    }
+  }
   return {
     base, token, dbPath, logs, call,
     stop: () => stopWith('SIGTERM'),

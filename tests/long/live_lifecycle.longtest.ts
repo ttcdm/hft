@@ -38,7 +38,7 @@ beforeAll(async () => {
   const signer = await market.signerKeyFile(dir, 5);
   trader = signer.keypair;
   ({ mint: coinA, wallets: holdersA } = await market.seedCoin(14, 0.6));
-  app = await startLocalnetApp({ dir, validator: v, signerKeyPath: signer.path });
+  app = await startLocalnetApp({ dir, validator: v, signerKeyPath: signer.path, confluenceThreshold: 0 });
   await armLive(app);
 }, 240_000);
 

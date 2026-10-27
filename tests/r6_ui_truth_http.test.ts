@@ -1,10 +1,14 @@
 import fs from 'node:fs';
 import { describe, it, expect, afterAll, beforeAll } from 'vitest';
-import { startApp, startRpcStub, scratchDir, haltInSeparateProcess, LOCALNET_STUB_GENESIS, type AppHandle, type RpcStub } from './helpers/liveServer';
+import { Keypair } from '@solana/web3.js';
+import { WorkstationDatabase } from '../server/db/database';
+import { startApp, startRpcStub, scratchDir, haltInSeparateProcess, LOCALNET_STUB_GENESIS, MAINNET_GENESIS, type AppHandle, type RpcStub } from './helpers/liveServer';
 
 /**
  * Round 6 (haiku-attack 2026-10-26), over the real server's HTTP API: what the code knows reaches the operator.
  * R6-1 / R7-1: GET /api/system/checks serves the open operator alerts, with a level, as the runbook says.
+ * R6-4: POST /api/auto/kill with exitAll answers success:false when a sell of what auto bought is refused.
+ * R6-2: GET /api/wallet/state lists an open LIVE position while the server is in PAPER.
  */
 const dirs: string[] = [];
 const handles: Array<{ stop(): Promise<void> }> = [];
@@ -35,5 +39,46 @@ describe('R6-1/R7-1: /api/system/checks serves the operator alerts', () => {
     await app.call('POST', '/api/auto/resume', { clearHalt: true });
     const after = (await app.call('GET', '/api/system/checks')).json;
     expect(after.operatorAlerts.some((a: any) => a.code === 'TRADING_HALTED')).toBe(false);
+  });
+});
+
+describe('R6-4 / R6-2: kill auto reports refused sells; an open LIVE position shows while the server is in PAPER', () => {
+  let rpc: RpcStub; let app: AppHandle;
+  const positionId = 'r64-http-live-1';
+  beforeAll(async () => {
+    const d = dir();
+    rpc = await startRpcStub(MAINNET_GENESIS); // ALLOWED_CLUSTER=mainnet-beta: every send is refused, so the close of the LIVE position fails
+    const db = new WorkstationDatabase(`${d}/app.db`);
+    const now = Date.now();
+    const mint = Keypair.generate().publicKey.toBase58();
+    db.savePosition({
+      id: positionId, mint, symbol: 'R64', name: 'R6-4 kill', tokenDecimals: 6, tokenQuantityRaw: '1000000000',
+      entryPriceSol: 1e-7, currentPriceSol: 1e-7, currentValueSol: 0.0001, costBasisLamports: 100_000, realizedPnLSol: 0, status: 'OPEN',
+      venue: 'PUMP_BONDING_CURVE', executionMode: 'LIVE', entryTxSignature: 'R64SeededEntry', entryTimestamp: now, lastMarkTimestamp: now, recordUpdatedAt: now, updatedAt: now,
+    } as any);
+    db.logDecision({ autoMode: 'DEVNET_LIVE', mint, symbol: 'R64', stage: 'buy', outcome: 'BOUGHT', reason: 'seeded', positionId });
+    (db as any).db.close();
+    app = await startApp(d, { SOLANA_RPC_URL: rpc.url, ALLOWED_CLUSTER: 'mainnet-beta', LOCALNET_GENESIS_HASH: '', ALLOW_LIVE_REAL_MONEY_TRADING: 'true' });
+    handles.push(app);
+  }, 120_000);
+  afterAll(() => rpc.close());
+
+  it('the server is in PAPER and /api/wallet/state still lists the LIVE position, in liveOpen', async () => {
+    const st = (await app.call('GET', '/api/wallet/state')).json.data;
+    expect(st.executionMode).toBe('PAPER');
+    expect(st.liveOpen.count).toBe(1);
+    expect(st.activePositions.find((p: any) => p.id === positionId).executionMode).toBe('LIVE');
+  });
+
+  it('KILL AUTO with exitAll answers success:false and names the position that was not sold', async () => {
+    const r = await app.call('POST', '/api/auto/kill', { exitAll: true, reason: 'r6-4 http' });
+    expect(r.status).toBe(200);
+    expect(r.json.success).toBe(false);
+    expect(r.json.mode).toBe('OFF');
+    expect(r.json.attempted).toBe(1);
+    expect(r.json.closed).toBe(0);
+    expect(r.json.failed[0].positionId).toBe(positionId);
+    expect(r.json.failed[0].error).toMatch(/CLUSTER_GUARD/);
+    expect(r.json.error).toMatch(/NOT sold/);
   });
 });

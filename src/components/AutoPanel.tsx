@@ -122,9 +122,24 @@ export function ConfluenceThresholdEditor({ confluence, onSave, busy }: { conflu
   );
 }
 
-export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOrderSize, onThreshold, code, onCode, busy, error }: {
+/**
+ * R6-4: what KILL AUTO did, from the POST /api/auto/kill reply. "Sell what it bought" is reported as done only when every sell was;
+ * a refused or failed one is counted and named, since those positions are still open.
+ */
+export interface KillReport { ok: boolean; text: string }
+export function killReportFor(j: any): KillReport | null {
+  if (!j || typeof j !== 'object' || typeof j.attempted !== 'number') return null;
+  const failed: Array<{ symbol?: string; error?: string }> = Array.isArray(j.failed) ? j.failed : [];
+  const closed = typeof j.closed === 'number' ? j.closed : 0;
+  if (j.attempted === 0) return { ok: true, text: 'Auto is OFF. It had no open position to sell.' };
+  if (failed.length === 0 && j.success === true) return { ok: true, text: `Auto is OFF. Sold ${closed} of ${j.attempted} position(s) it bought.` };
+  const names = failed.map((f) => `${f.symbol ?? '?'} (${f.error ?? 'refused'})`).join('; ');
+  return { ok: false, text: `Auto is OFF, but only ${closed} of ${j.attempted} position(s) were sold; ${failed.length} refused or failed and are STILL OPEN: ${names}. Close them by hand.` };
+}
+
+export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOrderSize, onThreshold, code, onCode, busy, error, killReport }: {
   status: AutoStatusData | null; onMode?: (m: AutoMode) => void; onKill?: () => void; onResume?: () => void; onBudget?: (maxBuys: number, maxSpendSol: number) => void; onOrderSize?: (sol: number) => void; onThreshold?: (value: number) => void;
-  code?: string; onCode?: (c: string) => void; busy?: boolean; error?: string | null;
+  code?: string; onCode?: (c: string) => void; busy?: boolean; error?: string | null; killReport?: KillReport | null;
 }) {
   if (!status) return <section className="rounded-lg border border-slate-800 bg-[#0B0F17] p-3 text-xs text-slate-500" data-testid="auto-panel">Auto-snipe: sign in as operator to read the controller.</section>;
   const s = status.stats;
@@ -149,6 +164,7 @@ export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOr
       </div>
       <input value={code ?? ''} onChange={(e) => onCode?.(e.target.value)} placeholder="DEVNET_LIVE confirmation code" className="w-full mb-2 px-2 py-1 rounded bg-slate-900 border border-slate-700 font-mono text-[11px]" />
       {error && <p className="text-red-400 mb-2" data-testid="auto-error">{error}</p>}
+      {killReport && <p className={`${killReport.ok ? 'text-emerald-300' : 'text-red-300 font-bold'} mb-2`} data-testid="auto-kill-report">{killReport.text}</p>}
       {status.haltReason && <p className="text-red-400 mb-2" data-testid="halt-reason">ALL TRADING HALTED: {status.haltReason} <button onClick={onResume} className="underline ml-1">clear halt</button></p>}
       {status.killReason && <p className="text-amber-400 mb-1">Killed: {status.killReason}</p>}
       {status.downgradeReason && <p className="text-amber-400 mb-1" data-testid="downgrade-reason">Dropped to SHADOW: {status.downgradeReason}</p>}
@@ -215,12 +231,14 @@ export function AutoPanel() {
   const shown = local ?? status;
   useEffect(() => { setLocal(null); }, [status]);
   const [error, setError] = useState<string | null>(null);
+  const [killReport, setKillReport] = useState<KillReport | null>(null);
   const post = useCallback(async (path: string, body: unknown) => {
     setBusy(true);
     setError(null);
     try {
       const r = await authFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       const j = await r.json().catch(() => null);
+      if (path === '/api/auto/kill') setKillReport(killReportFor(j));
       // R31: a refusal (400/403/409/429) carries its reason in the body; show it instead of dropping it
       if (!r.ok) setError(`${j?.error || j?.message || 'Request refused'} (HTTP ${r.status})`);
       if (j?.status) setLocal({ ...j.status, stats: shown?.stats });
@@ -229,7 +247,7 @@ export function AutoPanel() {
     } finally { setBusy(false); }
   }, [shown]);
   return (
-    <AutoPanelView status={shown} busy={busy} error={error} code={code} onCode={setCode}
+    <AutoPanelView status={shown} busy={busy} error={error} killReport={killReport} code={code} onCode={setCode}
       onMode={(m) => post('/api/auto/mode', { mode: m, confirmationCode: m === 'DEVNET_LIVE' ? code : undefined })}
       onKill={() => {
         // Q45: KILL sells every position the auto trader opened, so it asks first

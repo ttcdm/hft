@@ -131,7 +131,7 @@ describe('3K (m): a 5-buy DEVNET_LIVE session, spentSol against the wallet (3B)'
 
 /** A server whose saved state lives on a fake disk across boots. `persistBeforeAwait` is 3E's change. */
 function fakeServers(o: { persistBeforeAwait: boolean; neverSells?: boolean; cleanupThrows?: boolean }) {
-  const disk = { mode: 'OFF', killed: false, killReason: null as string | null, tripped: false, planted: [] as string[], positions: 0 };
+  const disk = { mode: 'OFF', killed: false, killReason: null as string | null, tripped: false, planted: [] as string[], positions: 0, threshold: 70 };
   const log: string[] = [];
   let onSend: (() => void) | null = null;
   let held = false;
@@ -155,6 +155,8 @@ function fakeServers(o: { persistBeforeAwait: boolean; neverSells?: boolean; cle
         if (!me.alive) throw new Error('server gone');
         if (route === '/api/execution/can-arm') return { status: 200, json: { allowed: !alert, reasons: alert ? ['The kill switch was on before the restart; clear KILL_SWITCH_WAS_ON with POST /api/auto/resume {clearHalt:true} before arming'] : [] } };
         if (route === '/api/execution/arm') return { status: 200, json: { success: !alert, message: 'armed' } };
+        if (route === '/api/auto/threshold') { disk.threshold = body.threshold; return { status: 200, json: { success: true, value: body.threshold } }; } // R5-40: (o) sets 0 before its hand buy
+        if (route === '/api/execution/trade' && disk.threshold > 0) return { status: 400, json: { success: false, error: `REJECTED: Confluence score 0/100 failed minimum threshold of ${disk.threshold}` } }; // a fresh coin scores 0
         if (route === '/api/execution/trade') { disk.positions++; return { status: 200, json: { success: true, lifecycleState: 'CONFIRMED', positionId: `pos${disk.positions}` } }; }
         if (route === '/api/auto/mode') { mode = body.mode; disk.mode = mode; return { status: 200, json: { success: true, mode } }; }
         if (route === '/api/auto/status') return { status: 200, json: { success: true, mode, killed, killReason } };

@@ -22,7 +22,8 @@ export function isAlertExpired(alert: Pick<AlertEvent, 'level' | 'timestamp'>, n
 }
 
 export const COLLAPSED_ALERTS = 1;
-export const EXPANDED_ALERTS = 3;
+/** R10-9: "Show all" shows all of them (it was capped at 3 while the counter said "+8"); the list scrolls inside the dock. */
+export const EXPANDED_ALERTS = Infinity;
 
 interface AlertSystemProps {
   alerts: AlertEvent[];
@@ -39,7 +40,7 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
   const [minimized, setMinimized] = useState(false);
   if (alerts.length === 0) return null;
   const ordered = orderAlerts(alerts);
-  const shown = minimized ? [] : ordered.slice(0, expanded ? EXPANDED_ALERTS : COLLAPSED_ALERTS);
+  const shown = minimized ? [] : expanded ? ordered : ordered.slice(0, COLLAPSED_ALERTS);
   const hidden = alerts.length - shown.length;
   const critical = alerts.filter((a) => a.level === 'CRITICAL').length;
 
@@ -80,6 +81,7 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
         </span>
       </div>
 
+      <div data-testid="alerts-list" className="space-y-2 max-h-[60vh] overflow-y-auto pointer-events-auto">
       {shown.map((alert) => (
         <div
           key={alert.id}
@@ -127,6 +129,7 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
           )}
         </div>
       ))}
+      </div>
     </div>
   );
 };

@@ -722,6 +722,28 @@ export class WorkstationDatabase {
     }
   }
 
+  /**
+   * R5-1: the mints among `mints` that this app ever sent a LIVE buy for (any state). null when the query cannot run: the caller cannot
+   * tell its own lost buy from a token anyone sent to the wallet, so it adopts nothing.
+   */
+  public loadLiveBuyMints(mints: string[]): Set<string> | null {
+    if (mints.length === 0) return new Set();
+    try {
+      const found = new Set<string>();
+      for (let i = 0; i < mints.length; i += 500) {
+        const chunk = mints.slice(i, i + 500);
+        const rows = this.db
+          .prepare(`SELECT DISTINCT mint FROM transactions WHERE direction = 'BUY' AND execution_mode = 'LIVE' AND mint IN (${chunk.map(() => '?').join(',')})`)
+          .all(...chunk) as Array<{ mint: string }>;
+        for (const r of rows) found.add(r.mint);
+      }
+      return found;
+    } catch (err: any) {
+      Logger.error(`loadLiveBuyMints could not read the transactions table (${err?.message || err}); nothing is adopted`);
+      return null;
+    }
+  }
+
   public hasUnresolvedLiveBuy(mint: string): boolean {
     try {
       const row = this.db

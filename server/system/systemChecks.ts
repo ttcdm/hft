@@ -80,6 +80,8 @@ export const SELLER_FUNDER_UNREAD_WARN_SHARE = 0.05;
 export const SELLER_FUNDER_UNREAD_MIN_ASKED = 20;
 
 const sec = (ms: number | null) => (ms === null ? 'never' : ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
+/** "12.0 s ago", or "none yet" when it never happened (it used to print "never ago"). */
+const ago = (ms: number | null) => (ms === null ? 'none yet' : `${sec(ms)} ago`);
 
 /**
  * Live results, each read from the component that owns the fact (no check here is computed from a constant). A check that cannot be read
@@ -149,7 +151,7 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
   const feedAge = feed.lastEventAgeMs >= 0 ? feed.lastEventAgeMs : null;
   checks.push({
     id: 'feed', label: 'Pump.fun event feed', status: !feedOk ? 'WARN' : feedAge === null ? 'WARN' : feedAge > 120_000 ? 'WARN' : 'OK',
-    value: `${feed.status}, last event ${sec(feedAge)} ago`, detail: `${feed.eventsReceived} logs received, ${feed.eventsParsed} creates and ${feed.tradesParsed} trades parsed. A quiet devnet is normal; on mainnet this is a warning.`,
+    value: `${feed.status}, last event ${ago(feedAge)}`, detail: `${feed.eventsReceived} logs received, ${feed.eventsParsed} creates and ${feed.tradesParsed} trades parsed. A quiet devnet is normal; on mainnet this is a warning.`,
   });
 
   const cap = watchWindow.getSnapshot(now).capacity;
@@ -172,7 +174,7 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
   const markAlerts = alerts.filter((a) => a.code === 'POSITION_MARK_UNAVAILABLE' || a.code === 'PAPER_MARKS_UNAVAILABLE');
   checks.push({
     id: 'marks', label: 'Position marks', status: markAlerts.length ? 'WARN' : diag.positionMarkHealth === 'STALE' ? 'WARN' : 'OK',
-    value: markAlerts.length ? `${markAlerts.length} stale-mark alert(s)` : `${diag.positionMarkHealth}, last mark ${sec(ages.positionMarkAgeMs)} ago`,
+    value: markAlerts.length ? `${markAlerts.length} stale-mark alert(s)` : `${diag.positionMarkHealth}, last mark ${ago(ages.positionMarkAgeMs)}`,
     detail: markAlerts.length ? markAlerts.map((a) => a.message).slice(0, 3).join(' | ') : `${diag.openPositionsCount} open position(s); no stale-mark alert.`,
   });
 

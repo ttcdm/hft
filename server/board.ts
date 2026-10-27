@@ -1,5 +1,6 @@
 import { workstationDb } from './db/database';
-import { executionCoordinator } from './execution/coordinator';
+import { executionCoordinator, MARK_STALE_MS } from './execution/coordinator';
+import { riskEngine } from './risk/riskEngine';
 import { memecoinAggregator } from './memecoinAggregator';
 import { watchWindow } from './signals/watchWindow';
 import { ExitEngine } from './exits/exitEngine';
@@ -41,6 +42,9 @@ export function buildBoard(now = Date.now()) {
   const mode = executionCoordinator.getExecutionMode();
   const balance = executionCoordinator.getRealWalletBalanceSol();
   const sol = solPriceService.lastKnownPrice();
+  const solReading = solPriceService.getPrice();
+  // R6-8: the balance is cached (read at boot, after a trade, on an RPC switch and in the DEVNET_LIVE wallet audit); say how old it is
+  const balanceRead = riskEngine.getLastBalanceRead();
 
   const launches = memecoinAggregator
     .getPools()
@@ -76,6 +80,8 @@ export function buildBoard(now = Date.now()) {
       entryPriceSol: p.entryPriceSol > 0 ? p.entryPriceSol : null,
       markPriceSol: p.currentPriceSol > 0 ? p.currentPriceSol : null,
       markAgeMs: p.lastMarkTimestamp ? now - p.lastMarkTimestamp : null,
+      /** R6-7: older than the coordinator's MARK_STALE_MS (or never marked) */
+      markStale: !p.lastMarkTimestamp || now - p.lastMarkTimestamp > MARK_STALE_MS,
       costSol: p.costBasisLamports ? p.costBasisLamports / 1e9 : null,
       pnlSol: p.currentPriceSol > 0 && !String(p.entryTxSignature || '').startsWith('RECOVERED:') ? (p.realizedPnLSol ?? 0) + (p.unrealizedPnLSol ?? 0) : null,
       nextExit: nextExitFor(p),
@@ -91,6 +97,12 @@ export function buildBoard(now = Date.now()) {
       rentLockedSol: balance === null ? null : executionCoordinator.getRentLockedSol(),
       spendableSol: balance === null ? null : executionCoordinator.getSpendableBankrollSol(),
       solUsd: sol,
+      /** R6-7: age of the SOL/USD reading; stale past SOL_PRICE_MAX_AGE_MS (USD figures still use it, LIVE sizing refuses it) */
+      solUsdAgeMs: solReading.ageMs,
+      solUsdStale: solReading.stale,
+      /** R6-8: age of the last successful wallet balance read; null when none succeeded or the last read failed */
+      balanceAgeMs: balance !== null && balanceRead?.ok ? now - balanceRead.at : null,
+      balanceLastReadFailed: balanceRead ? !balanceRead.ok : false,
     },
     launches,
     watching,

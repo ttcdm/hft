@@ -40,6 +40,7 @@ import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExtern
 import { authFetch } from '../services/engineClient';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
 import { positionPnlCell } from '../utils/positionPnl';
+import { ageText, markIsStale } from '../utils/freshness';
 import { BELOW_HEADER_TOP } from '../utils/headerOffset';
 
 interface PlugAndPlayTradingModalProps {
@@ -564,7 +565,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                         <th className="p-2.5">Mode</th>
                         <th className="p-2.5">Cost Basis</th>
                         <th className="p-2.5">Current Value</th>
-                        <th className="p-2.5">PnL</th>
+                        <th className="p-2.5" title="Open part at the curve spot price; exit fee, price impact and tip are not taken off">PnL (open at mark, before exit costs)</th>
                         <th className="p-2.5">Status</th>
                         <th className="p-2.5 text-right">Action</th>
                       </tr>
@@ -588,7 +589,14 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                               </span>
                             </td>
                             <td className="p-2.5 font-mono">{((pos.costBasisLamports ?? 0) / 1e9).toFixed(4)} SOL</td>
-                            <td className="p-2.5 font-mono">{(pos.currentValueSol ?? 0).toFixed(4)} SOL</td>
+                            <td className="p-2.5 font-mono">
+                              {(pos.currentValueSol ?? 0).toFixed(4)} SOL
+                              {(pos.status === 'OPEN' || pos.status === 'PARTIALLY_CLOSED') && (
+                                <span data-testid="blotter-mark-age" className={`block text-[10px] ${markIsStale(pos.lastMarkTimestamp, Date.now()) ? 'text-amber-300' : 'text-slate-500'}`}>
+                                  mark {ageText(pos.lastMarkTimestamp ? Date.now() - pos.lastMarkTimestamp : null)}{markIsStale(pos.lastMarkTimestamp, Date.now()) ? ' (STALE)' : ''}
+                                </span>
+                              )}
+                            </td>
                             <td className="p-2.5 font-mono font-bold">
                               <span className={positionPnlCell(pos).positive ? 'text-emerald-400' : 'text-rose-400'}>
                                 {positionPnlCell(pos).text}

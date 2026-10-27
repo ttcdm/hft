@@ -26,6 +26,7 @@ import { AutoHeaderBadge, useAutoStatus } from './AutoPanel';
 import { usePolled } from '../utils/usePolled';
 import { ReadOnlyPill } from './TradingModeBanner';
 import { publishHeaderHeight } from '../utils/headerOffset';
+import { ageText, isStale, PILL_STALE_MS } from '../utils/freshness';
 
 /** Facts, not adjectives: how many of the live checks are not OK. */
 export function checksBadgeFor(checks: Array<{ status: string }> | null): { text: string; tone: string } {
@@ -48,6 +49,14 @@ export const LiveOpenChip: React.FC<{ live: PillState['live'] }> = ({ live }) =>
       <span>LIVE {live.openCount} open</span>
       <span className="opacity-80">{signedUsd(live.unrealizedUsd)}</span>
       <span className="text-[10px] opacity-70">today {signedUsd(live.realizedUsd)}</span>
+    </span>
+  ) : null;
+
+/** R6-7: "stale" on the PnL pill when the last fetch failed or the last good answer is old. */
+export const PillStaleNote: React.FC<{ at: number | null; failed: boolean; now: number }> = ({ at, failed, now }) =>
+  isStale(at, failed, now, PILL_STALE_MS) ? (
+    <span data-testid="pill-stale" className="text-[10px] font-bold text-amber-300">
+      {at === null ? 'not read' : `STALE ${ageText(now - at)}`}
     </span>
   ) : null;
 
@@ -105,16 +114,27 @@ export const Header: React.FC<HeaderProps> = ({
 
   // Live Auto-Profit Ticker State (fetched from walletTrader) - Clean initial state (B22)
   const [profitSummary, setProfitSummary] = useState<PillState | null>(null);
+  // R6-7: the pill keeps its last values when a fetch fails, so it says when they are stale
+  const [profitAt, setProfitAt] = useState<number | null>(null);
+  const [profitFailed, setProfitFailed] = useState(false);
+  const [nowTick, setNowTick] = useState(() => Date.now());
 
   useEffect(() => {
     const fetchProfit = async () => {
+      setNowTick(Date.now());
       try {
         const res = await authFetch('/api/wallet/state');
         if (res.ok) {
           const json = await res.json();
           setProfitSummary(readPillState(json.data));
+          setProfitAt(Date.now());
+          setProfitFailed(false);
+        } else {
+          setProfitFailed(true);
         }
-      } catch {}
+      } catch {
+        setProfitFailed(true);
+      }
     };
     fetchProfit();
     const interval = setInterval(fetchProfit, 3500);
@@ -248,16 +268,17 @@ export const Header: React.FC<HeaderProps> = ({
         <button
           id="btn-auto-profit-ticker"
           onClick={() => handleNavClick('PLUG_AND_PLAY')}
-          title="Realized profit today (net of fees) and the marked profit of the open positions, from the server. Click for the wallet positions."
+          title="Realized profit today (net of fees) and the open positions' profit at the curve spot price (exit fee, price impact and tip NOT taken off), in USD at today's SOL price, from the server. Click for the wallet positions."
           className={`hidden min-[1500px]:flex items-center space-x-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-mono transition ${
-            { up: 'bg-emerald-950/70 border-emerald-500/40 text-emerald-300', down: 'bg-rose-950/70 border-rose-500/40 text-rose-300', flat: 'bg-slate-900 border-slate-700 text-slate-300', unknown: 'bg-slate-900 border-slate-700 text-slate-500' }[pillTone(profitSummary)]
+            { up: 'bg-emerald-950/70 border-emerald-500/40 text-emerald-300', down: 'bg-rose-950/70 border-rose-500/40 text-rose-300', flat: 'bg-slate-900 border-slate-700 text-slate-300', unknown: 'bg-slate-900 border-slate-700 text-slate-500' }[isStale(profitAt, profitFailed, nowTick, PILL_STALE_MS) ? 'unknown' : pillTone(profitSummary)]
           }`}
         >
           <span className="text-[10px] opacity-70">today</span>
           <span className="font-bold tracking-tight">{signedUsd(profitSummary?.realizedUsd)}</span>
-          <span className="text-[10px] opacity-70">open</span>
+          <span className="text-[10px] opacity-70">open at mark</span>
           <span className="font-bold tracking-tight">{signedUsd(profitSummary?.unrealizedUsd)}</span>
           <span className="text-[10px] opacity-70">({profitSummary?.openCount ?? '—'})</span>
+          <PillStaleNote at={profitAt} failed={profitFailed} now={nowTick} />
         </button>
 
         {/* Direct Quant Tools (Expanded on 2XL screens) */}

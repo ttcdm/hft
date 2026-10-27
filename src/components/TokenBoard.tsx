@@ -1,13 +1,18 @@
 import React, { useEffect, useState } from 'react';
 import { authFetch } from '../services/engineClient';
 import { onAuthenticated } from '../utils/authEvents';
+import { ageText } from '../utils/freshness';
 
 /** H1: the home page. Launches / Watching / Holding, all from GET /api/board. Unknown values render "—", never a number. */
 export interface BoardData {
   generatedAt: number;
   watchCapacity?: { active: number; max: number; refusedFull: number; lastRefusedMint: string | null };
   executionMode: string;
-  wallet: { balanceSol: number | null; reserveSol: number; rentLockedSol: number | null; spendableSol: number | null; solUsd: number | null };
+  wallet: {
+    balanceSol: number | null; reserveSol: number; rentLockedSol: number | null; spendableSol: number | null; solUsd: number | null;
+    /** R6-7 / R6-8: ages of the SOL/USD reading and the cached wallet balance. Absent on an older server. */
+    solUsdAgeMs?: number | null; solUsdStale?: boolean; balanceAgeMs?: number | null; balanceLastReadFailed?: boolean;
+  };
   launches: Array<{
     mint: string; symbol: string; name: string; priceSol: number | null; priceUsd: number | null; curveProgressPct: number | null;
     top10HoldersPct: number | null; creatorHoldingPct: number | null; mintRevoked: boolean | null; freezeRevoked: boolean | null; createdAgo: string | null;
@@ -21,7 +26,7 @@ export interface BoardData {
     };
   }>;
   holding: Array<{
-    id: string; mint: string; symbol: string; mode: string; entryPriceSol: number | null; markPriceSol: number | null; markAgeMs: number | null;
+    id: string; mint: string; symbol: string; mode: string; entryPriceSol: number | null; markPriceSol: number | null; markAgeMs: number | null; markStale?: boolean;
     costSol: number | null; pnlSol: number | null; nextExit: { kind: string; priceSol: number } | null;
   }>;
 }
@@ -36,20 +41,26 @@ const headLeft = 'px-3 py-2 text-left text-[10px] uppercase tracking-wider text-
 const head = 'px-3 py-2 text-right text-[10px] uppercase tracking-wider text-slate-500 font-semibold';
 
 export function WalletStrip({ wallet, mode }: { wallet: BoardData['wallet']; mode: string }) {
-  const item = (label: string, value: string, testId: string) => (
+  const item = (label: string, value: string, testId: string, age?: { text: string; warn: boolean }) => (
     <div className="flex flex-col" data-testid={testId}>
       <span className="text-[10px] uppercase tracking-wider text-slate-500">{label}</span>
       <span className="font-mono text-sm text-slate-100">{value}</span>
+      {age && <span data-testid={`${testId}-age`} className={`font-mono text-[10px] ${age.warn ? 'text-amber-300' : 'text-slate-500'}`}>{age.text}</span>}
     </div>
   );
+  // R6-8: the balance is a cached read (boot, after a trade, an RPC switch, the DEVNET_LIVE wallet audit), not a live figure
+  const balanceAge = wallet.balanceAgeMs === undefined && wallet.balanceLastReadFailed === undefined ? undefined
+    : wallet.balanceLastReadFailed ? { text: 'last read FAILED', warn: true }
+    : { text: wallet.balanceAgeMs === null || wallet.balanceAgeMs === undefined ? 'never read' : `read ${ageText(wallet.balanceAgeMs)}`, warn: wallet.balanceAgeMs === null || (wallet.balanceAgeMs ?? 0) > 60_000 };
+  const usdAge = wallet.solUsdAgeMs === undefined ? undefined : { text: `${ageText(wallet.solUsdAgeMs)}${wallet.solUsdStale ? ' (STALE)' : ''}`, warn: !!wallet.solUsdStale };
   return (
     <div className="col-span-12 flex flex-wrap items-center gap-x-8 gap-y-2 px-4 py-3 rounded-lg border border-slate-800 bg-[#0B0F17]" data-testid="wallet-strip">
       <span className="text-xs font-bold text-slate-300">SOL WALLET</span>
-      {item('Balance', `${fmt(wallet.balanceSol, 4)} SOL`, 'w-balance')}
+      {item('Balance', `${fmt(wallet.balanceSol, 4)} SOL`, 'w-balance', balanceAge)}
       {item('Reserve', `${fmt(wallet.reserveSol, 3)} SOL`, 'w-reserve')}
       {item('Rent locked', wallet.rentLockedSol === null ? DASH : `${fmt(wallet.rentLockedSol, 4)} SOL`, 'w-rent')}
       {item('Spendable', `${fmt(wallet.spendableSol, 4)} SOL`, 'w-spendable')}
-      {item('SOL/USD', wallet.solUsd === null ? DASH : `$${wallet.solUsd.toFixed(2)}`, 'w-usd')}
+      {item('SOL/USD', wallet.solUsd === null ? DASH : `$${wallet.solUsd.toFixed(2)}`, 'w-usd', usdAge)}
       <span className={`ml-auto px-2 py-0.5 rounded text-[11px] font-bold ${mode === 'LIVE' ? 'bg-red-900/60 text-red-200' : 'bg-slate-800 text-slate-300'}`}>{mode}</span>
     </div>
   );
@@ -127,14 +138,17 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
       )}
       {board && tab === 'holding' && (
         <table className="w-full text-xs">
-          <thead><tr><th className={headLeft}>Position</th><th className={head}>Entry</th><th className={head}>Mark</th><th className={head}>PnL (SOL)</th><th className={head}>Next exit</th></tr></thead>
+          <thead><tr><th className={headLeft}>Position</th><th className={head}>Entry</th><th className={head}>Mark (age)</th><th className={head} title="At the curve spot price; exit fee, price impact and tip are not taken off">PnL at mark (SOL, before exit costs)</th><th className={head}>Next exit</th></tr></thead>
           <tbody>
             {board.holding.length === 0 && <tr><td colSpan={5} className="p-6 text-center text-slate-500">No open positions.</td></tr>}
             {board.holding.map((h) => (
               <tr key={h.id} onClick={() => onSelect?.(h.mint)} className="border-t border-slate-800/60 cursor-pointer hover:bg-slate-900">
                 <td className="px-3 py-2 text-left"><span className="font-bold text-slate-100">${h.symbol}</span> <span className="text-slate-500">{h.mode}</span></td>
                 <td className={cell}>{fmtPrice(h.entryPriceSol)}</td>
-                <td className={cell}>{fmtPrice(h.markPriceSol)}</td>
+                <td className={cell}>
+                  {fmtPrice(h.markPriceSol)}
+                  <span data-testid="mark-age" className={`block text-[10px] ${h.markStale ? 'text-amber-300' : 'text-slate-500'}`}>{ageText(h.markAgeMs)}{h.markStale ? ' (STALE)' : ''}</span>
+                </td>
                 <td className={`${cell} ${h.pnlSol === null ? '' : h.pnlSol >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>{fmt(h.pnlSol, 5)}</td>
                 <td className={cell}>{h.nextExit ? `${h.nextExit.kind.replace(/_/g, ' ')} @ ${fmtPrice(h.nextExit.priceSol)}` : DASH}</td>
               </tr>

@@ -83,6 +83,14 @@ const solscan = (sig: string) => `https://solscan.io/tx/${sig}?cluster=devnet`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
+  // R2-9: an opt-in amount above the 1 SOL per-run ceiling on SOL at risk is refused before anything is read or sent
+  const spendSteps = await import('./devnet_e2e_steps');
+  const spendProblems = spendSteps.runSpendFlagProblems(process.env);
+  if (spendProblems.length) {
+    console.error(`ABORT: ${spendProblems.join('; ')}`);
+    process.exit(2);
+  }
+  const spend = new spendSteps.RunSpendLedger();
   // S227: tracing starts here when APEX_TRACING=true, as server.ts does at boot, after the environment above is set and before any connection is made.
   const { tracingReady } = await import('../server/observability/init');
   await tracingReady;
@@ -449,9 +457,12 @@ async function main() {
   if (dumpSol > 0) {
     const market = await dumpMarket();
     const have = (await conn.getBalance(kp.publicKey)) / LAMPORTS_PER_SOL;
-    const maxSeedSol = Math.min(dumpSol, have - BUY_SOL - 0.3);
+    const maxSeedSol = Math.min(dumpSol, have - BUY_SOL - 0.3, spend.remainingSol());
+    const reserved = maxSeedSol > 0 ? spend.reserve('(h) dump seed', maxSeedSol) : { ok: true as const }; // R2-9
     if (maxSeedSol <= 0) {
-      rec('(h) funding for the dump', false, `the throwaway ${kp.publicKey.toBase58()} has ${have.toFixed(3)} SOL; (h) needs the seed plus ${(BUY_SOL + 0.3).toFixed(2)} SOL`);
+      rec('(h) funding for the dump', false, `the throwaway ${kp.publicKey.toBase58()} has ${have.toFixed(3)} SOL; (h) needs the seed plus ${(BUY_SOL + 0.3).toFixed(2)} SOL, and the run may put at most ${spend.remainingSol()} SOL more at risk`);
+    } else if (!reserved.ok) {
+      rec('(h) SOL at risk within the per-run ceiling', false, reserved.reason);
     } else {
       await S.failedReadThenDumpStopLoss(steps, market, {
         appBuySol: BUY_SOL,
@@ -487,7 +498,7 @@ async function main() {
 
   await sellerNeverBoughtStep(steps, S, { conn, web3, kp, coordinator, PumpCurveService, txBuilder });
 
-  await releaseGatesStep(steps, S, { conn, web3, kp, coordinator, workstationDb, PumpCurveService, txBuilder, buildBuyRequestFor });
+  await releaseGatesStep(steps, S, { conn, web3, kp, coordinator, workstationDb, PumpCurveService, txBuilder, buildBuyRequestFor, spend });
 
   await S.waitPast(steps, gDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (g) buy');
   if (process.env.DEVNET_LOSS_FLOOR === '1') await freshMintFor('(n)');
@@ -536,6 +547,7 @@ async function main() {
 async function releaseGatesStep(steps: import('./devnet_e2e_steps').HarnessSteps, S: typeof import('./devnet_e2e_steps'), d: {
   conn: any; web3: any; kp: any; coordinator: any; workstationDb: any; PumpCurveService: any; txBuilder: any;
   buildBuyRequestFor: (m: string, st: any, allowWaive: boolean) => Promise<any>;
+  spend?: import('./devnet_e2e_steps').RunSpendLedger;
 }): Promise<void> {
   if (process.env.DEVNET_RELEASE_GATES !== '1') {
     console.log('INFO  (k) skipped: set DEVNET_RELEASE_GATES=1 (needs about 1.2 SOL free, spends about 0.1) to run the SHADOW/PAPER release-gates step; add DEVNET_CURVE_CAP=1 (about 27 SOL more, see the README) for the curve-cap push');
@@ -568,7 +580,7 @@ async function releaseGatesStep(steps: import('./devnet_e2e_steps').HarnessSteps
       buildBuyRequestFor: async (m) => d.buildBuyRequestFor(m, await curveState(m), true),
       balanceSol: async (k) => (await d.conn.getBalance(k.publicKey)) / 1e9,
       isLiveArmed: () => d.coordinator.isLiveArmed(),
-    }, { curveCap: process.env.DEVNET_CURVE_CAP === '1' });
+    }, { curveCap: process.env.DEVNET_CURVE_CAP === '1', spend: d.spend });
   }
   autoSnipeController.detachWatchWindow();
   watchWindow.stop();
@@ -843,7 +855,8 @@ async function killRestartStep(steps: import('./devnet_e2e_steps').HarnessSteps,
       const errors: string[] = [];
       try { await relay.close(); } catch (e: any) { errors.push(`relay close: ${String(e?.message ?? e).slice(0, 80)}`); }
       for (const w of [signer, creator]) { // each wallet on its own: one failed refund does not skip the other
-        if (mint) { try { await kit.sellAll(w, mint); } catch { /* nothing held */ } }
+        // R2-10: sellAll returns null when nothing is held; a throw leaves tokens behind and is reported with the key file
+        if (mint) { try { await kit.sellAll(w, mint); } catch (e: any) { errors.push(`sell ${mint} from ${w.publicKey.toBase58()} (key file ${kit.keyFileOf?.(w) ?? '<scratch>/temp-wallets/'}): ${String(e?.message ?? e).slice(0, 80)}`); } }
         try { await kit.refund(w, d.kp.publicKey); } catch (e: any) { errors.push(`refund ${w.publicKey.toBase58()}: ${String(e?.message ?? e).slice(0, 80)}`); }
       }
       if (errors.length) throw new Error(errors.join('; '));

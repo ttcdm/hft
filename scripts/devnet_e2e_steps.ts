@@ -26,6 +26,56 @@ import type { AddressInfo } from 'node:net';
 import { createAssociatedTokenAccountIdempotentInstruction, createTransferCheckedInstruction, getAssociatedTokenAddressSync } from '@solana/spl-token';
 import type { ExecuteTradeRequest, ExecutionResponse } from '../server/execution/coordinator';
 
+/**
+ * R2-9: the project's rule is at most 1 SOL at risk per devnet run. The two opt-in steps that can move far more into the harness's own
+ * throwaway wallets, (h) the dump seed (DEVNET_DUMP_SOL) and (k) the curve-cap push (DEVNET_CURVE_CAP=1, about 25.8 SOL on a 30 SOL
+ * curve), reserve their SOL in a per-run ledger first, and are refused above RUN_AT_RISK_CEILING_SOL unless DEVNET_ALLOW_OVER_1_SOL=1.
+ * A DEVNET_DUMP_SOL above the ceiling is refused before the run starts (`runSpendFlagProblems`); the curve-cap push is sized from the
+ * coin's own curve, so it is checked when that figure is known.
+ */
+export const RUN_AT_RISK_CEILING_SOL = 1;
+export const AT_RISK_OVERRIDE_ENV = 'DEVNET_ALLOW_OVER_1_SOL';
+export function atRiskOverride(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.DEVNET_ALLOW_OVER_1_SOL === '1'; // AT_RISK_OVERRIDE_ENV
+}
+/** R2-9: reasons to refuse the run before anything is sent: an opt-in amount above the ceiling without the override. */
+export function runSpendFlagProblems(env: NodeJS.ProcessEnv = process.env): string[] {
+  if (atRiskOverride(env)) return [];
+  const out: string[] = [];
+  const dump = Number(env.DEVNET_DUMP_SOL || 0);
+  if (dump > RUN_AT_RISK_CEILING_SOL) out.push(`DEVNET_DUMP_SOL=${env.DEVNET_DUMP_SOL} is above the ${RUN_AT_RISK_CEILING_SOL} SOL per-run ceiling on SOL at risk; lower it, or set ${AT_RISK_OVERRIDE_ENV}=1 to accept more`);
+  return out;
+}
+/** R2-9: what the opt-in steps put at risk in this run. `reserve` refuses an amount that would take the total above the ceiling (unless overridden). */
+export class RunSpendLedger {
+  readonly entries: { label: string; sol: number }[] = [];
+  constructor(readonly ceilingSol: number = RUN_AT_RISK_CEILING_SOL, readonly override: boolean = atRiskOverride()) {}
+  get atRiskSol(): number { return this.entries.reduce((a, e) => a + e.sol, 0); }
+  remainingSol(): number { return this.override ? Number.POSITIVE_INFINITY : Math.max(0, this.ceilingSol - this.atRiskSol); }
+  reserve(label: string, sol: number): { ok: true } | { ok: false; reason: string } {
+    if (!(sol >= 0)) return { ok: false, reason: `${label}: ${sol} SOL is not a valid amount` };
+    if (!this.override && this.atRiskSol + sol > this.ceilingSol + 1e-9) {
+      return { ok: false, reason: `${label} needs ${sol.toFixed(3)} SOL at risk; with ${this.atRiskSol.toFixed(3)} SOL already at risk this run that is above the ${this.ceilingSol} SOL per-run ceiling. Set ${AT_RISK_OVERRIDE_ENV}=1 to accept it; nothing was sent` };
+    }
+    this.entries.push({ label, sol });
+    return { ok: true };
+  }
+}
+
+/**
+ * R2-10: a cleanup sell. `sellAll` returns null when the wallet holds none, so a throw is a real failure: the tokens stay in a throwaway
+ * wallet. It is a FAIL line naming the mint, the wallet and its key file, so a run cannot pass with tokens stranded. The refund that follows
+ * still runs.
+ */
+export async function cleanupSell(s: Pick<HarnessSteps, 'rec'>, label: string, kit: ChainKit, w: any, mint: string): Promise<void> {
+  try {
+    await kit.sellAll(w, mint);
+  } catch (e: any) {
+    const pub = w?.publicKey?.toBase58?.() ?? String(w?.publicKey ?? '?');
+    s.rec(`${label}: cleanup sell of ${mint}`, false, `${String(e?.message ?? e).slice(0, 120)}; the tokens of ${mint} are left in ${pub}, key file ${kit.keyFileOf?.(w) ?? `<scratch>/temp-wallets/${pub}.json`}`);
+  }
+}
+
 type Tx = { signature: string; orderId: string; direction: string; reconciliationState: string; mint: string };
 type Pos = { id: string; mint: string; status: string };
 
@@ -372,6 +422,8 @@ export interface ChainKit {
   curveState(mint: string): Promise<{ virtualSolReserves: bigint; virtualTokenReserves: bigint; realTokenReserves: bigint; complete?: boolean }>;
   /** Sends what is left in `kp` (less one fee) to `to`. */
   refund(kp: any, to: any): Promise<void>;
+  /** R2-10: the key file `newWallet` wrote for `kp` (for FAIL lines that leave something in the wallet). */
+  keyFileOf?(kp: any): string;
 }
 
 /**
@@ -435,6 +487,7 @@ export function makeChainKit(d: { conn: any; web3: any; sdk: any; curve: any; bu
       writeKeyFile(path.join(d.keyDir, `${kp.publicKey.toBase58()}.json`), kp, 'wx');
       return kp;
     },
+    keyFileOf: (kp) => path.join(d.keyDir, `${kp.publicKey.toBase58()}.json`),
     transfer: (from, to, sol) => send(new Transaction().add(SystemProgram.transfer({ fromPubkey: from.publicKey, toPubkey: to, lamports: Math.ceil(sol * LAMPORTS_PER_SOL) })), [from]),
     async create(creator, symbol, name) {
       const mintKp = Keypair.generate();
@@ -561,10 +614,13 @@ export function makeDumpMarket(d: {
     priceSol: (mint: string) => kit.priceSol(mint),
     sellAll: (mint: string) => kit.sellAll(w2, mint),
     async refund() {
+      // R2-10: a sell that throws leaves tokens in the second wallet; the SOL refund still runs, then the caller records a FAIL naming them
+      const failed: string[] = [];
       for (const mint of coins()) {
-        try { await kit.sellAll(w2, mint); } catch (e: any) { console.log(`INFO  (h) second wallet could not sell ${mint}: ${String(e?.message ?? e).slice(0, 120)}`); }
+        try { await kit.sellAll(w2, mint); } catch (e: any) { failed.push(`${mint} (${String(e?.message ?? e).slice(0, 80)})`); }
       }
       await kit.refund(w2, d.payer.publicKey);
+      if (failed.length) throw new Error(`the second wallet ${w2.publicKey.toBase58()} could not sell ${failed.join(', ')}; its tokens are still there, key file ${d.keyPath}`);
     },
   };
 }
@@ -754,7 +810,7 @@ export async function creatorClusterOnChain(s: HarnessSteps, kit: ChainKit, feed
     s.rec(L, false, String(e?.message ?? e).slice(0, 300));
   } finally {
     for (const w of [W, ...five]) {
-      for (const c of coins) { try { await kit.sellAll(w, c); } catch { /* nothing held or curve moved; the refund below still runs */ } }
+      for (const c of coins) await cleanupSell(s, L, kit, w, c); // R2-10: a throw is a FAIL naming the key file; the refund below still runs
       // S263 (review 2026-10-24, finding 9): a refund that fails is a FAIL line, so a run cannot pass with SOL stranded; the key is in temp-wallets/
       try { await kit.refund(w, payer.publicKey); } catch (e: any) { s.rec(`${L}: refund ${w.publicKey.toBase58()}`, false, `${String(e?.message ?? e).slice(0, 120)}; key in <scratch>/temp-wallets/`); }
     }
@@ -960,7 +1016,7 @@ export function solToReachProgress(st: { virtualSolReserves: bigint; virtualToke
  */
 export async function releaseGatesOnChain(
   s: HarnessSteps, kit: ChainKit, feed: WatchFeed, payer: any, deps: ReleaseGatesDeps,
-  opts: { buyers?: number; buySol?: number; curveCap?: boolean; waitMs?: number } = {}
+  opts: { buyers?: number; buySol?: number; curveCap?: boolean; waitMs?: number; spend?: RunSpendLedger } = {}
 ): Promise<void> {
   const L = '(k) release gates';
   const st = s.stop;
@@ -1050,6 +1106,9 @@ export async function releaseGatesOnChain(
       const target = deps.capPct + 2;
       const need = solToReachProgress(state, target);
       const have = await deps.balanceSol(payer);
+      // R2-9: the push is SOL at risk in a throwaway wallet; refused above the per-run ceiling unless DEVNET_ALLOW_OVER_1_SOL=1
+      const reserved = (opts.spend ?? new RunSpendLedger()).reserve(`${C}: push to ${target}%`, need + 0.05);
+      if (!reserved.ok) { s.rec(`${C}: SOL at risk within the per-run ceiling`, false, reserved.reason); return; }
       if (have < need + 1) { s.rec(`${C}: funding for the push`, false, `pushing to ${target}% needs about ${need.toFixed(2)} SOL; the harness wallet has ${have.toFixed(3)}, needs ${(need + 1).toFixed(2)}`); return; }
       if (!(await waitUntil(() => !!find(coin.mint), 30_000))) { s.rec(`${C}: the app's feed watches the launch`, false, 'not in the watch window after 30 s'); return; }
       await kit.transfer(payer, pusher.publicKey, need + 0.05);
@@ -1083,7 +1142,7 @@ export async function releaseGatesOnChain(
     try { await st.auto.setMode('OFF'); } catch (e: any) { s.rec(`${L}: auto OFF after the step`, false, String(e?.message ?? e).slice(0, 200)); }
     if (prevAuto === undefined) delete process.env.AUTO_SNIPE_ENABLED; else process.env.AUTO_SNIPE_ENABLED = prevAuto;
     for (const w of wallets) {
-      for (const c of coins) { try { await kit.sellAll(w, c); } catch { /* nothing held; the refund below still runs */ } }
+      for (const c of coins) await cleanupSell(s, L, kit, w, c); // R2-10: a throw is a FAIL naming the key file; the refund below still runs
       try { await kit.refund(w, payer.publicKey); } catch (e: any) { s.rec(`${L}: refund ${w.publicKey.toBase58()}`, false, `${String(e?.message ?? e).slice(0, 120)}; key in <scratch>/temp-wallets/`); }
     }
     // S263 (review 2026-10-24, finding 4): the curve-cap check re-arms LIVE; a throw there skipped its disarm, and this only re-armed. Put
@@ -1177,7 +1236,7 @@ export async function hasBudget(s: Pick<HarnessSteps, 'rec'>, label: string, bal
 /** Sells what `w` holds of each coin, then sends what is left back to `payer`. A failed refund is a FAIL line naming the key file. */
 async function sellAndRefund(s: Pick<HarnessSteps, 'rec'>, label: string, kit: ChainKit, wallets: any[], coins: string[], payer: any): Promise<void> {
   for (const w of wallets) {
-    for (const c of coins) { try { await kit.sellAll(w, c); } catch { /* nothing held, or the curve moved; the refund below still runs */ } }
+    for (const c of coins) await cleanupSell(s, label, kit, w, c); // R2-10: a throw is a FAIL naming the key file; the refund below still runs
     try { await kit.refund(w, payer.publicKey); } catch (e: any) { s.rec(`${label}: refund ${w.publicKey.toBase58()}`, false, `${String(e?.message ?? e).slice(0, 120)}; key in <scratch>/temp-wallets/`); }
   }
 }

@@ -22,7 +22,20 @@ export interface AutoStatusData {
   orderLimits?: { minSol: number; maxSol: number };
   /** S187: the confluence buy threshold in force. Absent on an older server. */
   confluence?: { value: number; defaultValue: number; source: 'operator' | 'env' | 'default'; warnBelow: number; warning: string | null };
-  stats: { seen: number; rejectedByStage: Record<string, number>; wouldBuy: number; bought: number; open: number; closed: number; netPnlSol: number; feesPaidSol: number; winRate: number | null };
+  stats: { seen: number; rejectedByStage: Record<string, number>; wouldBuy: number; bought: number; open: number; closed: number; netPnlSol: number; feesPaidSol: number; winRate: number | null } & StatsWindow;
+}
+
+/** R6-3 (server side in another batch): which mode and window the stats cover, and whether the read was cut. Absent on an older server. */
+export interface StatsWindow {
+  mode?: 'SHADOW' | 'PAPER' | 'DEVNET_LIVE' | null;
+  windowStart?: number | null;
+  windowEnd?: number;
+  rowsCounted?: number;
+  rowsRead?: number;
+  rowLimit?: number;
+  truncated?: boolean;
+  pnlSource?: string;
+  notes?: string[];
 }
 
 /**
@@ -156,6 +169,22 @@ export function killReportFor(j: any): KillReport | null {
   return { ok: false, text: `Auto is OFF, but ${sold}${why}${open} Close them by hand.` };
 }
 
+const hhmm = (ms: number) => new Date(ms).toISOString().slice(11, 16);
+
+/** The label over the stats: their mode and window, "truncated" when the read hit its row limit, and the server's notes. */
+export function StatsWindowLabel({ s }: { s: StatsWindow }) {
+  if (s.mode === undefined && s.windowStart === undefined && s.truncated === undefined) return null;
+  const window = s.windowStart ? `${hhmm(s.windowStart)} to ${hhmm(s.windowEnd ?? Date.now())} UTC` : 'no rows yet';
+  const rows = typeof s.rowsCounted === 'number' && typeof s.rowsRead === 'number' ? ` (${s.rowsCounted} of ${s.rowsRead} rows read)` : '';
+  return (
+    <div className="border-t border-slate-800 pt-2 text-[10px] text-slate-500" data-testid="auto-stats-window">
+      <p>Stats below: {s.mode ? `${s.mode} only` : 'auto has not run'}, {window}{rows}{s.pnlSource ? `; PnL from the ${s.pnlSource}` : ''}.</p>
+      {s.truncated && <p className="text-amber-300 font-bold" data-testid="auto-stats-truncated">TRUNCATED: the read hit its {s.rowLimit ?? ''} row limit, so older rows of this window are not counted.</p>}
+      {(s.notes ?? []).map((n) => <p key={n}>{n}</p>)}
+    </div>
+  );
+}
+
 export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOrderSize, onThreshold, code, onCode, busy, error, killReport }: {
   status: AutoStatusData | null; onMode?: (m: AutoMode) => void; onKill?: () => void; onResume?: () => void; onBudget?: (maxBuys: number, maxSpendSol: number) => void; onOrderSize?: (sol: number) => void; onThreshold?: (value: number) => void;
   code?: string; onCode?: (c: string) => void; busy?: boolean; error?: string | null; killReport?: KillReport | null;
@@ -204,6 +233,7 @@ export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOr
         <span className="text-slate-500">Time left</span><span className="text-right">{b ? `${Math.round(b.msLeft / 60000)} min` : '—'}</span>
         <span className="text-slate-500">Slippage breaches</span><span className="text-right">{status.slippageBreaches}</span>
       </div>
+      <StatsWindowLabel s={s} />
       <div className="border-t border-slate-800 pt-2 grid grid-cols-2 gap-x-3 gap-y-0.5 font-mono" data-testid="auto-stats">
         <span className="text-slate-500">Seen</span><span className="text-right">{s.seen}</span>
         <span className="text-slate-500" data-testid="shadow-would-buy" title={SHADOW_TEST_NOTE}>Would buy (SHADOW, looser test)</span><span className="text-right">{s.wouldBuy}</span>

@@ -3,6 +3,7 @@ import { authFetch } from '../services/engineClient';
 import { fmt } from './TokenBoard';
 import { parseThreshold, thresholdWarning } from '../utils/confluenceThreshold';
 import { onAuthenticated } from '../utils/authEvents';
+import { useTradingMode } from '../utils/tradingMode';
 
 /** H3: the auto-snipe controller panel. Every number is read from GET /api/auto/status (controller state + decision journal). */
 export type AutoMode = 'OFF' | 'SHADOW' | 'PAPER' | 'DEVNET_LIVE';
@@ -169,6 +170,16 @@ export function killReportFor(j: any): KillReport | null {
   return { ok: false, text: `Auto is OFF, but ${sold}${why}${open} Close them by hand.` };
 }
 
+/**
+ * R10-3: after a restart the auto kill is saved (auto stays OFF, killed) but the risk-engine kill switch is memory-only and comes back
+ * off, so the panel said "Killed: operator kill switch" next to a header that said the switch was off. Say which is which.
+ */
+export function autoKillText(reason: string, mode: AutoMode, killSwitch: boolean | null | undefined): string {
+  const base = `Killed: ${reason}.${mode === 'OFF' ? ' Auto stays OFF until you set a mode.' : ''}`;
+  if (killSwitch === false && /kill switch|panic/i.test(reason)) return `${base} The kill switch itself is OFF now (it is held in memory, so a reset or a restart clears it); this only says why auto was stopped.`;
+  return base;
+}
+
 const hhmm = (ms: number) => new Date(ms).toISOString().slice(11, 16);
 
 /** The label over the stats: their mode and window, "truncated" when the read hit its row limit, and the server's notes. */
@@ -185,9 +196,11 @@ export function StatsWindowLabel({ s }: { s: StatsWindow }) {
   );
 }
 
-export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOrderSize, onThreshold, code, onCode, busy, error, killReport, staleText }: {
+export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOrderSize, onThreshold, code, onCode, busy, error, killReport, staleText, killSwitch }: {
   status: AutoStatusData | null; onMode?: (m: AutoMode) => void; onKill?: () => void; onResume?: () => void; onBudget?: (maxBuys: number, maxSpendSol: number) => void; onOrderSize?: (sol: number) => void; onThreshold?: (value: number) => void;
   code?: string; onCode?: (c: string) => void; busy?: boolean; error?: string | null; killReport?: KillReport | null; staleText?: string | null;
+  /** R10-3: the risk-engine kill switch as the header reads it (null: unknown) */
+  killSwitch?: boolean | null;
 }) {
   if (!status) return <section className="rounded-lg border border-slate-800 bg-[#0B0F17] p-3 text-xs text-slate-500" data-testid="auto-panel">{staleText ?? 'Auto-snipe: sign in as operator to read the controller.'}</section>;
   const s = status.stats;
@@ -215,7 +228,7 @@ export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOr
       {error && <p className="text-red-400 mb-2" data-testid="auto-error">{error}</p>}
       {killReport && <p className={`${killReport.ok ? 'text-emerald-300' : 'text-red-300 font-bold'} mb-2`} data-testid="auto-kill-report">{killReport.text}</p>}
       {status.haltReason && <p className="text-red-400 mb-2" data-testid="halt-reason">ALL TRADING HALTED: {status.haltReason} <button onClick={onResume} className="underline ml-1">clear halt</button></p>}
-      {status.killReason && <p className="text-amber-400 mb-1">Killed: {status.killReason}</p>}
+      {status.killReason && <p className="text-amber-400 mb-1" data-testid="auto-kill-reason">{autoKillText(status.killReason, status.mode, killSwitch)}</p>}
       {status.downgradeReason && <p className="text-amber-400 mb-1" data-testid="downgrade-reason">Dropped to SHADOW: {status.downgradeReason}</p>}
       {status.autoRestore && (
         <p className="text-cyan-300 mb-1" data-testid="auto-restore">PAPER comes back by itself once readiness has stayed green for {Math.round(status.autoRestore.needMs / 1000)}s (green for {Math.round(status.autoRestore.greenForMs / 1000)}s so far).</p>
@@ -311,6 +324,7 @@ export function AutoHeaderBadge() {
 
 export function AutoPanel() {
   const read = useAutoStatusRead();
+  const tradingMode = useTradingMode();
   const status = read.status;
   const [local, setLocal] = useState<AutoStatusData | null>(null);
   const [code, setCode] = useState('');
@@ -335,7 +349,7 @@ export function AutoPanel() {
     } finally { setBusy(false); }
   }, [shown]);
   return (
-    <AutoPanelView status={shown} busy={busy} error={error} killReport={killReport} code={code} onCode={setCode} staleText={autoStatusStaleText(read, Date.now())}
+    <AutoPanelView status={shown} busy={busy} error={error} killReport={killReport} code={code} onCode={setCode} staleText={autoStatusStaleText(read, Date.now())} killSwitch={tradingMode.killSwitch}
       onMode={(m) => post('/api/auto/mode', { mode: m, confirmationCode: m === 'DEVNET_LIVE' ? code : undefined })}
       onKill={() => {
         // Q45: KILL sells every position the auto trader opened, so it asks first

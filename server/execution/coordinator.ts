@@ -39,6 +39,8 @@ export const MARK_STALE_MS = 15_000;
 export const MARK_ALERT_AFTER_MS = 60_000;
 export const MARK_RETRY_BASE_MS = 60_000;
 export const MARK_RETRY_MAX_MS = 10 * 60_000;
+/** R4-9: a heartbeat slot that has not advanced for this long while time passed marks the RPC DEGRADED (a slot lasts about 0.4 s). */
+export const RPC_SLOT_STALL_MS = 30_000;
 /** R5-10: at most this many direct stale-mark reads run at once in one exit pass. */
 export const STALE_REFRESH_CONCURRENCY = 4;
 /** At most this many PAPER positions get a direct stale-mark read in one exit pass; LIVE positions are never capped. */
@@ -632,6 +634,7 @@ export class ExecutionCoordinator {
     const problems: string[] = [];
     if (this.clusterProblem !== null) problems.push(`the RPC is not on the allowed cluster (${this.clusterProblem})`);
     if (this.rpcHealth === 'DISCONNECTED') problems.push('Solana RPC is DISCONNECTED');
+    if (this.rpcSlotProblem) problems.push(`the RPC's slot cannot be trusted (${this.rpcSlotProblem})`); // R4-9
     if (!workstationDb.isWritable()) problems.push('the workstation database is not writable');
     if (!this.lastStartupReconciliation || this.lastStartupReconciliation.status !== 'EXECUTION_READY') {
       problems.push(`startup reconciliation is ${this.lastStartupReconciliation?.status ?? 'not finished'}`);
@@ -671,6 +674,8 @@ export class ExecutionCoordinator {
 
       this.rpcEndpoint = newEndpoint;
       this.connection = newConn;
+      this.heartbeatSlot = { slot: 0, firstSeenMono: 0 }; // R4-9: another endpoint has its own slot clock
+      this.rpcSlotProblem = null;
       this.clusterProblem = null; // the new connection just passed the genesis check above
       this.rpcLatencyMs = latency;
       this.rpcHealth = latency > 800 ? 'DEGRADED' : 'HEALTHY';
@@ -772,7 +777,29 @@ export class ExecutionCoordinator {
   public recordRpcHeartbeat(slot: number, latencyMs: number) {
     this.rpcLatencyMs = latencyMs;
     if (this.clusterProblem) return; // a wrong-cluster RPC does not become healthy because getSlot answers
-    this.rpcHealth = latencyMs > 800 ? 'DEGRADED' : 'HEALTHY';
+    // R4-9: health is not latency alone. A slot that goes backwards (a load balancer moved us to a lagging node) or stops advancing
+    // while time passes means the node serves old state fast; it is DEGRADED (arming refuses) and every LIVE buy is refused meanwhile.
+    this.rpcSlotProblem = this.heartbeatSlotProblem(slot);
+    if (this.rpcSlotProblem) Logger.warn(`[R4-9] RPC slot check: ${this.rpcSlotProblem}`);
+    this.rpcHealth = latencyMs > 800 || this.rpcSlotProblem ? 'DEGRADED' : 'HEALTHY';
+  }
+
+  /** R4-9: the heartbeat's slot clock: the highest slot seen and the monotonic time it was first seen. */
+  private heartbeatSlot = { slot: 0, firstSeenMono: 0 };
+  /** R4-9: why the heartbeat's slot cannot be trusted (backwards or stalled), null when it advances. */
+  private rpcSlotProblem: string | null = null;
+
+  private heartbeatSlotProblem(slot: number): string | null {
+    const now = performance.now();
+    if (!(slot > 0)) return null;
+    const prev = this.heartbeatSlot;
+    if (slot > prev.slot) {
+      this.heartbeatSlot = { slot, firstSeenMono: now };
+      return null;
+    }
+    if (slot < prev.slot) return `slot ${slot} is behind slot ${prev.slot} already seen on this endpoint (a lagging node)`;
+    const stalledMs = now - prev.firstSeenMono;
+    return stalledMs > RPC_SLOT_STALL_MS ? `slot ${slot} has not advanced for ${Math.round(stalledMs / 1000)}s` : null;
   }
 
   public recordPositionMarkEvent() {

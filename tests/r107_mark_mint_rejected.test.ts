@@ -9,7 +9,10 @@ import { workstationDb } from '../server/db/database';
 // R19: a "mint" whose account is not owned by a token program used to fall through to PumpSwap in the mark path with no alert.
 describe('R19: an account that is not a token mint is reported, not quietly re-tried on PumpSwap', () => {
   const account = () => ({ owner: SystemProgram.programId, data: Buffer.alloc(150), lamports: 1, executable: false });
-  const conn = () => ({ getMultipleAccountsInfo: vi.fn(async () => [account(), account()]) }) as any;
+  const conn = () => ({
+    getMultipleAccountsInfo: vi.fn(async () => [account(), account()]),
+    getMultipleAccountsInfoAndContext: vi.fn(async () => ({ context: { slot: 1 }, value: [account(), account()] })),
+  }) as any;
   afterEach(() => { vi.restoreAllMocks(); PumpCurveService.clearMintRejections(); });
 
   it('the mark query records the reason and never asks PumpSwap', async () => {

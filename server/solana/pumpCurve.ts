@@ -138,7 +138,13 @@ export interface PumpMarketState {
   creatorFeeBps: number;
   feeRecipient: PublicKey;
   buybackFeeRecipient: PublicKey;
+  /**
+   * R4-9: the wall time this read's data is from: when this process first saw the RPC's context slot of the read (not when the read
+   * returned), so a node that stalls on one slot serves marks that age, and the staleness gates (exit marks, the buy's market-data age) see it.
+   */
   marketDataTimestamp: number;
+  /** R4-9: the context slot of the account read (getMultipleAccountsInfoAndContext); undefined when the RPC gave none. */
+  marketDataSlot?: number;
   marketDataSource: string;
   token2022Report?: Token2022ExtensionReport;
   /**
@@ -619,6 +625,34 @@ export class PumpCurveService {
   private static lastGoodGlobal: { key: string; global: any } | null = null;
 
   /**
+   * R4-9: per Connection, the highest context slot a curve read has answered from and the wall time it was first seen. Reads ask for
+   * at least that slot (`minContextSlot`), so a load-balanced backend that lags is refused rather than read, and a read whose slot is
+   * lower anyway is treated as failed. A read from the same slot is stamped with the time that slot was first seen, so a stalled node's
+   * marks age while wall time advances. Keyed by the Connection object, so a new endpoint (setRpcEndpoint) starts fresh.
+   */
+  private static slotSeen = new WeakMap<object, { slot: number; firstSeenAt: number }>();
+
+  /** R4-9: the slot floor for the next read on this connection (undefined before the first). */
+  public static minContextSlotFor(connection: Connection): number | undefined {
+    return this.slotSeen.get(connection as object)?.slot;
+  }
+
+  /**
+   * R4-9: record a read's context slot; returns the wall time the data stands for, or null when the slot went backwards (the read is
+   * from an older state than one already seen, and must not be used).
+   */
+  public static noteContextSlot(connection: Connection, slot: number | undefined, now: number = Date.now()): number | null {
+    if (typeof slot !== 'number' || !Number.isFinite(slot) || slot <= 0) return now; // no context slot: the read time, as before
+    const prev = this.slotSeen.get(connection as object);
+    if (!prev || slot > prev.slot) {
+      this.slotSeen.set(connection as object, { slot, firstSeenAt: now });
+      return now;
+    }
+    if (slot < prev.slot) return null;
+    return Math.min(now, prev.firstSeenAt);
+  }
+
+  /**
    * P4.2 (N-43): the cache key: the Connection's endpoint plus the genesis hash the cluster guard requires for ALLOWED_CLUSTER (the
    * configured hash, not one read per call; the send path's genesis check is what proves the endpoint serves it). A read through
    * another endpoint, or after ALLOWED_CLUSTER / LOCALNET_GENESIS_HASH changed, refreshes the Global and FeeConfig first.
@@ -706,7 +740,15 @@ export class PumpCurveService {
         accountsToFetch.push(GLOBAL_PDA, PUMP_FEE_CONFIG_PDA);
       }
 
-      const accountInfos = await connection.getMultipleAccountsInfo(accountsToFetch);
+      // R4-9: read with the context slot, never from a state older than one already seen on this connection
+      const minContextSlot = this.minContextSlotFor(connection);
+      const read = await connection.getMultipleAccountsInfoAndContext(accountsToFetch, minContextSlot ? { minContextSlot } : undefined);
+      const accountInfos = read.value;
+      const marketDataSlot: number | undefined = read.context?.slot;
+      const marketDataTimestamp = this.noteContextSlot(connection, marketDataSlot);
+      if (marketDataTimestamp === null) {
+        return fail('RPC_ERROR', `the RPC answered from slot ${marketDataSlot}, older than slot ${minContextSlot} already seen (a lagging node); not used`);
+      }
       const mintAccountInfo = accountInfos[0];
       const curveAccountInfo = accountInfos[1];
 
@@ -965,7 +1007,8 @@ export class PumpCurveService {
         creatorFeeBps,
         feeRecipient,
         buybackFeeRecipient,
-        marketDataTimestamp: now,
+        marketDataTimestamp,
+        marketDataSlot,
         marketDataSource: 'SOLANA_RPC_BONDING_CURVE',
         token2022Report,
       };

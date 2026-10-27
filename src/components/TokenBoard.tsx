@@ -151,8 +151,9 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
                   {fmtPrice(h.markPriceSol)}
                   <span data-testid="mark-age" className={`block text-[10px] ${h.markStale ? 'text-amber-300' : 'text-slate-500'}`}>{ageText(h.markAgeMs)}{h.markStale ? ' (STALE)' : ''}</span>
                 </td>
-                <td className={`${cell} ${{ up: 'text-emerald-400', down: 'text-red-400', flat: '' }[signTone(h.pnlSol)]}`}>{fmtSignedSol(h.pnlSol, 5)}</td>
-                <td className={cell}>{h.nextExit ? `${h.nextExit.kind.replace(/_/g, ' ')} @ ${fmtPrice(h.nextExit.priceSol)}` : DASH}</td>
+                {/* R10-5: at a stale mark the PnL and the next exit are not current: the PnL is old, and exits wait for a fresh mark */}
+                <td data-testid="holding-pnl" className={`${cell} ${h.markStale ? 'text-amber-300' : { up: 'text-emerald-400', down: 'text-red-400', flat: '' }[signTone(h.pnlSol)]}`}>{fmtSignedSol(h.pnlSol, 5)}{h.markStale && <span className="block text-[10px]">at a STALE mark</span>}</td>
+                <td data-testid="holding-next-exit" className={cell}>{h.nextExit ? `${h.nextExit.kind.replace(/_/g, ' ')} @ ${fmtPrice(h.nextExit.priceSol)}` : DASH}{h.markStale && <span className="block text-[10px] text-amber-300">waits for a fresh mark</span>}</td>
               </tr>
             ))}
           </tbody>

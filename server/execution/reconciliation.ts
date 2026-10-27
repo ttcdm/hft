@@ -710,7 +710,7 @@ export class RealMarkPriceService {
             result[mintStr] = {
               priceSol: spotPriceSol,
               source: 'ON_CHAIN_BONDING_CURVE',
-              timestamp: now,
+              timestamp: state.marketDataTimestamp || now, // R4-9: when the read's context slot was first seen, so a stalled node's mark ages
             };
           }
         } else if (!state && PumpCurveService.getMintRejection(mintStr)) {

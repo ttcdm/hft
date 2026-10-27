@@ -50,6 +50,7 @@ For live development with hot reloading:
 ```bash
 npm run dev
 ```
+The dev server serves the project folder, so it answers 404 for secret and state files (`server/security/secretPaths.ts`): the name patterns (`.env*`, `env.txt`, `*keypair*.json`, `*.db`, logs, ...) and, by path, the configured `SIGNER_KEYPAIR_PATH`, `APEX_DB_PATH` (with its `-wal`, `-shm` and `.lock` files) and env file (`APEX_ENV_FILE`, else `.env`). Every match ignores case.
 
 ---
 

@@ -133,7 +133,7 @@ describe('S246 (h): every path refunds the second wallet', () => {
       chainErr: async () => null, mint: 'x', buildBuyRequest: async () => ({}) as any,
       rec: (step: string, ok: boolean, detail: string) => recs.push({ step, ok, detail }),
       link: (x: string) => x, sleep: async () => undefined,
-      connection: { sendRawTransaction: async () => 'sig', getMultipleAccountsInfo: async () => [] },
+      connection: { sendRawTransaction: async () => 'sig', getMultipleAccountsInfoAndContext: async () => ({ context: { slot: 1 }, value: [] }) },
       ...over,
     } as unknown as HarnessSteps;
     return { s, recs };
@@ -164,10 +164,41 @@ describe('S246 (h): every path refunds the second wallet', () => {
   it('a throw mid-step restores the connection and still refunds', async () => {
     const { s } = steps();
     (s.coordinator.syncRealWalletBalance as any).mockRejectedValue(new Error('boom'));
-    const orig = s.connection!.getMultipleAccountsInfo;
+    const orig = s.connection!.getMultipleAccountsInfoAndContext;
     const { m, refund } = market(async () => ({ mint: 'M', curve: 'C', seedSol: 0.2, projectedRatio: 0.7 }));
     await expect(failedReadThenDumpStopLoss(s, m, opts)).rejects.toThrow('boom');
     expect(refund).toHaveBeenCalledTimes(1);
-    expect(s.connection!.getMultipleAccountsInfo).toBe(orig);
+    expect(s.connection!.getMultipleAccountsInfoAndContext).toBe(orig);
+  });
+
+  it('the injected failure reaches the app\'s curve read, which goes through getMultipleAccountsInfoAndContext (R4-9)', async () => {
+    // Run 2026-10-27 (QuickNode): "no read of the curve in 10 s". R4-9 moved PumpCurveService.fetchPumpMarketState to
+    // getMultipleAccountsInfoAndContext (it needs the context slot), so a hook on getMultipleAccountsInfo alone never saw the read.
+    const curve = web3.Keypair.generate().publicKey;
+    const appReads: string[] = [];
+    const connection: any = {
+      getMultipleAccountsInfoAndContext: async (keys: any[]) => ({ context: { slot: 1 }, value: keys.map(() => null) }),
+    };
+    const origCtx = connection.getMultipleAccountsInfoAndContext;
+    // The exit loop's price read, as PumpCurveService does it, every pass (here: every harness sleep)
+    const sleep = async () => {
+      try { await connection.getMultipleAccountsInfoAndContext([web3.Keypair.generate().publicKey, curve], { minContextSlot: 1 }); appReads.push('ok'); } catch (e: any) { appReads.push(String(e?.message)); }
+    };
+    const pos = { id: 'P', mint: 'M', status: 'OPEN', entryPriceSol: 1 };
+    const { s, recs } = steps({
+      connection, sleep,
+      db: { loadTransactions: () => [], loadPositions: () => [pos] } as any,
+      coordinator: {
+        executeTrade: vi.fn(async () => ({ success: true, lifecycleState: 'CONFIRMED' })),
+        closePosition: vi.fn(async () => ({ success: true })),
+        syncRealWalletBalance: vi.fn(async () => undefined),
+      } as any,
+    });
+    const { m } = market(async () => ({ mint: 'M', curve: curve.toBase58(), seedSol: 0.2, projectedRatio: 0.7 }));
+    await failedReadThenDumpStopLoss(s, m, opts);
+    expect(recs.find((r) => /took the injected failure/.test(r.step))).toEqual(expect.objectContaining({ ok: true }));
+    expect(appReads[0]).toMatch(/harness: injected/);
+    expect(appReads.slice(1).every((r) => r === 'ok')).toBe(true); // one call only
+    expect(connection.getMultipleAccountsInfoAndContext).toBe(origCtx);
   });
 });

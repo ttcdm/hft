@@ -102,8 +102,8 @@ export interface HarnessSteps {
   skip?: (step: string, detail: string) => void;
   link: (sig: string) => string;
   sleep: (ms: number) => Promise<unknown>;
-  /** The coordinator's own Connection: (e'') wraps its `sendRawTransaction` for one call, (h) its `getMultipleAccountsInfo`. */
-  connection?: { sendRawTransaction: (...args: any[]) => Promise<string>; getMultipleAccountsInfo?: (...args: any[]) => Promise<unknown> };
+  /** The coordinator's own Connection: (e'') wraps its `sendRawTransaction` for one call, (h) its `getMultipleAccountsInfoAndContext`. */
+  connection?: { sendRawTransaction: (...args: any[]) => Promise<string>; getMultipleAccountsInfoAndContext?: (...args: any[]) => Promise<unknown> };
   /** (e''') P1.4: the app's own singletons for the panic and kill-switch step. */
   stop?: {
     telegram: { processTelegramCommand(text: string): Promise<{ reply: string; actionTaken?: string }> };
@@ -628,7 +628,7 @@ export function makeDumpMarket(d: {
 /**
  * (h) P1.6 (R1-19, R1-112): one failed price read does not blind the stop-loss. A second throwaway wallet creates a coin and seeds it (the seed
  * is sized from the coin's own curve by `dumpSeedPlan`, at most `maxSeedSol`); the app buys `appBuySol` of it; the harness then wraps the
- * coordinator's `getMultipleAccountsInfo` so the next call naming the curve throws once (the app's own price read takes it), and the second
+ * coordinator's `getMultipleAccountsInfoAndContext` (the curve read's method since R4-9) so the next call naming the curve throws once (the app's own price read takes it), and the second
  * wallet dumps everything. Expected: the exit loop's STOP_LOSS sell within about 6 s of the dump being visible on the curve (two 3 s passes;
  * before P1.6 the failed read put the mint in a 60 s back-off). The pass bound is `maxMs` (10 s by default, for devnet confirmation latency).
  * Every path, a failed create or seed included, ends in `finally`: the app's position is closed, the second wallet sells what it holds and
@@ -645,7 +645,7 @@ export async function failedReadThenDumpStopLoss(
   const rowFor = (mint: string) => (s.db.loadPositions() as Row[]).find((p) => p.mint === mint);
   if (!s.connection) { s.rec(L, false, 'harness did not pass the coordinator connection'); return; }
   const conn: any = s.connection;
-  const orig = conn.getMultipleAccountsInfo;
+  const orig = conn.getMultipleAccountsInfoAndContext;
   let coin: { mint: string; curve: string; seedSol: number; projectedRatio: number } | undefined;
   let injected = false;
   try {
@@ -663,17 +663,19 @@ export async function failedReadThenDumpStopLoss(
     const pos = rowFor(c.mint);
     if (!buy.success || !pos || pos.status === 'CLOSED') return;
 
-    conn.getMultipleAccountsInfo = async function (this: unknown, ...args: any[]) {
+    // R4-9: the app's curve read (PumpCurveService.fetchPumpMarketState) is getMultipleAccountsInfoAndContext, for its context slot;
+    // web3.js's getMultipleAccountsInfo calls it too, so this one hook sees both.
+    conn.getMultipleAccountsInfoAndContext = async function (this: unknown, ...args: any[]) {
       const keys: any[] = Array.isArray(args[0]) ? args[0] : [];
       if (!injected && keys.some((k) => String(k?.toBase58?.() ?? k) === c.curve)) {
         injected = true;
-        conn.getMultipleAccountsInfo = orig; // one call only
-        throw new Error('harness: injected getMultipleAccountsInfo failure');
+        conn.getMultipleAccountsInfoAndContext = orig; // one call only
+        throw new Error('harness: injected getMultipleAccountsInfoAndContext failure');
       }
       return orig.apply(this, args);
     };
     for (let i = 0; i < 40 && !injected; i++) await s.sleep(250);
-    s.rec(`${L}: the app's price read took the injected failure`, injected, injected ? 'one getMultipleAccountsInfo naming the curve threw' : 'no read of the curve in 10 s');
+    s.rec(`${L}: the app's price read took the injected failure`, injected, injected ? 'one getMultipleAccountsInfoAndContext naming the curve threw' : 'no read of the curve in 10 s');
     if (!injected) return;
 
     const dumpSig = await m.sellAll(c.mint);
@@ -701,7 +703,7 @@ export async function failedReadThenDumpStopLoss(
       s.rec(`${L}: the stop-loss sell succeeded on chain`, err === null, `err=${JSON.stringify(err)}`);
     }
   } finally {
-    conn.getMultipleAccountsInfo = orig;
+    conn.getMultipleAccountsInfoAndContext = orig;
     if (coin) {
       for (const p of openFor({ ...s, mint: coin.mint })) {
         try {

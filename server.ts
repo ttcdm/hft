@@ -129,7 +129,16 @@ server.on('error', (err: any) => {
 });
 
 // WebSocket Server for High-Performance Engine Telemetry & Orders
-const wss = new WebSocketServer({ server, path: '/ws/engine' });
+/** R4-12: the largest frame the engine socket accepts (64 KiB; the ws default is 100 MiB). A larger one closes the socket with 1009. */
+export const WS_MAX_PAYLOAD_BYTES = 64 * 1024;
+/** R4-12: close code for a socket that sent anything but an AUTHENTICATE before it authenticated. */
+const WS_CLOSE_AUTH_FIRST = 4002;
+const WS_AUTH_ACTIONS = new Set(['AUTHENTICATE', 'AUTH']);
+/** True when the frame is an authentication command (any of the spellings the UI and older clients send). */
+function isWsAuthFrame(parsed: any): boolean {
+  return !!parsed && typeof parsed === 'object' && (WS_AUTH_ACTIONS.has(parsed.action) || WS_AUTH_ACTIONS.has(parsed.type));
+}
+const wss = new WebSocketServer({ server, path: '/ws/engine', maxPayload: WS_MAX_PAYLOAD_BYTES });
 
 wss.on('error', (err: any) => {
   Logger.warn(`WebSocketServer error: ${err?.message || err}`);
@@ -214,17 +223,21 @@ wss.on('connection', (ws: WebSocket, req: any) => {
   } catch {}
 
   ws.on('message', async (msg: any) => {
-    let parsed: any;
+    let parsed: any = null;
+    // R4-12: before it authenticates, a socket may send only AUTHENTICATE (frames are at most WS_MAX_PAYLOAD_BYTES). Anything else, or a
+    // frame that is not JSON, closes it; the UI authenticates on open and again after login, and reconnects on close.
+    if (!(ws as any).isAuthenticated) {
+      try { parsed = JSON.parse(msg.toString()); } catch { /* not JSON: closed below */ }
+      if (!isWsAuthFrame(parsed)) {
+        try { ws.close(WS_CLOSE_AUTH_FIRST, 'Authenticate first'); } catch {}
+        return;
+      }
+    }
     try {
-      parsed = JSON.parse(msg.toString());
+      parsed ??= JSON.parse(msg.toString());
 
       // Operator Authentication command
-      if (
-        parsed.action === 'AUTHENTICATE' ||
-        parsed.action === 'AUTH' ||
-        parsed.type === 'AUTH' ||
-        parsed.type === 'AUTHENTICATE'
-      ) {
+      if (isWsAuthFrame(parsed)) {
         const token = parsed.sessionToken || parsed.token;
         if (verifyWsAuth(token)) {
           (ws as any).isAuthenticated = true;

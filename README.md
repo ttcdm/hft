@@ -143,7 +143,7 @@ Final Reconciliation & Ledger Audit
 
 What the code does, and where the limits are:
 
-- **CORS and WebSocket origins**: REST requests are allowed from `localhost`, `127.0.0.1`, the request's own host, and origins listed in `ALLOWED_ORIGINS` (`server/middleware/auth.ts`). Other origins get no CORS headers.
+- **CORS and WebSocket origins**: REST requests are allowed from `localhost`, `127.0.0.1`, the request's own host, and origins listed in `ALLOWED_ORIGINS` (`server/middleware/auth.ts`). Other origins get no CORS headers. The `/ws/engine` socket takes frames of at most 64 KiB (`WS_MAX_PAYLOAD_BYTES` in `server.ts`; a larger one closes it with 1009), and a socket that sends anything but `AUTHENTICATE` before it has authenticated is closed with 4002.
 - **Circuit breaker**: the risk engine opens the breaker and turns the kill switch on after 3 consecutive failed wallet-balance reads (`server/risk/riskEngine.ts`), and refuses buys once the net PnL of the last 24 hours (not since UTC midnight) reaches the floor set by `MAX_DAILY_LOSS_USD`; that refusal latches until an operator sends `POST /api/auto/resume {"clearDailyLossLatch":true}`, a flag separate from `clearHalt`. Only an operator closes the breaker: a kill-switch reset closes it once the latest balance read has succeeded.
 - **Keypair file**: `.apex_trading_keypair.json` is written with POSIX `0600` permissions, and the app checks `.env` and the keypair for looser permissions. Use a throwaway devnet key only.
 - **Audit trail**: auto decisions and trade records are rows in the SQLite database; see [`KNOWN_RISKS.md`](KNOWN_RISKS.md) section 10 for its limits.

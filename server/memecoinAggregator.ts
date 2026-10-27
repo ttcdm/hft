@@ -1,9 +1,10 @@
 import { MemecoinPool, SniperPosition, SniperBotConfig } from '../src/types';
+import { closeOutcomeText } from '../src/utils/closeOutcome';
 import { EventEmitter } from 'events';
 import { PublicKey } from '@solana/web3.js';
 import { traced } from './observability/tracing';
 import { PumpCurveService, type MarketStateFailure } from './solana/pumpCurve';
-import { executionCoordinator, isRecoveredPosition } from './execution/coordinator';
+import { executionCoordinator, isRecoveredPosition, type CloseOutcome } from './execution/coordinator';
 import { solPriceService } from './market/solPriceService';
 import { riskEngine } from './risk/riskEngine';
 import { workstationDb } from './db/database';
@@ -798,41 +799,9 @@ export class MemecoinAggregatorService extends EventEmitter {
       } catch {}
     }
 
-    if (!pool && !params.noSyntheticPool && executionCoordinator.getExecutionMode() === 'PAPER') {
-      const priceUsd = 0.000045;
-      const priceNative = priceUsd / this.solPriceUsd;
-      pool = {
-        id: `pool-simulated-${cleanCa.slice(0, 8)}`,
-        platform: 'PUMP_FUN',
-        chain: 'SOLANA',
-        symbol: cleanCa.slice(0, 5).toUpperCase(),
-        name: `Token ${cleanCa.slice(0, 4)}...${cleanCa.slice(-4)}`,
-        contractAddress: cleanCa,
-        priceUsd,
-        priceNative,
-        marketCapUsd: 45000,
-        liquidityUsd: 15000,
-        bondingCurveProgress: 45,
-        isMigrated: false,
-        volume5mUsd: 12000,
-        volume1hUsd: 35000,
-        volume24hUsd: 95000,
-        priceChange5mPct: 4.2,
-        priceChange1hPct: 12.0,
-        buys5m: 35,
-        sells5m: 6,
-        top10HoldersPct: 12,
-        devHoldingPct: 0.5,
-        isMintRevoked: true,
-        isFreezeRevoked: true,
-        isLpBurned: false,
-        rugcheckScore: 'SAFE',
-        createdAgo: 'Simulated Paper',
-        trendingRank: 1,
-      };
-      this.pools.unshift(pool);
-    }
-
+    // R10-8: an unknown mint used to get an invented PAPER pool here (price $0.000045, MC $45,000, mint and freeze revoked, SAFE) that
+    // then showed in the Aggregator with green badges and a live Snipe button; one wrong character in a pasted mint was enough. A mint
+    // with no feed pool, no readable curve and no callout is refused below (MARKET_DATA_UNAVAILABLE), in PAPER as in LIVE.
     // A144: a callout placeholder (`pool-callout-*`, made when the curve could not be read) is no more real than a simulated pool
     if (pool && params.noSyntheticPool && (DEMO_POOL_IDS.has(pool.id) || pool.id.startsWith('pool-simulated-') || pool.id.startsWith('pool-callout-'))) {
       return { success: false, message: `MARKET_DATA_UNAVAILABLE: ${cleanCa} has only a simulated or placeholder pool (${pool.id.replace(/-[^-]*$/, '')}); this order does not trade against one.`, txHash: '' };
@@ -975,16 +944,12 @@ export class MemecoinAggregatorService extends EventEmitter {
   public async closePosition(
     positionId: string,
     sellPct: number = 100
-  ): Promise<{ success: boolean; realizedPnl: number; message: string; adoptedPartial?: boolean; remainingTokensRaw?: string }> {
+  ): Promise<{ success: boolean; realizedPnl: number; message: string; outcome?: CloseOutcome; status?: string; remainingTokensRaw?: string }> {
     const res = await executionCoordinator.closePosition(positionId, sellPct, 'Aggregator Close');
 
     const pnlUsd = res.pnlSol * this.solPriceUsd;
-    // R6-9: a close that only adopted an earlier partial sold nothing now, and the position is still open
-    const message = res.success && res.adoptedPartial
-      ? `Nothing sold now: an earlier partial sell of position ${positionId.slice(0, 8)}... had landed and was booked (PnL ${res.pnlSol >= 0 ? '+' : ''}${res.pnlSol.toFixed(5)} SOL); ${res.remainingTokensRaw} raw tokens are still open. Close again to sell the rest.`
-      : res.success
-      ? `Closed ${sellPct}% of position ${positionId.slice(0, 8)}... Realized PnL: ${res.pnlSol >= 0 ? '+' : ''}${res.pnlSol.toFixed(5)} SOL ($${pnlUsd.toFixed(2)})`
-      : `Failed to close position: ${res.error}`;
+    // R6-9: an adopted earlier sell or an empty wallet (assumed loss) is not reported as "Closed 100%"
+    const message = closeOutcomeText(res, sellPct, `position ${positionId.slice(0, 8)}...`).text + (res.success ? ` ($${pnlUsd.toFixed(2)})` : '');
 
     this.emit('position_closed', { positionId, pnl: pnlUsd, message });
 
@@ -992,7 +957,10 @@ export class MemecoinAggregatorService extends EventEmitter {
       success: res.success,
       realizedPnl: pnlUsd,
       message,
-      ...(res.adoptedPartial ? { adoptedPartial: true, remainingTokensRaw: res.remainingTokensRaw } : {}),
+      // R6-9: what the close really did (an adopted earlier sell, an assumed loss), and what an adopted partial left open
+      outcome: res.outcome,
+      status: res.status,
+      ...(res.remainingTokensRaw !== undefined ? { remainingTokensRaw: res.remainingTokensRaw } : {}),
     };
   }
 

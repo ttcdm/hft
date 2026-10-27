@@ -180,7 +180,8 @@ describe('P1.4 N-11 / R1-119: Telegram /panic_sell sells the open LIVE position,
     const arm = vi.spyOn(executionCoordinator, 'armLiveTrading');
     vi.spyOn(executionCoordinator, 'getExecutionMode').mockImplementation(() => (arm.mock.calls.some((c) => c[0] === false) ? 'PAPER' : 'LIVE'));
     vi.spyOn(executionCoordinator, 'isLiveArmed').mockImplementation(() => !arm.mock.calls.some((c) => c[0] === false));
-    const close = vi.spyOn(executionCoordinator, 'closePosition').mockResolvedValue({ success: true, pnlSol: 0.001, status: 'CLOSED' });
+    // R5-9: a close that reports CLOSED also closes the row; the panic now reports a LIVE row still open after it
+    const close = vi.spyOn(executionCoordinator, 'closePosition').mockImplementation(async (pid: string) => { const p = row(pid); if (p) workstationDb.savePosition({ ...p, status: 'CLOSED', tokenQuantityRaw: '0' } as any); return { success: true, pnlSol: 0.001, status: 'CLOSED' }; });
 
     const r = await socialScanner.processTelegramCommand('/panic_sell');
     expect(arm).toHaveBeenCalledWith(false);

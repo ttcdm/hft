@@ -59,6 +59,15 @@ export const OPERATOR_ALERT_LEVELS: Record<string, OperatorAlertLevel> = {
   DISK_SPACE_LOW: 'WARNING',
   LATE_BUY_SOLD: 'INFO',
 };
+/**
+ * R9-12: split the mark alerts that no longer apply: a POSITION_MARK_UNAVAILABLE whose position is not open. (PAPER_MARKS_UNAVAILABLE needs
+ * no help: every exit pass raises or clears it.) Every other alert is kept as it is.
+ */
+export function splitMootMarkAlerts(alerts: OperatorAlert[], open: Array<{ id: string }>): { current: OperatorAlert[]; moot: OperatorAlert[] } {
+  const openIds = new Set(open.map((p) => p.id));
+  const isMoot = (a: OperatorAlert) => a.code === 'POSITION_MARK_UNAVAILABLE' && !!a.positionId && !openIds.has(a.positionId);
+  return { current: alerts.filter((a) => !isMoot(a)), moot: alerts.filter(isMoot) };
+}
 export const operatorAlertLevel = (code: string): OperatorAlertLevel => OPERATOR_ALERT_LEVELS[code] ?? 'CRITICAL';
 const LEVEL_RANK: Record<OperatorAlertLevel, number> = { CRITICAL: 0, WARNING: 1, INFO: 2 };
 
@@ -175,12 +184,15 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
 
   checks.push(recorderCheck(now));
 
-  const alerts = diag.operatorAlerts ?? [];
+  // R9-12: a mark alert is about a position the exit pass prices; the pass clears it only while the position is open, so after a close it
+  // stayed for good. A mark alert for a position that is no longer open is moot: it is left out of the marks row and the alert list.
+  const { current: alerts, moot: mootMarkAlerts } = splitMootMarkAlerts(diag.operatorAlerts ?? [], workstationDb.loadPositions(undefined, 'ACTIVE'));
   const markAlerts = alerts.filter((a) => a.code === 'POSITION_MARK_UNAVAILABLE' || a.code === 'PAPER_MARKS_UNAVAILABLE');
+  const mootNote = mootMarkAlerts.length ? ` ${mootMarkAlerts.length} mark alert(s) for positions no longer open are not counted.` : '';
   checks.push({
     id: 'marks', label: 'Position marks', status: markAlerts.length ? 'WARN' : diag.positionMarkHealth === 'STALE' ? 'WARN' : 'OK',
     value: markAlerts.length ? `${markAlerts.length} stale-mark alert(s)` : `${diag.positionMarkHealth}, last mark ${ago(ages.positionMarkAgeMs)}`,
-    detail: markAlerts.length ? markAlerts.map((a) => a.message).slice(0, 3).join(' | ') : `${diag.openPositionsCount} open position(s); no stale-mark alert.`,
+    detail: (markAlerts.length ? markAlerts.map((a) => a.message).slice(0, 3).join(' | ') : `${diag.openPositionsCount} open position(s); no stale-mark alert.`) + mootNote,
   });
 
   const operatorAlerts = operatorAlertViews(alerts);

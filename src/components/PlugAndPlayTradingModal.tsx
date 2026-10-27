@@ -253,7 +253,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
           slippagePct: Number(slippageBps) / 100,
           jitoTipSol: Number(jitoTipSol),
           callerHandle: '@manual_terminal',
-          confluenceScore: 100,
+          // R9-10: no confluenceScore. The server scores the token itself (and refuses a client-sent score).
           ...(tradingMode.live ? { confirmLive: true } : {}),
         }),
       });

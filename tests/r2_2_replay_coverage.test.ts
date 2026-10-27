@@ -57,6 +57,66 @@ describe('R7-12: no entry at a print taken before the recording ended', () => {
   });
 });
 
+// ---- R2-2: coverage and recorder markers ---------------------------------------------------------------------------------------------
+/** a print at price multiple m of the last row's state, dt ms after it, on the same constant product */
+function after(rows: TradeRow[], dtMs: number, m: number, user = 'later'): TradeRow {
+  const [ts, , , , , vS, vT] = rows[rows.length - 1];
+  return [ts + dtMs, true, 0.1, 1, user, Math.round(vS * Math.sqrt(m)), Math.round(vT / Math.sqrt(m)), `p-${dtMs}-${user}`];
+}
+
+describe('R2-2: the replay assumes no quiet market the recording did not show', () => {
+  afterEach(() => restoreStockEngine());
+  const W: ReplayOptions = { ...GATE, recordedForMs: 35 * 60_000 };
+
+  it('a launch with no END row is covered to its last row: the 35-minute window does not let a stale exit close it', () => {
+    const rows = quiet();
+    const withTail = [...rows, after(rows, 4_000, 1.0, 'tail')]; // one print after the buy lands, then silence (the process stopped)
+    const r = replayLaunch(toRecordedLaunch(launch(withTail), 150), [], 150, W);
+    expect(r.entered).toBe(true);
+    expect(r.outcome).toBe('OPEN_AT_END');
+    expect(r.exits).toEqual([]);
+    expect(r.coveredUntilTs).toBe(withTail[withTail.length - 1][0]);
+  });
+
+  it('a restart after the create cuts the recording: TRUNCATED, with the marker, and still no stale exit', () => {
+    const rows = quiet();
+    const withTail = [...rows, after(rows, 4_000, 1.0, 'tail')];
+    const marker = { ts: withTail[withTail.length - 1][0] + 10 * 60_000, reason: 'RECORDER_START' };
+    const r = replayLaunch(toRecordedLaunch(launch(withTail), 150), [], 150, { ...W, markers: [marker] });
+    expect(r.recording).toBe('TRUNCATED');
+    expect(r.recordingGap).toEqual(marker);
+    expect(r.outcome).toBe('OPEN_AT_END');
+    // a restart long after the recorder window does not label it
+    expect(replayLaunch(toRecordedLaunch(launch(withTail), 150), [], 150, { ...W, markers: [{ ts: T0 + 36 * 60_000, reason: 'RECORDER_START' }] }).recording).toBe('UNRESOLVED');
+  });
+
+  it('a feed gap during the watch window: DEAD as live released it, never entered (labelled COMPLETE and bought before)', () => {
+    const rows = curve();
+    const rec = { ...toRecordedLaunch(launch(rows), 150), endTs: T0 + 35 * 60_000, endReason: 'WINDOW' };
+    expect(replayLaunch(rec, [], 150, GATE).entered).toBe(true);
+    const r = replayLaunch(rec, [], 150, { ...GATE, markers: [{ ts: T0 + 10_000, reason: 'FEED_GAP', detail: 'WS_RECONNECT' }] });
+    expect(r.recording).toBe('TRUNCATED');
+    expect(r.verdict).toBe('DEAD');
+    expect(r.verdictReason).toMatch(/^FEED_GAP: the recording has a gap/);
+    expect(r.entered).toBe(false);
+  });
+
+  it('a feed gap after the buy: the prints after it are not replayed, so a take-profit the gap hides is not booked', () => {
+    const rows = quiet();
+    const path = [...rows, after(rows, 4_000, 1.0, 'a'), after(rows, 20_000, 1.0, 'b'), after(rows, 40_000, 1.4, 'c'), after(rows, 50_000, 1.4, 'd')];
+    const rec = { ...toRecordedLaunch(launch(path), 150), endTs: T0 + 35 * 60_000, endReason: 'WINDOW' };
+    const clean = replayLaunch(rec, [], 150, { ...GATE, impact: false });
+    expect(clean.exits.map((e) => e.reason)).toContain('TAKE_PROFIT_1');
+    const gapTs = rows[rows.length - 1][0] + 30_000;
+    const cut = replayLaunch(rec, [], 150, { ...GATE, impact: false, markers: [{ ts: gapTs, reason: 'FEED_GAP' }] });
+    expect(cut.recording).toBe('TRUNCATED');
+    expect(cut.entered).toBe(true);
+    expect(cut.exits).toEqual([]);
+    expect(cut.outcome).toBe('OPEN_AT_END');
+    expect(cut.coveredUntilTs).toBe(rows[rows.length - 1][0] + 20_000);
+  });
+});
+
 // ---- the database side: markers come back, a read error is an error -----------------------------------------------------------------
 import fs from 'node:fs';
 import os from 'node:os';

@@ -156,11 +156,11 @@ describe('5C (R1-106): the replay labels truncated, graduated and unresolved lau
     expect(b.COMPLETE.netPnlSol).toBeCloseTo(rep.launches[0].netPnlSol as number, 12);
   });
 
-  it('a launch with no END row is never assumed recorded past the moment the recording was read', () => {
+  it('a launch with no END row is never assumed recorded past its last row (R2-2), nor past the moment the recording was read', () => {
     const W = { recordedForMs: 35 * 60_000 };
-    expect(replayLaunch(rec(), [], 150, { ...GATE, ...W }).outcome).toBe('CLOSED'); // the window alone: quiet to create + 35 min, stale exit
-    // read 5 minutes after the create: the launch may still be recording, so nothing after the read is assumed
-    expect(replayLaunch(rec(), [], 150, { ...GATE, ...W, readAtTs: T0 + 5 * 60_000 }).outcome).toBe('OPEN_AT_END');
+    // R2-2: the window alone no longer makes it quiet to create + 35 min (the process may have stopped); the buy lands after the last row
+    expect(replayLaunch(rec(), [], 150, { ...GATE, ...W }).outcome).toBe('NO_ENTRY');
+    expect(replayLaunch(rec(), [], 150, { ...GATE, ...W, readAtTs: T0 + 5 * 60_000 }).outcome).toBe('NO_ENTRY');
     // an END row decides on its own
     expect(replayLaunch(rec({ endTs: T0 + 35 * 60_000, endReason: 'WINDOW' }), [], 150, { ...GATE, ...W, readAtTs: T0 + 5 * 60_000 }).outcome).toBe('CLOSED');
   });

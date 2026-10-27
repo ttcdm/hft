@@ -18,7 +18,7 @@ beforeAll(async () => {
 }, 120_000);
 afterAll(async () => { await app?.stop(); await stub?.close(); fs.rmSync(dir, { recursive: true, force: true }); });
 
-describe('5A the replay route passes the recorder window', () => {
+describe('5A the replay route: a quiet recorded tail closes by the stale exit', () => {
   it('a launch bought and then silent for the rest of a 40-minute recording closes STALE_POSITION', async () => {
     const T0 = 1_760_000_000_000;
     let vSol = 30e9, vTok = 1.073e15;
@@ -34,6 +34,8 @@ describe('5A the replay route passes the recorder window', () => {
     const c: CorpusLaunch = { ...full, trades: rows.filter((x) => x[0] <= T0 + rel) };
     const db = new WorkstationDatabase(app.dbPath);
     for (const e of toRecordedLaunch(c, 150).events) db.recordLaunchEvent(e.ts, c.mint, e.kind, e.payload);
+    // R2-2: the quiet tail is covered by the END/WINDOW row the recorder writes when the window passes (the window alone no longer is)
+    db.recordLaunchEvent(T0 + 40 * 60_000, c.mint, 'END', { reason: 'WINDOW', trades: c.trades.length, windowMs: 40 * 60_000 });
     const r = await app.call('GET', '/api/backtest/replay?minScore=0');
     expect(r.status).toBe(200);
     const l = r.json.report.launches.find((x: any) => x.mint === c.mint);

@@ -52,20 +52,17 @@ export type ReplayOptions = Partial<typeof REPLAY_DEFAULTS> & {
   /** 5A: price the order's own impact on the curve (default true); false prices at the recorded spot price */
   impact?: boolean;
   /**
-   * 5A: how long after its create each launch was recorded (the recorder window). With it, a sell or a stale decision after the last print is
-   * priced at that print (no print: the curve did not move) up to create + this; without it nothing is assumed past the last recorded print.
+   * 5A: how long after its create each launch was recorded (the recorder window). R2-2: it no longer extends a launch's coverage (a launch
+   * without an END row is covered to its last recorded row only: the process may have stopped). It bounds which recorder markers can have
+   * cut a launch that has no END row: those inside create + this. Without it, any marker after the create.
    */
   recordedForMs?: number;
-  /**
-   * 5A: the recorder's per-launch trade cap. A launch with this many recorded trades may have been cut off, so `recordedForMs` does not
-   * extend its coverage (5B's END rows, as `RecordedLaunch.endTs`, say so exactly).
-   */
+  /** 5A: the recorder's per-launch trade cap. R2-2: a launch without an END row that reached it is labelled TRUNCATED (it may have been cut). */
   recordedMaxTrades?: number;
-  /**
-   * 5C: when the recording was read (the route passes now). A launch with no END row may still be recording, so `recordedForMs` never extends
-   * its coverage past this moment: a launch created 5 minutes ago was not recorded quiet for 35.
-   */
+  /** 5C: when the recording was read. R2-2: not read any more (without an END row nothing past the last recorded row is covered, which is before the read). */
   readAtTs?: number;
+  /** R2-2: the recorder's MARKER rows (restarts and feed gaps, `loadLaunchRecording().markers`). The first one inside a launch's recording cuts it. */
+  markers?: RecordingMarker[];
 };
 
 /** 5A: the replay's costs as a costModel cost case. */
@@ -97,6 +94,8 @@ export interface RecordedLaunch { mint: string; events: RecordedEvent[]; endTs?:
  * 5C (R1-106): how the recording of a launch ended, from its END row. COMPLETE: recorded for the whole window. TRUNCATED: the recorder's
  * trade cap cut it (trades after it are missing). GRADUATED: the curve completed (nothing after graduation is recorded). UNRESOLVED: no END
  * row, so still recording, stopped with the process, or recorded before END rows existed; its end is not known.
+ * R2-2: replayLaunch also labels TRUNCATED a launch cut by a recorder marker (a restart or a feed gap inside its recording) and one without
+ * an END row that reached the trade cap. `recordingEnd` reads the END row only.
  */
 export type RecordingEnd = 'COMPLETE' | 'TRUNCATED' | 'GRADUATED' | 'UNRESOLVED';
 export const RECORDING_ENDS: RecordingEnd[] = ['COMPLETE', 'TRUNCATED', 'GRADUATED', 'UNRESOLVED'];
@@ -108,6 +107,28 @@ export function recordingEnd(l: Pick<RecordedLaunch, 'endTs' | 'endReason'>): Re
   return 'UNRESOLVED'; // an END row with a reason this code does not know
 }
 export interface FunderFact { ts: number; wallet: string; funder: string | null }
+/** R2-2: a recorder MARKER row: RECORDER_START (a restart dropped every in-progress launch's later trades) or FEED_GAP (trades in it may be missing). */
+export interface RecordingMarker { ts: number; reason: string; detail?: string }
+
+/**
+ * R2-2: the first recorder marker inside a launch's recording, or null. With an END row: a marker after the create and before the END. Without
+ * one: a marker after the create and inside the recorder window (`recordedForMs`, when given), because a launch without an END row that
+ * outlived a restart was cut by it. A FEED_GAP marker without an END row counts only up to the last recorded row (after it nothing is covered anyway).
+ */
+export function recordingGapOf(launch: Pick<RecordedLaunch, 'events' | 'endTs'>, markers: RecordingMarker[] | undefined, recordedForMs?: number): RecordingMarker | null {
+  if (!markers?.length) return null;
+  const create = launch.events.find((e) => e.kind === 'CREATE');
+  if (!create) return null;
+  const lastRow = launch.events[launch.events.length - 1].ts;
+  const until = launch.endTs ?? (recordedForMs !== undefined ? create.ts + recordedForMs : Infinity);
+  let first: RecordingMarker | null = null;
+  for (const m of markers) {
+    if (!(m.ts > create.ts && m.ts < until)) continue;
+    if (launch.endTs === undefined && m.reason !== 'RECORDER_START' && m.ts > lastRow) continue;
+    if (!first || m.ts < first.ts) first = m;
+  }
+  return first;
+}
 
 export type ReplayOutcome = 'NO_ENTRY' | 'CLOSED' | 'OPEN_AT_END';
 export interface ReplayedLaunch {
@@ -142,6 +163,10 @@ export interface ReplayedLaunch {
   concentrationPass?: boolean | null;
   /** 5C (R1-106): how the launch's recording ended (see RecordingEnd) */
   recording?: RecordingEnd;
+  /** R2-2: the recorder marker that cut this launch's recording (it is then TRUNCATED, and nothing after the marker is replayed) */
+  recordingGap?: RecordingMarker | null;
+  /** R2-2: the moment up to which the replay took the recording as complete (the END row, else the last recorded row; a marker cuts it) */
+  coveredUntilTs?: number | null;
 }
 
 /** S190: the release-to-peak buckets, in minutes. A peak at exactly a boundary belongs to the later bucket. */
@@ -261,17 +286,25 @@ export function creatorReportAt(launch: Pick<RecordedLaunch, 'creatorReports'>, 
   };
 }
 
-export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solUsdFallback: number | null, optsIn: ReplayOptions = {}): ReplayedLaunch {
+export function replayLaunch(launchIn: RecordedLaunch, funders: FunderFact[], solUsdFallback: number | null, optsIn: ReplayOptions = {}): ReplayedLaunch {
   const o = { ...REPLAY_DEFAULTS, ...optsIn };
   const minScore = optsIn.minScore ?? getConfluenceThreshold();
+  // R2-2: a recorder marker inside the recording (a restart or a feed gap) cuts it: nothing at or after the marker is replayed
+  const gap = recordingGapOf(launchIn, optsIn.markers, optsIn.recordedForMs);
+  const launch: RecordedLaunch = gap ? { ...launchIn, events: launchIn.events.filter((e) => e.ts < gap.ts) } : launchIn;
   const create = launch.events.find((e) => e.kind === 'CREATE');
   const trades = launch.events.filter((e) => e.kind === 'TRADE');
+  const capped = launchIn.endTs === undefined && o.recordedMaxTrades !== undefined && trades.length >= o.recordedMaxTrades;
+  // R2-2: covered to the END row, else to the last recorded row only (the process may have stopped, so no quiet market is assumed after it);
+  // a launch cut by a marker is covered to its last row before the marker (when the gap began is not known)
+  const lastRowTs = launch.events[launch.events.length - 1]?.ts ?? -Infinity;
+  const coveredUntilTs = gap || launchIn.endTs === undefined ? lastRowTs : Math.max(lastRowTs, launchIn.endTs);
   const base: ReplayedLaunch = {
     mint: launch.mint, symbol: create?.payload?.symbol ?? '?', trades: trades.length, verdict: 'NO_TRADES', verdictReason: 'no trade recorded', releasedAfterMs: null, score: null,
     entered: false, noEntryReason: null, outcome: 'NO_ENTRY', entryPriceSol: null, exits: [], holdMs: null, netPnlSol: null, openValueSol: null,
-    recording: recordingEnd(launch),
+    recording: gap || capped ? 'TRUNCATED' : recordingEnd(launchIn), recordingGap: gap, coveredUntilTs: Number.isFinite(coveredUntilTs) ? coveredUntilTs : null,
   };
-  if (!create || trades.length === 0) return { ...base, noEntryReason: 'nothing to replay' };
+  if (!create || trades.length === 0) return { ...base, noEntryReason: gap ? `${gap.reason}: the recording was cut before any trade` : 'nothing to replay' };
 
   const startTs = create.ts;
   const solUsd = Number(create.payload.solUsd) > 0 ? Number(create.payload.solUsd) : solUsdFallback;
@@ -350,12 +383,17 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
     // the recording ended before the window gave a verdict: let it run to its own maximum on the data it has
     // 5A (R1-104): the window's maximum runs from the first trade, so the fallback does too
     // 5C: from the tick after the last one, which ran before the trades recorded since; evaluating that tick again would let it see them
-    for (let t = lastTick + o.tickMs; t <= trades[0].ts + WATCH_MAX_MS + o.tickMs && !released; t += o.tickMs) {
+    // R2-2: never into a recorder gap: live released the watch there (FEED_GAP) or lost it (a restart)
+    for (let t = lastTick + o.tickMs; t <= trades[0].ts + WATCH_MAX_MS + o.tickMs && (!gap || t < gap.ts) && !released; t += o.tickMs) {
       clock = t;
       applyFacts(t);
       const r = ww.evaluate(launch.mint, t);
       if (r && r.state !== 'WATCHING') { released = r; releasedAt = t; }
     }
+  }
+  if (!released && gap) {
+    const why = `${gap.reason}: the recording has a gap ${Math.round((gap.ts - startTs) / 1000)} s after the create, before the watch verdict; live ${gap.reason === 'FEED_GAP' ? 'released every watched launch DEAD across it' : 'lost the watch with the process'}`;
+    return { ...base, verdict: 'DEAD', verdictReason: why, noEntryReason: why };
   }
   if (!released) return { ...base, verdict: 'NO_TRADES', verdictReason: 'no verdict inside the recording', noEntryReason: 'still watching when the recording ended' };
 
@@ -385,10 +423,6 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
   // 5A: entry, exits and money from the shared cost and latency model
   const rows = trades.map(tradeRow).filter((r): r is TradeRow => r !== null);
   if (rows.length === 0) return { ...result, noEntryReason: 'no recorded trade carries a price, so no price to buy at' };
-  const lastEventTs = launch.events[launch.events.length - 1]?.ts ?? rows[rows.length - 1][0];
-  const capped = o.recordedMaxTrades !== undefined && trades.length >= o.recordedMaxTrades;
-  const window = launch.endTs !== undefined ? launch.endTs : (o.recordedForMs !== undefined && !capped ? Math.min(startTs + o.recordedForMs, o.readAtTs ?? Infinity) : -Infinity);
-  const coveredUntilTs = Math.max(lastEventTs, window);
   // R7-12: the buy lands after the recording's known end (a TRADE_CAP launch's first dropped trade, or its last row): the curve state then
   // is not in the data, so it is not entered at a print taken before the cut
   const landing = releasedAt + o.entryDelayMs;
@@ -476,7 +510,7 @@ function buildReplayReport(rows: ReplayedLaunch[], opts: ReplayOptions, minScore
     ],
     notReplayed: [...NOT_REPLAYED.optimistic, ...NOT_REPLAYED.pessimistic, ...NOT_REPLAYED.unknown],
     notReplayedByDirection: NOT_REPLAYED,
-    assumptions: (({ readyGate: _g, curveCap: _c, impact: _i, ...numeric }) => ({ ...REPLAY_DEFAULTS, ...numeric, minScore, impact: opts.impact === false ? 0 : 1 }))(opts) as Record<string, number>,
+    assumptions: (({ readyGate: _g, curveCap: _c, impact: _i, markers: _m, ...numeric }) => ({ ...REPLAY_DEFAULTS, ...numeric, minScore, impact: opts.impact === false ? 0 : 1 }))(opts) as Record<string, number>,
     summary: {
       launches: rows.length, released, entries: rows.filter((r) => r.entered).length, closed: closed.length, openAtEnd: open.length,
       wins, losses: closed.length - wins, winRate: closed.length ? wins / closed.length : null,

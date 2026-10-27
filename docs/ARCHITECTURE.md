@@ -45,7 +45,7 @@ flowchart TD
   att --> sub["controller.ts: submitCandidate"]
   sub -->|"release older than the signal-age limit, READY failing readyGate, or curve past the cap"| refused["REJECTED or DROPPED row, not bought"]
   sub --> snipe["memecoinAggregator.ts: executeSnipe"]
-  manual["manual snipe routes, Plug & Play (walletTrader.ts: executeLiveSnipe), POST /api/execution/trade, callout snipe, social signal, Telegram"] -->|"LIVE armed: needs confirmLive"| snipe
+  manual["manual buys: POST /api/execution/trade, Plug & Play, callout, social signal, Telegram"] -->|"LIVE armed: needs confirmLive"| snipe
   snipe -->|"SHADOW: dry run"| prev["coordinator.ts: previewBuy"]
   prev --> would["WOULD_BUY row, nothing sent"]
   snipe --> exec["coordinator.ts: executeTrade"]
@@ -144,7 +144,7 @@ flowchart TD
     b1 --> b2["transactionBuilder.ts: buildBuyTransaction"]
     b2 --> b3["coordinator.ts: blockhashProblem, only when APEX_VERIFY_BLOCKHASH is true"]
     b3 --> b4["signer.ts: signTransaction"]
-    b4 --> q17["Q17: still armed, mode LIVE, not halted, kill switch off, liveBuyReadinessProblems again, send deadline not passed"]
+    b4 --> q17["Q17: still armed and LIVE, no halt or kill switch, readiness again, send deadline not passed"]
     q17 --> b5["database.ts: saveOrder"]
   end
   b5 --> subm
@@ -152,7 +152,7 @@ flowchart TD
     subm["readOnly.ts: assertNotReadOnly"] --> c1["clusterGuard.ts: assertSendClusterAllowed"]
     c1 --> c2["clusterGuard.ts: assertClusterAllowedCached"]
     c2 --> c3["database.ts: savePendingBuyIfNoneUnresolved"]
-    c3 --> c4["coordinator.ts: submitAndConfirmInner, kill switch and halt again before each send and resend of a BUY"]
+    c3 --> c4["coordinator.ts: submitAndConfirmInner, kill switch and halt again before each BUY send and resend"]
   end
   c4 --> c5["transports.ts: submit"]
   c5 --> f1["coordinator.ts: journalLiveBuySolDelta, one LIVE_BUY_FILLED row per landed buy"]

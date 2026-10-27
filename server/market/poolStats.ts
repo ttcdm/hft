@@ -17,8 +17,12 @@ export interface MeasuredPoolStats {
   curveProgressPct: number | null;
   /** Last price against the oldest price inside the 5 minute window (or the create price for a younger token). */
   priceChange5mPct: number;
+  /** R2-12: DISTINCT wallets that bought (sold) inside the 5 minute window, not trades: one wallet trading many times is one. */
   buys5m: number;
   sells5m: number;
+  /** R2-12: the trade counts inside the window. */
+  buyTrades5m: number;
+  sellTrades5m: number;
   volume5mSol: number;
   /** The ten largest wallets' share of the tokens that have left the curve. null when nothing has been bought. */
   top10HoldersPct: number | null;
@@ -36,7 +40,7 @@ interface PoolState {
   realSolReserves: number;
   realTokenReserves: bigint | null;
   initialRealTokenReserves: bigint | null;
-  trades: Array<{ at: number; isBuy: boolean; sol: number; priceSol: number }>;
+  trades: Array<{ at: number; isBuy: boolean; sol: number; priceSol: number; user: string }>;
   /** Token balances built from every trade since creation. Exact when the whole history was seen (the watch starts at the create). */
   balances: Map<string, bigint>;
   /** S14: sum of `balances`, kept incrementally so `get` needs no pass over every holder for it. */
@@ -114,7 +118,7 @@ export class OnChainPoolStats {
     s.realSolReserves = Number(t.realSolReserves) / 1e9;
     s.realTokenReserves = t.realTokenReserves;
     s.tradeCount++;
-    s.trades.push({ at, isBuy: t.isBuy, sol: Number(t.solAmountLamports) / 1e9, priceSol: price ?? s.priceSol ?? 0 });
+    s.trades.push({ at, isBuy: t.isBuy, sol: Number(t.solAmountLamports) / 1e9, priceSol: price ?? s.priceSol ?? 0, user: t.user });
     if (s.trades.length > MAX_TRADES_KEPT) s.trades.shift();
     const prev = s.balances.get(t.user) ?? 0n;
     const next = t.isBuy ? prev + t.tokenAmount : prev - t.tokenAmount;
@@ -165,8 +169,10 @@ export class OnChainPoolStats {
       realSolReserves: s.realSolReserves,
       curveProgressPct: curveProgressOf(s),
       priceChange5mPct,
-      buys5m: recent.filter((t) => t.isBuy).length,
-      sells5m: recent.filter((t) => !t.isBuy).length,
+      buys5m: new Set(recent.filter((t) => t.isBuy).map((t) => t.user)).size,
+      sells5m: new Set(recent.filter((t) => !t.isBuy).map((t) => t.user)).size,
+      buyTrades5m: recent.filter((t) => t.isBuy).length,
+      sellTrades5m: recent.filter((t) => !t.isBuy).length,
       volume5mSol: recent.reduce((a, t) => a + t.sol, 0),
       top10HoldersPct: outOfCurve > 0 ? (top10 / outOfCurve) * 100 : null,
       devHoldingPct: supply > 0 ? (dev / supply) * 100 : null,

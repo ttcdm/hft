@@ -101,6 +101,11 @@ export class MockSolanaRpc {
           };
         });
       },
+      // R4-9: the curve read asks for the context slot; this answers through getMultipleAccountsInfo above, so a spy on that still steers it
+      getMultipleAccountsInfoAndContext: async (pubkeys: PublicKey[], _cfg?: unknown) => ({
+        context: { slot: this.currentSlot },
+        value: await (conn as any).getMultipleAccountsInfo(pubkeys),
+      }),
       sendRawTransaction: async (rawTx: Buffer | Uint8Array) => {
         const buf = Buffer.from(rawTx);
         this.submittedTransactions.push(buf);

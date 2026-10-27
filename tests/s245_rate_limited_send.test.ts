@@ -229,7 +229,7 @@ describe('S245: rate-limited sends through the real coordinator', () => {
     expect(stepped).toBeLessThanOrEqual(EXIT_RATE_LIMITED_WAIT_MS);
     expect(coordinator.getOperatorAlerts().some((a) => a.code === 'EXIT_RATE_LIMITED' && a.positionId === id && !a.cleared)).toBe(true);
     // the row of the refused sell is resolved (TIMED_OUT: it never landed), not PENDING
-    expect(workstationDb.getPendingTransactions().some((t) => t.mint === VALID_PUMP_MINT_1.toBase58() && t.direction === 'SELL')).toBe(false);
+    expect(workstationDb.getPendingTransactions()!.some((t) => t.mint === VALID_PUMP_MINT_1.toBase58() && t.direction === 'SELL')).toBe(false);
 
     // the RPC recovers: the next close is not refused with SELL_PENDING_VERIFICATION; it sends and lands
     const second = await coordinator.closePosition(id, 100, 'STOP_LOSS');

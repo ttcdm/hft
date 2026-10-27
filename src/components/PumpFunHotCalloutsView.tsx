@@ -12,9 +12,10 @@
  * pump.fun list (the call passes `true` for "token is mainnet data"); this build trades devnet and localnet only.
  */
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
+import { ageText } from '../utils/freshness';
 import { SnipeAmountControl } from './SnipeAmountControl';
 import { CONFLUENCE_RULE_LABEL, CONFLUENCE_RULE_NOTE, CALLOUT_RULES_SCOPE_NOTE } from '../utils/calloutRuleText';
-import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
+import { useTradingMode, snipeBlockedReason, liveClickWarning } from '../utils/tradingMode';
 import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
 import React, { useState, useEffect, useRef } from 'react';
 import {
@@ -49,8 +50,13 @@ import {
 } from '../types';
 import { engineClient } from '../services/engineClient';
 import { hftAudio } from '../utils/audio';
+import { DecimalBox } from './DecimalBox';
+import { DialogFrame } from './DialogFrame';
+import { confirmLiveClick } from './ConfirmDialog';
 import {
   sanitizeExternalUrl,
+  sanitizeXProfileUrl,
+  hostOfUrl,
   sanitizeTwitterUrl,
   sanitizeTelegramUrl,
   isMainnetCluster,
@@ -73,9 +79,22 @@ export function rulesAfterPoll<T>(current: T, fromServer: T, dirty: boolean): T 
   return dirty ? current : fromServer;
 }
 
-/** 3H: the coin's own image, or an empty tile with its first letters. A missing or broken image used to show a stock photo as if it were the coin's. */
+/**
+ * 3H: the coin's own image, or an empty tile with its first letters. A missing or broken image used to show a stock photo as if it were the coin's.
+ * R2-11: the image URL is the creator's, so loading it tells the creator's server the operator's IP and when they looked. It is not loaded
+ * until the operator clicks the tile.
+ */
 export function TokenImage({ uri, symbol }: { uri: string; symbol: string }) {
   const [broken, setBroken] = useState(false);
+  const [load, setLoad] = useState(false);
+  if (uri && !broken && !load) {
+    return (
+      <button type="button" data-testid="token-image-click" onClick={() => setLoad(true)} title={`Load the creator-hosted image from ${hostOfUrl(uri) ?? 'an unknown host'} (your IP is visible to that host)`}
+        className="w-11 h-11 rounded-lg border border-dashed border-slate-600 bg-slate-800 flex flex-col items-center justify-center flex-shrink-0 text-[9px] font-mono text-slate-400">
+        <span>{symbol.slice(0, 3)}</span><span className="text-[8px] text-slate-500">img</span>
+      </button>
+    );
+  }
   if (!uri || broken) {
     return (
       <div data-testid="token-image-missing" className="w-11 h-11 rounded-lg border border-slate-700 bg-slate-800 flex items-center justify-center flex-shrink-0 text-[10px] font-mono text-slate-400">
@@ -86,13 +105,62 @@ export function TokenImage({ uri, symbol }: { uri: string; symbol: string }) {
   return <img src={uri} alt={symbol} className="w-11 h-11 rounded-lg border border-slate-700 object-cover flex-shrink-0" onError={() => setBroken(true)} />;
 }
 
+/** R6-10: what the callout action badge means. INSTANT_SNIPE used to read as a prime entry; it is the pump.fun list plus a paid boost. */
+export function calloutActionLabel(a: string): string {
+  return a === 'INSTANT_SNIPE' ? 'LISTED + BOOSTED' : a.replace(/_/g, ' ');
+}
+export function calloutActionTitle(a: string): string {
+  return a === 'INSTANT_SNIPE'
+    ? 'Near the top of the pump.fun HTTP list AND on DexScreener\'s paid boost list, multiple at most 2.5x and under 3 minutes old. A paid boost is promotion, not a verified signal.'
+    : 'Derived from the pump.fun HTTP feed (curve %, market cap multiple, age).';
+}
+export const InventedCallerTag = () => (
+  <span data-testid="invented-caller" title="DEMO_MODE=true: this caller and its stats are invented" className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-rose-950 text-rose-300 border border-rose-500/50">INVENTED (DEMO)</span>
+);
+
+/** R6-6: the age of the feed snapshot behind a callout card. Past CALLOUT_SNAPSHOT_MAX_AGE_MS the server's auto-snipe check skips it too. */
+export const CALLOUT_SNAPSHOT_STALE_MS = 15_000;
+export function CalloutSnapshotAge({ dataAsOfMs, now = Date.now() }: { dataAsOfMs?: number; now?: number }) {
+  const stale = typeof dataAsOfMs !== 'number' || now - dataAsOfMs > CALLOUT_SNAPSHOT_STALE_MS;
+  return (
+    <div data-testid="callout-snapshot-age" title="Curve %, market cap, price and multiple on this card are from this snapshot" className={`px-2 py-1 rounded border text-[10px] font-mono ${stale ? 'border-amber-500/50 text-amber-300' : 'border-[#1E293B] text-slate-500'}`}>
+      data {typeof dataAsOfMs === 'number' ? ageText(now - dataAsOfMs) : 'age unknown'}{stale ? ' (STALE)' : ''}
+    </div>
+  );
+}
+
+/** R10-7: a 1 s clock, so ages on this screen keep counting between feed syncs (they froze at the last snapshot's text). */
+export function useNow(intervalMs = 1000): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => { const t = setInterval(() => setNow(Date.now()), intervalMs); return () => clearInterval(t); }, [intervalMs]);
+  return now;
+}
+
+/** R10-7: the time since the token's last trade, counted from the callout's timestamp on this clock; the server's text only without one. */
+export function calloutAgeText(calloutTimestamp: number | undefined, fallback: string, now: number): string {
+  if (typeof calloutTimestamp !== 'number' || !Number.isFinite(calloutTimestamp) || calloutTimestamp <= 0) return fallback;
+  const s = Math.max(0, Math.floor((now - calloutTimestamp) / 1000));
+  return `${Math.floor(s / 60)}m ${s % 60}s ago`;
+}
+
+export function CalloutAge({ calloutTimestamp, fallback }: { calloutTimestamp?: number; fallback: string }) {
+  const now = useNow();
+  return <span data-testid="callout-age" title="Time since the token's last trade, counted on this screen">{calloutAgeText(calloutTimestamp, fallback, now)}</span>;
+}
+
+export function LiveCalloutSnapshotAge({ dataAsOfMs }: { dataAsOfMs?: number }) {
+  const now = useNow();
+  return <CalloutSnapshotAge dataAsOfMs={dataAsOfMs} now={now} />;
+}
+
 /** 3H (P3.7): the feed status as the server measures it. It used to be implied by fixed "Live ingest" text whether or not anything arrived. */
 export function FeedStatusPill({ status }: { status: string | null }) {
   const tone =
     status === 'ONLINE' ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
       : status === 'STALE' ? 'bg-amber-500/20 text-amber-300 border-amber-500/40'
         : 'bg-slate-700/40 text-slate-300 border-slate-600/50';
-  const text = status === 'ONLINE' ? 'FEED ONLINE' : status === 'STALE' ? 'FEED STALE (nothing in the last minute)' : status === 'NO_DATA' ? 'NO FEED DATA YET' : 'FEED STATUS UNKNOWN';
+  // R10-7: this is the callout list's own sync, not the Pump.fun event feed System checks reports; say which
+  const text = status === 'ONLINE' ? 'CALLOUT FEED ONLINE' : status === 'STALE' ? 'CALLOUT FEED STALE (no callout sync in the last minute; the Pump.fun event feed in System checks is separate)' : status === 'NO_DATA' ? 'NO FEED DATA YET' : 'CALLOUT FEED STATUS UNKNOWN';
   return <span data-testid="feed-status-pill" className={`px-1.5 py-0.5 rounded text-[9px] font-mono border ${tone}`}>{text}</span>;
 }
 
@@ -102,6 +170,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   onRefreshParent,
 }) => {
   const tradingMode = useTradingMode();
+  const snipeBlocked = snipeBlockedReason(tradingMode); // UI report fix 7: grey the snipe buttons while the kill switch is on
   const snipeAmount = useSnipeAmount();
   const [subTab, setSubTab] = useState<'CALLOUTS' | 'LEADERBOARD' | 'RULES'>('CALLOUTS');
   const [callouts, setCallouts] = useState<PumpFunHotCallout[]>([]);
@@ -241,7 +310,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
     const amountSol = snipeAmount.parsed.sol;
     // Q10b: while LIVE is armed this click sends a real transaction; say so and ask first
     const warning = liveClickWarning(tradingMode, `Sniping $${callout.token.symbol} for ${formatSol(amountSol)}`);
-    if (warning && !window.confirm(warning)) return;
+    if (warning && !(await confirmLiveClick(warning))) return;
     setSnipingCalloutId(callout.id);
     hftAudio.playOrderFill();
 
@@ -570,6 +639,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                               <span>@{c.caller.userId}</span>
                               <Eye className="w-3 h-3 text-slate-500" />
                             </span>
+                            {c.caller.invented && <InventedCallerTag />}
 
                             {/* REPUTATION TIER BADGE */}
                             <span
@@ -586,16 +656,16 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
 
                             {/* MULTI-CALLER CONFLUENCE BADGE */}
                             {isConfluence && (
-                              <span className="px-2 py-0.5 rounded text-[10px] font-mono font-black bg-rose-500 text-white animate-pulse shadow-sm flex items-center space-x-1">
+                              <span className="px-2 py-0.5 rounded text-[10px] font-mono font-black bg-rose-500 text-white shadow-sm flex items-center space-x-1">
                                 <Sparkles className="w-3 h-3" />
-                                <span>{c.confluenceCount}x CONFLUENCE HIT</span>
+                                <span title="Counted from the pump.fun HTTP list position, DexScreener's PAID boost list and 5-minute order flow; not from independent callers">{c.confluenceCount} feed signals (incl. paid DexScreener boost)</span>
                               </span>
                             )}
                           </div>
 
                           <div className="text-[10px] font-mono text-slate-400 flex items-center space-x-2 mt-0.5">
                             <span>
-                              Win Rate (2x+): <span className="text-emerald-400 font-bold">{c.caller.winRate2x}%</span>
+                              {c.caller.invented ? 'Invented win rate (2x+): ' : 'Win Rate (2x+): '}<span className="text-emerald-400 font-bold">{c.caller.winRate2x}%</span>
                             </span>
                             <span>•</span>
                             <span>
@@ -622,14 +692,16 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                           }`}
                         >
                           <Zap className="w-3.5 h-3.5" />
-                          <span>{c.hftAction.replace('_', ' ')}</span>
+                          <span title={calloutActionTitle(c.hftAction)}>{calloutActionLabel(c.hftAction)}</span>
                         </div>
 
                         {/* Time elapsed */}
                         <div className="px-2 py-1 rounded bg-[#090D16] border border-[#1E293B] text-[11px] font-mono text-slate-300 flex items-center space-x-1">
                           <Clock className="w-3 h-3 text-slate-500" />
-                          <span>{c.token.timeAgoStr}</span>
+                          <CalloutAge calloutTimestamp={c.calloutTimestamp} fallback={c.token.timeAgoStr} />
                         </div>
+                        {/* R6-6: curve %, market cap, price and multiple are a snapshot; say how old */}
+                        <LiveCalloutSnapshotAge dataAsOfMs={c.dataAsOfMs} />
                       </div>
                     </div>
 
@@ -713,7 +785,8 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                             {/* Verified X.com Link */}
                             {(() => {
                               const twitterUrl = sanitizeTwitterUrl(c.token.twitter, c.token.symbol, true);
-                              const hasOfficial = Boolean(c.token.twitter && c.token.twitter.toLowerCase() !== 'none');
+                              // Round 1 #12 / R2-11: the handle is the creator's own claim, and only an x.com / twitter.com link is followed
+                              const hasOfficial = Boolean(sanitizeXProfileUrl(c.token.twitter));
                               return (
                                 <a
                                   href={twitterUrl}
@@ -724,10 +797,10 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                                       ? 'text-sky-300 bg-sky-500/20 border border-sky-500/40 hover:bg-sky-500/30'
                                       : 'text-slate-400 hover:text-sky-400 hover:bg-slate-800'
                                   }`}
-                                  title={hasOfficial ? `Official 𝕏: ${c.token.twitter}` : `Search $${c.token.symbol} on 𝕏`}
+                                  title={hasOfficial ? `𝕏 handle supplied by the token creator (unverified): ${twitterUrl}` : `Search $${c.token.symbol} on 𝕏`}
                                 >
                                   <span className="font-bold">𝕏</span>
-                                  {hasOfficial && <span className="text-[8px] uppercase">LINK</span>}
+                                  {hasOfficial && <span className="text-[8px] uppercase">creator-supplied</span>}
                                 </a>
                               );
                             })()}
@@ -759,9 +832,10 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                                   target="_blank"
                                   rel="noreferrer"
                                   className="text-emerald-300 bg-emerald-500/20 border border-emerald-500/40 hover:bg-emerald-500/30 p-0.5 text-[9px] font-mono flex items-center gap-0.5 px-1 rounded transition"
-                                  title={`Website (creator-supplied, unverified): ${webUrl}`}
+                                  title={`Website (creator-supplied, unverified, goes to ${hostOfUrl(webUrl) ?? 'an unknown host'}): ${webUrl}`}
                                 >
                                   <Globe className="w-2.5 h-2.5" />
+                                  <span className="text-[8px]">{hostOfUrl(webUrl) ?? '?'}</span>
                                 </a>
                               );
                             })()}
@@ -803,7 +877,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                         {/* Security check badges */}
                         <div className="flex items-center space-x-2 text-[10px] font-mono text-slate-400">
                           {(() => {
-                            const b = authorityBadge('Mint', c.token.isMintRevoked as boolean | null);
+                            const b = authorityBadge('Mint', c.token.isMintRevoked as boolean | null, 'the pump.fun feed');
                             return (
                               <span className={`${authorityTone[b.tone]} flex items-center`}>
                                 <ShieldCheck className="w-3 h-3 mr-0.5" /> {b.text}
@@ -843,9 +917,9 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                       <div className="lg:col-span-2 flex flex-col space-y-1.5">
                         <button
                           onClick={() => handleSnipeCallout(c)}
-                          disabled={snipingCalloutId === c.id || c.status === 'SNIPED' || calloutSnipeBlock(tradingMode.cluster) !== null}
-                          title={calloutSnipeBlock(tradingMode.cluster) ?? undefined}
-                          className={`w-full py-2 px-3 rounded-lg font-mono font-bold text-xs transition flex items-center justify-center space-x-1.5 shadow-md ${
+                          disabled={snipingCalloutId === c.id || c.status === 'SNIPED' || calloutSnipeBlock(tradingMode.cluster) !== null || snipeBlocked !== null}
+                          title={calloutSnipeBlock(tradingMode.cluster) ?? snipeBlocked ?? undefined}
+                          className={`disabled:opacity-40 disabled:cursor-not-allowed w-full py-2 px-3 rounded-lg font-mono font-bold text-xs transition flex items-center justify-center space-x-1.5 shadow-md ${
                             c.status === 'SNIPED'
                               ? 'bg-emerald-950/80 border border-emerald-500/50 text-emerald-300 cursor-default'
                               : isDumpRisk
@@ -886,7 +960,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                       {c.otherCallers && c.otherCallers.length > 0 && (
                         <div className="flex items-center space-x-1 text-[10px] font-mono text-slate-400">
                           <Users className="w-3 h-3 text-rose-400" />
-                          <span>Also called by:</span>
+                          <span>{c.caller.invented ? 'Also "called" by (invented DEMO callers):' : 'Also called by:'}</span>
                           <span className="text-rose-300 font-bold">{c.otherCallers.join(', ')}</span>
                         </div>
                       )}
@@ -907,8 +981,12 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
           <div className="p-3 rounded-lg bg-[#0F1524] border border-[#1E293B] text-xs font-mono flex items-center justify-between">
             <div className="flex items-center space-x-2 text-slate-300">
               <Award className="w-4 h-4 text-amber-400" />
-              <span className="font-bold">Pump.fun Official Top Caller Rankings</span>
-              <span className="text-slate-500">• Verifiable on-chain track records</span>
+              <span className="font-bold">Caller leaderboard</span>
+              {leaderboard.some((c) => c.invented) ? (
+                <span data-testid="leaderboard-invented" className="text-rose-300 font-bold">• DEMO_MODE: these callers and their win rates are INVENTED, not real track records</span>
+              ) : (
+                <span className="text-slate-500">• no caller source is wired; this list is empty outside DEMO_MODE</span>
+              )}
             </div>
 
             <div className="text-[11px] text-slate-400">
@@ -1044,15 +1122,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Min Caller 2x+ Win Rate (%)
               </label>
-              <input
-                type="number"
-                value={rules.minCallerWinRate2x}
-                onChange={(e) =>
-                  editRules({ minCallerWinRate2x: parseFloat(e.target.value) || 0 })
-                }
-                step="1"
-                min="10"
-                max="90"
+              <DecimalBox testId="rule-minCallerWinRate2x" ariaLabel="Min caller 2x+ win rate (%)" value={rules.minCallerWinRate2x} onValue={(n) => editRules({ minCallerWinRate2x: n })}
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1065,15 +1135,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Min Average Multiple (e.g. 4.0x)
               </label>
-              <input
-                type="number"
-                value={rules.minAvgMultiple}
-                onChange={(e) =>
-                  editRules({ minAvgMultiple: parseFloat(e.target.value) || 0 })
-                }
-                step="0.5"
-                min="1.5"
-                max="20"
+              <DecimalBox testId="rule-minAvgMultiple" ariaLabel="Min average multiple" value={rules.minAvgMultiple} onValue={(n) => editRules({ minAvgMultiple: n })}
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1086,15 +1148,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Max Entry Multiple (Chasing Guard)
               </label>
-              <input
-                type="number"
-                value={rules.maxEntryMultiple}
-                onChange={(e) =>
-                  editRules({ maxEntryMultiple: parseFloat(e.target.value) || 1 })
-                }
-                step="0.05"
-                min="1.05"
-                max="2.5"
+              <DecimalBox testId="rule-maxEntryMultiple" ariaLabel="Max entry multiple" value={rules.maxEntryMultiple} onValue={(n) => editRules({ maxEntryMultiple: n })}
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1107,15 +1161,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Max Elapsed Callout Time (Seconds)
               </label>
-              <input
-                type="number"
-                value={rules.maxElapsedSeconds}
-                onChange={(e) =>
-                  editRules({ maxElapsedSeconds: parseInt(e.target.value) || 30 })
-                }
-                step="10"
-                min="15"
-                max="300"
+              <DecimalBox testId="rule-maxElapsedSeconds" ariaLabel="Max elapsed callout time (seconds)" value={rules.maxElapsedSeconds} onValue={(n) => editRules({ maxElapsedSeconds: n })} integer
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1148,15 +1194,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Jito Priority Tip (SOL)
               </label>
-              <input
-                type="number"
-                value={rules.jitoPriorityTipSol}
-                onChange={(e) =>
-                  editRules({ jitoPriorityTipSol: parseFloat(e.target.value) || 0.00018 })
-                }
-                step="0.0001"
-                min="0.00015"
-                max="0.05"
+              <DecimalBox testId="rule-jitoPriorityTipSol" ariaLabel="Jito priority tip (SOL)" value={rules.jitoPriorityTipSol} onValue={(n) => editRules({ jitoPriorityTipSol: n })}
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1169,7 +1207,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
 
       {/* CALLER PROFILE MODAL */}
       {selectedCallerModal && (
-        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+        <DialogFrame label="Caller profile" className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-[#0B0F19] border border-[#1E293B] rounded-2xl max-w-lg w-full p-5 space-y-4 shadow-2xl">
             <div className="flex items-start justify-between">
               <div className="flex items-center space-x-3">
@@ -1283,7 +1321,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               </p>
             </div>
           </div>
-        </div>
+        </DialogFrame>
       )}
     </div>
   );

@@ -48,6 +48,9 @@ export type BundleLifecycleState =
  * position for the pending window. A review showed that a balancer may already have forwarded the request. Since P2.1 (S251, S252) an
  * unknown send is watched, with resends, until its blockhash expires, and then released, so S245's problem no longer needs the
  * definite reading.
+ *
+ * R4-10: an HTTP 401, 402 or 403 (`rpcAuthRejectionStatus`) is definite: the provider refused the caller (an expired plan, a refused key)
+ * before forwarding anything. Its result carries `authRejected` and an error starting with RPC_AUTH_REJECTED.
  */
 export const DEFINITE_SEND_REJECTION = /sanitiz|failed to deserialize|signature verification fail|Transaction signature verification failure|Blockhash not found|invalid transaction/i;
 
@@ -66,7 +69,47 @@ const ALREADY_PROCESSED = /already (?:been )?processed/i;
 export const RATE_LIMITED_SEND = /request limit reached|too many requests|rate[ -]?limit(?:ed| exceeded| reached)|"code"\s*:\s*-3200[57]\b/i;
 export const RATE_LIMIT_RPC_CODES: ReadonlySet<number> = new Set([-32007, 429]); // S262: not -32005, which is Solana's "node unhealthy"
 
+/**
+ * R4-10: the HTTP statuses an RPC provider answers with when it refuses the caller, not the transaction: 401 (key missing or wrong),
+ * 402 (plan expired or out of credit) and 403 (key refused, IP or method not allowed). The gateway answers these before anything reaches
+ * a validator, so a send refused this way was not forwarded: it is a definite rejection, never an unknown outcome.
+ */
+export const RPC_AUTH_HTTP_STATUSES: ReadonlySet<number> = new Set([401, 402, 403]);
+export const RPC_AUTH_REJECTED = 'RPC_AUTH_REJECTED';
+export const RPC_AUTH_REJECTED_TEXT = 'RPC plan expired or key refused';
+
+/**
+ * R4-10: the auth status (401, 402 or 403) behind an RPC error, or null. web3.js 1.x turns a non-OK HTTP answer into a plain
+ * `Error(\`${status} ${statusText}: ${body}\`)` (statusText may be empty over HTTP/2, "401 : ..."), so the message starts with the status.
+ * An error object carrying a numeric `status`/`statusCode` is read too.
+ */
+export function rpcAuthRejectionStatus(err: unknown): number | null {
+  for (const k of ['status', 'statusCode']) {
+    const n = Number((err as any)?.[k]);
+    if (RPC_AUTH_HTTP_STATUSES.has(n)) return n;
+  }
+  const msg = String((err as any)?.message ?? err ?? '');
+  const m = /^(40[123])\b/.exec(msg);
+  return m ? Number(m[1]) : null;
+}
+
+/** R4-10: listeners told whenever an RPC request (a send or a read) is refused with 401, 402 or 403. The coordinator raises RPC_AUTH_REJECTED from it. */
+export type RpcAuthRejection = { status: number; method: string };
+const rpcAuthListeners = new Set<(r: RpcAuthRejection) => void>();
+/** Registers a listener; returns the function that removes it. */
+export function onRpcAuthRejected(fn: (r: RpcAuthRejection) => void): () => void {
+  rpcAuthListeners.add(fn);
+  return () => { rpcAuthListeners.delete(fn); };
+}
+/** Tells every listener. A listener that throws is logged and does not stop the others or the caller. */
+export function noteRpcAuthRejected(status: number, method: string): void {
+  for (const fn of rpcAuthListeners) {
+    try { fn({ status, method }); } catch (e: any) { Logger.error(`RPC_AUTH_REJECTED listener failed: ${e?.message ?? e}`); }
+  }
+}
+
 export function isRateLimitedSendError(err: unknown): boolean {
+  if (rpcAuthRejectionStatus(err) !== null) return false; // R4-10: an auth refusal is not a rate limit, even if its body says "limit"
   const code = Number((err as any)?.code);
   if (Number.isFinite(code) && RATE_LIMIT_RPC_CODES.has(code)) return true;
   const msg = String((err as any)?.message ?? err ?? '');
@@ -77,6 +120,8 @@ export function isRateLimitedSendError(err: unknown): boolean {
 export function isDefiniteSendRejection(err: unknown): boolean {
   const msg = String((err as any)?.message ?? err ?? '');
   if (ALREADY_PROCESSED.test(msg)) return false;
+  // R4-10: a 401/402/403 is the provider refusing the caller (an expired plan, a refused key) before anything is forwarded.
+  if (rpcAuthRejectionStatus(err) !== null) return true;
   // S262 (review 2026-10-24, HIGH on S245): a rate limit proves only that this answer was a refusal. Behind a load balancer an earlier
   // attempt of the same request may have been forwarded, so it is an unknown outcome, never proof that nothing was sent. The resend loop
   // (`submitThroughRateLimit`) is still safe: it resends the same signed bytes.
@@ -111,6 +156,8 @@ export interface SubmitResult {
   ambiguous?: boolean;
   /** S245: the RPC refused the send with a rate limit (HTTP 429, -32007, "request limit reached"). Definite: nothing was accepted, so resending the same signed transaction is safe. */
   rateLimited?: boolean;
+  /** R4-10: the RPC refused the caller with this HTTP status (401, 402 or 403): the plan expired or the key was refused. Definite: nothing was forwarded. `error` starts with RPC_AUTH_REJECTED. */
+  authRejected?: number;
   bundleId?: string;
   transport: 'SOLANA_RPC' | 'JITO';
   success: boolean;
@@ -189,16 +236,24 @@ export class SolanaRpcTransport implements ExecutionTransport {
       this.lastLatencyMs = duration;
       const ambiguous = !isDefiniteSendRejection(err);
       const rateLimited = isRateLimitedSendError(err);
-      Logger.error(`RPC submit failed${rateLimited ? ' (rate limited; outcome unknown, it is watched)' : ambiguous ? ' (outcome unknown: it may have been forwarded)' : ''}: ${err.message}`);
+      const authStatus = rpcAuthRejectionStatus(err);
+      const message = String(err?.message ?? err);
+      if (authStatus !== null) {
+        noteRpcAuthRejected(authStatus, 'sendTransaction');
+        Logger.error(`RPC submit refused (${RPC_AUTH_REJECTED}, HTTP ${authStatus}: ${RPC_AUTH_REJECTED_TEXT}; not forwarded): ${message}`);
+      } else {
+        Logger.error(`RPC submit failed${rateLimited ? ' (rate limited; outcome unknown, it is watched)' : ambiguous ? ' (outcome unknown: it may have been forwarded)' : ''}: ${message}`);
+      }
       return {
         signature: localSignature(tx),
         transport: 'SOLANA_RPC',
         success: false,
         ambiguous,
         rateLimited,
+        ...(authStatus !== null ? { authRejected: authStatus } : {}),
         submitDurationMs: duration,
         lifecycleState: 'SUBMIT_FAILED',
-        error: err.message,
+        error: authStatus !== null ? `${RPC_AUTH_REJECTED}: ${RPC_AUTH_REJECTED_TEXT} (HTTP ${authStatus}); nothing was forwarded. ${message}` : message,
       };
     }
   }
@@ -262,7 +317,7 @@ export class SolanaRpcTransport implements ExecutionTransport {
     signature: string,
     maxWaitMs = 25000,
     _bundleId?: string,
-    opts: { rebroadcast?: VersionedTransaction; lastValidBlockHeight?: number; resendEveryMs?: number; maxExtendMs?: number } = {}
+    opts: { rebroadcast?: VersionedTransaction; lastValidBlockHeight?: number; resendEveryMs?: number; maxExtendMs?: number; stopResends?: () => string | null } = {}
   ): Promise<ConfirmationResult> {
     const t0 = performance.now();
     const now = confirmPacing.now;
@@ -308,14 +363,21 @@ export class SolanaRpcTransport implements ExecutionTransport {
       }
       if (opts.rebroadcast && !resendStopped && t - lastResend >= resendEveryMs) {
         lastResend = t;
-        // through submit, so the read-only and cluster guards run on every resend; a failed resend is logged there and only skips this round
-        try {
-          await this.submit(opts.rebroadcast, { maxRetries: 0 });
-        } catch (guardErr: any) {
-          // Review L1: a guard that throws before sending (read-only turned on, or the cluster refused, mid-watch) stops the resends only.
-          // The transaction may already have landed, so the watch goes on and settles the row as it would without resends.
+        // R1 #8: the caller may stop the resends (a BUY after a kill or halt); the watch goes on, as after a guard that throws below
+        const stopWhy = opts.stopResends?.() ?? null;
+        if (stopWhy) {
           resendStopped = true;
-          Logger.warn(`Resends of ${signature.slice(0, 8)} stopped, the watch goes on: ${guardErr?.message ?? String(guardErr)}`);
+          Logger.warn(`Resends of ${signature.slice(0, 8)} stopped, the watch goes on: ${stopWhy}`);
+        } else {
+          // through submit, so the read-only and cluster guards run on every resend; a failed resend is logged there and only skips this round
+          try {
+            await this.submit(opts.rebroadcast, { maxRetries: 0 });
+          } catch (guardErr: any) {
+            // Review L1: a guard that throws before sending (read-only turned on, or the cluster refused, mid-watch) stops the resends only.
+            // The transaction may already have landed, so the watch goes on and settles the row as it would without resends.
+            resendStopped = true;
+            Logger.warn(`Resends of ${signature.slice(0, 8)} stopped, the watch goes on: ${guardErr?.message ?? String(guardErr)}`);
+          }
         }
       }
       await confirmPacing.sleep(400);

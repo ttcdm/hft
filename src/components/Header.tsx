@@ -1,4 +1,6 @@
-import { PillState, readPillState, signedUsd, pillTone } from '../utils/pnlPill';
+import { PillState, readPillState, signedUsd, usdTone } from '../utils/pnlPill';
+
+const USD_TONE = { up: 'text-emerald-300', down: 'text-rose-300', flat: 'text-slate-300', unknown: 'text-slate-500' } as const;
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Activity,
@@ -26,6 +28,7 @@ import { AutoHeaderBadge, useAutoStatus } from './AutoPanel';
 import { usePolled } from '../utils/usePolled';
 import { ReadOnlyPill } from './TradingModeBanner';
 import { publishHeaderHeight } from '../utils/headerOffset';
+import { ageText, isStale, PILL_STALE_MS } from '../utils/freshness';
 
 /** Facts, not adjectives: how many of the live checks are not OK. */
 export function checksBadgeFor(checks: Array<{ status: string }> | null): { text: string; tone: string } {
@@ -34,9 +37,35 @@ export function checksBadgeFor(checks: Array<{ status: string }> | null): { text
   return bad === 0 ? { text: `${checks.length}/${checks.length} OK`, tone: 'bg-emerald-500/20 text-emerald-300' } : { text: `${bad} not OK`, tone: 'bg-amber-500/20 text-amber-300' };
 }
 
+/**
+ * R6-2: real LIVE positions still open while the server is not in LIVE (after a kill switch, panic or DISARM). Shown at every width,
+ * apart from the paper totals, so the screen never says "no exposure" while real SOL is in tokens.
+ */
+export const LiveOpenChip: React.FC<{ live: PillState['live'] }> = ({ live }) =>
+  live ? (
+    <span
+      data-testid="live-open-chip"
+      title="Real LIVE positions are still open while the server is not in LIVE. Their exits keep running. Close them from Plug & Play."
+      className="flex items-center space-x-1 px-2 py-1 rounded-lg border border-rose-500/60 bg-rose-950/80 text-rose-200 text-[11px] font-mono font-bold whitespace-nowrap"
+    >
+      <span>LIVE {live.openCount} open</span>
+      <span className="opacity-80">{signedUsd(live.unrealizedUsd)}</span>
+      <span className="text-[10px] opacity-70">today {signedUsd(live.realizedUsd)}</span>
+    </span>
+  ) : null;
+
+/** R6-7: "stale" on the PnL pill when the last fetch failed or the last good answer is old. */
+export const PillStaleNote: React.FC<{ at: number | null; failed: boolean; now: number }> = ({ at, failed, now }) =>
+  isStale(at, failed, now, PILL_STALE_MS) ? (
+    <span data-testid="pill-stale" className="text-[10px] font-bold text-amber-300">
+      {at === null ? 'not read' : `STALE ${ageText(now - at)}`}
+    </span>
+  ) : null;
+
 interface HeaderProps {
   kpis: PerformanceKPIs;
-  isHalted: boolean;
+  /** R10-2: null when the server's kill-switch state is not known (not read yet, logged out, or the read failed) */
+  isHalted: boolean | null;
   onToggleKillSwitch: () => void;
   onOpenAiDiagnostics: () => void;
   onOpenSystemChecks: () => void;
@@ -88,16 +117,28 @@ export const Header: React.FC<HeaderProps> = ({
 
   // Live Auto-Profit Ticker State (fetched from walletTrader) - Clean initial state (B22)
   const [profitSummary, setProfitSummary] = useState<PillState | null>(null);
+  // R6-7: the pill keeps its last values when a fetch fails, so it says when they are stale
+  const [profitAt, setProfitAt] = useState<number | null>(null);
+  const [profitFailed, setProfitFailed] = useState(false);
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  const pillStale = isStale(profitAt, profitFailed, nowTick, PILL_STALE_MS);
 
   useEffect(() => {
     const fetchProfit = async () => {
+      setNowTick(Date.now());
       try {
         const res = await authFetch('/api/wallet/state');
         if (res.ok) {
           const json = await res.json();
           setProfitSummary(readPillState(json.data));
+          setProfitAt(Date.now());
+          setProfitFailed(false);
+        } else {
+          setProfitFailed(true);
         }
-      } catch {}
+      } catch {
+        setProfitFailed(true);
+      }
     };
     fetchProfit();
     const interval = setInterval(fetchProfit, 3500);
@@ -141,12 +182,14 @@ export const Header: React.FC<HeaderProps> = ({
     }
   };
 
-  // UI-6: below 1024 px the header wraps onto more rows instead of running off the right edge, so the nav and KILL SWITCH stay reachable
+  // UI-6 / R9-8: the header wraps onto more rows at every width instead of running off the right edge (at 1024 px it did not wrap and
+  // KILL SWITCH sat past the edge). The right-hand group wraps too, and KILL SWITCH never shrinks, so it is always on screen.
   return (
     <header
       ref={headerRef}
       id="apex-header"
-      className="min-h-16 lg:h-16 border-b border-[#1E293B] bg-[#0A0E17]/98 backdrop-blur px-3 sm:px-4 lg:px-6 py-2 lg:py-0 flex flex-wrap lg:flex-nowrap gap-y-2 items-center justify-between sticky top-0 z-50 w-full"
+      data-testid="apex-header"
+      className="min-h-16 border-b border-[#1E293B] bg-[#0A0E17]/98 backdrop-blur px-3 sm:px-4 lg:px-6 py-2 flex flex-wrap gap-y-2 items-center justify-between sticky top-0 z-50 w-full max-w-full"
     >
       {/* 1. BRAND & FEED SELECTOR */}
       <div className="flex items-center space-x-2.5 sm:space-x-3 flex-shrink-0">
@@ -225,21 +268,23 @@ export const Header: React.FC<HeaderProps> = ({
       </nav>
 
       {/* 3. RIGHT CONTROLS: AUTO-PROFIT PILL, QUANT SUITE, DEPLOY, KILL SWITCH */}
-      <div className="flex items-center space-x-1.5 sm:space-x-2 flex-shrink-0">
+      <div data-testid="header-right" className="flex flex-wrap items-center justify-end gap-1.5 sm:gap-2 min-w-0 ml-auto">
+        <LiveOpenChip live={profitSummary?.live} />
         {/* Q35: today's realized and the open positions' marked P&L, as the server reports them (a dash when it cannot say) */}
         <button
           id="btn-auto-profit-ticker"
           onClick={() => handleNavClick('PLUG_AND_PLAY')}
-          title="Realized profit today (net of fees) and the marked profit of the open positions, from the server. Click for the wallet positions."
-          className={`hidden min-[1500px]:flex items-center space-x-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-mono transition ${
-            { up: 'bg-emerald-950/70 border-emerald-500/40 text-emerald-300', down: 'bg-rose-950/70 border-rose-500/40 text-rose-300', flat: 'bg-slate-900 border-slate-700 text-slate-300', unknown: 'bg-slate-900 border-slate-700 text-slate-500' }[pillTone(profitSummary)]
+          title="Realized profit today (net of fees) and the open positions' profit at the curve spot price (exit fee, price impact and tip NOT taken off), in USD at today's SOL price, from the server. Click for the wallet positions."
+          className={`hidden sm:flex items-center space-x-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-mono transition ${
+            pillStale ? 'bg-slate-900 border-slate-700 text-slate-500' : 'bg-slate-900 border-slate-700 text-slate-300'
           }`}
         >
           <span className="text-[10px] opacity-70">today</span>
-          <span className="font-bold tracking-tight">{signedUsd(profitSummary?.realizedUsd)}</span>
-          <span className="text-[10px] opacity-70">open</span>
-          <span className="font-bold tracking-tight">{signedUsd(profitSummary?.unrealizedUsd)}</span>
+          <span data-testid="pill-realized" className={`font-bold tracking-tight ${pillStale ? '' : USD_TONE[usdTone(profitSummary?.realizedUsd)]}`}>{signedUsd(profitSummary?.realizedUsd)}</span>
+          <span className="text-[10px] opacity-70">open at mark</span>
+          <span data-testid="pill-open" className={`font-bold tracking-tight ${pillStale ? '' : USD_TONE[usdTone(profitSummary?.unrealizedUsd)]}`}>{signedUsd(profitSummary?.unrealizedUsd)}</span>
           <span className="text-[10px] opacity-70">({profitSummary?.openCount ?? '—'})</span>
+          <PillStaleNote at={profitAt} failed={profitFailed} now={nowTick} />
         </button>
 
         {/* Direct Quant Tools (Expanded on 2XL screens) */}
@@ -394,17 +439,25 @@ export const Header: React.FC<HeaderProps> = ({
         <button
           id="btn-emergency-kill-switch"
           onClick={onToggleKillSwitch}
-          className={`px-2.5 sm:px-3 py-1 rounded-lg border text-xs font-black font-mono tracking-wider transition flex items-center space-x-1 ${
+          className={`flex-shrink-0 whitespace-nowrap px-2.5 sm:px-3 py-1 rounded-lg border text-xs font-black font-mono tracking-wider transition flex items-center space-x-1 ${
             isHalted
               ? 'bg-emerald-500/15 hover:bg-emerald-500/25 border-emerald-500/50 text-emerald-400 shadow-lg shadow-emerald-500/15'
               : 'bg-red-500/15 hover:bg-red-500/25 border-red-500/50 text-red-400 shadow-lg shadow-red-500/15 animate-pulse'
           }`}
-          title="KILL SWITCH - the server refuses new orders and disarms LIVE trading. Open positions are not sold; protective exits keep running."
+          title={isHalted === null
+            ? 'Kill-switch state UNKNOWN: the server has not answered (not signed in, or not reachable). Pressing sends "engage"; it never resumes.'
+            : 'KILL SWITCH - the server refuses new orders and disarms LIVE trading. Open positions are not sold; protective exits keep running.'}
         >
-          {isHalted ? (
+          {isHalted === true ? (
             <>
               <ShieldAlert className="w-3.5 h-3.5 text-emerald-400" />
               <span>RESUME</span>
+            </>
+          ) : isHalted === null ? (
+            <>
+              <AlertOctagon className="w-3.5 h-3.5 text-amber-400" />
+              <span>KILL SWITCH</span>
+              <span className="text-[9px] font-bold text-amber-300" data-testid="kill-state-unknown">(state UNKNOWN)</span>
             </>
           ) : (
             <>

@@ -67,6 +67,8 @@ export interface PathOptions {
    * 5A: the data is known to be complete up to here (the recording window, or the corpus's whole curve life). A fill or a stale decision
    * after the last recorded print is priced at that print only up to this time (no print means the curve did not move); past it the
    * position stays open. Default: the last recorded print (nothing is assumed about time the data does not show).
+   * R7-12: when it is given, a buy that would land after it (and after the last print) is not entered: simulatePath returns null. Without
+   * it (the corpus studies, whose data runs to the curve's end) the buy still fills at the last print.
    */
   coveredUntilTs?: number;
 }
@@ -93,6 +95,9 @@ export function simulatePath(trades: TradeRow[], releaseTs: number, lat: Latency
     if (entryIdx < 0) return null;
     entryTs = trades[entryIdx][0];
   } else {
+    // R7-12: with a known coverage end (the in-app replay always passes one), a buy that lands after it is not priced: the last print is
+    // not the curve state then (a TRADE_CAP launch's later trades were dropped, an unresolved recording may have stopped).
+    if (opts.coveredUntilTs !== undefined && landing > Math.max(opts.coveredUntilTs, trades[n - 1][0])) return null;
     entryIdx = stateAt(trades, landing);
     entryTs = landing;
     if (entryIdx < 0) { entryIdx = 0; entryTs = trades[0][0]; } // nothing traded before the landing: the first print is the first known state

@@ -299,7 +299,9 @@ describe('3B: unresolved LIVE buys count everywhere; the wallet audit knows them
     expect(auditWalletChange(1, 1 - 0.0075, journal, unresolved)).toMatchObject({ explained: true, heldByUnresolved: true });
     expect(auditWalletChange(1, 1 - 0.0075, journal).explained).toBe(false); // the same drop with nothing unresolved
     expect(auditWalletChange(1, 1 - 0.0075 - WALLET_AUDIT_RENT_ALLOWANCE_SOL - 0.01, journal, unresolved).explained).toBe(false);
-    expect(auditWalletChange(1, 1.01, journal, unresolved).explained).toBe(false); // a rise is never an unresolved buy
+    // a rise is never an unresolved buy; R8-1: it is an inflow (logged, not a halt reason), never held as a buy's
+    expect(auditWalletChange(1, 1.01, journal, unresolved)).toMatchObject({ explained: true, heldByUnresolved: false });
+    expect(auditWalletChange(1, 1.01, journal, unresolved).inflowSol).toBeCloseTo(0.01, 9);
   });
 
   it('R1-38: a manual LIVE buy during DEVNET_LIVE journals its wallet delta once and does not halt', async () => {

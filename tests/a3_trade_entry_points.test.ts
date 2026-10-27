@@ -18,6 +18,9 @@ import {
 } from '../server/execution/tradeInputs';
 import { walletTrader } from '../server/walletTrader';
 import { executionCoordinator } from '../server/execution/coordinator';
+import { memecoinAggregator } from '../server/memecoinAggregator';
+import { solPriceService } from '../server/market/solPriceService';
+import { newPumpPool } from './fixtures/auto';
 
 const MINT = 'CzLSujWBLFsSjncfkh59rQD4NJYsZUMffEFrNJfiBA52';
 
@@ -70,7 +73,12 @@ describe('A3: trade entry point validation', () => {
 
     it('walletTrader.executeLiveSnipe sends MANUAL_OPERATOR provenance to the coordinator', async () => {
       const exec = vi.spyOn(executionCoordinator, 'executeTrade').mockResolvedValue({ success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'PAPER', error: 'stub', correlationId: 'c' });
-      await walletTrader.executeLiveSnipe({ mint: MINT, amountSol: 0.01 });
+      // R5-40: the buy runs executeSnipe's gates first, so it needs a real pool, a SOL price and (for this check) the confluence gate off
+      solPriceService.setPrice(150, 'TEST_FIXTURE');
+      memecoinAggregator.setConfluenceGating(false);
+      const { mint } = newPumpPool('NONE');
+      await walletTrader.executeLiveSnipe({ mint, amountSol: 0.01 });
+      memecoinAggregator.setConfluenceGating(true);
       expect(exec).toHaveBeenCalledWith(expect.objectContaining({ provenance: 'MANUAL_OPERATOR', source: 'MANUAL' }));
     });
   });

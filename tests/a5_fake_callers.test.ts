@@ -115,17 +115,26 @@ describe('A5: fake callers cannot drive auto-snipe', () => {
     expect(calloutProvenance(real)).toBe('REAL_SOCIAL');
   });
 
-  it('lets the synthetic-pool check win over an explicit REAL_ONCHAIN provenance', async () => {
-    // An unknown mint in PAPER mode resolves to a fabricated pool-simulated-* pool.
+  it('lets the placeholder-pool check win over an explicit REAL_ONCHAIN provenance', async () => {
+    // R10-8: an unknown mint no longer gets an invented pool; a placeholder (callout-derived) pool is the case left to check.
     const tradeSpy = vi
       .spyOn(executionCoordinator, 'executeTrade')
       .mockResolvedValue({ success: false, error: 'stubbed for A5 provenance check' } as any);
+    const mint = 'A5UnknownMint1111111111111111111111111111111';
+    const pools = (memecoinAggregator as any).pools as any[];
+    pools.unshift({
+      id: `pool-callout-${mint.slice(0, 8)}`, platform: 'PUMP_FUN', chain: 'SOLANA', symbol: 'A5', name: 'A5', contractAddress: mint, priceUsd: 0.00005,
+      priceNative: 0.0000003, marketCapUsd: 0, liquidityUsd: 15000, bondingCurveProgress: 50, isMigrated: false, volume5mUsd: 0, volume1hUsd: 0,
+      volume24hUsd: 0, priceChange5mPct: 0, priceChange1hPct: 0, buys5m: 0, sells5m: 0, top10HoldersPct: 15, devHoldingPct: 0.8, isMintRevoked: true,
+      isFreezeRevoked: true, isLpBurned: false, rugcheckScore: 'SAFE', createdAgo: 'test', trendingRank: 1, unverified: true,
+    });
 
     await memecoinAggregator.executeSnipe({
-      contractAddress: 'A5UnknownMint1111111111111111111111111111111',
+      contractAddress: mint,
       amountUsd: 5,
       provenance: 'REAL_ONCHAIN',
     });
+    pools.splice(pools.findIndex((p) => p.contractAddress === mint), 1);
 
     expect(tradeSpy).toHaveBeenCalledTimes(1);
     expect(tradeSpy.mock.calls[0][0].provenance).toBe('SYNTHETIC_TEST');

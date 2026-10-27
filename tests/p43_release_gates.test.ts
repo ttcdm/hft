@@ -15,7 +15,7 @@ import { setConfluenceThreshold, resetConfluenceThreshold, CONFLUENCE_DEVNET_LIV
 import { PumpCurveService } from '../server/solana/pumpCurve';
 import type { PumpTradeEvent } from '../server/solana/pumpFeedListener';
 import { setAutoMode, resetAuto, newPumpPool } from './fixtures/auto';
-import { replay, buyers, wallet } from './fixtures/watch';
+import { replay, buyers, wallet, type Step } from './fixtures/watch';
 import { createSimulatedBondingCurveState } from './e2e/helpers/simulatedStates';
 import { replayLaunch, type RecordedLaunch } from '../server/backtest/replay';
 import { eventToJson } from '../server/backtest/launchRecorder';
@@ -87,7 +87,8 @@ describe('P4.3: release gates', () => {
     await setAutoMode('PAPER');
     const snipe = vi.spyOn(memecoinAggregator, 'executeSnipe');
     const { mint } = newPumpPool('NONE');
-    releaseReady(mint, [[0, wallet(), 'buy', 0.3], [10, wallet(), 'buy', 0.2]], 75); // one wallet has 60% of the buy volume
+    // one wallet has 80% of the buy volume; R8-2: flow needs five distinct buying wallets, so five small ones make it the one passing signal
+    releaseReady(mint, [[0, wallet(), 'buy', 1.0], ...[2, 4, 6, 8, 10].map((t): Step => [t, wallet(), 'buy', 0.05])], 75);
     const v = watchWindow.getVerdict(mint)!;
     expect([v.state, v.score, v.passingSignals, v.concentrationPass]).toEqual(['READY', 75, 1, false]);
     const d = await autoSnipeController.submitCandidate(cand(mint));

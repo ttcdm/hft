@@ -163,10 +163,12 @@ describe('Phase 2 Remediation Suite (B02, B08, B09, B23)', () => {
       const listener = new PumpFeedListener(executionCoordinator.getConnection());
       const started = await listener.start();
       expect(started).toBe(true);
-      expect(listener.isActive()).toBe(true);
       const tel = listener.getTelemetry();
-      expect(tel.status).toBe('ACTIVE');
       expect(tel.subscriptionId !== null).toBe(true);
+      // Devnet run 25 (3K): ACTIVE only once the server confirms the subscription; no server answers here, so it stays CONNECTING
+      expect(tel.status).toBe('CONNECTING');
+      expect(tel.subscriptionConfirmed).toBe(false);
+      expect(listener.isActive()).toBe(false);
 
       await listener.stop();
       expect(listener.isActive()).toBe(false);

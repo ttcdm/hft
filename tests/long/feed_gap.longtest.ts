@@ -48,7 +48,8 @@ describe('localnet_dropWebSockets mid-watch', () => {
     listener.on('trade_event', (t: any) => { if (!t.isBuy) sells.push(t.signature); });
     try {
       expect(await listener.start()).toBe(true);
-      expect(listener.getTelemetry().status).toBe('ACTIVE');
+      // devnet run 25 (3K): ACTIVE once the validator confirms the subscription (CONNECTING until then)
+      expect(await until(() => listener.getTelemetry().status === 'ACTIVE' && listener.getTelemetry().subscriptionConfirmed, 5_000)).toBe(true);
       await sleep(2_500); // the socket opens and the slot heartbeat (the validator's slotSubscribe) starts
 
       const mint = await market.createCoin('GAP');

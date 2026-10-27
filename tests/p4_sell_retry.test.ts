@@ -116,10 +116,10 @@ describe('P4: sell preflight, slippage ladder and retry backoff', () => {
       signature: sig, orderId: `o_${posId}`, correlationId: `c_${posId}`, mint: VALID_PUMP_MINT_1.toBase58(), direction: 'SELL',
       submissionTransport: 'SOLANA_RPC', submissionTime: Date.now(), reconciliationState: 'PENDING', networkFeeLamports: 5000, jitoTipLamports: 0, executionMode: 'LIVE',
     });
-    expect(workstationDb.getPendingTransactions().some((t) => t.signature === sig)).toBe(true);
+    expect(workstationDb.getPendingTransactions()!.some((t) => t.signature === sig)).toBe(true);
     const res = await coordinator.closePosition(posId, 100, 'MANUAL');
     expect(res.success).toBe(true);
-    expect(workstationDb.getPendingTransactions().some((t) => t.signature === sig)).toBe(false);
+    expect(workstationDb.getPendingTransactions()!.some((t) => t.signature === sig)).toBe(false);
     const row = workstationDb.loadTransactions(`o_${posId}`).find((t) => t.signature === sig)!;
     expect(row.reconciliationState).toBe('RECONCILED');
     expect(row.landingSlot).toBe(6);
@@ -136,6 +136,9 @@ describe('P4: sell preflight, slippage ladder and retry backoff', () => {
     const expected = [3000, 6000, 12000, 24000, 30000, 30000];
     expect(EXIT_RETRY_BASE_MS).toBe(3000);
     expect(EXIT_RETRY_MAX_MS).toBe(30000);
+    // R2-5: only a failure that was sent (and cost a fee) backs off; a failed simulation steps the ladder with no wait (test below)
+    simulate.mockImplementation(async () => ({ context: { slot: 1 }, value: { err: null, logs: [] } }));
+    submit.mockResolvedValue({ success: false, signature: 'reverted', transport: 'SOLANA_RPC', error: 'Transaction reverted on chain', lifecycleState: 'REVERTED' });
     for (const want of expected) {
       const before = Date.now();
       await coordinator.closePosition(posId, 100, 'STOP_LOSS');
@@ -143,8 +146,34 @@ describe('P4: sell preflight, slippage ladder and retry backoff', () => {
       expect(wait).toBeGreaterThanOrEqual(want);
       expect(wait).toBeLessThanOrEqual(want + 5000); // wall time of the call itself
       // jump past the deadline so the next loop iteration is the "next" attempt
-      (coordinator as any).exitFailures.get(posId).nextAttemptAt = 0;
+      (coordinator as any).exitFailures.get(`${posId}|STOP_LOSS`).nextAttemptAt = 0;
     }
+  });
+
+  it('R2-5: a failed simulation steps the ladder but sets no backoff (nothing was sent, no fee)', async () => {
+    await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+    expect(coordinator.getExitFailureCount(posId, 'STOP_LOSS')).toBe(1);
+    expect(coordinator.exitSlippageBps(posId, 'STOP_LOSS')).toBe(SELL_SLIPPAGE_LADDER_BPS[1]);
+    expect(coordinator.exitRetryWaitMs(posId, Date.now(), 'STOP_LOSS')).toBe(0);
+  });
+
+  it('R5-6: take-profit failures neither widen the stop-loss slippage nor hold it with their backoff', async () => {
+    simulate.mockImplementation(async () => ({ context: { slot: 1 }, value: { err: null, logs: [] } }));
+    submit.mockResolvedValue({ success: false, signature: 'reverted', transport: 'SOLANA_RPC', error: 'Transaction reverted on chain', lifecycleState: 'REVERTED' });
+    for (let i = 0; i < 3; i++) {
+      await coordinator.closePosition(posId, 33, 'TAKE_PROFIT_1');
+      (coordinator as any).exitFailures.get(`${posId}|TAKE_PROFIT_1`).nextAttemptAt = 0;
+    }
+    expect(coordinator.getExitFailureCount(posId, 'TAKE_PROFIT_1')).toBe(3);
+    expect(coordinator.exitSlippageBps(posId, 'TAKE_PROFIT_1')).toBe(SELL_SLIPPAGE_LADDER_BPS[3]);
+    (coordinator as any).exitFailures.get(`${posId}|TAKE_PROFIT_1`).nextAttemptAt = Date.now() + 30_000;
+    expect(coordinator.exitRetryWaitMs(posId, Date.now(), 'TAKE_PROFIT_1')).toBeGreaterThan(0);
+    // the stop-loss starts at the base step and is not backing off
+    expect(coordinator.exitSlippageBps(posId, 'STOP_LOSS')).toBe(SELL_SLIPPAGE_LADDER_BPS[0]);
+    expect(coordinator.exitRetryWaitMs(posId, Date.now(), 'STOP_LOSS')).toBe(0);
+    submit.mockResolvedValue({ success: true, signature: 'sellsig', transport: 'SOLANA_RPC', slot: 5, lifecycleState: 'CONFIRMED' });
+    await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+    expect(lastSlippage()).toBe(SELL_SLIPPAGE_LADDER_BPS[0]);
   });
 
   it('an operator alert is raised once failures reach the threshold and cleared by a success', async () => {
@@ -184,14 +213,31 @@ describe('P4: sell preflight, slippage ladder and retry backoff', () => {
     });
 
     it('does not retry a stop-loss while backing off, and retries once the deadline passes', async () => {
-      const closeSpy = vi.spyOn(coordinator, 'closePosition').mockResolvedValue({ success: false, pnlSol: 0, error: 'SELL_SIMULATION_FAILED: x' });
-      (coordinator as any).recordExitOutcome(posId, { success: false, error: 'SELL_SIMULATION_FAILED: x' }, 'LIVE');
+      const closeSpy = vi.spyOn(coordinator, 'closePosition').mockResolvedValue({ success: false, pnlSol: 0, error: 'Transaction reverted on chain' });
+      (coordinator as any).recordExitOutcome(posId, { success: false, error: 'Transaction reverted on chain' }, 'LIVE', 'STOP_LOSS');
       await coordinator.evaluateAndProcessExits();
       const callsForPos = () => closeSpy.mock.calls.filter((c) => c[0] === posId).length;
       expect(callsForPos()).toBe(0);
-      (coordinator as any).exitFailures.get(posId).nextAttemptAt = Date.now() - 1;
+      (coordinator as any).exitFailures.get(`${posId}|STOP_LOSS`).nextAttemptAt = Date.now() - 1;
       await coordinator.evaluateAndProcessExits();
       expect(callsForPos()).toBe(1);
+    });
+
+    it('R2-5: a take-profit backing off does not hold the stop-loss', async () => {
+      const closeSpy = vi.spyOn(coordinator, 'closePosition').mockResolvedValue({ success: true, pnlSol: -0.05 });
+      (coordinator as any).recordExitOutcome(posId, { success: false, error: 'Transaction reverted on chain' }, 'LIVE', 'TAKE_PROFIT_1');
+      expect(coordinator.exitRetryWaitMs(posId, Date.now(), 'TAKE_PROFIT_1')).toBeGreaterThan(0);
+      await coordinator.evaluateAndProcessExits();
+      expect(closeSpy.mock.calls.some((c) => c[0] === posId && c[2] === 'STOP_LOSS')).toBe(true);
+    });
+
+    it('R5-21: a LIVE position with a stale mark already below its trailing stop still gets its TRAILING_STOP', async () => {
+      const closeSpy = vi.spyOn(coordinator, 'closePosition').mockResolvedValue({ success: true, pnlSol: 0.01 });
+      vi.spyOn(coordinator as any, 'refreshStaleMark').mockResolvedValue(false); // no fresh price can be read
+      const r = workstationDb.loadPositions().find((p) => p.id === posId)!;
+      workstationDb.savePosition({ ...r, currentPriceSol: 0.000118, highWaterMarkSol: 0.00015, trailingStopSol: 0.00012, lastMarkTimestamp: Date.now() - 20_000 } as any);
+      await coordinator.evaluateAndProcessExits();
+      expect(closeSpy.mock.calls.some((c) => c[0] === posId && c[2] === 'TRAILING_STOP')).toBe(true);
     });
 
     it('a position with no failures is exited on the first tick', async () => {
@@ -199,6 +245,22 @@ describe('P4: sell preflight, slippage ladder and retry backoff', () => {
       await coordinator.evaluateAndProcessExits();
       expect(closeSpy.mock.calls.some((c) => c[0] === posId && c[2] === 'STOP_LOSS')).toBe(true);
     });
+  });
+
+  it('R8-5: no sellable route (venue UNKNOWN) sends nothing, keeps the base slippage step and raises EXIT_NO_ROUTE', async () => {
+    (PumpSwapVenueService.resolveVenue as any).mockResolvedValue({ venue: 'UNKNOWN' });
+    for (let i = 0; i < 5; i++) {
+      const res = await coordinator.closePosition(posId, 100, 'STOP_LOSS');
+      expect(res.error).toMatch(/^UNKNOWN_TRADING_VENUE/);
+    }
+    expect(submit).not.toHaveBeenCalled();
+    expect(coordinator.exitSlippageBps(posId, 'STOP_LOSS')).toBe(SELL_SLIPPAGE_LADDER_BPS[0]);
+    expect(coordinator.exitRetryWaitMs(posId, Date.now(), 'STOP_LOSS')).toBe(0);
+    expect(coordinator.getOperatorAlerts().some((a) => a.code === 'EXIT_NO_ROUTE' && a.positionId === posId)).toBe(true);
+    (PumpSwapVenueService.resolveVenue as any).mockResolvedValue({ venue: 'PUMP_BONDING_CURVE' });
+    simulate.mockImplementation(async () => ({ context: { slot: 1 }, value: { err: null, logs: [] } }));
+    expect((await coordinator.closePosition(posId, 100, 'STOP_LOSS')).success).toBe(true);
+    expect(coordinator.getOperatorAlerts().some((a) => a.code === 'EXIT_NO_ROUTE' && a.positionId === posId)).toBe(false);
   });
 
   it('R10: a sell that cannot be quoted sends nothing, does not advance backoff or the slippage ladder, and raises its own alert', async () => {

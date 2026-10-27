@@ -12,10 +12,37 @@ export interface OperatorSession {
   role: 'OPERATOR' | 'READONLY';
 }
 
+/** The shortest OPERATOR_AUTH_TOKEN the server accepts; a shorter one is ignored and a volatile token is generated instead. */
+export const MIN_OPERATOR_TOKEN_LENGTH = 16;
+
+/**
+ * R4-11, R4-39: the boot warnings about operator access, never containing a credential. One when OPERATOR_AUTH_TOKEN is set but too short
+ * (it is ignored), and one when there is neither a usable OPERATOR_AUTH_TOKEN nor an OPERATOR_PASSWORD: then the volatile token generated at
+ * boot is the only way in, and a restart (or `/api/auth/rotate`) changes it.
+ */
+export function operatorAuthBootWarnings(env: NodeJS.ProcessEnv = process.env): string[] {
+  const out: string[] = [];
+  const token = env.OPERATOR_AUTH_TOKEN ?? '';
+  const tokenOk = token.length >= MIN_OPERATOR_TOKEN_LENGTH;
+  if (token.length > 0 && !tokenOk) {
+    out.push(`OPERATOR_AUTH_TOKEN IS SET BUT SHORTER THAN ${MIN_OPERATOR_TOKEN_LENGTH} CHARACTERS AND WAS IGNORED: a volatile token is used instead. Set a token of ${MIN_OPERATOR_TOKEN_LENGTH}+ characters (openssl rand -hex 32) and restart.`);
+  }
+  if (!tokenOk && !(env.OPERATOR_PASSWORD && env.OPERATOR_PASSWORD.length > 0)) {
+    out.push('NO OPERATOR_AUTH_TOKEN (16+ chars) AND NO OPERATOR_PASSWORD: the volatile token generated at this boot is the ONLY way to reach the kill switch and panic. It does not expire, but a restart replaces it. Set OPERATOR_AUTH_TOKEN or OPERATOR_PASSWORD.');
+  }
+  return out;
+}
+
 export class AuthManager {
   private sessions: Map<string, OperatorSession> = new Map();
   private primaryOperatorToken: string;
-  private readonly sessionTtlMs = 24 * 60 * 60 * 1000; // 24 hours
+  private readonly sessionTtlMs = 24 * 60 * 60 * 1000; // 24 hours, for sessions from a password login or createSession
+  /**
+   * R4-11: the primary operator token (OPERATOR_AUTH_TOKEN, the volatile boot token, or the token a rotate returns) never expires. It used
+   * to expire after 24 h with no way to renew it, which locked the kill switch and panic out until a restart. A logout or a rotate still
+   * revokes it.
+   */
+  private static readonly PRIMARY_EXPIRES_AT = Number.POSITIVE_INFINITY;
   private readonly revokeListeners = new Set<() => void>();
 
   constructor() {
@@ -32,14 +59,16 @@ export class AuthManager {
   }
 
   private initPrimaryToken(): string {
+    // R4-11, R4-39: say loudly (and without printing any token) when the configured access is missing or was ignored
+    for (const w of operatorAuthBootWarnings()) console.error(`\n!!! ${w}\n`);
     // If environment variable provides a token, use it
-    if (process.env.OPERATOR_AUTH_TOKEN && process.env.OPERATOR_AUTH_TOKEN.length >= 16) {
+    if (process.env.OPERATOR_AUTH_TOKEN && process.env.OPERATOR_AUTH_TOKEN.length >= MIN_OPERATOR_TOKEN_LENGTH) {
       const token = process.env.OPERATOR_AUTH_TOKEN;
       this.sessions.set(token, {
         token,
         createdAt: Date.now(),
         lastActiveAt: Date.now(),
-        expiresAt: Date.now() + 365 * 24 * 60 * 60 * 1000,
+        expiresAt: AuthManager.PRIMARY_EXPIRES_AT,
         role: 'OPERATOR',
       });
       return token;
@@ -51,7 +80,7 @@ export class AuthManager {
       token,
       createdAt: Date.now(),
       lastActiveAt: Date.now(),
-      expiresAt: Date.now() + this.sessionTtlMs,
+      expiresAt: AuthManager.PRIMARY_EXPIRES_AT,
       role: 'OPERATOR',
     };
     this.sessions.set(token, session);
@@ -85,7 +114,7 @@ export class AuthManager {
       token: newToken,
       createdAt: Date.now(),
       lastActiveAt: Date.now(),
-      expiresAt: Date.now() + this.sessionTtlMs,
+      expiresAt: AuthManager.PRIMARY_EXPIRES_AT,
       role: 'OPERATOR',
     });
     Logger.warn('Operator session rotated: all previous tokens revoked, new ephemeral token active.');

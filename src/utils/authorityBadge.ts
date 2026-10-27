@@ -1,5 +1,7 @@
 /** Q10c: mint / freeze authority badges from the value the server reported. Unknown is shown as unknown, never as revoked. */
-export function authorityBadge(kind: 'Mint' | 'Freeze', revoked: boolean | null | undefined): { text: string; tone: 'ok' | 'bad' | 'unknown' } {
+export function authorityBadge(kind: 'Mint' | 'Freeze', revoked: boolean | null | undefined, reportedBy?: string): { text: string; tone: 'ok' | 'bad' | 'unknown' } {
+  // R6-10: a value a third-party feed reported, not read from the mint account, is not shown as a green check
+  if (revoked === true && reportedBy) return { text: `${kind} revoked per ${reportedBy} (not checked on chain)`, tone: 'unknown' };
   if (revoked === true) return { text: `${kind} Revoked`, tone: 'ok' };
   if (revoked === false) return { text: `${kind} NOT revoked`, tone: 'bad' };
   return { text: `${kind}: unknown`, tone: 'unknown' };

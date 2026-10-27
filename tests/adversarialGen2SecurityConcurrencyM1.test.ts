@@ -1320,6 +1320,7 @@ describe('Adversarial Gen2: Security, Concurrency, and Isolation Empirical Probe
         unrealizedPnLPct: 0,
         realizedPnLSol: 0,
         entryTxSignature: 'sig_ghost',
+        walletPubkey: localSigner.getPublicKey().toBase58(), // R4-2: bound to the test signer
         entrySlot: 280000000,
         entryTimestamp: Date.now(),
         entryFeeLamports: 5000,

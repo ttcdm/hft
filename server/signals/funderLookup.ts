@@ -4,6 +4,12 @@ import { Logger } from '../middleware/enterprise';
 export const FUNDER_LOOKUP_CONCURRENCY = 4;
 export const FUNDER_LOOKUP_MAX_PER_MINT = 150;
 export const FUNDER_SIGNATURE_PAGE = 1000;
+/**
+ * R2-1 / R8-2: a wallet with at most this many signatures has its WHOLE history read (one getParsedTransaction per signature, oldest first),
+ * and every SOL source in it is reported, not only the first. A longer history is read at its oldest transaction only and reported `partial`:
+ * the window does not count such a wallet as an independent buyer. RPC cost: up to this many transaction reads per new wallet (was 1).
+ */
+export const FUNDER_FULL_HISTORY_MAX = 8;
 /** S4c: an RPC error is retried after these delays (then the wallet stays unknown). Public RPCs rate-limit; one error used to pin the wallet unknown for the candidate's life. */
 export const FUNDER_RETRY_DELAYS_MS = [1_500, 4_000, 10_000];
 /**
@@ -14,7 +20,9 @@ export const FUNDER_RETRY_DELAYS_MS = [1_500, 4_000, 10_000];
 export const FUNDER_LOOKUP_MAX_QUEUE = 1_000;
 
 export type FunderResult =
-  | { funder: string; reason?: undefined }
+  /** `alsoFundedBy`: every other SOL source found (later transfers in, and other wallets that paid a fee for it); absent when none.
+   *  `partial`: the history was longer than FUNDER_FULL_HISTORY_MAX, so only its oldest transaction was read. */
+  | { funder: string; reason?: undefined; alsoFundedBy?: string[]; partial?: true }
   | { funder: null; reason: 'NO_TRANSFER' | 'ESTABLISHED_WALLET' }
   | { funder: null; reason: 'ERROR'; error: string };
 
@@ -33,9 +41,47 @@ function fundingOf(ix: any): [string, string] | null {
   }
 }
 
+const keyOf = (k: any): string | null =>
+  typeof k === 'string' ? k : k?.pubkey !== undefined ? (typeof k.pubkey === 'string' ? k.pubkey : String(k.pubkey.toBase58?.() ?? k.pubkey)) : null;
+
+/**
+ * R2-1: the wallet that paid a parsed transaction's fee (its first account key) when `wallet` signed it and did not pay: someone sponsored
+ * the wallet's own transaction. A transaction the wallet did not sign (spam that merely lists it) names no source.
+ */
+function feePayerOf(tx: any, wallet: string): string | null {
+  const keys = (tx?.transaction?.message?.accountKeys ?? []) as any[];
+  if (keys.length === 0) return null;
+  const payer = keyOf(keys[0]);
+  if (!payer || payer === wallet) return null;
+  const signed = keys.some((k) => keyOf(k) === wallet && k?.signer === true);
+  return signed ? payer : null;
+}
+
+/** Every SOL source of `wallet` in one parsed transaction, in execution order: system transfers in (top level and inner), then the fee payer. */
+function sourcesIn(tx: any, wallet: string): string[] {
+  const out: string[] = [];
+  // Top-level instruction i, then the instructions it invoked (meta.innerInstructions[index === i]): execution order.
+  const inner = new Map<number, any[]>();
+  for (const set of (tx.meta?.innerInstructions ?? []) as any[]) inner.set(set.index, set.instructions ?? []);
+  const top = (tx.transaction?.message?.instructions ?? []) as any[];
+  for (let i = 0; i < top.length; i++) {
+    for (const ix of [top[i], ...(inner.get(i) ?? [])]) {
+      const f = fundingOf(ix);
+      if (f && f[1] === wallet && f[0] !== wallet) out.push(f[0]);
+    }
+  }
+  const payer = feePayerOf(tx, wallet);
+  if (payer) out.push(payer);
+  return out;
+}
+
 /**
  * Q6b: who first funded a wallet. The watch window's "unique buyers" signal only counts buyers whose funder is known (wallets sharing a
  * funder are one cluster), and no lookup existed, so the signal never passed.
+ *
+ * R2-1 / R8-2: a short history (FUNDER_FULL_HISTORY_MAX signatures or fewer) is read in full and every SOL source in it is reported
+ * (`alsoFundedBy`): a decoy's dust sent first no longer hides the creator's transfer behind it, and a fee paid by another wallet ties the two.
+ * A longer history is reported `partial`. One more hop (creator -> fresh wallet -> buyer) is still not traced.
  *
  * The funder is the sender of the first system transfer into the wallet, read from its oldest transaction. A wallet with a full page of
  * history is an established wallet: its first funding is out of reach here and it is reported as its own cluster, not guessed.
@@ -187,20 +233,18 @@ export class FunderLookup {
       // P4.1 (R1-54): a buyer always has its own buy in its history, so none at all means the index has not caught up
       if (sigs.length === 0) return { funder: null, reason: 'ERROR', error: 'no signatures yet (history not indexed at confirmed)' };
       if (sigs.length >= FUNDER_SIGNATURE_PAGE) return { funder: null, reason: 'ESTABLISHED_WALLET' };
-      const oldest = sigs[sigs.length - 1];
-      const tx = await conn.getParsedTransaction(oldest.signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
-      if (!tx) return { funder: null, reason: 'ERROR', error: 'oldest transaction not returned' };
-      // Top-level instruction i, then the instructions it invoked (meta.innerInstructions[index === i]): execution order.
-      const inner = new Map<number, any[]>();
-      for (const set of (tx.meta?.innerInstructions ?? []) as any[]) inner.set(set.index, set.instructions ?? []);
-      const top = tx.transaction.message.instructions as any[];
-      for (let i = 0; i < top.length; i++) {
-        for (const ix of [top[i], ...(inner.get(i) ?? [])]) {
-          const f = fundingOf(ix);
-          if (f && f[1] === wallet && f[0] !== wallet) return { funder: f[0] };
-        }
+      // R2-1: the whole short history, oldest first (the page is newest first); a long one at its oldest transaction only
+      const partial = sigs.length > FUNDER_FULL_HISTORY_MAX;
+      const toRead = partial ? [sigs[sigs.length - 1]] : [...sigs].reverse();
+      const sources: string[] = [];
+      for (const sig of toRead) {
+        const tx = await conn.getParsedTransaction(sig.signature, { maxSupportedTransactionVersion: 0, commitment: 'confirmed' });
+        if (!tx) return { funder: null, reason: 'ERROR', error: `transaction ${sig.signature.slice(0, 8)} not returned` };
+        for (const src of sourcesIn(tx, wallet)) if (!sources.includes(src)) sources.push(src);
       }
-      return { funder: null, reason: 'NO_TRANSFER' };
+      if (sources.length === 0) return { funder: null, reason: 'NO_TRANSFER' };
+      const [funder, ...also] = sources;
+      return { funder, ...(also.length ? { alsoFundedBy: also } : {}), ...(partial ? { partial: true as const } : {}) };
     } catch (e: any) {
       Logger.warn(`funder lookup for ${wallet.slice(0, 6)} failed: ${e?.message || e}`);
       return { funder: null, reason: 'ERROR', error: String(e?.message || e) };
@@ -214,14 +258,15 @@ export class FunderLookup {
  */
 export function wireFunderLookup(
   ww: {
-    setFunder(w: string, f: string): void; setNoFunder(w: string): void; setFunderUnreadable(w: string): void; isWatching(mint: string): boolean;
+    setFunder(w: string, f: string, at?: number, opts?: { alsoFundedBy?: string[]; verified?: boolean }): void; setNoFunder(w: string): void; setFunderUnreadable(w: string): void; isWatching(mint: string): boolean;
     setFunderRequester(fn: ((wallet: string, mint: string, priority?: boolean) => boolean | void) | null): void;
   },
   lookup: FunderLookup
 ): void {
   lookup.setWanted((mint) => ww.isWatching(mint)); // P4.1 (R1-60): a released mint's waiting lookups are dropped
   lookup.onResult((wallet, r) => {
-    if (r.funder) ww.setFunder(wallet, r.funder);
+    // R2-1: every source found, and whether the whole history was read (a partial one is not an independent buyer)
+    if (r.funder) ww.setFunder(wallet, r.funder, Date.now(), { alsoFundedBy: r.alsoFundedBy, verified: !r.partial });
     else if (r.reason !== 'ERROR') ww.setNoFunder(wallet);
     else ww.setFunderUnreadable(wallet);
   });

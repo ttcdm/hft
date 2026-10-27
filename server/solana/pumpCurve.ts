@@ -17,6 +17,7 @@ import { expectedGenesisHash } from './clusterGuard';
 import { Logger } from '../middleware/enterprise';
 import { executionConfig } from './executionConfig';
 import { ExecutionMode, TriState } from '../core/types';
+import { classifyHolder, defaultHolderFunderSource, type HolderClass, type HolderFunderSource } from '../signals/holderCluster';
 
 export type { ExecutionMode };
 
@@ -137,7 +138,13 @@ export interface PumpMarketState {
   creatorFeeBps: number;
   feeRecipient: PublicKey;
   buybackFeeRecipient: PublicKey;
+  /**
+   * R4-9: the wall time this read's data is from: when this process first saw the RPC's context slot of the read (not when the read
+   * returned), so a node that stalls on one slot serves marks that age, and the staleness gates (exit marks, the buy's market-data age) see it.
+   */
   marketDataTimestamp: number;
+  /** R4-9: the context slot of the account read (getMultipleAccountsInfoAndContext); undefined when the RPC gave none. */
+  marketDataSlot?: number;
   marketDataSource: string;
   token2022Report?: Token2022ExtensionReport;
   /**
@@ -412,16 +419,59 @@ export interface TokenHolderDistribution {
   nonBondingCirculatingSupply: bigint;
   bondingCurveBalance: bigint;
   creatorBalance: bigint;
+  /** R2-3: large holders whose owner the funder lookups tie to the creator (CREATOR_CLUSTER, or a non-ATA account of the creator). In devHoldingPct. */
+  creatorClusterBalance: bigint;
+  /** R2-3: large holders whose owner or funding is not known (UNKNOWN). Counted together as one holder in top10HoldersPct. */
+  unknownHolderBalance: bigint;
   top10HoldersPct: number;
+  /** The creator's own accounts plus its funder cluster (R2-3), as a share of total supply. */
   devHoldingPct: number;
-  topHolders: Array<{ address: string; amount: bigint; pct: number }>;
+  topHolders: Array<{ address: string; amount: bigint; pct: number; owner?: string | null; holderClass?: HolderClass | 'CREATOR_ATA' }>;
 }
 
+/**
+ * The most keys one getMultipleAccounts call may carry. QuickNode's Discover plan refuses more than 5 with HTTP 413 ("getMultipleAccounts is
+ * limited to a 5 range"; see the cloud devnet notes), which made the R2-3 owner read fail for every coin with more than 5 large holders
+ * (devnet run 2026-10-27, step (a)). Other providers allow 100; 5 costs at most 4 calls for the 20 largest accounts.
+ */
+export const GET_MULTIPLE_ACCOUNTS_MAX_KEYS = 5;
+
+/** R2-3: the owner of each token account (bytes 32..64 of the SPL / Token-2022 account), read GET_MULTIPLE_ACCOUNTS_MAX_KEYS at a time; null where unreadable. */
+async function tokenAccountOwners(connection: Connection, accounts: PublicKey[]): Promise<Array<string | null>> {
+  if (accounts.length === 0) return [];
+  if (typeof (connection as any).getMultipleAccountsInfo !== 'function') return accounts.map(() => null);
+  const owners: Array<string | null> = [];
+  for (let i = 0; i < accounts.length; i += GET_MULTIPLE_ACCOUNTS_MAX_KEYS) {
+    const batch = accounts.slice(i, i + GET_MULTIPLE_ACCOUNTS_MAX_KEYS);
+    try {
+      const infos = await connection.getMultipleAccountsInfo(batch, 'confirmed');
+      for (let j = 0; j < batch.length; j++) {
+        const d = infos?.[j]?.data;
+        owners.push(d && d.length >= 64 ? new PublicKey(d.subarray(32, 64)).toBase58() : null);
+      }
+    } catch (err: any) {
+      // fail closed: these holders count as unknown (never independent, never the creator's); the other batches are still read
+      Logger.warn(`holder owners for the holder gate could not be read for ${batch.length} of ${accounts.length} account(s) (${err?.message || err}); those holders count as unknown`);
+      for (let j = 0; j < batch.length; j++) owners.push(null);
+    }
+  }
+  return owners;
+}
+
+/**
+ * The holder gate's facts: creator holding and top-10 concentration, as shares of the total supply.
+ * R2-3: each large non-curve account's owner is read (getMultipleAccountsInfo, GET_MULTIPLE_ACCOUNTS_MAX_KEYS per call) and classified by the funder
+ * lookups' knowledge (`holderFunders`, default the watch window, see server/signals/holderCluster.ts). Holdings the creator's funder cluster
+ * owns count in devHoldingPct with the creator's own. Fail closed for LIVE: a holder whose owner or funding is unknown is never taken as
+ * independent; all unknown holders together count as ONE holder in the top-10 figure (so 40 unknown wallets at 1.8% read as 36% of the top
+ * 20 accounts, not 18%).
+ */
 export async function fetchTokenHolderDistribution(
   connection: Connection,
   mint: PublicKey,
   creator?: PublicKey,
-  bondingCurve?: PublicKey
+  bondingCurve?: PublicKey,
+  holderFunders: HolderFunderSource = defaultHolderFunderSource
 ): Promise<TokenHolderDistribution> {
   const largestAccountsRes = await connection.getTokenLargestAccounts(mint);
   const largestAccounts = largestAccountsRes.value || [];
@@ -520,25 +570,38 @@ export async function fetchTokenHolderDistribution(
     }
   }
 
-  // C1: concentration is a share of TOTAL supply. The bonding curve and the
-  // creator are excluded from the top-10 list (creator is scored via devHoldingPct).
-  const holderAddrs = new Set<string>(creatorAddrsForExclusion);
-  const top10Accounts = nonCurveAccounts.filter((acc) => !holderAddrs.has(acc.address.toBase58())).slice(0, 10);
-  const top10Amount = top10Accounts.reduce((sum, acc) => sum + BigInt(acc.amount), 0n);
+  // R2-3: classify every other large holder by its owner's funding (one owner read for all of them)
+  const insiders = new Set<string>(creator ? [creator.toBase58()] : []);
+  const others = nonCurveAccounts.filter((acc) => !creatorAddrsForExclusion.has(acc.address.toBase58()));
+  const owners = await tokenAccountOwners(connection, others.map((acc) => acc.address));
+  const classOf = new Map<string, { owner: string | null; cls: HolderClass }>();
+  others.forEach((acc, i) => classOf.set(acc.address.toBase58(), { owner: owners[i], cls: classifyHolder(owners[i], insiders, holderFunders) }));
+  let creatorClusterBalance = 0n, unknownHolderBalance = 0n;
+  const independent: bigint[] = [];
+  for (const acc of others) {
+    const amt = BigInt(acc.amount);
+    const c = classOf.get(acc.address.toBase58())!.cls;
+    if (c === 'CREATOR' || c === 'CREATOR_CLUSTER') creatorClusterBalance += amt;
+    else if (c === 'UNKNOWN') unknownHolderBalance += amt;
+    else independent.push(amt);
+  }
+
+  // C1: concentration is a share of TOTAL supply. The bonding curve and the creator's cluster are excluded from the top-10 list (they are
+  // scored via devHoldingPct). R2-3: the unknown holders are one entry in it, summed.
+  const entries = [...independent, ...(unknownHolderBalance > 0n ? [unknownHolderBalance] : [])].sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
+  const top10Amount = entries.slice(0, 10).reduce((sum, v) => sum + v, 0n);
   const pctOfTotal = (amt: bigint) =>
     totalSupply > 0n ? Number(((Number(amt) / Number(totalSupply)) * 100).toFixed(2)) : 0;
   const top10HoldersPct = pctOfTotal(top10Amount);
 
-  const devHoldingPct = pctOfTotal(creatorBalance);
+  const devHoldingPct = pctOfTotal(creatorBalance + creatorClusterBalance);
 
   const topHolders = nonCurveAccounts.map((acc) => {
     const amountBig = BigInt(acc.amount);
     const pct = pctOfTotal(amountBig);
-    return {
-      address: acc.address.toBase58(),
-      amount: amountBig,
-      pct,
-    };
+    const address = acc.address.toBase58();
+    const c = classOf.get(address);
+    return { address, amount: amountBig, pct, owner: c ? c.owner : creator?.toBase58() ?? null, holderClass: c ? c.cls : ('CREATOR_ATA' as const) };
   });
 
   return {
@@ -547,11 +610,22 @@ export async function fetchTokenHolderDistribution(
     nonBondingCirculatingSupply,
     bondingCurveBalance,
     creatorBalance,
+    creatorClusterBalance,
+    unknownHolderBalance,
     top10HoldersPct,
     devHoldingPct,
     topHolders,
   };
 }
+
+/**
+ * R4-9: how many slots a read (or the RPC heartbeat) may be behind the highest slot already seen on the same endpoint and still be used.
+ * The nodes behind one load-balanced RPC URL are usually a slot or two apart, and two concurrent reads can answer out of order; refusing
+ * those made LIVE buys fail MARKET_DATA_UNAVAILABLE at random. A node further behind (seconds to minutes) is still refused. About 3 s.
+ */
+export const RPC_SLOT_SKEW_TOLERANCE = 8;
+/** R4-9: the time one slot stands for when a read a few slots behind is stamped (Solana's target slot time). */
+export const SLOT_TIME_ESTIMATE_MS = 400;
 
 export class PumpCurveService {
   public static cachedGlobal: any = null;
@@ -571,6 +645,39 @@ export class PumpCurveService {
    * the Global as null, so a transient null read does not leave a stop-loss without a transaction to send. Cleared by `resetGlobalCache`.
    */
   private static lastGoodGlobal: { key: string; global: any } | null = null;
+
+  /**
+   * R4-9: per Connection, the highest context slot a curve read has answered from and the wall time it was first seen. Reads ask for
+   * at least that slot less RPC_SLOT_SKEW_TOLERANCE (`minContextSlot`), so a node further behind is refused by the RPC rather than read,
+   * and a read whose slot is further behind anyway is treated as failed. A read from the same slot is stamped with the time that slot was
+   * first seen, so a stalled node's marks age while wall time advances; one a few slots behind is stamped that much older again.
+   * Keyed by the Connection object, so a new endpoint (setRpcEndpoint) starts fresh.
+   */
+  private static slotSeen = new WeakMap<object, { slot: number; firstSeenAt: number }>();
+
+  /** R4-9: the slot floor for the next read on this connection (undefined before the first): the highest slot seen less the skew bound. */
+  public static minContextSlotFor(connection: Connection): number | undefined {
+    const seen = this.slotSeen.get(connection as object)?.slot;
+    return seen === undefined ? undefined : Math.max(1, seen - RPC_SLOT_SKEW_TOLERANCE);
+  }
+
+  /**
+   * R4-9: record a read's context slot; returns the wall time the data stands for, or null when the slot is more than
+   * RPC_SLOT_SKEW_TOLERANCE behind one already seen (a lagging node, whose state must not be used). A read up to that many slots
+   * behind (the nodes of a load-balanced RPC are a slot or two apart, and two concurrent reads can answer out of order) is used,
+   * stamped SLOT_TIME_ESTIMATE_MS per slot older than the time the newest slot was first seen.
+   */
+  public static noteContextSlot(connection: Connection, slot: number | undefined, now: number = Date.now()): number | null {
+    if (typeof slot !== 'number' || !Number.isFinite(slot) || slot <= 0) return now; // no context slot: the read time, as before
+    const prev = this.slotSeen.get(connection as object);
+    if (!prev || slot > prev.slot) {
+      this.slotSeen.set(connection as object, { slot, firstSeenAt: now });
+      return now;
+    }
+    const lag = prev.slot - slot;
+    if (lag > RPC_SLOT_SKEW_TOLERANCE) return null;
+    return Math.min(now, prev.firstSeenAt) - lag * SLOT_TIME_ESTIMATE_MS;
+  }
 
   /**
    * P4.2 (N-43): the cache key: the Connection's endpoint plus the genesis hash the cluster guard requires for ALLOWED_CLUSTER (the
@@ -660,7 +767,16 @@ export class PumpCurveService {
         accountsToFetch.push(GLOBAL_PDA, PUMP_FEE_CONFIG_PDA);
       }
 
-      const accountInfos = await connection.getMultipleAccountsInfo(accountsToFetch);
+      // R4-9: read with the context slot, never from a state older than one already seen on this connection
+      const minContextSlot = this.minContextSlotFor(connection);
+      const read = await connection.getMultipleAccountsInfoAndContext(accountsToFetch, minContextSlot ? { minContextSlot } : undefined);
+      const accountInfos = read.value;
+      const marketDataSlot: number | undefined = read.context?.slot;
+      const highestSeen = this.slotSeen.get(connection as object)?.slot;
+      const marketDataTimestamp = this.noteContextSlot(connection, marketDataSlot);
+      if (marketDataTimestamp === null) {
+        return fail('RPC_ERROR', `the RPC answered from slot ${marketDataSlot}, more than ${RPC_SLOT_SKEW_TOLERANCE} slots behind slot ${highestSeen} already seen (a lagging node); not used`);
+      }
       const mintAccountInfo = accountInfos[0];
       const curveAccountInfo = accountInfos[1];
 
@@ -919,7 +1035,8 @@ export class PumpCurveService {
         creatorFeeBps,
         feeRecipient,
         buybackFeeRecipient,
-        marketDataTimestamp: now,
+        marketDataTimestamp,
+        marketDataSlot,
         marketDataSource: 'SOLANA_RPC_BONDING_CURVE',
         token2022Report,
       };

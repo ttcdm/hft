@@ -121,7 +121,7 @@ describe('3E: the kill is saved before its awaits', () => {
     expect(workstationDb.getSetting('auto.mode')).toBe('OFF');
   });
 
-  it('an operator setting a mode again clears the saved kill; the next restart restores normally', async () => {
+  it('an operator setting a mode again clears the saved kill; the next restart is not killed (and starts OFF, by design)', async () => {
     await setAutoMode('PAPER');
     await autoSnipeController.kill({ reason: 's3e' });
     await setAutoMode('SHADOW');
@@ -129,7 +129,8 @@ describe('3E: the kill is saved before its awaits', () => {
     expect(autoSnipeController.getStatus().killed).toBe(false);
     simulateRestart();
     const r = await autoSnipeController.restorePersisted();
-    expect(r.mode).toBe('SHADOW');
+    expect(r.mode).toBe('OFF');
+    expect(r.note).toMatch(/last run was in SHADOW/);
     expect(autoSnipeController.getStatus().killed).toBe(false);
   });
 });
@@ -241,12 +242,6 @@ describe('3E: NEGATIVE_EXPECTANCY and LOSS_STREAK over the last auto trades acro
     expect(refused.error).toMatch(/^LOSS_TRIGGERS_NEED_ACK: LOSS_STREAK/);
     expect(refused.error).toMatch(/ackLossTriggers/);
     expect(autoSnipeController.getMode()).toBe('OFF');
-
-    // a restart that would bring PAPER back is refused the same way
-    workstationDb.setSetting('auto.mode', 'PAPER');
-    const r = await autoSnipeController.restorePersisted();
-    expect(r.mode).toBe('OFF');
-    expect(r.note).toMatch(/LOSS_TRIGGERS_NEED_ACK/);
 
     await new Promise((res) => setTimeout(res, 2));
     expect(autoSnipeController.resume({ ackLossTriggers: true })).toMatchObject({ lossTriggersAcked: true });

@@ -17,9 +17,9 @@ afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 const empty = fs.mkdtempSync(path.join(os.tmpdir(), 's185-empty-'));
 
 describe('S185 the flag and the startup refusal', () => {
-  it('is off unless APEX_READ_ONLY is exactly "true"', () => {
+  it('is off when APEX_READ_ONLY is unset, and on for "true" (R2-7: "1" now turns it on too, see r2_7_read_only_flag.test.ts)', () => {
     expect(isReadOnly({})).toBe(false);
-    expect(isReadOnly({ APEX_READ_ONLY: '1' } as any)).toBe(false);
+    expect(isReadOnly({ APEX_READ_ONLY: '1' } as any)).toBe(true);
     expect(isReadOnly({ APEX_READ_ONLY: 'true' } as any)).toBe(true);
     expect(() => assertNotReadOnly('x', {})).not.toThrow();
     expect(() => assertNotReadOnly('x', { APEX_READ_ONLY: 'true' } as any)).toThrow(ReadOnlyError);

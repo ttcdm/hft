@@ -242,7 +242,9 @@ export class PaperExecutionEngine {
     const costPortionLamports = Math.round(pos.costBasisLamports * fraction);
     const costPortionSol = costPortionLamports / 1e9;
     const exitNetworkFeeSol = 0.000015; // 5000 base + 10000 priority
-    const exitJitoTipSol = (pos.jitoTipLamports || 2000000) / 1e9;
+    // R9-25: a stored tip of 0 is a tip of 0 (`||` charged 0.002 SOL for it); only a row with no stored tip gets the default
+    const exitJitoTipLamports = pos.jitoTipLamports ?? 2000000;
+    const exitJitoTipSol = exitJitoTipLamports / 1e9;
     let grossProceedsSol: number;
     let netProceedsSol: number;
     if (curveQuote) {
@@ -304,7 +306,7 @@ export class PaperExecutionEngine {
       submissionTime: Date.now(),
       reconciliationState: 'RECONCILED',
       networkFeeLamports: 5000,
-      jitoTipLamports: 0,
+      jitoTipLamports: exitJitoTipLamports, // R9-25: the tip this exit charged
       executionMode: 'PAPER',
     });
 

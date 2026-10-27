@@ -18,6 +18,12 @@ import { engineClient, getOperatorSessionToken, authFetch } from './services/eng
 import { TokenBoard } from './components/TokenBoard';
 import { CurvePanel } from './components/CurvePanel';
 import { AutoPanel } from './components/AutoPanel';
+import { usePolled } from './utils/usePolled';
+import { readServerAlerts, serverAlertEvents, alertsUnreadableEvent, killSwitchStateAlert, acknowledgeServerAlert } from './utils/operatorAlerts';
+import { killSwitchPress } from './utils/killSwitchPress';
+import { exitAlerts, type WatchedPosition } from './utils/exitWatch';
+import { PanelErrorBoundary } from './components/ErrorBoundaries';
+import { ConfirmHost, askConfirm } from './components/ConfirmDialog';
 
 
 export function makeEmptyKpis(startingEquity: number): PerformanceKPIs {
@@ -42,7 +48,16 @@ export function makeEmptyKpis(startingEquity: number): PerformanceKPIs {
 
 export default function App() {
   // Master Kill Switch State
-  const [isHalted, setIsHalted] = useState(false);
+  // R10-2: null until the server has answered (and again when it cannot be read): never a guessed "not engaged"
+  const [isHalted, setIsHalted] = useState<boolean | null>(null);
+  // R9-1: when the switch was last seen turning on (by this button or the poll), so a double tap does not resume trading.
+  const haltedSince = useRef<number | null>(null);
+  const [haltedSinceAt, setHaltedSinceAt] = useState<number | null>(null);
+  useEffect(() => {
+    if (isHalted && haltedSince.current === null) haltedSince.current = Date.now();
+    if (!isHalted) haltedSince.current = null;
+    setHaltedSinceAt(haltedSince.current);
+  }, [isHalted]);
   const [selectedMint, setSelectedMint] = useState<string | null>(null);
   const [activeFeed, setActiveFeed] = useState('CME_AURORA');
 
@@ -138,6 +153,52 @@ export default function App() {
     return () => clearInterval(t);
   }, []);
 
+  // R6-1: the server's operator alerts (exit failing, position gone, halt not saved, ...) join the stack. A CRITICAL one stays until the
+  // server clears it; a WARNING or INFO one can be hidden in this browser.
+  const checksPoll = usePolled<any>('/api/system/checks', 5000, isOperatorAuthenticated);
+  const [hiddenServerAlerts, setHiddenServerAlerts] = useState<Set<string>>(new Set());
+  const [acknowledgedServerAlerts, setAcknowledgedServerAlerts] = useState<Set<string>>(new Set());
+  const serverAlerts = serverAlertEvents(readServerAlerts(checksPoll.data), hiddenServerAlerts, acknowledgedServerAlerts);
+  const unreadable = isOperatorAuthenticated && checksPoll.error ? [alertsUnreadableEvent(checksPoll.error, checksPoll.at ?? Date.now())] : [];
+  const shownAlerts = [...killSwitchStateAlert(isHalted, haltedSinceAt), ...unreadable, ...serverAlerts, ...alerts];
+  const seenServerAlerts = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    for (const a of serverAlerts) {
+      if (seenServerAlerts.current.has(a.id)) continue;
+      seenServerAlerts.current.add(a.id);
+      hftAudio.playAlertBeep(a.level === 'CRITICAL' ? 'CRITICAL' : 'WARNING');
+    }
+  });
+
+  // R10-4: an exit the bot makes by itself (take-profit, stop-loss, trailing, stale) is announced, with what it sold and the PnL
+  const watchedOpen = useRef<WatchedPosition[] | null>(null);
+  useEffect(() => {
+    if (!isOperatorAuthenticated) { watchedOpen.current = null; return; }
+    let alive = true;
+    const load = async () => {
+      try {
+        const r = await authFetch('/api/workstation/positions?status=ACTIVE');
+        if (!r.ok || !alive) return;
+        const open: WatchedPosition[] = (await r.json())?.positions ?? [];
+        const before = watchedOpen.current;
+        watchedOpen.current = open;
+        if (!before) return; // the first read is the baseline
+        const ids = new Set(open.map((p) => p.id));
+        const changed = before.some((p) => !ids.has(p.id) || open.find((q) => q.id === p.id)?.tokenQuantityRaw !== p.tokenQuantityRaw);
+        if (!changed) return;
+        let all: WatchedPosition[] = open;
+        if (before.some((p) => !ids.has(p.id))) {
+          const ra = await authFetch('/api/workstation/positions');
+          if (ra.ok) all = (await ra.json())?.positions ?? open;
+        }
+        if (alive) for (const a of exitAlerts(before, open, all)) triggerAlert(a.level, a.title, a.message);
+      } catch { /* the next read retries; the baseline stays */ }
+    };
+    load();
+    const t = setInterval(load, 5000);
+    return () => { alive = false; clearInterval(t); };
+  }, [isOperatorAuthenticated, triggerAlert]);
+
   // Q36: a refused WebSocket command is shown, not dropped.
   useEffect(() => {
     const unsub = engineClient.onActionError((m) => triggerAlert('CRITICAL', `COMMAND REFUSED${m.action ? `: ${m.action}` : ''}`, m.error));
@@ -151,10 +212,11 @@ export default function App() {
     const load = async () => {
       try {
         const r = await authFetch('/api/diagnostics/system');
-        if (!r.ok) return;
+        if (!alive) return;
+        if (!r.ok) { setIsHalted(null); return; } // R10-2: logged out or refused: the state is unknown
         const j = await r.json();
-        if (alive && typeof j?.systemAudit?.killSwitchActive === 'boolean') setIsHalted(j.systemAudit.killSwitchActive);
-      } catch { /* keep what is shown */ }
+        if (alive) setIsHalted(typeof j?.systemAudit?.killSwitchActive === 'boolean' ? j.systemAudit.killSwitchActive : null);
+      } catch { if (alive) setIsHalted(null); }
     };
     load();
     const t = setInterval(load, 5000);
@@ -165,8 +227,12 @@ export default function App() {
   const killInFlight = useRef(false);
   const toggleKillSwitch = async () => {
     if (killInFlight.current) return; // R33: a second click while the first request is out must not send the opposite value
+    // R9-1: send the intended state. RESUME needs a confirm, and a RESUME press right after the switch turned on is ignored.
+    // R10-11: the RESUME confirm is the in-page dialog (Enter cannot accept); a press while it is open is not sent
     killInFlight.current = true;
-    const nextHalted = !isHalted;
+    const press = await killSwitchPress(isHalted === true, haltedSince.current, Date.now(), (text) => askConfirm({ title: 'RESUME TRADING', body: text, confirmLabel: 'Resume trading' }));
+    if (press.action === 'IGNORE') { killInFlight.current = false; return; }
+    const nextHalted = press.activate;
     try {
       const res = await authFetch('/api/execution/kill-switch', {
         method: 'POST',
@@ -177,15 +243,11 @@ export default function App() {
       if (!res.ok || body.killSwitchActive !== nextHalted) {
         throw new Error(body.error || `server answered HTTP ${res.status}`);
       }
+      if (nextHalted) haltedSince.current = Date.now();
       setIsHalted(nextHalted);
       hftAudio.playKillSwitch(); // R33: after the server confirmed, not before
-      if (nextHalted) {
-        triggerAlert(
-          'CRITICAL',
-          'KILL SWITCH ENGAGED',
-          'The server refuses new orders and has disarmed LIVE trading. Open positions are NOT sold: close them from the Plug & Play panel.'
-        );
-      } else {
+      // R10-1: the ENGAGED alert comes from the state (killSwitchStateAlert below), so a reset here or in another tab removes it
+      if (!nextHalted) {
         // R26: the reset lifts only the kill switch. An open circuit breaker or an all-trading halt still refuses orders.
         const blockers: string[] = [];
         if (body.circuitBreaker === 'OPEN') blockers.push(`the circuit breaker is still OPEN${body.circuitBreakerReset?.reason ? ` (${body.circuitBreakerReset.reason})` : ''}`);
@@ -212,7 +274,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#06080D] text-slate-200 flex flex-col selection:bg-cyan-500 selection:text-white">
       {/* Q10b / Q41: mode, cluster, rpc and the age of the server's answer, always visible */}
-      <TradingModeBanner />
+      <PanelErrorBoundary name="Mode banner"><TradingModeBanner /></PanelErrorBoundary>
       {/* 1. INSTITUTIONAL HEADER BAR - PERMANENTLY DOCKED & ALWAYS ACCESSIBLE */}
       <Header
         kpis={kpis}
@@ -253,54 +315,88 @@ export default function App() {
 
       {/* 2. HOME: the token board (H1). Launches / Watching / Holding for Pump.fun on Solana. */}
       <main className="flex-1 p-4 lg:p-6 grid grid-cols-12 gap-5 max-w-[1920px] mx-auto w-full content-start">
-        <TokenBoard onSelect={setSelectedMint} selected={selectedMint} />
+        <PanelErrorBoundary name="Token board"><TokenBoard onSelect={setSelectedMint} selected={selectedMint} /></PanelErrorBoundary>
         <aside className="col-span-12 lg:col-span-4 flex flex-col space-y-5" data-testid="home-side">
-          <CurvePanel mint={selectedMint} />
-          <AutoPanel />
+          <PanelErrorBoundary name="Curve panel"><CurvePanel mint={selectedMint} /></PanelErrorBoundary>
+          <PanelErrorBoundary name="Auto panel"><AutoPanel /></PanelErrorBoundary>
         </aside>
       </main>
 
       {/* 3. ALERT SYSTEM POPUPS */}
-      <AlertSystem
-        alerts={alerts}
-        onDismissAlert={(id) => setAlerts((prev) => prev.filter((a) => a.id !== id))}
-        onClearAll={() => setAlerts([])}
-      />
+      <PanelErrorBoundary name="Alerts">
+        <AlertSystem
+          alerts={shownAlerts}
+          onDismissAlert={(id) => {
+            if (id.startsWith('server-')) setHiddenServerAlerts((prev) => new Set(prev).add(id));
+            else setAlerts((prev) => prev.filter((a) => a.id !== id));
+          }}
+          onAcknowledgeAlert={(alert) => {
+            if (!alert.serverAck) return;
+            void acknowledgeServerAlert(authFetch, alert.serverAck).then((err) => {
+              if (err === null) setAcknowledgedServerAlerts((prev) => new Set(prev).add(alert.id));
+              else triggerAlert('WARNING', `${alert.title} NOT ACKNOWLEDGED`, err);
+            });
+          }}
+          onClearAll={() => {
+            setAlerts([]);
+            setHiddenServerAlerts((prev) => { const next = new Set(prev); for (const a of serverAlerts) if (!a.sticky) next.add(a.id); return next; });
+          }}
+        />
+      </PanelErrorBoundary>
 
       {/* 4. MODALS */}
-      <AiDiagnosticsModal
-        isOpen={isAiDiagnosticsOpen}
-        onClose={() => setIsAiDiagnosticsOpen(false)}
-      />
+      <PanelErrorBoundary name="AI diagnostics">
+        <AiDiagnosticsModal
+          isOpen={isAiDiagnosticsOpen}
+          onClose={() => setIsAiDiagnosticsOpen(false)}
+        />
+      </PanelErrorBoundary>
 
-      <SystemChecksModal isOpen={isSystemChecksOpen} onClose={() => setIsSystemChecksOpen(false)} />
-      <ExecutionLatencyModal isOpen={isLatencyOpen} onClose={() => setIsLatencyOpen(false)} />
-      <AutoPipelineModal
-        isOpen={isAutoPipelineOpen}
-        onClose={() => setIsAutoPipelineOpen(false)}
-      />
+      <PanelErrorBoundary name="System checks">
+        <SystemChecksModal isOpen={isSystemChecksOpen} onClose={() => setIsSystemChecksOpen(false)} />
+      </PanelErrorBoundary>
+      <PanelErrorBoundary name="Latency">
+        <ExecutionLatencyModal isOpen={isLatencyOpen} onClose={() => setIsLatencyOpen(false)} />
+      </PanelErrorBoundary>
+      <PanelErrorBoundary name="Auto pipeline">
+        <AutoPipelineModal
+          isOpen={isAutoPipelineOpen}
+          onClose={() => setIsAutoPipelineOpen(false)}
+        />
+      </PanelErrorBoundary>
 
-      <MemecoinSocialSniperModal
-        isOpen={isMemecoinSniperOpen}
-        onClose={() => setIsMemecoinSniperOpen(false)}
-        onAlertTrigger={triggerAlert}
-      />
+      <PanelErrorBoundary name="Sniper">
+        <MemecoinSocialSniperModal
+          isOpen={isMemecoinSniperOpen}
+          onClose={() => setIsMemecoinSniperOpen(false)}
+          onAlertTrigger={triggerAlert}
+        />
+      </PanelErrorBoundary>
 
-      <BacktestModal
-        isOpen={isBacktestModalOpen}
-        onClose={() => setIsBacktestModalOpen(false)}
-      />
+      <PanelErrorBoundary name="Backtest">
+        <BacktestModal
+          isOpen={isBacktestModalOpen}
+          onClose={() => setIsBacktestModalOpen(false)}
+        />
+      </PanelErrorBoundary>
 
-      <PlugAndPlayTradingModal
-        isOpen={isPlugAndPlayOpen}
-        onClose={() => setIsPlugAndPlayOpen(false)}
-      />
+      <PanelErrorBoundary name="Plug & Play">
+        <PlugAndPlayTradingModal
+          isOpen={isPlugAndPlayOpen}
+          onClose={() => setIsPlugAndPlayOpen(false)}
+        />
+      </PanelErrorBoundary>
 
-      <AuthModal
-        isOpen={isAuthModalOpen}
-        onClose={() => setIsAuthModalOpen(false)}
-        onAuthenticated={handleAuthenticated}
-      />
+      <PanelErrorBoundary name="Sign-in">
+        <AuthModal
+          isOpen={isAuthModalOpen}
+          onClose={() => setIsAuthModalOpen(false)}
+          onAuthenticated={handleAuthenticated}
+        />
+      </PanelErrorBoundary>
+
+      {/* R10-11: the confirm step for PANIC and KILL AUTO (Enter cannot accept) */}
+      <ConfirmHost />
     </div>
   );
 }

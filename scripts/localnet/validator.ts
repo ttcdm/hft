@@ -141,7 +141,7 @@ export class LocalnetValidator {
   private known = new Set<string>();
   private validBlockhashes: string[] = [];
   private logSubs = new Map<number, { ws: WebSocket; filter: any }>();
-  /** slotSubscribe subscribers: told the slot on every advance and every SLOT_HEARTBEAT_MS (LiteSVM makes a slot per transaction only). */
+  /** slotSubscribe subscribers: told the slot on every advance (each transaction, and every SLOT_HEARTBEAT_MS of wall time). */
   private slotSubs = new Map<number, WebSocket>();
   private slotTimer: NodeJS.Timeout | null = null;
   /** `localnet_dropWebSockets(ms)`: until this time (ms since epoch) every websocket connection is closed as soon as it opens. */
@@ -724,7 +724,14 @@ export class LocalnetValidator {
         for (const [id, s] of this.slotSubs) if (s === ws) this.slotSubs.delete(id);
       });
     });
-    this.slotTimer = setInterval(() => this.notifySlot(), SLOT_HEARTBEAT_MS);
+    // R4-9: the app treats a slot that stops advancing as a stalled node (its curve reads age, a LIVE buy past 5 s is STALE_MARKET_DATA,
+    // and 30 s of one slot makes the RPC DEGRADED). A real cluster makes a slot about every 400 ms whether or not anyone trades, so this
+    // validator's clock advances with wall time too, not only per transaction (which made every quiet stretch of a test look stalled).
+    this.slotTimer = setInterval(() => {
+      this.slot += 1n;
+      this.svm.warpToSlot(this.slot);
+      this.notifySlot();
+    }, SLOT_HEARTBEAT_MS);
     this.slotTimer.unref?.();
     return `http://127.0.0.1:${this.port}`;
   }
@@ -748,8 +755,8 @@ const TRANSACTION_ERRORS: Record<number, string> = {
   5: 'InvalidAccountForFee', 6: 'AlreadyProcessed', 7: 'BlockhashNotFound',
 };
 
-/** How often slotSubscribe subscribers hear the current slot when no transaction advanced it (a real node sends one about every 400 ms). */
-const SLOT_HEARTBEAT_MS = 1000;
+/** The wall-clock slot: one more slot, and a slotSubscribe notification, this often (a real cluster makes a slot about every 400 ms). */
+const SLOT_HEARTBEAT_MS = 400;
 
 class RpcError extends Error {
   constructor(public code: number, message: string) {

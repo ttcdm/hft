@@ -1,33 +1,21 @@
 # Test baseline
 
-Measured on `overnight/integration` at A6 (`cf927ea`) plus R0 (`package-lock.json`), Node 22, with the
-real `@solana/web3.js`, `@solana/spl-token`, `@pump-fun/pump-sdk` and `@pump-fun/pump-swap-sdk`
-from the lockfile (not the hand-written stubs). No `.env`, no network to Solana (the sandbox proxy blocks it).
+Measured on the `snapshot/integration-3f890ed` tree (commit `13c4570`, the cloud integration with the feed watchdog, the late-buy sell, the child proxy pass-through and the harness clean-up applied), Node 22, with the real `@solana/web3.js`, `@solana/spl-token`, `@pump-fun/pump-sdk` and `@pump-fun/pump-swap-sdk` from the lockfile, on 2026-10-26. No `.env`, and no network to Solana from the test processes (the test guard refuses it).
 
-| Check | Before D1 | After D1 |
-|---|---|---|
-| `npx tsc --noEmit` | 0 errors | 0 errors |
-| `npx eslint .` | 0 errors, 203 warnings | 0 errors, 203 warnings |
-| `npx vitest run` | 8 failed / 774 passed (782), 40 files | 4 failed / 778 passed (782) |
+| Check | Result |
+|---|---|
+| `npx tsc --noEmit` | 0 errors |
+| `npx eslint .` | 0 errors, 145 warnings |
+| `npm test` (`vitest run`) | 306 files, 2725 passed, 0 skipped, 0 failed |
+| `npm run test:long` | 13 files, 47 passed |
+| `npm run localnet:e2e` | 48/48 steps passed |
+| `npm run test:facades` | 181 facade tests found, 181 in `tests/facade-baseline.json`, 0 new |
 
-## The 8 failures before D1
+The same tree passed the Stage 3 gate on devnet on 2026-10-26 (harness steps l, m, n, o and p, and a 50-minute DEVNET_LIVE session); the report is in the project folder (`notes/stage3-gate-report.md`). `README.md` ("Status") says what that does and does not prove.
 
-| # | Test | Class | Cause | Action |
-|---|---|---|---|---|
-| 1-3 | `adversarialGen2SecurityConcurrencyM1` 5.2, 5.3, 5.6 | broken test | `new ExecutionCoordinator()` probes `Connection.getSlot` on construction. The tests only mocked transaction lookups, so with a real SDK the probe hit the network, RPC health stayed `DISCONNECTED` and `startupReconciliation()` returned `OFFLINE`. The old stub always answered slot 1000, which hid this. | Fixed in D1: the Probe 5 `beforeEach` spies on `Connection.prototype.getSlot` and `getBalance`. |
-| 4 | `tier1/features21_25` F25.5 | broken test | Read `.agents/ORIGINAL_REQUEST.md`. `.agents/` is git-ignored, so the file does not exist in a clean checkout. The tracked copy is `docs/archive/ORIGINAL_REQUEST.md`. | Fixed in D1: test reads the root file. |
-| 5 | `tier2/boundaries16_20` B16.4 | contract conflict (needs Mike) | Asserts the Jito tip economic cap is 25% of notional. `executionConfig.ts` has 15%. A6 reverted the working-tree 25% edit, so code and committed tests disagree. | Not changed. Mike decides 15% or 25%, then the code or the three tests change. |
-| 6 | `tier5/jitoMevBundlesAndRpcFallback` JMB-2 | contract conflict (needs Mike) | Same 25% vs 15% cap. | Not changed. |
-| 7 | `phase3_stress_challenge` B07/B24 urgency multipliers | contract conflict (needs Mike) | Same 25% vs 15% cap (comment says "25% = 2.5M"). | Not changed. |
-| 8 | `phase1_remediation` B16 | bug (code) | The test expects `const BIND_HOST = process.env.BIND_HOST || '127.0.0.1'`. Committed `server.ts` defaults the bind host to `0.0.0.0`, which exposes the unauthenticated API on the LAN. | Fixed by package A1 (bind host resolution, default `127.0.0.1`). |
+## How to read these numbers
 
-No failure is a facade. Facade tests (tests that assert on a local stand-in and never import the real module) are
-a separate problem: see `scripts/find_facade_tests.ts` and package D2.
-
-## Findings from the run that are not failures
-
-- Tests that construct `ExecutionCoordinator` (about 10 files) start real RPC calls. Without a mock they use
-  `SOLANA_RPC_URL` or the code default, so on a machine with a `.env` they talk to whatever cluster it names. Package R1
-  removes the mainnet defaults, but tests should still mock the connection. Not fixed here beyond Probe 5.
-- `dotenv.config({ override: true })` lets a repo `.env` override the shell. See package R1.
-- The old suite result (`5 failed / 808 passed`) in earlier notes was measured on a different base and is not comparable.
+- Facade tests (tests that assert on a local stand-in and never import the real module) are counted by `scripts/find_facade_tests.ts`, and a new one fails `npm run test:facades`.
+- Tests that construct `ExecutionCoordinator` start real RPC calls unless the connection is mocked; the hermetic test config closes RPC, websocket and Jito on a loopback port so no test reaches a cluster. See `docs/TEST_FIDELITY.md`.
+- Environment loading uses dotenv's default (a variable already set in the real environment wins, `server/loadEnv.ts`), and `vitest.config.ts` sets `APEX_ENV_FILE` to an empty value, so a real `.env` cannot change a result.
+- The first baseline of this file (at A6, `cf927ea`) listed 8 failing tests and the causes; all of them have been fixed or removed since, and the table is not kept.

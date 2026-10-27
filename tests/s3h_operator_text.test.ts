@@ -362,13 +362,11 @@ describe('3H A4/A5: every sniper and wallet config key has a reader or a KNOWN_R
     return section6Rows().some((cell) => cell.includes(`\`${schema}\``) && cell.includes(`\`${rest.join('.')}\``));
   };
 
-  it('each key is read in production, refused by the schema, or listed in section 6 as doing nothing (riskLimits.stopLossPct and takeProfitMultiple included)', async () => {
+  it('each key is read in production, refused by the schema, or listed in section 6 as doing nothing', async () => {
     const keys = await schemaKeys();
-    expect(keys.length).toBe(21);
+    expect(keys.length).toBe(19);
     const unaccounted = keys.filter((k) => !READERS[k] && !REFUSED.includes(k) && !inSection6(k));
     expect(unaccounted).toEqual([]);
-    expect(inSection6('WalletConfigSchema.riskLimits.stopLossPct')).toBe(true);
-    expect(inSection6('WalletConfigSchema.riskLimits.takeProfitMultiple')).toBe(true);
     // a key is either read or listed as doing nothing, not both
     expect(keys.filter((k) => READERS[k] && inSection6(k))).toEqual([]);
   });
@@ -382,17 +380,28 @@ describe('3H A4/A5: every sniper and wallet config key has a reader or a KNOWN_R
     expect(WalletConfigSchema.safeParse({ riskLimits: { maxDailyLossUsd: 5 } }).success).toBe(false);
   });
 
-  it('a listed key really changes nothing: riskLimits.stopLossPct is stored and echoed, and the exit rules stay the same', async () => {
+  it('decision 2: riskLimits.stopLossPct and takeProfitMultiple are gone from the schema, the stored config and section 6; an old body still saves', async () => {
+    const { WalletConfigSchema } = await import('../server/middleware/enterprise');
     const { walletTrader } = await import('../server/walletTrader');
     const { exitRulesSummary } = await import('../server/exits/exitEngine');
+    const keys = await schemaKeys();
+    for (const k of ['stopLossPct', 'takeProfitMultiple']) {
+      expect(keys).not.toContain(`WalletConfigSchema.riskLimits.${k}`);
+      expect(Object.keys(walletTrader.getConfig().riskLimits)).not.toContain(k);
+      expect(inSection6(`WalletConfigSchema.riskLimits.${k}`)).toBe(false);
+    }
+    // a body from an older client or a script that still sends them parses, and the two keys are dropped
+    const parsed: any = WalletConfigSchema.parse({ riskLimits: { stopLossPct: 50, takeProfitMultiple: 3, maxPositionSizeSol: 0.01 } });
+    expect(parsed.riskLimits).toEqual({ maxPositionSizeSol: 0.01 });
     const before = exitRulesSummary();
-    const cfg = await walletTrader.updateConfig({ riskLimits: { stopLossPct: 50 } } as any);
-    expect(cfg.riskLimits.stopLossPct).toBe(50); // the success reply a caller sees
+    const cfg: any = await walletTrader.updateConfig({ riskLimits: { stopLossPct: 50, takeProfitMultiple: 3 } } as any);
+    expect(cfg.riskLimits.stopLossPct).toBeUndefined();
+    expect(cfg.riskLimits.takeProfitMultiple).toBeUndefined();
     expect(exitRulesSummary()).toEqual(before);
     expect(exitRulesSummary().stopLossPct).toBe(-20);
-    // and no production file outside the store reads it
-    const prod = ['server.ts', ...fs.readdirSync('server', { recursive: true }).map((f) => `server/${f}`).filter((f) => f.endsWith('.ts'))];
-    const readers = prod.filter((f) => /riskLimits\.(stopLossPct|takeProfitMultiple)/.test(fs.readFileSync(f, 'utf8').replace(/this\.config\.riskLimits\.(stopLossPct|takeProfitMultiple) = limits\.\w+/g, '').replace(/limits\.(stopLossPct|takeProfitMultiple) !== undefined/g, '')));
-    expect(readers).toEqual([]);
+    // and no production file, UI file or script mentions the two keys under riskLimits
+    const walk = (d: string): string[] => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => e.isDirectory() ? (e.name === 'node_modules' ? [] : walk(`${d}/${e.name}`)) : [`${d}/${e.name}`]);
+    const files = ['server.ts', ...walk('server'), ...walk('src'), ...walk('scripts')].filter((f) => /\.(ts|tsx)$/.test(f));
+    expect(files.filter((f) => /riskLimits[?]?\.(stopLossPct|takeProfitMultiple)|takeProfitMultiple/.test(fs.readFileSync(f, 'utf8')))).toEqual([]);
   });
 });

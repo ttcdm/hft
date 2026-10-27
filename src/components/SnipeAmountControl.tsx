@@ -10,11 +10,8 @@ export function SnipeAmountView({ state, compact = false }: { state: Pick<SnipeA
       <input
         id="snipe-amount-input"
         data-testid="snipe-amount-input"
-        type="number"
+        type="text"
         inputMode="decimal"
-        step="0.001"
-        min={limits.minSol}
-        max={limits.maxSol}
         value={text}
         onChange={(e) => setText(e.target.value)}
         className={`w-24 bg-[#141B2D] border rounded px-2 py-1 text-white outline-none ${parsed.ok ? 'border-[#1E293B] focus:border-cyan-400' : 'border-rose-500/70'}`}

@@ -2,6 +2,8 @@
 
 > **UNVERIFIED. Read before trusting any number below.** The "300 out-of-sample historical launches" are produced by `scripts/run_benchmarks_and_evaluation.ts` from a hand-written scenario table and a seeded pseudo-random generator (see `INDEPENDENT_REVIEW.md` §5.2). No recorded launch data has been replayed. The Profit Factor 2.36 and the +0.000677 SOL expectancy are properties of that synthetic input, not evidence of an edge, and stay unverified until a real replay exists. The script now writes `synthetic_benchmark_results.json`.
 
+> **Script removed.** `scripts/run_benchmarks_and_evaluation.ts` and its output `synthetic_benchmark_results.json` were deleted (decision 6, 2026-10-26): nothing ran or called them. Real backtests are in `backtests/` of the project files and the replay in `server/backtest/replay.ts`.
+
 **Evaluation Suite:** `scripts/run_benchmarks_and_evaluation.ts`  
 **Dataset:** 300 SYNTHETIC launches from a hand-written scenario table (previously described as "out-of-sample historical"; that description was not true)  
 **Deployment Tier:** `MICRO_10` (Bankroll: 0.07 SOL, Max Risk per Trade ≤ 10% / 0.007 SOL)  

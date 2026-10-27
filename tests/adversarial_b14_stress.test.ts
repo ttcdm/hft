@@ -717,6 +717,7 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
         hftAction: 'INSTANT_SNIPE',
         decayWindowSecondsRemaining: 90,
         status: 'ACTIVE',
+        dataAsOfMs: Date.now(), // R6-6: a fresh feed snapshot
       };
 
       (pumpfunService as any).hotCallouts = [mockCallout];
@@ -786,6 +787,7 @@ describe('Adversarial Stress Test Suite: Blocker B14 Alpha Pipeline Integration'
         hftAction: 'INSTANT_SNIPE',
         decayWindowSecondsRemaining: 70,
         status: 'ACTIVE',
+        dataAsOfMs: Date.now(), // R6-6: a fresh feed snapshot
       };
 
       seedSurge(highQualityCallout.token.mint); // C2: velocity must be measured

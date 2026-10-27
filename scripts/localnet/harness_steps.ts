@@ -157,15 +157,25 @@ async function run(info: { url: string; genesisHash: string }) {
   {
     const { executionConfig } = await import('../../server/solana/executionConfig');
     const { autoSnipeController } = await import('../../server/auto/controller');
+    // R2-3: the holder gate counts a large holder as independent only when the funder lookup read its whole short history and found a
+    // source that is not the creator (an airdropped wallet has no transfer to read and is UNKNOWN; all UNKNOWN holders together are one
+    // top-10 entry, 23% here). So each buyer is paid by a funder of its own with a plain transfer, and the app's own FunderLookup reads it
+    // into the app's watch window, as wireFunderLookup does for a buyer the log stream reports (the stream is stopped after (u) above).
+    const holderLookup = new FunderLookup(() => coordinator.getConnection());
     const seedCoin = async (symbol: string, name: string) => {
       const mkt = Keypair.generate();
       await conn.requestAirdrop(mkt.publicKey, 2 * LAMPORTS_PER_SOL);
       const c = await kit.create(mkt, symbol, name);
       await kit.buy(mkt, c.mint, 0.2);
       for (let i = 0; i < 14; i++) {
+        const funder = Keypair.generate();
+        await conn.requestAirdrop(funder.publicKey, 2.1 * LAMPORTS_PER_SOL);
         const w = Keypair.generate();
-        await conn.requestAirdrop(w.publicKey, 2 * LAMPORTS_PER_SOL);
+        await kit.transfer(funder, w.publicKey, 2);
         await kit.buy(w, c.mint, 0.6);
+        const r = await holderLookup.lookup(w.publicKey.toBase58());
+        if (r.funder) watchWindow.setFunder(w.publicKey.toBase58(), r.funder, Date.now(), { alsoFundedBy: r.alsoFundedBy, verified: !r.partial });
+        else rec(`${symbol} market setup: funder of holder ${i + 1} read`, false, `${r.reason}${r.reason === 'ERROR' ? ` ${r.error}` : ''}`);
       }
       return c;
     };
@@ -189,7 +199,7 @@ async function run(info: { url: string; genesisHash: string }) {
         refreshPrice: () => solPriceService.refresh(),
         dailyPnlSol: () => riskEngine.getDailyTotalPnLSol('LIVE'),
         latch: () => riskEngine.getDailyLossLatch('LIVE'),
-        clearLatch: () => riskEngine.clearDailyLossLatch(),
+        clearLatch: () => riskEngine.clearDailyLossLatch('LIVE'),
         resume: (o) => {
           if (o.clearDailyLossLatch) {
             failReads = fetch(info.url, { method: 'POST', headers: { 'content-type': 'application/json' },

@@ -1,8 +1,10 @@
+import { SHADOW_TEST_NOTE } from './AutoPanel';
 import React from 'react';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { X, Cpu } from 'lucide-react';
 import { usePolled } from '../utils/usePolled';
 import type { AutoStatusData } from './AutoPanel';
+import { DialogFrame } from './DialogFrame';
 
 export interface WatchSnapshotData {
   watching: Array<{ metrics: { mint: string; elapsedMs: number; tradeCount: number; uniqueBuyers: number; buyVolumeSol: number; passingSignals?: number } }>;
@@ -25,7 +27,7 @@ export function AutoPipelineView({ auto, watch, error }: { auto: AutoStatusData 
           </p>
           <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 mb-3" data-testid="pipeline-stats">
             <span className="text-slate-500">Candidates seen</span><span className="text-right">{auto.stats.seen}</span>
-            <span className="text-slate-500">Would buy (shadow)</span><span className="text-right">{auto.stats.wouldBuy}</span>
+            <span className="text-slate-500" data-testid="shadow-would-buy" title={SHADOW_TEST_NOTE}>Would buy (SHADOW, looser test)</span><span className="text-right">{auto.stats.wouldBuy}</span>
             <span className="text-slate-500">Bought</span><span className="text-right">{auto.stats.bought}</span>
             <span className="text-slate-500">Open / closed</span><span className="text-right">{auto.stats.open} / {auto.stats.closed}</span>
           </div>
@@ -54,7 +56,7 @@ export const AutoPipelineModal: React.FC<{ isOpen: boolean; onClose: () => void 
   useEscapeToClose(isOpen, onClose);
   if (!isOpen) return null;
   return (
-    <div className="fixed inset-0 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 z-50 font-mono">
+    <DialogFrame label="Auto pipeline" className="fixed inset-0 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 z-50 font-mono">
       <div className="bg-[#0D131F] border border-[#1E293B] rounded-xl p-5 max-w-xl w-full shadow-2xl max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between mb-3">
           <h3 className="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2"><Cpu className="w-4 h-4 text-cyan-400" /> Auto pipeline</h3>
@@ -62,6 +64,6 @@ export const AutoPipelineModal: React.FC<{ isOpen: boolean; onClose: () => void 
         </div>
         <AutoPipelineView auto={a.data} watch={w.data} error={a.error || w.error} />
       </div>
-    </div>
+    </DialogFrame>
   );
 };

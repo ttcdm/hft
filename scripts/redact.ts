@@ -41,9 +41,12 @@ export function redact(text: string, secretUrls: Array<string | undefined>): str
 }
 
 /**
- * A short, safe account of a child process that did not do what the harness expected: how it ended, then the last few lines of what it
- * printed, with the devnet guard's own network log lines left out (they are noise here) and every secret removed.
+ * A short, safe account of a child process that did not do what the harness expected: how it ended, the first sentence of an
+ * INSTANCE_LOCKED refusal if it printed one (the lock path and the holder's pid; devnet run 2026-10-27's (f) report kept only the end of
+ * that message), then the last few lines of what it printed, with the devnet guard's own network log lines left out (they are noise
+ * here) and every secret removed. At most CHILD_REPORT_MAX characters: the tail is cut, never the head.
  */
+export const CHILD_REPORT_MAX = 800;
 export function childReport(
   r: { status: number | null; signal: NodeJS.Signals | null; error?: Error; stdout?: string | null; stderr?: string | null },
   secretUrls: Array<string | undefined>,
@@ -51,6 +54,12 @@ export function childReport(
 ): string {
   const how = r.error ? `did not finish (${(r.error as NodeJS.ErrnoException).code ?? 'error'})` : r.signal ? `killed by ${r.signal}` : `exit ${r.status}`;
   const keep = (t?: string | null) => String(t ?? '').split('\n').map((l) => l.trim()).filter((l) => l && !l.startsWith('[devnet-guard]'));
-  const tail = [...keep(r.stdout), ...keep(r.stderr)].slice(-lines).join(' | ');
-  return redact(`${how}; last output: ${tail || '(none)'}`, secretUrls).slice(-500);
+  const all = [...keep(r.stdout), ...keep(r.stderr)];
+  const lockedLine = all.find((l) => l.includes('INSTANCE_LOCKED'));
+  const locked = lockedLine ? lockedLine.slice(lockedLine.indexOf('INSTANCE_LOCKED')) : '';
+  const lockedFirst = locked ? (/^INSTANCE_LOCKED: .*?\)\./.exec(locked)?.[0] ?? locked).slice(0, 400) : '';
+  const head = redact(lockedFirst ? `${how}; ${lockedFirst}` : how, secretUrls);
+  const tail = redact(`; last output: ${all.slice(-lines).join(' | ') || '(none)'}`, secretUrls);
+  const room = Math.max(0, CHILD_REPORT_MAX - head.length);
+  return head + (tail.length <= room ? tail : `; last output: ...${tail.slice(tail.length - Math.max(0, room - 18))}`);
 }

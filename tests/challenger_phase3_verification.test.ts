@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Connection, PublicKey, Keypair } from '@solana/web3.js';
 import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, createCloseAccountInstruction } from '@solana/spl-token';
 import {
@@ -21,6 +21,26 @@ import { HardenedRiskEngine } from '../server/risk/riskEngine';
 import { EligibilityFilter } from '../server/signals/eligibilityFilter';
 import fs from 'fs';
 import path from 'path';
+
+/** A small LIVE buy that passes every gate except the daily-loss ones. */
+function adv4Order() {
+  return {
+    mint: Keypair.generate().publicKey.toBase58(),
+    orderSizeSol: 0.001,
+    expectedPriceSol: 0.0001,
+    slippageBps: 300,
+    estimatedFeeLamports: 5000,
+    jitoTipLamports: 10000,
+    signalTimestamp: Date.now(),
+    marketDataTimestamp: Date.now(),
+    walletSpendableSol: 1,
+    currentOpenPositionsCount: 0,
+    currentTotalExposureSol: 0,
+    executionMode: 'LIVE' as const,
+  };
+}
+
+afterEach(() => vi.restoreAllMocks());
 
 describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B20, B24)', () => {
   const CANONICAL_FEE_RECIPIENT = new PublicKey('62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV');
@@ -610,25 +630,42 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
       const dailyTotal = memDb.getDailyTotalPnLSol('LIVE');
       expect(dailyTotal).toBeCloseTo(-0.005, 4);
 
-      const maxDailyLossSol = 0.020;
-      const breached = dailyTotal <= -maxDailyLossSol;
-      expect(breached).toBe(false);
+      // The real risk engine, fed that daily total at the DB boundary: not halted.
+      const risk = new HardenedRiskEngine();
+      risk.updateLimits({ maxDailyLossSol: 0.02 });
+      vi.spyOn(workstationDb, 'getDailyTotalPnLSol').mockReturnValue(dailyTotal);
+      const res = risk.evaluateOrder(adv4Order());
+      expect(res.reasonCode).not.toBe('DAILY_LOSS_LIMIT');
+      expect(res.approved).toBe(true);
+      expect(risk.getDailyLossLatch('LIVE')).toBeNull();
     });
 
     it('B20-ADV.4: Exact boundary transition at maxDailyLossSol (-0.01999 vs -0.02000)', () => {
-      const maxDailyLossSol = 0.02;
+      // Each case gets a fresh engine (a breach latches) and the real evaluateOrder; only the daily total is fed in at the DB boundary.
+      // Gate 10 (the floor itself) words its refusal "reached the floor"; the later worst-case gate words its own, so match on that.
+      const evalAt = (dailyPnl: number) => {
+        const risk = new HardenedRiskEngine();
+        risk.updateLimits({ maxDailyLossSol: 0.02 });
+        vi.spyOn(workstationDb, 'getDailyTotalPnLSol').mockReturnValue(dailyPnl);
+        return { res: risk.evaluateOrder(adv4Order()), risk };
+      };
 
-      // Case 1: Just below limit: -0.01999 SOL loss -> not breached
-      const dailyPnLSafe = -0.01999;
-      expect(dailyPnLSafe <= -maxDailyLossSol).toBe(false);
+      // Case 1: just below the floor, -0.01999 SOL: gate 10 does not fire
+      const safe = evalAt(-0.01999);
+      expect(safe.res.message ?? '').not.toMatch(/reached the floor/);
+      expect(safe.risk.getDailyLossLatch('LIVE')).toBeNull();
 
-      // Case 2: Exactly at limit: -0.02000 SOL loss -> breached
-      const dailyPnLLimit = -0.02000;
-      expect(dailyPnLLimit <= -maxDailyLossSol).toBe(true);
+      // Case 2: exactly at the floor, -0.02000 SOL: breached and latched
+      const atLimit = evalAt(-0.02);
+      expect(atLimit.res.approved).toBe(false);
+      expect(atLimit.res.reasonCode).toBe('DAILY_LOSS_LIMIT');
+      expect(atLimit.res.message).toMatch(/reached the floor/);
+      expect(atLimit.risk.getDailyLossLatch('LIVE')).not.toBeNull();
 
-      // Case 3: Over limit: -0.02001 SOL loss -> breached
-      const dailyPnLExceeded = -0.02001;
-      expect(dailyPnLExceeded <= -maxDailyLossSol).toBe(true);
+      // Case 3: over the floor, -0.02001 SOL: breached
+      const over = evalAt(-0.02001);
+      expect(over.res.reasonCode).toBe('DAILY_LOSS_LIMIT');
+      expect(over.res.message).toMatch(/reached the floor/);
     });
   });
 });

@@ -37,8 +37,9 @@ beforeAll(async () => {
   market = await LocalMarket.connect(v);
   const signer = await market.signerKeyFile(dir, 5);
   trader = signer.keypair;
+  app = await startLocalnetApp({ dir, validator: v, signerKeyPath: signer.path, confluenceThreshold: 0, holderFeed: true });
+  market.watchedBy(() => app); // R2-3: seeded coins wait until this app has looked up their holders
   ({ mint: coinA, wallets: holdersA } = await market.seedCoin(14, 0.6));
-  app = await startLocalnetApp({ dir, validator: v, signerKeyPath: signer.path });
   await armLive(app);
 }, 240_000);
 
@@ -158,9 +159,12 @@ describe('LIVE lifecycle on a real curve: buy, partial sell, take-profit, traili
   }, 240_000);
 
   it('the kill switch refuses a new buy and nothing reaches the chain; resetting it lifts the refusal', async () => {
+    // A coin whose every holder the app has looked up (R2-3): coinA's later buyers (pumpTo's wallets) bought after its watch window ended, so
+    // they are UNKNOWN to the holder gate, which runs before the kill switch is read and would refuse coinA for top-10 concentration first.
+    const { mint: coinK } = await market.seedCoin(14, 0.6);
     const before = await sends();
     expect((await app.call('POST', '/api/execution/kill-switch', { activate: true })).json.killSwitchActive).toBe(true);
-    const refused = await app.call('POST', '/api/execution/trade', { mint: coinA.toBase58(), symbol: 'LNG', name: 'LongTest', amountSol: 0.02, confirmLive: true });
+    const refused = await app.call('POST', '/api/execution/trade', { mint: coinK.toBase58(), symbol: 'LNG', name: 'LongTest', amountSol: 0.02, confirmLive: true });
     expect(refused.status).toBe(400);
     expect(String(refused.json.error)).toMatch(/KILL_SWITCH_ACTIVE/);
     expect(await sends()).toBe(before);

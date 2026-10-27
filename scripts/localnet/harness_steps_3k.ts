@@ -3,7 +3,7 @@
  * functions `npm run devnet:e2e` runs, against the LiteSVM local validator (real pump.fun program binaries, scripts/localnet/validator.ts).
  *
  *   npx tsx scripts/localnet/harness_steps_3k.ts            (prints PASS/FAIL/SKIP lines, exits 1 on any FAIL)
- *   APEX_3K_ONLY=m, o or p                                   (one step only)
+ *   APEX_3K_ONLY=j, w, m, o or p                             (one step only)
  *
  * Built like scripts/localnet/harness_steps.ts (3I): the app's coordinator, auto controller and watch window run in this process for (m);
  * (o) boots server.ts in child processes on its own scratch DB and its own throwaway signer. Everything is loopback; ALLOWED_CLUSTER=localnet
@@ -123,23 +123,30 @@ async function run(info: { url: string; genesisHash: string }) {
     }
   }
 
-  if (!only || only === 'm') {
-    if (armed.success && (await S.hasBudget(steps, '(m) 3B: DEVNET_LIVE session spend', bal, 0.25, 'DEVNET_SESSION_SPEND'))) {
-      const coins = S.stepCoins(steps, '(m) 3B: DEVNET_LIVE session spend', kit, kp);
-      const b0 = await bal();
-      await S.sessionSpendMatchesWallet(steps, {
-        auto: autoSnipeController as any,
-        watch: watchWindow as any,
-        confluence: memecoinAggregator,
-        balanceLamports: () => conn.getBalance(kp.publicKey),
-        haltReason: () => coordinator.getHaltReason(),
-        openLive: () => workstationDb.loadPositions('LIVE', 'ACTIVE'),
-        makeCoins: (n) => coins.make(n),
-        cleanupCoins: () => coins.cleanup(),
-      });
-      console.log(`INFO  (m) cost the harness wallet ${(b0 - (await bal())).toFixed(5)} SOL`);
+  if (!only || only === 'w') {
+    // Devnet run 25: the feed watchdog. The step moves a deafened subscription to a fresh socket and sees a launch after it.
+    const { PumpFeedListener } = await import('../../server/solana/pumpFeedListener');
+    const { WatchWindow } = await import('../../server/signals/watchWindow');
+    // Devnet (2026-10-26): after (w) the listener's fresh socket redialed the closed proxy, because its unsubscribes were still on their way
+    // to the remote RPC when the proxy closed. Here the proxy answers the cleanup's unsubscribes 1.5 s late, as a remote RPC does. No dial
+    // may be refused during the step's refund or in the 10 s after it.
+    const wsErrors: string[] = [];
+    const origError = console.error;
+    console.error = (...a: any[]) => { if (a[0] === 'ws error:') wsErrors.push(String(a[1])); else origError(...a); };
+    try {
+      await S.deafSocketRecovers({ rec, sleep }, { Listener: PumpFeedListener, Window: WatchWindow, Connection, rpcUrl: info.url, kit, payer: kp, cleanupUnsubscribeDelayMs: 1_500 });
+      await sleep(10_000);
+      // the proxy refuses nothing while the step runs, so any refused dial is one after its close (the devnet lines came during the refund)
+      const refused = wsErrors.filter((e) => /ECONNREFUSED/.test(e));
+      rec('(w) feed watchdog: no socket left redialing the closed proxy', refused.length === 0, `${refused.length} refused ws dial(s) from the step's start to 10 s after it${refused.length ? `: ${refused[0]}` : ''}`);
+    } finally {
+      console.error = origError;
     }
   }
+
+  // (p) before (m), as the devnet flow runs them (scripts/DEVNET_E2E_README.md 9f: after (l), before (m)). A31/A71: the DEVNET_LIVE session
+  // (its buys and spend) survives setMode for 4 h, so after (m) has used all 5 of its buys, (p)'s "auto DEVNET_LIVE then OFF" is refused
+  // SESSION_BUDGET_USED. Run first, (p) opens the session with no buy and (m) continues it from 0 buys.
   if (!only || only === 'p') {
     const L = '(p) 3F: no re-entry after an exit';
     if (armed.success && (await S.hasBudget(steps, L, bal, 0.05, 'DEVNET_REENTRY_BLOCK'))) {
@@ -158,6 +165,23 @@ async function run(info: { url: string; genesisHash: string }) {
         auto: autoSnipeController,
       });
       console.log(`INFO  (p) cost the harness wallet ${(b0 - (await bal())).toFixed(5)} SOL`);
+    }
+  }
+  if (!only || only === 'm') {
+    if (armed.success && (await S.hasBudget(steps, '(m) 3B: DEVNET_LIVE session spend', bal, 0.25, 'DEVNET_SESSION_SPEND'))) {
+      const coins = S.stepCoins(steps, '(m) 3B: DEVNET_LIVE session spend', kit, kp);
+      const b0 = await bal();
+      await S.sessionSpendMatchesWallet(steps, {
+        auto: autoSnipeController as any,
+        watch: watchWindow as any,
+        confluence: memecoinAggregator,
+        balanceLamports: () => conn.getBalance(kp.publicKey),
+        haltReason: () => coordinator.getHaltReason(),
+        openLive: () => workstationDb.loadPositions('LIVE', 'ACTIVE'),
+        makeCoins: (n) => coins.make(n),
+        cleanupCoins: () => coins.cleanup(),
+      });
+      console.log(`INFO  (m) cost the harness wallet ${(b0 - (await bal())).toFixed(5)} SOL`);
     }
   }
   coordinator.armLiveTrading(false);

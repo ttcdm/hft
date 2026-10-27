@@ -1,7 +1,8 @@
-import { executionCoordinator } from '../execution/coordinator';
+import { executionCoordinator, ACKNOWLEDGEABLE_ALERT_CODES } from '../execution/coordinator';
+import type { OperatorAlert } from '../core/types';
 import { autoSnipeController } from '../auto/controller';
 import { pumpFeedListener } from '../solana/pumpFeedListener';
-import { workstationDb } from '../db/database';
+import { workstationDb, WorkstationDatabase } from '../db/database';
 import { riskEngine } from '../risk/riskEngine';
 import { endpointOrigin } from '../middleware/enterprise';
 import { resolveRpcUrl, allowedCluster } from '../solana/clusterGuard';
@@ -22,13 +23,83 @@ export interface SystemCheck {
   /** what it was measured from, or why it is not OK */
   detail: string;
 }
-export interface SystemChecksResult { checkedAt: number; cluster: string; mode: string; checks: SystemCheck[] }
+export interface SystemChecksResult { checkedAt: number; cluster: string; mode: string; checks: SystemCheck[]; operatorAlerts: OperatorAlertView[] }
+
+/**
+ * R6-1 / R7-1: the coordinator's open operator alerts, as the UI and the runbook read them from GET /api/system/checks. Each carries a
+ * level: CRITICAL means money may be at risk or a record is wrong (an exit that cannot run, a position the wallet does not hold, a halt
+ * that did not persist); the UI keeps those on screen until the server clears them. A code not listed here is CRITICAL (fail closed).
+ */
+export type OperatorAlertLevel = 'CRITICAL' | 'WARNING' | 'INFO';
+export interface OperatorAlertView extends OperatorAlert {
+  level: OperatorAlertLevel;
+  /** It reports a past event and nothing clears it but the operator: POST /api/system/alerts/acknowledge { code, positionId }. */
+  acknowledgeable: boolean;
+}
+export const OPERATOR_ALERT_LEVELS: Record<string, OperatorAlertLevel> = {
+  TRADING_HALTED: 'CRITICAL',
+  HALT_NOT_PERSISTED: 'CRITICAL',
+  KILL_SWITCH_WAS_ON: 'CRITICAL',
+  EXIT_FAILING: 'CRITICAL',
+  EXIT_NO_SIGNER: 'CRITICAL',
+  EXIT_QUOTE_FAILING: 'CRITICAL',
+  POSITION_GONE: 'CRITICAL',
+  POSITION_BALANCE_MISSING: 'CRITICAL',
+  POSITION_NOT_PERSISTED: 'CRITICAL',
+  POSITION_MARK_UNAVAILABLE: 'CRITICAL',
+  LEDGER_WRITE_FAILED: 'CRITICAL',
+  LATE_BUY_NOT_SOLD: 'CRITICAL',
+  UNTRACKED_TOKEN_BALANCE: 'CRITICAL',
+  // raised by other batches (C1, C2, D): listed here so they stay CRITICAL by name, not only by the unknown-code default
+  RPC_AUTH_REJECTED: 'CRITICAL',
+  EXIT_LOOP_FAILING: 'CRITICAL',
+  SELL_LANDED_UNBOOKED: 'CRITICAL',
+  SELL_BLOCKHASH_UNCHECKED: 'CRITICAL',
+  EXIT_RATE_LIMITED: 'WARNING',
+  SELL_ADOPTED: 'WARNING',
+  POSITION_BALANCE_CLAMPED: 'WARNING',
+  MARK_MINT_REJECTED: 'WARNING',
+  PAPER_MARKS_UNAVAILABLE: 'WARNING',
+  DISK_SPACE_LOW: 'WARNING',
+  LATE_BUY_SOLD: 'INFO',
+};
+/**
+ * R9-12: split the mark alerts that no longer apply: a POSITION_MARK_UNAVAILABLE whose position is not open. (PAPER_MARKS_UNAVAILABLE needs
+ * no help: every exit pass raises or clears it.) Every other alert is kept as it is.
+ */
+export function splitMootMarkAlerts(alerts: OperatorAlert[], open: Array<{ id: string }>): { current: OperatorAlert[]; moot: OperatorAlert[] } {
+  const openIds = new Set(open.map((p) => p.id));
+  const isMoot = (a: OperatorAlert) => a.code === 'POSITION_MARK_UNAVAILABLE' && !!a.positionId && !openIds.has(a.positionId);
+  return { current: alerts.filter((a) => !isMoot(a)), moot: alerts.filter(isMoot) };
+}
+export const operatorAlertLevel = (code: string): OperatorAlertLevel => OPERATOR_ALERT_LEVELS[code] ?? 'CRITICAL';
+const LEVEL_RANK: Record<OperatorAlertLevel, number> = { CRITICAL: 0, WARNING: 1, INFO: 2 };
+
+/** Every open alert with its level, CRITICAL first, newest first within a level. */
+export function operatorAlertViews(alerts: OperatorAlert[]): OperatorAlertView[] {
+  return alerts
+    .map((a) => ({ ...a, level: operatorAlertLevel(a.code), acknowledgeable: ACKNOWLEDGEABLE_ALERT_CODES.includes(a.code) }))
+    .sort((a, b) => LEVEL_RANK[a.level] - LEVEL_RANK[b.level] || b.lastSeenAt - a.lastSeenAt);
+}
+
+/** The System checks row for the alerts: FAIL with any CRITICAL open, WARN with any other, OK with none. */
+export function operatorAlertsCheck(views: OperatorAlertView[]): SystemCheck {
+  const crit = views.filter((a) => a.level === 'CRITICAL').length;
+  const codes = [...new Set(views.map((a) => a.code))].join(', ');
+  return {
+    id: 'alerts', label: 'Operator alerts', status: crit ? 'FAIL' : views.length ? 'WARN' : 'OK',
+    value: views.length ? `${views.length} open (${crit} critical): ${codes}` : 'none open',
+    detail: views.length ? views.slice(0, 3).map((a) => `${a.code}: ${a.message}`).join(' | ') : 'No operator alert is open. Alerts live in memory only; a restart forgets them (the journal keeps the events).',
+  };
+}
 
 /** B3b: the capacity check warns when more than this share of seller funder lookups ended up unread, once this many were asked for. */
 export const SELLER_FUNDER_UNREAD_WARN_SHARE = 0.05;
 export const SELLER_FUNDER_UNREAD_MIN_ASKED = 20;
 
 const sec = (ms: number | null) => (ms === null ? 'never' : ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`);
+/** "12.0 s ago", or "none yet" when it never happened (it used to print "never ago"). */
+const ago = (ms: number | null) => (ms === null ? 'none yet' : `${sec(ms)} ago`);
 
 /**
  * Live results, each read from the component that owns the fact (no check here is computed from a constant). A check that cannot be read
@@ -78,6 +149,9 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
   const walletAuditRuns = auto.mode === 'DEVNET_LIVE';
   checks.push(halt
     ? { id: 'halt', label: 'Wallet audit / halt', status: 'FAIL', value: 'ALL TRADING HALTED', detail: halt }
+    // R9-4: "OK, no halt" read as "trading is allowed" right above a red kill-switch row; with the switch on, say so here too
+    : riskEngine.isKillSwitchActive()
+    ? { id: 'halt', label: 'Wallet audit / halt', status: 'WARN', value: 'no wallet-audit halt, but the KILL SWITCH is ON (orders refused)', detail: 'There is no persisted halt. The kill switch (row below) refuses every new order until it is reset.' }
     : { id: 'halt', label: 'Wallet audit / halt', status: 'OK', value: walletAuditRuns ? 'audit running, no halt' : 'no halt', detail: walletAuditRuns ? 'The wallet balance is compared with the journal; an unexplained change halts every buy plus the take-profit and stale exits; stop-loss, trailing stop, manual close and panic still run.' : `The wallet audit only runs in DEVNET_LIVE (auto mode is ${auto.mode}).` });
 
   const breakerOpen = riskEngine.getCircuitBreakerState() !== 'CLOSED';
@@ -98,7 +172,7 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
   const feedAge = feed.lastEventAgeMs >= 0 ? feed.lastEventAgeMs : null;
   checks.push({
     id: 'feed', label: 'Pump.fun event feed', status: !feedOk ? 'WARN' : feedAge === null ? 'WARN' : feedAge > 120_000 ? 'WARN' : 'OK',
-    value: `${feed.status}, last event ${sec(feedAge)} ago`, detail: `${feed.eventsReceived} logs received, ${feed.eventsParsed} creates and ${feed.tradesParsed} trades parsed. A quiet devnet is normal; on mainnet this is a warning.`,
+    value: `${feed.status}, last event ${ago(feedAge)}`, detail: `${feed.eventsReceived} logs received, ${feed.eventsParsed} creates and ${feed.tradesParsed} trades parsed. A quiet devnet is normal; on mainnet this is a warning.`,
   });
 
   const cap = watchWindow.getSnapshot(now).capacity;
@@ -117,19 +191,41 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
 
   checks.push(recorderCheck(now));
 
-  const alerts = diag.operatorAlerts ?? [];
+  // R9-12: a mark alert is about a position the exit pass prices; the pass clears it only while the position is open, so after a close it
+  // stayed for good. A mark alert for a position that is no longer open is moot: it is left out of the marks row and the alert list.
+  const { current: alerts, moot: mootMarkAlerts } = splitMootMarkAlerts(diag.operatorAlerts ?? [], workstationDb.loadPositions(undefined, 'ACTIVE'));
   const markAlerts = alerts.filter((a) => a.code === 'POSITION_MARK_UNAVAILABLE' || a.code === 'PAPER_MARKS_UNAVAILABLE');
+  const mootNote = mootMarkAlerts.length ? ` ${mootMarkAlerts.length} mark alert(s) for positions no longer open are not counted.` : '';
   checks.push({
     id: 'marks', label: 'Position marks', status: markAlerts.length ? 'WARN' : diag.positionMarkHealth === 'STALE' ? 'WARN' : 'OK',
-    value: markAlerts.length ? `${markAlerts.length} stale-mark alert(s)` : `${diag.positionMarkHealth}, last mark ${sec(ages.positionMarkAgeMs)} ago`,
-    detail: markAlerts.length ? markAlerts.map((a) => a.message).slice(0, 3).join(' | ') : `${diag.openPositionsCount} open position(s); no stale-mark alert.`,
+    value: markAlerts.length ? `${markAlerts.length} stale-mark alert(s)` : `${diag.positionMarkHealth}, last mark ${ago(ages.positionMarkAgeMs)}`,
+    detail: (markAlerts.length ? markAlerts.map((a) => a.message).slice(0, 3).join(' | ') : `${diag.openPositionsCount} open position(s); no stale-mark alert.`) + mootNote,
   });
 
-  checks.push({
-    id: 'database', label: 'Database', status: diag.sqliteJournalOk ? 'OK' : 'FAIL', value: diag.sqliteJournalOk ? 'writable' : 'NOT writable', detail: `${workstationDb.getDbPath()}, journal mode ${workstationDb.getJournalMode()}`,
-  });
+  const operatorAlerts = operatorAlertViews(alerts);
+  checks.push(operatorAlertsCheck(operatorAlerts));
 
-  return { checkedAt: now, cluster: cluster.allowed, mode: `${diag.executionMode}${diag.liveTradingActive ? ' (LIVE armed)' : ''}`, checks };
+  checks.push(databaseCheck(diag.sqliteJournalOk));
+
+  return { checkedAt: now, cluster: cluster.allowed, mode: `${diag.executionMode}${diag.liveTradingActive ? ' (LIVE armed)' : ''}`, checks, operatorAlerts };
+}
+
+/**
+ * The database row: FAIL when the writable check fails (it needs MIN_FREE_BYTES free), WARN while it passes with less than
+ * LOW_FREE_WARN_BYTES free, so the operator hears about a filling disk before buys stop.
+ */
+export function databaseCheck(writable: boolean): SystemCheck {
+  const free = workstationDb.getFreeBytes();
+  const mib = (b: number) => `${Math.floor(b / (1024 * 1024))} MiB`;
+  const low = free !== null && free < WorkstationDatabase.LOW_FREE_WARN_BYTES;
+  const where = `${workstationDb.getDbPath()}, journal mode ${workstationDb.getJournalMode()}${free === null ? '' : `, ${mib(free)} free`}`;
+  if (!writable) {
+    return { id: 'database', label: 'Database', status: 'FAIL', value: 'NOT writable', detail: `${where}. A test write failed, or less than ${mib(WorkstationDatabase.MIN_FREE_BYTES)} is free; buys are refused until it passes.` };
+  }
+  if (low) {
+    return { id: 'database', label: 'Database', status: 'WARN', value: `writable, ${mib(free)} free`, detail: `${where}. Free disk is below ${mib(WorkstationDatabase.LOW_FREE_WARN_BYTES)}; buys stop below ${mib(WorkstationDatabase.MIN_FREE_BYTES)}. Free some space.` };
+  }
+  return { id: 'database', label: 'Database', status: 'OK', value: free === null ? 'writable' : `writable, ${mib(free)} free`, detail: where };
 }
 
 /** S190: the launch recorder against its limits. Rate and days-left are measured from the last hour of writes, not assumed. */

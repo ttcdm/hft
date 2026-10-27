@@ -28,6 +28,7 @@ const keyPath = path.join(scratch, 'throwaway-keypair.json');
 const tempWalletDir = path.join(scratch, 'temp-wallets');
 // 3I: what the opt-in steps (t), (u) and (n) need free in the harness wallet before they start: what they lend, plus fees and a margin.
 const RPC_SWITCH_NEED_SOL = 0.1;
+const FEED_WATCHDOG_NEED_SOL = 0.1;
 const SELLER_NEVER_BOUGHT_NEED_SOL = 0.15;
 // (n): one harness buy plus the 0.015 SOL reserve, the first buy's token-account rent and fees, with a margin.
 const LOSS_FLOOR_NEED_SOL = 0.05;
@@ -82,6 +83,14 @@ const solscan = (sig: string) => `https://solscan.io/tx/${sig}?cluster=devnet`;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function main() {
+  // R2-9: an opt-in amount above the 1 SOL per-run ceiling on SOL at risk is refused before anything is read or sent
+  const spendSteps = await import('./devnet_e2e_steps');
+  const spendProblems = spendSteps.runSpendFlagProblems(process.env);
+  if (spendProblems.length) {
+    console.error(`ABORT: ${spendProblems.join('; ')}`);
+    process.exit(2);
+  }
+  const spend = new spendSteps.RunSpendLedger();
   // S227: tracing starts here when APEX_TRACING=true, as server.ts does at boot, after the environment above is set and before any connection is made.
   const { tracingReady } = await import('../server/observability/init');
   await tracingReady;
@@ -230,6 +239,9 @@ async function main() {
 
     // ---- stage 1: simulate (sigVerify false, replaceRecentBlockhash true) ----
     try {
+      // The curve is read again here: the scan's read is (j) and its 10 s block older, and a young devnet coin trades in that time (devnet
+      // 2026-10-26: two buys moved it past the 8% bound, pump 6002 TooMuchSolRequired). (a) passed: executeTrade reads the curve itself.
+      state = await PumpCurveService.fetchPumpMarketState({ connection: conn, mint: mintPk, executionMode: 'LIVE' });
       const quote = PumpCurveService.calculateBuyQuote({
         state, amountSol: BUY_SOL, slippageBps: 800, jitoTipSol: 0, priorityFeeLamports: 0, executionMode: 'LIVE',
       });
@@ -410,7 +422,14 @@ async function main() {
       emergencyStop: (await import('../server/execution/emergencyStop')).emergencyStop,
       setKillSwitch: (on) => riskEngine.setKillSwitch(on),
       arm: (a, code) => coordinator.armLiveTrading(a, code),
-      auto: (await import('../server/auto/controller')).autoSnipeController as any,
+      auto: await (async () => {
+        const { autoSnipeController: a, AutoSnipeController: A } = await import('../server/auto/controller');
+        // the controller itself, plus the static real-SOL session cap the budget route checks against ((e''') raises a used budget)
+        return {
+          setMode: a.setMode.bind(a), getStatus: a.getStatus.bind(a), submitCandidate: a.submitCandidate.bind(a), setBudget: a.setBudget.bind(a),
+          maxSessionSpendSol: () => A.maxSessionSpendSol(),
+        } as any;
+      })(),
     },
   };
   stepsRef = steps;
@@ -430,6 +449,7 @@ async function main() {
   await S.heldBlockhashStopLoss(steps); // P1.7
   const gDoneAt = Date.now();
   await rpcSwitchStep(steps, S, { conn, web3, kp, coordinator, PumpCurveService, txBuilder });
+  await feedWatchdogStep(steps, S, { conn, web3, kp, coordinator, PumpCurveService, txBuilder });
 
   // (h) P1.6: opt-in (DEVNET_DUMP_SOL is the most the seed may take). The seed is sized from the coin's own curve (DEVNET_E2E_README.md).
   const dumpSol = Number(process.env.DEVNET_DUMP_SOL || 0);
@@ -444,9 +464,12 @@ async function main() {
   if (dumpSol > 0) {
     const market = await dumpMarket();
     const have = (await conn.getBalance(kp.publicKey)) / LAMPORTS_PER_SOL;
-    const maxSeedSol = Math.min(dumpSol, have - BUY_SOL - 0.3);
+    const maxSeedSol = Math.min(dumpSol, have - BUY_SOL - 0.3, spend.remainingSol());
+    const reserved = maxSeedSol > 0 ? spend.reserve('(h) dump seed', maxSeedSol) : { ok: true as const }; // R2-9
     if (maxSeedSol <= 0) {
-      rec('(h) funding for the dump', false, `the throwaway ${kp.publicKey.toBase58()} has ${have.toFixed(3)} SOL; (h) needs the seed plus ${(BUY_SOL + 0.3).toFixed(2)} SOL`);
+      rec('(h) funding for the dump', false, `the throwaway ${kp.publicKey.toBase58()} has ${have.toFixed(3)} SOL; (h) needs the seed plus ${(BUY_SOL + 0.3).toFixed(2)} SOL, and the run may put at most ${spend.remainingSol()} SOL more at risk`);
+    } else if (!reserved.ok) {
+      rec('(h) SOL at risk within the per-run ceiling', false, reserved.reason);
     } else {
       await S.failedReadThenDumpStopLoss(steps, market, {
         appBuySol: BUY_SOL,
@@ -482,7 +505,7 @@ async function main() {
 
   await sellerNeverBoughtStep(steps, S, { conn, web3, kp, coordinator, PumpCurveService, txBuilder });
 
-  await releaseGatesStep(steps, S, { conn, web3, kp, coordinator, workstationDb, PumpCurveService, txBuilder, buildBuyRequestFor });
+  await releaseGatesStep(steps, S, { conn, web3, kp, coordinator, workstationDb, PumpCurveService, txBuilder, buildBuyRequestFor, spend });
 
   await S.waitPast(steps, gDoneAt, riskEngine.getLimits().cooldownPerMintMs, 'per-mint cooldown from the (g) buy');
   if (process.env.DEVNET_LOSS_FLOOR === '1') await freshMintFor('(n)');
@@ -505,7 +528,7 @@ async function main() {
   const lockPaths = [IL.dbLockPath(workstationDb.getDbPath()), IL.signerLockPath(kp.publicKey.toBase58())].filter((p): p is string => !!p);
   if (!(await S.handOverToChildPhases(steps, {
     stopTrading: () => coordinator.cleanup(), isLiveArmed: () => coordinator.isLiveArmed(), disarm: () => coordinator.armLiveTrading(false),
-    releaseAllLocks: IL.releaseAllLocks, holdsLock: (p) => IL.readLock(p)?.pid === process.pid, lockPaths,
+    releaseAllLocks: IL.releaseAllLocks, holdsLock: (p) => IL.isOwnLock(IL.readLock(p)), lockPaths,
     // the coordinator has no public handle on its running exit pass; the harness reads the private field it keeps (read only)
     exitPassDone: () => (coordinator as any).exitPassInFlight ?? Promise.resolve(),
   }))) return finish();
@@ -531,6 +554,7 @@ async function main() {
 async function releaseGatesStep(steps: import('./devnet_e2e_steps').HarnessSteps, S: typeof import('./devnet_e2e_steps'), d: {
   conn: any; web3: any; kp: any; coordinator: any; workstationDb: any; PumpCurveService: any; txBuilder: any;
   buildBuyRequestFor: (m: string, st: any, allowWaive: boolean) => Promise<any>;
+  spend?: import('./devnet_e2e_steps').RunSpendLedger;
 }): Promise<void> {
   if (process.env.DEVNET_RELEASE_GATES !== '1') {
     console.log('INFO  (k) skipped: set DEVNET_RELEASE_GATES=1 (needs about 1.2 SOL free, spends about 0.1) to run the SHADOW/PAPER release-gates step; add DEVNET_CURVE_CAP=1 (about 27 SOL more, see the README) for the curve-cap push');
@@ -563,7 +587,7 @@ async function releaseGatesStep(steps: import('./devnet_e2e_steps').HarnessSteps
       buildBuyRequestFor: async (m) => d.buildBuyRequestFor(m, await curveState(m), true),
       balanceSol: async (k) => (await d.conn.getBalance(k.publicKey)) / 1e9,
       isLiveArmed: () => d.coordinator.isLiveArmed(),
-    }, { curveCap: process.env.DEVNET_CURVE_CAP === '1' });
+    }, { curveCap: process.env.DEVNET_CURVE_CAP === '1', spend: d.spend });
   }
   autoSnipeController.detachWatchWindow();
   watchWindow.stop();
@@ -591,7 +615,7 @@ async function lossFloorStep(steps: import('./devnet_e2e_steps').HarnessSteps, S
     refreshPrice: () => solPriceService.refresh(),
     dailyPnlSol: () => riskEngine.getDailyTotalPnLSol('LIVE'),
     latch: () => riskEngine.getDailyLossLatch('LIVE'),
-    clearLatch: () => riskEngine.clearDailyLossLatch(),
+    clearLatch: () => riskEngine.clearDailyLossLatch('LIVE'),
     resume: (o) => autoSnipeController.resume(o),
     orderSol: d.buySol,
   });
@@ -672,6 +696,26 @@ async function rpcSwitchStep(steps: import('./devnet_e2e_steps').HarnessSteps, S
   } finally {
     watchWindow.stop();
   }
+}
+
+/**
+ * (w) task 3K, opt-in (DEVNET_FEED_WATCHDOG=1): a log subscription switched onto a deaf socket is noticed (NO_DELIVERY) and moved to a fresh
+ * one (devnet run 25). The step builds its own PumpFeedListener and WatchWindow on a Connection whose websocket goes through a loopback proxy
+ * in front of the devnet RPC's, so the app's singletons and the coordinator are not touched.
+ */
+async function feedWatchdogStep(steps: import('./devnet_e2e_steps').HarnessSteps, S: typeof import('./devnet_e2e_steps'), d: FeedStepDeps): Promise<void> {
+  if (process.env.DEVNET_FEED_WATCHDOG !== '1') {
+    console.log(`INFO  (w) skipped: set DEVNET_FEED_WATCHDOG=1 (needs ${FEED_WATCHDOG_NEED_SOL} SOL free, spends about 0.012) to run the deaf-socket feed watchdog step (run 25)`);
+    return;
+  }
+  if (!(await S.hasBudget(steps, '(w) feed watchdog: a deaf socket', async () => (await d.conn.getBalance(d.kp.publicKey)) / 1e9, FEED_WATCHDOG_NEED_SOL, 'DEVNET_FEED_WATCHDOG'))) return;
+  const { PUMP_SDK } = await import('@pump-fun/pump-sdk');
+  const { WatchWindow } = await import('../server/signals/watchWindow');
+  const { PumpFeedListener } = await import('../server/solana/pumpFeedListener');
+  await S.deafSocketRecovers(steps, {
+    Listener: PumpFeedListener, Window: WatchWindow, Connection: d.web3.Connection, rpcUrl: process.env.SOLANA_RPC_URL!,
+    kit: S.makeChainKit({ conn: d.conn, web3: d.web3, sdk: PUMP_SDK, curve: d.PumpCurveService, builder: d.txBuilder, keyDir: tempWalletDir }), payer: d.kp,
+  });
 }
 
 /** (u) 3I, opt-in (DEVNET_SELLER_NEVER_BOUGHT=1): a seller that never bought is looked up and its sell is CREATOR_SOLD (B3). Wired as (i). */
@@ -799,6 +843,7 @@ async function killRestartStep(steps: import('./devnet_e2e_steps').HarnessSteps,
         RPC_MAX_REQUESTS_PER_SEC: process.env.RPC_MAX_REQUESTS_PER_SEC ?? '10', MIN_LIQUIDITY_USD: '0', JITO_MAX_RETRIES: '1', JITO_RETRY_INTERVAL_MS: '200',
         APEX_DB_PATH: dbPath, SIGNER_KEYPAIR_PATH: path.join(tempWalletDir, `${signer.publicKey.toBase58()}.json`),
         ALLOW_LIVE_REAL_MONEY_TRADING: 'true', AUTO_SNIPE_ENABLED: 'true',
+        ...S.networkPassThroughEnv(process.env), // cloud run 28: the proxy, CA and ws preload when set (none on the Mac)
       },
     }),
     relay,
@@ -817,7 +862,8 @@ async function killRestartStep(steps: import('./devnet_e2e_steps').HarnessSteps,
       const errors: string[] = [];
       try { await relay.close(); } catch (e: any) { errors.push(`relay close: ${String(e?.message ?? e).slice(0, 80)}`); }
       for (const w of [signer, creator]) { // each wallet on its own: one failed refund does not skip the other
-        if (mint) { try { await kit.sellAll(w, mint); } catch { /* nothing held */ } }
+        // R2-10: sellAll returns null when nothing is held; a throw leaves tokens behind and is reported with the key file
+        if (mint) { try { await kit.sellAll(w, mint); } catch (e: any) { errors.push(`sell ${mint} from ${w.publicKey.toBase58()} (key file ${kit.keyFileOf?.(w) ?? '<scratch>/temp-wallets/'}): ${String(e?.message ?? e).slice(0, 80)}`); } }
         try { await kit.refund(w, d.kp.publicKey); } catch (e: any) { errors.push(`refund ${w.publicKey.toBase58()}: ${String(e?.message ?? e).slice(0, 80)}`); }
       }
       if (errors.length) throw new Error(errors.join('; '));

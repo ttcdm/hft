@@ -152,7 +152,9 @@ describe('PAPER never sends, and the kill switch refuses new trades', () => {
   let rpc: RpcStub; let app: AppHandle;
   beforeAll(async () => {
     rpc = await startRpcStub(LOCALNET_STUB_GENESIS);
-    app = await startApp(dir(), { SOLANA_RPC_URL: rpc.url, ALLOWED_CLUSTER: 'localnet', LOCALNET_GENESIS_HASH: LOCALNET_STUB_GENESIS });
+    // R5-40: the route runs executeSnipe's gates, which refuse a buy with no SOL/USD reading first (C3); the fixed localnet price lets the
+    // trade reach the market-data check this block is about.
+    app = await startApp(dir(), { SOLANA_RPC_URL: rpc.url, ALLOWED_CLUSTER: 'localnet', LOCALNET_GENESIS_HASH: LOCALNET_STUB_GENESIS, LOCALNET_SOL_PRICE_USD: '150' });
     handles.push(app);
   }, 90_000);
   afterAll(() => rpc.close());
@@ -165,12 +167,13 @@ describe('PAPER never sends, and the kill switch refuses new trades', () => {
 
   it('a PAPER trade with no market data is refused with a stated reason, in PAPER, and nothing reaches the RPC', async () => {
     const r = await app.call('POST', '/api/execution/trade', trade());
-    // The stub RPC has no bonding curve for a random mint, so the paper gate fails closed (price impact unknown). That is the
-    // outcome asserted: a stated refusal, not a 5xx, in PAPER, with nothing sent. A filled paper trade needs curve data (localnet:e2e).
+    // The stub RPC has no bonding curve for a random mint. R5-40: the route trades only against a real pool (no synthetic one, and not
+    // the caller's price), so it is refused MARKET_DATA_UNAVAILABLE before the coordinator. That is the outcome asserted: a stated
+    // refusal, not a 5xx, still in PAPER, with nothing sent. A filled paper trade needs curve data (localnet:e2e).
     expect(r.status).toBe(400);
     expect(r.json.success).toBe(false);
-    expect(r.json.executionMode).toBe('PAPER');
-    expect(String(r.json.error)).toMatch(/PRICE_IMPACT_TOO_HIGH/);
+    expect(String(r.json.error)).toMatch(/^MARKET_DATA_UNAVAILABLE/);
+    expect((await app.call('GET', '/api/execution/mode')).json.mode).toBe('PAPER');
     expect(sends(rpc)).toBe(0);
   });
 
@@ -234,7 +237,7 @@ describe('arming policy and readiness, through the real API', () => {
   it('only the exact confirmation code arms; arm, kill switch and disarm move the mode as stated; nothing is sent', async () => {
     const rpc = await startRpcStub(LOCALNET_STUB_GENESIS);
     try {
-      const app = await startApp(dir(), ENV(rpc, { ALLOW_LIVE_REAL_MONEY_TRADING: 'true' })); handles.push(app);
+      const app = await startApp(dir(), ENV(rpc, { ALLOW_LIVE_REAL_MONEY_TRADING: 'true', LOCALNET_SOL_PRICE_USD: '150' })); handles.push(app); // a SOL/USD reading, so the LIVE trade below gets past the price check (R5-40)
       for (const code of ['', 'CONFIRM', 'CONFIRM_LIVE_TRADING', 'YES_ARM', '123456']) {
         const bad = await app.call('POST', '/api/execution/arm', { arm: true, confirmationCode: code });
         expect(bad.status, `code "${code}"`).toBe(403);
@@ -271,7 +274,7 @@ describe('arming policy and readiness, through the real API', () => {
       // LIVE with no readable curve (the RPC has no accounts), and a caller-suggested price: refused, nothing is signed or sent.
       const live = await app.call('POST', '/api/execution/trade', { ...trade(), confirmLive: true });
       expect(live.json.success).toBe(false);
-      expect(live.json.error).toMatch(/MARKET_DATA_UNAVAILABLE: Could not fetch real Pump\.fun bonding curve/); // the caller's own currentPriceSol is not used in LIVE
+      expect(live.json.error).toMatch(/^MARKET_DATA_UNAVAILABLE: .*could not be resolved \(MINT_NOT_FOUND/); // R5-40: executeSnipe's gates; the caller's own currentPriceSol is never used
       expect(sends(rpc)).toBe(0);
 
       // the kill switch disarms LIVE and readiness then refuses a re-arm

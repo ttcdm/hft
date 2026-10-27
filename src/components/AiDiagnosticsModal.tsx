@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { Sparkles, Brain, Search, Send, X, ShieldAlert, Cpu } from 'lucide-react';
 import { authFetch } from '../services/engineClient';
+import { DialogFrame } from './DialogFrame';
 
 interface AiDiagnosticsModalProps {
   isOpen: boolean;
@@ -45,7 +46,7 @@ export const AiDiagnosticsModal: React.FC<AiDiagnosticsModalProps> = ({ isOpen, 
   };
 
   return (
-    <div className="fixed inset-0 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 z-50 font-mono">
+    <DialogFrame label="AI diagnostics" className="fixed inset-0 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 z-50 font-mono">
       <div className="bg-[#0D131F] border border-[#1E293B] rounded-xl p-6 max-w-2xl w-full shadow-2xl flex flex-col max-h-[90vh]">
         <div className="flex items-center justify-between mb-3">
           <div className="flex items-center space-x-2">
@@ -111,6 +112,6 @@ export const AiDiagnosticsModal: React.FC<AiDiagnosticsModalProps> = ({ isOpen, 
           </div>
         )}
       </div>
-    </div>
+    </DialogFrame>
   );
 };

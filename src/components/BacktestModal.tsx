@@ -1,8 +1,9 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { X, TrendingUp } from 'lucide-react';
 import { usePolled } from '../utils/usePolled';
 import { parseThreshold, thresholdWarning } from '../utils/confluenceThreshold';
+import { DialogFrame } from './DialogFrame';
 
 export interface ReplayedLaunchRow {
   mint: string; symbol: string; trades: number; verdict: string; verdictReason: string; releasedAfterMs: number | null; score: number | null;
@@ -19,6 +20,8 @@ export interface ReplayReportData {
     launches: number; released: Record<string, number>; entries: number; closed: number; openAtEnd: number; wins: number; losses: number; winRate: number | null; netPnlSol: number | null; avgHoldMs: number | null; exitReasons: Record<string, number>;
     /** 5A: the open-at-end positions marked at the last price, kept out of netPnlSol. Absent on an older server. */
     openMarkNetPnlSol?: number | null;
+    /** R6-11: every entry, closed at its realized result plus open-at-end marked at the last print. Absent on an older server. */
+    allEntries?: { entries: number; wins: number; losses: number; winRate: number | null; netPnlSol: number | null };
     /** 5C: the same figures by how each recording ended. Absent on an older server. */
     byRecording?: Record<'COMPLETE' | 'TRUNCATED' | 'GRADUATED' | 'UNRESOLVED', { launches: number; entries: number; closed: number; openAtEnd: number; netPnlSol: number | null; openMarkNetPnlSol: number | null }>;
   };
@@ -70,18 +73,21 @@ const dur = (ms: number | null) => (ms === null ? '—' : ms < 60_000 ? `${Math.
  * S187: the what-if box. Replays the recorded launches at another confluence threshold; the shortcut buttons run 70, 50 and 40.
  * Nothing here changes the live threshold (that is the Auto panel); this only changes what the replay below uses.
  */
-export function ReplayThresholdBox({ value, onChange, inForce }: { value: string; onChange: (v: string) => void; inForce?: number }) {
+export function ReplayThresholdBox({ value, onChange, inForce, replayedAt }: { value: string; onChange: (v: string) => void; inForce?: number; replayedAt?: number | null }) {
   const p = parseThreshold(value);
   const warn = p.ok ? thresholdWarning(p.value) : null;
+  // R9-11: an invalid value used to drop the slider to 0 while the result stayed at the last good value; the slider now stays there too
+  const sliderValue = p.ok ? p.value : (replayedAt ?? inForce ?? 70);
   return (
     <div className="mb-3 p-2 rounded border border-[#1E293B] bg-[#090D16]" data-testid="replay-threshold">
       <div className="text-slate-400 mb-1">What if the confluence buy threshold were… {inForce !== undefined && <span className="text-slate-600">(live: {inForce})</span>}</div>
       <div className="flex items-center gap-1.5 flex-wrap">
-        <input data-testid="replay-threshold-slider" type="range" min={0} max={100} step={1} value={p.ok ? p.value : 0} onChange={(e) => onChange(e.target.value)} className="flex-1 min-w-[8rem]" aria-label="Replay threshold" />
-        <input data-testid="replay-threshold-box" type="number" min={0} max={100} step={1} value={value} onChange={(e) => onChange(e.target.value)} className="w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
+        <input data-testid="replay-threshold-slider" type="range" min={0} max={100} step={1} value={sliderValue} onChange={(e) => onChange(e.target.value)} className="flex-1 min-w-[8rem]" aria-label="Replay threshold" />
+        <input data-testid="replay-threshold-box" type="text" inputMode="numeric" aria-label="Replay threshold (0 to 100)" value={value} onChange={(e) => onChange(e.target.value)} className="w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
         {[70, 50, 40].map((n) => <button key={n} data-testid={`replay-threshold-${n}`} onClick={() => onChange(String(n))} className="px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white">{n}</button>)}
       </div>
-      {!p.ok && <p className="text-rose-400 mt-1" data-testid="replay-threshold-problem">{p.reason}</p>}
+      {!p.ok && <p className="text-rose-400 mt-1" data-testid="replay-threshold-problem">{p.reason} The replay below is still at {replayedAt ?? (inForce !== undefined ? `${inForce} (live)` : 'the live threshold')}.</p>}
+      {p.ok && replayedAt !== undefined && <p className="text-slate-500 mt-1" data-testid="replay-threshold-applied">Replay below at threshold {replayedAt ?? (inForce !== undefined ? `${inForce} (live)` : 'live')}{replayedAt !== null && replayedAt !== p.value ? `; ${p.value} replays once you stop moving it` : ''}.</p>}
       {warn && <p className="text-amber-300 mt-1" data-testid="replay-threshold-warning">{warn}</p>}
     </div>
   );
@@ -118,6 +124,7 @@ export function ReplayBacktestView({ data, error }: { data: ReplayResponse | nul
               <span className="text-slate-500">Verdicts</span><span className="text-right">{Object.entries(s.released).map(([k, v]) => `${k} ${v}`).join(' · ') || '—'}</span>
               <span className="text-slate-500">Entered</span><span className="text-right">{s.entries}</span>
               <span className="text-slate-500">Closed / still open at end</span><span className="text-right">{s.closed} / {s.openAtEnd}</span>
+              {s.allEntries && <><span className="text-slate-500">Net PnL after fees, every entry (closed + open marked at the last price)</span><span className="text-right" data-testid="replay-all-entries">{sol(s.allEntries.netPnlSol)}{s.allEntries.winRate === null ? '' : `, ${(s.allEntries.winRate * 100).toFixed(0)}% up (${s.allEntries.wins} of ${s.allEntries.entries})`}</span></>}
               <span className="text-slate-500">Win rate (closed)</span><span className="text-right">{s.winRate === null ? '—' : `${(s.winRate * 100).toFixed(0)}% (${s.wins} of ${s.closed})`}</span>
               <span className="text-slate-500">Net PnL after fees (closed, realized)</span><span className="text-right">{sol(s.netPnlSol)}</span>
               {s.openMarkNetPnlSol !== undefined && <><span className="text-slate-500">Still open at end, marked at the last price (not in the net above)</span><span className="text-right" data-testid="replay-open-mark">{sol(s.openMarkNetPnlSol)}{s.openAtEnd ? ` over ${s.openAtEnd}` : ''}</span></>}
@@ -126,7 +133,7 @@ export function ReplayBacktestView({ data, error }: { data: ReplayResponse | nul
             </div>
             {s.byRecording && (
               <p className="text-slate-400 mb-3" data-testid="replay-by-recording">
-                Recordings: {s.byRecording.COMPLETE.launches} recorded for the whole window, {s.byRecording.TRUNCATED.launches} cut by the trade cap, {s.byRecording.GRADUATED.launches} graduated, {s.byRecording.UNRESOLVED.launches} unresolved (no END row: still recording, stopped with the app, or recorded before END rows).
+                Recordings: {s.byRecording.COMPLETE.launches} recorded for the whole window, {s.byRecording.TRUNCATED.launches} cut (trade cap, restart or feed gap), {s.byRecording.GRADUATED.launches} graduated, {s.byRecording.UNRESOLVED.launches} unresolved (no END row: still recording, stopped with the app, or recorded before END rows).
                 {(['TRUNCATED', 'GRADUATED', 'UNRESOLVED'] as const).filter((k) => s.byRecording![k].entries > 0).map((k) => ` ${k}: ${s.byRecording![k].entries} entered, net ${sol(s.byRecording![k].netPnlSol)} closed, ${sol(s.byRecording![k].openMarkNetPnlSol)} open mark.`).join('')}
               </p>
             )}
@@ -177,33 +184,40 @@ export function ReplayBacktestView({ data, error }: { data: ReplayResponse | nul
   );
 }
 
+export const REPLAY_DEBOUNCE_MS = 400;
+
 interface BacktestModalProps { isOpen: boolean; onClose: () => void }
 
 export const BacktestModal: React.FC<BacktestModalProps> = ({ isOpen, onClose }) => {
   const [thresholdText, setThresholdText] = useState('');
-  // untouched: the threshold in force (no query). A valid number: replay at that value. An invalid one keeps the last good replay.
+  // untouched or cleared: the threshold in force (no query). A valid number: replay at that value, once it has stayed put for
+  // REPLAY_DEBOUNCE_MS (R9-11: every slider step fired its own replay). An invalid one keeps the last good replay.
   const [applied, setApplied] = useState<number | null>(null);
-  const onThreshold = (v: string) => {
-    setThresholdText(v);
-    const p = parseThreshold(v);
-    if (p.ok) setApplied(p.value);
-  };
+  const onThreshold = (v: string) => setThresholdText(v);
+  useEffect(() => {
+    const t = setTimeout(() => {
+      if (thresholdText.trim() === '') { setApplied(null); return; } // R9-11: a cleared box shows the live value, so replay at it
+      const p = parseThreshold(thresholdText);
+      if (p.ok) setApplied(p.value);
+    }, REPLAY_DEBOUNCE_MS);
+    return () => clearTimeout(t);
+  }, [thresholdText]);
   const path = applied === null ? '/api/backtest/replay' : `/api/backtest/replay?minScore=${applied}`;
   const { data, error } = usePolled<ReplayResponse>(path, 30000, isOpen);
   const live = usePolled<{ confluence?: { value: number } }>('/api/auto/status', 10000, isOpen).data?.confluence?.value;
   useEscapeToClose(isOpen, onClose);
   if (!isOpen) return null;
   return (
-    <div className="fixed inset-0 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 z-50 font-mono">
+    <DialogFrame label="Backtest" className="fixed inset-0 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 z-50 font-mono">
       <div className="bg-[#0D131F] border border-[#1E293B] rounded-xl p-5 max-w-3xl w-full shadow-2xl max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between mb-3">
           <h3 className="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2"><TrendingUp className="w-4 h-4 text-emerald-400" /> Backtest: replay of recorded launches</h3>
           <button onClick={onClose} className="text-slate-400 hover:text-white" aria-label="Close"><X className="w-4 h-4" /></button>
         </div>
         <p className="text-[10px] text-slate-500 mb-3">Runs the auto trader's own watch window, confluence gate and exit engine over launches this app recorded. Past launches only: it says nothing about the next one.</p>
-        <ReplayThresholdBox value={thresholdText === '' ? String(live ?? 70) : thresholdText} onChange={onThreshold} inForce={live} />
+        <ReplayThresholdBox value={thresholdText === '' ? String(live ?? 70) : thresholdText} onChange={onThreshold} inForce={live} replayedAt={applied} />
         <ReplayBacktestView data={data} error={error} />
       </div>
-    </div>
+    </DialogFrame>
   );
 };

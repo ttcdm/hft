@@ -35,6 +35,7 @@ function seedLive(over: Record<string, unknown> = {}): { id: string; mint: strin
     entryPriceSol: 1e-4, currentPriceSol: 1e-4, currentValueSol: 0.1, realizedPnLSol: 0, entryTxSignature: `sig-${id}`,
     entryTimestamp: Date.now() - 60_000, lastMarkTimestamp: Date.now(), executionMode: 'LIVE', status: 'OPEN', venue: 'PUMP_BONDING_CURVE',
     baseTokenProgram: TOKEN_PROGRAM_ID.toBase58(),
+    walletPubkey: localSigner.getPublicKey().toBase58(), // R4-2: bound to the test signer
     ...over,
   } as any);
   seeded.push(id);

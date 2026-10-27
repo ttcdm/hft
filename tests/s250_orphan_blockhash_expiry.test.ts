@@ -28,7 +28,7 @@ describe('S250: an unlanded buy is resolved on blockhash expiry, not after 15 mi
     submissionTime: Date.now() - 90_000, reconciliationState: 'RECONCILIATION_REQUIRED', networkFeeLamports: 5000, jitoTipLamports: 0,
     executionMode: 'LIVE', error: 'UNCONFIRMED', lastValidBlockHeight,
   });
-  const stateOf = (sig: string) => workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED', 'TIMED_OUT']).find((t) => t.signature === sig)?.reconciliationState;
+  const stateOf = (sig: string) => workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED', 'TIMED_OUT'])!.find((t) => t.signature === sig)?.reconciliationState;
 
   beforeEach(() => {
     vi.spyOn(localSigner, 'getStatus').mockReturnValue('READY');
@@ -38,7 +38,7 @@ describe('S250: an unlanded buy is resolved on blockhash expiry, not after 15 mi
     conn = (coordinator as any).connection;
   });
   afterEach(() => {
-    for (const t of workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED', 'PENDING'])) if (t.mint === mint) workstationDb.saveTransaction({ ...t, reconciliationState: 'REVERTED' });
+    for (const t of workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED', 'PENDING'])!) if (t.mint === mint) workstationDb.saveTransaction({ ...t, reconciliationState: 'REVERTED' });
     coordinator.cleanup();
     vi.restoreAllMocks();
   });
@@ -86,7 +86,7 @@ describe('S250: an unlanded buy is resolved on blockhash expiry, not after 15 mi
     const t = row(4_242);
     workstationDb.saveTransaction(t);
     workstationDb.saveTransaction({ ...t, lastValidBlockHeight: undefined, error: 'updated' });
-    expect(workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED']).find((x) => x.signature === t.signature)?.lastValidBlockHeight).toBe(4_242);
+    expect(workstationDb.loadTransactionsInStates(['RECONCILIATION_REQUIRED'])!.find((x) => x.signature === t.signature)?.lastValidBlockHeight).toBe(4_242);
   });
 });
 

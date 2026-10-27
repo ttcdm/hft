@@ -205,7 +205,8 @@ describe('P3: orphaned landed buy', () => {
       await new Promise((r) => setTimeout(r, 5));
       expect(positionFor(f.sig)).toBeUndefined();
       getTx.mockImplementation(async () => f.txResult()); // indexed now
-      (coordinator as any).scheduleOrphanRecovery([0]);
+      coordinator.orphanRecoveryDelaysMs = [0];
+      (coordinator as any).scheduleOrphanRecovery();
       await vi.waitFor(() => expect(positionFor(f.sig)?.status).toBe('OPEN'));
     });
   });

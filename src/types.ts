@@ -27,6 +27,12 @@ export interface AlertEvent {
   title: string;
   message: string;
   acknowledged: boolean;
+  /** R6-1: 'server' for an operator alert the server holds (it leaves when the server clears it). */
+  source?: 'local' | 'server';
+  /** No dismiss button: it stays until the server clears it. */
+  sticky?: boolean;
+  /** A server alert that only the operator clears (POST /api/system/alerts/acknowledge with this code and positionId). */
+  serverAck?: { code: string; positionId?: string };
 }
 
 // ---------------- SOCIAL SCANNER & ALPHA INTELLIGENCE ----------------
@@ -138,7 +144,8 @@ export interface MemecoinPool {
    */
   authoritiesVerified?: boolean;
   isLpBurned: boolean;
-  rugcheckScore: 'SAFE' | 'CAUTION' | 'DANGEROUS';
+  /** R6-13: UNKNOWN when nothing has rated the token (a pool made from a create event or a callout); never SAFE by default. */
+  rugcheckScore: 'SAFE' | 'CAUTION' | 'DANGEROUS' | 'UNKNOWN';
   createdAgo: string;
   trendingRank: number;
   /** Q32: true when some numbers above are placeholders (a pool built from a callout, not read from the chain). It is never real evidence. */
@@ -166,6 +173,8 @@ export interface SniperPosition {
   openedAt: number;
   status: 'OPEN' | 'CLOSED';
   signalId?: string;
+  /** R6-2: the mode the position was opened in; a LIVE row is real SOL even while the server is in PAPER. */
+  executionMode?: 'LIVE' | 'PAPER' | 'BACKTEST' | 'REPLAY';
 }
 
 export interface SniperBotConfig {
@@ -204,6 +213,8 @@ export interface TopCalloutRecord {
 }
 
 export interface PumpFunCaller {
+  /** R6-10: a DEMO_MODE caller: the handle, win rates and history are invented, not a real track record. */
+  invented?: boolean;
   userId: string;
   userUuid: string;
   primaryWallet: string;
@@ -274,6 +285,8 @@ export interface PumpFunHotCallout {
   hftAction: CalloutHftAction;
   decayWindowSecondsRemaining: number;
   status: 'ACTIVE' | 'SNIPED' | 'EXPIRED';
+  /** R6-6: when the feed data behind curve %, market cap, price and multiple was fetched (ms). Absent on an older server. */
+  dataAsOfMs?: number;
 }
 
 export interface PumpFunHotCalloutsResponse {

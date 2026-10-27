@@ -26,6 +26,56 @@ import type { AddressInfo } from 'node:net';
 import { createAssociatedTokenAccountIdempotentInstruction, createTransferCheckedInstruction, getAssociatedTokenAddressSync } from '@solana/spl-token';
 import type { ExecuteTradeRequest, ExecutionResponse } from '../server/execution/coordinator';
 
+/**
+ * R2-9: the project's rule is at most 1 SOL at risk per devnet run. The two opt-in steps that can move far more into the harness's own
+ * throwaway wallets, (h) the dump seed (DEVNET_DUMP_SOL) and (k) the curve-cap push (DEVNET_CURVE_CAP=1, about 25.8 SOL on a 30 SOL
+ * curve), reserve their SOL in a per-run ledger first, and are refused above RUN_AT_RISK_CEILING_SOL unless DEVNET_ALLOW_OVER_1_SOL=1.
+ * A DEVNET_DUMP_SOL above the ceiling is refused before the run starts (`runSpendFlagProblems`); the curve-cap push is sized from the
+ * coin's own curve, so it is checked when that figure is known.
+ */
+export const RUN_AT_RISK_CEILING_SOL = 1;
+export const AT_RISK_OVERRIDE_ENV = 'DEVNET_ALLOW_OVER_1_SOL';
+export function atRiskOverride(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.DEVNET_ALLOW_OVER_1_SOL === '1'; // AT_RISK_OVERRIDE_ENV
+}
+/** R2-9: reasons to refuse the run before anything is sent: an opt-in amount above the ceiling without the override. */
+export function runSpendFlagProblems(env: NodeJS.ProcessEnv = process.env): string[] {
+  if (atRiskOverride(env)) return [];
+  const out: string[] = [];
+  const dump = Number(env.DEVNET_DUMP_SOL || 0);
+  if (dump > RUN_AT_RISK_CEILING_SOL) out.push(`DEVNET_DUMP_SOL=${env.DEVNET_DUMP_SOL} is above the ${RUN_AT_RISK_CEILING_SOL} SOL per-run ceiling on SOL at risk; lower it, or set ${AT_RISK_OVERRIDE_ENV}=1 to accept more`);
+  return out;
+}
+/** R2-9: what the opt-in steps put at risk in this run. `reserve` refuses an amount that would take the total above the ceiling (unless overridden). */
+export class RunSpendLedger {
+  readonly entries: { label: string; sol: number }[] = [];
+  constructor(readonly ceilingSol: number = RUN_AT_RISK_CEILING_SOL, readonly override: boolean = atRiskOverride()) {}
+  get atRiskSol(): number { return this.entries.reduce((a, e) => a + e.sol, 0); }
+  remainingSol(): number { return this.override ? Number.POSITIVE_INFINITY : Math.max(0, this.ceilingSol - this.atRiskSol); }
+  reserve(label: string, sol: number): { ok: true } | { ok: false; reason: string } {
+    if (!(sol >= 0)) return { ok: false, reason: `${label}: ${sol} SOL is not a valid amount` };
+    if (!this.override && this.atRiskSol + sol > this.ceilingSol + 1e-9) {
+      return { ok: false, reason: `${label} needs ${sol.toFixed(3)} SOL at risk; with ${this.atRiskSol.toFixed(3)} SOL already at risk this run that is above the ${this.ceilingSol} SOL per-run ceiling. Set ${AT_RISK_OVERRIDE_ENV}=1 to accept it; nothing was sent` };
+    }
+    this.entries.push({ label, sol });
+    return { ok: true };
+  }
+}
+
+/**
+ * R2-10: a cleanup sell. `sellAll` returns null when the wallet holds none, so a throw is a real failure: the tokens stay in a throwaway
+ * wallet. It is a FAIL line naming the mint, the wallet and its key file, so a run cannot pass with tokens stranded. The refund that follows
+ * still runs.
+ */
+export async function cleanupSell(s: Pick<HarnessSteps, 'rec'>, label: string, kit: ChainKit, w: any, mint: string): Promise<void> {
+  try {
+    await kit.sellAll(w, mint);
+  } catch (e: any) {
+    const pub = w?.publicKey?.toBase58?.() ?? String(w?.publicKey ?? '?');
+    s.rec(`${label}: cleanup sell of ${mint}`, false, `${String(e?.message ?? e).slice(0, 120)}; the tokens of ${mint} are left in ${pub}, key file ${kit.keyFileOf?.(w) ?? `<scratch>/temp-wallets/${pub}.json`}`);
+  }
+}
+
 type Tx = { signature: string; orderId: string; direction: string; reconciliationState: string; mint: string };
 type Pos = { id: string; mint: string; status: string };
 
@@ -52,8 +102,8 @@ export interface HarnessSteps {
   skip?: (step: string, detail: string) => void;
   link: (sig: string) => string;
   sleep: (ms: number) => Promise<unknown>;
-  /** The coordinator's own Connection: (e'') wraps its `sendRawTransaction` for one call, (h) its `getMultipleAccountsInfo`. */
-  connection?: { sendRawTransaction: (...args: any[]) => Promise<string>; getMultipleAccountsInfo?: (...args: any[]) => Promise<unknown> };
+  /** The coordinator's own Connection: (e'') wraps its `sendRawTransaction` for one call, (h) its `getMultipleAccountsInfoAndContext`. */
+  connection?: { sendRawTransaction: (...args: any[]) => Promise<string>; getMultipleAccountsInfoAndContext?: (...args: any[]) => Promise<unknown> };
   /** (e''') P1.4: the app's own singletons for the panic and kill-switch step. */
   stop?: {
     telegram: { processTelegramCommand(text: string): Promise<{ reply: string; actionTaken?: string }> };
@@ -65,6 +115,10 @@ export interface HarnessSteps {
       setMode(mode: 'OFF' | 'SHADOW' | 'PAPER' | 'DEVNET_LIVE', opts?: { confirmationCode?: string }): Promise<{ ok: boolean; mode: string; error?: string }>;
       getStatus(): { mode: string; killed: boolean };
       submitCandidate(c: { mint: string; source: 'TEST'; provenance?: 'REAL_ONCHAIN' }): Promise<{ outcome: string; reason: string }>;
+      /** What POST /api/auto/budget runs (A31/A71: the way an operator lets a used DEVNET_LIVE session buy more). */
+      setBudget?(b: { maxBuys: number; maxSpendSol: number }): { ok: boolean; reason?: string };
+      /** The real-SOL session spend cap the budget route allows (AutoSnipeController.maxSessionSpendSol). */
+      maxSessionSpendSol?(): number;
     };
   };
 }
@@ -290,7 +344,16 @@ export async function emergencyStopThroughApp(s: HarnessSteps): Promise<void> {
     await s.coordinator.syncRealWalletBalance();
     const buy = await s.coordinator.executeTrade(await s.buildBuyRequest());
     s.rec(`${L}: LIVE buy CONFIRMED`, buy.success && buy.lifecycleState === 'CONFIRMED', `${buy.lifecycleState} ${buy.error ?? ''} ${buy.txSignature ? s.link(buy.txSignature) : ''}`.slice(0, 300));
-    const live = await st.auto.setMode('DEVNET_LIVE', { confirmationCode: 'CONFIRM_AUTO_DEVNET' });
+    let live = await st.auto.setMode('DEVNET_LIVE', { confirmationCode: 'CONFIRM_AUTO_DEVNET' });
+    if (!live.ok && /SESSION_BUDGET_USED/.test(live.error ?? '') && st.auto.setBudget) {
+      // A31/A71: (m) earlier in this run (or a run within the last 4 h on this scratch DB) used the DEVNET_LIVE session's budget, and setting
+      // the mode again no longer resets it. This step only needs auto running to prove the panic stops it, so it raises the session budget
+      // through the operator's own budget route (POST /api/auto/budget) to the real-SOL cap, as an operator would, and says so.
+      const cap = st.auto.maxSessionSpendSol?.() ?? 0;
+      const b = st.auto.setBudget({ maxBuys: 50, maxSpendSol: Number(cap.toFixed(6)) });
+      console.log(`INFO  ${L}: the DEVNET_LIVE session budget was used earlier (${live.error?.slice(0, 120)}); raised it through the budget route: ${b.ok ? 'ok' : b.reason}`);
+      live = await st.auto.setMode('DEVNET_LIVE', { confirmationCode: 'CONFIRM_AUTO_DEVNET' });
+    }
     s.rec(`${L}: auto DEVNET_LIVE set`, live.ok, live.error || live.mode);
 
     const sellsBefore = new Set(s.db.loadTransactions().filter((t) => t.direction === 'SELL').map((t) => t.signature));
@@ -372,6 +435,8 @@ export interface ChainKit {
   curveState(mint: string): Promise<{ virtualSolReserves: bigint; virtualTokenReserves: bigint; realTokenReserves: bigint; complete?: boolean }>;
   /** Sends what is left in `kp` (less one fee) to `to`. */
   refund(kp: any, to: any): Promise<void>;
+  /** R2-10: the key file `newWallet` wrote for `kp` (for FAIL lines that leave something in the wallet). */
+  keyFileOf?(kp: any): string;
 }
 
 /**
@@ -435,6 +500,7 @@ export function makeChainKit(d: { conn: any; web3: any; sdk: any; curve: any; bu
       writeKeyFile(path.join(d.keyDir, `${kp.publicKey.toBase58()}.json`), kp, 'wx');
       return kp;
     },
+    keyFileOf: (kp) => path.join(d.keyDir, `${kp.publicKey.toBase58()}.json`),
     transfer: (from, to, sol) => send(new Transaction().add(SystemProgram.transfer({ fromPubkey: from.publicKey, toPubkey: to, lamports: Math.ceil(sol * LAMPORTS_PER_SOL) })), [from]),
     async create(creator, symbol, name) {
       const mintKp = Keypair.generate();
@@ -561,10 +627,13 @@ export function makeDumpMarket(d: {
     priceSol: (mint: string) => kit.priceSol(mint),
     sellAll: (mint: string) => kit.sellAll(w2, mint),
     async refund() {
+      // R2-10: a sell that throws leaves tokens in the second wallet; the SOL refund still runs, then the caller records a FAIL naming them
+      const failed: string[] = [];
       for (const mint of coins()) {
-        try { await kit.sellAll(w2, mint); } catch (e: any) { console.log(`INFO  (h) second wallet could not sell ${mint}: ${String(e?.message ?? e).slice(0, 120)}`); }
+        try { await kit.sellAll(w2, mint); } catch (e: any) { failed.push(`${mint} (${String(e?.message ?? e).slice(0, 80)})`); }
       }
       await kit.refund(w2, d.payer.publicKey);
+      if (failed.length) throw new Error(`the second wallet ${w2.publicKey.toBase58()} could not sell ${failed.join(', ')}; its tokens are still there, key file ${d.keyPath}`);
     },
   };
 }
@@ -572,7 +641,7 @@ export function makeDumpMarket(d: {
 /**
  * (h) P1.6 (R1-19, R1-112): one failed price read does not blind the stop-loss. A second throwaway wallet creates a coin and seeds it (the seed
  * is sized from the coin's own curve by `dumpSeedPlan`, at most `maxSeedSol`); the app buys `appBuySol` of it; the harness then wraps the
- * coordinator's `getMultipleAccountsInfo` so the next call naming the curve throws once (the app's own price read takes it), and the second
+ * coordinator's `getMultipleAccountsInfoAndContext` (the curve read's method since R4-9) so the next call naming the curve throws once (the app's own price read takes it), and the second
  * wallet dumps everything. Expected: the exit loop's STOP_LOSS sell within about 6 s of the dump being visible on the curve (two 3 s passes;
  * before P1.6 the failed read put the mint in a 60 s back-off). The pass bound is `maxMs` (10 s by default, for devnet confirmation latency).
  * Every path, a failed create or seed included, ends in `finally`: the app's position is closed, the second wallet sells what it holds and
@@ -589,7 +658,7 @@ export async function failedReadThenDumpStopLoss(
   const rowFor = (mint: string) => (s.db.loadPositions() as Row[]).find((p) => p.mint === mint);
   if (!s.connection) { s.rec(L, false, 'harness did not pass the coordinator connection'); return; }
   const conn: any = s.connection;
-  const orig = conn.getMultipleAccountsInfo;
+  const orig = conn.getMultipleAccountsInfoAndContext;
   let coin: { mint: string; curve: string; seedSol: number; projectedRatio: number } | undefined;
   let injected = false;
   try {
@@ -607,17 +676,19 @@ export async function failedReadThenDumpStopLoss(
     const pos = rowFor(c.mint);
     if (!buy.success || !pos || pos.status === 'CLOSED') return;
 
-    conn.getMultipleAccountsInfo = async function (this: unknown, ...args: any[]) {
+    // R4-9: the app's curve read (PumpCurveService.fetchPumpMarketState) is getMultipleAccountsInfoAndContext, for its context slot;
+    // web3.js's getMultipleAccountsInfo calls it too, so this one hook sees both.
+    conn.getMultipleAccountsInfoAndContext = async function (this: unknown, ...args: any[]) {
       const keys: any[] = Array.isArray(args[0]) ? args[0] : [];
       if (!injected && keys.some((k) => String(k?.toBase58?.() ?? k) === c.curve)) {
         injected = true;
-        conn.getMultipleAccountsInfo = orig; // one call only
-        throw new Error('harness: injected getMultipleAccountsInfo failure');
+        conn.getMultipleAccountsInfoAndContext = orig; // one call only
+        throw new Error('harness: injected getMultipleAccountsInfoAndContext failure');
       }
       return orig.apply(this, args);
     };
     for (let i = 0; i < 40 && !injected; i++) await s.sleep(250);
-    s.rec(`${L}: the app's price read took the injected failure`, injected, injected ? 'one getMultipleAccountsInfo naming the curve threw' : 'no read of the curve in 10 s');
+    s.rec(`${L}: the app's price read took the injected failure`, injected, injected ? 'one getMultipleAccountsInfoAndContext naming the curve threw' : 'no read of the curve in 10 s');
     if (!injected) return;
 
     const dumpSig = await m.sellAll(c.mint);
@@ -645,7 +716,7 @@ export async function failedReadThenDumpStopLoss(
       s.rec(`${L}: the stop-loss sell succeeded on chain`, err === null, `err=${JSON.stringify(err)}`);
     }
   } finally {
-    conn.getMultipleAccountsInfo = orig;
+    conn.getMultipleAccountsInfoAndContext = orig;
     if (coin) {
       for (const p of openFor({ ...s, mint: coin.mint })) {
         try {
@@ -724,6 +795,23 @@ export async function creatorClusterOnChain(s: HarnessSteps, kit: ChainKit, feed
     for (const w of five) await kit.transfer(payer, w.publicKey, buySol + 0.01);
     // S265: started 250 ms apart (all within about a second), so the harness's own sends stay under a 15/s RPC limit
     const buys = await Promise.allSettled(five.map((w, i) => s.sleep(i * 250).then(() => kit.buy(w, b.mint, buySol))));
+    // Run 27: one buy got the RPC's 15/s 429. A buy refused that way is sent again, one at a time, but only when the wallet is read to hold
+    // none of the coin (a 429 on the status poll after the send may hide a buy that landed; a second buy would make a sixth trade).
+    for (let i = 0; i < five.length; i++) {
+      for (let tryNo = 1; tryNo <= 2; tryNo++) {
+        const r = buys[i];
+        if (r.status !== 'rejected' || !/429|Too Many Requests|rate.?limit/i.test(String((r as PromiseRejectedResult).reason?.message ?? r.reason))) break;
+        await s.sleep(1_500);
+        const held = await kit.tokenBalance(five[i], b.mint).catch(() => null);
+        if (held === null || held > 0n) {
+          console.log(`INFO  ${L}: buyer ${i + 1}'s buy was rate-limited; not sent again (${held === null ? 'its balance could not be read' : 'it holds the coin: the buy landed'})`);
+          if (held !== null && held > 0n) buys[i] = { status: 'fulfilled', value: 'landed under a 429' };
+          break;
+        }
+        console.log(`INFO  ${L}: buyer ${i + 1}'s buy was rate-limited (429) and it holds none; sending it again (${tryNo}/2)`);
+        buys[i] = await kit.buy(five[i], b.mint, buySol).then((v) => ({ status: 'fulfilled', value: v }) as const, (reason) => ({ status: 'rejected', reason }) as const);
+      }
+    }
     const landed = buys.filter((x) => x.status === 'fulfilled').length;
     s.rec(`${L}: 5 wallets from one funder bought together`, landed === 5, `${landed}/5 buys confirmed`);
     const e = await waitFor(b.mint, (x) => x.metrics.rawUniqueBuyers >= landed && x.metrics.funderCoverage === 1);
@@ -737,7 +825,7 @@ export async function creatorClusterOnChain(s: HarnessSteps, kit: ChainKit, feed
     s.rec(L, false, String(e?.message ?? e).slice(0, 300));
   } finally {
     for (const w of [W, ...five]) {
-      for (const c of coins) { try { await kit.sellAll(w, c); } catch { /* nothing held or curve moved; the refund below still runs */ } }
+      for (const c of coins) await cleanupSell(s, L, kit, w, c); // R2-10: a throw is a FAIL naming the key file; the refund below still runs
       // S263 (review 2026-10-24, finding 9): a refund that fails is a FAIL line, so a run cannot pass with SOL stranded; the key is in temp-wallets/
       try { await kit.refund(w, payer.publicKey); } catch (e: any) { s.rec(`${L}: refund ${w.publicKey.toBase58()}`, false, `${String(e?.message ?? e).slice(0, 120)}; key in <scratch>/temp-wallets/`); }
     }
@@ -755,19 +843,24 @@ export async function startBlockingWsProxy(upstreamWs: string, port = 0) {
   const { WebSocketServer, WebSocket } = await import('ws');
   let blockedUntil = 0;
   let unsubscribeDelayMs = 0;
-  const pairs = new Set<{ a: any; b: any }>();
+  let deafNext = 0;
+  const pairs = new Set<{ a: any; b: any; deaf?: boolean }>();
   const server = http.createServer((_req, res) => res.writeHead(426).end());
   const wss = new WebSocketServer({ noServer: true });
   server.on('upgrade', (req, socket, head) => {
     if (Date.now() < blockedUntil) { socket.destroy(); return; }
     wss.handleUpgrade(req, socket, head, (client) => {
       const up = new WebSocket(upstreamWs);
-      const pair = { a: client, b: up };
+      const pair: { a: any; b: any; deaf?: boolean } = { a: client, b: up, deaf: deafNext > 0 };
+      if (deafNext > 0) deafNext--;
       pairs.add(pair);
       const queue: any[] = [];
       const end = () => { pairs.delete(pair); try { client.terminate(); } catch { /* gone */ } try { up.terminate(); } catch { /* gone */ } };
       up.on('open', () => { for (const m of queue.splice(0)) up.send(m); });
-      up.on('message', (m: any, isBinary: boolean) => { if (client.readyState === WebSocket.OPEN) client.send(m, { binary: isBinary }); });
+      up.on('message', (m: any, isBinary: boolean) => {
+        if (pair.deaf && !isBinary && /"method"\s*:\s*"\w+Notification"/.test(String(m))) return; // deafenNext(): replies pass, notifications do not
+        if (client.readyState === WebSocket.OPEN) client.send(m, { binary: isBinary });
+      });
       const forward = (data: any) => { if (up.readyState === WebSocket.OPEN) up.send(data); else queue.push(data); };
       client.on('message', (m: any, isBinary: boolean) => {
         const data = isBinary ? m : String(m);
@@ -784,6 +877,11 @@ export async function startBlockingWsProxy(upstreamWs: string, port = 0) {
     url: `ws://127.0.0.1:${(server.address() as AddressInfo).port}`,
     /** (t): every `*Unsubscribe` request from a client is forwarded `ms` late (0: at once again), as a slow RPC answers it. */
     slowUnsubscribe(ms: number) { unsubscribeDelayMs = ms; },
+    /**
+     * (w), devnet run 25: the next `n` sockets opened stay open and answer requests (a subscribe gets its id) but deliver no notification,
+     * no log and no slot, as run 25's coordinator socket did from (t)'s switch on. Sockets after them are normal.
+     */
+    deafenNext(n: number) { deafNext = n; },
     block(ms: number) {
       blockedUntil = Date.now() + ms;
       for (const p of [...pairs]) { try { p.a.terminate(); } catch { /* gone */ } try { p.b.terminate(); } catch { /* gone */ } }
@@ -933,7 +1031,7 @@ export function solToReachProgress(st: { virtualSolReserves: bigint; virtualToke
  */
 export async function releaseGatesOnChain(
   s: HarnessSteps, kit: ChainKit, feed: WatchFeed, payer: any, deps: ReleaseGatesDeps,
-  opts: { buyers?: number; buySol?: number; curveCap?: boolean; waitMs?: number } = {}
+  opts: { buyers?: number; buySol?: number; curveCap?: boolean; waitMs?: number; spend?: RunSpendLedger } = {}
 ): Promise<void> {
   const L = '(k) release gates';
   const st = s.stop;
@@ -955,7 +1053,9 @@ export async function releaseGatesOnChain(
   const norm = (r: { outcome: string; stage: string; reason: string } | undefined) =>
     r ? `${r.outcome === 'WOULD_BUY' ? 'BOUGHT' : r.outcome}|${r.stage}|${r.reason.replace(/[\d.]+/g, '#')}` : 'none';
 
-  const pair = async (mode: 'SHADOW' | 'PAPER'): Promise<string[] | null> => {
+  // Run 27: a feed gap (here a 10.5 s SLOT_SILENCE) released both launches DEAD FEED_GAP, as the app must (S239); the gates were never
+  // judged. Such a pair is made again once, with a new creator and buyers; a second gap is a SKIP, not a FAIL.
+  const pair = async (mode: 'SHADOW' | 'PAPER', attempt = 1): Promise<string[] | null> => {
     const set = await st.auto.setMode(mode);
     if (!set.ok) { s.rec(`${L}: auto ${mode}`, false, set.error ?? set.mode); return null; }
     const creator = kit.newWallet(); wallets.push(creator);
@@ -972,9 +1072,21 @@ export async function releaseGatesOnChain(
     for (const w of buyers) await kit.transfer(payer, w.publicKey, 2 * buySol + 0.02);
     for (const m of made) {
       const r = await Promise.allSettled(buyers.map((w, i) => s.sleep(i * 400).then(() => kit.buy(w, m, buySol)))); // S265/S268: 400 ms apart (run 10 still lost 1 of 10 at 250 ms)
-      s.rec(`${L}: ${mode}: ${nBuyers} equal buys of ${m.slice(0, 6)}`, r.every((x) => x.status === 'fulfilled'), `${r.filter((x) => x.status === 'fulfilled').length}/${nBuyers} confirmed`);
+      // run 2026-10-27: "9/10 confirmed" said nothing of why; the first failure is named (a 429, a refused curve read, a lost confirm)
+      const firstFail = r.find((x): x is PromiseRejectedResult => x.status === 'rejected');
+      s.rec(`${L}: ${mode}: ${nBuyers} equal buys of ${m.slice(0, 6)}`, r.every((x) => x.status === 'fulfilled'), `${r.filter((x) => x.status === 'fulfilled').length}/${nBuyers} confirmed${firstFail ? `; first failure: ${String(firstFail.reason?.message ?? firstFail.reason).slice(0, 200)}` : ''}`);
     }
     const released = await waitUntil(() => made.every((m) => { const e = find(m); return !!e && e.state !== 'WATCHING'; }), waitMs);
+    const gapped = made.filter((m) => /^FEED_GAP/.test(find(m)?.reason ?? ''));
+    if (released && gapped.length > 0) {
+      const why = `${gapped.length} of 2 launches released ${find(gapped[0])?.state} ${find(gapped[0])?.reason ?? ''}`.slice(0, 200);
+      if (attempt === 1) {
+        console.log(`INFO  ${L}: ${mode}: ${why}; the gates were not judged, so the pair is made again`);
+        return pair(mode, 2);
+      }
+      (s.skip ?? ((step: string, d: string) => console.log(`SKIP  ${step}: ${d}`)))(`${L}: ${mode}: both launches released and journaled`, `a feed gap again: ${why}; the gates were not judged`);
+      return null;
+    }
     const journaled = released && (await waitUntil(() => made.every((m) => !!lastDecision(m)), 30_000));
     const rows = made.map((m) => lastDecision(m));
     s.rec(
@@ -1011,6 +1123,9 @@ export async function releaseGatesOnChain(
       const target = deps.capPct + 2;
       const need = solToReachProgress(state, target);
       const have = await deps.balanceSol(payer);
+      // R2-9: the push is SOL at risk in a throwaway wallet; refused above the per-run ceiling unless DEVNET_ALLOW_OVER_1_SOL=1
+      const reserved = (opts.spend ?? new RunSpendLedger()).reserve(`${C}: push to ${target}%`, need + 0.05);
+      if (!reserved.ok) { s.rec(`${C}: SOL at risk within the per-run ceiling`, false, reserved.reason); return; }
       if (have < need + 1) { s.rec(`${C}: funding for the push`, false, `pushing to ${target}% needs about ${need.toFixed(2)} SOL; the harness wallet has ${have.toFixed(3)}, needs ${(need + 1).toFixed(2)}`); return; }
       if (!(await waitUntil(() => !!find(coin.mint), 30_000))) { s.rec(`${C}: the app's feed watches the launch`, false, 'not in the watch window after 30 s'); return; }
       await kit.transfer(payer, pusher.publicKey, need + 0.05);
@@ -1044,7 +1159,7 @@ export async function releaseGatesOnChain(
     try { await st.auto.setMode('OFF'); } catch (e: any) { s.rec(`${L}: auto OFF after the step`, false, String(e?.message ?? e).slice(0, 200)); }
     if (prevAuto === undefined) delete process.env.AUTO_SNIPE_ENABLED; else process.env.AUTO_SNIPE_ENABLED = prevAuto;
     for (const w of wallets) {
-      for (const c of coins) { try { await kit.sellAll(w, c); } catch { /* nothing held; the refund below still runs */ } }
+      for (const c of coins) await cleanupSell(s, L, kit, w, c); // R2-10: a throw is a FAIL naming the key file; the refund below still runs
       try { await kit.refund(w, payer.publicKey); } catch (e: any) { s.rec(`${L}: refund ${w.publicKey.toBase58()}`, false, `${String(e?.message ?? e).slice(0, 120)}; key in <scratch>/temp-wallets/`); }
     }
     // S263 (review 2026-10-24, finding 4): the curve-cap check re-arms LIVE; a throw there skipped its disarm, and this only re-armed. Put
@@ -1138,7 +1253,7 @@ export async function hasBudget(s: Pick<HarnessSteps, 'rec'>, label: string, bal
 /** Sells what `w` holds of each coin, then sends what is left back to `payer`. A failed refund is a FAIL line naming the key file. */
 async function sellAndRefund(s: Pick<HarnessSteps, 'rec'>, label: string, kit: ChainKit, wallets: any[], coins: string[], payer: any): Promise<void> {
   for (const w of wallets) {
-    for (const c of coins) { try { await kit.sellAll(w, c); } catch { /* nothing held, or the curve moved; the refund below still runs */ } }
+    for (const c of coins) await cleanupSell(s, label, kit, w, c); // R2-10: a throw is a FAIL naming the key file; the refund below still runs
     try { await kit.refund(w, payer.publicKey); } catch (e: any) { s.rec(`${label}: refund ${w.publicKey.toBase58()}`, false, `${String(e?.message ?? e).slice(0, 120)}; key in <scratch>/temp-wallets/`); }
   }
 }
@@ -1663,6 +1778,10 @@ export async function lossFloorLatch(s: HarnessSteps, d: LossFloorDeps): Promise
     const jump = msToNextUtcMidnight(realNow()) + 60_000;
     Date.now = () => realNow() + jump;
     try {
+      // R4-9: a curve read is stamped with the time its context slot was FIRST seen. A read right after the jump can come from the slot the
+      // last read (before the jump) already saw, and would carry the real clock's stamp: 16 h old to the jumped clock, STALE_MARKET_DATA.
+      // Wait past a few slots (about 0.4 s each, on devnet and on the local validator) so the next read is from a slot first seen after it.
+      await s.sleep(1_500);
       await d.refreshPrice();
       const r = await refusedBuy(`clock past the next 00:00 UTC (+${(jump / 3_600_000).toFixed(2)} h): still refused, latched`, true);
       if (r) s.rec(`${L}: the refusal says when the oldest loss leaves the window`, /leaves it at|no realized loss is left/.test(r.error ?? ''), (r.error ?? '').slice(-160));
@@ -1735,6 +1854,8 @@ export interface SessionSpendDeps {
     orderSol(): number;
     setOrderSol(sol: number): { ok: boolean; reason?: string };
     submitCandidate(c: { mint: string; source: 'TEST'; provenance?: 'REAL_ONCHAIN' }): Promise<{ outcome: string; stage?: string; reason: string; positionId?: string }>;
+    /** What POST /api/auto/resume calls (server.ts); the step sends `{ ackLossTriggers: true }` (R8-8, RUNBOOK section 6). */
+    resume(opts: { ackLossTriggers?: boolean }): { halted: boolean; mode: string; lossTriggersAcked?: boolean };
   };
   /** The app's watch window: its `getVerdict` is wrapped for the step's own coins only, and put back in `finally`. */
   watch: { getVerdict(mint: string): any };
@@ -1764,6 +1885,14 @@ export interface SessionSpendDeps {
  * returns) equal to the sum of the five wallet drops within 0.0002 SOL (the token account's rent is in both since 3B; before 3B spentSol
  * left out about 0.00204 SOL of rent per buy), five buys counted, and no halt (the wallet audit explains every buy).
  * A lost balance read makes the comparison a SKIP, never a FAIL.
+ *
+ * R8-8: every LIVE buy is refused while NEGATIVE_EXPECTANCY or LOSS_STREAK holds over the last 20 closed LIVE trades since the operator's
+ * acknowledgement, and APEX_E2E_SCRATCH (the harness DB) is reused on purpose, so the harness's own earlier test trades (every one loses
+ * its fees) trip both. The step first acknowledges them as the operator does (POST /api/auto/resume {ackLossTriggers:true}, RUNBOOK
+ * section 6; the same `resume` the route calls); an acknowledgement that cannot be saved is a FAIL and nothing is bought. The two Kelly
+ * refusals have no acknowledgement: the lifetime one ("Capital sizing failed (NEGATIVE_OR_ZERO_EXPECTANCY)", every closed LIVE trade once
+ * there are 25) and R8-8's recent window (NEGATIVE_RECENT_EXPECTANCY, the last 25). Either on the first buy is a SKIP naming it (the gate
+ * works; the scratch DB's history is what it judges), and a fresh APEX_E2E_SCRATCH runs the step.
  */
 export async function sessionSpendMatchesWallet(s: Pick<HarnessSteps, 'rec' | 'skip' | 'sleep' | 'coordinator'>, d: SessionSpendDeps, opts: { buys?: number; orderSol?: number } = {}): Promise<number> {
   const L = '(m) 3B: DEVNET_LIVE session spend';
@@ -1779,6 +1908,10 @@ export async function sessionSpendMatchesWallet(s: Pick<HarnessSteps, 'rec' | 's
   const coins = new Set<string>();
   try {
     process.env.AUTO_SNIPE_ENABLED = 'true';
+    // R8-8: the operator's acknowledgement of the loss triggers, before anything is made or bought (see above)
+    const ack = d.auto.resume({ ackLossTriggers: true });
+    s.rec(`${L}: loss triggers acknowledged (POST /api/auto/resume {ackLossTriggers:true})`, ack.lossTriggersAcked === true, ack.lossTriggersAcked === true ? 'acknowledged: LIVE trades closed before now no longer count for NEGATIVE_EXPECTANCY / LOSS_STREAK' : `lossTriggersAcked ${ack.lossTriggersAcked}: not saved, nothing changed`);
+    if (ack.lossTriggersAcked !== true) return lastTradeAt;
     for (const m of await d.makeCoins(n)) coins.add(m);
     if (coins.size !== n) { s.rec(`${L}: ${n} coins made`, false, `${coins.size} made`); return lastTradeAt; }
     // 0.008 SOL by default: the app refuses a 0.005 SOL first buy from a wallet that has not paid pump's one-time account rent yet
@@ -1808,6 +1941,12 @@ export async function sessionSpendMatchesWallet(s: Pick<HarnessSteps, 'rec' | 's
       const after = await readWithRetry(d.balanceLamports, s.sleep);
       const open = d.openLive();
       maxOpen = Math.max(maxOpen, open.length);
+      const kelly = /Capital sizing failed \((NEGATIVE_RECENT_EXPECTANCY|NEGATIVE_OR_ZERO_EXPECTANCY)/.exec(dec.reason);
+      if (bought === 0 && dec.outcome !== 'BOUGHT' && kelly) {
+        const which = kelly[1] === 'NEGATIVE_RECENT_EXPECTANCY' ? "the recent-window Kelly (R8-8, the last 25 closed LIVE trades)" : 'the lifetime Kelly (every closed LIVE trade)';
+        skip(`${L}: ${n} auto buys`, `the first auto buy was refused on ${which}; no operator acknowledgement exists for it: ${dec.reason.slice(0, 200)}; the scratch DB's closed LIVE trades are the harness's own losing test trades. Run with a fresh APEX_E2E_SCRATCH to run this step`);
+        return lastTradeAt;
+      }
       const drop = before !== null && after !== null ? (before - after) / 1e9 : null;
       if (drop === null) unmeasured++; else measured += drop;
       s.rec(`${L}: auto buy ${mint.slice(0, 6)} BOUGHT`, dec.outcome === 'BOUGHT', `${dec.outcome} ${dec.stage ?? ''} ${dec.reason}; wallet drop ${drop === null ? 'not read' : drop.toFixed(6)} SOL; spentSol ${d.auto.getStatus().session?.spentSol?.toFixed(6) ?? 'no session'}`.slice(0, 300));
@@ -1939,6 +2078,33 @@ export interface ChildApp {
   stop(): Promise<void>;
 }
 
+/** What a child server needs from the parent's environment to reach the network the way the parent does (networkPassThroughEnv). */
+export const NETWORK_PASS_THROUGH_VARS = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'NO_PROXY', 'no_proxy', 'NODE_EXTRA_CA_CERTS', 'NODE_USE_ENV_PROXY'] as const;
+
+/**
+ * Cloud run 28: (o) boots server.ts with an exact env, so in a cloud session (notes/cloud-devnet.md) the child had no proxy settings, never
+ * reached a SOL/USD price host, and its LIVE buy was refused SOL_PRICE_UNAVAILABLE. This returns, from `parent`, the proxy and CA variables
+ * that are set (NETWORK_PASS_THROUGH_VARS) and, as NODE_OPTIONS, only the `--require` preloads in the parent's NODE_OPTIONS (the cloud's
+ * websocket preload); nothing else. Where none of these is set (the Mac) it returns {} and the child's env is unchanged. The child still runs
+ * under the devnet guard, which spawnServer preloads itself.
+ */
+export function networkPassThroughEnv(parent: NodeJS.ProcessEnv): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const k of NETWORK_PASS_THROUGH_VARS) {
+    const v = parent[k];
+    if (typeof v === 'string' && v !== '') out[k] = v;
+  }
+  const words = (parent.NODE_OPTIONS ?? '').split(/\s+/).filter(Boolean);
+  const preloads: string[] = [];
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if ((w === '--require' || w === '-r') && words[i + 1]) preloads.push('--require', words[++i]);
+    else if (w.startsWith('--require=')) preloads.push('--require', w.slice('--require='.length));
+  }
+  if (preloads.length > 0) out.NODE_OPTIONS = preloads.join(' ');
+  return out;
+}
+
 /**
  * 3K (o): starts `node [--require <guard>] --import tsx server.ts` with exactly `env` (plus APP_PORT and OPERATOR_AUTH_TOKEN), logs appended
  * to `logFile`, and waits for /api/health (up to 120 s). Node runs the server itself (not the tsx CLI), so SIGKILL reaches it.
@@ -2025,6 +2191,12 @@ export async function killSurvivesRestart(s: Pick<HarnessSteps, 'rec' | 'sleep'>
     // 1. a LIVE position, made auto-owned
     app = await d.boot();
     if (!(await armWhenReady(app, 'boot 1'))) return;
+    // R5-40: the trade route runs executeSnipe's gates, and the step's coin was made a moment ago: no feed history, confluence 0/100
+    // ("missing data"), refused at the default 70. The operator threshold is set to 0 on this step's own scratch DB (saved there, so the
+    // later boots keep it); the gate still runs (`score < threshold`) and every other gate is unchanged. See scripts/DEVNET_E2E_README.md.
+    const threshold = await app.call('POST', '/api/auto/threshold', { threshold: 0 });
+    s.rec(`${L}: boot 1: confluence threshold 0 for a fresh coin`, threshold.status === 200 && threshold.json?.value === 0, `${threshold.status} ${threshold.json?.error ?? threshold.json?.value ?? ''}`.slice(0, 200));
+    if (threshold.json?.value !== 0) return;
     const buy = await app.call('POST', '/api/execution/trade', d.buyBody);
     const posId: string | undefined = buy.json?.positionId;
     s.rec(`${L}: boot 1: a LIVE position`, buy.json?.success === true && !!posId, `${buy.status} ${buy.json?.lifecycleState ?? ''} ${buy.json?.error ?? ''} ${posId ?? 'no position id'}`.slice(0, 300));
@@ -2224,4 +2396,105 @@ export async function reentryBlockedAfterExit(s: HarnessSteps, d: ReentryBlockDe
     }
   }
   return lastTradeAt;
+}
+
+/** (w) what the deaf-socket step needs from the app (passed in, so this file still imports nothing from server/). */
+export interface DeafSocketDeps {
+  /** The app's PumpFeedListener and WatchWindow classes and web3.js's Connection. */
+  Listener: new (conn: any) => any;
+  Window: new (opts: any) => any;
+  Connection: new (url: string, cfg: any) => any;
+  rpcUrl: string;
+  kit: ChainKit;
+  payer: any;
+  /** How long to wait for the NO_DELIVERY gap after the socket goes deaf (the watchdog's 15 s plus its 2 s check and a margin). */
+  gapWaitMs?: number;
+  /** How long to wait for a launch to be watched. */
+  watchWaitMs?: number;
+  /** Localnet only: how late the proxy answers the cleanup's unsubscribes, as a remote RPC's round trip makes them (devnet needs none). */
+  cleanupUnsubscribeDelayMs?: number;
+}
+
+/**
+ * (w) devnet run 25, task 3K: a log subscription that goes silently deaf is noticed and moved, not left ACTIVE. The app's PumpFeedListener
+ * subscribes through a loopback ws proxy in front of the RPC's websocket, with the app's WatchWindow attached. A launch is watched (the
+ * feed works). The listener is then switched (as an RPC switch moves it) onto a Connection whose socket the proxy keeps deaf: it answers
+ * the subscribes but passes no notification, which is what run 25's coordinator socket did from (t)'s switch on. Expected: within the
+ * watchdog's wait a NO_DELIVERY gap (status not ACTIVE, and a launch watched meanwhile released DEAD with FEED_GAP), the subscription moved
+ * to a fresh Connection (a new socket through the same proxy, which is not deaf), ACTIVE again, and a launch made after that is watched.
+ * Before the watchdog the listener stayed ACTIVE with no gap and the second launch was never seen. One throwaway creator (key on disk before it is funded) makes both coins; `finally` sells what it holds and refunds it.
+ */
+export async function deafSocketRecovers(s: Pick<HarnessSteps, 'rec' | 'sleep'>, d: DeafSocketDeps): Promise<void> {
+  const L = '(w) feed watchdog: a deaf socket';
+  const gapWaitMs = d.gapWaitMs ?? 30_000;
+  const watchWaitMs = d.watchWaitMs ?? 30_000;
+  const until = async (cond: () => boolean, ms: number) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline && !cond()) await s.sleep(200);
+    return cond();
+  };
+  const proxy = await startBlockingWsProxy(wsUrlFor(d.rpcUrl));
+  const conn = new d.Connection(d.rpcUrl, { commitment: 'confirmed', wsEndpoint: proxy.url });
+  const listener = new d.Listener(conn);
+  const ww = new d.Window({ publicFunders: [] });
+  ww.attach(listener);
+  const gaps: Array<{ reason: string; status: string }> = [];
+  listener.on('feed_gap', (g: any) => gaps.push({ reason: g.reason, status: listener.getTelemetry().status }));
+  const watched = (m: string) => { const snap = ww.getSnapshot(); return snap.watching.some((w: any) => w.metrics?.mint === m) || snap.released.some((r: any) => r.metrics?.mint === m); };
+  const creator = d.kit.newWallet();
+  const coins: string[] = [];
+  const deafConns: any[] = [];
+  try {
+    const started = await listener.start();
+    const active = started && (await until(() => listener.getTelemetry().status === 'ACTIVE', 15_000));
+    s.rec(`${L}: listener ACTIVE through the loopback ws proxy, subscription confirmed`, active && listener.getTelemetry().subscriptionConfirmed === true, `status ${listener.getTelemetry().status}, confirmed ${listener.getTelemetry().subscriptionConfirmed}`);
+    if (!active) return;
+    await d.kit.transfer(d.payer, creator.publicKey, 0.05);
+    const a = await d.kit.create(creator, 'W3KA', '3K watchdog A');
+    coins.push(a.mint);
+    const seenA = await until(() => watched(a.mint), watchWaitMs);
+    s.rec(`${L}: a launch before the socket goes deaf is watched`, seenA, seenA ? a.mint : `not in the watch window after ${watchWaitMs / 1000} s`);
+    if (!seenA) return;
+
+    // Run 25: (t) switched the coordinator, and the listener with it, onto a Connection whose socket answered the subscribes and then
+    // delivered nothing: no slot ever arrived on it, so the slot heartbeat never armed, and the socket's open closed the switch gap. ACTIVE.
+    proxy.deafenNext(1);
+    const gapsBefore = gaps.length;
+    const deaf = new d.Connection(d.rpcUrl, { commitment: 'confirmed', wsEndpoint: proxy.url });
+    deafConns.push(deaf);
+    await listener.switchConnection(deaf);
+    await until(() => listener.getTelemetry().subscriptionConfirmed === true, 10_000);
+    const afterSwitch = listener.getTelemetry().status;
+    const probe = creator.publicKey.toBase58(); // not a mint: only a watch entry that the gap must release
+    ww.watch(probe, null);
+    const gapSeen = await until(() => gaps.slice(gapsBefore).some((g) => g.reason === 'NO_DELIVERY'), gapWaitMs);
+    const g = gaps.slice(gapsBefore);
+    s.rec(`${L}: on a deaf socket after a switch, NO_DELIVERY gap, not ACTIVE`, gapSeen && g.filter((x) => x.reason === 'NO_DELIVERY').every((x) => x.status !== 'ACTIVE'), `status after the switch ${afterSwitch}; gaps after: ${g.map((x) => `${x.reason}/${x.status}`).join(', ') || 'none'} in ${gapWaitMs / 1000} s; status ${listener.getTelemetry().status}`);
+    const v = ww.getVerdict(probe);
+    s.rec(`${L}: a launch watched on the deaf socket is DEAD with FEED_GAP NO_DELIVERY`, v?.state === 'DEAD' && /^FEED_GAP: .*NO_DELIVERY/.test(v?.reason ?? ''), `${v?.state} ${v?.reason ?? ''}`.slice(0, 200));
+    if (!gapSeen) return;
+    const back = await until(() => listener.getTelemetry().status === 'ACTIVE' && listener.getTelemetry().noDeliveryTries === 0, watchWaitMs);
+    s.rec(`${L}: ACTIVE again on a fresh socket`, back, `status ${listener.getTelemetry().status}, tries ${listener.getTelemetry().noDeliveryTries}, gaps ${listener.getTelemetry().feedGaps}`);
+    const b = await d.kit.create(creator, 'W3KB', '3K watchdog B');
+    coins.push(b.mint);
+    const seenB = await until(() => watched(b.mint), watchWaitMs);
+    s.rec(`${L}: a launch after the move is watched`, seenB, seenB ? b.mint : `not in the watch window after ${watchWaitMs / 1000} s`);
+  } catch (e: any) {
+    s.rec(L, false, String(e?.message ?? e).slice(0, 300));
+  } finally {
+    // The listener unsubscribes over its socket, so the proxy must outlive that. Devnet (public RPC, 2026-10-26): destroy() unsubscribed in
+    // the background, the proxy closed first, and the listener's fresh socket redialed the closed proxy. web3.js reconnects a socket that
+    // still holds a subscription whatever its auto-reconnect setting, so the unsubscribes finish (bounded) before any socket is closed.
+    proxy.slowUnsubscribe(d.cleanupUnsubscribeDelayMs ?? 0);
+    await Promise.race([Promise.resolve(listener.stop?.()).catch(() => undefined), s.sleep(10_000)]);
+    const current = listener.connection ?? null; // the Connection it is on now: the watchdog's fresh one
+    listener.destroy?.();
+    for (const c of [conn, current, ...deafConns].filter(Boolean)) { // as (j): web3.js has no public close, and a down socket would redial the closed proxy for good
+      const ws = c._rpcWebSocket;
+      ws?.setAutoReconnect?.(false);
+      ws?.close?.();
+    }
+    await proxy.close();
+    await sellAndRefund(s, L, d.kit, [creator], coins, d.payer);
+  }
 }

@@ -70,7 +70,7 @@ import { getRandomJitoTipAccount, TOKEN_2022_PROGRAM_ID } from '../solana/progra
 import { executionConfig } from '../solana/executionConfig';
 import { Logger, endpointOrigin, rpcEndpointLabel } from '../middleware/enterprise';
 import { traced } from '../observability/tracing';
-import { acquireLock, dbLockPath, isPidAlive, signerLockPath, updateHeldLock } from '../system/instanceLock';
+import { acquireLock, dbLockPath, isLockHeld, isPidAlive, signerLockPath, updateHeldLock } from '../system/instanceLock';
 import crypto from 'node:crypto';
 import { createTradingConnection } from '../solana/rpcConnection';
 import { allowedCluster, assertClusterAllowed, assertClusterAllowedCached, assertSendClusterAllowed, blockhashCheckEnabled, ClusterGuardError, forgetGenesisCheck, rememberGenesisCheck, resolveRpcUrl, verifyBlockhashIndependently } from '../solana/clusterGuard';
@@ -292,6 +292,27 @@ export class ExecutionCoordinator {
   }
 
   private started = false;
+  /**
+   * Set by cleanup(): this coordinator's background work is over for good. Its retry timers do not re-arm (a pass still in flight at
+   * cleanup would otherwise schedule the next one), a timer that fires anyway does nothing, and the panic's pending-sell retry stops.
+   * The devnet harness calls cleanup(), releases the instance locks and hands them to a child process (step (f)).
+   */
+  private stopped = false;
+  /** The instance locks start() took (database file, signing key). */
+  private startLocks: string[] = [];
+
+  /** True after cleanup(): this coordinator schedules no more background passes. */
+  public isStopped(): boolean {
+    return this.stopped;
+  }
+
+  /**
+   * A lock start() took that this process no longer holds (released, removed by hand, or taken over), else null. Nothing is signed then:
+   * another process may own this database or key now, and a signature would take the signer lock back (signTransaction).
+   */
+  private lostStartLock(): string | null {
+    return this.startLocks.find((p) => !isLockHeld(p)) ?? null;
+  }
 
   /**
    * P1.1: begin trading-side work: the instance locks (database file and signing key), the RPC connection check with startup
@@ -301,7 +322,10 @@ export class ExecutionCoordinator {
   public start(): void {
     if (this.started) return;
     const dbLock = dbLockPath(workstationDb.getDbPath());
-    if (dbLock) acquireLock(dbLock, { dbPath: workstationDb.getDbPath() });
+    if (dbLock) {
+      acquireLock(dbLock, { dbPath: workstationDb.getDbPath() });
+      this.startLocks.push(dbLock);
+    }
     let pub: string | null;
     try {
       pub = localSigner.getStatus() === 'READY' ? localSigner.getPublicKey().toBase58() : null;
@@ -310,6 +334,7 @@ export class ExecutionCoordinator {
     }
     if (pub) {
       acquireLock(signerLockPath(pub), { walletPubkey: pub, dbPath: workstationDb.getDbPath() });
+      this.startLocks.push(signerLockPath(pub));
       if (dbLock) updateHeldLock(dbLock, { walletPubkey: pub });
     }
     this.started = true;
@@ -402,6 +427,7 @@ export class ExecutionCoordinator {
       // not wait for the first send to find out (the send path still re-checks). Started now, awaited after the Jito probe.
       const clusterCheck = this.verifyCluster();
       await this.jitoTransport.probe();
+      if (this.stopped) return; // cleanup() ran while the boot check was reading: start nothing more
       this.startJitoProbeLoop();
       if (!(await clusterCheck)) {
         // S254 (L3): reconciliation is skipped here, so the heartbeat must run it once the RPC verifies. Its own check can pass before this
@@ -414,6 +440,7 @@ export class ExecutionCoordinator {
       this.rpcHealth = this.rpcLatencyMs > 800 ? 'DEGRADED' : 'HEALTHY';
       Logger.info(`Solana RPC connected: Slot ${slot}, Latency ${this.rpcLatencyMs}ms`);
       await this.syncRealWalletBalance();
+      if (this.stopped) return;
       await this.startupReconciliation();
     } catch (err: any) {
       this.rpcHealth = 'DISCONNECTED';
@@ -1303,9 +1330,10 @@ export class ExecutionCoordinator {
 
   /** One follow-up reconciliation pass shortly after a pass found something not readable yet. */
   private scheduleReconcileRetry(delayMs = 15_000): void {
-    if (this.reconcileRetryTimer) return;
+    if (this.stopped || this.reconcileRetryTimer) return;
     this.reconcileRetryTimer = setTimeout(() => {
       this.reconcileRetryTimer = null;
+      if (this.stopped) return;
       void this.startupReconciliation().catch(() => undefined);
     }, delayMs);
     this.reconcileRetryTimer.unref?.();
@@ -1614,7 +1642,7 @@ export class ExecutionCoordinator {
   /** One background retry chain per coordinator (R2-4). A new failed buy restarts the ladder from its first step. */
   private scheduleOrphanRecovery(restart: boolean = true): void {
     const delays = this.orphanRecoveryDelaysMs;
-    if (delays.length === 0) return;
+    if (this.stopped || delays.length === 0) return; // after cleanup() a pass still in flight does not re-arm the chain
     if (this.orphanRecoveryTimer) {
       if (!restart) return;
       clearTimeout(this.orphanRecoveryTimer);
@@ -1622,6 +1650,7 @@ export class ExecutionCoordinator {
     this.orphanRecoveryStep = restart ? 0 : Math.min(this.orphanRecoveryStep + 1, delays.length - 1);
     const timer = setTimeout(async () => {
       if (this.orphanRecoveryTimer === timer) this.orphanRecoveryTimer = null;
+      if (this.stopped) return;
       try {
         const r = await this.recoverOrphanedBuys();
         if (r.stillOrphaned.length > 0 || r.ledgerUnreadable) this.scheduleOrphanRecovery(false);
@@ -3259,6 +3288,10 @@ export class ExecutionCoordinator {
         workstationDb.logJournal('CLUSTER_GUARD_BLOCK', correlationId, 'LIVE', { side: 'BUY', mint: req.mint, error: bhBuy });
         return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'LIVE', error: `CLUSTER_GUARD: ${bhBuy}; nothing was signed or sent.`, correlationId };
       }
+      const lostBuyLock = this.lostStartLock();
+      if (lostBuyLock) {
+        return { success: false, lifecycleState: 'RISK_REJECTED', executionMode: 'LIVE', error: `${INSTANCE_LOCK_LOST}: ${lostBuyLock}; nothing was signed or sent.`, correlationId };
+      }
       await traced('tx.sign', () => localSigner.signTransaction(v0Tx), { 'apex.side': 'BUY' });
 
       // Q17: risk approval was several awaits ago (curve read, holder lookup, tip floor, blockhash, snapshot, sign). Disarm, a halt or the
@@ -4314,6 +4347,8 @@ export class ExecutionCoordinator {
         workstationDb.logJournal('CLUSTER_GUARD_BLOCK', `exit-${positionId.slice(0, 8)}`, 'LIVE', { side: 'SELL', mint: target.mint, error: bhSell });
         return { success: false, pnlSol: 0, error: `CLUSTER_GUARD: ${bhSell}; nothing was signed or sent.`, notSent: true };
       }
+      const lostSellLock = this.lostStartLock();
+      if (lostSellLock) return { success: false, pnlSol: 0, error: `${INSTANCE_LOCK_LOST}: ${lostSellLock}; nothing was signed or sent.`, notSent: true };
       await traced('tx.sign', () => localSigner.signTransaction(v0Tx), { 'apex.side': 'SELL' });
 
       // A sell that would revert (slippage breached, bad account) costs fees every time it lands. Simulate first and only send one that passes.
@@ -5161,6 +5196,7 @@ export class ExecutionCoordinator {
   }
 
   public cleanup() {
+    this.stopped = true;
     this.offRpcAuthRejected?.();
     this.offRpcAuthRejected = null;
     if (this.orphanRecoveryTimer) {
@@ -5185,6 +5221,9 @@ export class ExecutionCoordinator {
     }
   }
 }
+
+/** The refusal of a sign once this process no longer holds an instance lock its coordinator's start() took (see `lostStartLock`). */
+export const INSTANCE_LOCK_LOST = 'INSTANCE_LOCK_LOST: this process no longer holds an instance lock it started with, so another process may own this database or key now';
 
 /** 3F (R1-9): a mint whose position (in the same execution mode) was closed less than this long ago is not bought again; after a loss, never. */
 export const MINT_REENTRY_BLOCK_MS = 24 * 60 * 60 * 1000;

@@ -289,6 +289,11 @@ export function updateHeldLock(lockPath: string, extra: Partial<Omit<LockInfo, '
   held.set(lockPath, next);
 }
 
+/** True while this process holds `lockPath` (taken by acquireLock, not released, not found removed or taken over by the heartbeat). */
+export function isLockHeld(lockPath: string): boolean {
+  return held.has(lockPath);
+}
+
 export function releaseLock(lockPath: string): void {
   if (!held.has(lockPath)) return;
   held.delete(lockPath);

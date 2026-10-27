@@ -136,6 +136,7 @@ async function retryPendingSells(pending: Map<string, NormalizedPosition>, repor
   const deadline = performance.now() + PANIC_PENDING_SELL_WAIT_MS.value; // monotonic, as waitForBuysInFlight
   while (pending.size > 0 && performance.now() < deadline) {
     await new Promise((r) => setTimeout(r, Math.max(0, Math.min(PANIC_PENDING_SELL_POLL_MS.value, deadline - performance.now()))));
+    if (executionCoordinator.isStopped()) break; // cleanup() ran meanwhile: no more sells from this process (each is reported below)
     for (const [id, p] of [...pending]) {
       const res = await closeWithFollowUps(p);
       if (!res.success && /^SELL_PENDING_VERIFICATION/.test(res.error || '')) continue;
@@ -143,8 +144,9 @@ async function retryPendingSells(pending: Map<string, NormalizedPosition>, repor
       recordPanicResult(p, res, report);
     }
   }
+  const stopped = executionCoordinator.isStopped();
   for (const p of pending.values()) {
-    report.failed.push({ id: p.id, symbol: p.symbol, error: `SELL_PENDING_VERIFICATION: an earlier sell of ${p.symbol || p.mint} was still unconfirmed when the panic ended (waited ${Math.round(PANIC_PENDING_SELL_WAIT_MS.value / 1000)}s); the position may still be open. Run the panic again.` });
+    report.failed.push({ id: p.id, symbol: p.symbol, error: `SELL_PENDING_VERIFICATION: an earlier sell of ${p.symbol || p.mint} was still unconfirmed when the panic ended (${stopped ? 'the coordinator was stopped before it resolved' : `waited ${Math.round(PANIC_PENDING_SELL_WAIT_MS.value / 1000)}s`}); the position may still be open. Run the panic again.` });
   }
 }
 

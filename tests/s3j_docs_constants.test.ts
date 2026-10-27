@@ -14,7 +14,7 @@ import {
   SELL_RATE_LIMIT_BACKOFF_MS, EXIT_RATE_LIMITED_WAIT_MS, EXIT_SELL_WAIT_MS, MARK_STALE_MS, MARK_RETRY_BASE_MS, MARK_RETRY_MAX_MS,
   MARK_ALERT_AFTER_MS, EXIT_RETRY_BASE_MS, EXIT_RETRY_MAX_MS, SELL_SLIPPAGE_LADDER_BPS, LIVE_BUY_FILLED, ExecutionCoordinator,
 } from '../server/execution/coordinator';
-import { PANIC_BUY_SETTLE_WAIT_MS } from '../server/execution/emergencyStop';
+import { PANIC_BUY_SETTLE_WAIT_MS, PANIC_PENDING_SELL_WAIT_MS } from '../server/execution/emergencyStop';
 import { READINESS_RED_LIMIT_MS, WALLET_AUDIT_BASE_TOLERANCE_SOL } from '../server/auto/killSwitch';
 import { CONFLUENCE_DEVNET_LIVE_FLOOR } from '../server/signals/confluenceThreshold';
 import { LOGIN_RATE_LIMIT } from '../server/middleware/enterprise';
@@ -98,7 +98,8 @@ const rows: Row[] = [
   ['PumpSwap CACHE_TTL_MS', num(fromSource('server/solana/pumpSwapService.ts', /CACHE_TTL_MS = (\d+)/)), 15_000, 'latency', '15 s (`CACHE_TTL_MS`)'],
   ['PANIC_BUY_SETTLE_WAIT_MS', PANIC_BUY_SETTLE_WAIT_MS.value, 30_000, 'latency', '30 s (`PANIC_BUY_SETTLE_WAIT_MS`)'],
   ['PANIC_BUY_SETTLE_WAIT_MS (runbook)', PANIC_BUY_SETTLE_WAIT_MS.value, 30_000, 'runbook', 'up to 30 s (`PANIC_BUY_SETTLE_WAIT_MS`)'],
-  ['pending sell (runbook)', num(fromSource('server/execution/coordinator.ts', /const PENDING_SELL_WINDOW_MS = ([\d_]+)/)), 100_000, 'runbook', 'up to 100 s for a pending sell'],
+  // R5-9: the panic now retries a pending sell itself, so the runbook names that bound instead of the 100 s window
+  ['PANIC_PENDING_SELL_WAIT_MS (runbook)', PANIC_PENDING_SELL_WAIT_MS.value, 90_000, 'runbook', 'for up to 90 s (`PANIC_PENDING_SELL_WAIT_MS`'],
   ['WALLET_AUDIT_BASE_TOLERANCE_SOL', WALLET_AUDIT_BASE_TOLERANCE_SOL, 0.0005, 'runbook', 'A difference above 0.0005 SOL'],
   ['LOGIN_RATE_LIMIT attempts', LOGIN_RATE_LIMIT.maxTokens, 5, 'env', '5 attempts, then one every 12 s'],
   ['LOGIN_RATE_LIMIT refill', Math.round(1 / LOGIN_RATE_LIMIT.refillRatePerSec), 12, 'env', 'one every 12 s'],

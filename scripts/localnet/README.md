@@ -2,10 +2,10 @@
 
 `npm run localnet:e2e` starts three things and drives them:
 
-1. `scripts/localnet/validator.ts`, a JSON-RPC server (plus a minimal WebSocket: `logsSubscribe`, and `slotSubscribe`, which hears the slot on every transaction and once a second) on 127.0.0.1 backed by **LiteSVM**.
+1. `scripts/localnet/validator.ts`, a JSON-RPC server (plus a minimal WebSocket: `logsSubscribe`, and `slotSubscribe`, which hears the slot on every advance) on 127.0.0.1 backed by **LiteSVM**.
    The real pump.fun, pump fee and PumpSwap program binaries and config accounts, dumped from devnet, are in
    `scripts/localnet/accounts/` (public chain data, no keys). It is **not** `solana-test-validator`: one in-process bank, a slot
-   per transaction, everything final, no lookup tables. It refuses to bind anything but loopback.
+   per transaction and one every 400 ms of wall time (R4-9: the app refuses buys on a slot that stops advancing), everything final, no lookup tables. It refuses to bind anything but loopback.
 2. The app itself (`server.ts`), booted with `ALLOWED_CLUSTER=localnet`, the validator's genesis hash, the validator's URL,
    an empty `APEX_ENV_FILE` (the real `.env` is never read), a throwaway key and a scratch database.
 3. The driver, which calls the app's authenticated HTTP API (`/api/execution/arm`, `/trade`, `/close`, ...) and checks

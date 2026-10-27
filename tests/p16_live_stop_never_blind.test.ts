@@ -282,6 +282,23 @@ describe('N-44: a fractional sell percentage', () => {
   });
 });
 
+describe('R3-5: closePosition clamps the sell percentage to 1..100', () => {
+  it('closePosition(id, 150) sells the whole balance; closePosition(id, 0.2) sells 1%', async () => {
+    const { c, build } = await liveCoordinator();
+    stubCurveSell();
+    const over = seedLive({ tokenQuantityRaw: '1000000001' });
+    const res = await c.closePosition(over.id, 150, 'STOP_LOSS');
+    expect(res.success, res.error).toBe(true);
+    expect(build).toHaveBeenCalledTimes(1);
+    expect((build.mock.calls[0][1] as any).amountTokens).toBe(1_000_000_001n); // 150 -> 100%, never more than the balance
+
+    const under = seedLive({ tokenQuantityRaw: '1000000000' });
+    await c.closePosition(under.id, 0.2, 'STOP_LOSS');
+    expect(build).toHaveBeenCalledTimes(2);
+    expect((build.mock.calls[1][1] as any).amountTokens).toBe(10_000_000n); // 0.2 -> 1% = floor(1e9 * 100 / 10000)
+  });
+});
+
 describe('N-42: a curve that cannot be fully read in LIVE', () => {
   const curveAccount = async () => ({
     owner: PUMP_FUN_PROGRAM_ID, lamports: 1_000_000, executable: false,

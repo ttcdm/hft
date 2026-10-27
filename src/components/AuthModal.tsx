@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { KeyRound, Lock, ShieldCheck, AlertCircle, Eye, EyeOff, X, Terminal, CheckCircle2 } from 'lucide-react';
 import { setOperatorSessionToken } from '../services/engineClient';
+import { DialogFrame } from './DialogFrame';
 
 interface AuthModalProps {
   isOpen: boolean;
@@ -110,7 +111,7 @@ export const AuthModal: React.FC<AuthModalProps> = ({
   };
 
   return (
-    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+    <DialogFrame label="Operator sign-in" className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
       <div className="bg-[#0D131F] border border-[#1E293B] rounded-xl max-w-lg w-full shadow-2xl overflow-hidden animate-in fade-in zoom-in-95 duration-200">
         {/* Header */}
         <div className="px-6 py-4 border-b border-[#1E293B] flex items-center justify-between bg-[#101726]">
@@ -254,6 +255,6 @@ export const AuthModal: React.FC<AuthModalProps> = ({
           </div>
         </form>
       </div>
-    </div>
+    </DialogFrame>
   );
 };

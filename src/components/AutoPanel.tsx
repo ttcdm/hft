@@ -5,6 +5,7 @@ import { parseThreshold, thresholdWarning } from '../utils/confluenceThreshold';
 import { onAuthenticated } from '../utils/authEvents';
 import { useTradingMode } from '../utils/tradingMode';
 import { parseDecimalText, COMMA_DECIMAL_REASON } from '../utils/numberInput';
+import { askConfirm } from './ConfirmDialog';
 
 /** H3: the auto-snipe controller panel. Every number is read from GET /api/auto/status (controller state + decision journal). */
 export type AutoMode = 'OFF' | 'SHADOW' | 'PAPER' | 'DEVNET_LIVE';
@@ -89,7 +90,7 @@ export function AutoBudgetEditor({ budgets, limits, onSave, busy }: { budgets: A
         <span className="text-slate-500">buys,</span>
         <input data-testid="budget-spend" type="text" inputMode="decimal" aria-label="Session budget: max spend (SOL)" value={spend} onChange={(e) => setSpend(e.target.value)} className="w-20 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
         <span className="text-slate-500">SOL incl. fees</span>
-        <button data-testid="budget-save" disabled={busy || found !== null || unedited} onClick={() => onSave?.(nBuys, nSpend)} className="ml-auto px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white disabled:opacity-40">Save</button>
+        <button data-testid="budget-save" aria-label="Save session budget" disabled={busy || found !== null || unedited} onClick={() => onSave?.(nBuys, nSpend)} className="ml-auto px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white disabled:opacity-40">Save</button>
       </div>
       {problem && <p className="text-rose-400 mt-0.5" data-testid="budget-problem">{problem}</p>}
       {runningNote && <p className="text-amber-300/90 mt-0.5" data-testid="budget-running-note">{runningNote}</p>}
@@ -115,7 +116,7 @@ export function AutoOrderSizeEditor({ orderSol, limits, spendLimitSol, onSave, b
       <div className="flex items-center gap-1.5">
         <input data-testid="order-sol" type="text" inputMode="decimal" aria-label="Order size (SOL)" value={text} onChange={(e) => setText(e.target.value)} className="w-20 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
         <span className="text-slate-500">SOL</span>
-        <button data-testid="order-save" disabled={busy || problem !== null} onClick={() => onSave?.(n)} className="ml-auto px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white disabled:opacity-40">Save</button>
+        <button data-testid="order-save" aria-label="Save order size" disabled={busy || problem !== null} onClick={() => onSave?.(n)} className="ml-auto px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white disabled:opacity-40">Save</button>
       </div>
       {problem && <p className="text-rose-400 mt-0.5" data-testid="order-problem">{problem}</p>}
       {limits && <p className="text-slate-600 mt-0.5">{limits.minSol} to {limits.maxSol} SOL. Applies to PAPER and DEVNET_LIVE buys from the next order; kept until the server restarts.</p>}
@@ -139,7 +140,7 @@ export function ConfluenceThresholdEditor({ confluence, onSave, busy }: { conflu
       <div className="flex items-center gap-1.5">
         <input data-testid="confluence-slider" type="range" min={0} max={100} step={1} value={shown} onChange={(e) => setText(e.target.value)} className="flex-1" aria-label="Confluence buy threshold" />
         <input data-testid="confluence-box" type="text" inputMode="numeric" aria-label="Confluence buy threshold (0 to 100)" value={text} onChange={(e) => setText(e.target.value)} className="w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
-        <button data-testid="confluence-save" disabled={busy || !parsed.ok || !dirty} onClick={() => parsed.ok && onSave?.(parsed.value)} className="px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white disabled:opacity-40">Save</button>
+        <button data-testid="confluence-save" aria-label="Save confluence threshold" disabled={busy || !parsed.ok || !dirty} onClick={() => parsed.ok && onSave?.(parsed.value)} className="px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white disabled:opacity-40">Save</button>
       </div>
       {!parsed.ok && <p className="text-rose-400 mt-0.5" data-testid="confluence-problem">{parsed.reason}</p>}
       {warning && <p className="text-amber-300 mt-0.5" data-testid="confluence-warning">{warning}</p>}
@@ -225,11 +226,11 @@ export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOr
       )}
       <div className="flex gap-1 mb-2">
         {(['OFF', 'SHADOW', 'PAPER', 'DEVNET_LIVE'] as AutoMode[]).map((m) => (
-          <button key={m} disabled={busy || status.mode === m} onClick={() => onMode?.(m)} data-testid={`mode-${m}`}
+          <button key={m} disabled={busy || status.mode === m} onClick={() => onMode?.(m)} aria-pressed={status.mode === m} data-testid={`mode-${m}`}
             className={`flex-1 px-1 py-1 rounded font-mono font-bold text-[10px] border ${status.mode === m ? 'border-cyan-500 text-cyan-300' : 'border-slate-700 text-slate-400 hover:text-slate-200'}`}>{m}</button>
         ))}
       </div>
-      <input value={code ?? ''} onChange={(e) => onCode?.(e.target.value)} placeholder="DEVNET_LIVE confirmation code" className="w-full mb-2 px-2 py-1 rounded bg-slate-900 border border-slate-700 font-mono text-[11px]" />
+      <input value={code ?? ''} onChange={(e) => onCode?.(e.target.value)} aria-label="DEVNET_LIVE confirmation code" placeholder="DEVNET_LIVE confirmation code" className="w-full mb-2 px-2 py-1 rounded bg-slate-900 border border-slate-700 font-mono text-[11px]" />
       {staleText && <p className="text-amber-300 font-bold mb-2" data-testid="auto-stale">{staleText}</p>}
       {error && <p className="text-red-400 mb-2" data-testid="auto-error">{error}</p>}
       {killReport && <p className={`${killReport.ok ? 'text-emerald-300' : 'text-red-300 font-bold'} mb-2`} data-testid="auto-kill-report">{killReport.text}</p>}
@@ -357,9 +358,9 @@ export function AutoPanel() {
   return (
     <AutoPanelView status={shown} busy={busy} error={error} killReport={killReport} code={code} onCode={setCode} staleText={autoStatusStaleText(read, Date.now())} killSwitch={tradingMode.killSwitch}
       onMode={(m) => post('/api/auto/mode', { mode: m, confirmationCode: m === 'DEVNET_LIVE' ? code : undefined })}
-      onKill={() => {
-        // Q45: KILL sells every position the auto trader opened, so it asks first
-        if (typeof window !== 'undefined' && !window.confirm('KILL AUTO: switch auto to OFF and sell every position it bought. Continue?')) return;
+      onKill={async () => {
+        // Q45: KILL sells every position the auto trader opened, so it asks first. R10-11: in a dialog Enter cannot accept.
+        if (!(await askConfirm({ title: 'KILL AUTO', body: 'KILL AUTO: switch auto to OFF and sell every position it bought. Continue?', confirmLabel: 'Kill auto and sell' }))) return;
         void post('/api/auto/kill', { exitAll: true, reason: 'operator kill from panel' });
       }}
       onResume={() => post('/api/auto/resume', { clearHalt: true })}

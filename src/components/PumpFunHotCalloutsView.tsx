@@ -51,6 +51,7 @@ import {
 import { engineClient } from '../services/engineClient';
 import { hftAudio } from '../utils/audio';
 import { DecimalBox } from './DecimalBox';
+import { DialogFrame } from './DialogFrame';
 import {
   sanitizeExternalUrl,
   sanitizeXProfileUrl,
@@ -1205,7 +1206,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
 
       {/* CALLER PROFILE MODAL */}
       {selectedCallerModal && (
-        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
+        <DialogFrame label="Caller profile" className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
           <div className="bg-[#0B0F19] border border-[#1E293B] rounded-2xl max-w-lg w-full p-5 space-y-4 shadow-2xl">
             <div className="flex items-start justify-between">
               <div className="flex items-center space-x-3">
@@ -1319,7 +1320,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               </p>
             </div>
           </div>
-        </div>
+        </DialogFrame>
       )}
     </div>
   );

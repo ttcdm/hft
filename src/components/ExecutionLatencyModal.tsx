@@ -2,6 +2,7 @@ import React from 'react';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { X, Timer } from 'lucide-react';
 import { usePolled } from '../utils/usePolled';
+import { DialogFrame } from './DialogFrame';
 
 export interface LatencyRowData { label: string; n: number; p50Ms: number | null; p95Ms: number | null; maxMs: number | null }
 export interface LatencyData {
@@ -50,7 +51,7 @@ export const ExecutionLatencyModal: React.FC<{ isOpen: boolean; onClose: () => v
   useEscapeToClose(isOpen, onClose);
   if (!isOpen) return null;
   return (
-    <div className="fixed inset-0 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 z-50 font-mono">
+    <DialogFrame label="Execution latency" className="fixed inset-0 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 z-50 font-mono">
       <div className="bg-[#0D131F] border border-[#1E293B] rounded-xl p-5 max-w-2xl w-full shadow-2xl max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between mb-3">
           <h3 className="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2"><Timer className="w-4 h-4 text-cyan-400" /> Execution latency</h3>
@@ -59,6 +60,6 @@ export const ExecutionLatencyModal: React.FC<{ isOpen: boolean; onClose: () => v
         <p className="text-[10px] text-slate-500 mb-3">Measured from this app's own journal (transaction submission and confirmation times, candidate arrival times). No co-location or network latency is assumed.</p>
         <ExecutionLatencyView data={data} error={error} />
       </div>
-    </div>
+    </DialogFrame>
   );
 };

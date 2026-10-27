@@ -86,9 +86,9 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
   ];
   return (
     <section className="col-span-12 lg:col-span-8 rounded-lg border border-slate-800 bg-[#0B0F17] overflow-hidden" data-testid="token-board">
-      <div className="flex border-b border-slate-800 items-center">
+      <div className="flex border-b border-slate-800 items-center" role="tablist" aria-label="Token board">
         {tabs.map(([key, label, n]) => (
-          <button key={key} onClick={() => onTab(key)} data-testid={`tab-${key}`}
+          <button key={key} role="tab" aria-selected={tab === key} onClick={() => onTab(key)} data-testid={`tab-${key}`}
             className={`px-4 py-2.5 text-sm font-semibold ${tab === key ? 'text-cyan-300 border-b-2 border-cyan-400' : 'text-slate-400 hover:text-slate-200'}`}>
             {label} <span className="text-xs text-slate-500">({n})</span>
           </button>

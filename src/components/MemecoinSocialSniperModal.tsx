@@ -71,6 +71,7 @@ import { PumpFunHotCalloutsView } from './PumpFunHotCalloutsView';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
 import { BELOW_HEADER_TOP } from '../utils/headerOffset';
 import { DecimalBox } from './DecimalBox';
+import { DialogFrame, KILL_SWITCH_ID } from './DialogFrame';
 
 /**
  * P1.4 (N-12): the sniper tab's header. The auto mode shown is the auto controller's own (GET /api/auto/status), read-only: the
@@ -483,7 +484,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   });
 
   return (
-    <div className={`fixed ${BELOW_HEADER_TOP} inset-x-0 bottom-0 z-40 flex items-start justify-center bg-black/85 backdrop-blur-md p-2 sm:p-4 overflow-y-auto`}>
+    <DialogFrame label="Memecoin social sniper" className={`fixed ${BELOW_HEADER_TOP} inset-x-0 bottom-0 z-40 flex items-start justify-center bg-black/85 backdrop-blur-md p-2 sm:p-4 overflow-y-auto`} alsoReach={[KILL_SWITCH_ID]}>
       <div className="relative w-full max-w-7xl bg-[#0B101D] border border-[#1E293B] rounded-2xl shadow-2xl flex flex-col my-2 sm:my-3 text-slate-200">
         {/* HEADER BAR */}
         <div className="px-5 py-4 border-b border-[#1E293B] bg-[#0E1526] flex flex-wrap items-center justify-between gap-3">
@@ -1540,7 +1541,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
       {/* COMPREHENSIVE OUTSIDE WORLD CONNECTIVITY & SIMULATION AUDIT MODAL */}
       {showDiagnosticsModal && diagnosticsResult && (
-        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-6">
+        <DialogFrame label="Connectivity audit" className="fixed inset-0 z-50 bg-black/80 backdrop-blur-md flex items-center justify-center p-3 sm:p-6">
           <div className="bg-[#0A0E1A] border border-[#1E293B] rounded-2xl max-w-4xl w-full max-h-[90vh] flex flex-col shadow-2xl overflow-hidden font-mono">
             {/* Modal Header */}
             <div className="p-4 border-b border-[#1E293B] bg-[#0E1424] flex items-center justify-between">
@@ -1784,7 +1785,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
               </div>
             </div>
           </div>
-        </div>
+        </DialogFrame>
       )}
 
       {/* External Token Explorer & Web Platform Modal */}
@@ -1793,6 +1794,6 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
         onClose={() => setSelectedExternalToken(null)}
         tokenData={selectedExternalToken}
       />
-    </div>
+    </DialogFrame>
   );
 };

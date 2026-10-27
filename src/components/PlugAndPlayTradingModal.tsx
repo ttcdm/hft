@@ -14,6 +14,7 @@ import { sellConfirmText } from '../utils/sellConfirm';
 import { journalEventDetail } from '../utils/exitWatch';
 import { ARMED_MESSAGE, PANIC_CONFIRM_TEXT, armRefusalText, panicOutcome } from '../utils/tradingCopy';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
+import { askConfirm } from './ConfirmDialog';
 import React, { useState, useEffect } from 'react';
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { SnipeAmountControl } from './SnipeAmountControl';
@@ -46,6 +47,7 @@ import { closeOutcomeText } from '../utils/closeOutcome';
 import { fmtSol } from '../utils/numFormat';
 import { ageText, markIsStale } from '../utils/freshness';
 import { BELOW_HEADER_TOP } from '../utils/headerOffset';
+import { DialogFrame, KILL_SWITCH_ID } from './DialogFrame';
 
 interface PlugAndPlayTradingModalProps {
   isOpen: boolean;
@@ -322,7 +324,8 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   };
 
   const handlePanicLiquidate = async () => {
-    if (!confirm(PANIC_CONFIRM_TEXT)) return;
+    // R10-11: an in-page dialog, where Enter cannot accept (window.confirm took Enter as yes)
+    if (!(await askConfirm({ title: 'PANIC LIQUIDATE', body: PANIC_CONFIRM_TEXT, confirmLabel: 'Close everything now' }))) return;
     try {
       setIsLoading(true);
       const res = await authFetch('/api/wallet/panic-liquidate', { method: 'POST' });
@@ -341,7 +344,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   if (!isOpen) return null;
 
   return (
-    <div className={`fixed ${BELOW_HEADER_TOP} inset-x-0 bottom-0 z-40 flex items-start justify-center bg-black/85 backdrop-blur-md p-2 sm:p-4 overflow-y-auto font-sans`}>
+    <DialogFrame label="Plug & Play trading" className={`fixed ${BELOW_HEADER_TOP} inset-x-0 bottom-0 z-40 flex items-start justify-center bg-black/85 backdrop-blur-md p-2 sm:p-4 overflow-y-auto font-sans`} alsoReach={[KILL_SWITCH_ID]}>
       <div className="bg-slate-900 border border-slate-700/80 rounded-2xl w-full max-w-5xl shadow-2xl overflow-hidden my-2 sm:my-4">
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-4 border-b border-slate-800 bg-slate-950/90 gap-3">
@@ -764,6 +767,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
             {/* Panic Liquidate / Trip Circuit Breaker */}
             <button
               onClick={handlePanicLiquidate}
+              data-testid="pnp-panic"
               className="px-3.5 py-2 rounded-lg bg-rose-950/60 hover:bg-rose-900/80 border border-rose-600/50 text-rose-300 font-bold text-xs flex items-center space-x-1.5"
             >
               <AlertTriangle className="w-3.5 h-3.5" />
@@ -797,7 +801,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
 
       {/* Confirmation Modal to Arm Live Trading */}
       {showArmConfirmModal && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-4">
+        <DialogFrame label="Confirm live Solana broadcast" className="fixed inset-0 z-50 flex items-center justify-center bg-black/90 p-4">
           <div className="bg-slate-900 border border-rose-500/60 rounded-2xl p-5 max-w-md w-full space-y-4 shadow-2xl">
             <div className="flex items-center space-x-2.5 text-rose-400 font-bold text-sm">
               <AlertTriangle className="w-5 h-5 flex-shrink-0" />
@@ -843,8 +847,8 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
               </button>
             </div>
           </div>
-        </div>
+        </DialogFrame>
       )}
-    </div>
+    </DialogFrame>
   );
 };

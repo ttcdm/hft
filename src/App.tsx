@@ -23,6 +23,7 @@ import { readServerAlerts, serverAlertEvents, alertsUnreadableEvent, killSwitchS
 import { killSwitchPress } from './utils/killSwitchPress';
 import { exitAlerts, type WatchedPosition } from './utils/exitWatch';
 import { PanelErrorBoundary } from './components/ErrorBoundaries';
+import { ConfirmHost } from './components/ConfirmDialog';
 
 
 export function makeEmptyKpis(startingEquity: number): PerformanceKPIs {
@@ -392,6 +393,9 @@ export default function App() {
           onAuthenticated={handleAuthenticated}
         />
       </PanelErrorBoundary>
+
+      {/* R10-11: the confirm step for PANIC and KILL AUTO (Enter cannot accept) */}
+      <ConfirmHost />
     </div>
   );
 }

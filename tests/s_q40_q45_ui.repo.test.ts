@@ -8,7 +8,7 @@ describe('Q40/Q43/Q44/Q45 source checks', () => {
     expect(read('src/components/PumpFunHotCalloutsView.tsx')).not.toMatch(/title=\{`Verified/);
     expect(read('src/App.tsx')).not.toContain('NEW STRATEGY DEPLOYED');
     expect(read('src/App.tsx')).not.toContain('Subscribed to live');
-    expect(read('src/components/AutoPanel.tsx')).toContain('window.confirm');
+    expect(read('src/components/AutoPanel.tsx')).toContain('askConfirm'); // R10-11: the in-page confirm, where Enter cannot accept
     expect(read('src/components/PlugAndPlayTradingModal.tsx')).not.toContain('handleEmergencyKillSwitch');
     expect(read('index.html')).not.toContain('event.preventDefault()');
     expect(JSON.parse(read('tsconfig.json')).compilerOptions.strictNullChecks).toBe(true);

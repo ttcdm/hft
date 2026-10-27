@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { getTokenExternalLinks, TokenLinkItem } from '../utils/tokenLinks';
 import { useTradingMode } from '../utils/tradingMode';
+import { DialogFrame } from './DialogFrame';
 
 interface TokenInlineExternalLinksProps {
   mintOrCa: string;
@@ -267,7 +268,7 @@ export const TokenExternalLinksModal: React.FC<TokenExternalLinksModalProps> = (
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in">
+    <DialogFrame label="Token links" className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm animate-in fade-in">
       <div className="bg-[#0D1322] border border-cyan-500/40 rounded-2xl w-full max-w-xl overflow-hidden shadow-2xl font-mono text-slate-200">
         {/* Modal Header */}
         <div className="flex items-center justify-between p-4 bg-[#090D17] border-b border-[#1E293B]">
@@ -391,6 +392,6 @@ export const TokenExternalLinksModal: React.FC<TokenExternalLinksModalProps> = (
           </button>
         </div>
       </div>
-    </div>
+    </DialogFrame>
   );
 };

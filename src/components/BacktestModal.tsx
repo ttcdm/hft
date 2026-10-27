@@ -3,6 +3,7 @@ import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { X, TrendingUp } from 'lucide-react';
 import { usePolled } from '../utils/usePolled';
 import { parseThreshold, thresholdWarning } from '../utils/confluenceThreshold';
+import { DialogFrame } from './DialogFrame';
 
 export interface ReplayedLaunchRow {
   mint: string; symbol: string; trades: number; verdict: string; verdictReason: string; releasedAfterMs: number | null; score: number | null;
@@ -207,7 +208,7 @@ export const BacktestModal: React.FC<BacktestModalProps> = ({ isOpen, onClose })
   useEscapeToClose(isOpen, onClose);
   if (!isOpen) return null;
   return (
-    <div className="fixed inset-0 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 z-50 font-mono">
+    <DialogFrame label="Backtest" className="fixed inset-0 bg-black/85 backdrop-blur-sm flex items-center justify-center p-4 z-50 font-mono">
       <div className="bg-[#0D131F] border border-[#1E293B] rounded-xl p-5 max-w-3xl w-full shadow-2xl max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between mb-3">
           <h3 className="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2"><TrendingUp className="w-4 h-4 text-emerald-400" /> Backtest: replay of recorded launches</h3>
@@ -217,6 +218,6 @@ export const BacktestModal: React.FC<BacktestModalProps> = ({ isOpen, onClose })
         <ReplayThresholdBox value={thresholdText === '' ? String(live ?? 70) : thresholdText} onChange={onThreshold} inForce={live} replayedAt={applied} />
         <ReplayBacktestView data={data} error={error} />
       </div>
-    </div>
+    </DialogFrame>
   );
 };

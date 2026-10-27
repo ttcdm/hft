@@ -122,7 +122,7 @@ export async function startValidator(dir: string, env: Record<string, string> = 
     rpc,
     methodCounts: async () => (await rpc('localnet_stats')).methods ?? {},
     stop: () => new Promise<void>((r) => {
-      if (child.exitCode !== null) return r();
+      if (child.exitCode !== null || child.signalCode !== null) return r(); // a child killed by a signal has no exit code
       child.once('exit', () => r());
       child.kill('SIGTERM');
       setTimeout(() => child.kill('SIGKILL'), 3000).unref();
@@ -205,7 +205,7 @@ export async function startLocalnetApp(o: AppOptions): Promise<LocalnetApp> {
     return { status: res.status, json: await res.json().catch(() => null) };
   };
   const stopWith = (signal: NodeJS.Signals) => new Promise<void>((r) => {
-    if (child.exitCode !== null) return r();
+    if (child.exitCode !== null || child.signalCode !== null) return r(); // a child killed by a signal has no exit code
     child.once('exit', () => r());
     child.kill(signal);
     if (signal !== 'SIGKILL') setTimeout(() => child.kill('SIGKILL'), 3000).unref();
@@ -214,7 +214,7 @@ export async function startLocalnetApp(o: AppOptions): Promise<LocalnetApp> {
     base, token, dbPath, logs, call,
     stop: () => stopWith('SIGTERM'),
     kill: () => stopWith('SIGKILL'),
-    exited: () => child.exitCode !== null,
+    exited: () => child.exitCode !== null || child.signalCode !== null,
   };
 }
 

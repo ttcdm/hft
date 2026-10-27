@@ -5,6 +5,7 @@ import { traced } from './observability/tracing';
 import { PumpCurveService, type MarketStateFailure } from './solana/pumpCurve';
 import { executionCoordinator, isRecoveredPosition } from './execution/coordinator';
 import { solPriceService } from './market/solPriceService';
+import { riskEngine } from './risk/riskEngine';
 import { workstationDb } from './db/database';
 import { evaluateTokenSafety } from './risk/tokenSafety';
 import { pumpFeedListener, PumpCreateEvent, PumpTradeEvent } from './solana/pumpFeedListener';
@@ -571,7 +572,15 @@ export class MemecoinAggregatorService extends EventEmitter {
 
     // Sizing via CapitalSizer (B12): determine spendable bankroll and 10% ceiling
     const executionMode = executionCoordinator.getExecutionMode();
-    // R5-40: the operator trade route reaches the coordinator only through here, and the curve read below comes first. On an RPC the
+    // R5-40: the operator trade route reaches the coordinator only through here, and the price, sizing and curve checks below come first.
+    // A kill switch or a halt refuses every buy whatever those say, so it is reported as itself (as the route did before R5-40), not
+    // shadowed by SOL_PRICE_UNAVAILABLE or MARKET_DATA_UNAVAILABLE. The coordinator still checks both; these refusals only come earlier.
+    if (!params.dryRun) {
+      if (riskEngine.isKillSwitchActive()) return { success: false, message: 'KILL_SWITCH_ACTIVE: Emergency kill switch is active', txHash: '' };
+      const halt = executionCoordinator.getHaltReason();
+      if (halt) return { success: false, message: `TRADING_HALTED: ${halt}`, txHash: '' };
+    }
+    // R5-40: the curve read below comes first in this path. On an RPC the
     // heartbeat found on another cluster (a new ledger behind the same URL) that read fails as a lagging slot or a missing curve, which
     // hid the real reason the coordinator gave before (CLUSTER_GUARD). Refuse with it here, before anything is read.
     if (executionMode === 'LIVE') {

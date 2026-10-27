@@ -545,9 +545,13 @@ async function main() {
   }
 
   // ---- kill switch over HTTP ----
+  // A coin this server has looked up the holders of (R2-3): mintE's were looked up two restarts ago, so the holder gate, which runs before
+  // the kill switch is read, would refuse it first and the line would pass for the wrong reason.
+  let mintK: PublicKey | null = null;
+  try { mintK = await seedCoin(); } catch (e: any) { rec('kill switch: seed a coin', false, String(e?.message ?? e).slice(0, 300)); }
   const ks = await call('POST', '/api/execution/kill-switch', { activate: true });
-  const blocked = await call('POST', '/api/execution/trade', { mint: mintE.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02, confirmLive: true });
-  rec('kill switch blocks new buys', ks.status === 200 && blocked.body?.success === false, `${blocked.status} ${JSON.stringify(blocked.body).slice(0, 200)}`);
+  const blocked = mintK ? await call('POST', '/api/execution/trade', { mint: mintK.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02, confirmLive: true }) : { status: 0, body: null as any };
+  rec('kill switch blocks new buys', ks.status === 200 && blocked.body?.success === false && /KILL_SWITCH_ACTIVE/.test(String(blocked.body?.error)), `${blocked.status} ${JSON.stringify(blocked.body).slice(0, 200)}`);
   await call('POST', '/api/execution/kill-switch', { activate: false });
 
   const stats = await rpcCall(info.url, 'localnet_stats', []);

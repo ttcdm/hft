@@ -1761,6 +1761,10 @@ export async function lossFloorLatch(s: HarnessSteps, d: LossFloorDeps): Promise
     const jump = msToNextUtcMidnight(realNow()) + 60_000;
     Date.now = () => realNow() + jump;
     try {
+      // R4-9: a curve read is stamped with the time its context slot was FIRST seen. A read right after the jump can come from the slot the
+      // last read (before the jump) already saw, and would carry the real clock's stamp: 16 h old to the jumped clock, STALE_MARKET_DATA.
+      // Wait past a few slots (about 0.4 s each, on devnet and on the local validator) so the next read is from a slot first seen after it.
+      await s.sleep(1_500);
       await d.refreshPrice();
       const r = await refusedBuy(`clock past the next 00:00 UTC (+${(jump / 3_600_000).toFixed(2)} h): still refused, latched`, true);
       if (r) s.rec(`${L}: the refusal says when the oldest loss leaves the window`, /leaves it at|no realized loss is left/.test(r.error ?? ''), (r.error ?? '').slice(-160));

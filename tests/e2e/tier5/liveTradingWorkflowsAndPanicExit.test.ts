@@ -465,10 +465,11 @@ describe('Tier 5 [mock-level]: Live Trading Workflows, Token Safety & Panic Exit
       executionCoordinator.armLiveTrading(true, 'CONFIRM_LIVE_TRADING_RISK');
 
       // Mock singleton closePosition for panic liquidate
-      const closeSpy = vi.spyOn(executionCoordinator, 'closePosition').mockResolvedValue({
-        success: true,
-        pnlSol: 0.02,
-        status: 'CLOSED',
+      // the stub closes the row as a real full sell would: the panic reports any LIVE row still open afterwards as STILL_OPEN
+      const closeSpy = vi.spyOn(executionCoordinator, 'closePosition').mockImplementation(async (id: string) => {
+        const row = workstationDb.loadPositions().find((p) => p.id === id);
+        if (row) workstationDb.savePosition({ ...row, status: 'CLOSED', tokenQuantityRaw: '0' } as any);
+        return { success: true, pnlSol: 0.02, status: 'CLOSED' };
       });
 
       const report = await walletTrader.panicLiquidateAll();

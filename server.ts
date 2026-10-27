@@ -77,6 +77,7 @@ import {
   isAllowedClientOrigin,
   isAllowedWsConnection,
   verifyWsAuth,
+  extractOperatorToken,
 } from './server/middleware/auth';
 import {
   findLoosePermissions,
@@ -91,6 +92,8 @@ import {
   errorHandler,
   rateLimiter,
   LOGIN_RATE_LIMIT,
+  EMERGENCY_RATE_LIMIT,
+  isEmergencyRoute,
   securityHeadersMiddleware,
   validateBody,
   WalletConfigSchema,
@@ -444,7 +447,10 @@ app.use(cors(corsPolicy));
 
 app.use(express.json());
 app.get('/favicon.ico', (req, res) => res.status(204).end());
-app.use('/api', rateLimiter({ maxTokens: Number(process.env.APEX_RATE_LIMIT_BURST) || 120, refillRatePerSec: 30 }));
+// R8-3: an authenticated emergency request (kill switch, panic, auto kill) has its own bucket, so other /api traffic cannot starve it
+const authedEmergency = (req: express.Request) => isEmergencyRoute(req) && authManager.isOperatorToken(extractOperatorToken(req));
+app.use('/api', rateLimiter({ maxTokens: Number(process.env.APEX_RATE_LIMIT_BURST) || 120, refillRatePerSec: 30, skip: authedEmergency }));
+app.use('/api', rateLimiter({ ...EMERGENCY_RATE_LIMIT, skip: (req) => !authedEmergency(req) }));
 // A1: deny-by-default. Only GET /api/health and POST /api/auth/login are reachable without an operator token.
 app.use(apiAuthGate);
 

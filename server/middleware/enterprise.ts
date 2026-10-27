@@ -325,12 +325,13 @@ export type RateLimitMiddleware = ((req: Request, res: Response, next: NextFunct
  * Each limiter has its own buckets. A bucket idle long enough to have refilled completely is the same as a new one, so it is dropped
  * (swept at most once per refill period, on a request); the map holds only peers seen within that period.
  */
-export function rateLimiter(opts: { maxTokens: number; refillRatePerSec: number }): RateLimitMiddleware {
+export function rateLimiter(opts: { maxTokens: number; refillRatePerSec: number; skip?: (req: Request) => boolean }): RateLimitMiddleware {
   const buckets = new Map<string, RateLimitBucket>();
   const fullRefillMs = (opts.maxTokens / opts.refillRatePerSec) * 1000;
   let lastSweepMs = Date.now();
 
   const middleware = (req: Request, res: Response, next: NextFunction) => {
+    if (opts.skip?.(req)) return next(); // R8-3: this request is counted by another limiter
     const key = req.socket?.remoteAddress || 'unknown-peer';
     const now = Date.now();
 
@@ -368,6 +369,21 @@ export function rateLimiter(opts: { maxTokens: number; refillRatePerSec: number 
     next();
   };
   return Object.assign(middleware, { bucketCount: () => buckets.size });
+}
+
+/**
+ * R8-3: the emergency routes (kill switch, panic liquidation, auto kill). Every request from the operator's machine shares one /api
+ * bucket, including requests a hostile page fires from the operator's browser, so the general bucket could be drained and the panic
+ * answered 429. An emergency request that carries a valid operator token skips the general limiter and is counted in its own bucket
+ * (EMERGENCY_RATE_LIMIT); a page cannot send one, because the token travels in a header, never a cookie. Without a token they count
+ * as any other /api request (and the auth gate refuses them).
+ */
+export const EMERGENCY_ROUTES: ReadonlySet<string> = new Set(['POST /api/execution/kill-switch', 'POST /api/wallet/panic-liquidate', 'POST /api/auto/kill']);
+export const EMERGENCY_RATE_LIMIT = { maxTokens: 30, refillRatePerSec: 1 } as const;
+/** True for one of EMERGENCY_ROUTES (path compared without a trailing slash; a case or encoding variant is not matched and stays in the general bucket). */
+export function isEmergencyRoute(req: Pick<Request, 'method' | 'originalUrl'>): boolean {
+  const p = String(req.originalUrl || '').split('?')[0].replace(/\/+$/, '');
+  return EMERGENCY_ROUTES.has(`${String(req.method).toUpperCase()} ${p}`);
 }
 
 /** 3G (N-5): POST /api/auth/login on top of the /api limiter: 5 attempts at once, then one every 12 s, per peer address. */

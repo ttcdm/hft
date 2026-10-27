@@ -29,6 +29,8 @@ export const EXIT_RETRY_MAX_MS = 30_000;
 export const EXIT_RATE_LIMITED_WAIT_MS = 6_000;
 /** Consecutive failed exits before an operator alert is raised. */
 export const EXIT_FAILURE_ALERT_AFTER = 4;
+/** R8-6: sells the exit ladder can make of one position (TP1, TP2, then the trailing or hard stop); the round-trip cost gate counts each. */
+export const EXIT_LADDER_SELL_COUNT = 3;
 /** R4-6: consecutive exit passes that threw before EXIT_LOOP_FAILING is raised (and LIVE buys are refused): 3 passes, about 9 s. */
 export const EXIT_LOOP_ALERT_AFTER = 3;
 
@@ -2172,6 +2174,15 @@ export class ExecutionCoordinator {
     return { success: false, signature: lastSignature, bundleId: lastBundleId, transport, error: `ENTRY_REVOKED_AFTER_SEND: ${why}; not resent, and the earlier send may still land`, lifecycleState: 'REVERTED', unconfirmed: !!lastSignature };
   }
 
+  /**
+   * R8-6: the round-trip cost the 20% gate compares with the order: estimateRoundTripCostLamports (one buy, one sell) plus, for each
+   * further sell of the exit ladder, one more sell tip, base fee and priority fee.
+   */
+  public static ladderRoundTripCostLamports(p: Parameters<typeof estimateRoundTripCostLamports>[0]): number {
+    const extraSells = EXIT_LADDER_SELL_COUNT - 1;
+    return estimateRoundTripCostLamports(p) + extraSells * (p.sellTipLamports + 5_000 + p.priorityFeeLamports);
+  }
+
   /** Shared by LIVE and PAPER (C5): the same on-chain facts become the same eligibility inputs. */
   private eligibilityInputFromMarket(
     req: ExecuteTradeRequest,
@@ -2850,7 +2861,9 @@ export class ExecutionCoordinator {
     // C7b: an entry whose round-trip execution cost (both tips, both base+priority fees, pump fees both sides)
     // exceeds 20% of the order cannot realistically be profitable. The size is never rounded up to make it pass.
     // S6: accumulatorRentLamports (read above) is part of the round trip too.
-    const roundTripCostLamports = estimateRoundTripCostLamports({
+    // R8-6: the exit ladder sells up to EXIT_LADDER_SELL_COUNT times (TP1, TP2, then the trailing or hard stop), each with its own tip,
+    // base fee and priority fee; the pump fee is a share of what is sold, so it is the same in total however the sale is split.
+    const roundTripCostLamports = ExecutionCoordinator.ladderRoundTripCostLamports({
       buyTipLamports: quote.expectedJitoTipLamports,
       sellTipLamports: resolvedTip.tipLamports,
       priorityFeeLamports: quote.expectedPriorityFeeLamports,

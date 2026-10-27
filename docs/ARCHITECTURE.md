@@ -138,7 +138,7 @@ flowchart TD
     t4 --> t5["one open LIVE position per mint"]
     t5 --> t6["spendable bankroll above zero and 10 percent ceiling"]
     t6 --> t7["quote, balance covers worst case, in-flight orders, unresolved LIVE buys and the reserve"]
-    t7 --> t8["round-trip cost at most 20 percent of the order"]
+    t7 --> t8["round-trip cost, counting the three sells of the exit ladder, at most 20 percent of the order"]
     t8 --> t9["riskEngine.ts: evaluateOrder"]
     t9 --> t10["no buy of this mint in flight or unresolved"]
     t10 --> b1["reconciliation.ts: capturePreTradeSnapshot"]

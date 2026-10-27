@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair } from '@solana/web3.js';
-import { ExecutionCoordinator } from '../server/execution/coordinator';
+import { ExecutionCoordinator, EXIT_LADDER_SELL_COUNT } from '../server/execution/coordinator';
+import { estimateRoundTripCostLamports, MAX_ROUND_TRIP_COST_FRACTION } from '../server/risk/riskEngine';
 import { localSigner } from '../server/solana/signer';
 import { workstationDb } from '../server/db/database';
 import { PumpCurveService } from '../server/solana/pumpCurve';
@@ -77,5 +78,25 @@ describe('R3-28: a LIVE buy past its signal/market-data deadline is not sent', (
     await buy();
     expect(submit).toHaveBeenCalledTimes(1);
     expect(typeof (submit.mock.calls[0][0] as any).buyNotAfter).toBe('number');
+  });
+
+  it('R8-6: the 20% round-trip gate counts one tip, base fee and priority fee per ladder sell (three), not one', async () => {
+    expect(EXIT_LADDER_SELL_COUNT).toBe(3);
+    const p = { buyTipLamports: 100_000, sellTipLamports: 100_000, priorityFeeLamports: 25_000, buyProtocolFeeLamports: 47_500, buyCreatorFeeLamports: 15_000 };
+    expect(ExecutionCoordinator.ladderRoundTripCostLamports(p)).toBe(estimateRoundTripCostLamports(p) + 2 * (100_000 + 5_000 + 25_000));
+    // an order whose one-sell round trip fits under 20% but whose three-sell ladder does not is refused
+    const seen: number[] = [];
+    const one: number[] = [];
+    const real = ExecutionCoordinator.ladderRoundTripCostLamports.bind(ExecutionCoordinator);
+    vi.spyOn(ExecutionCoordinator, 'ladderRoundTripCostLamports').mockImplementation((q) => { const v = real(q); seen.push(v - estimateRoundTripCostLamports(q)); one.push(estimateRoundTripCostLamports(q)); return v; });
+    vi.spyOn(TradeReconciler, 'capturePreTradeSnapshot').mockResolvedValue({ walletSolLamports: 1e9, tokenBalanceRaw: '0', tokenDecimals: 6, timestamp: Date.now() });
+    vi.spyOn(coordinator as any, 'resolveLiveTip').mockImplementation(() => ({ tipLamports: 300_000, tipSol: 0.0003, policyReason: 'test' }));
+    const res = await buy();
+    expect(seen.length).toBe(1);
+    expect(seen[0]).toBeGreaterThanOrEqual(2 * (300_000 + 5_000)); // two more sells, each with its tip and fees
+    expect(one[0]).toBeLessThanOrEqual(MAX_ROUND_TRIP_COST_FRACTION * 0.005 * 1e9); // one sell alone would have passed
+    expect(res.error).toMatch(/^EXPECTED_EDGE_BELOW_EXECUTION_COST/);
+    expect(submit).not.toHaveBeenCalled();
+    expect(MAX_ROUND_TRIP_COST_FRACTION).toBe(0.2);
   });
 });

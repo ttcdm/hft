@@ -50,6 +50,7 @@ import {
 } from '../types';
 import { engineClient } from '../services/engineClient';
 import { hftAudio } from '../utils/audio';
+import { DecimalBox } from './DecimalBox';
 import {
   sanitizeExternalUrl,
   sanitizeXProfileUrl,
@@ -1119,15 +1120,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Min Caller 2x+ Win Rate (%)
               </label>
-              <input
-                type="number"
-                value={rules.minCallerWinRate2x}
-                onChange={(e) =>
-                  editRules({ minCallerWinRate2x: parseFloat(e.target.value) || 0 })
-                }
-                step="1"
-                min="10"
-                max="90"
+              <DecimalBox testId="rule-minCallerWinRate2x" ariaLabel="Min caller 2x+ win rate (%)" value={rules.minCallerWinRate2x} onValue={(n) => editRules({ minCallerWinRate2x: n })}
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1140,15 +1133,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Min Average Multiple (e.g. 4.0x)
               </label>
-              <input
-                type="number"
-                value={rules.minAvgMultiple}
-                onChange={(e) =>
-                  editRules({ minAvgMultiple: parseFloat(e.target.value) || 0 })
-                }
-                step="0.5"
-                min="1.5"
-                max="20"
+              <DecimalBox testId="rule-minAvgMultiple" ariaLabel="Min average multiple" value={rules.minAvgMultiple} onValue={(n) => editRules({ minAvgMultiple: n })}
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1161,15 +1146,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Max Entry Multiple (Chasing Guard)
               </label>
-              <input
-                type="number"
-                value={rules.maxEntryMultiple}
-                onChange={(e) =>
-                  editRules({ maxEntryMultiple: parseFloat(e.target.value) || 1 })
-                }
-                step="0.05"
-                min="1.05"
-                max="2.5"
+              <DecimalBox testId="rule-maxEntryMultiple" ariaLabel="Max entry multiple" value={rules.maxEntryMultiple} onValue={(n) => editRules({ maxEntryMultiple: n })}
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1182,15 +1159,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Max Elapsed Callout Time (Seconds)
               </label>
-              <input
-                type="number"
-                value={rules.maxElapsedSeconds}
-                onChange={(e) =>
-                  editRules({ maxElapsedSeconds: parseInt(e.target.value) || 30 })
-                }
-                step="10"
-                min="15"
-                max="300"
+              <DecimalBox testId="rule-maxElapsedSeconds" ariaLabel="Max elapsed callout time (seconds)" value={rules.maxElapsedSeconds} onValue={(n) => editRules({ maxElapsedSeconds: n })} integer
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1223,15 +1192,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Jito Priority Tip (SOL)
               </label>
-              <input
-                type="number"
-                value={rules.jitoPriorityTipSol}
-                onChange={(e) =>
-                  editRules({ jitoPriorityTipSol: parseFloat(e.target.value) || 0.00018 })
-                }
-                step="0.0001"
-                min="0.00015"
-                max="0.05"
+              <DecimalBox testId="rule-jitoPriorityTipSol" ariaLabel="Jito priority tip (SOL)" value={rules.jitoPriorityTipSol} onValue={(n) => editRules({ jitoPriorityTipSol: n })}
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">

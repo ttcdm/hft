@@ -82,7 +82,7 @@ export function ReplayThresholdBox({ value, onChange, inForce, replayedAt }: { v
       <div className="text-slate-400 mb-1">What if the confluence buy threshold were… {inForce !== undefined && <span className="text-slate-600">(live: {inForce})</span>}</div>
       <div className="flex items-center gap-1.5 flex-wrap">
         <input data-testid="replay-threshold-slider" type="range" min={0} max={100} step={1} value={sliderValue} onChange={(e) => onChange(e.target.value)} className="flex-1 min-w-[8rem]" aria-label="Replay threshold" />
-        <input data-testid="replay-threshold-box" type="number" min={0} max={100} step={1} value={value} onChange={(e) => onChange(e.target.value)} className="w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
+        <input data-testid="replay-threshold-box" type="text" inputMode="numeric" aria-label="Replay threshold (0 to 100)" value={value} onChange={(e) => onChange(e.target.value)} className="w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
         {[70, 50, 40].map((n) => <button key={n} data-testid={`replay-threshold-${n}`} onClick={() => onChange(String(n))} className="px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white">{n}</button>)}
       </div>
       {!p.ok && <p className="text-rose-400 mt-1" data-testid="replay-threshold-problem">{p.reason} The replay below is still at {replayedAt ?? (inForce !== undefined ? `${inForce} (live)` : 'the live threshold')}.</p>}

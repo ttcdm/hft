@@ -70,6 +70,7 @@ import { hftAudio } from '../utils/audio';
 import { PumpFunHotCalloutsView } from './PumpFunHotCalloutsView';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
 import { BELOW_HEADER_TOP } from '../utils/headerOffset';
+import { DecimalBox } from './DecimalBox';
 
 /**
  * P1.4 (N-12): the sniper tab's header. The auto mode shown is the auto controller's own (GET /api/auto/status), read-only: the
@@ -1127,13 +1128,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                     <label className="block text-slate-400 text-[10px] mb-1" data-testid="jito-tip-label">
                       {jitoUseText(jitoStatus).tipLabel}
                     </label>
-                    <input
-                      type="number"
-                      step="0.001"
-                      value={sniperConfig.jitoTipSol}
-                      onChange={(e) =>
-                        setSniperConfig({ ...sniperConfig, jitoTipSol: Number(e.target.value) })
-                      }
+                    <DecimalBox testId="sniper-jito-tip" ariaLabel="Jito tip (SOL)" value={sniperConfig.jitoTipSol} onValue={(n) => setSniperConfig({ ...sniperConfig, jitoTipSol: n })}
                       className="w-full bg-[#141B2D] border border-[#1E293B] rounded p-2 text-white font-mono outline-none focus:border-cyan-400"
                     />
                   </div>

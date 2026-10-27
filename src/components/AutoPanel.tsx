@@ -4,6 +4,7 @@ import { fmt } from './TokenBoard';
 import { parseThreshold, thresholdWarning } from '../utils/confluenceThreshold';
 import { onAuthenticated } from '../utils/authEvents';
 import { useTradingMode } from '../utils/tradingMode';
+import { parseDecimalText, COMMA_DECIMAL_REASON } from '../utils/numberInput';
 
 /** H3: the auto-snipe controller panel. Every number is read from GET /api/auto/status (controller state + decision journal). */
 export type AutoMode = 'OFF' | 'SHADOW' | 'PAPER' | 'DEVNET_LIVE';
@@ -70,8 +71,11 @@ export function budgetProblem(nBuys: number, nSpend: number, limits?: AutoStatus
 export function AutoBudgetEditor({ budgets, limits, onSave, busy }: { budgets: AutoStatusData['budgets']; limits?: AutoStatusData['budgetLimits']; onSave?: (maxBuys: number, maxSpendSol: number) => void; busy?: boolean }) {
   const [buys, setBuys] = useState(String(budgets.maxBuys));
   const [spend, setSpend] = useState(String(Number(budgets.maxSpendSol.toFixed(6))));
-  const nBuys = Number(buys), nSpend = Number(spend);
-  const found = budgetProblem(nBuys, nSpend, limits);
+  const pBuys = parseDecimalText(buys), pSpend = parseDecimalText(spend);
+  const nBuys = pBuys.ok ? pBuys.value : NaN, nSpend = pSpend.ok ? pSpend.value : NaN;
+  // R10-10: a comma decimal is refused as such; the browser number box used to drop the comma, so "2,5" saved 25 buys
+  const commaProblem = [pBuys, pSpend].some((p) => !p.ok && p.reason === COMMA_DECIMAL_REASON) ? COMMA_DECIMAL_REASON : null;
+  const found = commaProblem ?? budgetProblem(nBuys, nSpend, limits);
   // S188: what the server is running with is shown as it is. A PAPER session defaults to 50 buys and 10 x the paper bankroll (0.7 SOL), which is
   // above the cap on a budget the operator SAVES (3 x MAX_POSITION_SIZE_SOL); flagging the server's own value red read as stale or broken input.
   const unedited = nBuys === budgets.maxBuys && Math.abs(nSpend - Number(budgets.maxSpendSol.toFixed(6))) < 1e-9;
@@ -81,9 +85,9 @@ export function AutoBudgetEditor({ budgets, limits, onSave, busy }: { budgets: A
     <div className="mb-2 font-mono" data-testid="auto-budget-editor">
       <div className="text-slate-500 mb-0.5">Session budget</div>
       <div className="flex items-center gap-1.5">
-        <input data-testid="budget-buys" type="number" step="1" min="1" max={limits?.maxBuys ?? 50} value={buys} onChange={(e) => setBuys(e.target.value)} className="w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
+        <input data-testid="budget-buys" type="text" inputMode="numeric" aria-label="Session budget: max buys" value={buys} onChange={(e) => setBuys(e.target.value)} className="w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
         <span className="text-slate-500">buys,</span>
-        <input data-testid="budget-spend" type="number" step="0.005" min={limits?.minSpendSol} max={limits?.maxSpendSol} value={spend} onChange={(e) => setSpend(e.target.value)} className="w-20 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
+        <input data-testid="budget-spend" type="text" inputMode="decimal" aria-label="Session budget: max spend (SOL)" value={spend} onChange={(e) => setSpend(e.target.value)} className="w-20 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
         <span className="text-slate-500">SOL incl. fees</span>
         <button data-testid="budget-save" disabled={busy || found !== null || unedited} onClick={() => onSave?.(nBuys, nSpend)} className="ml-auto px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white disabled:opacity-40">Save</button>
       </div>
@@ -97,9 +101,11 @@ export function AutoBudgetEditor({ budgets, limits, onSave, busy }: { budgets: A
 /** S183: edit the size of one auto order (SOL). Same bounds as the manual snipe amount; the server refuses anything else with its reason. */
 export function AutoOrderSizeEditor({ orderSol, limits, spendLimitSol, onSave, busy }: { orderSol: number; limits?: AutoStatusData['orderLimits']; spendLimitSol?: number; onSave?: (sol: number) => void; busy?: boolean }) {
   const [text, setText] = useState(String(Number(orderSol.toFixed(6))));
-  const n = text.trim() === '' ? NaN : Number(text);
+  const parsed = parseDecimalText(text);
+  const n = parsed.ok ? parsed.value : NaN;
   let problem: string | null = null;
-  if (!Number.isFinite(n) || n <= 0) problem = 'Enter an order size in SOL above 0.';
+  if (!parsed.ok && parsed.reason === COMMA_DECIMAL_REASON) problem = COMMA_DECIMAL_REASON;
+  else if (!Number.isFinite(n) || n <= 0) problem = 'Enter an order size in SOL above 0.';
   else if (limits && n < limits.minSol) problem = `Below the ${limits.minSol} SOL minimum: the network fee and token account rent would eat the order.`;
   else if (limits && n > limits.maxSol + 1e-9) problem = `Above the ${limits.maxSol} SOL maximum position size (MAX_POSITION_SIZE_SOL).`;
   else if (spendLimitSol !== undefined && n > spendLimitSol + 1e-9) problem = `Above the ${Number(spendLimitSol.toFixed(6))} SOL session spend limit; raise the session budget first.`;
@@ -107,7 +113,7 @@ export function AutoOrderSizeEditor({ orderSol, limits, spendLimitSol, onSave, b
     <div className="mb-2 font-mono" data-testid="auto-order-editor">
       <div className="text-slate-500 mb-0.5">Order size (each auto buy)</div>
       <div className="flex items-center gap-1.5">
-        <input data-testid="order-sol" type="number" step="0.001" min={limits?.minSol} max={limits?.maxSol} value={text} onChange={(e) => setText(e.target.value)} className="w-20 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
+        <input data-testid="order-sol" type="text" inputMode="decimal" aria-label="Order size (SOL)" value={text} onChange={(e) => setText(e.target.value)} className="w-20 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
         <span className="text-slate-500">SOL</span>
         <button data-testid="order-save" disabled={busy || problem !== null} onClick={() => onSave?.(n)} className="ml-auto px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white disabled:opacity-40">Save</button>
       </div>
@@ -132,7 +138,7 @@ export function ConfluenceThresholdEditor({ confluence, onSave, busy }: { conflu
       <div className="text-slate-500 mb-0.5">Confluence buy threshold <span className="text-slate-300" data-testid="confluence-current">in force: {confluence.value}</span> <span className="text-slate-600">(of 100)</span></div>
       <div className="flex items-center gap-1.5">
         <input data-testid="confluence-slider" type="range" min={0} max={100} step={1} value={shown} onChange={(e) => setText(e.target.value)} className="flex-1" aria-label="Confluence buy threshold" />
-        <input data-testid="confluence-box" type="number" step="1" min={0} max={100} value={text} onChange={(e) => setText(e.target.value)} className="w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
+        <input data-testid="confluence-box" type="text" inputMode="numeric" aria-label="Confluence buy threshold (0 to 100)" value={text} onChange={(e) => setText(e.target.value)} className="w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
         <button data-testid="confluence-save" disabled={busy || !parsed.ok || !dirty} onClick={() => parsed.ok && onSave?.(parsed.value)} className="px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white disabled:opacity-40">Save</button>
       </div>
       {!parsed.ok && <p className="text-rose-400 mt-0.5" data-testid="confluence-problem">{parsed.reason}</p>}

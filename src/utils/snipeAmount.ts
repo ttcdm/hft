@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { authFetch } from '../services/engineClient';
+import { parseDecimalText, COMMA_DECIMAL_REASON } from './numberInput';
 
 /** S181: the one snipe size every manual snipe button uses, in SOL. Saved per browser; the server still judges every request. */
 export interface SnipeLimits { minSol: number; maxSol: number; defaultSol: number; solPriceUsd: number | null }
@@ -12,8 +13,9 @@ export type ParsedAmount = { ok: true; sol: number } | { ok: false; reason: stri
 
 /** The same rules as the server's checkSnipeAmountSol, so the screen can say no before the request goes out. Nothing is clamped. */
 export function parseSnipeAmount(text: string, limits: SnipeLimits): ParsedAmount {
-  const t = text.trim();
-  const n = t === '' ? NaN : Number(t);
+  const p = parseDecimalText(text);
+  if (!p.ok && p.reason === COMMA_DECIMAL_REASON) return p;
+  const n = p.ok ? p.value : NaN;
   if (!Number.isFinite(n) || n <= 0) return { ok: false, reason: 'Enter an amount in SOL above 0.' };
   if (n < limits.minSol) return { ok: false, reason: `${n} SOL is below the ${limits.minSol} SOL minimum: the network fee and token account rent would eat the order.` };
   if (n > limits.maxSol + 1e-9) return { ok: false, reason: `${n} SOL is above the ${limits.maxSol} SOL maximum position size (MAX_POSITION_SIZE_SOL).` };

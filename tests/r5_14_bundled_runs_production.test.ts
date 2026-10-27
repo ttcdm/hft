@@ -46,5 +46,8 @@ describe('R5-14: the bundled server never runs the dev middleware', () => {
     delete env.VITEST;
     const res = JSON.parse(execFileSync(process.execPath, [out], { env, encoding: 'utf8' }).trim());
     expect(res).toEqual({ b: true, dev: false });
+    // The same module, unbundled in this process, sees no bundle: the answer above comes from the bundle's own file name.
+    expect(isBundledServer()).toBe(false);
+    expect(isBundledServer(out)).toBe(true);
   });
 });

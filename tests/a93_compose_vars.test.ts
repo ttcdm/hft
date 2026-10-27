@@ -9,11 +9,8 @@ import { executionConfig } from '../server/solana/executionConfig';
 const compose = fs.readFileSync('docker-compose.yml', 'utf8');
 
 describe('A93: compose passes only what the code reads, with the code\'s defaults', () => {
-  it('no BINANCE_* variable is passed into the container', () => {
+  it('no BINANCE_* variable is passed into the container, and the compose default for DEFAULT_JITO_TIP_SOL is the code\'s own default', () => {
     expect(compose).not.toMatch(/BINANCE_/);
-  });
-
-  it('the compose default for DEFAULT_JITO_TIP_SOL is the code\'s own default', () => {
     const m = /DEFAULT_JITO_TIP_SOL=\$\{DEFAULT_JITO_TIP_SOL:-([0-9.]+)\}/.exec(compose);
     expect(m).not.toBeNull();
     const saved = { a: process.env.DEFAULT_JITO_TIP_SOL, b: process.env.JITO_TIP_SOL, c: process.env.JITO_DEFAULT_TIP_LAMPORTS };

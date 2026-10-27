@@ -43,7 +43,7 @@ import { EligibilityFilter } from '../signals/eligibilityFilter';
 import { curveProgressPctOfState, curveProgressUnreadable, isCurveTooFar, curveTooFarReason } from '../signals/curveProgressCap';
 import { localSigner } from '../solana/signer';
 import { txBuilder, SolanaTransactionBuilder, PumpBuyParams, PumpSellParams } from '../solana/transactionBuilder';
-import { SolanaRpcTransport, JitoTransport } from '../solana/transports';
+import { SolanaRpcTransport, JitoTransport, onRpcAuthRejected, RPC_AUTH_REJECTED, RPC_AUTH_REJECTED_TEXT } from '../solana/transports';
 import { riskEngine, estimateRoundTripCostLamports, MAX_ROUND_TRIP_COST_FRACTION, PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS } from '../risk/riskEngine';
 import { userVolumeAccumulatorPda } from '@pump-fun/pump-sdk';
 import { paperEngine, PaperExecutionEngine } from './paperEngine';
@@ -214,6 +214,8 @@ export class ExecutionCoordinator {
     }
     this.jitoTransport = new JitoTransport(this.connection);
     this.rpcTransport = new SolanaRpcTransport(this.connection);
+    // R4-10: any read or send the RPC refuses with 401/402/403 (the trading Connection's fetch reports it) raises one named alert.
+    this.offRpcAuthRejected = onRpcAuthRejected(({ status, method }) => this.raiseRpcAuthAlert(status, method));
     if (this.isDefaultSingleton) {
       // A halt (for example an unexplained wallet drain) must outlive a restart; only an operator clears it.
       const persisted = workstationDb.getPersistedHaltReason();
@@ -1941,6 +1943,7 @@ export class ExecutionCoordinator {
       // S262 (review 2026-10-24, HIGH on S245): a send the RPC rate-limited past every resend is an unknown outcome, not "nothing was sent"
       // (a balancer may have forwarded an earlier attempt, or a block engine may hold the same transaction). It is watched below like any
       // ambiguous send, with resends, until it confirms or its blockhash expires; only then is it reported RPC_RATE_LIMITED (never landed).
+      if (rpcSubmit.authRejected) this.raiseRpcAuthAlert(rpcSubmit.authRejected, `the ${side.toLowerCase()} for order ${orderId}`); // R4-10: definite, not forwarded
       const rateLimitedOnly = !!rpcSubmit.rateLimited && !rpcSubmit.success;
       if (rateLimitedOnly) {
         Logger.warn(`[S262] ${side} for order ${orderId}: the RPC rate-limited the send ${rpcSubmit.rateLimitedResends + 1} time(s); watching ${rpcSubmit.signature.slice(0, 8)} until it lands or its blockhash expires`);
@@ -3341,9 +3344,10 @@ export class ExecutionCoordinator {
    * quantity are not rejected sends; counting them walked the ladder to 4000 bps before the real resend. P1.6: nor are a refusal by the
    * cluster guard, an invalid sell percentage, or anything thrown before the send (closePositionImpl reports those with `notSent`).
    * S245: nor is a sell the RPC rate-limited past every resend (RPC_RATE_LIMITED): it was refused, not priced wrong; it raises EXIT_RATE_LIMITED.
+   * R4-10: nor a send the RPC refused with 401/402/403 (RPC_AUTH_REJECTED): nothing was forwarded, and wider slippage cannot help.
    */
   private static isNonAttemptExitError(error?: string): boolean {
-    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found|SELL_PENDING_VERIFICATION|UNKNOWN_TRADING_VENUE|Trading venue for mint|Signer is not configured|Calculated sell quantity is zero|CLUSTER_GUARD|INVALID_SELL_PCT|BALANCE_UNTRUSTED|RPC_RATE_LIMITED)/.test(error) || ExecutionCoordinator.isQuoteFailure(error);
+    return !error || /^(TRADING_HALTED|EXIT_IN_PROGRESS|DUST_POSITION_EXIT_UNECONOMICAL|Position not found|SELL_PENDING_VERIFICATION|UNKNOWN_TRADING_VENUE|Trading venue for mint|Signer is not configured|Calculated sell quantity is zero|CLUSTER_GUARD|INVALID_SELL_PCT|BALANCE_UNTRUSTED|RPC_RATE_LIMITED|RPC_AUTH_REJECTED)/.test(error) || ExecutionCoordinator.isQuoteFailure(error);
   }
 
   /**
@@ -4456,7 +4460,15 @@ export class ExecutionCoordinator {
     return ok;
   }
 
+  private offRpcAuthRejected: (() => void) | null = null;
+  /** R4-10: the RPC refused this process (HTTP 401/402/403): every send and read fails until the plan or key is fixed. Logged once, kept until restart. */
+  private raiseRpcAuthAlert(status: number, method: string) {
+    this.raiseOperatorAlert(RPC_AUTH_REJECTED, `${RPC_AUTH_REJECTED_TEXT}: the RPC answered HTTP ${status} to ${method}. Nothing refused this way was sent; sells and reads fail until SOLANA_RPC_URL points at a working plan or key.`);
+  }
+
   public cleanup() {
+    this.offRpcAuthRejected?.();
+    this.offRpcAuthRejected = null;
     if (this.reconcileRetryTimer) {
       clearTimeout(this.reconcileRetryTimer);
       this.reconcileRetryTimer = null;

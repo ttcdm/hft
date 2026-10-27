@@ -1,4 +1,5 @@
 import { Connection, type ConnectionConfig } from '@solana/web3.js';
+import { RPC_AUTH_HTTP_STATUSES, noteRpcAuthRejected } from './transports';
 
 /**
  * P1.7 (R1-71): the trading Connection. Every call it makes is bounded:
@@ -9,7 +10,9 @@ import { Connection, type ConnectionConfig } from '@solana/web3.js';
  *    with no sleep (2 tries in all). A send is never retried here: whether it reached the node is unknown, and P1.5's watch decides
  *    (S245: a send refused with a rate limit was not accepted; the coordinator resends a SELL itself, SELL_RATE_LIMIT_BACKOFF_MS);
  *  - with RPC_MAX_REQUESTS_PER_SEC set, request starts are spaced to that rate, sends ahead of reads (off by default); the wait for a
- *    slot is bounded too (RPC_LIMITER_MAX_WAIT_MS, default 3000 ms), after which the request fails without being sent.
+ *    slot is bounded too (RPC_LIMITER_MAX_WAIT_MS, default 3000 ms), after which the request fails without being sent;
+ *  - R4-10: an answer of HTTP 401, 402 or 403 (the plan expired or the key was refused) is reported to `noteRpcAuthRejected`
+ *    (transports.ts), whatever the method, so the coordinator raises one RPC_AUTH_REJECTED alert for reads and sends alike.
  */
 export const DEFAULT_RPC_REQUEST_TIMEOUT_MS = 1500;
 export const RPC_READ_TRIES = 2;
@@ -171,6 +174,7 @@ export function boundedRpcFetch(timeoutMs: number = rpcRequestTimeoutMs(), maxRe
         if (limiter) await limiter.acquire(isSend);
         const res = await globalThis.fetch(input, { ...rest, signal: AbortSignal.timeout(limitMs) });
         if (res.status === 429 && attempt < tries) continue; // rate limited: one more try at once, no sleep
+        if (RPC_AUTH_HTTP_STATUSES.has(res.status)) noteRpcAuthRejected(res.status, label); // R4-10: plan expired or key refused, on any read or send
         return res;
       } catch (err: any) {
         // no slot in time: nothing was sent, and a second try would only wait again

@@ -15,7 +15,7 @@ afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 describe('S190 recorder limits are configurable, with sized defaults', () => {
   it('normal server: 30 min, 2,000 trades, 14 days, 3,000,000 rows', () => {
     // 5A: 35 minutes, and the trade cap scales with the window (two 30-minute steps)
-    expect(recorderConfig({})).toEqual({ mintMs: 35 * 60_000, maxTradesPerMint: 4_000, retentionDays: 14, maxRows: RECORD_DEFAULT_MAX_ROWS });
+    expect(recorderConfig({})).toEqual({ mintMs: 35 * 60_000, maxTradesPerMint: 4_000, retentionDays: 14, maxRows: RECORD_DEFAULT_MAX_ROWS, minFreeBytes: 256 * 1024 * 1024 }); // R4-5: the recorder's free-space floor
     expect(RECORD_DEFAULT_MAX_ROWS).toBeGreaterThanOrEqual(3_000_000);
   });
   it('read-only (the paper copy): 180 min, trades scaled to the window, 6,000,000 rows', () => {
@@ -26,7 +26,7 @@ describe('S190 recorder limits are configurable, with sized defaults', () => {
   });
   it('every limit is overridable by env, and an unusable value falls back with a warning', () => {
     const env = { APEX_RECORD_MINT_MINUTES: '240', APEX_RECORD_MAX_TRADES_PER_MINT: '50000', APEX_RECORD_RETENTION_DAYS: '30', APEX_RECORD_MAX_ROWS: '9000000' } as any;
-    expect(recorderConfig(env)).toEqual({ mintMs: 240 * 60_000, maxTradesPerMint: 50_000, retentionDays: 30, maxRows: 9_000_000 });
+    expect(recorderConfig(env)).toEqual({ mintMs: 240 * 60_000, maxTradesPerMint: 50_000, retentionDays: 30, maxRows: 9_000_000, minFreeBytes: 256 * 1024 * 1024 });
     const bad = { APEX_RECORD_MINT_MINUTES: '0', APEX_RECORD_MAX_ROWS: 'lots', APEX_RECORD_RETENTION_DAYS: '1.5' } as any;
     expect(recorderConfig(bad)).toEqual(recorderConfig({}));
     expect(recorderConfigProblems(bad)).toHaveLength(3);

@@ -137,7 +137,7 @@ Every LIVE buy re-reads a short readiness list (section 3 of [`ARCHITECTURE.md`]
 |---|---|---|
 | `the RPC is not on the allowed cluster (...)` | the heartbeat saw a wrong or unreadable genesis hash, or the database's cluster stamp is unreadable (`DB_CLUSTER_STAMP_UNREADABLE`) | fix the endpoint; the heartbeat clears it on its next passing check (10 s) |
 | `Solana RPC is DISCONNECTED` | no working connection (`DEGRADED`, over 800 ms, does not refuse a buy) | fix the RPC |
-| `the workstation database is not writable` | a real test write failed, or less than 32 MiB is free on the database's disk | free disk space or fix the database; a pass is cached for 1 s. Below 128 MiB free the System checks database row is WARN and a `DISK_SPACE_LOW` alert is up, while buys still go on |
+| `the workstation database is not writable` | a real test write failed, or less than 32 MiB is free on the database's disk | free disk space or fix the database; a pass is cached for 1 s. Below 128 MiB free the System checks database row is WARN and a `DISK_SPACE_LOW` alert is up, while buys still go on. The launch recorder, which writes into the same database, already stopped below 256 MiB (`APEX_RECORD_MIN_FREE_MB`; one `[RECORDER] stopped recording` log line, and one `recording resumed` line when space is back) |
 | `startup reconciliation is ...` | not `EXECUTION_READY`: `RECONCILIATION_MISMATCH`, or not finished | resolve the rows it names, then `api -X POST $APEX/api/execution/reconcile`; this blocks buys only, exits keep running |
 | `the risk circuit breaker is OPEN` | three failed wallet-balance reads | section 2 |
 | `the position mark feed is STALE` | no fresh position marks | check the RPC; open positions have no price meanwhile |

@@ -117,6 +117,41 @@ describe('R2-2: the replay assumes no quiet market the recording did not show', 
   });
 });
 
+// ---- R6-11: the summary and the late-spike denominators ------------------------------------------------------------------------------
+import { replayLaunches, analysePeaks } from '../server/backtest/replay';
+
+describe('R6-11: the replay summary does not flatter the result', () => {
+  afterEach(() => restoreStockEngine());
+  const FREE: ReplayOptions = { ...GATE, feePct: 0, impact: false, networkFeeSol: 0, priorityBuySol: 0, prioritySellSol: 0, tipSol: 0 };
+
+  it('the all-entries headline counts a loser still open at the end, marked at its last print', () => {
+    const rows = quiet();
+    const winner = [...rows, after(rows, 4_000, 1.35), after(rows, 10_000, 1.35), after(rows, 16_000, 1.7), after(rows, 22_000, 1.7), after(rows, 28_000, 1.2), after(rows, 34_000, 1.2)];
+    const loser = [...rows, after(rows, 4_000, 0.9), after(rows, 8_000, 0.88)];
+    const rep = replayLaunches([toRecordedLaunch(launch(winner, 'win'), 150), toRecordedLaunch(launch(loser, 'lose'), 150)], [], 150, FREE);
+    const s = rep.summary;
+    expect([s.closed, s.openAtEnd]).toEqual([1, 1]);
+    expect(s.winRate).toBe(1); // closed only: the flattering figure
+    const open = rep.launches.find((l) => l.mint === 'lose')!;
+    expect(open.outcome).toBe('OPEN_AT_END');
+    expect(open.openNetPnlSol as number).toBeLessThan(0);
+    expect(s.allEntries).toEqual({ entries: 2, wins: 1, losses: 1, winRate: 0.5, netPnlSol: expect.closeTo((s.netPnlSol as number) + (open.openNetPnlSol as number), 12) });
+  });
+
+  it('a launch recorded quiet for 35 minutes after its release is in the late-spike denominators (observed to its END row, peak 1x)', () => {
+    const rows = quiet();
+    const rec = { ...toRecordedLaunch(launch(rows), 150), endTs: T0 + 95 * 60_000, endReason: 'WINDOW' };
+    const r = replayLaunch(rec, [], 150, GATE);
+    expect(r.peak).not.toBeNull();
+    expect(r.peak!.peakMultiple).toBe(1);
+    expect(r.peak!.observedMs).toBe(T0 + 95 * 60_000 - (T0 + (r.releasedAfterMs as number)));
+    const a = analysePeaks([r]);
+    expect(a.launches).toBe(1);
+    expect(a.late.ofLaunchesWithAtLeast60MinData).toBe(1);
+    expect(a.late.peakAfter30MinAtLeast2x).toBe(0);
+  });
+});
+
 // ---- the database side: markers come back, a read error is an error -----------------------------------------------------------------
 import fs from 'node:fs';
 import os from 'node:os';

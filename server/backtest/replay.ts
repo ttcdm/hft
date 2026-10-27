@@ -199,6 +199,12 @@ export interface ReplayReport {
     wins: number; losses: number; winRate: number | null; netPnlSol: number | null; avgHoldMs: number | null; exitReasons: Record<string, number>;
     /** 5A: the OPEN_AT_END positions marked at the last recorded price with their exit cost charged; reported apart from the realized netPnlSol */
     openMarkNetPnlSol: number | null;
+    /**
+     * R6-11: the headline over EVERY entry: closed positions at their realized result plus open-at-end positions marked at the last print
+     * (their sell cost charged). `wins`, `winRate` and `netPnlSol` above cover the closed positions only, which flatters a replay whose
+     * losers are still open when the data ends.
+     */
+    allEntries: { entries: number; wins: number; losses: number; winRate: number | null; netPnlSol: number | null };
     /** 5C (R1-106): the same figures for each way a recording ended, so truncated, graduated and unresolved launches can be read apart */
     byRecording: Record<RecordingEnd, { launches: number; entries: number; closed: number; openAtEnd: number; netPnlSol: number | null; openMarkNetPnlSol: number | null }>;
   };
@@ -216,10 +222,14 @@ export function tradeFromJson(p: any): PumpTradeEvent {
   };
 }
 
-/** S190: the price the window left the launch at (last trade at or before the release) and the highest trade price after it. */
-function peakAfter(trades: RecordedEvent[], releasedAt: number): NonNullable<ReplayedLaunch['peak']> | null {
+/**
+ * S190: the price the window left the launch at (last trade at or before the release) and the highest trade price after it.
+ * R6-11: `observedMs` is how long the recording covers after the release (`coveredUntilTs`, the END row or the last row), not the last
+ * trade, and a launch with no trade after its release is kept (peak = the reference, 1x): a quiet launch is in the late-spike denominators.
+ */
+function peakAfter(trades: RecordedEvent[], releasedAt: number, coveredUntilTs: number): NonNullable<ReplayedLaunch['peak']> | null {
   let ref: number | null = null;
-  let peak = -Infinity, peakAt = 0, lastAt = releasedAt;
+  let peak = -Infinity, peakAt = releasedAt, lastAt = releasedAt;
   for (const ev of trades) {
     const p = tradePriceSol(tradeFromJson(ev.payload));
     if (p === null || !(p > 0)) continue;
@@ -228,8 +238,9 @@ function peakAfter(trades: RecordedEvent[], releasedAt: number): NonNullable<Rep
     lastAt = ev.ts;
     if (p > peak) { peak = p; peakAt = ev.ts; }
   }
-  if (ref === null || !(peak > 0) || lastAt <= releasedAt) return null;
-  return { refPriceSol: ref, peakPriceSol: peak, peakMultiple: peak / ref, timeToPeakMs: peakAt - releasedAt, observedMs: lastAt - releasedAt };
+  if (ref === null) return null;
+  if (!(peak > ref)) { peak = ref; peakAt = releasedAt; } // nothing above the release price: the best was the release itself
+  return { refPriceSol: ref, peakPriceSol: peak, peakMultiple: peak / ref, timeToPeakMs: peakAt - releasedAt, observedMs: Math.max(lastAt, coveredUntilTs) - releasedAt };
 }
 
 function median(v: number[]): number | null {
@@ -396,7 +407,7 @@ export function replayLaunch(launchIn: RecordedLaunch, funders: FunderFact[], so
   if (!released) return { ...base, verdict: 'NO_TRADES', verdictReason: 'no verdict inside the recording', noEntryReason: 'still watching when the recording ended' };
 
   const result: ReplayedLaunch = {
-    ...base, verdict: released.state, verdictReason: released.reason, releasedAfterMs: releasedAt - startTs, score: released.score ?? null, peak: peakAfter(trades, releasedAt),
+    ...base, verdict: released.state, verdictReason: released.reason, releasedAfterMs: releasedAt - startTs, score: released.score ?? null, peak: peakAfter(trades, releasedAt, coveredUntilTs),
     passingSignals: released.metrics.passingSignals, concentrationPass: released.metrics.signals.concentration?.pass ?? null,
   };
   if (released.state === 'DEAD') return { ...result, noEntryReason: `watch verdict DEAD: ${released.reason}` };
@@ -516,6 +527,11 @@ function buildReplayReport(rows: ReplayedLaunch[], opts: ReplayOptions, minScore
       avgHoldMs: closed.length ? closed.reduce((a, r) => a + (r.holdMs ?? 0), 0) / closed.length : null,
       exitReasons,
       openMarkNetPnlSol: open.length ? open.reduce((a, r) => a + (r.openNetPnlSol ?? 0), 0) : null,
+      allEntries: (() => {
+        const results = [...closed.map((r) => r.netPnlSol ?? 0), ...open.map((r) => r.openNetPnlSol ?? 0)];
+        const w = results.filter((x) => x > 0).length;
+        return { entries: results.length, wins: w, losses: results.length - w, winRate: results.length ? w / results.length : null, netPnlSol: results.length ? results.reduce((a, b) => a + b, 0) : null };
+      })(),
       byRecording: Object.fromEntries(RECORDING_ENDS.map((k) => {
         const of = rows.filter((r) => (r.recording ?? 'UNRESOLVED') === k);
         const c = of.filter((r) => r.outcome === 'CLOSED'), op = of.filter((r) => r.outcome === 'OPEN_AT_END');

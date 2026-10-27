@@ -10,6 +10,8 @@ export interface SystemAuditLite {
   /** S185: APEX_READ_ONLY=true on the server */
   readOnly?: boolean;
   rpcEndpoint?: string;
+  /** UI report fix 7: the server's kill switch */
+  killSwitchActive?: boolean;
 }
 
 export interface TradingModeInfo {
@@ -24,6 +26,8 @@ export interface TradingModeInfo {
   readOnly: boolean;
   rpcHost: string | null;
   ageMs: number | null;
+  /** UI report fix 7: true when the server's kill switch is on (every order is refused); null when unknown or stale */
+  killSwitch: boolean | null;
 }
 
 export const MODE_STALE_MS = 15_000;
@@ -39,14 +43,15 @@ const hostOf = (url?: string): string | null => {
  */
 export function describeTradingMode(audit: SystemAuditLite | null | undefined, fetchedAt: number | null, now = Date.now()): TradingModeInfo {
   if (!audit || fetchedAt === null) {
-    return { known: false, stale: false, live: false, label: 'MODE UNKNOWN', cluster: null, readOnly: false, rpcHost: null, ageMs: null };
+    return { known: false, stale: false, live: false, label: 'MODE UNKNOWN', cluster: null, readOnly: false, rpcHost: null, ageMs: null, killSwitch: null };
   }
   const ageMs = Math.max(0, now - fetchedAt);
   const stale = ageMs > MODE_STALE_MS;
   const armed = audit.isLiveArmed === true;
   const mode = String(audit.mode ?? '').toUpperCase();
   const label: TradingModeInfo['label'] = stale ? 'MODE UNKNOWN' : armed ? 'LIVE ARMED' : mode === 'LIVE' ? 'LIVE (NOT ARMED)' : 'PAPER';
-  return { known: !stale, stale, live: armed && !stale, label, cluster: audit.allowedCluster ?? null, readOnly: audit.readOnly === true, rpcHost: hostOf(audit.rpcEndpoint), ageMs };
+  const killSwitch = stale || typeof audit.killSwitchActive !== 'boolean' ? null : audit.killSwitchActive;
+  return { known: !stale, stale, live: armed && !stale, label, cluster: audit.allowedCluster ?? null, readOnly: audit.readOnly === true, rpcHost: hostOf(audit.rpcEndpoint), ageMs, killSwitch };
 }
 
 // One poller shared by every component that shows the mode.
@@ -112,4 +117,12 @@ export function plugAndPlayModeView(m: TradingModeInfo): { badge: string; tone: 
   if (!m.known) return { badge: 'MODE UNKNOWN', tone: 'unknown', mode: 'UNKNOWN', snipe: 'SNIPE (MODE UNKNOWN)' };
   if (m.live) return { badge: 'LIVE BROADCAST ACTIVE', tone: 'live', mode: 'LIVE (ARMED)', snipe: 'LIVE SNIPE' };
   return { badge: 'PAPER TRADING', tone: 'paper', mode: m.label, snipe: 'PAPER SNIPE' };
+}
+
+/**
+ * UI report fix 7: why a snipe button is greyed out, or null when it may be pressed. With the kill switch on the server refuses every
+ * order anyway; the button now says so instead of looking live.
+ */
+export function snipeBlockedReason(m: Pick<TradingModeInfo, 'killSwitch'>): string | null {
+  return m.killSwitch === true ? 'KILL SWITCH ON: the server refuses every order. Reset it from the header first.' : null;
 }

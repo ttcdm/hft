@@ -15,7 +15,7 @@ import { signalFeedBadge } from '../utils/signalBadge';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { usePolled } from '../utils/usePolled';
 import { probeBadge, probeBadgeClass, probeLatency, hostOfService, connectivityAuditSummary } from '../utils/probeBadge';
-import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
+import { useTradingMode, snipeBlockedReason, liveClickWarning } from '../utils/tradingMode';
 import { useAutoStatus, AutoModeBadge, type AutoMode } from './AutoPanel';
 import { buildPoolSnipeRequest } from '../utils/poolSnipe';
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
@@ -207,6 +207,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const [sendPingMsg, setSendPingMsg] = useState(false);
   const [isTestingDiagnostics, setIsTestingDiagnostics] = useState(false);
   const tradingMode = useTradingMode();
+  const snipeBlocked = snipeBlockedReason(tradingMode); // UI report fix 7: grey the snipe buttons while the kill switch is on
   const autoStatus = useAutoStatus(); // P1.4 (N-12): the sniper tab mirrors the auto controller's mode; it does not set it
   // 3H (A3): the Jito card and tip label say what the transport does, from GET /api/execution/readiness
   const readiness = usePolled<{ components?: { jito?: { status?: string } } }>('/api/execution/readiness', 15_000, isOpen);
@@ -879,7 +880,9 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                           ) : (
                             <button
                               onClick={() => handleSnipeSignal(sig)}
-                              className="px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs shadow-md shadow-emerald-950/40 flex items-center space-x-1.5 transition active:scale-95"
+                              disabled={snipeBlocked !== null}
+                              title={snipeBlocked ?? undefined}
+                              className="disabled:opacity-40 disabled:cursor-not-allowed px-3.5 py-1.5 rounded-lg bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-500 hover:to-teal-500 text-white font-bold text-xs shadow-md shadow-emerald-950/40 flex items-center space-x-1.5 transition active:scale-95"
                             >
                               <Zap className="w-3.5 h-3.5" />
                               <span>Snipe {snipeAmount.parsed.ok ? formatSol(snipeAmount.parsed.sol) : '(set amount)'} ({tradingMode.label})</span>
@@ -1080,7 +1083,9 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                               onClick={() => {
                                 handleSnipePool(pool);
                               }}
-                              className="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow transition active:scale-95 flex items-center space-x-1 ml-auto"
+                              disabled={snipeBlocked !== null}
+                              title={snipeBlocked ?? undefined}
+                              className="disabled:opacity-40 disabled:cursor-not-allowed px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs shadow transition active:scale-95 flex items-center space-x-1 ml-auto"
                             >
                               <Zap className="w-3 h-3" />
                               <span>Snipe {snipeAmount.parsed.ok ? formatSol(snipeAmount.parsed.sol) : '(set amount)'}</span>
@@ -1150,7 +1155,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
                 <button
                   onClick={handleManualSnipe}
-                  disabled={manualSnipeLoading || !manualSnipeCa}
+                  disabled={manualSnipeLoading || !manualSnipeCa || snipeBlocked !== null}
+                  title={snipeBlocked ?? undefined}
                   className="px-5 py-2 rounded-lg bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 text-black font-bold text-xs font-mono flex items-center space-x-1.5 transition active:scale-95"
                 >
                   <Zap className="w-4 h-4" />

@@ -38,7 +38,7 @@ import {
 } from 'lucide-react';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
 import { authFetch } from '../services/engineClient';
-import { useTradingMode, liveClickWarning, plugAndPlayModeView } from '../utils/tradingMode';
+import { useTradingMode, snipeBlockedReason, liveClickWarning, plugAndPlayModeView } from '../utils/tradingMode';
 import { positionPnlCell } from '../utils/positionPnl';
 import { closeOutcomeText } from '../utils/closeOutcome';
 import { fmtSol } from '../utils/numFormat';
@@ -110,6 +110,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   const [selectedExternalToken, setSelectedExternalToken] = useState<any>(null);
 
   const tradingMode = useTradingMode();
+  const snipeBlocked = snipeBlockedReason(tradingMode); // UI report fix 7: grey the snipe buttons while the kill switch is on
   const modeView = plugAndPlayModeView(tradingMode); // Round 1 #11: the shared, aging answer, never this modal's last good read
   const [isLoading, setIsLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ text: string; type: 'info' | 'success' | 'error' } | null>(null);
@@ -545,7 +546,8 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                     <button
                       type="button"
                       onClick={handleManualSnipe}
-                      disabled={isLoading || !manualMint}
+                      disabled={isLoading || !manualMint || snipeBlocked !== null}
+                      title={snipeBlocked ?? undefined}
                       className="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white text-xs font-bold flex items-center space-x-1.5 transition"
                     >
                       <Zap className="w-3.5 h-3.5" />

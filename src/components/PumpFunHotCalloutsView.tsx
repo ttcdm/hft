@@ -15,7 +15,7 @@ import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { ageText } from '../utils/freshness';
 import { SnipeAmountControl } from './SnipeAmountControl';
 import { CONFLUENCE_RULE_LABEL, CONFLUENCE_RULE_NOTE, CALLOUT_RULES_SCOPE_NOTE } from '../utils/calloutRuleText';
-import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
+import { useTradingMode, snipeBlockedReason, liveClickWarning } from '../utils/tradingMode';
 import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
 import React, { useState, useEffect, useRef } from 'react';
 import {
@@ -142,6 +142,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   onRefreshParent,
 }) => {
   const tradingMode = useTradingMode();
+  const snipeBlocked = snipeBlockedReason(tradingMode); // UI report fix 7: grey the snipe buttons while the kill switch is on
   const snipeAmount = useSnipeAmount();
   const [subTab, setSubTab] = useState<'CALLOUTS' | 'LEADERBOARD' | 'RULES'>('CALLOUTS');
   const [callouts, setCallouts] = useState<PumpFunHotCallout[]>([]);
@@ -888,9 +889,9 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                       <div className="lg:col-span-2 flex flex-col space-y-1.5">
                         <button
                           onClick={() => handleSnipeCallout(c)}
-                          disabled={snipingCalloutId === c.id || c.status === 'SNIPED' || calloutSnipeBlock(tradingMode.cluster) !== null}
-                          title={calloutSnipeBlock(tradingMode.cluster) ?? undefined}
-                          className={`w-full py-2 px-3 rounded-lg font-mono font-bold text-xs transition flex items-center justify-center space-x-1.5 shadow-md ${
+                          disabled={snipingCalloutId === c.id || c.status === 'SNIPED' || calloutSnipeBlock(tradingMode.cluster) !== null || snipeBlocked !== null}
+                          title={calloutSnipeBlock(tradingMode.cluster) ?? snipeBlocked ?? undefined}
+                          className={`disabled:opacity-40 disabled:cursor-not-allowed w-full py-2 px-3 rounded-lg font-mono font-bold text-xs transition flex items-center justify-center space-x-1.5 shadow-md ${
                             c.status === 'SNIPED'
                               ? 'bg-emerald-950/80 border border-emerald-500/50 text-emerald-300 cursor-default'
                               : isDumpRisk

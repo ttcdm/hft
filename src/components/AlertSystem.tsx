@@ -9,6 +9,10 @@ import { orderAlerts } from '../utils/operatorAlerts';
  * The stack shows one alert, with "Show all" for the rest. R6-19: the one shown is the most severe (CRITICAL, then WARNING, then INFO),
  * newest first within a level, so a later INFO cannot hide a CRITICAL. R6-1: the server's operator alerts are in the same stack; a
  * sticky one (a server CRITICAL) has no dismiss button and leaves only when the server clears it.
+ * R9-3: the stack was fixed over the bottom-right corner, on top of KILL AUTO, and a sticky CRITICAL cannot be dismissed, so it could
+ * hold the auto emergency control under it for good. It is now docked in the page flow (sticky to the bottom of the screen, on the left,
+ * with its own space at the end of the page, so scrolling always uncovers what is under it), and it can be minimized to its one-line
+ * bar whatever it holds.
  */
 export const ALERT_TTL_MS: Record<AlertEvent['level'], number | null> = { INFO: 8_000, WARNING: 20_000, CRITICAL: null };
 
@@ -32,16 +36,18 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
   onClearAll,
 }) => {
   const [expanded, setExpanded] = useState(false);
+  const [minimized, setMinimized] = useState(false);
   if (alerts.length === 0) return null;
   const ordered = orderAlerts(alerts);
-  const shown = ordered.slice(0, expanded ? EXPANDED_ALERTS : COLLAPSED_ALERTS);
+  const shown = minimized ? [] : ordered.slice(0, expanded ? EXPANDED_ALERTS : COLLAPSED_ALERTS);
   const hidden = alerts.length - shown.length;
   const critical = alerts.filter((a) => a.level === 'CRITICAL').length;
 
   return (
     <div
       id="alerts-notification-panel"
-      className="fixed bottom-4 right-4 z-50 max-w-sm w-full space-y-2 pointer-events-none"
+      data-testid="alerts-dock"
+      className="sticky bottom-0 z-50 self-start max-w-sm w-full p-4 pt-0 space-y-2 pointer-events-none"
     >
       <div className="flex items-center justify-between pointer-events-auto bg-[#0D131F] border border-[#1E293B] px-3 py-1.5 rounded-lg shadow-xl text-[11px] font-mono">
         <span className="text-amber-400 font-bold flex items-center space-x-1">
@@ -49,7 +55,14 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
           <span>Active Risk Alerts ({alerts.length}{critical ? `, ${critical} critical` : ''})</span>
         </span>
         <span className="flex items-center space-x-3">
-          {alerts.length > COLLAPSED_ALERTS && (
+          <button
+            onClick={() => setMinimized(!minimized)}
+            className="text-slate-400 hover:text-white text-[10px]"
+            data-testid="alerts-minimize"
+          >
+            {minimized ? 'Show' : 'Minimize'}
+          </button>
+          {!minimized && alerts.length > COLLAPSED_ALERTS && (
             <button
               onClick={() => setExpanded(!expanded)}
               className="text-slate-400 hover:text-white text-[10px]"

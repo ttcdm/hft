@@ -694,7 +694,7 @@ export class AutoSnipeController extends EventEmitter {
    * A change nothing in the journal explains (a drain, or an unknown spend) halts every buy plus the take-profit and stale exits;
    * stop-loss, trailing stop, manual close and panic still run (coordinator PROTECTIVE_EXIT_REASONS).
    */
-  public async auditWallet(now = Date.now()): Promise<{ explained: boolean; unexplainedSol: number } | null> {
+  public async auditWallet(now?: number): Promise<{ explained: boolean; unexplainedSol: number } | null> {
     if (this.mode !== 'DEVNET_LIVE') {
       this.walletMark = null;
       return null;
@@ -704,6 +704,8 @@ export class AutoSnipeController extends EventEmitter {
     if (this.busy || executionCoordinator.hasTradeInFlight()) return null;
     await executionCoordinator.syncRealWalletBalance();
     if (this.busy || executionCoordinator.hasTradeInFlight()) return null; // a trade started during the balance read
+    // R5-25: the window ends after the balance read, so a fill journaled while the read was out is inside it (it was outside, and read as a drain).
+    const ts = now ?? Date.now();
     const bal = executionCoordinator.getRealWalletBalanceSol();
     if (bal === null || bal === undefined) return null;
     // 3B (P3.2, R1-62): LIVE buys sent and still unresolved are in flight too, for as long as they stay unresolved (a buy that returned
@@ -711,10 +713,27 @@ export class AutoSnipeController extends EventEmitter {
     // orphan recovery journals the buy spans both. Unreadable: skip this look, keep the mark.
     const unresolved = executionCoordinator.getUnresolvedLiveBuys({ includeOwnInFlight: true });
     if (unresolved === null) return null;
+    // R7-5: LIVE sells sent whose outcome is unknown. Their proceeds can arrive before any journal row (adoption writes it later). Unreadable: skip.
+    const pendingSells = AutoSnipeController.pendingLiveSellCount();
+    if (pendingSells === null) return null;
     const prev = this.walletMark;
-    if (!prev || unresolved.mints.length === 0) this.walletMark = { sol: bal, ts: now };
-    if (!prev) return null;
-    const audit = auditWalletChange(prev.sol, bal, workstationDb.sumDecisionSolDelta(prev.ts, now), { worstCaseSol: unresolved.reservedSol, count: unresolved.mints.length });
+    if (!prev) {
+      this.walletMark = { sol: bal, ts };
+      return null;
+    }
+    const audit = auditWalletChange(prev.sol, bal, workstationDb.sumDecisionSolDelta(prev.ts, ts), { worstCaseSol: unresolved.reservedSol, count: unresolved.mints.length });
+    if (audit.inflowSol > 0) {
+      // R8-1: SOL arriving that the journal does not explain is logged, never a halt. With nothing pending it becomes the new baseline (a
+      // later drain is measured from it). With a sell or buy pending it may be that trade's proceeds, whose journal row comes later: keep the
+      // old mark, so the look after that row spans both and nets to zero (re-basing now would read the row as an outflow).
+      const held = pendingSells > 0 || unresolved.mints.length > 0;
+      const reason = `wallet received ${audit.inflowSol.toFixed(6)} SOL that the journal does not explain (tolerance ${audit.toleranceSol.toFixed(6)}); not a halt reason${held ? `; held while ${pendingSells} sell(s) and ${unresolved.mints.length} buy(s) are unresolved` : '; the audit baseline moves to the new balance'}`;
+      workstationDb.logDecision({ ts, autoMode: 'DEVNET_LIVE', mint: '-', stage: 'risk', outcome: 'WALLET_INFLOW', reason, inputs: { prevSol: prev.sol, nowSol: bal, inflowSol: audit.inflowSol, pendingSells, unresolvedBuys: unresolved.mints.length } });
+      Logger.warn(`[AUTO] ${reason}`);
+      if (!held) this.walletMark = { sol: bal, ts };
+      return { explained: true, unexplainedSol: audit.unexplainedSol };
+    }
+    if (audit.explained && !audit.heldByUnresolved && unresolved.mints.length === 0) this.walletMark = { sol: bal, ts };
     if (!audit.explained) {
       const reason = `wallet changed by an unexplained ${audit.unexplainedSol.toFixed(6)} SOL (tolerance ${audit.toleranceSol.toFixed(6)})`;
       executionCoordinator.haltAll(reason);
@@ -731,6 +750,17 @@ export class AutoSnipeController extends EventEmitter {
       this.emit('mode', { mode: this.mode, reason });
     }
     return { explained: audit.explained, unexplainedSol: audit.unexplainedSol };
+  }
+
+  /** R7-5: LIVE SELL ledger rows still PENDING or RECONCILIATION_REQUIRED (a sell sent whose outcome is unknown). null when unreadable. */
+  private static pendingLiveSellCount(): number | null {
+    try {
+      const rows = workstationDb.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED']) as unknown as Array<{ direction: string; executionMode: string }> | null;
+      if (!rows) return null;
+      return rows.filter((t) => t.direction === 'SELL' && t.executionMode === 'LIVE').length;
+    } catch {
+      return null;
+    }
   }
 
   /**

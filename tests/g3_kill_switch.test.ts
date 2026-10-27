@@ -63,15 +63,17 @@ describe('G3: kill-switch triggers (pure rules)', () => {
     expect(codes(baseCtx({ mode: 'DEVNET_LIVE', walletSol: null }))).toEqual(['WALLET_UNKNOWN']);
   });
 
-  it('wallet audit: a change the journal explains passes; a drain, a surprise deposit, or any change with no fills does not', () => {
+  it('wallet audit: a change the journal explains passes; a drain, or a fall with no fills, does not; a surprise deposit is an inflow (R8-1)', () => {
     // bought 0.005 SOL (+ fee): wallet fell by that much
     expect(auditWalletChange(1, 0.994, { delta: -0.0055, gross: 0.0055 }).explained).toBe(true);
     // drained 0.3 SOL with only a small fill journaled
     const drain = auditWalletChange(1, 0.7, { delta: -0.0055, gross: 0.0055 });
     expect(drain.explained).toBe(false);
     expect(drain.unexplainedSol).toBeCloseTo(-0.2945, 6);
-    // money appearing from nowhere is also unexplained
-    expect(auditWalletChange(1, 1.1, { delta: 0, gross: 0 }).explained).toBe(false);
+    // R8-1: money appearing from nowhere is reported as an inflow (logged by the caller), not as a halt reason
+    const deposit = auditWalletChange(1, 1.1, { delta: 0, gross: 0 });
+    expect(deposit.explained).toBe(true);
+    expect(deposit.inflowSol).toBeCloseTo(0.1, 9);
     // no fills, tiny wobble inside the base tolerance
     expect(auditWalletChange(1, 0.9998, { delta: 0, gross: 0 }).explained).toBe(true);
   });

@@ -429,25 +429,38 @@ export interface TokenHolderDistribution {
   topHolders: Array<{ address: string; amount: bigint; pct: number; owner?: string | null; holderClass?: HolderClass | 'CREATOR_ATA' }>;
 }
 
-/** R2-3: the owner of each token account (bytes 32..64 of the SPL / Token-2022 account), one getMultipleAccountsInfo; null where unreadable. */
+/**
+ * The most keys one getMultipleAccounts call may carry. QuickNode's Discover plan refuses more than 5 with HTTP 413 ("getMultipleAccounts is
+ * limited to a 5 range"; see the cloud devnet notes), which made the R2-3 owner read fail for every coin with more than 5 large holders
+ * (devnet run 2026-10-27, step (a)). Other providers allow 100; 5 costs at most 4 calls for the 20 largest accounts.
+ */
+export const GET_MULTIPLE_ACCOUNTS_MAX_KEYS = 5;
+
+/** R2-3: the owner of each token account (bytes 32..64 of the SPL / Token-2022 account), read GET_MULTIPLE_ACCOUNTS_MAX_KEYS at a time; null where unreadable. */
 async function tokenAccountOwners(connection: Connection, accounts: PublicKey[]): Promise<Array<string | null>> {
   if (accounts.length === 0) return [];
-  try {
-    if (typeof (connection as any).getMultipleAccountsInfo !== 'function') return accounts.map(() => null);
-    const infos = await connection.getMultipleAccountsInfo(accounts, 'confirmed');
-    return accounts.map((_, i) => {
-      const d = infos?.[i]?.data;
-      return d && d.length >= 64 ? new PublicKey(d.subarray(32, 64)).toBase58() : null;
-    });
-  } catch (err: any) {
-    Logger.warn(`holder owners for the holder gate could not be read (${err?.message || err}); every large holder counts as unknown`);
-    return accounts.map(() => null);
+  if (typeof (connection as any).getMultipleAccountsInfo !== 'function') return accounts.map(() => null);
+  const owners: Array<string | null> = [];
+  for (let i = 0; i < accounts.length; i += GET_MULTIPLE_ACCOUNTS_MAX_KEYS) {
+    const batch = accounts.slice(i, i + GET_MULTIPLE_ACCOUNTS_MAX_KEYS);
+    try {
+      const infos = await connection.getMultipleAccountsInfo(batch, 'confirmed');
+      for (let j = 0; j < batch.length; j++) {
+        const d = infos?.[j]?.data;
+        owners.push(d && d.length >= 64 ? new PublicKey(d.subarray(32, 64)).toBase58() : null);
+      }
+    } catch (err: any) {
+      // fail closed: these holders count as unknown (never independent, never the creator's); the other batches are still read
+      Logger.warn(`holder owners for the holder gate could not be read for ${batch.length} of ${accounts.length} account(s) (${err?.message || err}); those holders count as unknown`);
+      for (let j = 0; j < batch.length; j++) owners.push(null);
+    }
   }
+  return owners;
 }
 
 /**
  * The holder gate's facts: creator holding and top-10 concentration, as shares of the total supply.
- * R2-3: each large non-curve account's owner is read (one getMultipleAccountsInfo over at most 20 accounts) and classified by the funder
+ * R2-3: each large non-curve account's owner is read (getMultipleAccountsInfo, GET_MULTIPLE_ACCOUNTS_MAX_KEYS per call) and classified by the funder
  * lookups' knowledge (`holderFunders`, default the watch window, see server/signals/holderCluster.ts). Holdings the creator's funder cluster
  * owns count in devHoldingPct with the creator's own. Fail closed for LIVE: a holder whose owner or funding is unknown is never taken as
  * independent; all unknown holders together count as ONE holder in the top-10 figure (so 40 unknown wallets at 1.8% read as 36% of the top

@@ -219,7 +219,7 @@ async function referenceIsValid(blockhash: string): Promise<boolean> {
  * a buy costs nothing.
  */
 export const SELL_BLOCKHASH_RECHECK_DELAYS_MS = [500, 1000, 2000, 3000] as const;
-const BUY_BLOCKHASH_RECHECK_DELAYS_MS = [500] as const;
+export const BUY_BLOCKHASH_RECHECK_DELAYS_MS = [500] as const;
 
 /**
  * Asks an INDEPENDENT RPC (the public devnet endpoint, not the configured one) whether the order's blockhash exists on devnet. An RPC that

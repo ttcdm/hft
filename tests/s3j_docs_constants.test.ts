@@ -7,7 +7,7 @@ import { FUNDER_RETRY_DELAYS_MS, FUNDER_LOOKUP_CONCURRENCY, FUNDER_LOOKUP_MAX_PE
 import { RELEASE_RETRY_MS, PENDING_RELEASE_MAX_AGE_MS, DEVNET_MAX_OPEN_POSITIONS } from '../server/auto/controller';
 import { riskEngine, DAILY_LOSS_WINDOW_MS, DAILY_LOSS_PRICE_MAX_AGE_MS, WORST_CASE_LOSS_FRACTION } from '../server/risk/riskEngine';
 import { SOL_PRICE_MAX_AGE_MS, SOL_PRICE_ANCHOR_MAX_AGE_MS } from '../server/market/solPriceService';
-import { GENESIS_CHECK_TTL_MS } from '../server/solana/clusterGuard';
+import { GENESIS_CHECK_TTL_MS, BUY_BLOCKHASH_RECHECK_DELAYS_MS, SELL_BLOCKHASH_RECHECK_DELAYS_MS } from '../server/solana/clusterGuard';
 import { WorkstationDatabase } from '../server/db/database';
 import { DEFAULT_RPC_REQUEST_TIMEOUT_MS, RPC_READ_TRIES, SLOW_READ_TIMEOUT_MS, DEFAULT_RPC_LIMITER_MAX_WAIT_MS } from '../server/solana/rpcConnection';
 import {
@@ -61,7 +61,8 @@ const rows: Row[] = [
   ['DAILY_LOSS_PRICE_MAX_AGE_MS', DAILY_LOSS_PRICE_MAX_AGE_MS, 3_600_000, 'latency', 'older than 1 h'],
   ['WORST_CASE_LOSS_FRACTION', WORST_CASE_LOSS_FRACTION, 1, 'arch', '`WORST_CASE_LOSS_FRACTION` = 1'],
   ['GENESIS_CHECK_TTL_MS', GENESIS_CHECK_TTL_MS, 60_000, 'latency', '60 s per Connection'],
-  ['blockhash check retry', num(fromSource('server/solana/clusterGuard.ts', /await sleep\((\d+)\)/)), 500, 'latency', 'a second after 500 ms'],
+  ['BUY_BLOCKHASH_RECHECK_DELAYS_MS', [...BUY_BLOCKHASH_RECHECK_DELAYS_MS], [500], 'latency', 'a buy asks again once after 500 ms'],
+  ['SELL_BLOCKHASH_RECHECK_DELAYS_MS', [...SELL_BLOCKHASH_RECHECK_DELAYS_MS], [500, 1_000, 2_000, 3_000], 'latency', 'a sell asks again after 0.5, 1, 2 and 3 s (6.5 s in all)'],
   ['WRITABLE_CACHE_MS', WorkstationDatabase.WRITABLE_CACHE_MS, 1_000, 'latency', 'reused for 1 s'],
   ['MIN_FREE_BYTES', WorkstationDatabase.MIN_FREE_BYTES, 32 * 1024 * 1024, 'latency', 'needs 32 MiB free'],
   ['LOW_FREE_WARN_BYTES', WorkstationDatabase.LOW_FREE_WARN_BYTES, 128 * 1024 * 1024, 'latency', 'warns below 128 MiB free'],

@@ -40,6 +40,7 @@ import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExtern
 import { authFetch } from '../services/engineClient';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
 import { positionPnlCell } from '../utils/positionPnl';
+import { closeOutcomeText } from '../utils/closeOutcome';
 import { ageText, markIsStale } from '../utils/freshness';
 import { BELOW_HEADER_TOP } from '../utils/headerOffset';
 
@@ -270,7 +271,10 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Close position failed');
       await fetchSystemData();
-      setStatusMessage({ text: `Position closed with PnL: ${data.data?.realizedPnLSol} SOL`, type: 'info' });
+      // R6-9: say what the close did: a sale, an adopted earlier sell (maybe partial), or an assumed loss on an empty wallet
+      const pos = positions.find((p) => p.id === posId);
+      const said = closeOutcomeText({ success: true, pnlSol: Number(data.data?.realizedPnLSol ?? 0), status: data.data?.status, outcome: data.data?.outcome }, 100, pos?.symbol ? `$${pos.symbol}` : 'the position');
+      setStatusMessage({ text: said.text, type: said.tone === 'info' ? 'info' : 'error' });
     } catch (err: any) {
       setStatusMessage({ text: err.message || 'Failed to close position', type: 'error' });
     }

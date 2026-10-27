@@ -93,7 +93,7 @@ export interface AutoKillResult {
   closed: number;
   refused: Array<{ positionId: string; mint: string; error: string }>;
   failed: Array<{ positionId: string; mint: string; error: string }>;
-  /** Auto-owned positions still ACTIVE after the sells (0 when exitAll was not asked for and none was open). */
+  /** Auto-owned positions still ACTIVE after the sells; 0 when exitAll was not asked for (nothing was sold, nothing was counted). */
   stillOpen: number;
 }
 
@@ -707,7 +707,7 @@ export class AutoSnipeController extends EventEmitter {
       }
     }
     // R6-4: say what is still open, so "success" never reads as "all sold"
-    const stillOpen = workstationDb.loadPositions(undefined, 'ACTIVE').filter((p) => AutoSnipeController.isAutoOwned(owned, p)).length;
+    const stillOpen = opts.exitAll ? workstationDb.loadPositions(undefined, 'ACTIVE').filter((p) => AutoSnipeController.isAutoOwned(owned, p)).length : 0;
     Logger.warn(`[AUTO] kill: ${this.killReason}; closed ${closed} position(s), ${refused.length} refused, ${failed.length} failed, ${stillOpen} auto position(s) still open`);
     if (refused.length + failed.length > 0) {
       workstationDb.logDecision({ autoMode: 'OFF', mint: '-', stage: 'exit', outcome: 'INFO', reason: `kill: ${refused.length} sell(s) refused and ${failed.length} failed; ${stillOpen} auto position(s) still open`, inputs: { refused, failed } });

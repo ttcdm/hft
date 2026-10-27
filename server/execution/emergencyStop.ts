@@ -1,4 +1,4 @@
-import { executionCoordinator } from './coordinator';
+import { executionCoordinator, isAdoptedPartialClose, type ClosePositionResult } from './coordinator';
 import { autoSnipeController } from '../auto/controller';
 import { riskEngine } from '../risk/riskEngine';
 import { workstationDb } from '../db/database';
@@ -103,7 +103,7 @@ export async function emergencyStop(opts: { exitAll: boolean; reason?: string })
   }
 }
 
-async function closeOnce(id: string): Promise<{ success: boolean; pnlSol: number; status?: string; error?: string; adoptedPartial?: boolean }> {
+async function closeOnce(id: string): Promise<ClosePositionResult> {
   try {
     return await executionCoordinator.closePosition(id, 100, PANIC_CLOSE_REASON);
   } catch (e: any) {
@@ -162,7 +162,7 @@ async function closeWithFollowUps(p: NormalizedPosition): Promise<{ success: boo
       res = await closeOnce(p.id);
     }
   }
-  if (res.success && res.adoptedPartial) {
+  if (res.success && isAdoptedPartialClose(res)) {
     // R6-9: the close only adopted an earlier partial that had landed unseen; the rest is still open, so sell it now
     const first = res;
     const rest = await closeOnce(p.id);

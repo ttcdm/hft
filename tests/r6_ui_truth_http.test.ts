@@ -85,8 +85,12 @@ describe('R6-4 / R6-2: kill auto reports refused sells; an open LIVE position sh
     expect(r.json.mode).toBe('OFF');
     expect(r.json.attempted).toBe(1);
     expect(r.json.closed).toBe(0);
-    expect(r.json.failed[0].positionId).toBe(positionId);
-    expect(r.json.failed[0].error).toMatch(/CLUSTER_GUARD/);
+    // the wrong-cluster sell is refused before anything is sent, so it is in `refused`; it is still open
+    const notSold = [...r.json.refused, ...r.json.failed];
+    expect(notSold).toHaveLength(1);
+    expect(notSold[0].positionId).toBe(positionId);
+    expect(notSold[0].error).toMatch(/CLUSTER_GUARD/);
+    expect(r.json.stillOpen).toBe(1);
     expect(r.json.error).toMatch(/NOT sold/);
   });
 });

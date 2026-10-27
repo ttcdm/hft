@@ -17,6 +17,7 @@ import { closeOutcomeText } from '../src/utils/closeOutcome';
  * R6-9 (haiku-attack 2026-10-26): a close that adopted an earlier sell (maybe partial) or found the wallet empty (assumed loss) was
  * reported as "Closed 100%" / "Position closed with PnL". The real coordinator now says which, and the text says what happened.
  * Setup as tests/n1_exit_core.test.ts: real coordinator and SQLite, RPC, builder and reconciler stubbed at their edges; throwaway keys.
+ * The position is bound to the signer's wallet (R5-2: an empty balance proves nothing for a position whose wallet is unknown).
  */
 const uid = () => Math.random().toString(36).slice(2);
 
@@ -59,7 +60,7 @@ describe('R6-9: the coordinator says when a close sold nothing now', () => {
     workstationDb.savePosition({
       id: posId, mint: VALID_PUMP_MINT_1.toBase58(), symbol: 'R69', name: 'R6-9', tokenDecimals: 6, tokenQuantityRaw: '1000000000', entryPriceSol: 0.0001,
       currentPriceSol: 0.00005, currentValueSol: 0.05, costBasisLamports: 100_000_000, realizedPnLSol: 0, status: 'OPEN', venue: 'PUMP_BONDING_CURVE',
-      executionMode: 'LIVE', entryTxSignature: `sig_${posId}`, entryTimestamp: Date.now(), lastMarkTimestamp: Date.now(), recordUpdatedAt: Date.now(), updatedAt: Date.now(),
+      executionMode: 'LIVE', walletPubkey: kp.publicKey.toBase58(), entryTxSignature: `sig_${posId}`, entryTimestamp: Date.now(), lastMarkTimestamp: Date.now(), recordUpdatedAt: Date.now(), updatedAt: Date.now(),
     } as any);
   });
 
@@ -116,15 +117,16 @@ describe('R6-9: the Sniper close message', () => {
   });
 });
 
-describe('R6-9: the adoptedPendingSell / adoptedPartial flags (batch C2) read the same way', () => {
-  it('an adopted partial says so and gives the tokens left; an adopted full sell is "no new sell"', async () => {
-    const { closeOutcomeText } = await import('../src/utils/closeOutcome');
-    const p = closeOutcomeText({ success: true, pnlSol: 0.001, status: 'PARTIALLY_CLOSED', adoptedPendingSell: true, adoptedPartial: true, remainingTokensRaw: '123456' }, 100, 'AAA');
+describe('R6-9: an adopted partial (C2) and an unread fill (C1) read from the one outcome field', () => {
+  it('an adopted partial says so and gives the tokens left; an adopted full sell is "no new sell"; an unread fill names the assumed loss', async () => {
+    const p = closeOutcomeText({ success: true, pnlSol: 0.001, status: 'PARTIALLY_CLOSED', outcome: 'ADOPTED_EARLIER_SELL', remainingTokensRaw: '123456' }, 100, 'AAA');
     expect(p.text).toMatch(/earlier PARTIAL sell of AAA .*adopted/);
     expect(p.text).toContain('123456 raw token units left');
     expect(p.text).not.toMatch(/now closed|Closed 100%/);
     expect(p.tone).toBe('warning');
-    const f = closeOutcomeText({ success: true, pnlSol: 0.002, status: 'CLOSED', adoptedPendingSell: true }, 100, 'AAA');
+    const f = closeOutcomeText({ success: true, pnlSol: 0.002, status: 'CLOSED', outcome: 'ADOPTED_EARLIER_SELL' }, 100, 'AAA');
     expect(f.text).toMatch(/^No new sell was sent: an earlier sell of AAA/);
+    const u = closeOutcomeText({ success: true, pnlSol: -0.05, status: 'CLOSED', outcome: 'ADOPTED_EARLIER_SELL_FILL_UNREAD' }, 100, 'AAA');
+    expect(u.text).toMatch(/fill could not be read: the sold share of its cost basis is booked as an ASSUMED loss \(-0\.050000 SOL\)/);
   });
 });

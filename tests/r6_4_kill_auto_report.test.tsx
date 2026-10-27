@@ -29,10 +29,10 @@ describe('R6-4: a kill that leaves positions open says so', () => {
       return { success: true, pnlSol: 0 };
     }) as any);
     const r = await autoSnipeController.kill({ exitAll: true, reason: 'r6-4' });
-    const mine = r.failed.filter((f) => f.positionId.startsWith('r64'));
+    const mine = [...r.refused, ...r.failed].filter((f) => f.positionId.startsWith('r64'));
     expect(r.mode).toBe('OFF');
     expect(r.attempted).toBeGreaterThanOrEqual(3);
-    expect(mine.map((f) => [f.positionId, f.error]).sort()).toEqual([['r64refused', 'RPC down'], ['r64throws', 'boom']]);
+    expect(mine.map((f) => [f.positionId, f.error]).sort()).toEqual([['r64refused', 'RPC down'], ['r64throws', 'ERROR: boom']]);
     expect(r.closed).toBeGreaterThanOrEqual(1);
   });
 

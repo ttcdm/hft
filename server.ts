@@ -1317,11 +1317,14 @@ app.post('/api/auto/mode', requireOperatorAuth, validateTradeBody(AutoModeSchema
 
 app.post('/api/auto/kill', requireOperatorAuth, validateTradeBody(AutoKillSchema), asyncHandler(async (req, res) => {
   const result = await autoSnipeController.kill({ exitAll: req.body.exitAll, reason: req.body.reason });
-  // R6-4: auto is OFF either way, but "sell what it bought" succeeded only if every sell did; a refused or failed one is success:false
-  const partial = result.failed.length > 0 && result.closed > 0;
+  // R6-4: auto is OFF either way, but "sell what it bought" succeeded only if every sell did and nothing auto bought is still open; a
+  // refused or failed sell, or a position still open, is success:false
+  const notSold = [...result.refused, ...result.failed];
+  const success = notSold.length === 0 && result.stillOpen === 0;
+  const partial = !success && result.closed > 0;
   res.json({
-    success: result.failed.length === 0, partial, ...result,
-    ...(result.failed.length ? { error: `Auto is OFF, but ${result.failed.length} of ${result.attempted} position(s) were NOT sold: ${result.failed.map((f) => `${f.symbol} (${f.error})`).join('; ')}. They are still open; close them by hand.` } : {}),
+    success, partial, ...result,
+    ...(success ? {} : { error: `Auto is OFF, but ${notSold.length} of ${result.attempted} position(s) were NOT sold${notSold.length ? `: ${notSold.map((f) => `${f.symbol} (${f.error})`).join('; ')}` : ''}; ${result.stillOpen} auto position(s) are still open. Close them by hand.` }),
     status: autoSnipeController.getStatus(),
   });
 }));

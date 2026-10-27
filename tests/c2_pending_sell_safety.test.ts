@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { Keypair } from '@solana/web3.js';
-import { ExecutionCoordinator } from '../server/execution/coordinator';
+import { ExecutionCoordinator, isAdoptedClose, isAdoptedPartialClose } from '../server/execution/coordinator';
 import { localSigner } from '../server/solana/signer';
 import { workstationDb } from '../server/db/database';
 import { PumpCurveService } from '../server/solana/pumpCurve';
@@ -133,7 +133,7 @@ describe('C2: a pending sell is held until it is proven unable to land, and neve
     balance('1200000000'); // 330,000,000 sold, then 530,000,000 sent in from outside
     const again = await coordinator.closePosition(posId, 33, 'TAKE_PROFIT_1');
     expect(again.success, again.error).toBe(true);
-    expect(again.adoptedPendingSell).toBe(true);
+    expect(isAdoptedClose(again)).toBe(true);
     expect(submit).toHaveBeenCalledTimes(1); // adopted, not sent a second time
     const r = row();
     expect(r.tokenQuantityRaw).toBe('670000000');
@@ -173,8 +173,8 @@ describe('C2: a pending sell is held until it is proven unable to land, and neve
     balance('670000000');
     const res = await coordinator.closePosition(posId, 100, 'Operator close');
     expect(res.success, res.error).toBe(true);
-    expect(res.adoptedPendingSell).toBe(true);
-    expect(res.adoptedPartial).toBe(true);
+    expect(res.outcome).toBe('ADOPTED_EARLIER_SELL');
+    expect(isAdoptedPartialClose(res)).toBe(true);
     expect(res.remainingTokensRaw).toBe('670000000');
     expect(submit).toHaveBeenCalledTimes(1);
     const r = row();

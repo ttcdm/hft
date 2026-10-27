@@ -75,7 +75,7 @@ describe('R5-9: the panic and a pending sell', () => {
       calls++;
       if (calls === 1) {
         closeRow(id, '670000000', 'PARTIALLY_CLOSED');
-        return { success: true, pnlSol: 0.01, status: 'PARTIALLY_CLOSED', adoptedPendingSell: true, adoptedPartial: true, remainingTokensRaw: '670000000' };
+        return { success: true, pnlSol: 0.01, status: 'PARTIALLY_CLOSED', outcome: 'ADOPTED_EARLIER_SELL', remainingTokensRaw: '670000000' };
       }
       closeRow(id);
       return { success: true, pnlSol: 0.02, status: 'CLOSED' };

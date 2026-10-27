@@ -12,6 +12,7 @@
  * pump.fun list (the call passes `true` for "token is mainnet data"); this build trades devnet and localnet only.
  */
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
+import { ageText } from '../utils/freshness';
 import { SnipeAmountControl } from './SnipeAmountControl';
 import { CONFLUENCE_RULE_LABEL, CONFLUENCE_RULE_NOTE, CALLOUT_RULES_SCOPE_NOTE } from '../utils/calloutRuleText';
 import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
@@ -84,6 +85,17 @@ export function TokenImage({ uri, symbol }: { uri: string; symbol: string }) {
     );
   }
   return <img src={uri} alt={symbol} className="w-11 h-11 rounded-lg border border-slate-700 object-cover flex-shrink-0" onError={() => setBroken(true)} />;
+}
+
+/** R6-6: the age of the feed snapshot behind a callout card. Past CALLOUT_SNAPSHOT_MAX_AGE_MS the server's auto-snipe check skips it too. */
+export const CALLOUT_SNAPSHOT_STALE_MS = 15_000;
+export function CalloutSnapshotAge({ dataAsOfMs, now = Date.now() }: { dataAsOfMs?: number; now?: number }) {
+  const stale = typeof dataAsOfMs !== 'number' || now - dataAsOfMs > CALLOUT_SNAPSHOT_STALE_MS;
+  return (
+    <div data-testid="callout-snapshot-age" title="Curve %, market cap, price and multiple on this card are from this snapshot" className={`px-2 py-1 rounded border text-[10px] font-mono ${stale ? 'border-amber-500/50 text-amber-300' : 'border-[#1E293B] text-slate-500'}`}>
+      data {typeof dataAsOfMs === 'number' ? ageText(now - dataAsOfMs) : 'age unknown'}{stale ? ' (STALE)' : ''}
+    </div>
+  );
 }
 
 /** 3H (P3.7): the feed status as the server measures it. It used to be implied by fixed "Live ingest" text whether or not anything arrived. */
@@ -628,8 +640,10 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                         {/* Time elapsed */}
                         <div className="px-2 py-1 rounded bg-[#090D16] border border-[#1E293B] text-[11px] font-mono text-slate-300 flex items-center space-x-1">
                           <Clock className="w-3 h-3 text-slate-500" />
-                          <span>{c.token.timeAgoStr}</span>
+                          <span title="Time since the token's last trade, as of the snapshot below">{c.token.timeAgoStr}</span>
                         </div>
+                        {/* R6-6: curve %, market cap, price and multiple are a snapshot; say how old */}
+                        <CalloutSnapshotAge dataAsOfMs={c.dataAsOfMs} />
                       </div>
                     </div>
 

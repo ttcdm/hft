@@ -293,6 +293,14 @@ const UNATTRIBUTED_CALLER: PumpFunCaller = {
 
 const DEMO_CALLER_IDS: ReadonlySet<string> = new Set(INITIAL_CALLERS.map((c) => c.userId));
 
+/** R6-6: with the WebSocket streaming, the HTTP poll that refreshes the listed callouts' figures still runs this often. */
+export const CALLOUT_REFRESH_WITH_WS_MS = 10_000;
+/** R6-6: the auto-snipe check reads a callout's multiple only when its snapshot is at most this old. */
+export const CALLOUT_SNAPSHOT_MAX_AGE_MS = 15_000;
+export function calloutSnapshotFresh(dataAsOfMs: number | undefined, now: number): boolean {
+  return typeof dataAsOfMs === 'number' && Number.isFinite(dataAsOfMs) && now - dataAsOfMs <= CALLOUT_SNAPSHOT_MAX_AGE_MS;
+}
+
 /** Fake hardcoded callers are only loaded when DEMO_MODE=true (A5). */
 function isDemoMode(): boolean {
   return process.env.DEMO_MODE === 'true';
@@ -430,6 +438,7 @@ export class PumpFunService extends EventEmitter {
       profile_image: null,
       video_uri: null,
       last_trade_timestamp: event.receivedAt,
+      _fetchedAt: event.receivedAt, // R6-6: the create event's own figures; the poll refreshes them
     };
 
     this.rawTokensCache = [rawCoin, ...this.rawTokensCache.filter((c) => c.mint !== event.mint)].slice(0, 30);
@@ -437,17 +446,17 @@ export class PumpFunService extends EventEmitter {
   }
 
   // Start background sync from real-world APIs (relegated to secondary fallback behind WebSocket)
+  private lastHttpSyncAt = 0;
   private initPolling(env?: NodeJS.ProcessEnv) {
     // Initial fetch immediately
     this.syncRealWorldData({ env }).catch(console.error);
 
-    // Poll every 5 seconds as secondary fallback when WebSocket logs are inactive or reconnecting (B08)
+    // Poll every 5 seconds as secondary fallback when WebSocket logs are inactive or reconnecting (B08). R6-6: while the WebSocket
+    // streams, the log stream only ADDS new launches; the curve %, market cap, price and multiple of the callouts already listed come
+    // from this poll alone. Skipping it froze them (and the auto-snipe check read the frozen multiple), so it still runs, less often.
     setInterval(() => {
       const wsActive = pumpFeedListener.isActive() && Date.now() - pumpFeedListener.getLastEventTimestamp() < 60000;
-      if (wsActive) {
-        // WebSocket is actively streaming on-chain events; HTTP polling is relegated to standby
-        return;
-      }
+      if (wsActive && Date.now() - this.lastHttpSyncAt < CALLOUT_REFRESH_WITH_WS_MS) return;
       this.syncRealWorldData({ env }).catch(() => {});
     }, 5000);
   }
@@ -521,6 +530,10 @@ export class PumpFunService extends EventEmitter {
         } catch {}
       }
 
+      // R6-6: each coin carries the time its figures were fetched, so a callout can say how old its snapshot is
+      const fetchedAt = Date.now();
+      for (const c of pumpCoins) c._fetchedAt = fetchedAt;
+      if (pumpCoins.length > 0) this.lastHttpSyncAt = fetchedAt;
       this.rawTokensCache = pumpCoins;
       // 3H: a poll counts as feed activity only when pump.fun returned coins; a failed or empty fetch used to move the sync time too.
       if (pumpCoins.length > 0) {
@@ -731,6 +744,7 @@ export class PumpFunService extends EventEmitter {
         hftAction,
         decayWindowSecondsRemaining,
         status: isAlreadySniped ? 'SNIPED' : 'ACTIVE',
+        dataAsOfMs: typeof c._fetchedAt === 'number' ? c._fetchedAt : now,
       };
 
       // Feed live token social telemetry into SocialAlphaScanner
@@ -780,6 +794,8 @@ export class PumpFunService extends EventEmitter {
         continue;
       }
 
+      // R6-6: a multiple read from a snapshot older than CALLOUT_SNAPSHOT_MAX_AGE_MS is not a current multiple; such a callout waits for the next poll
+      if (!calloutSnapshotFresh(callout.dataAsOfMs, Date.now())) continue;
       const caller = callout.caller;
       const meetsCallerWinRate = caller.winRate2x >= rules.minCallerWinRate2x;
       const meetsAvgMultiple = caller.avgMultiple >= rules.minAvgMultiple;

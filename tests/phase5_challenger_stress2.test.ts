@@ -401,6 +401,7 @@ describe('Phase 5 Challenger Stress & Adversarial Suite: Alpha Pipeline (B14)', 
       hftAction: 'INSTANT_SNIPE',
       decayWindowSecondsRemaining: 50,
       status: 'ACTIVE',
+      dataAsOfMs: Date.now(), // R6-6: a fresh feed snapshot
       ...overrides,
     });
 

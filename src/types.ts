@@ -281,6 +281,8 @@ export interface PumpFunHotCallout {
   hftAction: CalloutHftAction;
   decayWindowSecondsRemaining: number;
   status: 'ACTIVE' | 'SNIPED' | 'EXPIRED';
+  /** R6-6: when the feed data behind curve %, market cap, price and multiple was fetched (ms). Absent on an older server. */
+  dataAsOfMs?: number;
 }
 
 export interface PumpFunHotCalloutsResponse {

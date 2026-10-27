@@ -31,13 +31,13 @@ const line = (recs: Rec[], part: string) => recs.find((r) => r.step.includes(par
 
 const RENT = 2_039_280;
 const FEE = 5_000;
-function fakeSessionApp(o: { countRent?: boolean; refuseAt?: number; loseReadAt?: number; makeThrows?: boolean } = {}) {
+function fakeSessionApp(o: { countRent?: boolean; refuseAt?: number; loseReadAt?: number; makeThrows?: boolean; lossTriggersPending?: boolean; ackNotSaved?: boolean; recentKellyNegative?: boolean } = {}) {
   let lamports = 1_000_000_000;
   let reads = 0;
   const state = {
     mode: 'OFF', gating: true, budgets: { maxBuys: 5, maxSpendSol: 0.02 }, order: 0.005,
     session: null as null | { buys: number; spentSol: number }, open: [] as Array<{ id: string; mint: string; status: string }>,
-    candidates: 0, cleaned: 0, closes: 0,
+    candidates: 0, cleaned: 0, closes: 0, acks: 0, ackedBeforeFirstBuy: false,
   };
   const watch = { getVerdict: (_m: string): any => null };
   const origVerdict = watch.getVerdict;
@@ -53,8 +53,19 @@ function fakeSessionApp(o: { countRent?: boolean; refuseAt?: number; loseReadAt?
       getStatus: () => ({ mode: state.mode, budgets: { ...state.budgets }, session: state.session ? { ...state.session } : null }),
       orderSol: () => state.order,
       setOrderSol: (sol) => { state.order = sol; return { ok: true }; },
+      resume: (r) => {
+        if (!r.ackLossTriggers) return { halted: false, mode: state.mode };
+        state.acks++;
+        if (state.candidates === 0) state.ackedBeforeFirstBuy = true;
+        return { halted: false, mode: state.mode, lossTriggersAcked: !o.ackNotSaved };
+      },
       submitCandidate: async (c) => {
         const i = state.candidates++;
+        // R8-8: the scratch DB's earlier harness trades trip the loss triggers until the operator acknowledges them
+        if (o.lossTriggersPending && !(state.acks > 0 && !o.ackNotSaved)) {
+          return { outcome: 'REJECTED', stage: 'execute', reason: 'REJECTED: LOSS_TRIGGERS: LOSS_STREAK (20 losses in a row (bug detector)), over the last LIVE trades (manual and auto). Check them, then acknowledge with POST /api/auto/resume {ackLossTriggers:true}' };
+        }
+        if (o.recentKellyNegative) return { outcome: 'REJECTED', stage: 'execute', reason: 'REJECTED: Capital sizing failed (NEGATIVE_RECENT_EXPECTANCY: raw Kelly -4.0000 over the last 25 closed LIVE trades, win rate 0.0%, payoff 0.25)' };
         if (o.refuseAt === i) return { outcome: 'REJECTED', stage: 'eligibility', reason: 'ELIGIBILITY_CHECK_FAILED' };
         const v = watch.getVerdict(c.mint);
         if (v?.state !== 'HOT' || state.gating) return { outcome: 'DROPPED', stage: 'watch', reason: 'not wrapped' };
@@ -87,6 +98,32 @@ describe('3K (m): a 5-buy DEVNET_LIVE session, spentSol against the wallet (3B)'
     expect(line(r.recs, "spentSol equals the wallet's drop")?.ok).toBe(true);
     expect(f.watch.getVerdict).toBe(f.origVerdict);
     expect(f.state).toMatchObject({ gating: true, mode: 'OFF', budgets: { maxBuys: 5, maxSpendSol: 0.02 }, order: 0.005, cleaned: 1, closes: 5 });
+  });
+  it('earlier losing harness trades in the reused scratch DB (R8-8): the step acknowledges the loss triggers first, through the operator route, and every line passes', async () => {
+    const r = recorder();
+    const f = fakeSessionApp({ lossTriggersPending: true });
+    await sessionSpendMatchesWallet({ ...r, coordinator: f.coordinator }, f.deps);
+    expect(fails(r.recs), JSON.stringify(r.recs, null, 1)).toEqual([]);
+    expect(f.state.ackedBeforeFirstBuy).toBe(true);
+    expect(line(r.recs, 'loss triggers acknowledged')?.ok).toBe(true);
+    expect(r.recs.filter((x) => x.step.includes('BOUGHT'))).toHaveLength(5);
+  });
+  it('an acknowledgement that could not be saved: a FAIL line, nothing bought, everything put back', async () => {
+    const r = recorder();
+    const f = fakeSessionApp({ lossTriggersPending: true, ackNotSaved: true });
+    await sessionSpendMatchesWallet({ ...r, coordinator: f.coordinator }, f.deps);
+    expect(line(r.recs, 'loss triggers acknowledged')?.ok).toBe(false);
+    expect(f.state).toMatchObject({ candidates: 0, gating: true, mode: 'OFF', order: 0.005, cleaned: 1 });
+  });
+  it('the recent-window Kelly refusal (R8-8, no operator acknowledgement) on the first buy: a SKIP naming it, not a FAIL', async () => {
+    const r = recorder();
+    const f = fakeSessionApp({ recentKellyNegative: true });
+    await sessionSpendMatchesWallet({ ...r, coordinator: f.coordinator }, f.deps);
+    expect(fails(r.recs), JSON.stringify(r.recs, null, 1)).toEqual([]);
+    const sk = r.recs.find((x) => x.skip);
+    expect(sk?.detail).toMatch(/NEGATIVE_RECENT_EXPECTANCY/);
+    expect(sk?.detail).toMatch(/APEX_E2E_SCRATCH/);
+    expect(f.state).toMatchObject({ candidates: 1, gating: true, mode: 'OFF', cleaned: 1 });
   });
   it('an app whose spentSol leaves out the token account rent (3B missing): the spentSol line FAILs with the gap', async () => {
     const r = recorder();

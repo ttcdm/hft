@@ -1839,6 +1839,8 @@ export interface SessionSpendDeps {
     orderSol(): number;
     setOrderSol(sol: number): { ok: boolean; reason?: string };
     submitCandidate(c: { mint: string; source: 'TEST'; provenance?: 'REAL_ONCHAIN' }): Promise<{ outcome: string; stage?: string; reason: string; positionId?: string }>;
+    /** What POST /api/auto/resume calls (server.ts); the step sends `{ ackLossTriggers: true }` (R8-8, RUNBOOK section 6). */
+    resume(opts: { ackLossTriggers?: boolean }): { halted: boolean; mode: string; lossTriggersAcked?: boolean };
   };
   /** The app's watch window: its `getVerdict` is wrapped for the step's own coins only, and put back in `finally`. */
   watch: { getVerdict(mint: string): any };
@@ -1868,6 +1870,13 @@ export interface SessionSpendDeps {
  * returns) equal to the sum of the five wallet drops within 0.0002 SOL (the token account's rent is in both since 3B; before 3B spentSol
  * left out about 0.00204 SOL of rent per buy), five buys counted, and no halt (the wallet audit explains every buy).
  * A lost balance read makes the comparison a SKIP, never a FAIL.
+ *
+ * R8-8: every LIVE buy is refused while NEGATIVE_EXPECTANCY or LOSS_STREAK holds over the last 20 closed LIVE trades since the operator's
+ * acknowledgement, and APEX_E2E_SCRATCH (the harness DB) is reused on purpose, so the harness's own earlier test trades (every one loses
+ * its fees) trip both. The step first acknowledges them as the operator does (POST /api/auto/resume {ackLossTriggers:true}, RUNBOOK
+ * section 6; the same `resume` the route calls); an acknowledgement that cannot be saved is a FAIL and nothing is bought. The recent-window
+ * Kelly refusal (NEGATIVE_RECENT_EXPECTANCY, the last 25 closed LIVE trades) has no acknowledgement: on the first buy it is a SKIP naming
+ * it (the gate works; the scratch DB's history is what it judges), and a fresh APEX_E2E_SCRATCH runs the step.
  */
 export async function sessionSpendMatchesWallet(s: Pick<HarnessSteps, 'rec' | 'skip' | 'sleep' | 'coordinator'>, d: SessionSpendDeps, opts: { buys?: number; orderSol?: number } = {}): Promise<number> {
   const L = '(m) 3B: DEVNET_LIVE session spend';
@@ -1883,6 +1892,10 @@ export async function sessionSpendMatchesWallet(s: Pick<HarnessSteps, 'rec' | 's
   const coins = new Set<string>();
   try {
     process.env.AUTO_SNIPE_ENABLED = 'true';
+    // R8-8: the operator's acknowledgement of the loss triggers, before anything is made or bought (see above)
+    const ack = d.auto.resume({ ackLossTriggers: true });
+    s.rec(`${L}: loss triggers acknowledged (POST /api/auto/resume {ackLossTriggers:true})`, ack.lossTriggersAcked === true, ack.lossTriggersAcked === true ? 'acknowledged: LIVE trades closed before now no longer count for NEGATIVE_EXPECTANCY / LOSS_STREAK' : `lossTriggersAcked ${ack.lossTriggersAcked}: not saved, nothing changed`);
+    if (ack.lossTriggersAcked !== true) return lastTradeAt;
     for (const m of await d.makeCoins(n)) coins.add(m);
     if (coins.size !== n) { s.rec(`${L}: ${n} coins made`, false, `${coins.size} made`); return lastTradeAt; }
     // 0.008 SOL by default: the app refuses a 0.005 SOL first buy from a wallet that has not paid pump's one-time account rent yet
@@ -1912,6 +1925,10 @@ export async function sessionSpendMatchesWallet(s: Pick<HarnessSteps, 'rec' | 's
       const after = await readWithRetry(d.balanceLamports, s.sleep);
       const open = d.openLive();
       maxOpen = Math.max(maxOpen, open.length);
+      if (bought === 0 && dec.outcome !== 'BOUGHT' && /NEGATIVE_RECENT_EXPECTANCY/.test(dec.reason)) {
+        skip(`${L}: ${n} auto buys`, `the first auto buy was refused on the recent-window Kelly (R8-8, no operator acknowledgement exists for it): ${dec.reason.slice(0, 200)}; the scratch DB's last closed LIVE trades are the harness's own losing test trades. Run with a fresh APEX_E2E_SCRATCH to run this step`);
+        return lastTradeAt;
+      }
       const drop = before !== null && after !== null ? (before - after) / 1e9 : null;
       if (drop === null) unmeasured++; else measured += drop;
       s.rec(`${L}: auto buy ${mint.slice(0, 6)} BOUGHT`, dec.outcome === 'BOUGHT', `${dec.outcome} ${dec.stage ?? ''} ${dec.reason}; wallet drop ${drop === null ? 'not read' : drop.toFixed(6)} SOL; spentSol ${d.auto.getStatus().session?.spentSol?.toFixed(6) ?? 'no session'}`.slice(0, 300));

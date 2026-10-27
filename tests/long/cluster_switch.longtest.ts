@@ -23,8 +23,9 @@ beforeAll(async () => {
   const market = await LocalMarket.connect(a);
   const signer = await market.signerKeyFile(dir, 5);
   trader = signer.keypair;
+  app = await startLocalnetApp({ dir, validator: a, signerKeyPath: signer.path, confluenceThreshold: 0, holderFeed: true });
+  market.watchedBy(() => app); // R2-3: seeded coins wait until this app has looked up their holders
   ({ mint } = await market.seedCoin(14, 0.6));
-  app = await startLocalnetApp({ dir, validator: a, signerKeyPath: signer.path, confluenceThreshold: 0 });
   await armLive(app);
 }, 240_000);
 

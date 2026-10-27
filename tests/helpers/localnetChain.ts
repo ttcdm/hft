@@ -159,6 +159,12 @@ export interface AppOptions {
    * still runs (0 < 0 is false, it compares `score < threshold`); every other gate (pool, freeze, sizing, risk, cluster) is unchanged.
    */
   confluenceThreshold?: number;
+  /**
+   * Runs the server's pump log stream against the validator (APEX_PUMP_WS_ONLY=true, honoured on localnet only), so the watch window and
+   * its funder lookup see seeded launches as a devnet server does by default. Needed for buys of seeded coins since R2-3 (see
+   * `LocalMarket.watchedBy`).
+   */
+  holderFeed?: boolean;
 }
 
 /**
@@ -188,6 +194,7 @@ export async function startLocalnetApp(o: AppOptions): Promise<LocalnetApp> {
     ALLOW_LIVE_REAL_MONEY_TRADING: 'true',
     APEX_DISABLE_EXTERNAL_FEEDS: 'true', // no Coinbase / pump.fun / DexScreener from a child process
     STARTUP_GRACE_PERIOD_MS: '0',
+    ...(o.holderFeed ? { APEX_PUMP_WS_ONLY: 'true' } : {}),
     ...(o.env ?? {}),
   };
   // node --import tsx, not the tsx CLI wrapper: the wrapper runs the server in a grandchild and cannot relay SIGKILL, so a
@@ -292,7 +299,20 @@ export class LocalMarket {
   private curve: any;
   private builder: any;
   readonly creator = Keypair.generate();
+  /** The app whose pump log stream must have seen each seeded coin's holders (see `watchedBy`); null: nobody waits. */
+  private watcher: (() => LocalnetApp | undefined) | null = null;
   private constructor(readonly v: ValidatorHandle) {}
+
+  /**
+   * R2-3: the app's holder gate counts a large holder as independent only when its funder lookup (the watch window, fed by the pump log
+   * stream) read the holder's whole short history and found a source that is not the creator; every other holder is UNKNOWN, and all
+   * UNKNOWN holders together are one entry in the top-10 figure. A test that buys seeded coins starts its app with `holderFeed: true`
+   * (the log stream on loopback, as a devnet server runs it by default) and calls this, so `seedCoin` waits until that app has looked up
+   * every holder. `getApp` is a getter so a restarted app is the one waited on.
+   */
+  watchedBy(getApp: () => LocalnetApp | undefined): void {
+    this.watcher = getApp;
+  }
 
   static async connect(v: ValidatorHandle): Promise<LocalMarket> {
     process.env.ALLOWED_CLUSTER = 'localnet';
@@ -408,15 +428,52 @@ export class LocalMarket {
    * concentration, liquidity) pass honestly. Returns the buyer keypairs so a test can move the market later.
    */
   async seedCoin(buyers = 14, buySol = 0.6): Promise<{ mint: PublicKey; wallets: Keypair[] }> {
-    const mint = await this.createCoin();
+    const app = this.watcher?.();
+    let mint = await this.createCoin();
+    // A launch created before the app's log stream (re)subscribed is never watched, so its holders are never looked up: make another.
+    for (let i = 0; app && !(await this.watchedEntry(app, mint, 5_000)); i++) {
+      if (i >= 8) throw new Error('the app never watched a seeded launch: start it with holderFeed: true (its pump log stream did not subscribe)');
+      mint = await this.createCoin();
+    }
     await this.buy(this.creator, mint, 0.2);
     const wallets: Keypair[] = [];
     for (let i = 0; i < buyers; i++) {
-      const w = await this.fresh(buySol + 1);
+      // R2-3: each buyer is paid by a funder of its own with a plain transfer, so the app's funder lookup finds a source that is not the
+      // creator (an airdrop leaves no transfer to read, and such a holder is UNKNOWN to the holder gate).
+      const funder = await this.fresh(buySol + 1.1);
+      const w = Keypair.generate();
+      await this.transfer(funder, w.publicKey, buySol + 1);
       await this.buy(w, mint, buySol);
       wallets.push(w);
     }
+    if (app) await this.waitHoldersLookedUp(app, mint, buyers);
     return { mint, wallets };
+  }
+
+  private async watchedEntry(app: LocalnetApp, mint: PublicKey, timeoutMs: number): Promise<any | undefined> {
+    const m = mint.toBase58();
+    const deadline = Date.now() + timeoutMs;
+    do {
+      const j = (await app.call('GET', '/api/watch')).json;
+      const e = [...(j?.watching ?? []), ...(j?.released ?? [])].find((x: any) => x.metrics?.mint === m);
+      if (e) return e;
+      await sleep(250);
+    } while (Date.now() < deadline);
+    return undefined;
+  }
+
+  /** Until the watch window still watching `mint` has every buyer's funder (funderCoverage 1 over at least `buyers` buyers). */
+  private async waitHoldersLookedUp(app: LocalnetApp, mint: PublicKey, buyers: number, timeoutMs = 30_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    let last: any;
+    while (Date.now() < deadline) {
+      last = await this.watchedEntry(app, mint, 0);
+      const mt = last?.metrics;
+      if (last?.state === 'WATCHING' && mt?.rawUniqueBuyers >= buyers && mt?.funderCoverage === 1) return;
+      if (last && last.state !== 'WATCHING') break; // released: its metrics no longer move
+      await sleep(250);
+    }
+    throw new Error(`the app did not look up every holder of ${mint.toBase58()}: ${JSON.stringify(last ? { state: last.state, reason: last.reason, raw: last.metrics?.rawUniqueBuyers, coverage: last.metrics?.funderCoverage } : null)}`);
   }
 
   /** Buys with fresh wallets until the spot price is at least `targetRatio` × the price at call time. */

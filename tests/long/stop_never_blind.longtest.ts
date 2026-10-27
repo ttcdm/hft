@@ -35,7 +35,7 @@ async function boot(tag: string): Promise<void> {
   fs.mkdirSync(sub);
   const signer = await market.signerKeyFile(sub, 5);
   trader = signer.keypair;
-  app = await startLocalnetApp({ dir: sub, validator: v, signerKeyPath: signer.path, confluenceThreshold: 0 });
+  app = await startLocalnetApp({ dir: sub, validator: v, signerKeyPath: signer.path, confluenceThreshold: 0, holderFeed: true });
   await armLive(app);
 }
 
@@ -113,6 +113,7 @@ async function writePool(mint: PublicKey, priceSol: number): Promise<PublicKey> 
 beforeAll(async () => {
   v = await startValidator(dir);
   market = await LocalMarket.connect(v);
+  market.watchedBy(() => app); // R2-3: seeded coins wait until this app has looked up their holders
 }, 120_000);
 
 afterEach(async () => {
@@ -127,8 +128,8 @@ afterAll(async () => {
 
 describe('P1.6: a LIVE stop-loss is never blind', () => {
   it('one failed curve read, then a dump from another wallet: STOP_LOSS sells and is journaled EXITED within a few passes', async () => {
-    const coin = await market.seedCoin(14, 0.6);
     await boot('failread');
+    const coin = await market.seedCoin(14, 0.6);
     const pos = await open(coin.mint);
 
     const before = (await v.methodCounts()).getMultipleAccounts ?? 0;
@@ -147,8 +148,8 @@ describe('P1.6: a LIVE stop-loss is never blind', () => {
   }, 300_000);
 
   it('curve completes, no pool for a few passes, then the pool appears at -30%: the exit loop alone sells STOP_LOSS through PumpSwap', async () => {
-    const coin = await market.seedCoin(14, 0.6);
     await boot('migrate');
+    const coin = await market.seedCoin(14, 0.6);
     const pos = await open(coin.mint);
 
     await completeCurve(coin.mint);

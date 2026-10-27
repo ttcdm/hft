@@ -120,7 +120,7 @@ async function main() {
   const { PumpCurveService } = await import('../../server/solana/pumpCurve');
   const { txBuilder } = await import('../../server/solana/transactionBuilder');
   const { assertClusterAllowed } = await import('../../server/solana/clusterGuard');
-  const { Transaction, ComputeBudgetProgram } = await import('@solana/web3.js');
+  const { Transaction, ComputeBudgetProgram, SystemProgram } = await import('@solana/web3.js');
 
   const g = await assertClusterAllowed(conn);
   rec('cluster guard', g.cluster === 'localnet', `assertClusterAllowed -> ${g.cluster}`);
@@ -182,58 +182,9 @@ async function main() {
 
   /** create_v2 + a small creator buy + 14 other buyers, so the app's own safety filters (creator share, top-10, liquidity) pass honestly. */
   async function seedCoin(): Promise<PublicKey> {
-    const m = await createCoin();
-    await marketBuy(creator, m, 0.2);
-    for (let i = 0; i < 14; i++) {
-      const w = Keypair.generate();
-      await conn.requestAirdrop(w.publicKey, 2 * LAMPORTS_PER_SOL);
-      await marketBuy(w, m, 0.6);
-    }
+    const m = await createWatchedCoin();
+    await seedBuyers(m);
     return m;
-  }
-
-  let mint: PublicKey;
-  let mintD: PublicKey;
-  let mintE: PublicKey;
-  let mintF: PublicKey;
-  let mintG: PublicKey;
-  let mintH: PublicKey;
-  try {
-    mint = await createCoin();
-    rec('seed: create_v2', !!lastCreate?.signature, `mint ${mint.toBase58()} created by the real pump program`);
-    {
-      // L5: the pump feed decoder must agree with the program's own account for a REAL create_v2 event log.
-      const { PumpFeedListener } = await import('../../server/solana/pumpFeedListener');
-      const l = new PumpFeedListener();
-      const ev = l.parseLogs({ err: null, signature: lastCreate!.signature, logs: lastCreate!.logs } as any, { slot: 1 });
-      l.destroy();
-      const st = await PumpCurveService.fetchPumpMarketState({ connection: conn, mint, executionMode: 'LIVE' });
-      const same = !!ev && !!st && ev.mint === mint.toBase58() && ev.creator === creator.publicKey.toBase58() &&
-        ev.virtualTokenReserves === st.virtualTokenReserves && ev.virtualSolReserves === st.virtualSolReserves &&
-        ev.realTokenReserves === st.realTokenReserves && ev.tokenTotalSupply === st.tokenTotalSupply;
-      rec('pump feed decodes the real create_v2 log like the on-chain curve', same, ev ? `vTok ${ev.virtualTokenReserves} vSol ${ev.virtualSolReserves} real ${ev.realTokenReserves} vs chain ${st?.virtualTokenReserves}/${st?.virtualSolReserves}/${st?.realTokenReserves}` : 'parseLogs returned null');
-      if (process.env.LOCALNET_DUMP_CREATE_LOG) {
-        fs.writeFileSync(process.env.LOCALNET_DUMP_CREATE_LOG, JSON.stringify({ signature: lastCreate!.signature, mint: mint.toBase58(), creator: creator.publicKey.toBase58(), logs: lastCreate!.logs, chain: { virtualTokenReserves: String(st?.virtualTokenReserves), virtualSolReserves: String(st?.virtualSolReserves), realTokenReserves: String(st?.realTokenReserves), tokenTotalSupply: String(st?.tokenTotalSupply) } }, null, 1));
-      }
-    }
-    await marketBuy(creator, mint, 0.2);
-    for (let i = 0; i < 14; i++) {
-      const w = Keypair.generate();
-      await conn.requestAirdrop(w.publicKey, 2 * LAMPORTS_PER_SOL);
-      await marketBuy(w, mint, 0.6);
-    }
-    const st = (await PumpCurveService.fetchPumpMarketState({ connection: conn, mint, executionMode: 'LIVE' }))!;
-    rec('seed: 15 buyers', st.realSolReserves > 0n && !st.complete, `real SOL reserves ${Number(st.realSolReserves) / 1e9}, virtual ${Number(st.virtualSolReserves) / 1e9}`);
-    // The app has a per-mint cooldown, so each failure scenario gets its own coin.
-    mintD = await seedCoin();
-    mintE = await seedCoin();
-    mintF = await seedCoin();
-    mintG = await seedCoin();
-    mintH = await seedCoin();
-    rec('seed: 5 more coins (revert, failed-send, restart, sell-in-flight, PumpSwap scenarios)', new Set([mintD, mintE, mintF, mintG, mintH].map((m) => m.toBase58())).size === 5, [mintD, mintE, mintF, mintG, mintH].map((m) => m.toBase58()).join(' '));
-  } catch (e: any) {
-    rec('seed market', false, String(e?.stack || e).slice(0, 600));
-    return finish();
   }
 
   // ---- start the real app server against the validator ----
@@ -273,6 +224,90 @@ async function main() {
 
   let { base, proc } = await startServer();
   let call = api(base);
+
+  // R2-3: the holder gate counts a large holder as independent only when the app's funder lookup (its watch window, fed by its pump log
+  // stream, which a localnet server runs by default) read the holder's whole short history and found a source that is not the creator. An
+  // airdropped wallet has no transfer to read and is UNKNOWN, and all UNKNOWN holders together are one top-10 entry (23% for 14 buyers).
+  // So the coins the app buys are created while the server runs (a launch it did not see is never watched: make another), each buyer is
+  // paid by a funder of its own with a plain transfer, and the seed waits until the running server has looked up every buyer.
+  const watchEntry = async (m: PublicKey): Promise<any | undefined> => {
+    const j = (await call('GET', '/api/watch')).body;
+    return [...(j?.watching ?? []), ...(j?.released ?? [])].find((x: any) => x.metrics?.mint === m.toBase58());
+  };
+  async function createWatchedCoin(): Promise<PublicKey> {
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const m = await createCoin();
+      for (let i = 0; i < 20; i++) {
+        if (await watchEntry(m)) return m;
+        await sleep(250);
+      }
+    }
+    throw new Error('the server never watched a launch: its pump log stream did not subscribe to the validator');
+  }
+  async function fundedBuyer(sol: number): Promise<Keypair> {
+    const funder = Keypair.generate();
+    await conn.requestAirdrop(funder.publicKey, (sol + 0.1) * LAMPORTS_PER_SOL);
+    const w = Keypair.generate();
+    const tx = new Transaction().add(SystemProgram.transfer({ fromPubkey: funder.publicKey, toPubkey: w.publicKey, lamports: sol * LAMPORTS_PER_SOL }));
+    tx.recentBlockhash = (await conn.getLatestBlockhash()).blockhash;
+    tx.feePayer = funder.publicKey;
+    await send(tx, [funder]);
+    return w;
+  }
+  async function waitHoldersLookedUp(m: PublicKey, buyers: number): Promise<void> {
+    let last: any;
+    for (let i = 0; i < 120; i++) {
+      last = await watchEntry(m);
+      if (last?.state === 'WATCHING' && last.metrics?.rawUniqueBuyers >= buyers && last.metrics?.funderCoverage === 1) return;
+      if (last && last.state !== 'WATCHING') break;
+      await sleep(250);
+    }
+    throw new Error(`the server did not look up every holder of ${m.toBase58()}: ${JSON.stringify(last ? { state: last.state, reason: last.reason, raw: last.metrics?.rawUniqueBuyers, coverage: last.metrics?.funderCoverage } : null)}`);
+  }
+  async function seedBuyers(m: PublicKey): Promise<void> {
+    await marketBuy(creator, m, 0.2);
+    for (let i = 0; i < 14; i++) await marketBuy(await fundedBuyer(2), m, 0.6);
+    await waitHoldersLookedUp(m, 14);
+  }
+
+  let mint: PublicKey;
+  let mintD: PublicKey;
+  let mintE: PublicKey;
+  let mintF: PublicKey;
+  let mintG: PublicKey;
+  let mintH: PublicKey;
+  try {
+    mint = await createWatchedCoin();
+    rec('seed: create_v2', !!lastCreate?.signature, `mint ${mint.toBase58()} created by the real pump program`);
+    {
+      // L5: the pump feed decoder must agree with the program's own account for a REAL create_v2 event log.
+      const { PumpFeedListener } = await import('../../server/solana/pumpFeedListener');
+      const l = new PumpFeedListener();
+      const ev = l.parseLogs({ err: null, signature: lastCreate!.signature, logs: lastCreate!.logs } as any, { slot: 1 });
+      l.destroy();
+      const st = await PumpCurveService.fetchPumpMarketState({ connection: conn, mint, executionMode: 'LIVE' });
+      const same = !!ev && !!st && ev.mint === mint.toBase58() && ev.creator === creator.publicKey.toBase58() &&
+        ev.virtualTokenReserves === st.virtualTokenReserves && ev.virtualSolReserves === st.virtualSolReserves &&
+        ev.realTokenReserves === st.realTokenReserves && ev.tokenTotalSupply === st.tokenTotalSupply;
+      rec('pump feed decodes the real create_v2 log like the on-chain curve', same, ev ? `vTok ${ev.virtualTokenReserves} vSol ${ev.virtualSolReserves} real ${ev.realTokenReserves} vs chain ${st?.virtualTokenReserves}/${st?.virtualSolReserves}/${st?.realTokenReserves}` : 'parseLogs returned null');
+      if (process.env.LOCALNET_DUMP_CREATE_LOG) {
+        fs.writeFileSync(process.env.LOCALNET_DUMP_CREATE_LOG, JSON.stringify({ signature: lastCreate!.signature, mint: mint.toBase58(), creator: creator.publicKey.toBase58(), logs: lastCreate!.logs, chain: { virtualTokenReserves: String(st?.virtualTokenReserves), virtualSolReserves: String(st?.virtualSolReserves), realTokenReserves: String(st?.realTokenReserves), tokenTotalSupply: String(st?.tokenTotalSupply) } }, null, 1));
+      }
+    }
+    await seedBuyers(mint);
+    const st = (await PumpCurveService.fetchPumpMarketState({ connection: conn, mint, executionMode: 'LIVE' }))!;
+    rec('seed: 15 buyers', st.realSolReserves > 0n && !st.complete, `real SOL reserves ${Number(st.realSolReserves) / 1e9}, virtual ${Number(st.virtualSolReserves) / 1e9}`);
+    // The app has a per-mint cooldown, so each failure scenario gets its own coin.
+    mintD = await seedCoin();
+    mintE = await seedCoin();
+    mintF = await seedCoin();
+    // (g) and (h) buy after a restart, and a restarted server has not looked up their holders: they are seeded after it (below).
+    rec('seed: 3 more coins (revert, failed-send, restart scenarios)', new Set([mintD, mintE, mintF].map((m) => m.toBase58())).size === 3, [mintD, mintE, mintF].map((m) => m.toBase58()).join(' '));
+  } catch (e: any) {
+    rec('seed market', false, String(e?.stack || e).slice(0, 600));
+    return finish();
+  }
+
   rec('server boot', /^http:\/\/127\.0\.0\.1:\d+$/.test(base), `${base} (ALLOWED_CLUSTER=localnet, RPC ${info.url}, real .env not read)`);
 
   const health = await call('GET', '/api/health');
@@ -403,7 +438,9 @@ async function main() {
   }
 
   // ---- (g) Q18: the app dies right after a SELL lands on-chain, before it records the result ----
-  await sleep(16_000);
+  const gStart = Date.now();
+  try { mintG = await seedCoin(); } catch (e: any) { rec('(g) seed a coin after the restart', false, String(e?.message ?? e).slice(0, 300)); return finish(); }
+  await sleep(Math.max(0, 16_000 - (Date.now() - gStart)));
   const buyG = await call('POST', '/api/execution/trade', { mint: mintG.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02, confirmLive: true });
   rec('(g) buy for the sell-in-flight scenario', buyG.status === 200 && buyG.body?.success, JSON.stringify(buyG.body).slice(0, 200));
   if (buyG.body?.positionId) {
@@ -437,6 +474,7 @@ async function main() {
   // ---- (h) Q4: sell a MIGRATED coin through the real PumpSwap program; where do the proceeds end up? ----
   // A migration is simulated by marking the bonding curve complete and writing the canonical pool and its vaults into the bank; the
   // PumpSwap program itself (the real binary) executes the app's sell.
+  try { mintH = await seedCoin(); } catch (e: any) { rec('(h) seed a coin after the restart', false, String(e?.message ?? e).slice(0, 300)); return finish(); }
   const armH = await call('POST', '/api/execution/arm', { arm: true, confirmationCode: 'CONFIRM_LIVE_TRADING_RISK' }); // a restart leaves the app in PAPER
   rec('(h) re-armed after the restart', armH.status === 200 && armH.body?.success, JSON.stringify(armH.body).slice(0, 120));
   const buyH = await call('POST', '/api/execution/trade', { mint: mintH.toBase58(), symbol: 'LCL', name: 'Localnet', amountSol: 0.02, confirmLive: true });

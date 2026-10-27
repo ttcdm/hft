@@ -30,7 +30,7 @@ const chainQty = async (mint: PublicKey) => market.tokenBalance(trader.publicKey
 const mark = (m: string) => console.log(`[long test ${new Date().toISOString().slice(11, 19)}] ${m}`);
 const positions = async () => ((await app.call('GET', '/api/workstation/positions')).json?.positions ?? []) as any[];
 const restart = async (env: Record<string, string> = {}) => {
-  app = await startLocalnetApp({ dir, validator: v, signerKeyPath: signerPath, dbPath, token, env, confluenceThreshold: 0 });
+  app = await startLocalnetApp({ dir, validator: v, signerKeyPath: signerPath, dbPath, token, env, confluenceThreshold: 0, holderFeed: true });
   return app;
 };
 /** Waits until the validator has executed one transaction whose HTTP response it is withholding. */
@@ -50,7 +50,8 @@ beforeAll(async () => {
   const signer = await market.signerKeyFile(dir, 5);
   trader = signer.keypair;
   signerPath = signer.path;
-  app = await startLocalnetApp({ dir, validator: v, signerKeyPath: signerPath, confluenceThreshold: 0 });
+  app = await startLocalnetApp({ dir, validator: v, signerKeyPath: signerPath, confluenceThreshold: 0, holderFeed: true });
+  market.watchedBy(() => app); // R2-3: seeded coins wait until this app has looked up their holders
   token = app.token;
   dbPath = app.dbPath;
   await armLive(app);

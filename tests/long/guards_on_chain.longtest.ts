@@ -87,7 +87,8 @@ describe('(a) wrong cluster: the chain answers with a genesis the server does no
 describe('(b)-(e) failures on the right cluster', () => {
   let app: LocalnetApp;
   beforeAll(async () => {
-    app = await startLocalnetApp({ dir, validator: v, signerKeyPath: signerPath, confluenceThreshold: 0 });
+    app = await startLocalnetApp({ dir, validator: v, signerKeyPath: signerPath, confluenceThreshold: 0, holderFeed: true });
+    market.watchedBy(() => app); // R2-3: seeded coins wait until this app has looked up their holders
     await armLive(app);
   }, 180_000);
   afterAll(() => app?.stop());

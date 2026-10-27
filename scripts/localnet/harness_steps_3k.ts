@@ -144,23 +144,9 @@ async function run(info: { url: string; genesisHash: string }) {
     }
   }
 
-  if (!only || only === 'm') {
-    if (armed.success && (await S.hasBudget(steps, '(m) 3B: DEVNET_LIVE session spend', bal, 0.25, 'DEVNET_SESSION_SPEND'))) {
-      const coins = S.stepCoins(steps, '(m) 3B: DEVNET_LIVE session spend', kit, kp);
-      const b0 = await bal();
-      await S.sessionSpendMatchesWallet(steps, {
-        auto: autoSnipeController as any,
-        watch: watchWindow as any,
-        confluence: memecoinAggregator,
-        balanceLamports: () => conn.getBalance(kp.publicKey),
-        haltReason: () => coordinator.getHaltReason(),
-        openLive: () => workstationDb.loadPositions('LIVE', 'ACTIVE'),
-        makeCoins: (n) => coins.make(n),
-        cleanupCoins: () => coins.cleanup(),
-      });
-      console.log(`INFO  (m) cost the harness wallet ${(b0 - (await bal())).toFixed(5)} SOL`);
-    }
-  }
+  // (p) before (m), as the devnet flow runs them (scripts/DEVNET_E2E_README.md 9f: after (l), before (m)). A31/A71: the DEVNET_LIVE session
+  // (its buys and spend) survives setMode for 4 h, so after (m) has used all 5 of its buys, (p)'s "auto DEVNET_LIVE then OFF" is refused
+  // SESSION_BUDGET_USED. Run first, (p) opens the session with no buy and (m) continues it from 0 buys.
   if (!only || only === 'p') {
     const L = '(p) 3F: no re-entry after an exit';
     if (armed.success && (await S.hasBudget(steps, L, bal, 0.05, 'DEVNET_REENTRY_BLOCK'))) {
@@ -179,6 +165,23 @@ async function run(info: { url: string; genesisHash: string }) {
         auto: autoSnipeController,
       });
       console.log(`INFO  (p) cost the harness wallet ${(b0 - (await bal())).toFixed(5)} SOL`);
+    }
+  }
+  if (!only || only === 'm') {
+    if (armed.success && (await S.hasBudget(steps, '(m) 3B: DEVNET_LIVE session spend', bal, 0.25, 'DEVNET_SESSION_SPEND'))) {
+      const coins = S.stepCoins(steps, '(m) 3B: DEVNET_LIVE session spend', kit, kp);
+      const b0 = await bal();
+      await S.sessionSpendMatchesWallet(steps, {
+        auto: autoSnipeController as any,
+        watch: watchWindow as any,
+        confluence: memecoinAggregator,
+        balanceLamports: () => conn.getBalance(kp.publicKey),
+        haltReason: () => coordinator.getHaltReason(),
+        openLive: () => workstationDb.loadPositions('LIVE', 'ACTIVE'),
+        makeCoins: (n) => coins.make(n),
+        cleanupCoins: () => coins.cleanup(),
+      });
+      console.log(`INFO  (m) cost the harness wallet ${(b0 - (await bal())).toFixed(5)} SOL`);
     }
   }
   coordinator.armLiveTrading(false);

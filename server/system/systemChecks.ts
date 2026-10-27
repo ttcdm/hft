@@ -145,6 +145,9 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
   const walletAuditRuns = auto.mode === 'DEVNET_LIVE';
   checks.push(halt
     ? { id: 'halt', label: 'Wallet audit / halt', status: 'FAIL', value: 'ALL TRADING HALTED', detail: halt }
+    // R9-4: "OK, no halt" read as "trading is allowed" right above a red kill-switch row; with the switch on, say so here too
+    : riskEngine.isKillSwitchActive()
+    ? { id: 'halt', label: 'Wallet audit / halt', status: 'WARN', value: 'no wallet-audit halt, but the KILL SWITCH is ON (orders refused)', detail: 'There is no persisted halt. The kill switch (row below) refuses every new order until it is reset.' }
     : { id: 'halt', label: 'Wallet audit / halt', status: 'OK', value: walletAuditRuns ? 'audit running, no halt' : 'no halt', detail: walletAuditRuns ? 'The wallet balance is compared with the journal; an unexplained change halts every buy plus the take-profit and stale exits; stop-loss, trailing stop, manual close and panic still run.' : `The wallet audit only runs in DEVNET_LIVE (auto mode is ${auto.mode}).` });
 
   const breakerOpen = riskEngine.getCircuitBreakerState() !== 'CLOSED';

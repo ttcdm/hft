@@ -126,3 +126,15 @@ export function plugAndPlayModeView(m: TradingModeInfo): { badge: string; tone: 
 export function snipeBlockedReason(m: Pick<TradingModeInfo, 'killSwitch'>): string | null {
   return m.killSwitch === true ? 'KILL SWITCH ON: the server refuses every order. Reset it from the header first.' : null;
 }
+
+/**
+ * R9-4: the Plug & Play "Circuit Breaker" tile read the breaker only, so it stayed green "NORMAL (ACTIVE)" under the kill switch. It
+ * now leads with the kill switch, and says "unknown" when the kill-switch state is (killSwitch null: no fresh answer).
+ */
+export function killAndBreakerTile(killSwitch: boolean | null, breaker: 'CLOSED' | 'OPEN' | 'HALF_OPEN' | undefined, haveRisk: boolean): { text: string; tone: string } {
+  if (killSwitch === true) return { text: 'KILL SWITCH ON (orders refused)', tone: 'text-rose-400' };
+  if (breaker === 'OPEN') return { text: 'BREAKER TRIPPED (orders refused)', tone: 'text-rose-400' };
+  if (breaker === 'HALF_OPEN') return { text: 'RECOVERING (HALF-OPEN)', tone: 'text-amber-400' };
+  if (killSwitch === null) return { text: 'kill switch unknown (no fresh server answer)', tone: 'text-amber-400' };
+  return haveRisk ? { text: 'kill switch off, breaker closed', tone: 'text-emerald-400' } : { text: '—', tone: 'text-slate-400' };
+}

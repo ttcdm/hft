@@ -39,7 +39,7 @@ import {
 } from 'lucide-react';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
 import { authFetch } from '../services/engineClient';
-import { useTradingMode, snipeBlockedReason, liveClickWarning, plugAndPlayModeView } from '../utils/tradingMode';
+import { useTradingMode, snipeBlockedReason, liveClickWarning, plugAndPlayModeView, killAndBreakerTile } from '../utils/tradingMode';
 import { positionPnlCell } from '../utils/positionPnl';
 import { closeOutcomeText } from '../utils/closeOutcome';
 import { fmtSol } from '../utils/numFormat';
@@ -112,6 +112,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
 
   const tradingMode = useTradingMode();
   const snipeBlocked = snipeBlockedReason(tradingMode); // UI report fix 7: grey the snipe buttons while the kill switch is on
+  const breakerTile = killAndBreakerTile(tradingMode.killSwitch, riskControls?.circuitBreakerState, !!riskControls);
   const modeView = plugAndPlayModeView(tradingMode); // Round 1 #11: the shared, aging answer, never this modal's last good read
   const [isLoading, setIsLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ text: string; type: 'info' | 'success' | 'error' } | null>(null);
@@ -402,15 +403,10 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
             </span>
           </div>
 
-          <div className="p-2.5 rounded-lg bg-slate-900/80 border border-slate-800">
-            <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-0.5">Circuit Breaker</span>
-            <span
-              className={`font-bold text-xs ${
-                riskControls?.circuitBreakerState === 'OPEN' ? 'text-rose-400' : riskControls?.circuitBreakerState === 'HALF_OPEN' ? 'text-amber-400' : 'text-emerald-400'
-              }`}
-            >
-              {riskControls?.circuitBreakerState === 'OPEN' ? 'TRIPPED (HALTED)' : riskControls?.circuitBreakerState === 'HALF_OPEN' ? 'RECOVERING (HALF-OPEN)' : riskControls ? 'NORMAL (ACTIVE)' : '—'}
-            </span>
+          <div className="p-2.5 rounded-lg bg-slate-900/80 border border-slate-800" data-testid="pnp-breaker-tile">
+            <span className="text-slate-400 block text-[10px] uppercase font-bold tracking-wider mb-0.5">Kill switch / breaker</span>
+            {/* R9-4: this tile was green "NORMAL (ACTIVE)" under the kill switch: it read the breaker only */}
+            <span className={`font-bold text-xs ${breakerTile.tone}`}>{breakerTile.text}</span>
           </div>
 
           <div className="p-2.5 rounded-lg bg-slate-900/80 border border-slate-800 flex items-center justify-between">
@@ -751,7 +747,10 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
             ) : (
               <button
                 onClick={() => setShowArmConfirmModal(true)}
-                className="px-5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs flex items-center space-x-1.5"
+                disabled={snipeBlocked !== null}
+                title={snipeBlocked ? 'KILL SWITCH ON: the server refuses to arm LIVE. Reset it from the header first.' : undefined}
+                data-testid="pnp-arm-live"
+                className="px-5 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold text-xs flex items-center space-x-1.5"
               >
                 <Play className="w-3.5 h-3.5 fill-current" />
                 <span>ARM LIVE TRADING</span>

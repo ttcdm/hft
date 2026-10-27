@@ -162,6 +162,12 @@ const SETTING_THRESHOLD = 'auto.confluenceThreshold';
 const SETTING_MODE = 'auto.mode';
 /** 3E: the last kill, `{ reason, ts }`, or null once an operator has set a trading mode again. Read back by `restorePersisted`. */
 const SETTING_KILL = 'auto.kill';
+/**
+ * A31/A71: the DEVNET_LIVE session's real-SOL spend, `{ startedAt, startingBankrollSol, buys, spentSol, positionIds }`. A DEVNET_LIVE session
+ * lasts SESSION_BUDGETS.maxDurationMs from its start, across mode changes, kills and restarts, so neither a setMode nor a restart hands out a
+ * fresh 0.02 SOL budget.
+ */
+const SETTING_LIVE_SESSION = 'auto.liveSession';
 /** 3E: `{ ts }` of the operator's last acknowledgement of the loss triggers; trades closed at or before it no longer count. */
 const SETTING_LOSS_ACK = 'auto.lossTriggerAck';
 /** 3E: how many of the latest auto-owned closed trades the expectancy and loss-streak triggers look at, across sessions. */
@@ -287,6 +293,43 @@ export class AutoSnipeController extends EventEmitter {
 
   /** S189: which kind of session the budget editor is talking to. A running (or SHADOW-downgraded) PAPER session is PAPER; anything else gets the real-SOL cap. */
   private sessionKind: 'PAPER' | 'DEVNET_LIVE' | null = null;
+  /** A31/A71: the current DEVNET_LIVE session, kept (and saved) after a mode change or a kill until its time is up. */
+  private liveSession: AutoSession | null = null;
+
+  /** A31/A71: save the DEVNET_LIVE session's spend. Called on every change; a failed write is logged (the in-memory figure still holds). */
+  private saveLiveSession(s: AutoSession | null): void {
+    if (!s || s !== this.liveSession) return;
+    const ok = workstationDb.setSetting(SETTING_LIVE_SESSION, { startedAt: s.startedAt, startingBankrollSol: s.startingBankrollSol, buys: s.buys, spentSol: s.spentSol, positionIds: s.positionIds });
+    if (!ok) Logger.error(`[AUTO] the DEVNET_LIVE session spend (${s.spentSol} SOL) could not be saved; a restart would not know it`);
+  }
+
+  /**
+   * A31/A71: the DEVNET_LIVE session to continue, if one started less than SESSION_BUDGETS.maxDurationMs ago: the one in memory, else the
+   * saved one. null when none is running (a new session starts). A saved value that cannot be read is treated as a full session (fail closed).
+   */
+  private continuedLiveSession(budgets: SessionBudgets, now: number): AutoSession | null {
+    const fresh = (startedAt: number) => now - startedAt < SESSION_BUDGETS.maxDurationMs;
+    // The saved row is the record (it is written on every change); the in-memory object is reused when it is that same session, so the
+    // worst-case figures waiting in unsettledBuys still settle against it.
+    const saved = workstationDb.getSetting<Record<string, unknown>>(SETTING_LIVE_SESSION);
+    if (!saved || typeof saved !== 'object') return null;
+    const startedAt = Number(saved.startedAt);
+    if (Number.isFinite(startedAt) && !fresh(startedAt)) return null;
+    if (this.liveSession && this.liveSession.startedAt === startedAt) return this.liveSession;
+    const num = (v: unknown, fallback: number) => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : fallback);
+    if (!Number.isFinite(startedAt)) {
+      Logger.warn('[AUTO] the saved DEVNET_LIVE session could not be read; its budget is treated as used until its time would be up');
+      return { startedAt: now, startingBankrollSol: 0, buys: budgets.maxBuys, spentSol: budgets.maxSpendSol, positionIds: [], budgets };
+    }
+    return {
+      startedAt,
+      startingBankrollSol: num(saved.startingBankrollSol, 0),
+      buys: num(saved.buys, budgets.maxBuys),
+      spentSol: num(saved.spentSol, budgets.maxSpendSol),
+      positionIds: Array.isArray(saved.positionIds) ? saved.positionIds.filter((x): x is string => typeof x === 'string') : [],
+      budgets,
+    };
+  }
   private spendCap(): { cap: number; kind: 'PAPER' | 'REAL'; note: string } {
     if (this.session && this.sessionKind === 'PAPER') {
       const cap = AutoSnipeController.maxPaperSessionSpendSol();
@@ -509,6 +552,12 @@ export class AutoSnipeController extends EventEmitter {
       // DEVNET_LIVE must not start buying again under it, nor reset the wallet baseline the halt was measured against.
       const halt = executionCoordinator.getHaltReason();
       if (halt) return { ok: false, mode: this.mode, error: `DEVNET_LIVE is refused: TRADING_HALTED: ${halt}. Look at why, then clear the halt (POST /api/auto/resume {clearHalt:true}) before setting DEVNET_LIVE.` };
+      // A31/A71: a session that has used its budget is not restarted by setting the mode again; it ends when its time is up.
+      const liveBudgets: SessionBudgets = this.budgetOverride ? { ...SESSION_BUDGETS, ...this.budgetOverride } : { ...SESSION_BUDGETS };
+      const cont = this.continuedLiveSession(liveBudgets, Date.now());
+      if (cont && (cont.buys >= liveBudgets.maxBuys || cont.spentSol + this.orderSol() > liveBudgets.maxSpendSol + 1e-9)) {
+        return { ok: false, mode: this.mode, error: `DEVNET_LIVE is refused: SESSION_BUDGET_USED: the DEVNET_LIVE session started ${new Date(cont.startedAt).toISOString()} has ${cont.buys} buy(s) and ${cont.spentSol.toFixed(6)} SOL spent of ${liveBudgets.maxBuys} buys / ${liveBudgets.maxSpendSol} SOL; it ends at ${new Date(cont.startedAt + SESSION_BUDGETS.maxDurationMs).toISOString()}. Setting the mode again does not reset it.` };
+      }
       try {
         await assertClusterAllowed(executionCoordinator.getConnection());
       } catch (e: any) {
@@ -544,7 +593,20 @@ export class AutoSnipeController extends EventEmitter {
         : { ...SESSION_BUDGETS };
       // S181: the operator's saved budget (buys and spend) replaces the defaults; loss and time limits stay fixed.
       const budgets: SessionBudgets = this.budgetOverride ? { ...base, ...this.budgetOverride } : base;
-      this.session = { startedAt: Date.now(), startingBankrollSol: bankroll, buys: 0, spentSol: 0, positionIds: [], budgets };
+      const now = Date.now();
+      const continued = next === 'DEVNET_LIVE' ? this.continuedLiveSession(budgets, now) : null;
+      if (continued) {
+        // A31/A71: same session (it started less than 4 h ago): its spend, buys and positions carry on; only the budgets in force are re-read.
+        continued.budgets = budgets;
+        if (continued.startingBankrollSol <= 0) continued.startingBankrollSol = bankroll;
+        this.session = continued;
+        this.liveSession = continued;
+        workstationDb.logDecision({ autoMode: next, mint: '-', stage: 'budget', outcome: 'INFO', reason: `DEVNET_LIVE continues the session started ${new Date(continued.startedAt).toISOString()}: ${continued.buys} buy(s), ${continued.spentSol.toFixed(6)} SOL spent so far` });
+      } else {
+        this.session = { startedAt: now, startingBankrollSol: bankroll, buys: 0, spentSol: 0, positionIds: [], budgets };
+        if (next === 'DEVNET_LIVE') this.liveSession = this.session;
+      }
+      this.saveLiveSession(this.session);
       this.sessionKind = next;
     } else {
       this.session = null;
@@ -1050,6 +1112,7 @@ export class AutoSnipeController extends EventEmitter {
           const countedSol = startOrderSol * (1 + (params.slippagePct ?? 0) / 100) + (CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS + PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS) / 1e9;
           startSession.spentSol += countedSol;
           if (startMode === 'DEVNET_LIVE') this.unsettledBuys.push({ session: startSession, mint: c.mint, sinceTs: startTs, countedSol });
+          this.saveLiveSession(startSession);
           workstationDb.logDecision({ autoMode: startMode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'budget', outcome: 'INFO', reason: `counted ${countedSol.toFixed(6)} SOL against the session cap: the buy was sent and may have landed`, inputs: watchInputs });
         }
         retryable = RETRYABLE_REJECTION.test(res.message || '');
@@ -1065,6 +1128,7 @@ export class AutoSnipeController extends EventEmitter {
         startSession.spentSol += journaled ?? (res.amountSol ?? 0) + (res.feesPaidLamports ?? 0) / 1e9
           + (startMode === 'DEVNET_LIVE' ? (CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS + PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS) / 1e9 : 0);
         if (res.positionId) startSession.positionIds.push(res.positionId);
+        this.saveLiveSession(startSession);
       }
       const feesSol = (res.feesPaidLamports ?? 0) / 1e9;
       // Q7: a PAPER fill priced by the flat model (the curve could not be read) is not evidence of what a real fill would cost
@@ -1111,10 +1175,11 @@ export class AutoSnipeController extends EventEmitter {
    */
   private settleUnresolvedSpend(): void {
     this.unsettledBuys = this.unsettledBuys.filter((u) => {
-      if (u.session !== this.session) return false; // a later session starts from 0
+      if (u.session !== this.session && u.session !== this.liveSession) return false; // a later session starts from 0
       const spent = this.journaledBuySpendSol(u.mint, u.sinceTs);
       if (spent === null) return true;
       u.session.spentSol += spent - u.countedSol;
+      this.saveLiveSession(u.session);
       return false;
     });
   }

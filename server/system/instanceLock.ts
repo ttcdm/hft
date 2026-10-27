@@ -15,8 +15,8 @@
  * as "this process" or as dead here. In the same host and pid namespace (`pidNs`, LOCK_PID_NAMESPACE) the pid decides, as it did for
  * host processes: a lock whose pid is alive (and is not this process) is refused, any other is stale and taken over at once. Elsewhere,
  * with no fresh heartbeat, the pid decides the same way. A pid that was reused by an unrelated process reads as alive: the refusal
- * message names the file so the operator can remove it. Every write is atomic (a temp file, then link or rename), so no reader sees a
- * half-written lock (round 1 #23).
+ * message names the file so the operator can remove it. A lock is created atomically (a temp file, then a hard link), so it never
+ * exists empty (round 1 #23); it is rewritten in place (see `rewriteHeld`), and a reader that catches a rewrite half done reads again.
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -84,13 +84,31 @@ export function isPidAlive(pid: number): boolean {
   }
 }
 
+/** How often a lock that does not parse is read again before it counts as stale: a rewrite in place (rewriteHeld) can be caught half done. */
+const TORN_READ_RETRIES = 3;
+const TORN_READ_WAIT_MS = 5;
+
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 export function readLock(lockPath: string): LockInfo | null {
-  try {
-    const j = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-    return j && typeof j.pid === 'number' ? (j as LockInfo) : { pid: -1, startedAt: 0 };
-  } catch (e: any) {
-    if (e?.code === 'ENOENT') return null;
-    return { pid: -1, startedAt: 0 }; // unreadable or half-written: treated as stale
+  for (let attempt = 0; ; attempt++) {
+    let raw: string;
+    try {
+      raw = fs.readFileSync(lockPath, 'utf8');
+    } catch (e: any) {
+      if (e?.code === 'ENOENT') return null;
+      return { pid: -1, startedAt: 0 }; // unreadable: treated as stale
+    }
+    try {
+      const j = JSON.parse(raw);
+      return j && typeof j.pid === 'number' ? (j as LockInfo) : { pid: -1, startedAt: 0 };
+    } catch {
+      // Half written (a holder's rewrite in progress), or left half written by a crash: read again, then treat it as stale.
+      if (attempt >= TORN_READ_RETRIES) return { pid: -1, startedAt: 0 };
+      sleepSync(TORN_READ_WAIT_MS);
+    }
   }
 }
 
@@ -120,11 +138,23 @@ const held = new Map<string, LockInfo>();
 let exitHooked = false;
 let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
-/** Writes `info` to `lockPath` atomically (temp file in the same directory, then rename over it). */
-function writeAtomic(lockPath: string, info: LockInfo): void {
-  const tmp = `${lockPath}.${LOCK_BOOT_ID}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(info), { mode: 0o600 });
-  fs.renameSync(tmp, lockPath);
+/**
+ * Rewrites a lock this process holds, in place: the new content over the old from offset 0, then the file cut to its length, so it is
+ * never empty. Not a temp file renamed over it: on a FUSE mount with delayed write-back (rclone; the cloud devnet harness keeps its scratch
+ * database, and so `<db>.lock`, on one), a rename over the lock followed by the unlink at release made rclone upload the lock's FIRST
+ * version again about 5 s after the release. The file came back naming this live pid, and the next process on that database exited
+ * INSTANCE_LOCKED (devnet run 2026-10-27, step (f), the crash child). In-place writes do not bring it back. 'r+' never creates the file,
+ * so a lock removed by hand is not re-created. A reader that catches the write half done (new bytes, then old) reads again (readLock).
+ */
+function rewriteHeld(lockPath: string, info: LockInfo): void {
+  const buf = Buffer.from(JSON.stringify(info));
+  const fd = fs.openSync(lockPath, 'r+');
+  try {
+    fs.writeSync(fd, buf, 0, buf.length, 0);
+    fs.ftruncateSync(fd, buf.length);
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 /**
@@ -140,7 +170,7 @@ export function heartbeatHeldLocks(now: number = Date.now()): void {
         continue;
       }
       const next = { ...info, heartbeatAt: now };
-      writeAtomic(lockPath, next);
+      rewriteHeld(lockPath, next);
       held.set(lockPath, next);
     } catch (e: any) {
       console.error(`[INSTANCE LOCK] heartbeat of ${lockPath} failed: ${e?.message ?? e}`);
@@ -255,7 +285,7 @@ export function updateHeldLock(lockPath: string, extra: Partial<Omit<LockInfo, '
   const mine = held.get(lockPath);
   if (!mine) return;
   const next = { ...mine, ...extra, heartbeatAt: Date.now() };
-  writeAtomic(lockPath, next);
+  rewriteHeld(lockPath, next);
   held.set(lockPath, next);
 }
 

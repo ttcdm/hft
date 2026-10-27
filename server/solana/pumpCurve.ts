@@ -17,6 +17,7 @@ import { expectedGenesisHash } from './clusterGuard';
 import { Logger } from '../middleware/enterprise';
 import { executionConfig } from './executionConfig';
 import { ExecutionMode, TriState } from '../core/types';
+import { classifyHolder, defaultHolderFunderSource, type HolderClass, type HolderFunderSource } from '../signals/holderCluster';
 
 export type { ExecutionMode };
 
@@ -412,16 +413,46 @@ export interface TokenHolderDistribution {
   nonBondingCirculatingSupply: bigint;
   bondingCurveBalance: bigint;
   creatorBalance: bigint;
+  /** R2-3: large holders whose owner the funder lookups tie to the creator (CREATOR_CLUSTER, or a non-ATA account of the creator). In devHoldingPct. */
+  creatorClusterBalance: bigint;
+  /** R2-3: large holders whose owner or funding is not known (UNKNOWN). Counted together as one holder in top10HoldersPct. */
+  unknownHolderBalance: bigint;
   top10HoldersPct: number;
+  /** The creator's own accounts plus its funder cluster (R2-3), as a share of total supply. */
   devHoldingPct: number;
-  topHolders: Array<{ address: string; amount: bigint; pct: number }>;
+  topHolders: Array<{ address: string; amount: bigint; pct: number; owner?: string | null; holderClass?: HolderClass | 'CREATOR_ATA' }>;
 }
 
+/** R2-3: the owner of each token account (bytes 32..64 of the SPL / Token-2022 account), one getMultipleAccountsInfo; null where unreadable. */
+async function tokenAccountOwners(connection: Connection, accounts: PublicKey[]): Promise<Array<string | null>> {
+  if (accounts.length === 0) return [];
+  try {
+    if (typeof (connection as any).getMultipleAccountsInfo !== 'function') return accounts.map(() => null);
+    const infos = await connection.getMultipleAccountsInfo(accounts, 'confirmed');
+    return accounts.map((_, i) => {
+      const d = infos?.[i]?.data;
+      return d && d.length >= 64 ? new PublicKey(d.subarray(32, 64)).toBase58() : null;
+    });
+  } catch (err: any) {
+    Logger.warn(`holder owners for the holder gate could not be read (${err?.message || err}); every large holder counts as unknown`);
+    return accounts.map(() => null);
+  }
+}
+
+/**
+ * The holder gate's facts: creator holding and top-10 concentration, as shares of the total supply.
+ * R2-3: each large non-curve account's owner is read (one getMultipleAccountsInfo over at most 20 accounts) and classified by the funder
+ * lookups' knowledge (`holderFunders`, default the watch window, see server/signals/holderCluster.ts). Holdings the creator's funder cluster
+ * owns count in devHoldingPct with the creator's own. Fail closed for LIVE: a holder whose owner or funding is unknown is never taken as
+ * independent; all unknown holders together count as ONE holder in the top-10 figure (so 40 unknown wallets at 1.8% read as 36% of the top
+ * 20 accounts, not 18%).
+ */
 export async function fetchTokenHolderDistribution(
   connection: Connection,
   mint: PublicKey,
   creator?: PublicKey,
-  bondingCurve?: PublicKey
+  bondingCurve?: PublicKey,
+  holderFunders: HolderFunderSource = defaultHolderFunderSource
 ): Promise<TokenHolderDistribution> {
   const largestAccountsRes = await connection.getTokenLargestAccounts(mint);
   const largestAccounts = largestAccountsRes.value || [];
@@ -520,25 +551,38 @@ export async function fetchTokenHolderDistribution(
     }
   }
 
-  // C1: concentration is a share of TOTAL supply. The bonding curve and the
-  // creator are excluded from the top-10 list (creator is scored via devHoldingPct).
-  const holderAddrs = new Set<string>(creatorAddrsForExclusion);
-  const top10Accounts = nonCurveAccounts.filter((acc) => !holderAddrs.has(acc.address.toBase58())).slice(0, 10);
-  const top10Amount = top10Accounts.reduce((sum, acc) => sum + BigInt(acc.amount), 0n);
+  // R2-3: classify every other large holder by its owner's funding (one owner read for all of them)
+  const insiders = new Set<string>(creator ? [creator.toBase58()] : []);
+  const others = nonCurveAccounts.filter((acc) => !creatorAddrsForExclusion.has(acc.address.toBase58()));
+  const owners = await tokenAccountOwners(connection, others.map((acc) => acc.address));
+  const classOf = new Map<string, { owner: string | null; cls: HolderClass }>();
+  others.forEach((acc, i) => classOf.set(acc.address.toBase58(), { owner: owners[i], cls: classifyHolder(owners[i], insiders, holderFunders) }));
+  let creatorClusterBalance = 0n, unknownHolderBalance = 0n;
+  const independent: bigint[] = [];
+  for (const acc of others) {
+    const amt = BigInt(acc.amount);
+    const c = classOf.get(acc.address.toBase58())!.cls;
+    if (c === 'CREATOR' || c === 'CREATOR_CLUSTER') creatorClusterBalance += amt;
+    else if (c === 'UNKNOWN') unknownHolderBalance += amt;
+    else independent.push(amt);
+  }
+
+  // C1: concentration is a share of TOTAL supply. The bonding curve and the creator's cluster are excluded from the top-10 list (they are
+  // scored via devHoldingPct). R2-3: the unknown holders are one entry in it, summed.
+  const entries = [...independent, ...(unknownHolderBalance > 0n ? [unknownHolderBalance] : [])].sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
+  const top10Amount = entries.slice(0, 10).reduce((sum, v) => sum + v, 0n);
   const pctOfTotal = (amt: bigint) =>
     totalSupply > 0n ? Number(((Number(amt) / Number(totalSupply)) * 100).toFixed(2)) : 0;
   const top10HoldersPct = pctOfTotal(top10Amount);
 
-  const devHoldingPct = pctOfTotal(creatorBalance);
+  const devHoldingPct = pctOfTotal(creatorBalance + creatorClusterBalance);
 
   const topHolders = nonCurveAccounts.map((acc) => {
     const amountBig = BigInt(acc.amount);
     const pct = pctOfTotal(amountBig);
-    return {
-      address: acc.address.toBase58(),
-      amount: amountBig,
-      pct,
-    };
+    const address = acc.address.toBase58();
+    const c = classOf.get(address);
+    return { address, amount: amountBig, pct, owner: c ? c.owner : creator?.toBase58() ?? null, holderClass: c ? c.cls : ('CREATOR_ATA' as const) };
   });
 
   return {
@@ -547,6 +591,8 @@ export async function fetchTokenHolderDistribution(
     nonBondingCirculatingSupply,
     bondingCurveBalance,
     creatorBalance,
+    creatorClusterBalance,
+    unknownHolderBalance,
     top10HoldersPct,
     devHoldingPct,
     topHolders,

@@ -481,7 +481,7 @@ export const NOT_REPLAYED = {
     'Failed or reverted transactions: every buy and sell lands (no revert on slippage, no failed send)',
     'Risk limits, capital sizing and the one-position cap: every release is bought',
     'Mint and freeze authority: not recorded (live reads them from the curve at the buy)',
-    'The coordinator\'s eligibility filter reads holder concentration from an RPC holder query; the replay applies only the dev-holding gate, from the recorded trades',
+    'The coordinator\'s eligibility filter reads holder concentration from an RPC holder query and counts the creator\'s funder cluster (R2-3); the replay applies only the dev-holding gate, from the recorded trades, over the creator and create signer',
   ],
   pessimistic: [
     'The tip is charged on every transaction; a straight-to-RPC send (Jito unset) pays none',

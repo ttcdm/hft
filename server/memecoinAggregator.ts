@@ -15,6 +15,7 @@ import { ConfluenceEngine, isConfluencePassed } from './signals/confluenceEngine
 import { getConfluenceThreshold } from './signals/confluenceThreshold';
 import { curveVelocityEvaluator } from './signals/curveVelocityEvaluator';
 import { checkSnipeAmountSol } from './execution/snipeAmount';
+import { lossTriggerHits, LOSS_TRIGGER_ACK_SETTING, LOSS_TRIGGER_TRADES } from './auto/killSwitch';
 
 const INITIAL_POOLS: MemecoinPool[] = [
   {
@@ -491,6 +492,33 @@ export class MemecoinAggregatorService extends EventEmitter {
     };
   }
 
+  /**
+   * R8-8: why a LIVE buy is refused on recent results, or null. (1) NEGATIVE_EXPECTANCY / LOSS_STREAK over the last LOSS_TRIGGER_TRADES LIVE
+   * closed trades (manual and auto) since the operator's last acknowledgement, with auto's thresholds; cleared by
+   * POST /api/auto/resume {ackLossTriggers:true}, as for auto. (2) Past the cold start, a raw Kelly at or below zero over the last
+   * CapitalSizer.KELLY_RECENT_WINDOW closed LIVE trades.
+   */
+  private recentEvidenceRefusal(lifetimeTradeCount: number): string | null {
+    const ack = workstationDb.getSetting<{ ts?: unknown }>(LOSS_TRIGGER_ACK_SETTING);
+    const ackTs = ack && typeof ack === 'object' && typeof ack.ts === 'number' && Number.isFinite(ack.ts) ? ack.ts : null;
+    const evidence = workstationDb.loadEvidenceClosedTrades('LIVE')
+      .filter((p) => ackTs === null || (p.lastUpdatedTimestamp ?? 0) > ackTs)
+      .slice(-LOSS_TRIGGER_TRADES)
+      .map((p) => p.realizedPnLSol ?? 0);
+    const hits = lossTriggerHits(evidence);
+    if (hits.length > 0) {
+      return `REJECTED: LOSS_TRIGGERS: ${hits.map((h) => `${h.code} (${h.message})`).join('; ')}, over the last LIVE trades (manual and auto). Check them, then acknowledge with POST /api/auto/resume {ackLossTriggers:true}; trades closed before that no longer count.`;
+    }
+    if (lifetimeTradeCount >= CapitalSizer.SHRINKAGE_PRIOR_WEIGHT) {
+      const recent = CapitalSizer.getHistoricalTradeStats('LIVE', { lastN: CapitalSizer.KELLY_RECENT_WINDOW });
+      const kelly = CapitalSizer.calculateRawKelly(recent.winRate, recent.winLossRatio);
+      if (!(kelly > 0)) {
+        return `REJECTED: Capital sizing failed (NEGATIVE_RECENT_EXPECTANCY: raw Kelly ${kelly.toFixed(4)} over the last ${recent.tradeCount} closed LIVE trades, win rate ${(recent.winRate * 100).toFixed(1)}%, payoff ${recent.winLossRatio.toFixed(2)})`;
+      }
+    }
+    return null;
+  }
+
   // Execution routed STRICTLY through authoritative ExecutionCoordinator
   public async executeSnipe(params: {
     contractAddress: string;
@@ -580,6 +608,12 @@ export class MemecoinAggregatorService extends EventEmitter {
         message: `REJECTED: Capital sizing failed (${sizingResult.rejectionReason})`,
         txHash: '',
       };
+    }
+    if (executionMode === 'LIVE') {
+      // R8-8: manual LIVE had no expectancy or loss-streak check (auto's triggers run only inside auto) and Kelly approval read the lifetime
+      // figures only. Both are refusals here, for every LIVE buy: they add a reason to refuse and never approve anything the checks above refuse.
+      const recentRefusal = this.recentEvidenceRefusal(historicalStats.tradeCount);
+      if (recentRefusal) return { success: false, message: recentRefusal, txHash: '' };
     }
 
     // A LIVE buy sized against a bankroll with nothing spendable would skip the 10% cap below (it only applies when spendable > 0)

@@ -20,6 +20,11 @@ export const WALLET_AUDIT_GROSS_TOLERANCE = 0.05;
  */
 export const WALLET_AUDIT_RENT_ALLOWANCE_SOL = 0.0025;
 
+/** 3E: `app_settings` key of the operator's last acknowledgement of the loss triggers, `{ ts }`; trades closed at or before it no longer count. */
+export const LOSS_TRIGGER_ACK_SETTING = 'auto.lossTriggerAck';
+/** 3E: how many of the latest closed trades the expectancy and loss-streak triggers look at. */
+export const LOSS_TRIGGER_TRADES = Math.max(EXPECTANCY_WINDOW, MAX_CONSECUTIVE_LOSSES);
+
 export interface KillTrigger {
   code: string;
   message: string;
@@ -125,4 +130,14 @@ export function auditWalletChange(
   const pendingSol = unresolved.count > 0 ? unresolved.worstCaseSol + WALLET_AUDIT_RENT_ALLOWANCE_SOL * unresolved.count : 0;
   const held = pendingSol > 0 && -unexplainedSol <= pendingSol + toleranceSol;
   return { explained: held, unexplainedSol, toleranceSol, heldByUnresolved: held, inflowSol: 0 };
+}
+
+/**
+ * R8-8: the two triggers that judge trade results (NEGATIVE_EXPECTANCY, LOSS_STREAK), with the same thresholds as auto, over net PnL per
+ * closed trade, oldest first. Used as a refusal for every LIVE buy (manual included), where auto uses them to drop to SHADOW.
+ */
+export function lossTriggerHits(closedNetPnlSol: number[]): KillTrigger[] {
+  return evaluateKillTriggers({
+    mode: 'PAPER', closedNetPnlSol, dailyTotalPnlSol: 0, maxDailyLossSol: 0, slippageBreaches: 0, readinessRed: [], walletSol: null, reserveSol: 0, maxTradeSol: 0,
+  }).filter((h) => h.code === 'NEGATIVE_EXPECTANCY' || h.code === 'LOSS_STREAK');
 }

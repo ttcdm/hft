@@ -12,7 +12,7 @@ import { allowedCluster, assertClusterAllowed } from '../solana/clusterGuard';
 import { Logger } from '../middleware/enterprise';
 import type { SignalProvenance } from '../core/types';
 import { computeJournalStats, autoEvidencePnl, type JournalStatsReport } from './journalStats';
-import { evaluateKillTriggers, auditWalletChange, EXPECTANCY_WINDOW, MAX_CONSECUTIVE_LOSSES, type KillTrigger } from './killSwitch';
+import { evaluateKillTriggers, auditWalletChange, LOSS_TRIGGER_ACK_SETTING, LOSS_TRIGGER_TRADES as LOSS_TRIGGER_TRADES_ALL, type KillTrigger } from './killSwitch';
 import { riskEngine, PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS } from '../risk/riskEngine';
 import { watchWindow, readyGate, type WatchResult, type WatchVerdict } from '../signals/watchWindow';
 import { checkConfluenceThreshold, getConfluenceThreshold, setConfluenceThreshold, confluenceThresholdInfo, CONFLUENCE_DEVNET_LIVE_FLOOR, type ConfluenceThresholdInfo } from '../signals/confluenceThreshold';
@@ -187,10 +187,10 @@ const SETTING_KILL = 'auto.kill';
  * fresh 0.02 SOL budget.
  */
 const SETTING_LIVE_SESSION = 'auto.liveSession';
-/** 3E: `{ ts }` of the operator's last acknowledgement of the loss triggers; trades closed at or before it no longer count. */
-const SETTING_LOSS_ACK = 'auto.lossTriggerAck';
+/** 3E: `{ ts }` of the operator's last acknowledgement of the loss triggers; trades closed at or before it no longer count (R8-8: manual LIVE too). */
+const SETTING_LOSS_ACK = LOSS_TRIGGER_ACK_SETTING;
 /** 3E: how many of the latest auto-owned closed trades the expectancy and loss-streak triggers look at, across sessions. */
-export const LOSS_TRIGGER_TRADES = Math.max(EXPECTANCY_WINDOW, MAX_CONSECUTIVE_LOSSES);
+export const LOSS_TRIGGER_TRADES = LOSS_TRIGGER_TRADES_ALL;
 /** 3E: the triggers that judge trade results, and so need an operator acknowledgement before auto may buy again. */
 const LOSS_TRIGGER_CODES = new Set(['NEGATIVE_EXPECTANCY', 'LOSS_STREAK']);
 /** S189: how long readiness must stay green before a PAPER session downgraded by READINESS_RED is put back. */

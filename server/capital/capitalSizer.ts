@@ -50,6 +50,12 @@ export class CapitalSizer {
   public static readonly DEFAULT_MAX_CAPITAL_PCT_CEILING = 0.10;
   public static readonly DEFAULT_FRACTION_MULTIPLIER = 0.25;
   public static readonly SHRINKAGE_PRIOR_WEIGHT = 25;
+  /**
+   * R8-8: the recent window for Kelly approval. A LIVE buy past the cold start needs a positive raw Kelly over the whole history (as before)
+   * AND over the last KELLY_RECENT_WINDOW closed trades, so a recent losing run refuses buys before the lifetime figures turn. 25 is the
+   * cold-start length (SHRINKAGE_PRIOR_WEIGHT): the window is full the moment the lifetime check starts to apply. It only adds a refusal.
+   */
+  public static readonly KELLY_RECENT_WINDOW = 25;
 
   /**
    * Calculates spendable bankroll:
@@ -90,10 +96,12 @@ export class CapitalSizer {
    * Queries closed positions from SQLite to derive historical performance stats.
    * If insufficient trade history exists, provides a conservative prior.
    */
-  public static getHistoricalTradeStats(mode?: ExecutionMode): HistoricalTradeStats {
+  public static getHistoricalTradeStats(mode?: ExecutionMode, opts: { lastN?: number } = {}): HistoricalTradeStats {
     try {
       // G3: paper fills with an unverified gate are not evidence of an edge and are left out of win rate and payoff
-      const closed = workstationDb.loadEvidenceClosedTrades(mode);
+      const all = workstationDb.loadEvidenceClosedTrades(mode);
+      // R8-8: `lastN` keeps only the most recent closed trades (the list is oldest first), for the recent-window Kelly check
+      const closed = opts.lastN !== undefined && opts.lastN > 0 ? all.slice(-opts.lastN) : all;
       if (closed.length === 0) {
         return {
           tradeCount: 0,

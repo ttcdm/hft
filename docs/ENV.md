@@ -14,7 +14,7 @@ Values are read as strings. Booleans mean the exact text `true` unless the row s
 | `SOLANA_RPC_URL` | `https://api.devnet.solana.com` | `server/solana/clusterGuard.ts` | A devnet URL or a loopback URL. A URL that names mainnet is replaced by the devnet default. Never commit one with an API key in it. |
 | `ALLOW_LIVE_REAL_MONEY_TRADING` | off (anything but `true`) | `server/execution/coordinator.ts`, `server/solana/readOnly.ts` | Leave `false`. Only the devnet harness sets it, in-process, after checking the genesis hash. Read-only mode refuses to start with it on. |
 | `APEX_READ_ONLY` | off | `server/solana/readOnly.ts` | `true` for watch-only mode. Startup refuses if any signing key is configured. |
-| `OPERATOR_AUTH_TOKEN` | none: a volatile token is generated at start | `server/middleware/auth.ts` | 16+ characters, `openssl rand -hex 32`. Never commit it. |
+| `OPERATOR_AUTH_TOKEN` | none: a volatile token is generated at start | `server/middleware/auth.ts` | 16+ characters, `openssl rand -hex 32`. Never commit it. A shorter value is ignored, with a boot warning that says so. The token (and the volatile one) never expires; a logout or `/api/auth/rotate` revokes it. With neither this nor `OPERATOR_PASSWORD` set, boot warns that the volatile token is the only way in. |
 | `OPERATOR_PASSWORD` | none (password login off) | `server/middleware/auth.ts` | Optional. Enables password login that returns a session token. |
 | `SIGNER_KEYPAIR_PATH` | `.apex_trading_keypair.json` in the working directory | `server/middleware/filePermissions.ts`, `server/solana/signer.ts` | A throwaway devnet key, mode 0600. |
 | `OPERATOR_PRIVATE_KEY` | none | `server/solana/signer.ts` | Overrides the keypair file. Better left unset. Throwaway devnet key only. |

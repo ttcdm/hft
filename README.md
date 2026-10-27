@@ -89,7 +89,7 @@ cp .env.example .env
 
 Key environment variables. [`docs/ENV.md`](docs/ENV.md) lists every variable the server reads, with defaults and devnet-safe values (a test keeps it in step with the code); `.env.example` is the starting file:
 - `PORT=3000`, `BIND_HOST` / `ALLOW_PUBLIC_BIND`: port and bind address (loopback by default)
-- `OPERATOR_AUTH_TOKEN`: operator API token (min 16 characters; `openssl rand -hex 32`). If unset, a volatile token is generated and printed at startup. Never commit it. `OPERATOR_PASSWORD` optionally enables password login.
+- `OPERATOR_AUTH_TOKEN`: operator API token (min 16 characters; `openssl rand -hex 32`). If unset (or shorter than 16 characters, which is ignored with a boot warning), a volatile token is generated and printed at startup (not printed in a container). The primary token never expires; a restart or a rotate replaces it. Never commit it. `OPERATOR_PASSWORD` optionally enables password login.
 - `ALLOWED_CLUSTER`: `devnet` (default) or `localnet` (with `LOCALNET_GENESIS_HASH`). LIVE arming, trading and sending on mainnet are refused. `mainnet-beta` is accepted only so a read-only server can watch mainnet.
 - `SOLANA_RPC_URL`: `https://api.devnet.solana.com` or a loopback URL for a local validator. The websocket address is derived from it; `SOLANA_WS_URL` is not read by the server.
 - `ALLOW_LIVE_REAL_MONEY_TRADING`: leave `false`; only the devnet harness sets it, in-process, after checking the genesis hash.

@@ -136,7 +136,7 @@ export function ConfluenceThresholdEditor({ confluence, onSave, busy }: { conflu
       </div>
       {!parsed.ok && <p className="text-rose-400 mt-0.5" data-testid="confluence-problem">{parsed.reason}</p>}
       {warning && <p className="text-amber-300 mt-0.5" data-testid="confluence-warning">{warning}</p>}
-      <p className="text-slate-600 mt-0.5">One value for the watch window and the buy gate (manual snipes too). {confluence.source === 'operator' ? `Default is ${confluence.defaultValue}.` : confluence.source === 'env' ? `Set by CONFLUENCE_MIN_SCORE (${confluence.defaultValue}).` : 'Default.'} Kept until the server restarts.</p>
+      <p className="text-slate-600 mt-0.5">One value for the watch window and the buy gate (manual snipes too). {confluence.source === 'operator' ? `Default is ${confluence.defaultValue}.` : confluence.source === 'env' ? `Set by CONFLUENCE_MIN_SCORE (${confluence.defaultValue}).` : 'Default.'} Saved on the server: a restart keeps it (it does not go back to the default).</p>
     </div>
   );
 }

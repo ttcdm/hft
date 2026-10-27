@@ -422,7 +422,14 @@ async function main() {
       emergencyStop: (await import('../server/execution/emergencyStop')).emergencyStop,
       setKillSwitch: (on) => riskEngine.setKillSwitch(on),
       arm: (a, code) => coordinator.armLiveTrading(a, code),
-      auto: (await import('../server/auto/controller')).autoSnipeController as any,
+      auto: await (async () => {
+        const { autoSnipeController: a, AutoSnipeController: A } = await import('../server/auto/controller');
+        // the controller itself, plus the static real-SOL session cap the budget route checks against ((e''') raises a used budget)
+        return {
+          setMode: a.setMode.bind(a), getStatus: a.getStatus.bind(a), submitCandidate: a.submitCandidate.bind(a), setBudget: a.setBudget.bind(a),
+          maxSessionSpendSol: () => A.maxSessionSpendSol(),
+        } as any;
+      })(),
     },
   };
   stepsRef = steps;

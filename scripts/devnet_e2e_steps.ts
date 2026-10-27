@@ -115,6 +115,10 @@ export interface HarnessSteps {
       setMode(mode: 'OFF' | 'SHADOW' | 'PAPER' | 'DEVNET_LIVE', opts?: { confirmationCode?: string }): Promise<{ ok: boolean; mode: string; error?: string }>;
       getStatus(): { mode: string; killed: boolean };
       submitCandidate(c: { mint: string; source: 'TEST'; provenance?: 'REAL_ONCHAIN' }): Promise<{ outcome: string; reason: string }>;
+      /** What POST /api/auto/budget runs (A31/A71: the way an operator lets a used DEVNET_LIVE session buy more). */
+      setBudget?(b: { maxBuys: number; maxSpendSol: number }): { ok: boolean; reason?: string };
+      /** The real-SOL session spend cap the budget route allows (AutoSnipeController.maxSessionSpendSol). */
+      maxSessionSpendSol?(): number;
     };
   };
 }
@@ -340,7 +344,16 @@ export async function emergencyStopThroughApp(s: HarnessSteps): Promise<void> {
     await s.coordinator.syncRealWalletBalance();
     const buy = await s.coordinator.executeTrade(await s.buildBuyRequest());
     s.rec(`${L}: LIVE buy CONFIRMED`, buy.success && buy.lifecycleState === 'CONFIRMED', `${buy.lifecycleState} ${buy.error ?? ''} ${buy.txSignature ? s.link(buy.txSignature) : ''}`.slice(0, 300));
-    const live = await st.auto.setMode('DEVNET_LIVE', { confirmationCode: 'CONFIRM_AUTO_DEVNET' });
+    let live = await st.auto.setMode('DEVNET_LIVE', { confirmationCode: 'CONFIRM_AUTO_DEVNET' });
+    if (!live.ok && /SESSION_BUDGET_USED/.test(live.error ?? '') && st.auto.setBudget) {
+      // A31/A71: (m) earlier in this run (or a run within the last 4 h on this scratch DB) used the DEVNET_LIVE session's budget, and setting
+      // the mode again no longer resets it. This step only needs auto running to prove the panic stops it, so it raises the session budget
+      // through the operator's own budget route (POST /api/auto/budget) to the real-SOL cap, as an operator would, and says so.
+      const cap = st.auto.maxSessionSpendSol?.() ?? 0;
+      const b = st.auto.setBudget({ maxBuys: 50, maxSpendSol: Number(cap.toFixed(6)) });
+      console.log(`INFO  ${L}: the DEVNET_LIVE session budget was used earlier (${live.error?.slice(0, 120)}); raised it through the budget route: ${b.ok ? 'ok' : b.reason}`);
+      live = await st.auto.setMode('DEVNET_LIVE', { confirmationCode: 'CONFIRM_AUTO_DEVNET' });
+    }
     s.rec(`${L}: auto DEVNET_LIVE set`, live.ok, live.error || live.mode);
 
     const sellsBefore = new Set(s.db.loadTransactions().filter((t) => t.direction === 'SELL').map((t) => t.signature));

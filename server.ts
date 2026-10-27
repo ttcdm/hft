@@ -1411,18 +1411,29 @@ app.post('/api/execution/kill-switch', requireOperatorAuth, asyncHandler(async (
 
 app.post('/api/execution/trade', requireOperatorAuth, requireLiveConfirmation, validateTradeBody(OperatorExecuteTradeSchema), asyncHandler(async (req, res) => {
   try {
-    // Provenance and source are set here. A client cannot choose them (the schema rejects them).
-    const result = await executionCoordinator.executeTrade({
-      ...req.body,
+    // R5-40: through executeSnipe, so this route runs the gates every other manual buy runs (confluence, pool checks, sizing refusals,
+    // no synthetic pool). The pool supplies price, liquidity, symbol and name; the client's are not used. Provenance and source are set
+    // here (the schema rejects client ones). The mode is read before any await and sent with the order, so a LIVE arm in between is
+    // refused MODE_CHANGED. The reply is the coordinator's result when the order reached it, as before.
+    const { mint, amountSol, slippageBps, jitoTipSol } = req.body;
+    const result = await memecoinAggregator.executeSnipe({
+      contractAddress: mint,
+      amountUsd: 0,
+      operatorAmountSol: amountSol,
+      slippagePct: slippageBps !== undefined ? slippageBps / 100 : undefined,
+      jitoTipSol,
+      provenance: OPERATOR_PROVENANCE,
       source: 'MANUAL',
       // The operator's request is the signal (K4a). The schema rejects a client-supplied signalTimestamp.
       signalTimestamp: Date.now(),
-      provenance: OPERATOR_PROVENANCE,
+      expectedMode: executionCoordinator.getExecutionMode(),
+      noSyntheticPool: true,
     });
-    if (!result.success) {
-      return res.status(400).json(result);
+    const body = result.execResult ?? { success: false, error: result.message };
+    if (!body.success) {
+      return res.status(400).json(body);
     }
-    res.json(result);
+    res.json(body);
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }

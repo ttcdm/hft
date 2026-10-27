@@ -390,7 +390,8 @@ export class MemecoinAggregatorService extends EventEmitter {
   // Canonical positions mapped from single authoritative SQLite store via ExecutionCoordinator
   public getPositions(): SniperPosition[] {
     const mode = executionCoordinator.getExecutionMode();
-    const rawPositions = executionCoordinator.getPositions(mode);
+    // R6-2: after a disarm the mode is PAPER while real LIVE positions stay open; list those too (each row says its executionMode)
+    const rawPositions = mode === 'LIVE' ? executionCoordinator.getPositions(mode) : [...executionCoordinator.getPositions(mode), ...executionCoordinator.getPositions('LIVE', 'ACTIVE')];
 
     return rawPositions.map((p) => {
       const tokenQty = Number(p.tokenQuantityRaw) / Math.pow(10, p.tokenDecimals);
@@ -420,6 +421,7 @@ export class MemecoinAggregatorService extends EventEmitter {
         openedAt: p.entryTimestamp,
         status: p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED' ? 'OPEN' : 'CLOSED',
         txHash: p.entryTxSignature,
+        executionMode: p.executionMode,
       };
     });
   }

@@ -103,3 +103,13 @@ export function readOnlyBannerText(m: Pick<TradingModeInfo, 'readOnly' | 'cluste
   const c = m.cluster === 'mainnet-beta' || m.cluster === 'mainnet' ? 'MAINNET' : (m.cluster ?? 'UNKNOWN CLUSTER').toUpperCase();
   return `${c} · READ-ONLY · PAPER`;
 }
+
+/**
+ * Round 1 #11: the Plug & Play mode badge, mode tile and snipe button, from the shared poller (15 s staleness) instead of the modal's own
+ * last good /api/diagnostics/system answer, which never aged out and kept saying PAPER TRADING while the banner said MODE UNKNOWN.
+ */
+export function plugAndPlayModeView(m: TradingModeInfo): { badge: string; tone: 'unknown' | 'live' | 'paper'; mode: string; snipe: string } {
+  if (!m.known) return { badge: 'MODE UNKNOWN', tone: 'unknown', mode: 'UNKNOWN', snipe: 'SNIPE (MODE UNKNOWN)' };
+  if (m.live) return { badge: 'LIVE BROADCAST ACTIVE', tone: 'live', mode: 'LIVE (ARMED)', snipe: 'LIVE SNIPE' };
+  return { badge: 'PAPER TRADING', tone: 'paper', mode: m.label, snipe: 'PAPER SNIPE' };
+}

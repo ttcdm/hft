@@ -38,7 +38,7 @@ import {
 } from 'lucide-react';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
 import { authFetch } from '../services/engineClient';
-import { useTradingMode, liveClickWarning } from '../utils/tradingMode';
+import { useTradingMode, liveClickWarning, plugAndPlayModeView } from '../utils/tradingMode';
 import { positionPnlCell } from '../utils/positionPnl';
 import { closeOutcomeText } from '../utils/closeOutcome';
 import { ageText, markIsStale } from '../utils/freshness';
@@ -98,6 +98,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   const [selectedExternalToken, setSelectedExternalToken] = useState<any>(null);
 
   const tradingMode = useTradingMode();
+  const modeView = plugAndPlayModeView(tradingMode); // Round 1 #11: the shared, aging answer, never this modal's last good read
   const [isLoading, setIsLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ text: string; type: 'info' | 'success' | 'error' } | null>(null);
 
@@ -312,15 +313,16 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
               <div className="flex items-center space-x-2">
                 <h2 className="text-base sm:text-lg font-bold text-white tracking-wide">SOLANA TRADING WORKSTATION</h2>
                 <span
+                  data-testid="pnp-mode-badge"
                   className={`px-2 py-0.5 text-xs font-bold rounded ${
-                    !systemAudit
+                    modeView.tone === 'unknown'
                       ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
-                      : systemAudit.isLiveArmed
+                      : modeView.tone === 'live'
                         ? 'bg-rose-500/20 text-rose-400 border border-rose-500/40 animate-pulse'
                         : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
                   }`}
                 >
-                  {!systemAudit ? 'MODE UNKNOWN' : systemAudit.isLiveArmed ? 'LIVE BROADCAST ACTIVE' : 'PAPER TRADING'}
+                  {modeView.badge}
                 </span>
               </div>
               <p className="text-xs text-slate-400">
@@ -353,11 +355,11 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
             <div className="flex items-center space-x-1.5">
               <span
                 className={`w-2 h-2 rounded-full ${
-                  !systemAudit ? 'bg-slate-500' : systemAudit.isLiveArmed ? 'bg-rose-400 animate-ping' : 'bg-emerald-400'
+                  modeView.tone === 'unknown' ? 'bg-slate-500' : modeView.tone === 'live' ? 'bg-rose-400 animate-ping' : 'bg-emerald-400'
                 }`}
               />
-              <span className={`font-bold ${!systemAudit ? 'text-slate-400' : systemAudit.isLiveArmed ? 'text-rose-400' : 'text-emerald-400'}`}>
-                {systemAudit?.mode || 'UNKNOWN'}
+              <span className={`font-bold ${modeView.tone === 'unknown' ? 'text-slate-400' : modeView.tone === 'live' ? 'text-rose-400' : 'text-emerald-400'}`}>
+                {modeView.mode}
               </span>
             </div>
           </div>
@@ -514,7 +516,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                     <span>Instant Token Snipe Terminal</span>
                   </span>
                   <span className="text-[10px] text-slate-400 font-mono">
-                    Mode: <strong className={systemAudit?.isLiveArmed ? 'text-rose-400' : 'text-emerald-400'}>{systemAudit?.mode}</strong>
+                    Mode: <strong className={modeView.tone === 'live' ? 'text-rose-400' : modeView.tone === 'unknown' ? 'text-amber-300' : 'text-emerald-400'}>{modeView.mode}</strong>
                   </span>
                 </h3>
 
@@ -535,7 +537,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                       className="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white text-xs font-bold flex items-center space-x-1.5 transition"
                     >
                       <Zap className="w-3.5 h-3.5" />
-                      <span>{systemAudit?.isLiveArmed ? 'LIVE SNIPE' : 'PAPER SNIPE'}</span>
+                      <span>{modeView.snipe}</span>
                     </button>
                   </div>
                 </div>

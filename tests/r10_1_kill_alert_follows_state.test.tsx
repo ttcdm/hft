@@ -19,13 +19,13 @@ describe('R10-1: the kill-switch alert follows the server state', () => {
   const showAll = async () => { const t = document.querySelector('[data-testid="alerts-toggle"]'); if (t && /Show all/.test(t.textContent || '')) await click(t); };
 
   it('RESUME in this tab removes ENGAGED, also after the RESET notice expires', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     await renderApp();
     await click(document.getElementById('btn-emergency-kill-switch'));
     expect(dockText()).toMatch(/KILL SWITCH ENGAGED/);
     const t0 = Date.now();
     vi.spyOn(Date, 'now').mockImplementation(() => t0 + 3000);
     await click(document.getElementById('btn-emergency-kill-switch')); // RESUME, past the double-press guard
+    await click(document.querySelector('[data-testid="confirm-ok"]')); // R10-11: the in-page confirm
     expect(server.killSwitchActive).toBe(false);
     await showAll();
     expect(dockText()).not.toMatch(/KILL SWITCH ENGAGED/);

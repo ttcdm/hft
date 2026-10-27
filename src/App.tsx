@@ -23,7 +23,7 @@ import { readServerAlerts, serverAlertEvents, alertsUnreadableEvent, killSwitchS
 import { killSwitchPress } from './utils/killSwitchPress';
 import { exitAlerts, type WatchedPosition } from './utils/exitWatch';
 import { PanelErrorBoundary } from './components/ErrorBoundaries';
-import { ConfirmHost } from './components/ConfirmDialog';
+import { ConfirmHost, askConfirm } from './components/ConfirmDialog';
 
 
 export function makeEmptyKpis(startingEquity: number): PerformanceKPIs {
@@ -228,9 +228,10 @@ export default function App() {
   const toggleKillSwitch = async () => {
     if (killInFlight.current) return; // R33: a second click while the first request is out must not send the opposite value
     // R9-1: send the intended state. RESUME needs a confirm, and a RESUME press right after the switch turned on is ignored.
-    const press = killSwitchPress(isHalted === true, haltedSince.current, Date.now(), (text) => window.confirm(text));
-    if (press.action === 'IGNORE') return;
+    // R10-11: the RESUME confirm is the in-page dialog (Enter cannot accept); a press while it is open is not sent
     killInFlight.current = true;
+    const press = await killSwitchPress(isHalted === true, haltedSince.current, Date.now(), (text) => askConfirm({ title: 'RESUME TRADING', body: text, confirmLabel: 'Resume trading' }));
+    if (press.action === 'IGNORE') { killInFlight.current = false; return; }
     const nextHalted = press.activate;
     try {
       const res = await authFetch('/api/execution/kill-switch', {

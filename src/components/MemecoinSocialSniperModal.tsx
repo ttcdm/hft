@@ -72,6 +72,7 @@ import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExtern
 import { BELOW_HEADER_TOP } from '../utils/headerOffset';
 import { DecimalBox } from './DecimalBox';
 import { DialogFrame, KILL_SWITCH_ID } from './DialogFrame';
+import { confirmLiveClick, confirmSell } from './ConfirmDialog';
 
 /**
  * P1.4 (N-12): the sniper tab's header. The auto mode shown is the auto controller's own (GET /api/auto/status), read-only: the
@@ -348,7 +349,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     const amount = snipeAmount.parsed.sol;
     // Q10b: while LIVE is armed this click sends a real transaction; say so and ask first
     const warning = liveClickWarning(tradingMode, `Sniping ${sig.tokenTicker} for ${formatSol(amount)}`);
-    if (warning && !window.confirm(warning)) return;
+    if (warning && !(await confirmLiveClick(warning))) return;
     hftAudio.playOrderFill();
     const res = await engineClient.snipeSocialSignal(sig.id, amount, sniperConfig.jitoTipSol, sniperConfig.maxSlippagePct, tradingMode.live);
     
@@ -378,7 +379,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     if (!snipeAmount.parsed.ok) { onAlertTrigger?.('WARNING', 'SNIPE NOT SENT', snipeAmount.parsed.reason); return; }
     const amount = snipeAmount.parsed.sol;
     const warning = liveClickWarning(tradingMode, `Sniping $${pool.symbol} for ${formatSol(amount)}`);
-    if (warning && !window.confirm(warning)) return;
+    if (warning && !(await confirmLiveClick(warning))) return;
     hftAudio.playOrderFill();
     const res = await engineClient.executeMemecoinSnipe(buildPoolSnipeRequest(pool, amount, sniperConfig), tradingMode.live);
     const r = res?.result ?? res?.tradeResult;
@@ -402,7 +403,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
       name: pos ? (pos.tokenTicker.startsWith('$') ? pos.tokenTicker : `$${pos.tokenTicker}`) : 'this position', sellPct, mode: pos?.executionMode,
       tokensHeld: pos?.quantityTokens, valueText: pos && Number.isFinite(pos.currentValueUsd) ? `$${pos.currentValueUsd.toFixed(2)}` : null,
     });
-    if (typeof window !== 'undefined' && !window.confirm(ask)) return;
+    if (!(await confirmSell(ask))) return;
     hftAudio.playOrderFill();
     const res = await engineClient.closeSniperPosition(posId, sellPct);
     if (res?.result?.success) {
@@ -444,7 +445,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     // S1: a manual snipe by address is a one-click trade too
     if (!snipeAmount.parsed.ok) { onAlertTrigger?.('WARNING', 'SNIPE NOT SENT', snipeAmount.parsed.reason); return; }
     const warning = liveClickWarning(tradingMode, `Sniping ${manualSnipeCa.trim().slice(0, 8)}… for ${formatSol(snipeAmount.parsed.sol)}`);
-    if (warning && !window.confirm(warning)) return;
+    if (warning && !(await confirmLiveClick(warning))) return;
     setManualSnipeLoading(true);
     hftAudio.playOrderFill();
     try {

@@ -5,7 +5,8 @@
  * second press (meant as "kill") sent the negation of what was shown. Now:
  * - a press while the switch is shown OFF engages it (the intended state, true);
  * - a press on RESUME within RESUME_GUARD_MS of the switch turning on is ignored (a double tap of the emergency stop);
- * - any other press on RESUME asks the operator to confirm first, like PANIC and KILL AUTO do.
+ * - any other press on RESUME asks the operator to confirm first, like PANIC and KILL AUTO do (R10-11: in the in-page dialog, where
+ *   Enter cannot accept).
  */
 export const RESUME_GUARD_MS = 2000;
 
@@ -18,13 +19,13 @@ export type KillSwitchPress =
   | { action: 'RESUME'; activate: false }
   | { action: 'IGNORE'; reason: 'DOUBLE_PRESS' | 'NOT_CONFIRMED' };
 
-export function killSwitchPress(
+export async function killSwitchPress(
   shownHalted: boolean,
   haltedSinceMs: number | null,
   nowMs: number,
-  confirmResume: (text: string) => boolean,
-): KillSwitchPress {
+  confirmResume: (text: string) => Promise<boolean>,
+): Promise<KillSwitchPress> {
   if (!shownHalted) return { action: 'ENGAGE', activate: true };
   if (haltedSinceMs !== null && nowMs - haltedSinceMs < RESUME_GUARD_MS) return { action: 'IGNORE', reason: 'DOUBLE_PRESS' };
-  return confirmResume(RESUME_CONFIRM_TEXT) ? { action: 'RESUME', activate: false } : { action: 'IGNORE', reason: 'NOT_CONFIRMED' };
+  return (await confirmResume(RESUME_CONFIRM_TEXT)) ? { action: 'RESUME', activate: false } : { action: 'IGNORE', reason: 'NOT_CONFIRMED' };
 }

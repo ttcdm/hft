@@ -52,6 +52,7 @@ import { engineClient } from '../services/engineClient';
 import { hftAudio } from '../utils/audio';
 import { DecimalBox } from './DecimalBox';
 import { DialogFrame } from './DialogFrame';
+import { confirmLiveClick } from './ConfirmDialog';
 import {
   sanitizeExternalUrl,
   sanitizeXProfileUrl,
@@ -309,7 +310,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
     const amountSol = snipeAmount.parsed.sol;
     // Q10b: while LIVE is armed this click sends a real transaction; say so and ask first
     const warning = liveClickWarning(tradingMode, `Sniping $${callout.token.symbol} for ${formatSol(amountSol)}`);
-    if (warning && !window.confirm(warning)) return;
+    if (warning && !(await confirmLiveClick(warning))) return;
     setSnipingCalloutId(callout.id);
     hftAudio.playOrderFill();
 

@@ -64,3 +64,8 @@ export function ConfirmDialogView({ req, onAnswer }: { req: ConfirmRequest; onAn
     </div>
   );
 }
+
+/** A click that sends a real transaction while LIVE is armed (the text is liveClickWarning's). */
+export const confirmLiveClick = (warning: string): Promise<boolean> => askConfirm({ title: 'LIVE ORDER', body: warning, confirmLabel: 'Send the real transaction' });
+/** A sell (the text is sellConfirmText's). */
+export const confirmSell = (ask: string): Promise<boolean> => askConfirm({ title: 'SELL', body: ask, confirmLabel: 'Sell' });

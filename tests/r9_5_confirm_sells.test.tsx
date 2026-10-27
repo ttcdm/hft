@@ -38,9 +38,11 @@ describe('R9-5: one-click sells ask first; a partial is not "POSITION CLOSED"', 
   });
 
   const posts = (url: string) => server.calls.filter((c) => c.url === url && c.method === 'POST');
+  // R10-11: the sell confirm is the in-page dialog, not window.confirm
+  const dialogText = () => document.querySelector('[role="alertdialog"] #confirm-body')?.textContent ?? '';
+  const answer = (yes: boolean) => click(document.querySelector(`[data-testid="${yes ? 'confirm-ok' : 'confirm-cancel'}"]`));
 
   it('Sniper Take 50%: asks with the quantity; refused sends nothing; accepted says "still open"', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
     await renderApp();
     await click(document.getElementById('btn-nav-telegram-tracker'));
     const tab = [...document.querySelectorAll('button')].find((b) => /Autonomous Sniper/.test(b.textContent || ''));
@@ -50,11 +52,11 @@ describe('R9-5: one-click sells ask first; a partial is not "POSITION CLOSED"', 
     expect(take).toBeTruthy();
     expect(document.querySelector('[data-testid="holding-qty"]')?.textContent).toMatch(/2000 tokens held/);
     await click(take!);
-    expect(confirmSpy).toHaveBeenCalledTimes(1);
-    expect(String(confirmSpy.mock.calls[0][0])).toMatch(/^SELL 50% of \$RNF\? PAPER \(nothing is sent\): about 1000 of 2000 tokens held/);
+    expect(dialogText()).toMatch(/^SELL 50% of \$RNF\? PAPER \(nothing is sent\): about 1000 of 2000 tokens held/);
+    await answer(false);
     expect(posts('/api/memecoins/close')).toEqual([]);
-    confirmSpy.mockReturnValue(true);
     await click(take!);
+    await answer(true);
     await flush();
     expect(posts('/api/memecoins/close').map((c) => c.body.sellPct)).toEqual([50]);
     const toggle = document.querySelector('[data-testid="alerts-toggle"]');
@@ -65,7 +67,6 @@ describe('R9-5: one-click sells ask first; a partial is not "POSITION CLOSED"', 
   });
 
   it('Plug & Play Close asks first', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
     await renderApp();
     await click(document.getElementById('btn-nav-plug-and-play'));
     await flush(10);
@@ -73,10 +74,11 @@ describe('R9-5: one-click sells ask first; a partial is not "POSITION CLOSED"', 
     const close = [...document.querySelectorAll('button')].find((b) => b.textContent?.trim() === 'Close' && b.className.includes('text-rose-300'));
     expect(close).toBeTruthy();
     await click(close!);
-    expect(String(confirmSpy.mock.calls.at(-1)?.[0])).toMatch(/^SELL 100% of \$RNF\? PAPER \(nothing is sent\): about 2000 of 2000 tokens held/);
+    expect(dialogText()).toMatch(/^SELL 100% of \$RNF\? PAPER \(nothing is sent\): about 2000 of 2000 tokens held/);
+    await answer(false);
     expect(posts('/api/wallet/close-position')).toEqual([]);
-    confirmSpy.mockReturnValue(true);
     await click(close!);
+    await answer(true);
     expect(posts('/api/wallet/close-position')).toHaveLength(1);
   });
 });

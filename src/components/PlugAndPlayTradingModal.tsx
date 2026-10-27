@@ -14,7 +14,7 @@ import { sellConfirmText } from '../utils/sellConfirm';
 import { journalEventDetail } from '../utils/exitWatch';
 import { ARMED_MESSAGE, PANIC_CONFIRM_TEXT, armRefusalText, panicOutcome } from '../utils/tradingCopy';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
-import { askConfirm } from './ConfirmDialog';
+import { askConfirm, confirmLiveClick, confirmSell } from './ConfirmDialog';
 import React, { useState, useEffect } from 'react';
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { SnipeAmountControl } from './SnipeAmountControl';
@@ -264,7 +264,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
     const amountSol = snipeAmount.parsed.sol;
     // S1: this button sends a real transaction while LIVE is armed, so it asks first and tells the server it asked
     const warning = liveClickWarning(tradingMode, `Sniping ${manualMint.trim().slice(0, 8)}… for ${formatSol(amountSol)}`);
-    if (warning && !window.confirm(warning)) return;
+    if (warning && !(await confirmLiveClick(warning))) return;
 
     try {
       setIsLoading(true);
@@ -304,7 +304,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
     const target = positions.find((p) => p.id === posId);
     const held = target && /^\d+$/.test(String(target.tokenQuantityRaw ?? '')) ? Number(target.tokenQuantityRaw) / Math.pow(10, target.tokenDecimals ?? 6) : null;
     const ask = sellConfirmText({ name: target?.symbol ? `$${target.symbol}` : 'this position', sellPct: 100, mode: target?.executionMode, tokensHeld: held, valueText: target ? fmtSol(target.currentValueSol) : null });
-    if (!window.confirm(ask)) return;
+    if (!(await confirmSell(ask))) return;
     try {
       const res = await authFetch('/api/wallet/close-position', {
         method: 'POST',

@@ -88,6 +88,18 @@ export function signerStorageText(a: { keypairStorage?: string; signerKeySource?
   return a.keypairStorage ?? 'unknown';
 }
 
+/** R9-6: why each list could not be read, or null once it was; 'not read yet' before the first answer. */
+interface ReadProblems { diag: string | null; positions: string | null; events: string | null }
+const UNREAD: ReadProblems = { diag: 'not read yet', positions: 'not read yet', events: 'not read yet' };
+
+/** R9-6: an unread list is never shown as an empty one. */
+export function unreadText(what: string, why: string, haveOld: boolean): string {
+  if (why === UNREAD.positions) return `${what}: reading from the server...`;
+  return haveOld
+    ? `${what}: the last read failed (${why}). The list below is from an earlier read and may be out of date.`
+    : `${what} could not be read (${why}). This is not an empty list${/401/.test(why) ? ': sign in as operator to read it' : ''}.`;
+}
+
 export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = ({ isOpen, onClose }) => {
   const [systemAudit, setSystemAudit] = useState<SystemAudit | null>(null);
   const [riskControls, setRiskControls] = useState<RiskControls | null>(null);
@@ -117,6 +129,9 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   const [isLoading, setIsLoading] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ text: string; type: 'info' | 'success' | 'error' } | null>(null);
 
+  // R9-6: why each list could not be read (null once it was read). The lists start empty, so without this a 401 read as "No positions
+  // opened yet" / "No events logged yet" / "Public Key: None".
+  const [readProblem, setReadProblem] = useState<ReadProblems>(UNREAD);
   const fetchSystemData = async () => {
     try {
       const [diagRes, posRes, evRes] = await Promise.all([
@@ -124,24 +139,28 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
         authFetch('/api/workstation/positions'),
         authFetch('/api/workstation/events?limit=25'),
       ]);
+      const next: ReadProblems = { diag: null, positions: null, events: null };
 
       if (diagRes.ok) {
         const dJson = await diagRes.json();
         setSystemAudit(dJson.systemAudit);
         setRiskControls(dJson.riskControls);
-      }
+      } else next.diag = `HTTP ${diagRes.status}`;
 
       if (posRes.ok) {
         const pJson = await posRes.json();
         setPositions(pJson.positions || []);
-      }
+      } else next.positions = `HTTP ${posRes.status}`;
 
       if (evRes.ok) {
         const eJson = await evRes.json();
         setEvents(eJson.events || []);
-      }
-    } catch (err) {
+      } else next.events = `HTTP ${evRes.status}`;
+      setReadProblem(next);
+    } catch (err: any) {
       console.error('Failed to fetch system data:', err);
+      const why = `server not reachable (${err?.message || 'network error'})`;
+      setReadProblem({ diag: why, positions: why, events: why });
     }
   };
 
@@ -574,10 +593,17 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                 />
               </div>
 
+              {readProblem.positions && (
+                <div data-testid="pnp-positions-unread" className="p-2 rounded-lg border border-amber-500/40 bg-amber-950/40 text-amber-200 text-[11px]">
+                  {unreadText('Positions', readProblem.positions, positions.length > 0)}
+                </div>
+              )}
               {positions.length === 0 ? (
+                readProblem.positions ? null : (
                 <div className="p-8 text-center text-slate-400 bg-slate-950/40 rounded-xl border border-slate-800">
                   No positions opened yet. Snipe a token to record honest execution in SQLite.
                 </div>
+                )
               ) : (
                 <div className="overflow-x-auto border border-slate-800 rounded-xl">
                   <table className="w-full text-left text-xs">
@@ -655,10 +681,17 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
           {activeTab === 'RISK_LOGS' && (
             <div className="space-y-3">
               <span className="font-bold text-white text-xs">Immutable Event Log (SQLite Journal)</span>
+              {readProblem.events && (
+                <div data-testid="pnp-events-unread" className="p-2 rounded-lg border border-amber-500/40 bg-amber-950/40 text-amber-200 text-[11px]">
+                  {unreadText('Events', readProblem.events, events.length > 0)}
+                </div>
+              )}
               {events.length === 0 ? (
+                readProblem.events ? null : (
                 <div className="p-8 text-center text-slate-400 bg-slate-950/40 rounded-xl border border-slate-800">
                   No events logged yet.
                 </div>
+                )
               ) : (
                 <div className="space-y-2">
                   {events.map((ev) => (
@@ -696,7 +729,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
 
                 <div className="p-3 rounded-lg bg-slate-900 border border-slate-800 font-mono text-xs text-slate-300 space-y-1">
                   <div>Status: <strong className="text-emerald-400">{systemAudit?.signerStatus}</strong></div>
-                  <div>Public Key: <span className="text-amber-300">{systemAudit?.walletPubkey || 'None'}</span></div>
+                  <div>Public Key: <span className="text-amber-300">{systemAudit?.walletPubkey || (readProblem.diag ? `unknown (not read: ${readProblem.diag})` : 'None')}</span></div>
                   <div>Storage Location: <span className="text-slate-400" data-testid="signer-storage">{signerStorageText(systemAudit)}</span></div>
                 </div>
 

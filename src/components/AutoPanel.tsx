@@ -185,11 +185,11 @@ export function StatsWindowLabel({ s }: { s: StatsWindow }) {
   );
 }
 
-export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOrderSize, onThreshold, code, onCode, busy, error, killReport }: {
+export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOrderSize, onThreshold, code, onCode, busy, error, killReport, staleText }: {
   status: AutoStatusData | null; onMode?: (m: AutoMode) => void; onKill?: () => void; onResume?: () => void; onBudget?: (maxBuys: number, maxSpendSol: number) => void; onOrderSize?: (sol: number) => void; onThreshold?: (value: number) => void;
-  code?: string; onCode?: (c: string) => void; busy?: boolean; error?: string | null; killReport?: KillReport | null;
+  code?: string; onCode?: (c: string) => void; busy?: boolean; error?: string | null; killReport?: KillReport | null; staleText?: string | null;
 }) {
-  if (!status) return <section className="rounded-lg border border-slate-800 bg-[#0B0F17] p-3 text-xs text-slate-500" data-testid="auto-panel">Auto-snipe: sign in as operator to read the controller.</section>;
+  if (!status) return <section className="rounded-lg border border-slate-800 bg-[#0B0F17] p-3 text-xs text-slate-500" data-testid="auto-panel">{staleText ?? 'Auto-snipe: sign in as operator to read the controller.'}</section>;
   const s = status.stats;
   const b = status.session?.budgetsLeft;
   const rejected = Object.entries(s.rejectedByStage);
@@ -211,6 +211,7 @@ export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOr
         ))}
       </div>
       <input value={code ?? ''} onChange={(e) => onCode?.(e.target.value)} placeholder="DEVNET_LIVE confirmation code" className="w-full mb-2 px-2 py-1 rounded bg-slate-900 border border-slate-700 font-mono text-[11px]" />
+      {staleText && <p className="text-amber-300 font-bold mb-2" data-testid="auto-stale">{staleText}</p>}
       {error && <p className="text-red-400 mb-2" data-testid="auto-error">{error}</p>}
       {killReport && <p className={`${killReport.ok ? 'text-emerald-300' : 'text-red-300 font-bold'} mb-2`} data-testid="auto-kill-report">{killReport.text}</p>}
       {status.haltReason && <p className="text-red-400 mb-2" data-testid="halt-reason">ALL TRADING HALTED: {status.haltReason} <button onClick={onResume} className="underline ml-1">clear halt</button></p>}
@@ -260,33 +261,57 @@ export function asAutoStatus(x: unknown): AutoStatusData | null {
   return o as AutoStatusData;
 }
 
-export function useAutoStatus(): AutoStatusData | null {
-  const [status, setStatus] = useState<AutoStatusData | null>(null);
+/** R9-6 / R9-7: how old the panel's status is, and why the last read failed (null when it succeeded). */
+export interface AutoStatusRead { status: AutoStatusData | null; at: number | null; error: string | null }
+export const AUTO_STATUS_STALE_MS = 15_000;
+
+export function useAutoStatusRead(): AutoStatusRead {
+  const [read, setRead] = useState<AutoStatusRead>({ status: null, at: null, error: null });
   useEffect(() => {
     let alive = true;
     const load = async () => {
       try {
         const r = await authFetch('/api/auto/status');
-        if (!r.ok || !alive) return;
+        if (!alive) return;
+        // R9-6: a refused read (401 after Clear Token) keeps the last status, marked with why it is old
+        if (!r.ok) { setRead((p) => ({ ...p, error: `HTTP ${r.status}` })); return; }
         const j = asAutoStatus(await r.json());
-        if (j && j.stats && typeof j.stats === 'object') setStatus(j);
-      } catch { /* keep last */ }
+        if (j && j.stats && typeof j.stats === 'object') setRead({ status: j, at: Date.now(), error: null });
+        else setRead((p) => ({ ...p, error: 'unreadable answer' }));
+      } catch (e: any) {
+        if (alive) setRead((p) => ({ ...p, error: `server not reachable (${e?.message || 'network error'})` }));
+      }
     };
     load();
     const t = setInterval(load, 4000);
     const off = onAuthenticated(load); // UI-5
     return () => { alive = false; clearInterval(t); off(); };
   }, []);
-  return status;
+  return read;
+}
+
+export function useAutoStatus(): AutoStatusData | null {
+  return useAutoStatusRead().status;
+}
+
+/** R9-6 / R9-7: the status is old when its last read failed or it is older than AUTO_STATUS_STALE_MS. */
+export function autoStatusStaleText(read: Pick<AutoStatusRead, 'at' | 'error'>, now: number): string | null {
+  if (read.at === null) return read.error ? `Auto status could not be read (${read.error}).` : null;
+  const age = now - read.at;
+  if (!read.error && age <= AUTO_STATUS_STALE_MS) return null;
+  return `STALE: auto status last read ${Math.round(age / 1000)}s ago${read.error ? ` (${read.error})` : ''}. The mode and figures below may have changed.`;
 }
 
 export function AutoHeaderBadge() {
-  const s = useAutoStatus();
-  return <AutoModeBadge mode={s?.mode ?? null} halted={!!s?.haltReason} />;
+  const r = useAutoStatusRead();
+  const stale = autoStatusStaleText(r, Date.now());
+  if (stale && r.status) return <span title={stale} className="px-2 py-0.5 rounded text-[11px] font-bold font-mono bg-amber-950 text-amber-200 border border-amber-500/50" data-testid="auto-badge">AUTO: {r.status.mode}? (stale)</span>;
+  return <AutoModeBadge mode={r.status?.mode ?? null} halted={!!r.status?.haltReason} />;
 }
 
 export function AutoPanel() {
-  const status = useAutoStatus();
+  const read = useAutoStatusRead();
+  const status = read.status;
   const [local, setLocal] = useState<AutoStatusData | null>(null);
   const [code, setCode] = useState('');
   const [busy, setBusy] = useState(false);
@@ -310,7 +335,7 @@ export function AutoPanel() {
     } finally { setBusy(false); }
   }, [shown]);
   return (
-    <AutoPanelView status={shown} busy={busy} error={error} killReport={killReport} code={code} onCode={setCode}
+    <AutoPanelView status={shown} busy={busy} error={error} killReport={killReport} code={code} onCode={setCode} staleText={autoStatusStaleText(read, Date.now())}
       onMode={(m) => post('/api/auto/mode', { mode: m, confirmationCode: m === 'DEVNET_LIVE' ? code : undefined })}
       onKill={() => {
         // Q45: KILL sells every position the auto trader opened, so it asks first

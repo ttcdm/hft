@@ -78,10 +78,11 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
   board: BoardData | null; tab: 'launches' | 'watching' | 'holding'; onTab: (t: 'launches' | 'watching' | 'holding') => void;
   onSelect?: (mint: string) => void; selected?: string | null;
 }) {
-  const tabs: Array<['launches' | 'watching' | 'holding', string, number]> = [
-    ['launches', 'New launches', board?.launches.length ?? 0],
-    ['watching', 'Watching', board?.watching.length ?? 0],
-    ['holding', 'Holding', board?.holding.length ?? 0],
+  // R9-6: before the board is read (or while it cannot be), the counts are unknown, not 0
+  const tabs: Array<['launches' | 'watching' | 'holding', string, number | string]> = [
+    ['launches', 'New launches', board?.launches.length ?? '—'],
+    ['watching', 'Watching', board?.watching.length ?? '—'],
+    ['holding', 'Holding', board?.holding.length ?? '—'],
   ];
   return (
     <section className="col-span-12 lg:col-span-8 rounded-lg border border-slate-800 bg-[#0B0F17] overflow-hidden" data-testid="token-board">

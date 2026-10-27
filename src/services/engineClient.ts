@@ -85,9 +85,13 @@ export type MemecoinSnapshotCallback = (data: {
 }) => void;
 export type SniperTradeCallback = (data: any) => void;
 
+export const WS_QUIET_MS = 30_000;
+
 class EngineClient {
   private ws: WebSocket | null = null;
   private isConnected: boolean = false;
+  /** R9-7: when the socket last delivered a message. Offline, a socket can stay "open" long after nothing arrives. */
+  private lastMessageAt = 0;
   private pumpCalloutCallbacks: Set<PumpHotCalloutsCallback> = new Set();
   private calloutSnipedCallbacks: Set<CalloutSnipedCallback> = new Set();
   private memecoinSnapshotCallbacks: Set<MemecoinSnapshotCallback> = new Set();
@@ -117,6 +121,7 @@ class EngineClient {
       };
 
       this.ws.onmessage = (event) => {
+        this.lastMessageAt = Date.now();
         try {
           const msg = JSON.parse(event.data);
           if (msg.type === 'PUMP_HOT_CALLOUTS' && msg.data) {
@@ -201,8 +206,9 @@ class EngineClient {
     return () => this.sniperTradeCallbacks.delete(cb);
   }
 
-  public isWsConnected(): boolean {
-    return this.isConnected;
+  /** R9-7: "streaming" means open AND a message arrived in the last WS_QUIET_MS, so a dead link stops reading as live. */
+  public isWsConnected(now = Date.now()): boolean {
+    return this.isConnected && now - this.lastMessageAt < WS_QUIET_MS;
   }
 
   public wsSnipePumpCallout(calloutId: string, amountUsd: number = 5.0, jitoTipSol: number = 0.005, slippagePct: number = 6.0, confirmLive = false) {

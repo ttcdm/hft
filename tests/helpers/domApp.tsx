@@ -19,6 +19,8 @@ export interface FakeServer {
   /** Exact path (no query) to handler. A handler returning undefined falls through to the default. */
   routes: Record<string, Route>;
   killSwitchActive: boolean;
+  /** When set and true for a path, the server answers 401 (a cleared or refused token). */
+  deny?: (path: string) => boolean;
 }
 
 class NeverOpenSocket {
@@ -77,6 +79,7 @@ export function installFakeServer(server: FakeServer, defaults: Record<string, a
     let body: any;
     try { body = init?.body ? JSON.parse(String(init.body)) : undefined; } catch { body = init?.body; }
     server.calls.push({ url: path, method: (init?.method || 'GET').toUpperCase(), body });
+    if (server.deny?.(path)) return new Response(JSON.stringify({ error: 'Operator token required' }), { status: 401, headers: { 'Content-Type': 'application/json' } });
     const handler = server.routes[path];
     const hit = handler ? handler(body, init, raw) : undefined;
     if (hit) return new Response(JSON.stringify(hit.json), { status: hit.status ?? 200, headers: { 'Content-Type': 'application/json' } });

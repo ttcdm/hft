@@ -262,6 +262,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   };
 
   const [isWsLive, setIsWsLive] = useState(engineClient.isWsConnected());
+  const [signalsRead, setSignalsRead] = useState<'pending' | 'ok' | 'failed'>('pending');
 
   // Deduplicate pools by CA and ID to guarantee unique React keys
   const deduplicatePools = (poolList: MemecoinPool[]): MemecoinPool[] => {
@@ -282,7 +283,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     setIsRefreshing(true);
     try {
       const sigData = await engineClient.getSocialSignals();
-      if (sigData?.signals) setSignals(sigData.signals);
+      // R9-6: a refused read (401) is "not read", never "0 Live"
+      if (sigData?.status !== 'ERROR' && Array.isArray(sigData?.signals)) { setSignals(sigData.signals); setSignalsRead('ok'); } else setSignalsRead('failed');
 
       const poolData = await engineClient.getMemecoinPools(selectedPlatform, selectedChain);
       if (poolData?.pools) setPools(deduplicatePools(poolData.pools));
@@ -558,7 +560,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
               <Send className="w-3.5 h-3.5 text-blue-400" />
               <span>Alpha Signals Detected</span>
             </span>
-            <span className="font-bold text-cyan-300">{signals.length} Live</span>
+            <span className="font-bold text-cyan-300" data-testid="signals-count">{signalsRead === 'failed' ? 'not read' : signalsRead === 'pending' ? '—' : `${signals.length} Live`}</span>
           </div>
           <div className="p-3 border-r border-[#1E293B] flex items-center justify-between">
             <span className="text-slate-400 flex items-center space-x-1.5">

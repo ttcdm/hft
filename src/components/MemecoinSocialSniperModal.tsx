@@ -1122,19 +1122,9 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                     />
                   </div>
 
-                  <div>
-                    <label className="block text-slate-400 text-[10px] mb-1">
-                      Take-Profit Target (%) (not used by exits)
-                    </label>
-                    <input
-                      type="number"
-                      value={sniperConfig.takeProfitPct}
-                      onChange={(e) =>
-                        setSniperConfig({ ...sniperConfig, takeProfitPct: Number(e.target.value) })
-                      }
-                      className="w-full bg-[#141B2D] border border-[#1E293B] rounded p-2 text-white font-mono outline-none focus:border-cyan-400"
-                    />
-                  </div>
+                  {/* UI report fix 4: a take-profit percentage box was here. Its value was read only by the box itself: this screen never
+                      posts the config, and the exits use the fixed ExitEngine rules (shown by ExitRulesNote), so it was removed. The Jito tip
+                      box stays: its value is sent with every snipe from this screen. */}
                 </div>
               </div>
 

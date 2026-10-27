@@ -37,7 +37,7 @@ describe('Q35: header profit pill', () => {
   it('signed amounts and tones', () => {
     expect(signedUsd(1.239)).toBe('+$1.24');
     expect(signedUsd(-0.3)).toBe('-$0.30');
-    expect(signedUsd(0)).toBe('+$0.00');
+    expect(signedUsd(0)).toBe('$0.00'); // R10-6: no sign on zero
     expect(signedUsd(null)).toBe('—');
     expect(pillTone({ realizedUsd: -0.3, unrealizedUsd: 0.045, openCount: 2 })).toBe('down');
     expect(pillTone({ realizedUsd: 1, unrealizedUsd: null, openCount: 0 })).toBe('up');

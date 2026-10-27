@@ -1,4 +1,6 @@
-import { PillState, readPillState, signedUsd, pillTone } from '../utils/pnlPill';
+import { PillState, readPillState, signedUsd, usdTone } from '../utils/pnlPill';
+
+const USD_TONE = { up: 'text-emerald-300', down: 'text-rose-300', flat: 'text-slate-300', unknown: 'text-slate-500' } as const;
 import React, { useState, useEffect, useRef } from 'react';
 import {
   Activity,
@@ -119,6 +121,7 @@ export const Header: React.FC<HeaderProps> = ({
   const [profitAt, setProfitAt] = useState<number | null>(null);
   const [profitFailed, setProfitFailed] = useState(false);
   const [nowTick, setNowTick] = useState(() => Date.now());
+  const pillStale = isStale(profitAt, profitFailed, nowTick, PILL_STALE_MS);
 
   useEffect(() => {
     const fetchProfit = async () => {
@@ -273,13 +276,13 @@ export const Header: React.FC<HeaderProps> = ({
           onClick={() => handleNavClick('PLUG_AND_PLAY')}
           title="Realized profit today (net of fees) and the open positions' profit at the curve spot price (exit fee, price impact and tip NOT taken off), in USD at today's SOL price, from the server. Click for the wallet positions."
           className={`hidden sm:flex items-center space-x-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-mono transition ${
-            { up: 'bg-emerald-950/70 border-emerald-500/40 text-emerald-300', down: 'bg-rose-950/70 border-rose-500/40 text-rose-300', flat: 'bg-slate-900 border-slate-700 text-slate-300', unknown: 'bg-slate-900 border-slate-700 text-slate-500' }[isStale(profitAt, profitFailed, nowTick, PILL_STALE_MS) ? 'unknown' : pillTone(profitSummary)]
+            pillStale ? 'bg-slate-900 border-slate-700 text-slate-500' : 'bg-slate-900 border-slate-700 text-slate-300'
           }`}
         >
           <span className="text-[10px] opacity-70">today</span>
-          <span className="font-bold tracking-tight">{signedUsd(profitSummary?.realizedUsd)}</span>
+          <span data-testid="pill-realized" className={`font-bold tracking-tight ${pillStale ? '' : USD_TONE[usdTone(profitSummary?.realizedUsd)]}`}>{signedUsd(profitSummary?.realizedUsd)}</span>
           <span className="text-[10px] opacity-70">open at mark</span>
-          <span className="font-bold tracking-tight">{signedUsd(profitSummary?.unrealizedUsd)}</span>
+          <span data-testid="pill-open" className={`font-bold tracking-tight ${pillStale ? '' : USD_TONE[usdTone(profitSummary?.unrealizedUsd)]}`}>{signedUsd(profitSummary?.unrealizedUsd)}</span>
           <span className="text-[10px] opacity-70">({profitSummary?.openCount ?? '—'})</span>
           <PillStaleNote at={profitAt} failed={profitFailed} now={nowTick} />
         </button>

@@ -7,8 +7,19 @@ export interface PillState {
   live?: { openCount: number; unrealizedUsd: number | null; realizedUsd: number | null } | null;
 }
 
-export const signedUsd = (v: number | null | undefined): string =>
-  typeof v === 'number' && Number.isFinite(v) ? `${v < 0 ? '-' : '+'}$${Math.abs(v).toFixed(2)}` : '—';
+/** R10-6: a sign only when the shown cents are not zero; "$0.00" for zero (it used to read "+$0.00"). */
+export const signedUsd = (v: number | null | undefined): string => {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return '—';
+  const t = Math.abs(v).toFixed(2);
+  return t === '0.00' ? '$0.00' : `${v < 0 ? '-' : '+'}$${t}`;
+};
+
+/** R10-6: each figure in the pill gets its own colour; the realized loss no longer paints the open figure red. */
+export function usdTone(v: number | null | undefined): 'up' | 'down' | 'flat' | 'unknown' {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return 'unknown';
+  const t = Math.abs(v).toFixed(2);
+  return t === '0.00' ? 'flat' : v > 0 ? 'up' : 'down';
+}
 
 export function readPillState(data: any): PillState | null {
   if (!data || typeof data !== 'object') return null;

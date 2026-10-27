@@ -93,3 +93,28 @@ describe('R2-2 / R6-11: loadLaunchRecording returns the recorder markers and thr
     });
   });
 });
+
+// ---- the recorder writes the markers ------------------------------------------------------------------------------------------------
+import { EventEmitter } from 'node:events';
+import { LaunchRecorder } from '../server/backtest/launchRecorder';
+
+describe('R2-2: the recorder writes a RECORDER_START marker when attached and a FEED_GAP marker on every feed gap', () => {
+  it('both markers are MARKER rows with mint "" on the recorder clock', () => {
+    const rows: Array<{ ts: number; mint: string; kind: string; payload: any }> = [];
+    const db = { recordLaunchEvent: (ts: number, mint: string, kind: any, payload: any) => { rows.push({ ts, mint, kind, payload }); return true; }, pruneLaunchRecording: () => 0 };
+    const win = Object.assign(new EventEmitter(), { isWatching: () => true });
+    const feed = new EventEmitter();
+    let now = T0;
+    const rec = new LaunchRecorder(db as any, win as any, () => 150, () => now, { mintMs: 35 * 60_000, maxTradesPerMint: 2_000, retentionDays: 14, maxRows: 1_000_000 });
+    rec.attach(feed);
+    now = T0 + 90_000;
+    feed.emit('feed_gap', { reason: 'WS_RECONNECT', at: now });
+    expect(rows).toEqual([
+      { ts: T0, mint: '', kind: 'MARKER', payload: { reason: 'RECORDER_START' } },
+      { ts: T0 + 90_000, mint: '', kind: 'MARKER', payload: { reason: 'FEED_GAP', detail: 'WS_RECONNECT' } },
+    ]);
+    rec.detach();
+    feed.emit('feed_gap', { reason: 'after detach', at: now });
+    expect(rows).toHaveLength(2);
+  });
+});

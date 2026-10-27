@@ -35,6 +35,13 @@ type Db = Pick<WorkstationDatabase, 'recordLaunchEvent' | 'pruneLaunchRecording'
 /** R4-5: how often the recorder reads the free space (a statfs) while it records. */
 export const RECORD_SPACE_CHECK_MS = 5_000;
 
+/**
+ * R2-2: why the recording has a hole, as a MARKER row (mint ''). RECORDER_START: the recorder was attached, so a process that stopped lost
+ * the in-memory state of every launch it was recording (their later trades were never saved). FEED_GAP: the pump feed reported a gap, and
+ * live released every watched launch DEAD across it. The replay bounds a launch's coverage at the first marker inside its recording.
+ */
+export type RecordingMarkerReason = 'RECORDER_START' | 'FEED_GAP';
+
 /** BigInt-safe JSON form of a decoded pump event (all u64 fields as decimal strings). */
 export function eventToJson(e: object): Record<string, unknown> {
   return JSON.parse(JSON.stringify(e, (_k, v) => (typeof v === 'bigint' ? v.toString() : v)));
@@ -102,11 +109,19 @@ export class LaunchRecorder {
     const onCreate = (e: PumpCreateEvent) => this.onCreate(e);
     const onTrade = (t: PumpTradeEvent) => this.onTrade(t);
     const onFunder = (f: { wallet: string; funder: string | null }) => this.onFunder(f);
+    const onGap = (g: { reason?: string; at?: number }) => this.marker('FEED_GAP', g?.reason);
     feed.on('create_event', onCreate);
     feed.on('trade_event', onTrade);
+    feed.on('feed_gap', onGap);
     this.window.on('funder', onFunder);
     const offReports = creatorReports?.onReport((c, r) => this.onCreatorReport(c, r));
-    this.attachedTo.push({ off: () => { feed.off('create_event', onCreate); feed.off('trade_event', onTrade); this.window.off('funder', onFunder); offReports?.(); } });
+    this.attachedTo.push({ off: () => { feed.off('create_event', onCreate); feed.off('trade_event', onTrade); feed.off('feed_gap', onGap); this.window.off('funder', onFunder); offReports?.(); } });
+    this.marker('RECORDER_START');
+  }
+
+  /** R2-2: one MARKER row, on the recorder's clock. A failed write is swallowed like every recording write. */
+  public marker(reason: RecordingMarkerReason, detail?: string): void {
+    this.db.recordLaunchEvent(this.now(), '', 'MARKER', { reason, ...(detail !== undefined ? { detail: String(detail) } : {}) });
   }
 
   public detach(): void {

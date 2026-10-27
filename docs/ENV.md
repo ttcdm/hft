@@ -125,7 +125,7 @@ Read by files under `scripts/`, not by the server. The harness READMEs (`scripts
 | `APEX_SCRIPT_KEEP_TEST_DB_PATH` | `scripts/scriptEnv.ts` (via `hermeticEnv`): `true` keeps an exported `TEST_DB_PATH`. Otherwise every script that imports `hermeticEnv` drops it (it would beat the script's `APEX_DB_PATH`). `hermeticEnv` also always empties `APEX_ENV_FILE`, removes `OPERATOR_PRIVATE_KEY` and `SOLANA_PRIVATE_KEY`, and defaults `APEX_DB_PATH` to a scratch file and `SIGNER_KEYPAIR_PATH` to a file that does not exist. |
 | `APEX_SCRIPT_ALLOW_REPO_STATE` | `scripts/scriptEnv.ts` (via `hermeticEnv`): `true` lets a script run with `./apex_workstation.db` as its database or `./.apex_trading_keypair.json` as its key. Without it the script exits with code 2. |
 | `SEED_RPC_URL` | `scripts/devnet_seed.ts`: RPC for the devnet seed script. |
-| `SEED_FUNDER_KEYPAIR_PATH` | `scripts/devnet_seed.ts`: funder keypair. |
+| `SEED_FUNDER_KEYPAIR_PATH` | `scripts/devnet_seed.ts`: funder keypair. Without it (or `--funder-keyfile`) the seed refuses to pay from the app wallet unless `--use-app-wallet` is given; then the app must be idle and the run holds the wallet's signer lock. |
 | `SEED_PROOF_BUYERS` | `scripts/localnet/seed_proof.ts`: buyers to simulate. |
 | `AUTO_RUN_DIR` | `scripts/localnet/auto_run.ts`: run directory. |
 | `RUN_SECONDS` | `scripts/localnet/auto_run.ts`: how long to run. |

@@ -7,11 +7,13 @@
  *   npx tsx scripts/devnet_seed.ts --execute       spends devnet SOL (needs the operator's go-ahead)
  *   npx tsx scripts/devnet_seed.ts --sweep .overnight/seed-wallets/<mint>.json     bring the SOL in a saved run's buyer wallets back to its funder
  *   --funder-keyfile <file> (or SEED_FUNDER_KEYPAIR_PATH): pay from a separate devnet wallet, not the app wallet
+ *   --use-app-wallet: pay from the app wallet (refused without this flag, round 1 #10); the app must be idle and its signer lock free
  *   npx tsx scripts/devnet_seed.ts --make-funder <file> --fund-sol <x> --confirm-auto-off
  *       create that separate wallet: a fresh keypair file (0600) funded with x SOL (max 0.5) from the app wallet. Auto mode must be OFF. Prints only the public key.
  *   options: --buyers 30  --buy-sol 0.01  --window-s 30  --cap-sol 0.45  --no-sweep
  *
- * The funder is the wallet the app uses (OPERATOR_PRIVATE_KEY / SOLANA_PRIVATE_KEY / SIGNER_KEYPAIR_PATH, read from `.env`).
+ * The funder is a separate wallet (--funder-keyfile), or, with --use-app-wallet, the wallet the app uses (OPERATOR_PRIVATE_KEY /
+ * SOLANA_PRIVATE_KEY / SIGNER_KEYPAIR_PATH, read from `.env`): then `claimAppWallet` checks the app is idle and holds its signer lock.
  * Hard limits that no flag removes: devnet only (ALLOWED_CLUSTER unset or devnet; the RPC must report the devnet genesis hash; a
  * loopback / private / mainnet-looking RPC URL is refused); at most 0.45 SOL leaves the funder in total.
  * Nothing runs unless every check passes; a failed check exits 2 before the first transaction.
@@ -36,7 +38,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
-import { dbLockPath, otherLiveLockHolder, signerLockPath } from '../server/system/instanceLock';
+import { acquireLock, dbLockPath, InstanceLockError, otherLiveLockHolder, releaseLock, signerLockPath } from '../server/system/instanceLock';
 import { resolveDbPath } from '../server/db/dbPath';
 import { Connection, Keypair, LAMPORTS_PER_SOL, PublicKey, SystemProgram, Transaction, ComputeBudgetProgram } from '@solana/web3.js';
 
@@ -466,6 +468,27 @@ export function assertAppIdle(appDbPath: string | null, walletPubkey: string): v
   if (saved !== null && saved !== 'OFF') throw new SeedGuardError(`the app database ${appDbPath} has auto mode ${String(saved)} saved; set auto OFF in the app first (--confirm-auto-off is not enough)`);
 }
 
+/**
+ * Round 1 #10: the seed (or --make-funder) is about to sign with the app wallet. Refused unless `useAppWallet` (--use-app-wallet) was
+ * given; then the app must be idle (`assertAppIdle`) and this process takes the wallet's signer lock, so a server that starts meanwhile
+ * refuses to sign with it. Returns the function that releases the lock. `useAppWallet` is ignored for --make-funder, which pays from the
+ * app wallet by design.
+ */
+export function claimAppWallet(o: { walletPubkey: string; appDbPath: string | null; useAppWallet: boolean; what: string }): () => void {
+  if (!o.useAppWallet) {
+    throw new SeedGuardError(`${o.what} would sign with the APP wallet ${o.walletPubkey.slice(0, 8)}; its auto controller sees that as an unexplained balance change and halts trading. Use --funder-keyfile <file> (see --make-funder), or pass --use-app-wallet with the app stopped.`);
+  }
+  assertAppIdle(o.appDbPath, o.walletPubkey);
+  const lock = signerLockPath(o.walletPubkey);
+  try {
+    acquireLock(lock, { walletPubkey: o.walletPubkey });
+  } catch (e: any) {
+    if (e instanceof InstanceLockError) throw new SeedGuardError(`the app wallet's signer lock is held: ${e.message}`);
+    throw e;
+  }
+  return () => releaseLock(lock);
+}
+
 export interface MakeFunderResult { pubkey: string; file: string; fundedSol: number; signature: string }
 
 /**
@@ -532,11 +555,17 @@ async function main() {
       const pub = localSigner.getPublicKey?.();
       const appKp = localSigner.exportKeypair();
       if (!pub || !appKp) throw new SeedGuardError('no app wallet: set OPERATOR_PRIVATE_KEY or SIGNER_KEYPAIR_PATH in .env');
-      const r = await makeFunder({
-        connection: conn, allowedGenesis: DEVNET_GENESIS_HASH, file, fundSol: Number(val('fund-sol')), autoOffConfirmed: flag('confirm-auto-off'), appDbPath: resolveDbPath(),
-        signer: { publicKey: pub, sign: async (tx) => { tx.partialSign(appKp); } },
-      });
-      console.log(r.pubkey); // only the public key; the secret stays in the file
+      // makeFunder checks auto OFF and the app idle itself; the lock keeps a server from starting to sign while it pays
+      const release = claimAppWallet({ walletPubkey: pub.toBase58(), appDbPath: resolveDbPath(), useAppWallet: true, what: '--make-funder' });
+      try {
+        const r = await makeFunder({
+          connection: conn, allowedGenesis: DEVNET_GENESIS_HASH, file, fundSol: Number(val('fund-sol')), autoOffConfirmed: flag('confirm-auto-off'), appDbPath: resolveDbPath(),
+          signer: { publicKey: pub, sign: async (tx) => { tx.partialSign(appKp); } },
+        });
+        console.log(r.pubkey); // only the public key; the secret stays in the file
+      } finally {
+        release();
+      }
       return;
     }
     if (flag('sweep')) {
@@ -548,30 +577,40 @@ async function main() {
     }
     // A separate funder keeps the app's wallet audit quiet; without one the app wallet pays (and the audit will see a drain).
     let signer: SeedSigner;
+    let releaseAppWallet: () => void = () => undefined;
     if (keyfile) {
       const kp = loadFunderKeypair(keyfile);
       signer = { publicKey: kp.publicKey, sign: async (tx) => { tx.partialSign(kp); } };
       console.log(`funder: ${kp.publicKey.toBase58()} (separate seed wallet from ${keyfile})`);
+      let isAppWallet = false;
       try {
         const { localSigner } = await import('../server/solana/signer');
-        if (localSigner.getPublicKey?.().equals(kp.publicKey)) console.log('WARNING: that keyfile IS the app wallet; the app\'s wallet audit will halt auto trading while the seed funds buyers');
+        isAppWallet = !!localSigner.getPublicKey?.().equals(kp.publicKey);
       } catch { /* no app wallet configured: nothing to compare */ }
+      // round 1 #10: a keyfile that IS the app wallet is the app wallet: same flag, idle check and signer lock
+      if (isAppWallet) releaseAppWallet = claimAppWallet({ walletPubkey: kp.publicKey.toBase58(), appDbPath: resolveDbPath(), useAppWallet: flag('use-app-wallet'), what: 'the seed (that keyfile is the app wallet)' });
     } else {
       const { localSigner } = await import('../server/solana/signer');
       let pub: PublicKey | undefined;
       try { pub = localSigner.getPublicKey(); } catch { /* getPublicKey throws when no signer is configured */ }
       if (!pub) throw new SeedGuardError('no funder wallet: set OPERATOR_PRIVATE_KEY or SIGNER_KEYPAIR_PATH in .env, or give --funder-keyfile / SEED_FUNDER_KEYPAIR_PATH');
+      releaseAppWallet = claimAppWallet({ walletPubkey: pub.toBase58(), appDbPath: resolveDbPath(), useAppWallet: flag('use-app-wallet'), what: 'the seed' });
       const kp = localSigner.exportKeypair();
-      if (!kp) throw new Error('funder keypair is not readable');
+      if (!kp) { releaseAppWallet(); throw new Error('funder keypair is not readable'); }
       signer = { publicKey: pub, sign: async (tx) => { tx.partialSign(kp); } };
-      console.log(`funder: ${pub.toBase58()} (the APP wallet: its auto controller will see this as an unexplained balance change and halt trading)`);
+      console.log(`funder: ${pub.toBase58()} (the APP wallet, --use-app-wallet: the app is idle and this run holds its signer lock)`);
     }
-    const report = await runSeed({
-      connection: conn, signer, allowedGenesis: DEVNET_GENESIS_HASH,
-      buyers: val('buyers') ? Number(val('buyers')) : undefined, buySol: val('buy-sol') ? Number(val('buy-sol')) : undefined,
-      windowMs: val('window-s') ? Number(val('window-s')) * 1000 : undefined, capSol: val('cap-sol') ? Number(val('cap-sol')) : undefined,
-      dryRun: !flag('execute'), sweep: !flag('no-sweep'), log: (m) => console.log(m),
-    });
+    let report: SeedReport;
+    try {
+      report = await runSeed({
+        connection: conn, signer, allowedGenesis: DEVNET_GENESIS_HASH,
+        buyers: val('buyers') ? Number(val('buyers')) : undefined, buySol: val('buy-sol') ? Number(val('buy-sol')) : undefined,
+        windowMs: val('window-s') ? Number(val('window-s')) * 1000 : undefined, capSol: val('cap-sol') ? Number(val('cap-sol')) : undefined,
+        dryRun: !flag('execute'), sweep: !flag('no-sweep'), log: (m) => console.log(m),
+      });
+    } finally {
+      releaseAppWallet();
+    }
     console.log(JSON.stringify({ ...report, buyers: report.buyers.map((b) => ({ ...b, wallet: b.wallet.slice(0, 6) })) }, null, 2));
     if (report.dryRun) console.log('\nDRY RUN: nothing was sent. Add --execute to spend devnet SOL.');
   } catch (e: any) {

@@ -10,6 +10,7 @@ import http from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { createServer as createViteServer, createLogger } from 'vite';
 import { secretPathGuard, viteDevServerOptions } from './server/security/secretPaths';
+import { defaultBundledToProduction, useDevMiddleware } from './server/system/runtimeMode';
 import { GoogleGenAI } from '@google/genai';
 import { socialScanner, isTelegramTradeCommand, xTwitterScopeEntry } from './server/socialScanner';
 import { memecoinAggregator } from './server/memecoinAggregator';
@@ -97,6 +98,8 @@ import {
   ClosePositionSchema, publicHealthBody } from './server/middleware/enterprise';
 
 
+// R5-14: `npm start` (dist/server.cjs) runs as production even with NODE_ENV unset; set before express() reads it
+{ const note = defaultBundledToProduction(); if (note) console.warn(note); }
 const app = express();
 // Defense in depth with the normalized auth gate: `/API/...` must not reach a route at all.
 app.set('case sensitive routing', true);
@@ -1531,7 +1534,7 @@ async function startServer() {
   await tracingReady; // S209: instrumentation must be in place before any outbound connection is made
   assertReadOnlyStartup(); // S185: refuses to start next to a signing key in read-only mode
   { const p = envConfluenceProblem(); if (p) console.warn(`[APEX QUANT HFT] ${p}`); } // S187
-  if (process.env.NODE_ENV !== 'production') {
+  if (useDevMiddleware()) { // R5-14: never from the bundle
     const customLogger = createLogger();
     const originalError = customLogger.error.bind(customLogger);
     customLogger.error = (msg, options) => {

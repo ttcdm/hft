@@ -41,6 +41,7 @@ npm run build
 # 3. Start the production server
 npm start
 ```
+`npm start` runs the bundle `dist/server.cjs`, which always runs in production mode (it sets `NODE_ENV=production` itself when it is unset, and says so) and serves only the built `dist/` folder. The Vite dev middleware, which serves the project folder, runs only under `npm run dev` (`server/system/runtimeMode.ts`).
 
 Open [http://localhost:3000](http://localhost:3000) in your browser.
 

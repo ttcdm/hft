@@ -64,6 +64,7 @@ import {
   MemecoinPlatform,
 } from '../types';
 import { engineClient } from '../services/engineClient';
+import { fmtRank, fmtUsdPrice } from '../utils/numFormat';
 import { hftAudio } from '../utils/audio';
 import { PumpFunHotCalloutsView } from './PumpFunHotCalloutsView';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
@@ -956,7 +957,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                           {/* Token Name & CA */}
                           <td className="p-3">
                             <div className="flex items-center space-x-2">
-                              <span className="text-slate-500 font-bold">#{pool.trendingRank}</span>
+                              <span className="text-slate-500 font-bold" title="Trending rank from the feed; — when it gives none">{fmtRank(pool.trendingRank)}</span>
                               <div>
                                 <div className="font-bold text-white text-sm flex items-center space-x-1">
                                   <span>${pool.symbol}</span>
@@ -1007,7 +1008,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                           {/* Price & Change */}
                           <td className="p-3">
                             <div className="font-bold text-slate-200">
-                              ${pool.priceUsd < 0.001 ? pool.priceUsd.toFixed(6) : pool.priceUsd.toFixed(4)}
+                              {fmtUsdPrice(pool.priceUsd)}
                             </div>
                             <div className={`text-[11px] font-bold flex items-center space-x-0.5 ${isPositive ? 'text-emerald-400' : 'text-rose-400'}`}>
                               {isPositive ? <ArrowUpRight className="w-3 h-3" /> : <ArrowDownRight className="w-3 h-3" />}
@@ -1289,8 +1290,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                     </div>
                                   </td>
                                   <td className="p-3 text-slate-300">{pos.platform}</td>
-                                  <td className="p-3 text-slate-300">${(pos.entryPriceUsd ?? 0).toFixed(6)}</td>
-                                  <td className="p-3 font-bold text-cyan-300">${(pos.currentPriceUsd ?? 0).toFixed(6)}</td>
+                                  <td className="p-3 text-slate-300">{fmtUsdPrice(pos.entryPriceUsd)}</td>
+                                  <td className="p-3 font-bold text-cyan-300">{fmtUsdPrice(pos.currentPriceUsd)}</td>
                                   <td className="p-3 text-slate-200">
                                     ${(pos.currentValueUsd ?? 0).toFixed(2)}{' '}
                                     <span className="text-slate-500 text-[10px]">(${(pos.costBasisUsd ?? 0).toFixed(2)} cost)</span>

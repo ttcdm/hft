@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { authFetch } from '../services/engineClient';
 import { onAuthenticated } from '../utils/authEvents';
 import { ageText } from '../utils/freshness';
+import { fmtSignedSol, signTone } from '../utils/numFormat';
 
 /** H1: the home page. Launches / Watching / Holding, all from GET /api/board. Unknown values render "—", never a number. */
 export interface BoardData {
@@ -149,7 +150,7 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
                   {fmtPrice(h.markPriceSol)}
                   <span data-testid="mark-age" className={`block text-[10px] ${h.markStale ? 'text-amber-300' : 'text-slate-500'}`}>{ageText(h.markAgeMs)}{h.markStale ? ' (STALE)' : ''}</span>
                 </td>
-                <td className={`${cell} ${h.pnlSol === null ? '' : h.pnlSol >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>{fmt(h.pnlSol, 5)}</td>
+                <td className={`${cell} ${{ up: 'text-emerald-400', down: 'text-red-400', flat: '' }[signTone(h.pnlSol)]}`}>{fmtSignedSol(h.pnlSol, 5)}</td>
                 <td className={cell}>{h.nextExit ? `${h.nextExit.kind.replace(/_/g, ' ')} @ ${fmtPrice(h.nextExit.priceSol)}` : DASH}</td>
               </tr>
             ))}

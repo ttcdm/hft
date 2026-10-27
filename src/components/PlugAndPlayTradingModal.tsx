@@ -41,6 +41,7 @@ import { authFetch } from '../services/engineClient';
 import { useTradingMode, liveClickWarning, plugAndPlayModeView } from '../utils/tradingMode';
 import { positionPnlCell } from '../utils/positionPnl';
 import { closeOutcomeText } from '../utils/closeOutcome';
+import { fmtSol } from '../utils/numFormat';
 import { ageText, markIsStale } from '../utils/freshness';
 import { BELOW_HEADER_TOP } from '../utils/headerOffset';
 
@@ -605,9 +606,9 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                                 {pos.executionMode}
                               </span>
                             </td>
-                            <td className="p-2.5 font-mono">{((pos.costBasisLamports ?? 0) / 1e9).toFixed(4)} SOL</td>
+                            <td className="p-2.5 font-mono">{fmtSol((pos.costBasisLamports ?? 0) / 1e9)}</td>
                             <td className="p-2.5 font-mono">
-                              {(pos.currentValueSol ?? 0).toFixed(4)} SOL
+                              {fmtSol(pos.currentValueSol)}
                               {(pos.status === 'OPEN' || pos.status === 'PARTIALLY_CLOSED') && (
                                 <span data-testid="blotter-mark-age" className={`block text-[10px] ${markIsStale(pos.lastMarkTimestamp, Date.now()) ? 'text-amber-300' : 'text-slate-500'}`}>
                                   mark {ageText(pos.lastMarkTimestamp ? Date.now() - pos.lastMarkTimestamp : null)}{markIsStale(pos.lastMarkTimestamp, Date.now()) ? ' (STALE)' : ''}
@@ -615,7 +616,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                               )}
                             </td>
                             <td className="p-2.5 font-mono font-bold">
-                              <span className={positionPnlCell(pos).positive ? 'text-emerald-400' : 'text-rose-400'}>
+                              <span className={{ up: 'text-emerald-400', down: 'text-rose-400', mixed: 'text-amber-300', flat: 'text-slate-300' }[positionPnlCell(pos).tone]}>
                                 {positionPnlCell(pos).text}
                               </span>
                             </td>

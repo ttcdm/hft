@@ -34,6 +34,23 @@ export function checksBadgeFor(checks: Array<{ status: string }> | null): { text
   return bad === 0 ? { text: `${checks.length}/${checks.length} OK`, tone: 'bg-emerald-500/20 text-emerald-300' } : { text: `${bad} not OK`, tone: 'bg-amber-500/20 text-amber-300' };
 }
 
+/**
+ * R6-2: real LIVE positions still open while the server is not in LIVE (after a kill switch, panic or DISARM). Shown at every width,
+ * apart from the paper totals, so the screen never says "no exposure" while real SOL is in tokens.
+ */
+export const LiveOpenChip: React.FC<{ live: PillState['live'] }> = ({ live }) =>
+  live ? (
+    <span
+      data-testid="live-open-chip"
+      title="Real LIVE positions are still open while the server is not in LIVE. Their exits keep running. Close them from Plug & Play."
+      className="flex items-center space-x-1 px-2 py-1 rounded-lg border border-rose-500/60 bg-rose-950/80 text-rose-200 text-[11px] font-mono font-bold whitespace-nowrap"
+    >
+      <span>LIVE {live.openCount} open</span>
+      <span className="opacity-80">{signedUsd(live.unrealizedUsd)}</span>
+      <span className="text-[10px] opacity-70">today {signedUsd(live.realizedUsd)}</span>
+    </span>
+  ) : null;
+
 interface HeaderProps {
   kpis: PerformanceKPIs;
   isHalted: boolean;
@@ -226,6 +243,7 @@ export const Header: React.FC<HeaderProps> = ({
 
       {/* 3. RIGHT CONTROLS: AUTO-PROFIT PILL, QUANT SUITE, DEPLOY, KILL SWITCH */}
       <div className="flex items-center space-x-1.5 sm:space-x-2 flex-shrink-0">
+        <LiveOpenChip live={profitSummary?.live} />
         {/* Q35: today's realized and the open positions' marked P&L, as the server reports them (a dash when it cannot say) */}
         <button
           id="btn-auto-profit-ticker"

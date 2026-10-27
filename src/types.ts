@@ -171,6 +171,8 @@ export interface SniperPosition {
   openedAt: number;
   status: 'OPEN' | 'CLOSED';
   signalId?: string;
+  /** R6-2: the mode the position was opened in; a LIVE row is real SOL even while the server is in PAPER. */
+  executionMode?: 'LIVE' | 'PAPER' | 'BACKTEST' | 'REPLAY';
 }
 
 export interface SniperBotConfig {

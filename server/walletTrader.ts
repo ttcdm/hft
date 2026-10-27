@@ -39,8 +39,12 @@ export interface LiveWalletState {
    * the whole total NaN (review 2026-10-24, finding 13).
    */
   totalPortfolioValueUsd: number | null;
+  /**
+   * The open positions of the current mode, followed (R6-2) by the open LIVE positions when the mode is not LIVE. Each row carries its
+   * own `executionMode`, so a LIVE row is labelled as such.
+   */
   activePositions: NormalizedPosition[];
-  /** Q35: the header pill reads these; it used to read two fields that were never sent. */
+  /** Q35: the header pill reads these; it used to read two fields that were never sent. Current mode only (LIVE ones are in `liveOpen`). */
   activePositionsCount: number;
   closedPositionsCount: number;
   /** Realized today (UTC day, as the database keys it), net of fees, from the realized-events ledger. */
@@ -55,6 +59,23 @@ export interface LiveWalletState {
   killSwitchActive: boolean;
   rpcLatencyMs: number;
   lastSyncTimestamp: number;
+  /**
+   * R6-2: real LIVE positions still open while the mode is not LIVE (a kill switch, panic, DISARM or an auto trigger sets PAPER, and their
+   * exits keep running). The totals above are the current mode's; these are the LIVE ones, kept apart so paper and real PnL never mix.
+   * null when the mode is LIVE (the totals above are LIVE then) or no LIVE position is open.
+   */
+  liveOpen: LiveOpenSummary | null;
+}
+
+export interface LiveOpenSummary {
+  count: number;
+  unrealizedPnLSol: number;
+  unrealizedPnLUsd: number | null;
+  /** null when any open LIVE position has no finite mark */
+  openValueSol: number | null;
+  /** realized LIVE PnL today (UTC day), net of fees */
+  realizedTodaySol: number;
+  realizedTodayUsd: number | null;
 }
 
 export type PanicLiquidationReport = EmergencyStopReport;
@@ -262,7 +283,10 @@ class PlugAndPlayWalletTrader extends EventEmitter {
 
   public getState(): LiveWalletState {
     const mode = executionCoordinator.getExecutionMode();
-    const activePositions = executionCoordinator.getPositions(mode, 'ACTIVE');
+    const modePositions = executionCoordinator.getPositions(mode, 'ACTIVE');
+    // R6-2: after a disarm the mode is PAPER while real LIVE positions stay open; they are always listed, labelled by executionMode
+    const liveOpenPositions = mode === 'LIVE' ? [] : executionCoordinator.getPositions('LIVE', 'ACTIVE');
+    const activePositions = modePositions;
     const closedPositions = executionCoordinator.getPositions(mode, 'CLOSED');
     // null when any open position is unpriced: a total that silently leaves one out would read as a real figure
     const totalOpenValue = activePositions.every((p) => Number.isFinite(p.currentValueSol))
@@ -275,6 +299,17 @@ class PlugAndPlayWalletTrader extends EventEmitter {
     const totalUnrealizedPnLSol = activePositions.reduce((s, p) => s + (Number.isFinite(p.unrealizedPnLSol) ? (p.unrealizedPnLSol as number) : 0), 0);
     const totalRealizedPnLSol = workstationDb.getDailyRealizedPnLSol(mode);
     const totalRealizedPnLUsd = solPriceUsd === null ? null : totalRealizedPnLSol * solPriceUsd;
+
+    const liveUnrealizedSol = liveOpenPositions.reduce((s, p) => s + (Number.isFinite(p.unrealizedPnLSol) ? (p.unrealizedPnLSol as number) : 0), 0);
+    const liveRealizedSol = liveOpenPositions.length ? workstationDb.getDailyRealizedPnLSol('LIVE') : 0;
+    const liveOpen: LiveOpenSummary | null = liveOpenPositions.length === 0 ? null : {
+      count: liveOpenPositions.length,
+      unrealizedPnLSol: Number(liveUnrealizedSol.toFixed(6)),
+      unrealizedPnLUsd: solPriceUsd === null ? null : Number((liveUnrealizedSol * solPriceUsd).toFixed(2)),
+      openValueSol: liveOpenPositions.every((p) => Number.isFinite(p.currentValueSol)) ? liveOpenPositions.reduce((s, p) => s + (p.currentValueSol as number), 0) : null,
+      realizedTodaySol: Number(liveRealizedSol.toFixed(4)),
+      realizedTodayUsd: solPriceUsd === null ? null : Number((liveRealizedSol * solPriceUsd).toFixed(2)),
+    };
 
     const totalJitoTipsPaidSol = activePositions.reduce((s, p) => s + (p.jitoTipLamports ?? 0) / 1e9, 0);
 
@@ -290,8 +325,8 @@ class PlugAndPlayWalletTrader extends EventEmitter {
       solBalance: diag.walletSolBalance,
       solPriceUsd: solPriceUsd === null ? null : Number(solPriceUsd.toFixed(2)),
       totalPortfolioValueUsd: totalPortfolioValueUsd === null ? null : Number(totalPortfolioValueUsd.toFixed(2)),
-      activePositions,
-      activePositionsCount: activePositions.length,
+      activePositions: [...modePositions, ...liveOpenPositions],
+      activePositionsCount: modePositions.length,
       closedPositionsCount: closedPositions.length,
       totalRealizedPnLSol: Number(totalRealizedPnLSol.toFixed(4)),
       totalRealizedPnLUsd: totalRealizedPnLUsd === null ? null : Number(totalRealizedPnLUsd.toFixed(2)),
@@ -303,6 +338,7 @@ class PlugAndPlayWalletTrader extends EventEmitter {
       killSwitchActive: riskEngine.isKillSwitchActive(),
       rpcLatencyMs: diag.rpcLatencyMs,
       lastSyncTimestamp: Date.now(),
+      liveOpen,
     };
   }
 }

@@ -1260,6 +1260,15 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                         <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-800/80 text-cyan-300 border border-slate-700">
                                           {pos.chain}
                                         </span>
+                                        {pos.executionMode && (
+                                          <span
+                                            data-testid="position-mode"
+                                            title={pos.executionMode === 'LIVE' ? 'Real SOL position. Its exits keep running while the server is disarmed.' : 'Simulated position: no SOL moves.'}
+                                            className={`px-1.5 py-0.5 rounded text-[10px] font-bold border ${pos.executionMode === 'LIVE' ? 'bg-rose-950/80 text-rose-300 border-rose-500/50' : 'bg-slate-800/80 text-slate-300 border-slate-700'}`}
+                                          >
+                                            {pos.executionMode === 'LIVE' ? 'LIVE (real SOL)' : pos.executionMode}
+                                          </span>
+                                        )}
                                       </div>
 
                                       {pos.contractAddress && (

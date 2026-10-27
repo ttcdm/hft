@@ -3,6 +3,8 @@ export interface PillState {
   realizedUsd: number | null;
   unrealizedUsd: number | null;
   openCount: number;
+  /** R6-2: real LIVE positions still open while the server is not in LIVE (after a disarm); absent when there are none. */
+  live?: { openCount: number; unrealizedUsd: number | null; realizedUsd: number | null } | null;
 }
 
 export const signedUsd = (v: number | null | undefined): string =>
@@ -15,6 +17,9 @@ export function readPillState(data: any): PillState | null {
     realizedUsd: num(data.totalRealizedPnLUsd),
     unrealizedUsd: num(data.totalUnrealizedPnLUsd),
     openCount: num(data.activePositionsCount) ?? 0,
+    ...(data.liveOpen && typeof data.liveOpen === 'object' && (num(data.liveOpen.count) ?? 0) > 0
+      ? { live: { openCount: num(data.liveOpen.count) as number, unrealizedUsd: num(data.liveOpen.unrealizedPnLUsd), realizedUsd: num(data.liveOpen.realizedTodayUsd) } }
+      : {}),
   };
 }
 

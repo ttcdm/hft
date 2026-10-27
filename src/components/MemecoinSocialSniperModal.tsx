@@ -20,7 +20,7 @@ import { useAutoStatus, AutoModeBadge, type AutoMode } from './AutoPanel';
 import { buildPoolSnipeRequest } from '../utils/poolSnipe';
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { SnipeAmountControl } from './SnipeAmountControl';
-import { mainnetLinksAvailable, isMainnetDataProvenance, sanitizeExternalUrl, sanitizeTelegramUrl, formatPctChange } from '../utils/tokenLinks';
+import { mainnetLinksAvailable, isMainnetDataProvenance, sanitizeXProfileUrl, sanitizeTelegramUrl, formatPctChange } from '../utils/tokenLinks';
 import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
 import React, { useState, useEffect } from 'react';
 import {
@@ -812,7 +812,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                             {/* X.com Link */}
                             <a
                               href={
-                                sanitizeExternalUrl(sig.socials?.twitter) ||
+                                sanitizeXProfileUrl(sig.socials?.twitter) ||
                                 (sig.source === 'X_TWITTER' && sig.authorHandle.startsWith('@')
                                   ? `https://x.com/${sig.authorHandle.replace('@', '')}`
                                   : `https://x.com/search?q=%24${sig.tokenTicker.replace('$', '')}+solana`)
@@ -821,15 +821,15 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                               rel="noreferrer"
                               className="px-2 py-0.5 rounded bg-sky-500/10 hover:bg-sky-500/20 text-sky-300 border border-sky-500/30 text-[10px] font-mono flex items-center space-x-1 transition"
                               title={
-                                sanitizeExternalUrl(sig.socials?.twitter)
-                                  ? `Token X link (creator-supplied, unverified): ${sanitizeExternalUrl(sig.socials?.twitter)}`
+                                sanitizeXProfileUrl(sig.socials?.twitter)
+                                  ? `Token X link (creator-supplied, unverified): ${sanitizeXProfileUrl(sig.socials?.twitter)}`
                                   : sig.source === 'X_TWITTER'
                                   ? `View Author @${sig.authorHandle} on X`
                                   : `Search $${sig.tokenTicker} on X.com`
                               }
                             >
                               <span className="font-bold text-[11px]">𝕏</span>
-                              <span>{sanitizeExternalUrl(sig.socials?.twitter) ? 'Token 𝕏' : sig.source === 'X_TWITTER' ? 'KOL 𝕏' : 'Search 𝕏'}</span>
+                              <span>{sanitizeXProfileUrl(sig.socials?.twitter) ? 'Token 𝕏' : sig.source === 'X_TWITTER' ? 'KOL 𝕏' : 'Search 𝕏'}</span>
                               <ExternalLink className="w-2 h-2 text-sky-400" />
                             </a>
 

@@ -40,17 +40,43 @@ export function sanitizeExternalUrl(url?: string | null): string | undefined {
   return `https://${trimmed}`;
 }
 
-export function sanitizeTwitterUrl(raw?: string | null, fallbackSymbol?: string, isSolana = true): string {
-  if (raw) {
-    const trimmed = raw.trim();
-    if (trimmed && trimmed.toLowerCase() !== 'none' && trimmed.toLowerCase() !== 'n/a') {
-      if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
-        return trimmed;
-      }
-      const handle = trimmed.replace(/^@/, '');
-      return `https://x.com/${handle}`;
-    }
+/**
+ * R2-11: a creator-supplied social link is followed only to the host it claims to be. Any other host (a tracking or phishing page
+ * dressed as "Twitter") is not linked. Returns the https URL, or undefined when the host is not one of `hosts`.
+ */
+export function urlOnHosts(raw: string, hosts: readonly string[]): string | undefined {
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return undefined;
+    const h = u.hostname.toLowerCase();
+    if (!hosts.some((k) => h === k || h === `www.${k}` || h === `mobile.${k}`)) return undefined;
+    u.protocol = 'https:';
+    return u.toString();
+  } catch {
+    return undefined;
   }
+}
+export const X_HOSTS = ['x.com', 'twitter.com'] as const;
+export const TELEGRAM_HOSTS = ['t.me', 'telegram.me'] as const;
+const HANDLE = /^@?[A-Za-z0-9_]{1,32}$/;
+
+/** The creator-supplied X profile as an x.com / twitter.com link, or undefined (unknown host, or not a handle). */
+export function sanitizeXProfileUrl(raw?: string | null): string | undefined {
+  const t = (raw ?? '').trim();
+  if (!t || ['none', 'n/a', 'null', 'undefined'].includes(t.toLowerCase())) return undefined;
+  if (/^https?:\/\//i.test(t)) return urlOnHosts(t, X_HOSTS);
+  return HANDLE.test(t) ? `https://x.com/${t.replace(/^@/, '')}` : undefined;
+}
+
+/** The host of a creator-supplied website, for the link label (R2-11: the operator sees where it goes before clicking). */
+export function hostOfUrl(url?: string): string | null {
+  if (!url) return null;
+  try { return new URL(url).hostname; } catch { return null; }
+}
+
+export function sanitizeTwitterUrl(raw?: string | null, fallbackSymbol?: string, isSolana = true): string {
+  const profile = sanitizeXProfileUrl(raw); // R2-11: only x.com / twitter.com; anything else falls back to the search link
+  if (profile) return profile;
   const sym = (fallbackSymbol || '').replace('$', '').trim();
   return `https://x.com/search?q=${encodeURIComponent(`$${sym}${isSolana ? ' solana' : ''}`)}`;
 }
@@ -67,10 +93,10 @@ export function sanitizeTelegramUrl(raw?: string | null): string | undefined {
     return undefined;
   }
   if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
-    return trimmed;
+    return urlOnHosts(trimmed, TELEGRAM_HOSTS); // R2-11: t.me / telegram.me only
   }
   const handle = trimmed.replace(/^@/, '');
-  return `https://t.me/${handle}`;
+  return HANDLE.test(handle) ? `https://t.me/${handle}` : undefined;
 }
 
 /** S20: only a known mainnet cluster may link to the mainnet-only sites. Unknown (the server has not answered yet) is NOT mainnet. */
@@ -257,10 +283,10 @@ export function getTokenExternalLinks(params: {
     },
     {
       id: 'twitter',
-      name: twitter ? '𝕏 (creator-supplied profile)' : '𝕏 (Twitter Search)',
-      shortName: twitter ? '𝕏 Profile' : '𝕏 Search',
+      name: sanitizeXProfileUrl(twitter) ? '𝕏 (creator-supplied profile)' : '𝕏 (Twitter Search)',
+      shortName: sanitizeXProfileUrl(twitter) ? '𝕏 Profile' : '𝕏 Search',
       url: twitterClean,
-      description: twitter
+      description: sanitizeXProfileUrl(twitter)
         ? 'Project 𝕏 handle as supplied by the token creator (unverified)'
         : 'Search live influencer callouts, caller confluence, and community sentiment',
       colorClass: 'text-sky-400 hover:text-sky-300 border-sky-500/40 hover:border-sky-400',
@@ -292,10 +318,10 @@ export function getTokenExternalLinks(params: {
   if (websiteClean) {
     items.push({
       id: 'website',
-      name: 'Project Website',
-      shortName: 'Website',
+      name: `Creator-supplied site: ${hostOfUrl(websiteClean) ?? 'unknown host'}`,
+      shortName: `Site (${hostOfUrl(websiteClean) ?? '?'})`,
       url: websiteClean,
-      description: 'Website supplied by the token creator (unverified)',
+      description: `Website supplied by the token creator (unverified). It goes to ${hostOfUrl(websiteClean) ?? 'an unknown host'}, which the creator controls.`,
       colorClass: 'text-emerald-400 hover:text-emerald-300 border-emerald-500/40 hover:border-emerald-400',
       badgeBgClass: 'bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-300 border-emerald-500/30',
       isAvailable: true,

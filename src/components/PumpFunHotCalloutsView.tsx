@@ -52,6 +52,8 @@ import { engineClient } from '../services/engineClient';
 import { hftAudio } from '../utils/audio';
 import {
   sanitizeExternalUrl,
+  sanitizeXProfileUrl,
+  hostOfUrl,
   sanitizeTwitterUrl,
   sanitizeTelegramUrl,
   isMainnetCluster,
@@ -74,9 +76,22 @@ export function rulesAfterPoll<T>(current: T, fromServer: T, dirty: boolean): T 
   return dirty ? current : fromServer;
 }
 
-/** 3H: the coin's own image, or an empty tile with its first letters. A missing or broken image used to show a stock photo as if it were the coin's. */
+/**
+ * 3H: the coin's own image, or an empty tile with its first letters. A missing or broken image used to show a stock photo as if it were the coin's.
+ * R2-11: the image URL is the creator's, so loading it tells the creator's server the operator's IP and when they looked. It is not loaded
+ * until the operator clicks the tile.
+ */
 export function TokenImage({ uri, symbol }: { uri: string; symbol: string }) {
   const [broken, setBroken] = useState(false);
+  const [load, setLoad] = useState(false);
+  if (uri && !broken && !load) {
+    return (
+      <button type="button" data-testid="token-image-click" onClick={() => setLoad(true)} title={`Load the creator-hosted image from ${hostOfUrl(uri) ?? 'an unknown host'} (your IP is visible to that host)`}
+        className="w-11 h-11 rounded-lg border border-dashed border-slate-600 bg-slate-800 flex flex-col items-center justify-center flex-shrink-0 text-[9px] font-mono text-slate-400">
+        <span>{symbol.slice(0, 3)}</span><span className="text-[8px] text-slate-500">img</span>
+      </button>
+    );
+  }
   if (!uri || broken) {
     return (
       <div data-testid="token-image-missing" className="w-11 h-11 rounded-lg border border-slate-700 bg-slate-800 flex items-center justify-center flex-shrink-0 text-[10px] font-mono text-slate-400">
@@ -741,7 +756,8 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                             {/* Verified X.com Link */}
                             {(() => {
                               const twitterUrl = sanitizeTwitterUrl(c.token.twitter, c.token.symbol, true);
-                              const hasOfficial = Boolean(c.token.twitter && c.token.twitter.toLowerCase() !== 'none');
+                              // Round 1 #12 / R2-11: the handle is the creator's own claim, and only an x.com / twitter.com link is followed
+                              const hasOfficial = Boolean(sanitizeXProfileUrl(c.token.twitter));
                               return (
                                 <a
                                   href={twitterUrl}
@@ -752,10 +768,10 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                                       ? 'text-sky-300 bg-sky-500/20 border border-sky-500/40 hover:bg-sky-500/30'
                                       : 'text-slate-400 hover:text-sky-400 hover:bg-slate-800'
                                   }`}
-                                  title={hasOfficial ? `Official 𝕏: ${c.token.twitter}` : `Search $${c.token.symbol} on 𝕏`}
+                                  title={hasOfficial ? `𝕏 handle supplied by the token creator (unverified): ${twitterUrl}` : `Search $${c.token.symbol} on 𝕏`}
                                 >
                                   <span className="font-bold">𝕏</span>
-                                  {hasOfficial && <span className="text-[8px] uppercase">LINK</span>}
+                                  {hasOfficial && <span className="text-[8px] uppercase">creator-supplied</span>}
                                 </a>
                               );
                             })()}
@@ -787,9 +803,10 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                                   target="_blank"
                                   rel="noreferrer"
                                   className="text-emerald-300 bg-emerald-500/20 border border-emerald-500/40 hover:bg-emerald-500/30 p-0.5 text-[9px] font-mono flex items-center gap-0.5 px-1 rounded transition"
-                                  title={`Website (creator-supplied, unverified): ${webUrl}`}
+                                  title={`Website (creator-supplied, unverified, goes to ${hostOfUrl(webUrl) ?? 'an unknown host'}): ${webUrl}`}
                                 >
                                   <Globe className="w-2.5 h-2.5" />
+                                  <span className="text-[8px]">{hostOfUrl(webUrl) ?? '?'}</span>
                                 </a>
                               );
                             })()}

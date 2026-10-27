@@ -3,7 +3,7 @@ import { EventEmitter } from 'events';
 import { PublicKey } from '@solana/web3.js';
 import { traced } from './observability/tracing';
 import { PumpCurveService } from './solana/pumpCurve';
-import { executionCoordinator } from './execution/coordinator';
+import { executionCoordinator, isRecoveredPosition } from './execution/coordinator';
 import { solPriceService } from './market/solPriceService';
 import { workstationDb } from './db/database';
 import { evaluateTokenSafety } from './risk/tokenSafety';
@@ -219,7 +219,8 @@ export class MemecoinAggregatorService extends EventEmitter {
 
       const mode = executionCoordinator.getExecutionMode();
       const activePositions = executionCoordinator.getPositions(mode, 'ACTIVE');
-      if (activePositions.length >= 3) return;
+      // R5-1: a RECOVERED row (a balance found in the wallet, not a trade auto chose) does not take one of the 3 slots
+      if (activePositions.filter((p) => !isRecoveredPosition(p)).length >= 3) return;
 
       try {
         const { pumpFunService, calloutProvenance } = await import('./pumpfunService');

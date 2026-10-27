@@ -138,7 +138,8 @@ export interface MemecoinPool {
    */
   authoritiesVerified?: boolean;
   isLpBurned: boolean;
-  rugcheckScore: 'SAFE' | 'CAUTION' | 'DANGEROUS';
+  /** R6-13: UNKNOWN when nothing has rated the token (a pool made from a create event or a callout); never SAFE by default. */
+  rugcheckScore: 'SAFE' | 'CAUTION' | 'DANGEROUS' | 'UNKNOWN';
   createdAgo: string;
   trendingRank: number;
   /** Q32: true when some numbers above are placeholders (a pool built from a callout, not read from the chain). It is never real evidence. */

@@ -871,6 +871,8 @@ export class ExecutionCoordinator {
   // passes never recover the same pending transaction or rewrite the same positions at once.
   // `fresh` (the operator's Reconcile click) never takes the result of a run that started before the click: it waits for the run in
   // progress and then runs once more, shared by every fresh caller meanwhile (R17: the click is usually made after fixing something).
+  /** R7-4: the in-flight run whose pass outlived the timeout (it keeps the lock until the pass ends). */
+  private reconcileTimedOutRun: Promise<unknown> | null = null;
   private reconcileFollowUp: Promise<{ status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE'; mismatchesCount: number; details: string }> | null = null;
   public startupReconciliation(opts: { fresh?: boolean } = {}): Promise<{
     status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE';
@@ -878,6 +880,9 @@ export class ExecutionCoordinator {
     details: string;
   }> {
     if (opts.fresh && this.reconcileInFlight) {
+      // R7-4: a pass that timed out is still running and still holds the lock; a fresh pass cannot start beside it, so the click gets the
+      // timed-out answer at once (it says the pass is still running) instead of waiting on a hung RPC call.
+      if (this.reconcileTimedOutRun === this.reconcileInFlight) return this.reconcileInFlight;
       if (!this.reconcileFollowUp) {
         const follow: Promise<{ status: 'EXECUTION_READY' | 'RECONCILIATION_MISMATCH' | 'SIGNER_LOCKED' | 'OFFLINE'; mismatchesCount: number; details: string }> = this.reconcileInFlight
           .catch(() => undefined)
@@ -891,23 +896,36 @@ export class ExecutionCoordinator {
     }
     if (!this.reconcileInFlight) {
       // R7: no await inside a pass has a timeout of its own, so a hung RPC call would make every later Reconcile click join the same
-      // hung promise and readiness would say "in progress" forever. Bound the whole pass; on timeout record it as a mismatch and let the next call start fresh.
+      // hung promise and readiness would say "in progress" forever. Bound the whole pass; on timeout record it as a mismatch (R7-4: a new pass starts only once the timed-out one has ended).
       let timer: NodeJS.Timeout | undefined;
       const timeout = new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error('RECONCILIATION_TIMED_OUT')), this.reconcileTimeoutMs);
         timer.unref?.();
       });
-      const run = Promise.race([this.runStartupReconciliation(), timeout])
+      // R7-4: the timeout answers the callers, but it cannot stop the pass, which goes on writing (step 4 can book a sell). The lock is
+      // therefore held until the pass itself settles: a call made meanwhile gets the timed-out answer instead of a second pass beside it.
+      const pass = this.runStartupReconciliation();
+      let passSettled = false;
+      let runSettled = false;
+      const release = () => {
+        if (!(passSettled && runSettled)) return;
+        if (this.reconcileInFlight === run) this.reconcileInFlight = null;
+        if (this.reconcileTimedOutRun === run) this.reconcileTimedOutRun = null;
+      };
+      pass.then(() => { passSettled = true; release(); }, () => { passSettled = true; release(); });
+      const run: ReturnType<typeof this.runStartupReconciliation> = Promise.race([pass, timeout])
         .catch((err: Error) => {
           if (err.message !== 'RECONCILIATION_TIMED_OUT') throw err; // a real failure still rejects, as before
-          const details = `Reconciliation did not finish within ${Math.round(this.reconcileTimeoutMs / 1000)}s (an RPC call is hanging); run it again`;
+          this.reconcileTimedOutRun = run;
+          const details = `Reconciliation did not finish within ${Math.round(this.reconcileTimeoutMs / 1000)}s (an RPC call is hanging); it is still running, and a new pass can start once it ends`;
           this.lastStartupReconciliation = { status: 'RECONCILIATION_MISMATCH', checkedAt: Date.now(), details };
           return { status: 'RECONCILIATION_MISMATCH' as const, mismatchesCount: 1, details };
         })
         .finally(() => {
           if (timer) clearTimeout(timer);
-          if (this.reconcileInFlight === run) this.reconcileInFlight = null;
           this.firstReconciliationDone = true; // P2.2: whatever the outcome (a timeout included), exits stop waiting for it
+          runSettled = true;
+          release();
         });
       this.reconcileInFlight = run;
     }

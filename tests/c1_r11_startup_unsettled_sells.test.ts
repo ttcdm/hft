@@ -50,6 +50,7 @@ describe('R1 #1 / R5-3 / R7-18: startup reconciliation and unsettled sells', () 
     conn.getSignatureStatuses = vi.fn(async () => ({ context: { slot: 1 }, value: [null] }));
     conn.getTokenAccountBalance = vi.fn(async () => ({ value: { amount: '1000' } }));
     (coordinator as any).rpcHealth = 'HEALTHY';
+    await vi.waitFor(() => expect(coordinator.getReconciliationStatus()).not.toBeNull()); // the boot pass a directly built coordinator starts
     await (coordinator as any).reconcileInFlight?.catch(() => undefined);
     vi.spyOn(coordinator as any, 'scheduleReconcileRetry').mockImplementation(() => undefined);
     clearLedger();

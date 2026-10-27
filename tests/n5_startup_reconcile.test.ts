@@ -153,15 +153,23 @@ describe('N5-N9: startup reconciliation does not wedge readiness on states that 
     expect(second.status).toBe('EXECUTION_READY');
   });
 
-  it('R7: a hung reconciliation is cut off, reported as a mismatch, and the next call starts a fresh pass', async () => {
+  it('R7 / R7-4: a hung reconciliation is cut off and reported as a mismatch; a new pass starts once the hung one has ended', async () => {
     await coordinator.startupReconciliation(); // let the boot pass the constructor started finish, so the next call starts a new one
     (coordinator as any).reconcileTimeoutMs = 50;
-    const hung = vi.spyOn(coordinator as any, 'runStartupReconciliation').mockImplementationOnce(() => new Promise(() => undefined));
+    let endHung!: () => void;
+    const hung = vi.spyOn(coordinator as any, 'runStartupReconciliation').mockImplementationOnce(
+      () => new Promise((resolve) => { endHung = () => resolve({ status: 'RECONCILIATION_MISMATCH', mismatchesCount: 1, details: 'hung pass ended' }); })
+    );
     const first = await coordinator.startupReconciliation();
     expect(first.status).toBe('RECONCILIATION_MISMATCH');
     expect(first.details).toMatch(/did not finish/);
     expect(coordinator.canExecuteLive().reasons.join(' ')).toMatch(/unresolved issues|reconciliation/i);
-    const second = await coordinator.startupReconciliation(); // not joined to the hung promise
+    const whileHung = await coordinator.startupReconciliation(); // R7-4: no second pass beside the one still running
+    expect(hung).toHaveBeenCalledTimes(1);
+    expect(whileHung.details).toMatch(/did not finish/);
+    endHung();
+    await new Promise((r) => setTimeout(r, 0));
+    const second = await coordinator.startupReconciliation(); // the hung pass has ended: this one is fresh
     expect(hung).toHaveBeenCalledTimes(2);
     expect(second.details).not.toMatch(/did not finish/);
   });

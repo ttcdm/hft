@@ -945,7 +945,12 @@ export class ExecutionCoordinator {
 
     // 4. Resolve pending transactions from previous runs with actual on-chain transaction verification
     // R5-4: an unreadable transactions table is unknown, not empty. Nothing is resolved, step 4b closes nothing, and the pass is a mismatch.
-    const pendingRead = workstationDb.getPendingTransactions();
+    // R1 #1 / R5-3: a LIVE SELL left RECONCILIATION_REQUIRED (its fill could not be matched or rebuilt, or it was confirmed on a boot with no
+    // signer) is tried again on every pass. Nothing else revisits it, and its position must never be closed as a zero-balance loss meanwhile.
+    const unresolvedRead = workstationDb.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED']);
+    const pendingRead = unresolvedRead === null
+      ? null
+      : unresolvedRead.filter((t) => t.reconciliationState === 'PENDING' || (t.direction === 'SELL' && t.executionMode === 'LIVE'));
     const ledgerUnreadable = pendingRead === null;
     if (ledgerUnreadable) {
       mismatchesCount++;
@@ -1068,22 +1073,30 @@ export class ExecutionCoordinator {
                   issues.push(`Transaction ${pTx.signature.slice(0, 8)}... confirmed but could not reconstruct position`);
                 }
               } else {
-                pTx.reconciliationState = 'RECONCILIATION_REQUIRED';
+                // R5-3: with no signer the fill cannot be rebuilt (it is read for the wallet). That decides nothing about the row, so it stays
+                // as it was for a pass that has the signer, instead of becoming RECONCILIATION_REQUIRED.
                 mismatchesCount++;
-                issues.push(`Transaction ${pTx.signature.slice(0, 8)}... confirmed but missing position record`);
+                issues.push(`Transaction ${pTx.signature.slice(0, 8)}... is confirmed but cannot be applied without a signer; left for a pass with one`);
               }
             }
             workstationDb.saveTransaction(pTx);
+          } else if (status) {
+            // R7-18: a status (processed, not yet confirmed) means the transaction landed; it is not expired whatever the block height says.
+            mismatchesCount++;
+            issues.push(`Transaction ${pTx.signature.slice(0, 8)}... has landed but is not confirmed yet; retrying`);
+            this.scheduleReconcileRetry();
           } else if (typeof pTx.lastValidBlockHeight === 'number' && pTx.lastValidBlockHeight > 0) {
             // P2.1 here too: with no status, the row is decided by the chain's block height against its lastValidBlockHeight, not by its
             // age (a slow RPC or a long restart said nothing about whether it can still land). Not expired yet: keep it and look again.
-            if (await this.blockhashExpired(pTx)) {
+            // R7-18: the status read above came before the height read, so a transaction that landed in between had no status then. Read
+            // the status again after the height says expired (the runtime order, signatureUnseen), and only an unseen one is TIMED_OUT.
+            if ((await this.blockhashExpired(pTx)) && (await this.signatureUnseen(pTx.signature))) {
               pTx.reconciliationState = 'TIMED_OUT';
               workstationDb.saveTransaction(pTx);
             } else {
               this.scheduleReconcileRetry();
             }
-          } else if (Date.now() - pTx.submissionTime > 120000) {
+          } else if (Date.now() - pTx.submissionTime > 120000 && (await this.signatureUnseen(pTx.signature))) {
             pTx.reconciliationState = 'TIMED_OUT'; // a row written before lastValidBlockHeight was stored
             workstationDb.saveTransaction(pTx);
           }
@@ -1102,11 +1115,12 @@ export class ExecutionCoordinator {
       // S10: a SELL that step 4 could not settle (the RPC failed, or the signature is confirmed but its details are not readable yet) is
       // still PENDING here. Its position shows an empty wallet precisely BECAUSE the sell landed, and closing it now would zero the cost
       // basis; the retry would then find the position closed and drop the sell as "already applied", so its realized PnL is lost for good.
+      // R1 #1: RECONCILIATION_REQUIRED sells count as unsettled too (step 4 could not apply them, and their PnL is still owed).
       // R5-4: when the ledger cannot be read, no sell can be ruled out, so no position is closed on a zero balance in this pass.
-      const pendingAfterStep4 = ledgerUnreadable ? null : workstationDb.getPendingTransactions();
-      const unsettledSellMints = pendingAfterStep4 === null
+      const unsettledAfterStep4 = ledgerUnreadable ? null : workstationDb.loadTransactionsInStates(['PENDING', 'RECONCILIATION_REQUIRED']);
+      const unsettledSellMints = unsettledAfterStep4 === null
         ? null
-        : new Map(pendingAfterStep4.filter((t) => t.direction === 'SELL').map((t) => [t.mint, t.signature]));
+        : new Map(unsettledAfterStep4.filter((t) => t.direction === 'SELL' && t.executionMode === 'LIVE').map((t) => [t.mint, t.signature]));
       if (unsettledSellMints === null && !ledgerUnreadable) {
         mismatchesCount++;
         issues.push('The transactions table could not be read after resolving pending rows; no position was closed on a zero balance');

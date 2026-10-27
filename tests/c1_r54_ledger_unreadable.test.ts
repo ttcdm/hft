@@ -64,7 +64,7 @@ describe('R5-4: an unreadable ledger never reads as "no unresolved transactions"
     const id = `r54_${uid()}`;
     livePosition(id);
     conn.getTokenAccountBalance = vi.fn(async () => { throw new Error('failed to get token account balance: Invalid param: could not find account'); });
-    vi.spyOn(workstationDb, 'getPendingTransactions').mockReturnValue(null);
+    vi.spyOn(workstationDb, 'loadTransactionsInStates').mockReturnValue(null);
     const journal = vi.spyOn(workstationDb, 'logJournal');
     const res = await coordinator.startupReconciliation();
     const row = workstationDb.loadPositions().find((p) => p.id === id)!;

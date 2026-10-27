@@ -16,7 +16,7 @@ Where to look:
 
 | Route | Shows |
 |---|---|
-| `GET /api/system/checks` | cluster, signer, RPC, reconciliation, halt, kill switch and circuit breaker, feed, marks, database, and the open operator alerts (`TRADING_HALTED`, `HALT_NOT_PERSISTED`, `KILL_SWITCH_WAS_ON`, `EXIT_FAILING`, `EXIT_QUOTE_FAILING`, `EXIT_RATE_LIMITED`, `EXIT_NO_SIGNER`, `SELL_ADOPTED`, `UNTRACKED_TOKEN_BALANCE`, `POSITION_NOT_PERSISTED`, `POSITION_MARK_UNAVAILABLE`, ...). The capacity row also shows how many seller funder lookups ended unread |
+| `GET /api/system/checks` | cluster, signer, RPC, reconciliation, halt, kill switch and circuit breaker, feed, marks, database, and the open operator alerts (`TRADING_HALTED`, `HALT_NOT_PERSISTED`, `KILL_SWITCH_WAS_ON`, `EXIT_FAILING`, `EXIT_QUOTE_FAILING`, `EXIT_RATE_LIMITED`, `RPC_AUTH_REJECTED`, `EXIT_NO_SIGNER`, `SELL_ADOPTED`, `UNTRACKED_TOKEN_BALANCE`, `POSITION_NOT_PERSISTED`, `POSITION_MARK_UNAVAILABLE`, ...). The capacity row also shows how many seller funder lookups ended unread |
 | `GET /api/execution/can-arm` | `allowed`, plus every reason arming would fail |
 | `GET /api/execution/mode` | coordinator mode and `isLiveArmed` |
 | `GET /api/execution/readiness` | every readiness component, the same list `can-arm` is built from |

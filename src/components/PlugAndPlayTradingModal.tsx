@@ -11,6 +11,7 @@
  */
 import { probeLatency } from '../utils/probeBadge';
 import { sellConfirmText } from '../utils/sellConfirm';
+import { journalEventDetail } from '../utils/exitWatch';
 import { ARMED_MESSAGE, PANIC_CONFIRM_TEXT, armRefusalText, panicOutcome } from '../utils/tradingCopy';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import React, { useState, useEffect } from 'react';
@@ -705,6 +706,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                         </span>
                         <span className="text-white font-mono">{ev.payload?.mint || ev.payload?.positionId || ''}</span>
                         <span className="text-slate-400">{ev.payload?.reason || ev.payload?.source || ''}</span>
+                        {journalEventDetail(ev) && <span className="text-slate-300 font-mono" data-testid="journal-sell-detail">{journalEventDetail(ev)}</span>}
                       </div>
                       <span className="text-slate-500 text-[10px] font-mono">
                         {new Date(ev.timestamp).toLocaleTimeString()}

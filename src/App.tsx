@@ -21,6 +21,7 @@ import { AutoPanel } from './components/AutoPanel';
 import { usePolled } from './utils/usePolled';
 import { readServerAlerts, serverAlertEvents, alertsUnreadableEvent, killSwitchStateAlert } from './utils/operatorAlerts';
 import { killSwitchPress } from './utils/killSwitchPress';
+import { exitAlerts, type WatchedPosition } from './utils/exitWatch';
 import { PanelErrorBoundary } from './components/ErrorBoundaries';
 
 
@@ -166,6 +167,35 @@ export default function App() {
       hftAudio.playAlertBeep(a.level === 'CRITICAL' ? 'CRITICAL' : 'WARNING');
     }
   });
+
+  // R10-4: an exit the bot makes by itself (take-profit, stop-loss, trailing, stale) is announced, with what it sold and the PnL
+  const watchedOpen = useRef<WatchedPosition[] | null>(null);
+  useEffect(() => {
+    if (!isOperatorAuthenticated) { watchedOpen.current = null; return; }
+    let alive = true;
+    const load = async () => {
+      try {
+        const r = await authFetch('/api/workstation/positions?status=ACTIVE');
+        if (!r.ok || !alive) return;
+        const open: WatchedPosition[] = (await r.json())?.positions ?? [];
+        const before = watchedOpen.current;
+        watchedOpen.current = open;
+        if (!before) return; // the first read is the baseline
+        const ids = new Set(open.map((p) => p.id));
+        const changed = before.some((p) => !ids.has(p.id) || open.find((q) => q.id === p.id)?.tokenQuantityRaw !== p.tokenQuantityRaw);
+        if (!changed) return;
+        let all: WatchedPosition[] = open;
+        if (before.some((p) => !ids.has(p.id))) {
+          const ra = await authFetch('/api/workstation/positions');
+          if (ra.ok) all = (await ra.json())?.positions ?? open;
+        }
+        if (alive) for (const a of exitAlerts(before, open, all)) triggerAlert(a.level, a.title, a.message);
+      } catch { /* the next read retries; the baseline stays */ }
+    };
+    load();
+    const t = setInterval(load, 5000);
+    return () => { alive = false; clearInterval(t); };
+  }, [isOperatorAuthenticated, triggerAlert]);
 
   // Q36: a refused WebSocket command is shown, not dropped.
   useEffect(() => {

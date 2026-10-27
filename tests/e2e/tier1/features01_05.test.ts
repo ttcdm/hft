@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { PublicKey, Keypair } from '@solana/web3.js';
 import { AccountLayout } from '@solana/spl-token';
 import { PUMP_AMM_SDK, canonicalPumpPoolPda } from '@pump-fun/pump-swap-sdk';
+import { bondingCurvePda, PUMP_PROGRAM_ID } from '@pump-fun/pump-sdk';
 import BN from 'bn.js';
 import { Logger } from '../../../server/middleware/enterprise';
 import { PumpCurveService, resolvePumpFeeRecipients } from '../../../server/solana/pumpCurve';
@@ -159,6 +160,9 @@ describe('Tier 1: Feature Coverage (Features 1 - 5)', () => {
       expect(pda).toBeInstanceOf(PublicKey);
       expect(bump).toBeGreaterThanOrEqual(0);
       expect(bump).toBeLessThanOrEqual(255);
+      // the address itself equals the pinned SDK's derivation, and the bump re-derives it
+      expect(pda.toBase58()).toBe(bondingCurvePda(VALID_PUMP_MINT_1).toBase58());
+      expect(PublicKey.createProgramAddressSync([Buffer.from('bonding-curve'), new PublicKey(VALID_PUMP_MINT_1).toBuffer(), Buffer.from([bump])], PUMP_PROGRAM_ID).toBase58()).toBe(pda.toBase58());
     });
 
     it('F2.2: calculates integer buy quote without fractional rounding errors', () => {

@@ -36,11 +36,15 @@ describe('C6: one source for Jito tip defaults', () => {
     solPriceService.setPrice(150, 'TEST');
     vi.spyOn(executionCoordinator, 'getExecutionMode').mockReturnValue('PAPER');
     const resolver = vi.spyOn(executionConfig, 'resolveDynamicJitoTip');
-    await executionCoordinator.executeTrade({
+    // A rejection here is a real failure of the test: it is not swallowed any more.
+    const res = await executionCoordinator.executeTrade({
       mint: MINT_A, symbol: 'T', name: 'T', amountSol: 0.02, currentPriceSol: 0.0000001, slippageBps: 800, liquidityUsd: 50000,
-    } as any).catch(() => undefined);
+    } as any);
+    expect(res).toBeDefined();
     expect(resolver).toHaveBeenCalled();
     expect(resolver.mock.calls[0][0].explicitTipSol).toBeUndefined();
+    const resolved = await resolver.mock.results[0].value;
+    expect(resolved).toBeDefined();
   });
 
   it('request schemas no longer inject a tip default', () => {

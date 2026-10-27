@@ -70,13 +70,18 @@ describe('WebSocket auth on the real server', () => {
     c.ws.close();
   });
 
-  it('a mutating action without a valid token is refused with UNAUTHORIZED_MUTATION', async () => {
+  it('a mutating action before AUTHENTICATE closes the socket (4002) and runs nothing', async () => {
+    // R4-12 (F): before it authenticates, a socket may send only AUTHENTICATE; anything else closes it (it used to answer
+    // UNAUTHORIZED_MUTATION and keep the socket open).
+    const panic = vi.spyOn(walletTrader, 'panicLiquidateAll');
     const c = await connect();
     await vi.waitFor(() => expect(has(c.frames, 'AUTH_REQUIRED')).toBe(true));
     c.ws.send(JSON.stringify({ action: 'PANIC_LIQUIDATE' }));
-    await vi.waitFor(() => expect(has(c.frames, 'AUTH_ERROR')).toBe(true));
-    expect(c.frames.find((f) => f.type === 'AUTH_ERROR').error).toMatch(/^UNAUTHORIZED_MUTATION/);
-    c.ws.close();
+    const closed = await c.closed;
+    expect(closed.code).toBe(4002);
+    expect(closed.reason).toBe('Authenticate first');
+    expect(c.frames.map((f) => f.type)).toEqual(['AUTH_REQUIRED']);
+    expect(panic).not.toHaveBeenCalled();
   });
 
   it('a foreign Origin is closed with 4003', async () => {

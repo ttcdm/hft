@@ -18,7 +18,7 @@ import { watchWindow, readyGate, type WatchResult, type WatchVerdict } from '../
 import { checkConfluenceThreshold, getConfluenceThreshold, setConfluenceThreshold, confluenceThresholdInfo, CONFLUENCE_DEVNET_LIVE_FLOOR, type ConfluenceThresholdInfo } from '../signals/confluenceThreshold';
 import { isCurveTooFar, curveTooFarReason } from '../signals/curveProgressCap';
 import { onChainPoolStats } from '../market/poolStats';
-import { dbLockPath, liveLockHolder } from '../system/instanceLock';
+import { dbLockPath, otherLiveLockHolder } from '../system/instanceLock';
 
 /**
  * G1: the only owner of auto trading.
@@ -366,8 +366,8 @@ export class AutoSnipeController extends EventEmitter {
     // P1.1 (N-59): another live process owns this database. Restoring here would start a second session on it and rewrite the mode that
     // process saved, out of reach of its kill switch. The instance lock normally stops a second server before this; this is the backstop.
     const lock = dbLockPath(workstationDb.getDbPath());
-    const holder = lock ? liveLockHolder(lock) : null;
-    if (holder && holder.pid !== process.pid) {
+    const holder = lock ? otherLiveLockHolder(lock) : null; // R4-1: by boot id, so another container's PID 1 counts
+    if (holder) {
       note = `restart: auto mode not restored: process ${holder.pid} holds ${lock}; auto stays OFF and the saved mode is left as it is`;
       Logger.warn(`[AUTO] ${note}`);
       return { threshold, mode: this.mode, note };

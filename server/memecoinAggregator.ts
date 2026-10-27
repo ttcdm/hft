@@ -2,7 +2,7 @@ import { MemecoinPool, SniperPosition, SniperBotConfig } from '../src/types';
 import { EventEmitter } from 'events';
 import { PublicKey } from '@solana/web3.js';
 import { traced } from './observability/tracing';
-import { PumpCurveService } from './solana/pumpCurve';
+import { PumpCurveService, type MarketStateFailure } from './solana/pumpCurve';
 import { executionCoordinator, isRecoveredPosition } from './execution/coordinator';
 import { solPriceService } from './market/solPriceService';
 import { workstationDb } from './db/database';
@@ -571,6 +571,13 @@ export class MemecoinAggregatorService extends EventEmitter {
 
     // Sizing via CapitalSizer (B12): determine spendable bankroll and 10% ceiling
     const executionMode = executionCoordinator.getExecutionMode();
+    // R5-40: the operator trade route reaches the coordinator only through here, and the curve read below comes first. On an RPC the
+    // heartbeat found on another cluster (a new ledger behind the same URL) that read fails as a lagging slot or a missing curve, which
+    // hid the real reason the coordinator gave before (CLUSTER_GUARD). Refuse with it here, before anything is read.
+    if (executionMode === 'LIVE') {
+      const clusterProblem = executionCoordinator.getClusterStatus().problem;
+      if (clusterProblem) return { success: false, message: `CLUSTER_GUARD: the RPC is not on the allowed cluster (${clusterProblem.replace(/^CLUSTER_GUARD: /, '')}); nothing was read or sent`, txHash: '' };
+    }
     // C3: LIVE needs a fresh SOL/USD price (fail closed). PAPER may use the last known one, but not none.
     if (executionMode === 'LIVE') {
       try {
@@ -659,6 +666,8 @@ export class MemecoinAggregatorService extends EventEmitter {
     const jitoTipSol = params.jitoTipSol || this.config.jitoTipSol || undefined;
 
     let pool = this.pools.find((p) => p.contractAddress.toLowerCase() === cleanCa.toLowerCase());
+    /** Why the on-chain curve read gave no state (P1.6 failure out-param), for the MARKET_DATA_UNAVAILABLE reason below. */
+    const curveFailure: Partial<MarketStateFailure> = {};
 
     if (!pool) {
       try {
@@ -668,6 +677,7 @@ export class MemecoinAggregatorService extends EventEmitter {
           connection: executionCoordinator.getConnection(),
           mint: mintPubkey,
           executionMode: currentMode,
+          failure: curveFailure,
         });
         // the feed may have created this mint's pool while the curve was being read; use it instead of adding a second entry
         pool = this.pools.find((p) => p.contractAddress.toLowerCase() === cleanCa.toLowerCase());
@@ -820,7 +830,7 @@ export class MemecoinAggregatorService extends EventEmitter {
     if (!pool) {
       return {
         success: false,
-        message: `MARKET_DATA_UNAVAILABLE: Token pool ${cleanCa} not found and real on-chain bonding curve could not be resolved. Sniping without real market state is rejected.`,
+        message: `MARKET_DATA_UNAVAILABLE: Token pool ${cleanCa} not found and real on-chain bonding curve could not be resolved${curveFailure.reason ? ` (${curveFailure.reason}: ${curveFailure.message ?? ''})` : ''}. Sniping without real market state is rejected.`,
         txHash: '',
       };
     }

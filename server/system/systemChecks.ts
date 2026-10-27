@@ -1,4 +1,4 @@
-import { executionCoordinator } from '../execution/coordinator';
+import { executionCoordinator, ACKNOWLEDGEABLE_ALERT_CODES } from '../execution/coordinator';
 import type { OperatorAlert } from '../core/types';
 import { autoSnipeController } from '../auto/controller';
 import { pumpFeedListener } from '../solana/pumpFeedListener';
@@ -31,7 +31,11 @@ export interface SystemChecksResult { checkedAt: number; cluster: string; mode: 
  * that did not persist); the UI keeps those on screen until the server clears them. A code not listed here is CRITICAL (fail closed).
  */
 export type OperatorAlertLevel = 'CRITICAL' | 'WARNING' | 'INFO';
-export interface OperatorAlertView extends OperatorAlert { level: OperatorAlertLevel }
+export interface OperatorAlertView extends OperatorAlert {
+  level: OperatorAlertLevel;
+  /** It reports a past event and nothing clears it but the operator: POST /api/system/alerts/acknowledge { code, positionId }. */
+  acknowledgeable: boolean;
+}
 export const OPERATOR_ALERT_LEVELS: Record<string, OperatorAlertLevel> = {
   TRADING_HALTED: 'CRITICAL',
   HALT_NOT_PERSISTED: 'CRITICAL',
@@ -74,7 +78,7 @@ const LEVEL_RANK: Record<OperatorAlertLevel, number> = { CRITICAL: 0, WARNING: 1
 /** Every open alert with its level, CRITICAL first, newest first within a level. */
 export function operatorAlertViews(alerts: OperatorAlert[]): OperatorAlertView[] {
   return alerts
-    .map((a) => ({ ...a, level: operatorAlertLevel(a.code) }))
+    .map((a) => ({ ...a, level: operatorAlertLevel(a.code), acknowledgeable: ACKNOWLEDGEABLE_ALERT_CODES.includes(a.code) }))
     .sort((a, b) => LEVEL_RANK[a.level] - LEVEL_RANK[b.level] || b.lastSeenAt - a.lastSeenAt);
 }
 

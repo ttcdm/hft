@@ -37,6 +37,14 @@ export const EXIT_LOOP_ALERT_AFTER = 3;
 export const MARK_STALE_MS = 15_000;
 /** R6-9: a close that did something other than sell now: adopted an earlier landed sell, or found the wallet empty and booked an assumed loss. */
 export type CloseOutcome = 'ADOPTED_EARLIER_SELL' | 'ADOPTED_EARLIER_SELL_FILL_UNREAD' | 'ASSUMED_LOSS_EMPTY_WALLET';
+/**
+ * The CRITICAL operator alerts nothing clears by itself: each reports something that already happened (a position closed because the
+ * wallet held none of it, a sell adopted after its confirmation was missed, a ledger row that could not be written), so no later state
+ * makes it go away and it used to stay until a restart. The operator acknowledges one of these, by code and position, with
+ * POST /api/system/alerts/acknowledge once it has been looked at. Every other alert clears when its condition does, and cannot be
+ * acknowledged away while it still holds.
+ */
+export const ACKNOWLEDGEABLE_ALERT_CODES: readonly string[] = ['POSITION_GONE', 'POSITION_BALANCE_MISSING', 'SELL_ADOPTED', 'LEDGER_WRITE_FAILED'];
 /** C4: if a direct read still fails after this long, raise an operator alert. */
 export const MARK_ALERT_AFTER_MS = 60_000;
 export const MARK_RETRY_BASE_MS = 60_000;
@@ -1230,6 +1238,7 @@ export class ExecutionCoordinator {
             pos.exitReason = 'RECONCILED_ZERO_BALANCE: no tokens in the wallet at startup reconciliation (REALIZED_ASSUMED_LOSS)';
             pos.lastUpdatedTimestamp = Date.now();
             workstationDb.savePosition(pos);
+            this.clearClosedPositionAlerts(pos.id);
             this.raiseOperatorAlert('POSITION_GONE', `Position ${pos.symbol || pos.mint.slice(0, 6)} was recorded open but the wallet holds none of it. Closed in the database and booked as a loss of its cost basis (${assumedLossSol.toFixed(6)} SOL), since no sell was found.`, pos.id);
             issues.push(`Position ${pos.symbol} (${pos.mint.slice(0, 6)}...) had no on-chain balance: closed in the database`);
           }
@@ -3834,6 +3843,7 @@ export class ExecutionCoordinator {
     try {
       const res = await this.closePositionImpl(positionId, sellPct, reason);
       this.recordExitOutcome(positionId, res, before?.executionMode, reason);
+      if (res.success && res.status === 'CLOSED') this.clearClosedPositionAlerts(positionId);
       if (res.success && before) {
         workstationDb.logDecision({
           autoMode: 'n/a',
@@ -4604,6 +4614,27 @@ export class ExecutionCoordinator {
     Logger.error(`[OPERATOR ALERT] ${code}: ${message}`);
   }
 
+  /**
+   * The operator has looked at an alert that reports a past event (ACKNOWLEDGEABLE_ALERT_CODES) and clears it. `positionId` is the key the
+   * alert carries (a position id; the buy's signature for LEDGER_WRITE_FAILED); left out, it matches an alert raised without one.
+   * Refused for any other code, and NOT_FOUND when no such alert is open.
+   */
+  public acknowledgeOperatorAlert(code: string, positionId?: string): { acknowledged: boolean; error?: string } {
+    if (!ACKNOWLEDGEABLE_ALERT_CODES.includes(code)) {
+      return { acknowledged: false, error: `NOT_ACKNOWLEDGEABLE: ${code} clears by itself when its condition does; only ${ACKNOWLEDGEABLE_ALERT_CODES.join(', ')} are acknowledged by the operator` };
+    }
+    const open = this.operatorAlerts.filter((a) => a.code === code && a.positionId === positionId && !a.cleared);
+    if (open.length === 0) return { acknowledged: false, error: `NOT_FOUND: no open ${code} alert${positionId ? ` for ${positionId}` : ''}` };
+    for (const a of open) a.cleared = true;
+    Logger.warn(`[OPERATOR ALERT] ${code}${positionId ? ` (${positionId})` : ''} acknowledged by the operator`);
+    return { acknowledged: true };
+  }
+
+  /** A position that is closed has no mark to wait for: its POSITION_MARK_UNAVAILABLE no longer applies. */
+  private clearClosedPositionAlerts(positionId: string): void {
+    this.clearOperatorAlert('POSITION_MARK_UNAVAILABLE', positionId);
+  }
+
   private clearOperatorAlert(code: string, positionId?: string) {
     for (const a of this.operatorAlerts) {
       if (a.code === code && a.positionId === positionId) a.cleared = true;
@@ -4858,6 +4889,11 @@ export class ExecutionCoordinator {
     } catch {}
 
     let positions = workstationDb.loadPositions(undefined, 'ACTIVE');
+    // A position closed by any path (a sell, reconciliation, a paper exit, startup) leaves no mark alert behind
+    const openIds = new Set(positions.map((p) => p.id));
+    for (const a of this.operatorAlerts) {
+      if (a.code === 'POSITION_MARK_UNAVAILABLE' && a.positionId && !a.cleared && !openIds.has(a.positionId)) this.clearClosedPositionAlerts(a.positionId);
+    }
     // P2.2 (R1-23, R1-83, R1-115): until the first startup reconciliation has applied the SELL rows from before a restart, a LIVE position
     // with an unresolved sell is not evaluated: its earlier sell may have landed, and selling again could sell a partial twice.
     // R5-4: a ledger that cannot be read (here, or when pendingSells was seeded) is unknown: every LIVE position is held, since any of

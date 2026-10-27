@@ -31,6 +31,8 @@ export interface AlertEvent {
   source?: 'local' | 'server';
   /** No dismiss button: it stays until the server clears it. */
   sticky?: boolean;
+  /** A server alert that only the operator clears (POST /api/system/alerts/acknowledge with this code and positionId). */
+  serverAck?: { code: string; positionId?: string };
 }
 
 // ---------------- SOCIAL SCANNER & ALPHA INTELLIGENCE ----------------

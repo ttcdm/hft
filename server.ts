@@ -52,6 +52,7 @@ import {
   AutoOrderSizeSchema,
   AutoThresholdSchema,
   AutoKillSchema,
+  AlertAcknowledgeSchema,
   AutoResumeSchema,
   CalloutSnipeSchema,
   AutoSnipeRulesSchema,
@@ -1197,6 +1198,15 @@ app.get('/api/diagnostics/system', requireOperatorAuth, (req, res) => {
 
 // System checks and measured latency: live reads, each from the component that owns the fact (see server/system/*).
 app.get('/api/system/checks', requireOperatorAuth, (req, res) => {
+  res.json({ success: true, ...buildSystemChecks() });
+});
+
+// A CRITICAL alert that reports a past event (POSITION_GONE, POSITION_BALANCE_MISSING, SELL_ADOPTED, LEDGER_WRITE_FAILED) stayed until a
+// restart. The operator acknowledges one here, by code and position, once it has been looked at. Any other code is refused (409): it
+// clears by itself when its condition does. 404 when no such alert is open.
+app.post('/api/system/alerts/acknowledge', requireOperatorAuth, validateTradeBody(AlertAcknowledgeSchema), (req, res) => {
+  const r = executionCoordinator.acknowledgeOperatorAlert(req.body.code, req.body.positionId);
+  if (!r.acknowledged) return res.status(/^NOT_FOUND/.test(r.error ?? '') ? 404 : 409).json({ success: false, error: r.error });
   res.json({ success: true, ...buildSystemChecks() });
 });
 

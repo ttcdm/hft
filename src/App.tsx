@@ -19,7 +19,7 @@ import { TokenBoard } from './components/TokenBoard';
 import { CurvePanel } from './components/CurvePanel';
 import { AutoPanel } from './components/AutoPanel';
 import { usePolled } from './utils/usePolled';
-import { readServerAlerts, serverAlertEvents, alertsUnreadableEvent, killSwitchStateAlert } from './utils/operatorAlerts';
+import { readServerAlerts, serverAlertEvents, alertsUnreadableEvent, killSwitchStateAlert, acknowledgeServerAlert } from './utils/operatorAlerts';
 import { killSwitchPress } from './utils/killSwitchPress';
 import { exitAlerts, type WatchedPosition } from './utils/exitWatch';
 import { PanelErrorBoundary } from './components/ErrorBoundaries';
@@ -156,7 +156,8 @@ export default function App() {
   // server clears it; a WARNING or INFO one can be hidden in this browser.
   const checksPoll = usePolled<any>('/api/system/checks', 5000, isOperatorAuthenticated);
   const [hiddenServerAlerts, setHiddenServerAlerts] = useState<Set<string>>(new Set());
-  const serverAlerts = serverAlertEvents(readServerAlerts(checksPoll.data), hiddenServerAlerts);
+  const [acknowledgedServerAlerts, setAcknowledgedServerAlerts] = useState<Set<string>>(new Set());
+  const serverAlerts = serverAlertEvents(readServerAlerts(checksPoll.data), hiddenServerAlerts, acknowledgedServerAlerts);
   const unreadable = isOperatorAuthenticated && checksPoll.error ? [alertsUnreadableEvent(checksPoll.error, checksPoll.at ?? Date.now())] : [];
   const shownAlerts = [...killSwitchStateAlert(isHalted, haltedSinceAt), ...unreadable, ...serverAlerts, ...alerts];
   const seenServerAlerts = useRef<Set<string>>(new Set());
@@ -326,6 +327,13 @@ export default function App() {
           onDismissAlert={(id) => {
             if (id.startsWith('server-')) setHiddenServerAlerts((prev) => new Set(prev).add(id));
             else setAlerts((prev) => prev.filter((a) => a.id !== id));
+          }}
+          onAcknowledgeAlert={(alert) => {
+            if (!alert.serverAck) return;
+            void acknowledgeServerAlert(authFetch, alert.serverAck).then((err) => {
+              if (err === null) setAcknowledgedServerAlerts((prev) => new Set(prev).add(alert.id));
+              else triggerAlert('WARNING', `${alert.title} NOT ACKNOWLEDGED`, err);
+            });
           }}
           onClearAll={() => {
             setAlerts([]);

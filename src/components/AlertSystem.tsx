@@ -12,7 +12,8 @@ import { orderAlerts } from '../utils/operatorAlerts';
  * R9-3: the stack was fixed over the bottom-right corner, on top of KILL AUTO, and a sticky CRITICAL cannot be dismissed, so it could
  * hold the auto emergency control under it for good. It is now docked in the page flow (sticky to the bottom of the screen, on the left,
  * with its own space at the end of the page, so scrolling always uncovers what is under it), and it can be minimized to its one-line
- * bar whatever it holds.
+ * bar whatever it holds. A server CRITICAL that reports a past event (POSITION_GONE, SELL_ADOPTED, ...) used to stay until a restart;
+ * it has an Acknowledge button that clears it on the server.
  */
 export const ALERT_TTL_MS: Record<AlertEvent['level'], number | null> = { INFO: 8_000, WARNING: 20_000, CRITICAL: null };
 
@@ -29,12 +30,15 @@ interface AlertSystemProps {
   alerts: AlertEvent[];
   onDismissAlert: (id: string) => void;
   onClearAll: () => void;
+  /** A server alert with `serverAck` (one only the operator clears) gets an Acknowledge button that calls this. */
+  onAcknowledgeAlert?: (alert: AlertEvent) => void;
 }
 
 export const AlertSystem: React.FC<AlertSystemProps> = ({
   alerts,
   onDismissAlert,
   onClearAll,
+  onAcknowledgeAlert,
 }) => {
   const [expanded, setExpanded] = useState(false);
   const [minimized, setMinimized] = useState(false);
@@ -114,19 +118,33 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
             </div>
           </div>
 
-          {alert.sticky ? (
-            <span className="text-[9px] text-red-300/80 ml-2 whitespace-nowrap" data-testid="alert-sticky" title="Held by the server: it leaves when the server clears it">
-              until cleared
-            </span>
-          ) : (
-            <button
-              onClick={() => onDismissAlert(alert.id)}
-              className="text-slate-400 hover:text-white p-0.5 ml-2"
-              aria-label="Dismiss alert"
-            >
-              <X className="w-3.5 h-3.5" />
-            </button>
-          )}
+          <div className="flex items-start ml-2 space-x-1">
+            {alert.serverAck && onAcknowledgeAlert && (
+              <button
+                onClick={() => onAcknowledgeAlert(alert)}
+                className="text-[9px] border border-current/60 rounded px-1.5 py-0.5 whitespace-nowrap opacity-90 hover:opacity-100"
+                data-testid="alert-acknowledge"
+                title="It reports something that already happened; acknowledging clears it on the server"
+              >
+                Acknowledge
+              </button>
+            )}
+            {alert.sticky ? (
+              !(alert.serverAck && onAcknowledgeAlert) && (
+                <span className="text-[9px] text-red-300/80 whitespace-nowrap" data-testid="alert-sticky" title="Held by the server: it leaves when the server clears it">
+                  until cleared
+                </span>
+              )
+            ) : (
+              <button
+                onClick={() => onDismissAlert(alert.id)}
+                className="text-slate-400 hover:text-white p-0.5"
+                aria-label="Dismiss alert"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
         </div>
       ))}
       </div>

@@ -24,7 +24,7 @@ Where to look:
 | `GET /api/diagnostics/system` | `systemAudit.killSwitchActive`, `riskControls.circuitBreakerState`, wallet balance, RPC host and latency |
 | `GET /api/workstation/positions` | positions; add `?status=ACTIVE` and `&mode=LIVE` to filter |
 
-Operator alerts live in memory only; a restart forgets them (the journal keeps the events). The UI alert stack shows the same list; a CRITICAL alert stays on screen until the server clears it. To read them from a shell: `api "$APEX/api/system/checks" | jq '.operatorAlerts'`.
+Operator alerts live in memory only; a restart forgets them (the journal keeps the events). The UI alert stack shows the same list; a CRITICAL alert stays on screen until the server clears it. `POSITION_GONE`, `POSITION_BALANCE_MISSING`, `SELL_ADOPTED` and `LEDGER_WRITE_FAILED` report something that already happened, so nothing clears them by itself: once you have looked (the position, the wallet, the ledger row), acknowledge each with its Acknowledge button or `api -X POST $APEX/api/system/alerts/acknowledge -d '{"code":"POSITION_GONE","positionId":"<id>"}'` (the `positionId` the alert carries; for `LEDGER_WRITE_FAILED` it is the buy's signature). Any other code is refused (409): it clears when its condition does. To read them from a shell: `api "$APEX/api/system/checks" | jq '.operatorAlerts'`.
 
 ## 1. Stop everything
 

@@ -59,8 +59,6 @@ export type ReplayOptions = Partial<typeof REPLAY_DEFAULTS> & {
   recordedForMs?: number;
   /** 5A: the recorder's per-launch trade cap. R2-2: a launch without an END row that reached it is labelled TRUNCATED (it may have been cut). */
   recordedMaxTrades?: number;
-  /** 5C: when the recording was read. R2-2: not read any more (without an END row nothing past the last recorded row is covered, which is before the read). */
-  readAtTs?: number;
   /** R2-2: the recorder's MARKER rows (restarts and feed gaps, `loadLaunchRecording().markers`). The first one inside a launch's recording cuts it. */
   markers?: RecordingMarker[];
 };

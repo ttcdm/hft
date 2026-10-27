@@ -1237,10 +1237,10 @@ app.get('/api/backtest/replay', requireOperatorAuth, asyncHandler(async (req, re
     let running = replayInFlight.get(key);
     if (!running) {
       running = (async () => {
-        const { launches, funders } = workstationDb.loadLaunchRecording(cap);
-        // 5A: the recorder's window and trade cap tell the replay how far each recording reaches (a quiet coin's stale exit is then visible)
+        const { launches, funders, markers } = workstationDb.loadLaunchRecording(cap);
+        // R2-2: the recorder's restart and feed-gap markers cut the launches they fall in; the window and trade cap say which can be cut
         const rc = recorderConfig();
-        const report = await replayLaunchesAsync(launches, funders, solPriceService.lastKnownPrice(), { ...(minScore === undefined ? {} : { minScore }), recordedForMs: rc.mintMs, recordedMaxTrades: rc.maxTradesPerMint, maxDevHoldingPct, readAtTs: Date.now() });
+        const report = await replayLaunchesAsync(launches, funders, solPriceService.lastKnownPrice(), { ...(minScore === undefined ? {} : { minScore }), recordedForMs: rc.mintMs, recordedMaxTrades: rc.maxTradesPerMint, maxDevHoldingPct, markers });
         // S188: the replay covers the newest `cap` launches; the response says so, so a count below the recorder's is explained
         const body = { success: true, recorded: status, report, message: null, replayedLaunches: launches.length, replayCap: cap };
         replayCache = { key, at: Date.now(), body };

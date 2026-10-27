@@ -42,3 +42,13 @@ describe('Q37: POST /api/wallet/panic-liquidate over HTTP', () => {
     } finally { await rpc.close(); }
   }, 90_000);
 });
+
+describe('Q37 / R5-9: panic positions STILL_OPEN after the run are named, never shown as success', () => {
+  it('a STILL_OPEN row turns the banner red and names the position, even under success:true', async () => {
+    const { panicOutcome } = await import('../src/utils/tradingCopy');
+    const r = panicOutcome(true, 200, { success: true, message: 'Emergency liquidation complete.', data: { failed: [{ id: 'p1', symbol: 'AAA', error: 'STILL_OPEN: AAA is still ACTIVE after the panic' }, { id: 'buy-x', symbol: 'Bxyz12', error: 'BUY_IN_FLIGHT: ...' }] } });
+    expect(r.type).toBe('error');
+    expect(r.text).toContain('STILL OPEN after the panic: AAA, Bxyz12');
+    expect(panicOutcome(true, 200, { success: true, message: 'ok', data: { failed: [] } })).toEqual({ text: 'ok', type: 'success' });
+  });
+});

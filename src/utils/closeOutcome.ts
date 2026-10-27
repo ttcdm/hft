@@ -10,17 +10,28 @@ export interface CloseResultLike {
   status?: string;
   error?: string;
   outcome?: 'ADOPTED_EARLIER_SELL' | 'ADOPTED_EARLIER_SELL_FILL_UNREAD' | 'ASSUMED_LOSS_EMPTY_WALLET';
+  /** Another batch's flags for the same thing: the call only adopted an earlier sell, and (adoptedPartial) that sell was a partial. */
+  adoptedPendingSell?: boolean;
+  adoptedPartial?: boolean;
+  /** Raw token units still held after an adopted partial sell. */
+  remainingTokensRaw?: string;
 }
 
 const sol = (v: number) => `${v >= 0 ? '+' : '-'}${Math.abs(v).toFixed(6)} SOL`;
 
 export function closeOutcomeText(r: CloseResultLike, sellPct: number, name = 'the position'): { text: string; tone: 'info' | 'warning' | 'error' } {
   if (!r.success) return { text: `Close failed: ${r.error ?? 'refused'}. ${name} is still open.`, tone: 'error' };
-  const left = r.status === 'PARTIALLY_CLOSED' ? ` Tokens are still held (PARTIALLY_CLOSED): close again to sell the rest.` : '';
+  const rawLeft = typeof r.remainingTokensRaw === 'string' && /^\d+$/.test(r.remainingTokensRaw) ? r.remainingTokensRaw : null;
+  const left = r.status === 'PARTIALLY_CLOSED' || r.adoptedPartial
+    ? ` Tokens are still held (PARTIALLY_CLOSED${rawLeft ? `, ${rawLeft} raw token units left` : ''}): close again to sell the rest.`
+    : '';
+  if (r.adoptedPartial) {
+    return { text: `No new sell was sent: an earlier PARTIAL sell of ${name} that landed unconfirmed was adopted, realized ${sol(r.pnlSol)}.${left}`, tone: 'warning' };
+  }
   if (r.outcome === 'ASSUMED_LOSS_EMPTY_WALLET') {
     return { text: `Nothing was sold: the wallet held none of ${name}. The row was closed and booked as an ASSUMED loss of its cost basis (${sol(r.pnlSol)}); no sell was found. Check the wallet.`, tone: 'warning' };
   }
-  if (r.outcome === 'ADOPTED_EARLIER_SELL') {
+  if (r.outcome === 'ADOPTED_EARLIER_SELL' || (r.adoptedPendingSell && r.outcome === undefined)) {
     return { text: `No new sell was sent: an earlier sell of ${name} that landed unconfirmed was adopted, realized ${sol(r.pnlSol)}.${left || ' The position is now closed.'}`, tone: 'warning' };
   }
   if (r.outcome === 'ADOPTED_EARLIER_SELL_FILL_UNREAD') {

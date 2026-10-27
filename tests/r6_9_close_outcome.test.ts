@@ -115,3 +115,16 @@ describe('R6-9: the Sniper close message', () => {
     expect((await memecoinAggregator.closePosition('abcdefgh-123', 100)).message).toMatch(/^Close failed: RPC down/);
   });
 });
+
+describe('R6-9: the adoptedPendingSell / adoptedPartial flags (batch C2) read the same way', () => {
+  it('an adopted partial says so and gives the tokens left; an adopted full sell is "no new sell"', async () => {
+    const { closeOutcomeText } = await import('../src/utils/closeOutcome');
+    const p = closeOutcomeText({ success: true, pnlSol: 0.001, status: 'PARTIALLY_CLOSED', adoptedPendingSell: true, adoptedPartial: true, remainingTokensRaw: '123456' }, 100, 'AAA');
+    expect(p.text).toMatch(/earlier PARTIAL sell of AAA .*adopted/);
+    expect(p.text).toContain('123456 raw token units left');
+    expect(p.text).not.toMatch(/now closed|Closed 100%/);
+    expect(p.tone).toBe('warning');
+    const f = closeOutcomeText({ success: true, pnlSol: 0.002, status: 'CLOSED', adoptedPendingSell: true }, 100, 'AAA');
+    expect(f.text).toMatch(/^No new sell was sent: an earlier sell of AAA/);
+  });
+});

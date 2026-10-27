@@ -21,6 +21,7 @@ import { AutoPanel } from './components/AutoPanel';
 import { usePolled } from './utils/usePolled';
 import { readServerAlerts, serverAlertEvents, alertsUnreadableEvent } from './utils/operatorAlerts';
 import { killSwitchPress } from './utils/killSwitchPress';
+import { PanelErrorBoundary } from './components/ErrorBoundaries';
 
 
 export function makeEmptyKpis(startingEquity: number): PerformanceKPIs {
@@ -241,7 +242,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#06080D] text-slate-200 flex flex-col selection:bg-cyan-500 selection:text-white">
       {/* Q10b / Q41: mode, cluster, rpc and the age of the server's answer, always visible */}
-      <TradingModeBanner />
+      <PanelErrorBoundary name="Mode banner"><TradingModeBanner /></PanelErrorBoundary>
       {/* 1. INSTITUTIONAL HEADER BAR - PERMANENTLY DOCKED & ALWAYS ACCESSIBLE */}
       <Header
         kpis={kpis}
@@ -282,60 +283,78 @@ export default function App() {
 
       {/* 2. HOME: the token board (H1). Launches / Watching / Holding for Pump.fun on Solana. */}
       <main className="flex-1 p-4 lg:p-6 grid grid-cols-12 gap-5 max-w-[1920px] mx-auto w-full content-start">
-        <TokenBoard onSelect={setSelectedMint} selected={selectedMint} />
+        <PanelErrorBoundary name="Token board"><TokenBoard onSelect={setSelectedMint} selected={selectedMint} /></PanelErrorBoundary>
         <aside className="col-span-12 lg:col-span-4 flex flex-col space-y-5" data-testid="home-side">
-          <CurvePanel mint={selectedMint} />
-          <AutoPanel />
+          <PanelErrorBoundary name="Curve panel"><CurvePanel mint={selectedMint} /></PanelErrorBoundary>
+          <PanelErrorBoundary name="Auto panel"><AutoPanel /></PanelErrorBoundary>
         </aside>
       </main>
 
       {/* 3. ALERT SYSTEM POPUPS */}
-      <AlertSystem
-        alerts={shownAlerts}
-        onDismissAlert={(id) => {
-          if (id.startsWith('server-')) setHiddenServerAlerts((prev) => new Set(prev).add(id));
-          else setAlerts((prev) => prev.filter((a) => a.id !== id));
-        }}
-        onClearAll={() => {
-          setAlerts([]);
-          setHiddenServerAlerts((prev) => { const next = new Set(prev); for (const a of serverAlerts) if (!a.sticky) next.add(a.id); return next; });
-        }}
-      />
+      <PanelErrorBoundary name="Alerts">
+        <AlertSystem
+          alerts={shownAlerts}
+          onDismissAlert={(id) => {
+            if (id.startsWith('server-')) setHiddenServerAlerts((prev) => new Set(prev).add(id));
+            else setAlerts((prev) => prev.filter((a) => a.id !== id));
+          }}
+          onClearAll={() => {
+            setAlerts([]);
+            setHiddenServerAlerts((prev) => { const next = new Set(prev); for (const a of serverAlerts) if (!a.sticky) next.add(a.id); return next; });
+          }}
+        />
+      </PanelErrorBoundary>
 
       {/* 4. MODALS */}
-      <AiDiagnosticsModal
-        isOpen={isAiDiagnosticsOpen}
-        onClose={() => setIsAiDiagnosticsOpen(false)}
-      />
+      <PanelErrorBoundary name="AI diagnostics">
+        <AiDiagnosticsModal
+          isOpen={isAiDiagnosticsOpen}
+          onClose={() => setIsAiDiagnosticsOpen(false)}
+        />
+      </PanelErrorBoundary>
 
-      <SystemChecksModal isOpen={isSystemChecksOpen} onClose={() => setIsSystemChecksOpen(false)} />
-      <ExecutionLatencyModal isOpen={isLatencyOpen} onClose={() => setIsLatencyOpen(false)} />
-      <AutoPipelineModal
-        isOpen={isAutoPipelineOpen}
-        onClose={() => setIsAutoPipelineOpen(false)}
-      />
+      <PanelErrorBoundary name="System checks">
+        <SystemChecksModal isOpen={isSystemChecksOpen} onClose={() => setIsSystemChecksOpen(false)} />
+      </PanelErrorBoundary>
+      <PanelErrorBoundary name="Latency">
+        <ExecutionLatencyModal isOpen={isLatencyOpen} onClose={() => setIsLatencyOpen(false)} />
+      </PanelErrorBoundary>
+      <PanelErrorBoundary name="Auto pipeline">
+        <AutoPipelineModal
+          isOpen={isAutoPipelineOpen}
+          onClose={() => setIsAutoPipelineOpen(false)}
+        />
+      </PanelErrorBoundary>
 
-      <MemecoinSocialSniperModal
-        isOpen={isMemecoinSniperOpen}
-        onClose={() => setIsMemecoinSniperOpen(false)}
-        onAlertTrigger={triggerAlert}
-      />
+      <PanelErrorBoundary name="Sniper">
+        <MemecoinSocialSniperModal
+          isOpen={isMemecoinSniperOpen}
+          onClose={() => setIsMemecoinSniperOpen(false)}
+          onAlertTrigger={triggerAlert}
+        />
+      </PanelErrorBoundary>
 
-      <BacktestModal
-        isOpen={isBacktestModalOpen}
-        onClose={() => setIsBacktestModalOpen(false)}
-      />
+      <PanelErrorBoundary name="Backtest">
+        <BacktestModal
+          isOpen={isBacktestModalOpen}
+          onClose={() => setIsBacktestModalOpen(false)}
+        />
+      </PanelErrorBoundary>
 
-      <PlugAndPlayTradingModal
-        isOpen={isPlugAndPlayOpen}
-        onClose={() => setIsPlugAndPlayOpen(false)}
-      />
+      <PanelErrorBoundary name="Plug & Play">
+        <PlugAndPlayTradingModal
+          isOpen={isPlugAndPlayOpen}
+          onClose={() => setIsPlugAndPlayOpen(false)}
+        />
+      </PanelErrorBoundary>
 
-      <AuthModal
-        isOpen={isAuthModalOpen}
-        onClose={() => setIsAuthModalOpen(false)}
-        onAuthenticated={handleAuthenticated}
-      />
+      <PanelErrorBoundary name="Sign-in">
+        <AuthModal
+          isOpen={isAuthModalOpen}
+          onClose={() => setIsAuthModalOpen(false)}
+          onAuthenticated={handleAuthenticated}
+        />
+      </PanelErrorBoundary>
     </div>
   );
 }

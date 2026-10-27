@@ -1,3 +1,4 @@
+import './helpers/domGlobals';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { installDom, removeDom, installFakeServer, renderApp, click, flush, FakeServer } from './helpers/domApp';
 

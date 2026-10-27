@@ -206,6 +206,17 @@ export function AutoPanelView({ status, onMode, onKill, onResume, onBudget, onOr
   );
 }
 
+/**
+ * R9-2: only an object with the fields the panel reads is a status. A refusal (400) carries `status: "REJECTED"`, a string, and
+ * spreading it into the panel state made the next render throw.
+ */
+export function asAutoStatus(x: unknown): AutoStatusData | null {
+  if (!x || typeof x !== 'object' || Array.isArray(x)) return null;
+  const o = x as any;
+  if (typeof o.mode !== 'string' || !o.budgets || typeof o.budgets !== 'object' || typeof o.budgets.maxBuys !== 'number') return null;
+  return o as AutoStatusData;
+}
+
 export function useAutoStatus(): AutoStatusData | null {
   const [status, setStatus] = useState<AutoStatusData | null>(null);
   useEffect(() => {
@@ -213,7 +224,9 @@ export function useAutoStatus(): AutoStatusData | null {
     const load = async () => {
       try {
         const r = await authFetch('/api/auto/status');
-        if (r.ok && alive) setStatus(await r.json());
+        if (!r.ok || !alive) return;
+        const j = asAutoStatus(await r.json());
+        if (j && j.stats && typeof j.stats === 'object') setStatus(j);
       } catch { /* keep last */ }
     };
     load();
@@ -247,7 +260,8 @@ export function AutoPanel() {
       if (path === '/api/auto/kill') setKillReport(killReportFor(j));
       // R31: a refusal (400/403/409/429) carries its reason in the body; show it instead of dropping it
       if (!r.ok) setError(`${j?.error || j?.message || 'Request refused'} (HTTP ${r.status})`);
-      if (j?.status) setLocal({ ...j.status, stats: shown?.stats });
+      const next = asAutoStatus(j?.status);
+      if (next && shown?.stats) setLocal({ ...next, stats: shown.stats });
     } catch (e: any) {
       setError(`Could not reach the server (${e?.message || 'network error'}). Nothing was changed as far as the panel knows; check the status above.`);
     } finally { setBusy(false); }

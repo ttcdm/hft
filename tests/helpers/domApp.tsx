@@ -5,6 +5,7 @@
  * The test file stays in the node environment (the shared setup file imports server code, which vite will not bundle for a browser
  * environment); `installDom()` puts a happy-dom window on globalThis instead.
  */
+import './domGlobals';
 import React from 'react';
 import { createRoot, Root } from 'react-dom/client';
 import { act } from 'react';
@@ -123,4 +124,28 @@ export async function click(el: Element | null): Promise<void> {
   if (!el) throw new Error('element not found');
   await act(async () => { (el as HTMLElement).click(); });
   await flush();
+}
+
+/** Types into a React-controlled input: set the value through the native setter, then fire `input`, as a browser does. */
+export async function typeInto(el: Element | null, value: string): Promise<void> {
+  if (!el) throw new Error('input not found');
+  const input = el as HTMLInputElement;
+  let proto = Object.getPrototypeOf(input);
+  let setter: ((v: string) => void) | undefined;
+  while (proto && !setter) { setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set; proto = Object.getPrototypeOf(proto); }
+  await act(async () => {
+    if (setter) setter.call(input, value); else input.value = value;
+    input.dispatchEvent(new (window as any).Event('input', { bubbles: true }));
+    input.dispatchEvent(new (window as any).Event('change', { bubbles: true }));
+  });
+  await flush();
+}
+
+/** Runs the real express validation middleware for `schema` on `body` and returns the status and JSON it would answer. */
+export function middlewareAnswer(mw: (req: any, res: any, next: () => void) => void, body: unknown): { status: number; json: any } | undefined {
+  let out: { status: number; json: any } | undefined;
+  let code = 200;
+  const res = { status(c: number) { code = c; return res; }, json(j: any) { out = { status: code, json: j }; return res; } };
+  mw({ body }, res, () => undefined);
+  return out;
 }

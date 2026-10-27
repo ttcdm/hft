@@ -46,7 +46,8 @@ export function makeEmptyKpis(startingEquity: number): PerformanceKPIs {
 
 export default function App() {
   // Master Kill Switch State
-  const [isHalted, setIsHalted] = useState(false);
+  // R10-2: null until the server has answered (and again when it cannot be read): never a guessed "not engaged"
+  const [isHalted, setIsHalted] = useState<boolean | null>(null);
   // R9-1: when the switch was last seen turning on (by this button or the poll), so a double tap does not resume trading.
   const haltedSince = useRef<number | null>(null);
   const [haltedSinceAt, setHaltedSinceAt] = useState<number | null>(null);
@@ -179,10 +180,11 @@ export default function App() {
     const load = async () => {
       try {
         const r = await authFetch('/api/diagnostics/system');
-        if (!r.ok) return;
+        if (!alive) return;
+        if (!r.ok) { setIsHalted(null); return; } // R10-2: logged out or refused: the state is unknown
         const j = await r.json();
-        if (alive && typeof j?.systemAudit?.killSwitchActive === 'boolean') setIsHalted(j.systemAudit.killSwitchActive);
-      } catch { /* keep what is shown */ }
+        if (alive) setIsHalted(typeof j?.systemAudit?.killSwitchActive === 'boolean' ? j.systemAudit.killSwitchActive : null);
+      } catch { if (alive) setIsHalted(null); }
     };
     load();
     const t = setInterval(load, 5000);
@@ -194,7 +196,7 @@ export default function App() {
   const toggleKillSwitch = async () => {
     if (killInFlight.current) return; // R33: a second click while the first request is out must not send the opposite value
     // R9-1: send the intended state. RESUME needs a confirm, and a RESUME press right after the switch turned on is ignored.
-    const press = killSwitchPress(isHalted, haltedSince.current, Date.now(), (text) => window.confirm(text));
+    const press = killSwitchPress(isHalted === true, haltedSince.current, Date.now(), (text) => window.confirm(text));
     if (press.action === 'IGNORE') return;
     killInFlight.current = true;
     const nextHalted = press.activate;

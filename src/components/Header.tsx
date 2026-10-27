@@ -62,7 +62,8 @@ export const PillStaleNote: React.FC<{ at: number | null; failed: boolean; now: 
 
 interface HeaderProps {
   kpis: PerformanceKPIs;
-  isHalted: boolean;
+  /** R10-2: null when the server's kill-switch state is not known (not read yet, logged out, or the read failed) */
+  isHalted: boolean | null;
   onToggleKillSwitch: () => void;
   onOpenAiDiagnostics: () => void;
   onOpenSystemChecks: () => void;
@@ -440,12 +441,20 @@ export const Header: React.FC<HeaderProps> = ({
               ? 'bg-emerald-500/15 hover:bg-emerald-500/25 border-emerald-500/50 text-emerald-400 shadow-lg shadow-emerald-500/15'
               : 'bg-red-500/15 hover:bg-red-500/25 border-red-500/50 text-red-400 shadow-lg shadow-red-500/15 animate-pulse'
           }`}
-          title="KILL SWITCH - the server refuses new orders and disarms LIVE trading. Open positions are not sold; protective exits keep running."
+          title={isHalted === null
+            ? 'Kill-switch state UNKNOWN: the server has not answered (not signed in, or not reachable). Pressing sends "engage"; it never resumes.'
+            : 'KILL SWITCH - the server refuses new orders and disarms LIVE trading. Open positions are not sold; protective exits keep running.'}
         >
-          {isHalted ? (
+          {isHalted === true ? (
             <>
               <ShieldAlert className="w-3.5 h-3.5 text-emerald-400" />
               <span>RESUME</span>
+            </>
+          ) : isHalted === null ? (
+            <>
+              <AlertOctagon className="w-3.5 h-3.5 text-amber-400" />
+              <span>KILL SWITCH</span>
+              <span className="text-[9px] font-bold text-amber-300" data-testid="kill-state-unknown">(state UNKNOWN)</span>
             </>
           ) : (
             <>

@@ -497,3 +497,14 @@ describe('run 27: (k) makes a pair again when a feed gap released it, and SKIPs 
     expect(fails(h.r.recs)).toEqual([]);
   });
 });
+
+describe('(k) a buy from a temp wallet that fails says why', () => {
+  it('9/10 confirmed names the first failure, so a devnet run tells a rate limit or a refused read from a lost confirm', async () => {
+    const h = gatesHarness(0);
+    let n = 0;
+    (h.kit as any).buy = async () => { if (n++ === 1) throw new Error('no curve state for M1'); return 'sig'; };
+    await releaseGatesOnChain(h.s, h.kit, h.feed as any, {}, h.deps as any, { buyers: 2, waitMs: 1_000 });
+    const l = h.r.recs.find((x) => /equal buys/.test(x.step) && !x.ok);
+    expect(l?.detail).toMatch(/^1\/2 confirmed; first failure: no curve state for M1/);
+  });
+});

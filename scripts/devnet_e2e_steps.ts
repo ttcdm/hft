@@ -1059,7 +1059,9 @@ export async function releaseGatesOnChain(
     for (const w of buyers) await kit.transfer(payer, w.publicKey, 2 * buySol + 0.02);
     for (const m of made) {
       const r = await Promise.allSettled(buyers.map((w, i) => s.sleep(i * 400).then(() => kit.buy(w, m, buySol)))); // S265/S268: 400 ms apart (run 10 still lost 1 of 10 at 250 ms)
-      s.rec(`${L}: ${mode}: ${nBuyers} equal buys of ${m.slice(0, 6)}`, r.every((x) => x.status === 'fulfilled'), `${r.filter((x) => x.status === 'fulfilled').length}/${nBuyers} confirmed`);
+      // run 2026-10-27: "9/10 confirmed" said nothing of why; the first failure is named (a 429, a refused curve read, a lost confirm)
+      const firstFail = r.find((x): x is PromiseRejectedResult => x.status === 'rejected');
+      s.rec(`${L}: ${mode}: ${nBuyers} equal buys of ${m.slice(0, 6)}`, r.every((x) => x.status === 'fulfilled'), `${r.filter((x) => x.status === 'fulfilled').length}/${nBuyers} confirmed${firstFail ? `; first failure: ${String(firstFail.reason?.message ?? firstFail.reason).slice(0, 200)}` : ''}`);
     }
     const released = await waitUntil(() => made.every((m) => { const e = find(m); return !!e && e.state !== 'WATCHING'; }), waitMs);
     const gapped = made.filter((m) => /^FEED_GAP/.test(find(m)?.reason ?? ''));

@@ -151,7 +151,7 @@ describe('5C (R1-106): the replay labels truncated, graduated and unresolved lau
     const b = rep.summary.byRecording;
     expect([b.COMPLETE.launches, b.TRUNCATED.launches, b.GRADUATED.launches, b.UNRESOLVED.launches]).toEqual([1, 1, 0, 1]);
     expect(b.COMPLETE.closed).toBe(1); // recorded quiet to the window end: the stale exit closes it
-    expect(b.TRUNCATED.openAtEnd).toBe(1); // cut by the cap: nothing assumed past the cut
+    expect(b.TRUNCATED.entries).toBe(0); // cut by the cap: nothing assumed past the cut, so a buy landing after it is not entered (R7-12)
     expect(b.COMPLETE.closed + b.TRUNCATED.closed + b.UNRESOLVED.closed).toBe(rep.summary.closed);
     expect(b.COMPLETE.netPnlSol).toBeCloseTo(rep.launches[0].netPnlSol as number, 12);
   });

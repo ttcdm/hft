@@ -108,9 +108,10 @@ const FREE: ReplayOptions = { feePct: 0, impact: false, networkFeeSol: 0, priori
 describe('5A replay: fills, exits and money from the shared model', () => {
   afterEach(() => restoreStockEngine());
 
-  it('a launch with no print after the release is still bought, at the curve state when the buy lands', () => {
+  it('a launch recorded quiet after the release (END WINDOW) is still bought, at the curve state when the buy lands', () => {
     const { rows, releaseTs } = released();
-    const r = replay(rows);
+    // R7-12: the quiet tail must be in the recording (its END row); a landing past the known end is not entered
+    const r = replayLaunch({ ...toRecordedLaunch(launch(rows), 150), endTs: releaseTs + 60_000, endReason: 'WINDOW' }, [], 150, GATE);
     expect(r.entered).toBe(true);
     expect(r.outcome).toBe('OPEN_AT_END');
     expect(r.entryPriceSol).toBeCloseTo(rows[rows.length - 1][5] / rows[rows.length - 1][6] / 1000, 15);
@@ -291,7 +292,8 @@ describe('5A: what the recording window may assume', () => {
   it('a launch at the recorder\'s trade cap gets no coverage past its last print, since it may have been cut off', () => {
     const { rows } = released();
     expect(replay(rows, W).outcome).toBe('CLOSED');
-    expect(replay(rows, { ...W, recordedMaxTrades: rows.length }).outcome).toBe('OPEN_AT_END');
+    // R7-12: covered only to its last print, the buy (which lands after it) is not entered at all
+    expect(replay(rows, { ...W, recordedMaxTrades: rows.length })).toMatchObject({ outcome: 'NO_ENTRY', noEntryReason: expect.stringMatching(/^ENTRY_AFTER_RECORDING/) });
     expect(replay(rows, { ...W, recordedMaxTrades: rows.length + 1 }).outcome).toBe('CLOSED');
   });
   it('an END time on the launch decides the coverage over the window', () => {

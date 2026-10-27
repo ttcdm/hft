@@ -389,6 +389,12 @@ export function replayLaunch(launch: RecordedLaunch, funders: FunderFact[], solU
   const capped = o.recordedMaxTrades !== undefined && trades.length >= o.recordedMaxTrades;
   const window = launch.endTs !== undefined ? launch.endTs : (o.recordedForMs !== undefined && !capped ? Math.min(startTs + o.recordedForMs, o.readAtTs ?? Infinity) : -Infinity);
   const coveredUntilTs = Math.max(lastEventTs, window);
+  // R7-12: the buy lands after the recording's known end (a TRADE_CAP launch's first dropped trade, or its last row): the curve state then
+  // is not in the data, so it is not entered at a print taken before the cut
+  const landing = releasedAt + o.entryDelayMs;
+  if (landing > coveredUntilTs) {
+    return { ...result, noEntryReason: `ENTRY_AFTER_RECORDING: the buy would land ${Math.round((landing - coveredUntilTs) / 1000)} s after the recording's known end, so its fill is not in the data` };
+  }
   const path = simulatePath(rows, releasedAt, { entryMs: o.entryDelayMs, exitMs: o.exitDelayMs }, null, { coveredUntilTs });
   if (!path) return { ...result, noEntryReason: 'the entry trade carries no price' };
   const money = priceEntryParts(rows, path, o.orderSol, replayCostCase({ ...o, impact: optsIn.impact }));

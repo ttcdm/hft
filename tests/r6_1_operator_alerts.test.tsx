@@ -76,3 +76,10 @@ describe('R6-1/R6-19: the alert stack shows server alerts, most severe first, an
     expect(renderToStaticMarkup(<AlertSystem alerts={[e]} onDismissAlert={() => {}} onClearAll={() => {}} />)).toContain('could not be read');
   });
 });
+
+describe('R6-1: the alert codes added by other batches are CRITICAL by name', () => {
+  it('RPC_AUTH_REJECTED, EXIT_LOOP_FAILING, SELL_LANDED_UNBOOKED and SELL_BLOCKHASH_UNCHECKED', async () => {
+    const { OPERATOR_ALERT_LEVELS } = await import('../server/system/systemChecks');
+    for (const code of ['RPC_AUTH_REJECTED', 'EXIT_LOOP_FAILING', 'SELL_LANDED_UNBOOKED', 'SELL_BLOCKHASH_UNCHECKED']) expect(OPERATOR_ALERT_LEVELS[code]).toBe('CRITICAL');
+  });
+});

@@ -151,6 +151,17 @@ describe('S227: no part of a private RPC URL survives in anything the harness pr
     expect(r).not.toMatch(/devnet-guard|quiknode|secretvalue1/);
   });
 
+  it('childReport keeps the first line of an INSTANCE_LOCKED refusal (the lock path and the holder pid), however long the stack after it', () => {
+    const msg = 'INSTANCE_LOCKED: /scratch/cloud-harness/e2e.db.lock is held by running process 4242 (started 2026-10-27T10:01:00.000Z). '
+      + 'Only one server may use a database or a signing key at a time. Stop that process (or container) first. '
+      + 'If it is gone, the lock frees itself 30 s after its last heartbeat; if it is not an Apex server (a reused pid), delete the lock file.';
+    const stack = Array.from({ length: 12 }, (_, i) => `    at frame${i} (/home/user/work/integ2/server/x${i}.ts:${i}:1)`).join('\n');
+    const r = childReport({ status: 1, signal: null, stdout: 'INFO  SOL/USD 99\n', stderr: `/home/user/work/integ2/server/system/instanceLock.ts:198\nInstanceLockError: ${msg}\n${stack}\n` }, [url]);
+    expect(r).toMatch(/^exit 1; INSTANCE_LOCKED: \/scratch\/cloud-harness\/e2e\.db\.lock is held by running process 4242 \(started 2026-10-27T10:01:00\.000Z\)/);
+    expect(r).toMatch(/last output: .*frame11/);
+    expect(r.length).toBeLessThanOrEqual(800);
+  });
+
   it('the devnet guard prints a private RPC host as <rpc> and a public host as itself', () => {
     const guard = path.resolve(process.cwd(), 'scripts/devnet_guard.cjs');
     const run = (code: string, env: Record<string, string>) => spawnSync(process.execPath, ['--require', guard, '-e', code], { encoding: 'utf8', timeout: 20_000, env: { ...process.env, ...env } });

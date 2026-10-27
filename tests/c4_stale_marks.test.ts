@@ -1,4 +1,3 @@
-import fs from 'fs';
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { executionCoordinator, MARK_STALE_MS, MARK_ALERT_AFTER_MS, MARK_RETRY_BASE_MS } from '../server/execution/coordinator';
 import { RealMarkPriceService } from '../server/execution/reconciliation';
@@ -10,6 +9,7 @@ const MINTS = [
   'So11111111111111111111111111111111111111112',
   'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB',
   'DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263',
+  'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v',
 ];
 const open = (mint: string) => workstationDb.loadPositions().find((p) => p.mint === mint)!;
 
@@ -86,10 +86,24 @@ describe('C4: exits keep working on stale marks', () => {
     expect(open(MINTS[2]).status).toBe('CLOSED');
   });
 
-  it('lastUpdatedTimestamp no longer hides staleness: a never-marked position ages from its entry', () => {
+  it('lastUpdatedTimestamp does not hide staleness: a never-marked position ages from its entry (behavioural)', async () => {
     expect(MARK_STALE_MS).toBe(15_000);
-    const src = fs.readFileSync('server/execution/coordinator.ts', 'utf8');
-    const block = src.slice(src.indexOf('public async evaluateAndProcessExits'));
-    expect(block.slice(0, 900)).not.toMatch(/lastMarkTimestamp \|\| pos\.lastUpdatedTimestamp/);
+    const mint = MINTS[3];
+    await enter(mint);
+    const p = open(mint);
+    p.entryTimestamp = Date.now() - (MARK_ALERT_AFTER_MS + 5_000);
+    workstationDb.savePosition(p);
+    // savePosition stores a zero mark as the entry time, so a never-marked row cannot be written; the DB read is where it is shown to the pass.
+    const realLoad = workstationDb.loadPositions.bind(workstationDb);
+    vi.spyOn(workstationDb, 'loadPositions').mockImplementation(((...a: any[]) =>
+      (realLoad as any)(...a).map((x: any) => (x.id === p.id ? { ...x, lastMarkTimestamp: 0, lastUpdatedTimestamp: Date.now() } : x))) as any);
+    vi.spyOn(executionCoordinator, 'updatePositionMarkPrices').mockResolvedValue(undefined as any);
+    const direct = vi.spyOn(RealMarkPriceService, 'queryOnChainMarkPrices').mockResolvedValue({} as any);
+    vi.spyOn(Date, 'now').mockReturnValue(Date.now() + MARK_RETRY_BASE_MS + 1); // past any back-off the entry's own failed mark read started
+    await executionCoordinator.evaluateAndProcessExits();
+    // aged from entry: stale, so the direct read is tried and, with no price, the operator alert is raised
+    expect(direct).toHaveBeenCalled();
+    expect(executionCoordinator.getOperatorAlerts().filter((a) => a.positionId === p.id && a.code === 'POSITION_MARK_UNAVAILABLE')).toHaveLength(1);
+    expect(open(mint).status).not.toBe('CLOSED');
   });
 });

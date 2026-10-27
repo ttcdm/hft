@@ -5,7 +5,7 @@ import { Keypair, PublicKey, SystemProgram, TransactionMessage, VersionedTransac
 import { AccountLayout, NATIVE_MINT, TOKEN_PROGRAM_ID } from '@solana/spl-token';
 import { PUMP_SDK, GLOBAL_PDA } from '@pump-fun/pump-sdk';
 import { PUMP_AMM_SDK, PUMP_AMM_PROGRAM_ID, canonicalPumpPoolPda, pumpPoolAuthorityPda } from '@pump-fun/pump-swap-sdk';
-import { ExecutionCoordinator, executionCoordinator, SELL_SLIPPAGE_LADDER_BPS } from '../server/execution/coordinator';
+import { ExecutionCoordinator, SELL_SLIPPAGE_LADDER_BPS } from '../server/execution/coordinator';
 import { RealMarkPriceService, TradeReconciler } from '../server/execution/reconciliation';
 import { PumpCurveService, PUMP_SELL_FEE_CEILING_BPS } from '../server/solana/pumpCurve';
 import { PumpSwapVenueService } from '../server/solana/pumpSwapService';
@@ -65,36 +65,40 @@ function clock(): { now: number } {
 describe('R1-19 / R1-112: one failed price read does not blind a LIVE stop-loss', () => {
   it('c4-style: the read returns nothing once, then -30%; the second pass sells STOP_LOSS (no back-off is cleared by hand)', async () => {
     const t = clock();
+    const { c, send, build } = await liveCoordinator();
+    stubCurveSell();
     const { id, mint } = seedLive({ lastMarkTimestamp: t.now - 10_000 });
     vi.spyOn(RealMarkPriceService, 'queryOnChainMarkPrices')
       .mockResolvedValueOnce({})
       .mockImplementation(async (_c, mints) => (mints.includes(mint) ? { [mint]: { priceSol: ENTRY * 0.7, source: 'ON_CHAIN_BONDING_CURVE', timestamp: t.now } } : {}));
-    const close = vi.spyOn(executionCoordinator, 'closePosition').mockResolvedValue({ success: true, pnlSol: 0 });
 
-    await executionCoordinator.evaluateAndProcessExits();
-    expect(close).not.toHaveBeenCalled(); // pass 1: no new price, the last one is at entry
+    await c.evaluateAndProcessExits();
+    expect(send).not.toHaveBeenCalled(); // pass 1: no new price, the last one is at entry
+    expect(row(id).status).toBe('OPEN');
 
     t.now += 3_000; // one exit-loop tick later
-    await executionCoordinator.evaluateAndProcessExits();
-    expect(close).toHaveBeenCalledWith(id, 100, 'STOP_LOSS');
+    await c.evaluateAndProcessExits();
+    expectStopLossSent(id, build, send);
   });
 
   it('a stale LIVE mark already past the hard stop still fires STOP_LOSS while no price can be read; a stale mark above the stop fires nothing', async () => {
     const t = clock();
+    const { c, send, build } = await liveCoordinator();
+    stubCurveSell();
     const breached = seedLive({ lastMarkTimestamp: t.now - 30_000, currentPriceSol: ENTRY * 0.7 });
     const above = seedLive({ lastMarkTimestamp: t.now - 30_000, currentPriceSol: ENTRY * 0.9 });
     vi.spyOn(RealMarkPriceService, 'queryOnChainMarkPrices').mockResolvedValue({});
-    const close = vi.spyOn(executionCoordinator, 'closePosition').mockResolvedValue({ success: true, pnlSol: 0 });
 
-    await executionCoordinator.evaluateAndProcessExits();
-    expect(close).toHaveBeenCalledWith(breached.id, 100, 'STOP_LOSS');
-    expect(close.mock.calls.some((c) => c[0] === above.id)).toBe(false);
+    await c.evaluateAndProcessExits();
+    expectStopLossSent(breached.id, build, send);
+    expect(row(above.id).status).toBe('OPEN');
   });
 });
 
 describe('R1-31 / R1-123: a migrated LIVE position is marked from the pool as it is now, not from the 15 s cache', () => {
   it('the pool vault balances change between two passes 3 s apart; the second pass sees the new price and sells STOP_LOSS', async () => {
     const t = clock();
+    const { c, conn, send } = await liveCoordinator();
     const mint = Keypair.generate().publicKey;
     const poolPk = canonicalPumpPoolPda(mint);
     const baseVault = Keypair.generate().publicKey;
@@ -113,7 +117,6 @@ describe('R1-31 / R1-123: a migrated LIVE position is marked from the pool as it
     mintData[44] = 6;
     const BASE = 200_000_000_000_000n; // 2e8 tokens
     let quoteLamports = 20_000_000_000n; // 20 SOL: 1e-7 SOL per token
-    const conn = executionCoordinator.getConnection();
     const account = (pk: PublicKey): any => {
       const k = pk.toBase58();
       if (k === mint.toBase58()) return { owner: TOKEN_PROGRAM_ID, lamports: 1_461_600, data: mintData, executable: false };
@@ -125,16 +128,22 @@ describe('R1-31 / R1-123: a migrated LIVE position is marked from the pool as it
     vi.spyOn(conn, 'getAccountInfo').mockImplementation((async (pk: PublicKey) => account(pk)) as any);
     vi.spyOn(conn, 'getMultipleAccountsInfo').mockImplementation((async (pks: PublicKey[]) => pks.map(account)) as any);
     const { id } = seedLive({ mint: mint.toBase58(), venue: 'PUMPSWAP', poolAddress: poolPk.toBase58(), entryPriceSol: 1e-7, currentPriceSol: 1e-7, lastMarkTimestamp: t.now });
-    const close = vi.spyOn(executionCoordinator, 'closePosition').mockResolvedValue({ success: true, pnlSol: 0 });
+    vi.spyOn(PumpSwapVenueService, 'resolveVenue').mockResolvedValue({ venue: 'PUMPSWAP', isMigrated: true, poolAddress: poolPk } as any);
+    const swapSell = vi.spyOn(PumpSwapVenueService, 'buildPumpSwapSellInstructions').mockResolvedValue({ instructions: [] } as any);
+    vi.spyOn(txBuilder, 'buildCustomVersionedTransaction').mockImplementation(async () => signedTx() as any);
 
-    await executionCoordinator.evaluateAndProcessExits();
+    await c.evaluateAndProcessExits();
     expect(row(id).markSource).toBe('ON_CHAIN_PUMPSWAP_POOL');
-    expect(close).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(row(id).status).toBe('OPEN');
 
     quoteLamports = 14_000_000_000n; // someone dumped into the pool: -30%
     t.now += 3_000;
-    await executionCoordinator.evaluateAndProcessExits();
-    expect(close).toHaveBeenCalledWith(id, 100, 'STOP_LOSS');
+    await c.evaluateAndProcessExits();
+    expect(swapSell).toHaveBeenCalledTimes(1);
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(row(id).status).toBe('CLOSED');
+    expect(row(id).exitReason).toMatch(/STOP_LOSS/);
     expect(row(id).currentPriceSol).toBeLessThan(1e-7);
   });
 });
@@ -185,6 +194,22 @@ async function liveCoordinator(opts: { genesisHash?: string } = {}) {
     actualJitoTipLamports: 0, actualRealizedPnLSol: -0.05, remainingTokensRaw: '0', isFullyClosed: true, slot: 6,
   } as any);
   return { c, conn, mockRpc, owner: owner.publicKey, send, build };
+}
+
+/** The sell path below closePosition: venue and curve state are read from doubles, the rest (closePosition, build call, send) is real. */
+function stubCurveSell() {
+  vi.spyOn(PumpSwapVenueService, 'resolveVenue').mockResolvedValue({ venue: 'PUMP_BONDING_CURVE', isMigrated: false } as any);
+  vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockResolvedValue(createSimulatedBondingCurveState());
+  vi.spyOn(PumpCurveService, 'calculateSellQuote').mockReturnValue({ expectedJitoTipLamports: 0, minOutputLamports: 1 } as any);
+}
+
+/** A STOP_LOSS SELL reached the send: the sell was built for the whole balance and sendRawTransaction was called. */
+function expectStopLossSent(id: string, built: { mock: { calls: any[][] } }, send: { mock: { calls: any[][] } }, qty = 1_000_000_000n) {
+  expect(built.mock.calls).toHaveLength(1);
+  expect((built.mock.calls[0][1] as any).amountTokens).toBe(qty);
+  expect(send.mock.calls).toHaveLength(1);
+  expect(row(id).status).toBe('CLOSED');
+  expect(row(id).exitReason).toMatch(/STOP_LOSS/);
 }
 
 const alerts = (c: ExecutionCoordinator, id: string) => c.getOperatorAlerts().filter((a) => a.positionId === id).map((a) => a.code);

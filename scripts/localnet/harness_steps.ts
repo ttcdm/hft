@@ -189,7 +189,7 @@ async function run(info: { url: string; genesisHash: string }) {
         refreshPrice: () => solPriceService.refresh(),
         dailyPnlSol: () => riskEngine.getDailyTotalPnLSol('LIVE'),
         latch: () => riskEngine.getDailyLossLatch('LIVE'),
-        clearLatch: () => riskEngine.clearDailyLossLatch(),
+        clearLatch: () => riskEngine.clearDailyLossLatch('LIVE'),
         resume: (o) => {
           if (o.clearDailyLossLatch) {
             failReads = fetch(info.url, { method: 'POST', headers: { 'content-type': 'application/json' },

@@ -764,7 +764,7 @@ export class AutoSnipeController extends EventEmitter {
    * 3E: `ackLossTriggers` records the operator's acknowledgement of NEGATIVE_EXPECTANCY / LOSS_STREAK: auto trades closed until now stop
    * counting, so a mode can be set again. `lossTriggersAcked` is false when it could not be saved (nothing changes then).
    */
-  public resume(opts: { clearHalt?: boolean; clearDailyLossLatch?: boolean; ackLossTriggers?: boolean } = {}): { halted: boolean; mode: AutoMode; lossTriggersAcked?: boolean; clearHaltRefused?: string } {
+  public resume(opts: { clearHalt?: boolean; clearDailyLossLatch?: boolean | 'PAPER' | 'LIVE'; ackLossTriggers?: boolean } = {}): { halted: boolean; mode: AutoMode; lossTriggersAcked?: boolean; clearHaltRefused?: string; dailyLossLatchCleared?: 'PAPER' | 'LIVE' } {
     let clearHaltRefused: string | undefined;
     if (opts.clearHalt) {
       // R5-17: a read-only server cannot trade, so it has nothing to resume; its TRADING_HALT_CLEARED row would make the next signed boot
@@ -772,7 +772,15 @@ export class AutoSnipeController extends EventEmitter {
       if (isReadOnly()) clearHaltRefused = 'READ_ONLY: APEX_READ_ONLY=true. A read-only server does not clear a trading halt; clear it from the server that signs.';
       else executionCoordinator.clearHalt();
     }
-    if (opts.clearDailyLossLatch) riskEngine.clearDailyLossLatch();
+    // R5-15: the latch is cleared for one mode only: the one named, or (`true`) the mode the coordinator is in now.
+    let dailyLossLatchCleared: 'PAPER' | 'LIVE' | undefined;
+    if (opts.clearDailyLossLatch) {
+      const mode: 'PAPER' | 'LIVE' = opts.clearDailyLossLatch === 'PAPER' || opts.clearDailyLossLatch === 'LIVE'
+        ? opts.clearDailyLossLatch
+        : executionCoordinator.getExecutionMode() === 'LIVE' ? 'LIVE' : 'PAPER';
+      riskEngine.clearDailyLossLatch(mode);
+      dailyLossLatchCleared = mode;
+    }
     let lossTriggersAcked: boolean | undefined;
     if (opts.ackLossTriggers) {
       const ts = Date.now();
@@ -782,7 +790,7 @@ export class AutoSnipeController extends EventEmitter {
         : 'operator acknowledgement of the loss triggers could not be saved; nothing changed';
       workstationDb.logDecision({ ts, autoMode: this.mode, mint: '-', stage: 'risk', outcome: 'INFO', reason });
     }
-    return { halted: executionCoordinator.getHaltReason() !== null, mode: this.mode, ...(lossTriggersAcked !== undefined ? { lossTriggersAcked } : {}), ...(clearHaltRefused ? { clearHaltRefused } : {}) };
+    return { halted: executionCoordinator.getHaltReason() !== null, mode: this.mode, ...(lossTriggersAcked !== undefined ? { lossTriggersAcked } : {}), ...(clearHaltRefused ? { clearHaltRefused } : {}), ...(dailyLossLatchCleared ? { dailyLossLatchCleared } : {}) };
   }
 
   private watchListener: ((r: WatchResult) => void) | null = null;

@@ -124,10 +124,10 @@ Two different refusals:
 
 To resume:
 1. Find out why the losses happened (`api "$APEX/api/workstation/positions?status=CLOSED"`, the decision journal). Do not clear the latch to get around a losing strategy.
-2. `api -X POST $APEX/api/auto/resume -d '{"clearDailyLossLatch":true}'`. This clears the latch only; `clearHalt` does not clear it, and this flag does not clear a halt. Send both flags in one request to clear both.
+2. `api -X POST $APEX/api/auto/resume -d '{"clearDailyLossLatch":true}'`. This clears the latch of the mode the coordinator is in now (LIVE when LIVE is armed, else PAPER; the reply's `dailyLossLatchCleared` names it), not both; `clearHalt` does not clear it, and this flag does not clear a halt. Send both flags in one request to clear both.
 3. If the 24 h window still holds net losses at or beyond the floor, the next buy is refused and latches again. Wait for the window to move (the message says when), or raise `MAX_DAILY_LOSS_USD` in the environment and restart.
 
-The latch is held in memory. After a restart it is gone, but the 24 h window still holds the losses, so the next buy latches again; a restart more than 24 h after the losses starts clean.
+The latch is saved in the database and survives a restart; only the clear above lifts it.
 
 ## 5. A buy is refused as LIVE_NOT_READY (or ENTRY_REVOKED)
 

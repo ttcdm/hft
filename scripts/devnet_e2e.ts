@@ -608,7 +608,7 @@ async function lossFloorStep(steps: import('./devnet_e2e_steps').HarnessSteps, S
     refreshPrice: () => solPriceService.refresh(),
     dailyPnlSol: () => riskEngine.getDailyTotalPnLSol('LIVE'),
     latch: () => riskEngine.getDailyLossLatch('LIVE'),
-    clearLatch: () => riskEngine.clearDailyLossLatch(),
+    clearLatch: () => riskEngine.clearDailyLossLatch('LIVE'),
     resume: (o) => autoSnipeController.resume(o),
     orderSol: d.buySol,
   });

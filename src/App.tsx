@@ -19,7 +19,7 @@ import { TokenBoard } from './components/TokenBoard';
 import { CurvePanel } from './components/CurvePanel';
 import { AutoPanel } from './components/AutoPanel';
 import { usePolled } from './utils/usePolled';
-import { readServerAlerts, serverAlertEvents, alertsUnreadableEvent } from './utils/operatorAlerts';
+import { readServerAlerts, serverAlertEvents, alertsUnreadableEvent, killSwitchStateAlert } from './utils/operatorAlerts';
 import { killSwitchPress } from './utils/killSwitchPress';
 import { PanelErrorBoundary } from './components/ErrorBoundaries';
 
@@ -47,6 +47,14 @@ export function makeEmptyKpis(startingEquity: number): PerformanceKPIs {
 export default function App() {
   // Master Kill Switch State
   const [isHalted, setIsHalted] = useState(false);
+  // R9-1: when the switch was last seen turning on (by this button or the poll), so a double tap does not resume trading.
+  const haltedSince = useRef<number | null>(null);
+  const [haltedSinceAt, setHaltedSinceAt] = useState<number | null>(null);
+  useEffect(() => {
+    if (isHalted && haltedSince.current === null) haltedSince.current = Date.now();
+    if (!isHalted) haltedSince.current = null;
+    setHaltedSinceAt(haltedSince.current);
+  }, [isHalted]);
   const [selectedMint, setSelectedMint] = useState<string | null>(null);
   const [activeFeed, setActiveFeed] = useState('CME_AURORA');
 
@@ -148,7 +156,7 @@ export default function App() {
   const [hiddenServerAlerts, setHiddenServerAlerts] = useState<Set<string>>(new Set());
   const serverAlerts = serverAlertEvents(readServerAlerts(checksPoll.data), hiddenServerAlerts);
   const unreadable = isOperatorAuthenticated && checksPoll.error ? [alertsUnreadableEvent(checksPoll.error, checksPoll.at ?? Date.now())] : [];
-  const shownAlerts = [...unreadable, ...serverAlerts, ...alerts];
+  const shownAlerts = [...killSwitchStateAlert(isHalted, haltedSinceAt), ...unreadable, ...serverAlerts, ...alerts];
   const seenServerAlerts = useRef<Set<string>>(new Set());
   useEffect(() => {
     for (const a of serverAlerts) {
@@ -183,12 +191,6 @@ export default function App() {
 
   // Emergency kill switch: the server decides. The UI only shows "halted" after the server confirmed it.
   const killInFlight = useRef(false);
-  // R9-1: when the switch was last seen turning on (by this button or the poll), so a double tap does not resume trading.
-  const haltedSince = useRef<number | null>(null);
-  useEffect(() => {
-    if (isHalted && haltedSince.current === null) haltedSince.current = Date.now();
-    if (!isHalted) haltedSince.current = null;
-  }, [isHalted]);
   const toggleKillSwitch = async () => {
     if (killInFlight.current) return; // R33: a second click while the first request is out must not send the opposite value
     // R9-1: send the intended state. RESUME needs a confirm, and a RESUME press right after the switch turned on is ignored.
@@ -209,13 +211,8 @@ export default function App() {
       if (nextHalted) haltedSince.current = Date.now();
       setIsHalted(nextHalted);
       hftAudio.playKillSwitch(); // R33: after the server confirmed, not before
-      if (nextHalted) {
-        triggerAlert(
-          'CRITICAL',
-          'KILL SWITCH ENGAGED',
-          'The server refuses new orders and has disarmed LIVE trading. Open positions are NOT sold: close them from the Plug & Play panel.'
-        );
-      } else {
+      // R10-1: the ENGAGED alert comes from the state (killSwitchStateAlert below), so a reset here or in another tab removes it
+      if (!nextHalted) {
         // R26: the reset lifts only the kill switch. An open circuit breaker or an all-trading halt still refuses orders.
         const blockers: string[] = [];
         if (body.circuitBreaker === 'OPEN') blockers.push(`the circuit breaker is still OPEN${body.circuitBreakerReset?.reason ? ` (${body.circuitBreakerReset.reason})` : ''}`);

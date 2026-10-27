@@ -64,3 +64,18 @@ const RANK: Record<AlertEvent['level'], number> = { CRITICAL: 0, WARNING: 1, INF
 export function orderAlerts(alerts: AlertEvent[]): AlertEvent[] {
   return [...alerts].sort((a, b) => RANK[a.level] - RANK[b.level] || b.timestamp - a.timestamp);
 }
+
+/**
+ * R10-1: the "KILL SWITCH ENGAGED" alert is drawn from the server's kill-switch state, not pushed once by the click. It is there while the
+ * server says the switch is on (in every tab, through the poll) and gone as soon as it says off; it cannot be dismissed while it holds.
+ */
+export const KILL_SWITCH_ALERT_ID = 'state-kill-switch';
+export function killSwitchStateAlert(on: boolean | null, since: number | null): AlertEvent[] {
+  if (on !== true) return [];
+  const at = since ?? Date.now();
+  return [{
+    id: KILL_SWITCH_ALERT_ID, timestamp: at, timeStr: new Date(at).toLocaleTimeString(), level: 'CRITICAL', title: 'KILL SWITCH ENGAGED',
+    message: 'The server refuses new orders and has disarmed LIVE trading. Open positions are NOT sold: close them from the Plug & Play panel.',
+    acknowledged: false, sticky: true,
+  }];
+}

@@ -23,6 +23,11 @@ export function isAlertExpired(alert: Pick<AlertEvent, 'level' | 'timestamp'>, n
 }
 
 export const COLLAPSED_ALERTS = 1;
+/** R9-3: below this width (Tailwind's `sm`) the dock starts minimized. */
+export const PHONE_MAX_WIDTH = 639;
+function isPhoneWidth(): boolean {
+  try { return typeof window !== 'undefined' && typeof window.innerWidth === 'number' && window.innerWidth > 0 && window.innerWidth <= PHONE_MAX_WIDTH; } catch { return false; }
+}
 /** R10-9: "Show all" shows all of them (it was capped at 3 while the counter said "+8"); the list scrolls inside the dock. */
 export const EXPANDED_ALERTS = Infinity;
 
@@ -41,7 +46,9 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
   onAcknowledgeAlert,
 }) => {
   const [expanded, setExpanded] = useState(false);
-  const [minimized, setMinimized] = useState(false);
+  // R9-3 at phone width: one CRITICAL card plus the bar took a large band of a 390 px screen and covered KILL AUTO while it scrolled
+  // through it. Below PHONE_MAX_WIDTH the dock opens as its bar, which names the most severe alert; "Show" opens the cards.
+  const [minimized, setMinimized] = useState(() => isPhoneWidth());
   // R12-13: CRITICAL alerts are announced to assistive tech. The live region is on the page before any alert arrives (a region added
   // together with its text is often not read) and stays when the dock is minimized; it changes only when the set of CRITICALs does.
   const liveRegion = (
@@ -63,7 +70,8 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
       data-testid="alerts-dock"
       className="sticky bottom-0 z-50 self-start max-w-sm w-full p-4 pt-0 space-y-2 pointer-events-none"
     >
-      <div className="flex items-center justify-between pointer-events-auto bg-[#0D131F] border border-[#1E293B] px-3 py-1.5 rounded-lg shadow-xl text-[11px] font-mono">
+      <div className="pointer-events-auto bg-[#0D131F] border border-[#1E293B] px-3 py-1.5 rounded-lg shadow-xl text-[11px] font-mono">
+      <div className="flex items-center justify-between">
         <span className="text-amber-400 font-bold flex items-center space-x-1">
           <AlertTriangle className="w-3.5 h-3.5 mr-1" />
           <span>Active Risk Alerts ({alerts.length}{critical ? `, ${critical} critical` : ''})</span>
@@ -93,8 +101,14 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
           </button>
         </span>
       </div>
+      {minimized && (
+        <div data-testid="alerts-top-title" className={`truncate font-bold ${ordered[0].level === 'CRITICAL' ? 'text-red-300' : ordered[0].level === 'WARNING' ? 'text-amber-300' : 'text-cyan-300'}`}>
+          {ordered[0].title}
+        </div>
+      )}
+      </div>
 
-      <div data-testid="alerts-list" className="space-y-2 max-h-[60vh] overflow-y-auto pointer-events-auto">
+      <div data-testid="alerts-list" className="space-y-2 max-h-[40vh] sm:max-h-[60vh] overflow-y-auto pointer-events-auto">
       {shown.map((alert) => (
         <div
           key={alert.id}

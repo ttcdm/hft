@@ -11,6 +11,7 @@
  * `docs/ARCHITECTURE.md`. While LIVE is armed the server refuses a snipe that does not carry `confirmLive`, and this screen only sends it
  * after the operator accepts the warning. Some switches here are stored but change nothing (KNOWN_RISKS.md section 6).
  */
+import { dollarSymbol, displayName, displaySymbol } from '../utils/displayName';
 import { signalFeedBadge } from '../utils/signalBadge';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { usePolled } from '../utils/usePolled';
@@ -320,7 +321,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
     const unsubTrade = engineClient.onSniperTrade((data) => {
       if (data?.position) {
-        onAlertTrigger?.('INFO', '⚡ SNIPER TRADE EXECUTED', data.message || `Snipe filled for ${data.position.tokenTicker}`);
+        onAlertTrigger?.('INFO', '⚡ SNIPER TRADE EXECUTED', data.message || `Snipe filled for ${dollarSymbol(data.position.tokenTicker)}`);
         refreshData();
       }
     });
@@ -348,7 +349,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     if (!snipeAmount.parsed.ok) { onAlertTrigger?.('WARNING', 'SNIPE NOT SENT', snipeAmount.parsed.reason); return; }
     const amount = snipeAmount.parsed.sol;
     // Q10b: while LIVE is armed this click sends a real transaction; say so and ask first
-    const warning = liveClickWarning(tradingMode, `Sniping ${sig.tokenTicker} for ${formatSol(amount)}`);
+    const warning = liveClickWarning(tradingMode, `Sniping ${dollarSymbol(sig.tokenTicker)} for ${formatSol(amount)}`);
     if (warning && !(await confirmLiveClick(warning))) return;
     hftAudio.playOrderFill();
     const res = await engineClient.snipeSocialSignal(sig.id, amount, sniperConfig.jitoTipSol, sniperConfig.maxSlippagePct, tradingMode.live);
@@ -356,7 +357,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     if (res?.tradeResult?.success) {
       onAlertTrigger?.(
         'INFO',
-        `SNIPED ${sig.tokenTicker}`,
+        `SNIPED ${dollarSymbol(sig.tokenTicker)}`,
         `${/^PAPER/i.test(String(res.tradeResult.txHash ?? '')) ? 'Paper fill' : 'Sent'} for ${formatSol(amount)} on ${sig.chain}${res.tradeResult.txHash ? ` (${String(res.tradeResult.txHash).slice(0, 14)}...)` : ''}. CA: ${sig.contractAddress.slice(0, 10)}...`
       );
       // Update signal status locally
@@ -378,7 +379,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const handleSnipePool = async (pool: MemecoinPool) => {
     if (!snipeAmount.parsed.ok) { onAlertTrigger?.('WARNING', 'SNIPE NOT SENT', snipeAmount.parsed.reason); return; }
     const amount = snipeAmount.parsed.sol;
-    const warning = liveClickWarning(tradingMode, `Sniping $${pool.symbol} for ${formatSol(amount)}`);
+    const warning = liveClickWarning(tradingMode, `Sniping ${dollarSymbol(pool.symbol)} for ${formatSol(amount)}`);
     if (warning && !(await confirmLiveClick(warning))) return;
     hftAudio.playOrderFill();
     const res = await engineClient.executeMemecoinSnipe(buildPoolSnipeRequest(pool, amount, sniperConfig), tradingMode.live);
@@ -386,7 +387,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     if (r?.success) {
       onAlertTrigger?.(
         'INFO',
-        `SNIPED $${pool.symbol}`,
+        `SNIPED ${dollarSymbol(pool.symbol)}`,
         `${/^PAPER/i.test(String(r.txHash ?? '')) ? 'Paper fill' : 'Sent'} for ${formatSol(amount)} on ${pool.chain}${r.txHash ? ` (${String(r.txHash).slice(0, 14)}...)` : ''}. CA: ${pool.contractAddress.slice(0, 10)}...`
       );
       refreshData();
@@ -400,7 +401,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     // R9-5: a sell asks first, with what it sells
     const pos = positions.find((p) => p.id === posId);
     const ask = sellConfirmText({
-      name: pos ? (pos.tokenTicker.startsWith('$') ? pos.tokenTicker : `$${pos.tokenTicker}`) : 'this position', sellPct, mode: pos?.executionMode,
+      name: pos ? dollarSymbol(pos.tokenTicker) : 'this position', sellPct, mode: pos?.executionMode,
       tokensHeld: pos?.quantityTokens, valueText: pos && Number.isFinite(pos.currentValueUsd) ? `$${pos.currentValueUsd.toFixed(2)}` : null,
     });
     if (!(await confirmSell(ask))) return;
@@ -776,8 +777,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <div className="flex flex-wrap items-center gap-3">
                           <div className="flex items-center space-x-1.5">
                             <span className="text-slate-400">Token:</span>
-                            <span className="font-bold text-cyan-300 text-sm">{sig.tokenTicker}</span>
-                            <span className="text-slate-500">({sig.tokenName})</span>
+                            <span className="font-bold text-cyan-300 text-sm">{dollarSymbol(sig.tokenTicker)}</span>
+                            <span className="text-slate-500 truncate max-w-[220px]">({displayName(sig.tokenName)})</span>
                           </div>
 
                           <div className="flex items-center space-x-1 bg-[#141B2D] px-2 py-1 rounded border border-[#1E293B]">
@@ -854,7 +855,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                   ? `Token X link (creator-supplied, unverified): ${sanitizeXProfileUrl(sig.socials?.twitter)}`
                                   : sig.source === 'X_TWITTER'
                                   ? `View Author @${sig.authorHandle} on X`
-                                  : `Search $${sig.tokenTicker} on X.com`
+                                  : `Search ${dollarSymbol(sig.tokenTicker)} on X.com`
                               }
                             >
                               <span className="font-bold text-[11px]">𝕏</span>
@@ -990,8 +991,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                               <span className="text-slate-500 font-bold" title="Trending rank from the feed; — when it gives none">{fmtRank(pool.trendingRank)}</span>
                               <div>
                                 <div className="font-bold text-white text-sm flex items-center space-x-1">
-                                  <span>${pool.symbol}</span>
-                                  <span className="text-slate-400 text-xs font-normal">({pool.name})</span>
+                                  <span>{dollarSymbol(pool.symbol)}</span>
+                                  <span className="text-slate-400 text-xs font-normal truncate max-w-[220px]">({displayName(pool.name)})</span>
                                 </div>
                                 <div className="text-[10px] text-slate-400 flex items-center space-x-1">
                                   <span data-testid="pool-mint" title={pool.contractAddress} className="font-mono text-slate-300">{pool.contractAddress.slice(0, 8)}...{pool.contractAddress.slice(-6)}</span>
@@ -1005,8 +1006,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                 </div>
                                 <TokenInlineExternalLinks
                                   mintOrCa={pool.contractAddress}
-                                  symbol={pool.symbol}
-                                  name={pool.name}
+                                  symbol={displaySymbol(pool.symbol)}
+                                  name={displayName(pool.name)}
                                   chain={pool.chain}
                                   platform={pool.platform}
                                   mainnetToken={pool.id.startsWith('pool-callout-')}
@@ -1015,8 +1016,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                     setSelectedExternalToken({
                                       mainnetToken: pool.id.startsWith('pool-callout-'),
                                       mintOrCa: pool.contractAddress,
-                                      symbol: pool.symbol,
-                                      name: pool.name,
+                                      symbol: displaySymbol(pool.symbol),
+                                      name: displayName(pool.name),
                                       chain: pool.chain,
                                       platform: pool.platform,
                                       priceUsd: pool.priceUsd,
@@ -1273,9 +1274,9 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                   <td className="p-3 font-bold text-white min-w-[240px]">
                                     <div className="flex flex-col space-y-1">
                                       <div className="flex items-center space-x-1.5">
-                                        <span className="text-white text-sm font-bold tracking-wide">${pos.tokenTicker}</span>
+                                        <span className="text-white text-sm font-bold tracking-wide">{dollarSymbol(pos.tokenTicker)}</span>
                                         {pos.tokenName && (
-                                          <span className="text-slate-400 text-xs font-normal">({pos.tokenName})</span>
+                                          <span className="text-slate-400 text-xs font-normal truncate max-w-[220px]">({displayName(pos.tokenName)})</span>
                                         )}
                                         <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-800/80 text-cyan-300 border border-slate-700">
                                           {pos.chain}
@@ -1300,15 +1301,15 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                       {/* External Website Direct Launchers (DexScreener, Pump.fun, Birdeye, Solscan, Photon) */}
                                       <TokenInlineExternalLinks
                                         mintOrCa={pos.contractAddress}
-                                        symbol={pos.tokenTicker}
-                                        name={pos.tokenName}
+                                        symbol={displaySymbol(pos.tokenTicker)}
+                                        name={displayName(pos.tokenName)}
                                         chain={pos.chain}
                                         platform={pos.platform}
                                         onOpenModal={() =>
                                           setSelectedExternalToken({
                                             mintOrCa: pos.contractAddress,
-                                            symbol: pos.tokenTicker,
-                                            name: pos.tokenName,
+                                            symbol: displaySymbol(pos.tokenTicker),
+                                            name: displayName(pos.tokenName),
                                             chain: pos.chain,
                                             platform: pos.platform,
                                             priceUsd: pos.currentPriceUsd,

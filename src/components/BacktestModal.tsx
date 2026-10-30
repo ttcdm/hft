@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from 'react';
+import { dollarSymbol } from '../utils/displayName';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { X, TrendingUp } from 'lucide-react';
 import { usePolled } from '../utils/usePolled';
@@ -144,7 +145,7 @@ export function ReplayBacktestView({ data, error }: { data: ReplayResponse | nul
               <tbody>
                 {r.launches.slice(-TABLE_ROWS_SHOWN).reverse().map((l) => (
                   <tr key={l.mint} className="border-t border-[#1E293B] align-top">
-                    <td className="py-1 text-slate-300">${l.symbol}<div className="text-[10px] text-slate-500" title={l.mint}>{l.mint.slice(0, 6)}…{l.mint.slice(-4)} · {l.trades} trades</div></td>
+                    <td className="py-1 text-slate-300">{dollarSymbol(l.symbol)}<div className="text-[10px] text-slate-500" title={l.mint}>{l.mint.slice(0, 6)}…{l.mint.slice(-4)} · {l.trades} trades</div></td>
                     <td title={l.verdictReason}>{l.verdict}{l.releasedAfterMs !== null ? ` @${Math.round(l.releasedAfterMs / 1000)}s` : ''}</td>
                     <td>{l.score ?? '—'}</td>
                     <td>{l.entered ? `${l.outcome === 'OPEN_AT_END' ? 'open at end' : 'closed'}: ${l.exits.map((e) => e.reason).join(', ') || 'no exit yet'}` : (l.noEntryReason ?? '—')}</td>

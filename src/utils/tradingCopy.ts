@@ -1,3 +1,5 @@
+import { displaySymbol } from './displayName';
+
 /** Q37: the words on the arm and panic buttons, kept in one place so they can be tested against what the server does. */
 
 export const ARMED_MESSAGE = (cluster?: string): string =>
@@ -53,7 +55,7 @@ export function panicOutcome(ok: boolean, status: number, data: PanicResponseLit
   const failed = Array.isArray(data.data?.failed) ? data.data!.failed! : [];
   // a position the server lists as still open (or a buy still in flight) is never a success, whatever `success` says
   const open = failed.filter((f) => /^(STILL_OPEN|BUY_IN_FLIGHT)/.test(String(f?.error ?? '')));
-  const openText = open.length ? ` STILL OPEN after the panic: ${open.map((f) => f.symbol || f.id || '?').join(', ')}. Run the panic again or close them by hand.` : '';
+  const openText = open.length ? ` STILL OPEN after the panic: ${open.map((f) => (f.symbol ? displaySymbol(f.symbol) : f.id || '?')).join(', ')}. Run the panic again or close them by hand.` : '';
   if (data.success === false || failed.length > 0) return { text: `${data.message || 'Panic liquidate finished with failures. Some positions may still be open.'}${openText}`, type: 'error' };
   return { text: data.message || 'Panic liquidate finished.', type: 'success' };
 }

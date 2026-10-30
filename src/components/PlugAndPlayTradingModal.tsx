@@ -9,6 +9,7 @@
  * It must not hold or show key material, and it must not arm LIVE by itself: arming needs the operator to type the confirmation code, and
  * the server decides whether the prerequisites hold (`getLiveReadiness`). In read-only mode the server refuses to arm and to generate a key.
  */
+import { dollarSymbol, displayName } from '../utils/displayName';
 import { probeLatency } from '../utils/probeBadge';
 import { sellConfirmText } from '../utils/sellConfirm';
 import { journalEventDetail } from '../utils/exitWatch';
@@ -312,9 +313,9 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
     // R9-5: a sell asks first, with what it sells
     const target = positions.find((p) => p.id === posId);
     const held = target && /^\d+$/.test(String(target.tokenQuantityRaw ?? '')) ? Number(target.tokenQuantityRaw) / Math.pow(10, target.tokenDecimals ?? 6) : null;
-    const ask = sellConfirmText({ name: target?.symbol ? `$${target.symbol}` : 'this position', sellPct: 100, mode: target?.executionMode, tokensHeld: held, valueText: target ? fmtSol(target.currentValueSol) : null });
+    const ask = sellConfirmText({ name: target?.symbol ? dollarSymbol(target.symbol) : 'this position', sellPct: 100, mode: target?.executionMode, tokensHeld: held, valueText: target ? fmtSol(target.currentValueSol) : null });
     if (!(await confirmSell(ask))) return;
-    const name = target?.symbol ? `$${target.symbol}` : 'the position';
+    const name = target?.symbol ? dollarSymbol(target.symbol) : 'the position';
     try {
       const res = await authFetch('/api/wallet/close-position', {
         method: 'POST',
@@ -348,7 +349,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
     if (panicInFlight.current) return;
     // R10-11: an in-page dialog, where Enter cannot accept (window.confirm took Enter as yes)
     // R11-7: the confirm names what this screen read as open (count, tokens, modes) and the trading mode
-    const body = panicConfirmText(readProblem.positions ? null : positions, tradingMode.label);
+    const body = panicConfirmText(readProblem.positions ? null : positions, tradingMode.label, (s) => dollarSymbol(s));
     panicInFlight.current = true;
     setPanicPending(true);
     try {
@@ -656,7 +657,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                         .map((pos) => (
                           <tr key={pos.id}>
                             <td className="p-2.5 font-mono">
-                              <div className="font-bold text-white">${pos.symbol || pos.mint.slice(0, 6)}</div>
+                              <div className="font-bold text-white truncate max-w-[160px]" title={pos.name ? displayName(pos.name) : undefined}>{pos.symbol ? dollarSymbol(pos.symbol) : `$${String(pos.mint ?? '').slice(0, 6)}`}</div>
                               <span className="text-[10px] text-slate-400 truncate block max-w-[140px]">{pos.mint}</span>
                             </td>
                             <td className="p-2.5">

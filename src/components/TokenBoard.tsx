@@ -3,6 +3,7 @@ import { authFetch } from '../services/engineClient';
 import { onAuthenticated } from '../utils/authEvents';
 import { ageText } from '../utils/freshness';
 import { fmtSignedSol, signTone } from '../utils/numFormat';
+import { dollarSymbol, displayName } from '../utils/displayName';
 
 /** H1: the home page. Launches / Watching / Holding, all from GET /api/board. Unknown values render "—", never a number. */
 export interface BoardData {
@@ -108,7 +109,7 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
             {board.launches.length === 0 && <tr><td colSpan={6} className="p-6 text-center text-slate-500">No launches seen yet. The board fills from the Pump.fun create-event stream.</td></tr>}
             {board.launches.map((l) => (
               <tr key={l.mint} onClick={() => onSelect?.(l.mint)} className={`border-t border-slate-800/60 cursor-pointer hover:bg-slate-900 ${selected === l.mint ? 'bg-slate-900' : ''}`}>
-                <td className="px-3 py-2 text-left"><span className="font-bold text-slate-100">${l.symbol}</span> <span className="text-slate-500 font-mono">{short(l.mint)}</span></td>
+                <td className="px-3 py-2 text-left"><span className="font-bold text-slate-100" title={displayName(l.name)}>{dollarSymbol(l.symbol)}</span> <span className="text-slate-500 font-mono">{short(l.mint)}</span></td>
                 <td className={cell}>{fmtPrice(l.priceSol)}</td>
                 <td className={cell}>{fmt(l.curveProgressPct, 1, '%')}</td>
                 <td className={cell}>{fmt(l.top10HoldersPct, 1, '%')}</td>
@@ -145,7 +146,7 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
             {board.holding.length === 0 && <tr><td colSpan={5} className="p-6 text-center text-slate-500">No open positions.</td></tr>}
             {board.holding.map((h) => (
               <tr key={h.id} onClick={() => onSelect?.(h.mint)} className="border-t border-slate-800/60 cursor-pointer hover:bg-slate-900">
-                <td className="px-3 py-2 text-left"><span className="font-bold text-slate-100">${h.symbol}</span> <span className="text-slate-500">{h.mode}</span></td>
+                <td className="px-3 py-2 text-left"><span className="font-bold text-slate-100">{dollarSymbol(h.symbol)}</span> <span className="text-slate-500">{h.mode}</span></td>
                 <td className={cell}>{fmtPrice(h.entryPriceSol)}</td>
                 <td className={cell}>
                   {fmtPrice(h.markPriceSol)}

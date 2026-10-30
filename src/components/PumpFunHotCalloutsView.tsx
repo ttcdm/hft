@@ -11,6 +11,7 @@
  * gates, and in LIVE it needs `confirmLive`. Explorer and market links are always offered on this screen, because the callouts come from the mainnet
  * pump.fun list (the call passes `true` for "token is mainnet data"); this build trades devnet and localnet only.
  */
+import { dollarSymbol, displayName, displaySymbol } from '../utils/displayName';
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { ageText } from '../utils/freshness';
 import { SnipeAmountControl } from './SnipeAmountControl';
@@ -263,8 +264,8 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
         );
         onAlertTrigger?.(
           'INFO',
-          `⚡ AUTONOMOUS CALLOUT SNIPED: $${data.callout.token.symbol}`,
-          data.tradeRes?.message || `Snipe request handled for $${data.callout.token.symbol}`
+          `⚡ AUTONOMOUS CALLOUT SNIPED: ${dollarSymbol(data.callout.token.symbol)}`,
+          data.tradeRes?.message || `Snipe request handled for ${dollarSymbol(data.callout.token.symbol)}`
         );
         onRefreshParent?.();
       }
@@ -307,7 +308,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
     }
     const amountSol = snipeAmount.parsed.sol;
     // Q10b: while LIVE is armed this click sends a real transaction; say so and ask first
-    const warning = liveClickWarning(tradingMode, `Sniping $${callout.token.symbol} for ${formatSol(amountSol)}`);
+    const warning = liveClickWarning(tradingMode, `Sniping ${dollarSymbol(callout.token.symbol)} for ${formatSol(amountSol)}`);
     if (warning && !(await confirmLiveClick(warning))) return;
     setSnipingCalloutId(callout.id);
     hftAudio.playOrderFill();
@@ -323,7 +324,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
     if (res?.status === 'OK' && res?.result?.success) {
       onAlertTrigger?.(
         'INFO',
-        `⚡ HOT CALLOUT SNIPED: $${callout.token.symbol}`,
+        `⚡ HOT CALLOUT SNIPED: ${dollarSymbol(callout.token.symbol)}`,
         `${tradingMode.live ? 'Sent' : 'PAPER fill of'} ${formatSol(amountSol)} on Pump.fun (${tradingMode.label}). Caller: @${callout.caller.userId} (Avg: ${callout.caller.avgMultiple}x)`
       );
       setCallouts((prev) =>
@@ -707,14 +708,14 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                     <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-center">
                       {/* TOKEN IDENTITY (Cols 1-4) */}
                       <div className="lg:col-span-4 flex items-start space-x-3">
-                        <TokenImage uri={c.token.imageUri} symbol={c.token.symbol} />
+                        <TokenImage uri={c.token.imageUri} symbol={displaySymbol(c.token.symbol)} />
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center space-x-2">
                             <span className="font-extrabold text-white text-sm tracking-wide font-sans">
-                              ${c.token.symbol}
+                              {dollarSymbol(c.token.symbol)}
                             </span>
                             <span className="text-xs text-slate-400 truncate max-w-[120px]">
-                              {c.token.name}
+                              {displayName(c.token.name)}
                             </span>
                           </div>
 
@@ -795,7 +796,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                                       ? 'text-sky-300 bg-sky-500/20 border border-sky-500/40 hover:bg-sky-500/30'
                                       : 'text-slate-400 hover:text-sky-400 hover:bg-slate-800'
                                   }`}
-                                  title={hasOfficial ? `𝕏 handle supplied by the token creator (unverified): ${twitterUrl}` : `Search $${c.token.symbol} on 𝕏`}
+                                  title={hasOfficial ? `𝕏 handle supplied by the token creator (unverified): ${twitterUrl}` : `Search ${dollarSymbol(c.token.symbol)} on 𝕏`}
                                 >
                                   <span className="font-bold">𝕏</span>
                                   {hasOfficial && <span className="text-[8px] uppercase">creator-supplied</span>}
@@ -1076,7 +1077,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                             key={`top-${top.calloutId || top.symbol}-${tIdx}`}
                             className="px-1.5 py-0.5 rounded bg-emerald-950/60 border border-emerald-500/40 text-[10px] font-mono text-emerald-300 flex items-center space-x-1"
                           >
-                            <span className="font-bold">${top.symbol}</span>
+                            <span className="font-bold">{dollarSymbol(top.symbol)}</span>
                             <span className="text-amber-300 font-black">{top.multiple}x</span>
                           </span>
                         ))}
@@ -1291,7 +1292,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                     className="p-2 rounded bg-[#0E1424] border border-[#1E293B] flex items-center justify-between text-xs font-mono"
                   >
                     <div className="flex items-center space-x-2">
-                      <span className="font-bold text-white">${c.symbol}</span>
+                      <span className="font-bold text-white">{dollarSymbol(c.symbol)}</span>
                       <span className="text-slate-500 truncate max-w-[140px]">{c.coinMint}</span>
                     </div>
                     <div className="flex items-center space-x-2">

@@ -1117,10 +1117,15 @@ export class ExecutionCoordinator {
                       .loadPositions()
                       .find((p) => p.mint === recovery.mint && p.executionMode === 'LIVE' && (p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED'));
                     if (targetPos) {
-                      const remainingTokens = BigInt(recovery.remainingTokensRaw ?? '0');
+                      // R14-3: the sale is a share of the ROW, not of the wallet balance before it (tokens sent in from outside are not the
+                      // position's): the basis removed is sold / row, and the row keeps row - sold. The wallet's balance after the sell only
+                      // decides that nothing is left. Extra wallet tokens stay untracked (step 6 below adopts what this app once bought).
+                      const rowTokens = BigInt(targetPos.tokenQuantityRaw);
                       const tokensSold = BigInt(recovery.tokensSoldRaw ?? '0');
-                      const totalTokensBefore = BigInt(recovery.tokenBeforeRaw ?? targetPos.tokenQuantityRaw);
-                      const sellFraction = totalTokensBefore > 0n ? Number(tokensSold) / Number(totalTokensBefore) : 1;
+                      const walletAfter = BigInt(recovery.remainingTokensRaw ?? '0');
+                      const remainingTokens = walletAfter <= 0n || tokensSold >= rowTokens ? 0n : rowTokens - tokensSold;
+                      // closing the row books its whole basis against the proceeds (tokens the row claimed beyond the wallet are a loss, not free)
+                      const sellFraction = remainingTokens > 0n ? Number(tokensSold) / Number(rowTokens) : 1;
                       const costPortionLamports = Math.round(targetPos.costBasisLamports * sellFraction);
                       const netProceedsLamports = recovery.solReceivedLamports ?? 0;
                       const realizedPnLSol = (netProceedsLamports - costPortionLamports) / 1e9;

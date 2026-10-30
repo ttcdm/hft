@@ -89,6 +89,42 @@ describe('R14: startup reconciliation books a landed SELL once, from the row, on
     expect((coordinator as any).pendingSells.has(id)).toBe(false);
   });
 
+  it('R14-3: a landed partial is sized against the row, not the wallet balance before it (the wallet holds extra tokens)', async () => {
+    const id = `r143_${uid()}`;
+    livePosition(id); // the row holds 1000 for 0.1 SOL
+    const sig = `r143sell_${uid()}`;
+    sellRow(sig);
+    conn.getSignatureStatuses = vi.fn(async () => confirmed);
+    conn.getTransaction = vi.fn(async () => ({ slot: SELL_SLOT, blockTime: Math.floor(Date.now() / 1000) - 240, meta: { err: null, fee: 5000 } }));
+    conn.getTokenAccountBalance = vi.fn(async () => ({ context: { slot: SELL_SLOT + 10 }, value: { amount: '1000' } }));
+    // the wallet held 1500 (500 sent in from outside); the sell sold 500, half of the row
+    landedSell({ sold: '500', before: '1500', after: '1000', received: 60_000_000 });
+    await coordinator.startupReconciliation();
+    const row = rowOf(id);
+    expect(stateOf(sig)).toBe('RECONCILED');
+    expect(row.status).toBe('PARTIALLY_CLOSED');
+    expect(row.tokenQuantityRaw).toBe('500'); // the row's 1000 less the 500 sold; the wallet's extra 500 stays untracked
+    expect(row.costBasisLamports).toBe(50_000_000); // half of the basis went with half of the row
+    expect(row.realizedPnLSol).toBeCloseTo(0.01, 9); // 0.06 SOL received for 0.05 SOL of basis
+  });
+
+  it('R14-3: a landed sell of at least the whole row closes it, even with tokens left in the wallet', async () => {
+    const id = `r143b_${uid()}`;
+    livePosition(id);
+    const sig = `r143bsell_${uid()}`;
+    sellRow(sig, { exitReason: 'STOP_LOSS' });
+    conn.getSignatureStatuses = vi.fn(async () => confirmed);
+    conn.getTransaction = vi.fn(async () => ({ slot: SELL_SLOT, blockTime: Math.floor(Date.now() / 1000) - 240, meta: { err: null, fee: 5000 } }));
+    conn.getTokenAccountBalance = vi.fn(async () => ({ context: { slot: SELL_SLOT + 10 }, value: { amount: '500' } }));
+    landedSell({ sold: '1000', before: '1500', after: '500', received: 70_000_000 });
+    await coordinator.startupReconciliation();
+    const row = rowOf(id);
+    expect(row.status).toBe('CLOSED');
+    expect(row.tokenQuantityRaw).toBe('0');
+    expect(row.costBasisLamports).toBe(0);
+    expect(row.realizedPnLSol).toBeCloseTo(-0.03, 9);
+  });
+
   it('R14-1: a pending sell that step 4 finds reverted on chain is dropped too', async () => {
     const id = `r141r_${uid()}`;
     livePosition(id);

@@ -52,6 +52,7 @@ import {
 import { engineClient, useWsStreaming } from '../services/engineClient';
 import { hftAudio } from '../utils/audio';
 import { DecimalBox } from './DecimalBox';
+import { TipBox } from './TipBox';
 import { DialogFrame } from './DialogFrame';
 import { confirmLiveClick } from './ConfirmDialog';
 import {
@@ -192,14 +193,18 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
     lastUpdated: null,
   });
 
-  const [rules, setRules] = useState({
+  // R11-8: jitoPriorityTipSol is absent until the operator sets one (the server's rules carry no tip by default: its dynamic policy
+  // decides). The box shows "auto" then, and the snipe sends no tip; it used to show the literal "undefined".
+  const [rules, setRules] = useState<{
+    minCallerWinRate2x: number; minAvgMultiple: number; autoSnipeOnConfluence: boolean; maxEntryMultiple: number; maxElapsedSeconds: number;
+    snipeAmountUsd: number; jitoPriorityTipSol?: number;
+  }>({
     minCallerWinRate2x: 40.0,
     minAvgMultiple: 4.0,
     autoSnipeOnConfluence: true,
     maxEntryMultiple: 1.35,
     maxElapsedSeconds: 60,
     snipeAmountUsd: capitalTier === 'MICRO_10' ? 5.0 : 25.0,
-    jitoPriorityTipSol: 0.00018,
   });
 
   const rulesDirty = useRef(false); // true from the first edit until the server confirms a save
@@ -944,7 +949,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                           </div>
                         ) : (
                           <div className="text-center text-[10px] font-mono text-slate-500">
-                            {calloutSendNote(rules.jitoPriorityTipSol)}
+                            {typeof rules.jitoPriorityTipSol === 'number' ? calloutSendNote(rules.jitoPriorityTipSol) : 'Sent over the normal RPC path. Jito tip: auto (the server picks it), paid only if the server has Jito configured (devnet: never).'}
                           </div>
                         )}
                       </div>
@@ -1193,7 +1198,8 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Jito Priority Tip (SOL)
               </label>
-              <DecimalBox testId="rule-jitoPriorityTipSol" ariaLabel="Jito priority tip (SOL)" value={rules.jitoPriorityTipSol} onValue={(n) => editRules({ jitoPriorityTipSol: n })}
+              <TipBox testId="rule-jitoPriorityTipSol" ariaLabel="Jito priority tip (SOL)" value={typeof rules.jitoPriorityTipSol === 'number' ? rules.jitoPriorityTipSol : null}
+                onValue={(n) => editRules({ jitoPriorityTipSol: n ?? undefined })}
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">

@@ -433,8 +433,9 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
       const filePath = path.join(process.cwd(), 'src/components/PumpFunHotCalloutsView.tsx');
       const content = fs.readFileSync(filePath, 'utf8');
 
-      // Rule default
-      expect(content).toContain('jitoPriorityTipSol: 0.00018');
+      // R11-8: no client-side rule default (it was never used: the first poll replaced it); the box shows "auto" and the server's
+      // dynamic policy decides (0.00018 SOL at the MICRO_10 size, asserted above)
+      expect(content).not.toMatch(/jitoPriorityTipSol: \d/);
       // No remaining 0.005 SOL default
       expect(content.includes('jitoPriorityTipSol: 0.005')).toBe(false);
     });

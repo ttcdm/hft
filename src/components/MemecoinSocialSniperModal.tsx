@@ -70,9 +70,9 @@ import { sellConfirmText } from '../utils/sellConfirm';
 import { closeOutcomeTitle } from '../utils/closeOutcome';
 import { hftAudio } from '../utils/audio';
 import { PumpFunHotCalloutsView } from './PumpFunHotCalloutsView';
+import { TipBox } from './TipBox';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
 import { BELOW_HEADER_TOP } from '../utils/headerOffset';
-import { DecimalBox } from './DecimalBox';
 import { DialogFrame, KILL_SWITCH_ID } from './DialogFrame';
 import { askConfirm, confirmLiveClick, confirmSell } from './ConfirmDialog';
 import { CONSOLE_PANIC_CONFIRM_TEXT, isConsoleEmergencyCommand } from '../utils/tradingCopy';
@@ -175,7 +175,6 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     isAutoSnipeEnabled: false,
     defaultSnipeAmountUsd: capitalTier === 'MICRO_10' ? 5.0 : 50.0,
     maxSlippagePct: 8.0,
-    jitoTipSol: 0.005,
     takeProfitPct: 50.0,
     stopLossPct: 20.0,
     trailingStopEnabled: true,
@@ -185,6 +184,11 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     telegramChatId: '',
     telegramWebhookActive: true,
   });
+
+  // R11-8: the tip lives apart from sniperConfig. The server config has no tip (C6: absent means its dynamic policy decides), so every
+  // config load put `undefined` in the box and overwrote a typed tip. null is "auto": nothing is sent. A typed tip is kept until changed.
+  const [jitoTip, setJitoTip] = useState<number | null>(null);
+  const tipParam = jitoTip === null ? {} : { jitoTipSol: jitoTip };
 
   // Filters & UI states
   const [selectedPlatform, setSelectedPlatform] = useState<string>('ALL');
@@ -352,7 +356,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     const warning = liveClickWarning(tradingMode, `Sniping ${dollarSymbol(sig.tokenTicker)} for ${formatSol(amount)}`);
     if (warning && !(await confirmLiveClick(warning))) return;
     hftAudio.playOrderFill();
-    const res = await engineClient.snipeSocialSignal(sig.id, amount, sniperConfig.jitoTipSol, sniperConfig.maxSlippagePct, tradingMode.live);
+    const res = await engineClient.snipeSocialSignal(sig.id, amount, jitoTip ?? undefined, sniperConfig.maxSlippagePct, tradingMode.live);
     
     if (res?.tradeResult?.success) {
       onAlertTrigger?.(
@@ -382,7 +386,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     const warning = liveClickWarning(tradingMode, `Sniping ${dollarSymbol(pool.symbol)} for ${formatSol(amount)}`);
     if (warning && !(await confirmLiveClick(warning))) return;
     hftAudio.playOrderFill();
-    const res = await engineClient.executeMemecoinSnipe(buildPoolSnipeRequest(pool, amount, sniperConfig), tradingMode.live);
+    const res = await engineClient.executeMemecoinSnipe(buildPoolSnipeRequest(pool, amount, { maxSlippagePct: sniperConfig.maxSlippagePct, jitoTipSol: jitoTip ?? undefined }), tradingMode.live);
     const r = res?.result ?? res?.tradeResult;
     if (r?.success) {
       onAlertTrigger?.(
@@ -467,7 +471,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
       const res = await engineClient.executeMemecoinSnipe({
         contractAddress: manualSnipeCa.trim(),
         amountSol: snipeAmount.parsed.sol,
-        jitoTipSol: sniperConfig.jitoTipSol,
+        ...tipParam,
         slippagePct: sniperConfig.maxSlippagePct,
       }, tradingMode.live);
 
@@ -1145,7 +1149,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                     <label className="block text-slate-400 text-[10px] mb-1" data-testid="jito-tip-label">
                       {jitoUseText(jitoStatus).tipLabel}
                     </label>
-                    <DecimalBox testId="sniper-jito-tip" ariaLabel="Jito tip (SOL)" value={sniperConfig.jitoTipSol} onValue={(n) => setSniperConfig({ ...sniperConfig, jitoTipSol: n })}
+                    <TipBox testId="sniper-jito-tip" ariaLabel="Jito tip (SOL)" value={jitoTip} onValue={setJitoTip}
                       className="w-full bg-[#141B2D] border border-[#1E293B] rounded p-2 text-white font-mono outline-none focus:border-cyan-400"
                     />
                   </div>

@@ -305,12 +305,13 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
       expect(resolved.policyReason).toContain('DYNAMIC_NOTIONAL_SCALING');
     });
 
-    it('B24: UI PumpFunHotCalloutsView sets default Jito tip to 0.00018 SOL', () => {
+    it('B24: UI PumpFunHotCalloutsView sets no client-side Jito tip default (R11-8: the server\'s dynamic tip, shown as "auto")', () => {
       const componentPath = path.join(process.cwd(), 'src/components/PumpFunHotCalloutsView.tsx');
       const fileContent = fs.readFileSync(componentPath, 'utf8');
 
-      // Verifies default tip in initial state is 0.00018 SOL
-      expect(fileContent).toContain('jitoPriorityTipSol: 0.00018');
+      // R11-8: the 0.00018 initial value was never what was used (the first poll replaced it with the server's, which has no tip). The
+      // rules start with no tip, the box says "auto", and the server's dynamic policy (0.00018 SOL at the MICRO_10 size) decides.
+      expect(fileContent).not.toMatch(/jitoPriorityTipSol: \d/);
       // Verifies no hardcoded 0.005 SOL default remains in rules state
       expect(fileContent.includes('jitoPriorityTipSol: 0.005')).toBe(false);
     });

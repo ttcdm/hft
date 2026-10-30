@@ -161,6 +161,8 @@ Every LIVE buy re-reads a short readiness list (section 3 of [`ARCHITECTURE.md`]
 
 ## 6. Auto refuses PAPER or DEVNET_LIVE with LOSS_TRIGGERS_NEED_ACK (3E)
 
+`POST /api/auto/mode` also answers 409 with `KILL_SWITCH_ACTIVE:` for PAPER or DEVNET_LIVE while the risk kill switch is on, so resetting the switch never starts buying by itself; SHADOW is allowed. While auto is in a mode and the kill switch is on (or trading is halted), `GET /api/auto/status` gives `killSwitchActive` and `buysRefusedBy` (`{ code, message }`, null when nothing outside auto refuses buys).
+
 `POST /api/auto/mode` answers 409 with an error starting `LOSS_TRIGGERS_NEED_ACK:` when the last 20 closed trades auto opened in that mode (PAPER, or LIVE for DEVNET_LIVE) trip `NEGATIVE_EXPECTANCY` or `LOSS_STREAK`. Only auto's own trades count: positions in the current session, or with a `BOUGHT` journal row, closed after the last acknowledgement.
 
 1. Look at those trades (`api $APEX/api/auto/status`, the journal) and decide whether the losses are understood.

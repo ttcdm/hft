@@ -169,6 +169,13 @@ export interface AutoStatus {
   confluence: ConfluenceThresholdInfo;
   /** S189: set while a PAPER session waits in SHADOW for readiness to stay green; it then comes back by itself. */
   autoRestore: { greenForMs: number; needMs: number } | null;
+  /** R12-3: the risk-engine kill switch, read now (it is not auto's own kill: see `killed`). */
+  killSwitchActive: boolean;
+  /**
+   * R12-3: why auto buys nothing in the mode it is in, when something outside auto refuses them: KILL_SWITCH_ACTIVE (the risk kill switch
+   * is on; SHADOW still journals would-buys) or TRADING_HALTED. null when nothing outside auto blocks buys. The panel shows it next to the mode.
+   */
+  buysRefusedBy: { code: 'KILL_SWITCH_ACTIVE' | 'TRADING_HALTED'; message: string } | null;
 }
 
 const MAX_DECISIONS = 500;
@@ -573,7 +580,20 @@ export class AutoSnipeController extends EventEmitter {
       orderLimits: { minSol: SNIPE_AMOUNT_MIN_SOL, maxSol: executionConfig.getConfig().maxPositionSizeSol },
       confluence: confluenceThresholdInfo(),
       autoRestore: this.autoRestore ? { greenForMs: this.autoRestore.greenSince === null ? 0 : Date.now() - this.autoRestore.greenSince, needMs: READINESS_RESTORE_GREEN_MS } : null,
+      killSwitchActive: riskEngine.isKillSwitchActive(),
+      buysRefusedBy: this.buysRefusedBy(),
     };
+  }
+
+  /** R12-3: see AutoStatus.buysRefusedBy. */
+  private buysRefusedBy(): AutoStatus['buysRefusedBy'] {
+    if (this.mode === 'OFF') return null;
+    if (riskEngine.isKillSwitchActive()) {
+      return { code: 'KILL_SWITCH_ACTIVE', message: `auto is ${this.mode}, but the kill switch is ON: every buy is refused${this.mode === 'SHADOW' ? ' (SHADOW still journals what it would buy)' : ''} until the kill switch is reset. Resetting it does not change the auto mode.` };
+    }
+    const halt = executionCoordinator.getHaltReason();
+    if (halt) return { code: 'TRADING_HALTED', message: `auto is ${this.mode}, but all trading is halted (${halt}): every buy is refused until the halt is cleared` };
+    return null;
   }
 
   /** Drop to SHADOW when any session budget has run out. Called before every decision and status read. */
@@ -631,6 +651,11 @@ export class AutoSnipeController extends EventEmitter {
     }
     if (process.env.AUTO_SNIPE_ENABLED !== 'true') {
       return { ok: false, mode: this.mode, error: 'AUTO_SNIPE_ENABLED is not true: auto trading stays OFF' };
+    }
+    // R12-3: a mode that buys is not set under the risk kill switch, so resetting the switch never starts buying by itself. SHADOW buys
+    // nothing and is allowed; its status says buys are refused by the kill switch (buysRefusedBy).
+    if ((next === 'PAPER' || next === 'DEVNET_LIVE') && riskEngine.isKillSwitchActive()) {
+      return { ok: false, mode: this.mode, error: `KILL_SWITCH_ACTIVE: ${next} is refused while the kill switch is ON. Look at why it was engaged, reset it (RESUME), then set ${next}. SHADOW is allowed meanwhile.` };
     }
     // Q29: never swap the session under a buy in flight; its spend and position belong to the session it started in
     await this.waitInflight('setMode');

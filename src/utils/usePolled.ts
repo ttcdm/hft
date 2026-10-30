@@ -3,11 +3,16 @@ import { authFetch } from '../services/engineClient';
 
 export interface Polled<T> { data: T | null; error: string | null; at: number | null }
 
-/** GET `path` now and every `everyMs` while `enabled`. An error keeps the last good data and says what failed; nothing is invented. */
+const EMPTY: Polled<never> = { data: null, error: null, at: null };
+
+/**
+ * GET `path` now and every `everyMs` while `enabled`. An error keeps the last good data and says what failed; nothing is invented.
+ * R13-6: when it is disabled (logged out, a 401, a closed modal) the data is dropped, so nothing read under an old session stays on screen.
+ */
 export function usePolled<T>(path: string, everyMs: number, enabled = true): Polled<T> {
-  const [state, setState] = useState<Polled<T>>({ data: null, error: null, at: null });
+  const [state, setState] = useState<Polled<T>>(EMPTY);
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled) { setState((s) => (s.data === null && s.error === null && s.at === null ? s : EMPTY)); return; }
     let alive = true;
     const load = async () => {
       try {

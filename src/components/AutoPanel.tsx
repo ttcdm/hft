@@ -329,7 +329,11 @@ export function AutoHeaderBadge() {
   return <AutoModeBadge mode={r.status?.mode ?? null} halted={!!r.status?.haltReason} />;
 }
 
-export function AutoPanel() {
+/**
+ * `killSwitch`: the kill-switch state the header shows (App passes it, R11-3), so the panel and the header say the same thing and both
+ * re-read it right after a PANIC or KILL reply. Without it the panel falls back to the shared mode poller.
+ */
+export function AutoPanel({ killSwitch }: { killSwitch?: boolean | null } = {}) {
   const read = useAutoStatusRead();
   const tradingMode = useTradingMode();
   const status = read.status;
@@ -356,7 +360,7 @@ export function AutoPanel() {
     } finally { setBusy(false); }
   }, [shown]);
   return (
-    <AutoPanelView status={shown} busy={busy} error={error} killReport={killReport} code={code} onCode={setCode} staleText={autoStatusStaleText(read, Date.now())} killSwitch={tradingMode.killSwitch}
+    <AutoPanelView status={shown} busy={busy} error={error} killReport={killReport} code={code} onCode={setCode} staleText={autoStatusStaleText(read, Date.now())} killSwitch={killSwitch !== undefined ? killSwitch : tradingMode.killSwitch}
       onMode={(m) => post('/api/auto/mode', { mode: m, confirmationCode: m === 'DEVNET_LIVE' ? code : undefined })}
       onKill={async () => {
         // Q45: KILL sells every position the auto trader opened, so it asks first. R10-11: in a dialog Enter cannot accept.

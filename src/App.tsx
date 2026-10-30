@@ -14,7 +14,7 @@ import { MemecoinSocialSniperModal } from './components/MemecoinSocialSniperModa
 import { BacktestModal } from './components/BacktestModal';
 import { PlugAndPlayTradingModal } from './components/PlugAndPlayTradingModal';
 import { AuthModal } from './components/AuthModal';
-import { engineClient, getOperatorSessionToken, authFetch } from './services/engineClient';
+import { engineClient, getOperatorSessionToken, authFetch, onKillStateMayHaveChanged } from './services/engineClient';
 import { TokenBoard } from './components/TokenBoard';
 import { CurvePanel } from './components/CurvePanel';
 import { AutoPanel } from './components/AutoPanel';
@@ -250,7 +250,8 @@ export default function App() {
     void readKillState();
     const t = setInterval(() => void readKillState(), 5000);
     const age = setInterval(() => setKillStale(killStateIsStale(killReadRef.current, Date.now())), 1000);
-    return () => { clearInterval(t); clearInterval(age); };
+    const off = onKillStateMayHaveChanged(() => void readKillState()); // R11-3: right after a PANIC / KILL / RESUME reply
+    return () => { clearInterval(t); clearInterval(age); off(); };
   }, [readKillState]);
 
   useEffect(() => {
@@ -353,7 +354,7 @@ export default function App() {
         <PanelErrorBoundary name="Token board"><TokenBoard onSelect={setSelectedMint} selected={selectedMint} /></PanelErrorBoundary>
         <aside className="col-span-12 lg:col-span-4 flex flex-col space-y-5" data-testid="home-side">
           <PanelErrorBoundary name="Curve panel"><CurvePanel mint={selectedMint} /></PanelErrorBoundary>
-          <PanelErrorBoundary name="Auto panel"><AutoPanel /></PanelErrorBoundary>
+          <PanelErrorBoundary name="Auto panel"><AutoPanel killSwitch={isHalted} /></PanelErrorBoundary>
         </aside>
       </main>
 

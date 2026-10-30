@@ -44,7 +44,36 @@ export function isAuthRequired(): boolean {
   return authRequired;
 }
 
+/**
+ * R11-3: requests that can turn the kill switch on or off. When one of them is answered (or fails, since it may still have been applied),
+ * KILL_STATE_EVENT fires and the header and auto panel read the kill state at once instead of showing the old one until their next poll.
+ * The Memecoin console's webhook is here because `/panic_sell` and `/dump_all` run the emergency stop.
+ */
+export const KILL_STATE_EVENT = 'apex:kill-state-changed';
+const KILL_STATE_ROUTES = ['/api/wallet/panic-liquidate', '/api/execution/kill-switch', '/api/auto/kill', '/api/auto/resume', '/api/telegram/webhook'];
+
+export function onKillStateMayHaveChanged(fn: () => void): () => void {
+  if (typeof window === 'undefined') return () => {};
+  window.addEventListener(KILL_STATE_EVENT, fn);
+  return () => window.removeEventListener(KILL_STATE_EVENT, fn);
+}
+
+function announceKillStateMayHaveChanged(urlText: string, init?: RequestInit): void {
+  if ((init?.method || 'GET').toUpperCase() !== 'POST' || typeof window === 'undefined') return;
+  const path = urlText.replace(/^https?:\/\/[^/]+/, '').split('?')[0];
+  if (KILL_STATE_ROUTES.includes(path)) window.dispatchEvent(new CustomEvent(KILL_STATE_EVENT));
+}
+
 export async function authFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  try {
+    return await authFetchInner(input, init);
+  } finally {
+    const urlText = typeof input === 'string' ? input : input instanceof URL ? input.pathname : (input as Request).url;
+    announceKillStateMayHaveChanged(urlText, init);
+  }
+}
+
+async function authFetchInner(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const token = await getOperatorSessionToken();
   const urlText = typeof input === 'string' ? input : input instanceof URL ? input.pathname : (input as Request).url;
   if (authRequired && !token && !urlText.includes('/api/auth')) {

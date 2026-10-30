@@ -26,7 +26,8 @@ describe('V3: board column headers align with their cells', () => {
   const board = read('src/components/TokenBoard.tsx');
   it('left-aligned headers do not also carry text-right (CSS order made the right one win)', () => {
     expect(board).not.toMatch(/\$\{head\} text-left/);
-    expect(board.match(/className=\{headLeft\}/g)?.length).toBe(3);
+    // R11-10 made the watch tab's Reason column a left-aligned text column, so five headers now use headLeft
+    expect(board.match(/className=\{headLeft\}/g)?.length).toBe(5);
   });
 });
 

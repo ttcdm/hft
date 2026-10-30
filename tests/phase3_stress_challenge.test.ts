@@ -468,8 +468,8 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
       const componentPath = path.join(process.cwd(), 'src/components/PumpFunHotCalloutsView.tsx');
       const fileContent = fs.readFileSync(componentPath, 'utf8');
 
-      // Verifies 0.00018 SOL is present
-      expect(fileContent).toContain('0.00018');
+      // R11-8: no client-side tip default at all (the box says "auto" and the server's dynamic tip decides), as tests/phase3_remediation
+      expect(fileContent).not.toMatch(/jitoPriorityTipSol: \d/);
       // Verifies old 0.005 default tip is not present
       expect(fileContent.includes('0.005')).toBe(false);
     });

@@ -4081,9 +4081,11 @@ export class ExecutionCoordinator {
             onChain = totalTokensRaw - sold; // what the row keeps; tokens sent in from outside stay untracked
             this.raiseOperatorAlert('SELL_LANDED_WALLET_TOPPED_UP', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed, but the wallet holds at least as many tokens as before it (tokens were sent in). Booked from the transaction: ${sold} sold.`, positionId);
           } else if (sellBps >= 10_000) {
-            // a full exit sells what the wallet holds (clamped below), so it cannot double-sell a partial; the earlier sell's fill stays unbooked
+            // R13-16: a full exit sells the row's recorded quantity (clamped below only when the wallet holds less, which it does not here), so
+            // it closes the position whatever the earlier sell took; tokens it sells beyond the position's are ones sent in from outside. The
+            // earlier sell's fill stays unbooked.
             this.pendingSells.delete(positionId);
-            this.raiseOperatorAlert('SELL_LANDED_UNBOOKED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed but its fill could not be read and the wallet was topped up since; the full exit sells what the wallet holds. Realized PnL of the earlier sell is not recorded.`, positionId);
+            this.raiseOperatorAlert('SELL_LANDED_UNBOOKED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed but its fill could not be read and the wallet was topped up since; the full exit sells the position's recorded quantity. Realized PnL of the earlier sell is not recorded.`, positionId);
           } else {
             return { success: false, pnlSol: 0, error: `SELL_PENDING_VERIFICATION: sell ${pendingSell.signature.slice(0, 8)} landed but the amount it sold cannot be read yet; not selling again` };
           }
@@ -4455,16 +4457,26 @@ export class ExecutionCoordinator {
       filled.lastUpdatedTimestamp = Date.now();
       filled.exitStage = exitStageAfterFill(reason, filled.exitStage); // in the same write as the fill (R1-91)
 
-      if (sellRecon.isFullyClosed || sellBps >= 10_000) {
+      // R14-2: the row keeps its own quantity less what the chain says was sold. remainingTokensRaw is the WALLET's balance after the sell,
+      // which also counts tokens sent in from outside, so a partial that took it grew the row past what it ever held.
+      const soldRaw = BigInt(sellRecon.actualTokensSoldRaw || '0');
+      const rowLeftRaw = totalTokensRaw - (soldRaw > 0n ? soldRaw : 0n);
+      if (sellRecon.isFullyClosed || sellBps >= 10_000 || rowLeftRaw <= 0n) {
         filled.status = 'CLOSED';
         filled.tokenQuantityRaw = '0';
         filled.costBasisLamports = 0;
       } else {
         filled.status = 'PARTIALLY_CLOSED';
-        filled.tokenQuantityRaw = sellRecon.remainingTokensRaw;
+        filled.tokenQuantityRaw = rowLeftRaw.toString();
         filled.costBasisLamports = Math.round(filled.costBasisLamports * (1 - fraction));
       }
       target.status = filled.status;
+      // R13-16: the position is closed but the wallet still holds some of the token (sent in from outside, or a row that said less than the
+      // wallet). No position watches those tokens now, so say so instead of closing in silence.
+      const walletLeftRaw = BigInt(sellRecon.remainingTokensRaw || '0');
+      const leftoverAlert = filled.status === 'CLOSED' && walletLeftRaw > 0n
+        ? `${target.symbol || target.mint}: the position is closed, but the wallet still holds ${walletLeftRaw} raw of it after the sell (${subRes.signature.slice(0, 8)}). No position covers those tokens, so no stop-loss watches them. Run Reconcile to adopt them for exit monitoring (only a mint this app bought is adopted), or sell them by hand.`
+        : null;
 
       try {
         // S258: the position and its RECONCILED ledger row are one write, so a crash between them cannot leave a booked sell PENDING
@@ -4475,6 +4487,7 @@ export class ExecutionCoordinator {
         return { success: false, pnlSol: 0, error: `SELL_BOOKING_FAILED: ${err?.message ?? err}; the landed sell ${subRes.signature.slice(0, 8)} is booked on the next pass` };
       }
       this.pendingSells.delete(positionId); // R4-7: booked
+      if (leftoverAlert) this.raiseOperatorAlert('TOKENS_LEFT_AFTER_EXIT', leftoverAlert, `leftover-${target.mint}`);
       await this.syncRealWalletBalance();
 
       return {

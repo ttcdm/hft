@@ -622,6 +622,10 @@ export class AutoSnipeController extends EventEmitter {
       await this.waitInflight('setMode(OFF)');
       this.session = null;
       this.downgradeReason = null;
+      // R12-4: the triggers say why the session that just ended was dropped; with auto OFF they no longer apply (System checks kept
+      // showing READINESS_RED). A new PAPER or DEVNET_LIVE session re-checks the loss evidence itself (pendingLossTriggers).
+      this.triggers = [];
+      this.redSince.clear();
       this.emit('mode', { mode: this.mode });
       return { ok: true, mode: this.mode };
     }
@@ -820,7 +824,8 @@ export class AutoSnipeController extends EventEmitter {
     const hits = evaluateKillTriggers(ctx);
     if (hits.length === 0) return [];
 
-    const reason = `kill switch: ${hits.map((h) => `${h.code} (${h.message})`).join('; ')}`;
+    // R12-4: an auto trigger, not the risk kill switch (which this does not set); it read "Dropped to SHADOW: kill switch: READINESS_RED"
+    const reason = `auto trigger: ${hits.map((h) => `${h.code} (${h.message})`).join('; ')}`;
     const from = this.mode;
     this.triggers = hits;
     this.mode = 'SHADOW';

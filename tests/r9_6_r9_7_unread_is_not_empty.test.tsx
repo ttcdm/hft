@@ -61,10 +61,12 @@ describe('R9-7: an old answer stops looking live', () => {
   it('"WS STREAMING" needs a message within WS_QUIET_MS, not only an open socket', () => {
     const c = engineClient as any;
     c.isConnected = true;
+    c.isAuthenticated = true; // R12-8: and the server said AUTHENTICATED on it
     c.lastMessageAt = 10_000;
     expect(engineClient.isWsConnected(10_000 + WS_QUIET_MS - 1)).toBe(true);
     expect(engineClient.isWsConnected(10_000 + WS_QUIET_MS + 1)).toBe(false);
     c.isConnected = false;
+    c.isAuthenticated = false;
   });
 
   it('the read-only strip is amber "LAST KNOWN" once the mode answer is stale', async () => {

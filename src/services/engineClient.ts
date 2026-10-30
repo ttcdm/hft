@@ -19,7 +19,9 @@ export function setOperatorSessionToken(token: string) {
     }
   }
   try {
-    engineClient.authenticate();
+    // R12-8: clearing the token ends the socket's session too (it reconnects unauthenticated); a new token authenticates the open socket
+    if (cachedSessionToken) engineClient.authenticate();
+    else engineClient.dropSession();
   } catch {}
 }
 
@@ -96,6 +98,7 @@ async function authFetchInner(input: RequestInfo | URL, init?: RequestInit): Pro
         authRequired = true;
       }
       cachedSessionToken = null;
+      engineClient.dropSession(); // R12-8: the refused token's socket session ends with it
     } catch {}
   }
   return res;
@@ -116,11 +119,17 @@ export type SniperTradeCallback = (data: any) => void;
 
 export const WS_QUIET_MS = 30_000;
 
+/** R12-8: frames that say nothing about the stream being alive: the server's auth prompts and refusals. */
+const NOT_STREAM_FRAMES = new Set(['AUTH_REQUIRED', 'AUTH_ERROR']);
+
 class EngineClient {
   private ws: WebSocket | null = null;
   private isConnected: boolean = false;
-  /** R9-7: when the socket last delivered a message. Offline, a socket can stay "open" long after nothing arrives. */
+  /** R12-8: the server said AUTHENTICATED on this socket (reset on close and when the session is dropped) */
+  private isAuthenticated = false;
+  /** R9-7: when the socket last delivered a data message. Offline, a socket can stay "open" long after nothing arrives. */
   private lastMessageAt = 0;
+  private wsStateCallbacks: Set<() => void> = new Set();
   private pumpCalloutCallbacks: Set<PumpHotCalloutsCallback> = new Set();
   private calloutSnipedCallbacks: Set<CalloutSnipedCallback> = new Set();
   private memecoinSnapshotCallbacks: Set<MemecoinSnapshotCallback> = new Set();
@@ -131,6 +140,32 @@ class EngineClient {
 
   constructor() {
     this.connectWs();
+    // R9-7: offline, the socket can stay "open" for a long time; say it is down at once, and reconnect when the browser is back
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('offline', () => { this.isConnected = false; this.isAuthenticated = false; this.lastMessageAt = 0; this.notifyWsState(); });
+      window.addEventListener('online', () => { try { this.ws?.close(); } catch {} });
+    }
+  }
+
+  private notifyWsState() {
+    this.wsStateCallbacks.forEach((cb) => { try { cb(); } catch {} });
+  }
+
+  /** R12-8 / R9-7: called whenever the socket's live state may have changed (open, close, auth, a data frame, offline). */
+  public onWsStateChange(cb: () => void): () => void {
+    this.wsStateCallbacks.add(cb);
+    return () => { this.wsStateCallbacks.delete(cb); };
+  }
+
+  /**
+   * R12-8: end the socket's operator session (Clear Token, or a 401 that purged the token). The socket is closed, so the server forgets
+   * its token; it reconnects unauthenticated and authenticates again only once a new token is entered.
+   */
+  public dropSession() {
+    this.isAuthenticated = false;
+    this.lastMessageAt = 0;
+    try { this.ws?.close(); } catch {}
+    this.notifyWsState();
   }
 
   private connectWs() {
@@ -150,9 +185,12 @@ class EngineClient {
       };
 
       this.ws.onmessage = (event) => {
-        this.lastMessageAt = Date.now();
         try {
           const msg = JSON.parse(event.data);
+          // R12-8: only data frames count as the stream being alive; an AUTH_ERROR (refused token) or AUTH_REQUIRED does not
+          if (msg?.type === 'AUTHENTICATED' || msg?.type === 'AUTH_SUCCESS') this.isAuthenticated = true;
+          if (msg?.type === 'AUTH_ERROR' && msg.error === 'INVALID_OPERATOR_TOKEN') this.isAuthenticated = false; // server.ts: AUTH refused
+          if (msg && typeof msg.type === 'string' && !NOT_STREAM_FRAMES.has(msg.type)) { this.lastMessageAt = Date.now(); this.notifyWsState(); }
           if (msg.type === 'PUMP_HOT_CALLOUTS' && msg.data) {
             this.lastPumpCalloutsData = msg.data;
             this.pumpCalloutCallbacks.forEach((cb) => cb(msg.data));
@@ -190,11 +228,14 @@ class EngineClient {
 
       this.ws.onclose = () => {
         this.isConnected = false;
+        this.isAuthenticated = false;
+        this.notifyWsState();
         setTimeout(() => this.connectWs(), 3000);
       };
 
       this.ws.onerror = () => {
         this.isConnected = false;
+        this.notifyWsState();
       };
     } catch {
       this.isConnected = false;
@@ -235,9 +276,13 @@ class EngineClient {
     return () => this.sniperTradeCallbacks.delete(cb);
   }
 
-  /** R9-7: "streaming" means open AND a message arrived in the last WS_QUIET_MS, so a dead link stops reading as live. */
+  /**
+   * R9-7: "streaming" means open AND a data message arrived in the last WS_QUIET_MS, so a dead link stops reading as live. R12-8: and the
+   * socket is authenticated, and the browser is online.
+   */
   public isWsConnected(now = Date.now()): boolean {
-    return this.isConnected && now - this.lastMessageAt < WS_QUIET_MS;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return false;
+    return this.isConnected && this.isAuthenticated && now - this.lastMessageAt < WS_QUIET_MS;
   }
 
   public wsSnipePumpCallout(calloutId: string, amountUsd: number = 5.0, jitoTipSol: number = 0.005, slippagePct: number = 6.0, confirmLive = false) {

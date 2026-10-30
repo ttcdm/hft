@@ -28,6 +28,9 @@ export interface BoardData {
       buySellRatio: number | null; largestBuyerShare: number | null; creatorSold: boolean; passingSignals: number; tradeCount: number;
       netInflowPer10s: number[];
     };
+    /** R11-10: released rows only (absent on an older server): the score at release, the threshold in force now, the READY gate's
+     * answer (null for HOT and DEAD), how old the release is, and the age past which it can no longer be bought. */
+    score?: number | null; threshold?: number; readyGate?: { pass: boolean; reason: string } | null; releasedAgeMs?: number | null; signalLimitMs?: number;
   }>;
   holding: Array<{
     id: string; mint: string; symbol: string; mode: string; entryPriceSol: number | null; markPriceSol: number | null; markAgeMs: number | null; markStale?: boolean;
@@ -89,6 +92,28 @@ const STATE_STYLE: Record<string, string> = {
 };
 
 export const BOARD_STALE_MS = 10_000;
+
+type WatchRow = BoardData['watching'][number];
+/** R11-10: the reason as released, with the threshold in force now beside the one it was released under when they differ. */
+export function liveVerdictReason(w: Pick<WatchRow, 'reason' | 'threshold'>): string {
+  if (!w.reason) return DASH;
+  if (typeof w.threshold !== 'number') return w.reason;
+  return w.reason.replace(/\(threshold (\d+(?:\.\d+)?)\)/, (all, at) => (Number(at) === w.threshold ? all : `(threshold ${at} at release, ${w.threshold} now)`));
+}
+/** R11-10: READY is green only when the READY gate would let it through; a refused READY reads so. */
+const verdictChip = (w: WatchRow): { text: string; style: string } =>
+  w.state === 'READY' && w.readyGate && !w.readyGate.pass ? { text: 'READY (gate refuses)', style: 'bg-amber-900/50 text-amber-200' } : { text: w.state, style: STATE_STYLE[w.state] };
+const verdictGate = (w: WatchRow): string =>
+  w.state === 'READY' ? (w.readyGate ? (w.readyGate.pass ? 'READY gate passes' : `REFUSED: ${w.readyGate.reason}`) : DASH)
+  : w.state === 'HOT' && typeof w.score === 'number' && typeof w.threshold === 'number'
+    ? (w.score >= w.threshold ? 'score at release clears the threshold now' : 'score at release is BELOW the threshold now')
+    : DASH;
+const verdictAge = (w: WatchRow): { text: string; expired: boolean } => {
+  if (w.state === 'WATCHING' || w.releasedAgeMs === undefined) return { text: DASH, expired: false };
+  if (w.releasedAgeMs === null) return { text: 'release time unknown', expired: true };
+  const expired = typeof w.signalLimitMs === 'number' && w.releasedAgeMs > w.signalLimitMs;
+  return { text: `released ${ageText(w.releasedAgeMs)}${expired ? ` (signal expired after ${Math.round((w.signalLimitMs as number) / 1000)}s: no longer buyable)` : ''}`, expired };
+};
 /** R11-11: a launch's price and curve are stale once its last feed trade is older than the coordinator's mark limit, or none was seen. */
 const launchStale = (ageMs: number | null | undefined): boolean => ageMs === null || (typeof ageMs === 'number' && ageMs > MARK_STALE_MS);
 
@@ -148,18 +173,23 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
       )}
       {board && tab === 'watching' && (
         <div className={tableBox}><table className={tableCls}>
-          <thead><tr><th className={headLeft}>Token</th><th className={head}>State</th><th className={head}>Net inflow</th><th className={head}>Buyers</th><th className={head}>Buy:sell</th><th className={head}>Top buyer</th><th className={head}>Creator sold</th></tr></thead>
+          <thead><tr><th className={headLeft}>Token</th><th className={head}>State</th><th className={head} title="Score at release / the confluence threshold in force now">Score / threshold</th><th className={headLeft}>Gate</th><th className={head}>Released</th><th className={head}>Net inflow</th><th className={head}>Buyers</th><th className={head}>Buy:sell</th><th className={head}>Top buyer</th><th className={head}>Creator sold</th><th className={headLeft}>Reason</th></tr></thead>
           <tbody>
-            {board.watching.length === 0 && <tr><td colSpan={7} className="p-6 text-center text-slate-500">Nothing in the watch window.</td></tr>}
+            {board.watching.length === 0 && <tr><td colSpan={11} className="p-6 text-center text-slate-500">Nothing in the watch window.</td></tr>}
             {board.watching.map((w) => (
-              <tr key={w.mint} onClick={() => onSelect?.(w.mint)} className="border-t border-slate-800/60 cursor-pointer hover:bg-slate-900" title={w.reason ?? ''}>
+              <tr key={w.mint} onClick={() => onSelect?.(w.mint)} className="border-t border-slate-800/60 cursor-pointer hover:bg-slate-900">
                 <td className="px-3 py-2 text-left font-mono text-slate-300"><RowSelect mint={w.mint} label={w.mint} onSelect={onSelect} selected={selected === w.mint}>{short(w.mint)}</RowSelect></td>
-                <td className={cell}><span className={`px-1.5 py-0.5 rounded font-bold ${STATE_STYLE[w.state]}`}>{w.state}</span></td>
+                <td className={cell}><span className={`px-1.5 py-0.5 rounded font-bold ${verdictChip(w).style}`}>{verdictChip(w).text}</span></td>
+                <td data-testid="verdict-score" className={cell}>{w.state === 'WATCHING' || w.threshold === undefined ? DASH : `${w.score ?? 'no score'} / ${w.threshold}`}</td>
+                <td data-testid="verdict-gate" className={`px-3 py-2 text-left ${w.readyGate && !w.readyGate.pass ? 'text-amber-300' : 'text-slate-300'}`}>{verdictGate(w)}</td>
+                <td data-testid="verdict-age" className={`${cell} ${verdictAge(w).expired ? 'text-amber-300' : ''}`}>{verdictAge(w).text}</td>
                 <td className={cell}>{w.metrics.tradeCount === 0 ? DASH : `${fmt(w.metrics.cumulativeNetInflowSol, 3)} SOL`}</td>
                 <td className={cell}>{w.metrics.rawUniqueBuyers === 0 ? DASH : `${w.metrics.uniqueBuyers}${w.metrics.funderCoverage < 1 ? '?' : ''}`}</td>
                 <td className={cell}>{fmt(w.metrics.buySellRatio, 2)}</td>
                 <td className={cell}>{w.metrics.largestBuyerShare === null ? DASH : `${(w.metrics.largestBuyerShare * 100).toFixed(1)}%`}</td>
                 <td className={cell}>{w.metrics.tradeCount === 0 ? DASH : w.metrics.creatorSold ? 'YES' : 'no'}</td>
+                {/* R11-10: the reason is text in the row (it was a row tooltip only, which a keyboard cannot reach) */}
+                <td data-testid="verdict-reason" className="px-3 py-2 text-left text-slate-400 whitespace-normal min-w-[16rem]">{liveVerdictReason(w)}</td>
               </tr>
             ))}
           </tbody>

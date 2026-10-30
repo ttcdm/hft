@@ -65,3 +65,12 @@ export function armRefusalText(status: number, data: ArmResponseLite | null | un
   const why = data?.message || data?.error || (data?.reasons?.length ? data.reasons.join('; ') : `the server answered HTTP ${status} with no reason`);
   return `Arming refused: ${why.replace(/\.+$/, '')}. Live trading is NOT armed.`;
 }
+
+/**
+ * R13-7: the Memecoin console commands that run the full emergency stop on the server (socialScanner.processTelegramCommand matches
+ * them by prefix). Matched here without case so a near-miss also asks first.
+ */
+export const isConsoleEmergencyCommand = (text: string): boolean => /^\/(panic_sell|dump_all)/i.test(text.trim());
+
+export const CONSOLE_PANIC_CONFIRM_TEXT = (command: string): string =>
+  `EMERGENCY STOP from the console (${command.trim().split(/\s+/)[0]}): this is the same as PANIC LIQUIDATE. ${PANIC_CONFIRM_TEXT}`;

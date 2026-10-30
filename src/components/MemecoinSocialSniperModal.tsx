@@ -22,7 +22,7 @@ import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { SnipeAmountControl } from './SnipeAmountControl';
 import { mainnetLinksAvailable, isMainnetDataProvenance, sanitizeXProfileUrl, sanitizeTelegramUrl, formatPctChange } from '../utils/tokenLinks';
 import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Send,
   Radio,
@@ -73,7 +73,8 @@ import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExtern
 import { BELOW_HEADER_TOP } from '../utils/headerOffset';
 import { DecimalBox } from './DecimalBox';
 import { DialogFrame, KILL_SWITCH_ID } from './DialogFrame';
-import { confirmLiveClick, confirmSell } from './ConfirmDialog';
+import { askConfirm, confirmLiveClick, confirmSell } from './ConfirmDialog';
+import { CONSOLE_PANIC_CONFIRM_TEXT, isConsoleEmergencyCommand } from '../utils/tradingCopy';
 
 /**
  * P1.4 (N-12): the sniper tab's header. The auto mode shown is the auto controller's own (GET /api/auto/status), read-only: the
@@ -418,9 +419,24 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   };
 
   // Send terminal message
+  // R13-7: /panic_sell and /dump_all run the full emergency stop on the server; they ask first in the in-page confirm (Enter cannot
+  // accept it), and while one is being confirmed or is out, another Enter does not send a second one.
+  const consolePanicBusy = useRef(false);
   const handleSendTerminal = async () => {
     if (!terminalInput.trim()) return;
     const text = terminalInput.trim();
+    if (isConsoleEmergencyCommand(text)) {
+      if (consolePanicBusy.current) return;
+      consolePanicBusy.current = true;
+      try {
+        if (!(await askConfirm({ title: 'EMERGENCY STOP', body: CONSOLE_PANIC_CONFIRM_TEXT(text), confirmLabel: 'Run the emergency stop' }))) return;
+        await sendTerminal(text);
+      } finally { consolePanicBusy.current = false; }
+      return;
+    }
+    await sendTerminal(text);
+  };
+  const sendTerminal = async (text: string) => {
     const nowStr = new Date().toLocaleTimeString();
     
     setTerminalHistory((prev) => [...prev, { sender: 'USER', text, time: nowStr }]);

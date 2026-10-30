@@ -11,6 +11,7 @@ import { executionConfig } from '../server/solana/executionConfig';
 import { walletTrader } from '../server/walletTrader';
 import { PumpCurveService } from '../server/solana/pumpCurve';
 import { EligibilityFilter } from '../server/signals/eligibilityFilter';
+import { stubCleanHolderFacts } from './fixtures/holderFacts';
 import { MockSolanaRpc } from './e2e/helpers/mockRpc';
 import { MockJitoEngine } from './e2e/helpers/mockJito';
 import { TestDatabase } from './e2e/helpers/testDb';
@@ -103,6 +104,7 @@ describe('Plug & Play Workstation: Zero-Config & Out-of-the-Box Readiness', () =
 
       const mockState = createSimulatedBondingCurveState();
       vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockResolvedValue(mockState);
+      stubCleanHolderFacts(); // R12-10: PAPER refuses holder facts it asked for and could not read; this fake chain has no holder endpoints
 
       const res = await coordinator.executeTrade({
         mint: VALID_PUMP_MINT_1.toBase58(),
@@ -124,6 +126,7 @@ describe('Plug & Play Workstation: Zero-Config & Out-of-the-Box Readiness', () =
     it('PP-5: tracks accurate profit, loss, and full position lifecycle in PAPER mode', async () => {
       const mockState = createSimulatedBondingCurveState();
       vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockResolvedValue(mockState);
+      stubCleanHolderFacts(); // R12-10: PAPER refuses holder facts it asked for and could not read; this fake chain has no holder endpoints
 
       // 1. Open paper position
       const buyRes = await coordinator.executeTrade({

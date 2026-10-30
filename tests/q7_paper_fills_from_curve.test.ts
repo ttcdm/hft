@@ -7,6 +7,7 @@ import { workstationDb } from '../server/db/database';
 import { autoSnipeController } from '../server/auto/controller';
 import { createSimulatedBondingCurveState } from './e2e/helpers/simulatedStates';
 import { newPumpPool, setAutoMode, resetAuto } from './fixtures/auto';
+import { stubCleanHolderFacts } from './fixtures/holderFacts';
 
 /**
  * Q7: PAPER fills used the caller's price (a WS pool's came from the create event) and invented fees (1% in, 0.5% concession and 1% out).
@@ -48,6 +49,7 @@ describe('Q7: PAPER fills are priced from the curve', () => {
     const { mint, pool } = newPumpPool('NONE');
     pool.priceNative = 1e-9; // a create-event price far from the curve's: the old fill used this
     vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockImplementation(async (p: any) => curveFor(p.mint.toBase58()));
+    stubCleanHolderFacts(); // R12-10: PAPER refuses holder facts it asked for and could not read; this fake chain has no holder endpoints
 
     const res = await memecoinAggregator.executeSnipe({ contractAddress: mint, amountUsd: 0, amountSolOverride: 0.0055, platform: 'PUMP_FUN', provenance: 'REAL_ONCHAIN', slippagePct: 6 });
     expect(res.success, res.message).toBe(true);
@@ -90,6 +92,7 @@ describe('Q7: PAPER fills are priced from the curve', () => {
   it('a buy larger than the curve can quote is refused, not filled by the model', async () => {
     const { mint } = newPumpPool('NONE');
     vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockImplementation(async (p: any) => ({ ...curveFor(p.mint.toBase58()), virtualSolReserves: 1n, virtualTokenReserves: 1n }));
+    stubCleanHolderFacts(); // R12-10: PAPER refuses holder facts it asked for and could not read; this fake chain has no holder endpoints
     const res = await memecoinAggregator.executeSnipe({ contractAddress: mint, amountUsd: 0, amountSolOverride: 0.0055, platform: 'PUMP_FUN', provenance: 'REAL_ONCHAIN', slippagePct: 6 });
     expect(res.success).toBe(false);
     expect(res.message).toMatch(/PAPER_QUOTE_FAILED|quote/i);

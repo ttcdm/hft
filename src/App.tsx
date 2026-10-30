@@ -164,7 +164,7 @@ export default function App() {
   const [acknowledgedServerAlerts, setAcknowledgedServerAlerts] = useState<Set<string>>(new Set());
   const serverAlerts = serverAlertEvents(readServerAlerts(checksPoll.data), hiddenServerAlerts, acknowledgedServerAlerts);
   const unreadable = isOperatorAuthenticated && checksPoll.error ? [alertsUnreadableEvent(checksPoll.error, checksPoll.at ?? Date.now())] : [];
-  const shownAlerts = [...killSwitchStateAlert(isHalted, haltedSinceAt), ...unreadable, ...serverAlerts, ...alerts];
+  const shownAlerts = [...killSwitchStateAlert(isHalted, haltedSinceAt, { lastKnown: killRead.at === null ? null : killRead.value, lastAt: killRead.at, failed: killRead.failed || (killRead.at !== null && killStale) }), ...unreadable, ...serverAlerts, ...alerts];
   const seenServerAlerts = useRef<Set<string>>(new Set());
   useEffect(() => {
     for (const a of serverAlerts) {

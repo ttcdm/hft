@@ -15,7 +15,7 @@ import { journalEventDetail } from '../utils/exitWatch';
 import { ARMED_MESSAGE, armRefusalText, panicConfirmText, panicOutcome } from '../utils/tradingCopy';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { askConfirm, confirmLiveClick, confirmSell } from './ConfirmDialog';
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { SnipeAmountControl } from './SnipeAmountControl';
 import {
@@ -323,12 +323,19 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
     }
   };
 
+  // R12-6: one PANIC at a time. A second confirmed PANIC sent during a slow first one answered "Attempted: 0" and its reply overwrote
+  // the first one's. The ref blocks a second press at once (state updates land a render later); the state disables and relabels the button.
+  const panicInFlight = useRef(false);
+  const [panicPending, setPanicPending] = useState(false);
   const handlePanicLiquidate = async () => {
+    if (panicInFlight.current) return;
     // R10-11: an in-page dialog, where Enter cannot accept (window.confirm took Enter as yes)
     // R11-7: the confirm names what this screen read as open (count, tokens, modes) and the trading mode
     const body = panicConfirmText(readProblem.positions ? null : positions, tradingMode.label);
-    if (!(await askConfirm({ title: 'PANIC LIQUIDATE', body, confirmLabel: 'Close everything now' }))) return;
+    panicInFlight.current = true;
+    setPanicPending(true);
     try {
+      if (!(await askConfirm({ title: 'PANIC LIQUIDATE', body, confirmLabel: 'Close everything now' }))) return;
       setIsLoading(true);
       const res = await authFetch('/api/wallet/panic-liquidate', { method: 'POST' });
       const data = await res.json().catch(() => ({}));
@@ -339,6 +346,8 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
       setStatusMessage({ text: err.message || 'Panic liquidate failed', type: 'error' });
     } finally {
       setIsLoading(false);
+      panicInFlight.current = false;
+      setPanicPending(false);
     }
   };
 
@@ -770,10 +779,13 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
             <button
               onClick={handlePanicLiquidate}
               data-testid="pnp-panic"
-              className="px-3.5 py-2 rounded-lg bg-rose-950/60 hover:bg-rose-900/80 border border-rose-600/50 text-rose-300 font-bold text-xs flex items-center space-x-1.5"
+              disabled={panicPending}
+              aria-busy={panicPending}
+              title={panicPending ? 'A PANIC is being confirmed or is already out; its reply is shown when it comes back.' : undefined}
+              className="px-3.5 py-2 rounded-lg bg-rose-950/60 hover:bg-rose-900/80 disabled:opacity-60 border border-rose-600/50 text-rose-300 font-bold text-xs flex items-center space-x-1.5"
             >
               <AlertTriangle className="w-3.5 h-3.5" />
-              <span>PANIC LIQUIDATE</span>
+              <span>{panicPending ? 'PANIC IN PROGRESS…' : 'PANIC LIQUIDATE'}</span>
             </button>
 
             {/* Arm / Disarm Live Mode */}

@@ -40,6 +40,7 @@ describe('holder-owner reads fit the RPC plan, and a failed read never makes up 
     const ww = new WatchWindow({ publicFunders: [] });
     const others = Array.from({ length: 11 }, pk);
     others.forEach((o, i) => ww.setFunder(o.toBase58(), `independent-funder-${i}`));
+    others.forEach((_, i) => ww.setNoFunder(`independent-funder-${i}`)); // R13-4: the second hop was looked up too
     const f = quicknodeLike([{ owner: creator, pct: 8 }, ...others.map((owner) => ({ owner, pct: 1 }))]); // the creator's 8% sits in a non-ATA account
     const d = await fetchTokenHolderDistribution(f.conn, pk(), creator, undefined, ww);
     expect(f.calls.every((n) => n <= 5)).toBe(true);

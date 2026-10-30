@@ -86,6 +86,7 @@ describe('R2-3: the holder gate sums the creator\'s funder cluster', () => {
     const ww = new WatchWindow({ publicFunders: [] });
     const owners = Array.from({ length: 20 }, pk);
     owners.forEach((o, i) => ww.setFunder(o.toBase58(), `independent-funder-${i}`));
+    owners.forEach((_, i) => ww.setNoFunder(`independent-funder-${i}`)); // R13-4: the second hop was looked up too
     const d = await fetchTokenHolderDistribution(conn(owners.map((owner) => ({ owner, pct: 1.8 }))), pk(), pk(), undefined, ww);
     expect(d.devHoldingPct).toBe(0);
     expect(d.top10HoldersPct).toBeCloseTo(18, 6);

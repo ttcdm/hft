@@ -81,7 +81,8 @@ function sourcesIn(tx: any, wallet: string): string[] {
  *
  * R2-1 / R8-2: a short history (FUNDER_FULL_HISTORY_MAX signatures or fewer) is read in full and every SOL source in it is reported
  * (`alsoFundedBy`): a decoy's dust sent first no longer hides the creator's transfer behind it, and a fee paid by another wallet ties the two.
- * A longer history is reported `partial`. One more hop (creator -> fresh wallet -> buyer) is still not traced.
+ * A longer history is reported `partial`. The buyer clustering does not trace one more hop (creator -> fresh wallet -> buyer); the holder gate
+ * does (R13-4: the watch window asks for the funders of a looked-up wallet's sources, see holderCluster.ts).
  *
  * The funder is the sender of the first system transfer into the wallet, read from its oldest transaction. A wallet with a full page of
  * history is an established wallet: its first funding is out of reach here and it is reported as its own cluster, not guessed.
@@ -139,9 +140,11 @@ export class FunderLookup {
   /**
    * Ask for a wallet's funder. Cached wallets answer at once; the rest are queued, bounded per mint. B3: a `priority` request (a seller,
    * whose sell may be the creator cluster's) is not held to the per-mint bound and goes to the front of the queue; the queue bound still
-   * applies. Returns false when the request was refused (no answer will come), true when it was answered or is waiting.
+   * applies. R13-4: a `hop` request (the funder of a buyer's source, for the holder gate) is not held to the per-mint bound either (the
+   * watch window bounds it, WATCH_FUNDER_HOP_MAX) and does not use it up, so it never takes a buyer's place; it waits at the back.
+   * Returns false when the request was refused (no answer will come), true when it was answered or is waiting.
    */
-  public request(wallet: string, mint: string, priority = false): boolean {
+  public request(wallet: string, mint: string, priority = false, hop = false): boolean {
     const hit = this.cache.get(wallet);
     if (hit) {
       for (const fn of this.listeners) fn(wallet, hit);
@@ -155,7 +158,7 @@ export class FunderLookup {
       return true;
     }
     const used = this.perMint.get(mint) ?? 0;
-    if (!priority && used >= (this.opts.maxPerMint ?? FUNDER_LOOKUP_MAX_PER_MINT)) return false;
+    if (!priority && !hop && used >= (this.opts.maxPerMint ?? FUNDER_LOOKUP_MAX_PER_MINT)) return false;
     const maxQueue = this.opts.maxQueue ?? FUNDER_LOOKUP_MAX_QUEUE;
     if (this.waitingCount() >= maxQueue) {
       const keep: Job[] = [];
@@ -172,7 +175,7 @@ export class FunderLookup {
         return false;
       }
     }
-    this.perMint.set(mint, used + 1);
+    if (!hop) this.perMint.set(mint, used + 1);
     if (this.perMint.size > 500) this.perMint.delete(this.perMint.keys().next().value as string);
     const job: Job = { wallet, mints: new Set([mint]), attempt: 0 };
     this.queued.set(wallet, job);
@@ -259,7 +262,7 @@ export class FunderLookup {
 export function wireFunderLookup(
   ww: {
     setFunder(w: string, f: string, at?: number, opts?: { alsoFundedBy?: string[]; verified?: boolean }): void; setNoFunder(w: string): void; setFunderUnreadable(w: string): void; isWatching(mint: string): boolean;
-    setFunderRequester(fn: ((wallet: string, mint: string, priority?: boolean) => boolean | void) | null): void;
+    setFunderRequester(fn: ((wallet: string, mint: string, priority?: boolean, hop?: boolean) => boolean | void) | null): void;
   },
   lookup: FunderLookup
 ): void {
@@ -270,5 +273,5 @@ export function wireFunderLookup(
     else if (r.reason !== 'ERROR') ww.setNoFunder(wallet);
     else ww.setFunderUnreadable(wallet);
   });
-  ww.setFunderRequester((wallet, mint, priority) => lookup.request(wallet, mint, priority));
+  ww.setFunderRequester((wallet, mint, priority, hop) => lookup.request(wallet, mint, priority, hop));
 }

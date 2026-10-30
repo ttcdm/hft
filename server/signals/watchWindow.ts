@@ -58,6 +58,12 @@ export const FLOW_MIN_DISTINCT_BUYERS = 5;
  */
 export const WATCH_FUNDER_SAMPLE_BUYERS = 100;
 /**
+ * R13-4: the most second-hop lookups (the funder of a buyer's or seller's SOL source) asked for per watched mint, for the holder gate's
+ * creator -> hop -> holder check (holderCluster.ts). A source past the bound is never looked up, so a holder funded by it reads UNKNOWN.
+ * RPC cost: up to this many more lookups per launch, each at most FUNDER_FULL_HISTORY_MAX + 1 reads (an exchange wallet costs one).
+ */
+export const WATCH_FUNDER_HOP_MAX = 50;
+/**
  * S4d: wallets that fund thousands of unrelated traders (exchange hot wallets, a faucet) and must not make their customers one cluster.
  * EXPLICIT only: an operator-supplied list in APEX_PUBLIC_FUNDERS (comma-separated addresses), empty by default. It is deliberately not
  * inferred from behaviour (for example "funds buyers of 5 mints"), because an attacker can fake any behaviour cheaply and so make their own
@@ -149,6 +155,8 @@ interface Candidate {
   sellersUnreadable: Set<string>;
   /** Wallets whose funder was asked for on this mint's behalf. */
   requested: Set<string>;
+  /** R13-4: SOL sources of those wallets whose own funder was asked for (the second hop), at most WATCH_FUNDER_HOP_MAX. */
+  hopRequested: Set<string>;
   seen: Set<string>;
 }
 
@@ -204,7 +212,7 @@ export class WatchWindow extends EventEmitter {
   private publicFunders: Set<string>;
   /** Wallets whose funder was looked up and does not exist / is out of reach: they count as known, in a cluster of their own. */
   private noFunder = new Set<string>();
-  private requestFunder: ((wallet: string, mint: string, priority?: boolean) => boolean | void) | null = null;
+  private requestFunder: ((wallet: string, mint: string, priority?: boolean, hop?: boolean) => boolean | void) | null = null;
   /** Q6c: launches that were not watched because the window was full. */
   private refusedFull = 0;
   private lastRefusedMint: string | null = null;
@@ -246,6 +254,30 @@ export class WatchWindow extends EventEmitter {
     for (const c of [...this.active.values()]) {
       if (!c.creatorSold && c.sellers.has(wallet) && this.inCreatorCluster(c, wallet)) this.releaseCreatorSold(c, wallet, at);
     }
+    this.askHops(wallet);
+  }
+
+  /**
+   * R13-4: a wallet looked up for a watched mint has its sources' own funders asked for too (one more hop, never further), so the holder
+   * gate can see creator -> hop -> holder. Bounded per mint by WATCH_FUNDER_HOP_MAX; a public funder, an insider, and a wallet already
+   * known or asked for are skipped.
+   */
+  private askHops(wallet: string): void {
+    if (!this.requestFunder) return;
+    for (const c of this.active.values()) {
+      if (!c.requested.has(wallet)) continue; // a hop's own answer does not start a third hop
+      for (const s of this.sourcesOf(wallet)) {
+        if (c.hopRequested.size >= WATCH_FUNDER_HOP_MAX) break;
+        if (this.publicFunders.has(s) || c.insiders.has(s) || c.requested.has(s) || c.hopRequested.has(s) || this.funderFacts(s) !== null) continue;
+        c.hopRequested.add(s);
+        this.requestFunder(s, c.mint, false, true);
+      }
+    }
+  }
+
+  /** S4d: an allowlisted public funder; the holder gate does not trace its funding (holderCluster.ts). */
+  public isPublicFunder(wallet: string): boolean {
+    return this.publicFunders.has(wallet);
   }
 
   /**
@@ -289,9 +321,10 @@ export class WatchWindow extends EventEmitter {
 
   /**
    * Q6b: ask this function for the funder of every new buyer, and (B3) of every seller whose funder is not known, with `priority` true.
+   * R13-4: and of those wallets' SOL sources (the second hop), with `hop` true.
    * The answer comes back through setFunder / setNoFunder (setFunderUnreadable when it failed); a `false` return means it was refused.
    */
-  public setFunderRequester(fn: ((wallet: string, mint: string, priority?: boolean) => boolean | void) | null): void {
+  public setFunderRequester(fn: ((wallet: string, mint: string, priority?: boolean, hop?: boolean) => boolean | void) | null): void {
     this.requestFunder = fn;
   }
 
@@ -346,7 +379,7 @@ export class WatchWindow extends EventEmitter {
     this.active.set(mint, {
       mint, creator, insiders: new Set([creator, ...alsoInsiders].filter((w): w is string => !!w)), registeredAt: now, firstTradeAt: null, buyVolumeByWallet: new Map(),
       sellVolumeSol: 0, tradeCount: 0, creatorSold: false, flow: [], sellers: new Set(), sellersPending: new Set(), sellersUnreadable: new Set(),
-      requested: new Set(), seen: new Set(),
+      requested: new Set(), hopRequested: new Set(), seen: new Set(),
     });
     return true;
   }

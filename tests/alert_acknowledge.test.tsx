@@ -109,7 +109,7 @@ describe('the alert stack offers Acknowledge for exactly those alerts', () => {
   afterEach(() => { for (const c of ['POSITION_GONE', 'EXIT_NO_SIGNER', 'SELL_ADOPTED']) coord.clearOperatorAlert(c, 'pos-ack-ui'); });
 
   it('/api/system/checks marks them acknowledgeable; the stack shows the button for them only, and hides one the server confirmed', () => {
-    expect([...ACKNOWLEDGEABLE_ALERT_CODES].sort()).toEqual(['LEDGER_WRITE_FAILED', 'POSITION_BALANCE_MISSING', 'POSITION_GONE', 'SELL_ADOPTED']);
+    expect([...ACKNOWLEDGEABLE_ALERT_CODES].sort()).toEqual(['BUY_OUTCOME_UNKNOWN', 'LEDGER_WRITE_FAILED', 'POSITION_BALANCE_MISSING', 'POSITION_GONE', 'SELL_ADOPTED', 'TOKENS_LEFT_AFTER_EXIT']);
     coord.raiseOperatorAlert('POSITION_GONE', 'XYZ was recorded open but the wallet holds none of it', 'pos-ack-ui');
     coord.raiseOperatorAlert('EXIT_NO_SIGNER', 'Exit cannot be signed', 'pos-ack-ui');
     const alerts = readServerAlerts(wire(buildSystemChecks())).filter((a) => a.positionId === 'pos-ack-ui');

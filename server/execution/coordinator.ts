@@ -44,7 +44,7 @@ export type CloseOutcome = 'ADOPTED_EARLIER_SELL' | 'ADOPTED_EARLIER_SELL_FILL_U
  * POST /api/system/alerts/acknowledge once it has been looked at. Every other alert clears when its condition does, and cannot be
  * acknowledged away while it still holds.
  */
-export const ACKNOWLEDGEABLE_ALERT_CODES: readonly string[] = ['POSITION_GONE', 'POSITION_BALANCE_MISSING', 'SELL_ADOPTED', 'LEDGER_WRITE_FAILED'];
+export const ACKNOWLEDGEABLE_ALERT_CODES: readonly string[] = ['POSITION_GONE', 'POSITION_BALANCE_MISSING', 'SELL_ADOPTED', 'LEDGER_WRITE_FAILED', 'TOKENS_LEFT_AFTER_EXIT', 'BUY_OUTCOME_UNKNOWN'];
 /** C4: if a direct read still fails after this long, raise an operator alert. */
 export const MARK_ALERT_AFTER_MS = 60_000;
 export const MARK_RETRY_BASE_MS = 60_000;

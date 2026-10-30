@@ -50,6 +50,8 @@ export const OPERATOR_ALERT_LEVELS: Record<string, OperatorAlertLevel> = {
   LEDGER_WRITE_FAILED: 'CRITICAL',
   LATE_BUY_NOT_SOLD: 'CRITICAL',
   UNTRACKED_TOKEN_BALANCE: 'CRITICAL',
+  TOKENS_LEFT_AFTER_EXIT: 'CRITICAL', // R14-2/R13-16: a full exit left tokens in the wallet; acknowledged by the operator
+  BUY_OUTCOME_UNKNOWN: 'CRITICAL', // R14-10: a LIVE buy threw after its send began with the ledger unreadable; acknowledged by the operator
   // raised by other batches (C1, C2, D): listed here so they stay CRITICAL by name, not only by the unknown-code default
   RPC_AUTH_REJECTED: 'CRITICAL',
   EXIT_LOOP_FAILING: 'CRITICAL',

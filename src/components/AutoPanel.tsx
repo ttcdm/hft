@@ -6,6 +6,7 @@ import { onAuthenticated } from '../utils/authEvents';
 import { useTradingMode } from '../utils/tradingMode';
 import { parseDecimalText, COMMA_DECIMAL_REASON } from '../utils/numberInput';
 import { askConfirm } from './ConfirmDialog';
+import { killAutoConfirmText } from '../utils/tradingCopy';
 
 /** H3: the auto-snipe controller panel. Every number is read from GET /api/auto/status (controller state + decision journal). */
 export type AutoMode = 'OFF' | 'SHADOW' | 'PAPER' | 'DEVNET_LIVE';
@@ -379,7 +380,8 @@ export function AutoPanel({ killSwitch }: { killSwitch?: boolean | null } = {}) 
       onMode={(m) => post('/api/auto/mode', { mode: m, confirmationCode: m === 'DEVNET_LIVE' ? code : undefined })}
       onKill={async () => {
         // Q45: KILL sells every position the auto trader opened, so it asks first. R10-11: in a dialog Enter cannot accept.
-        if (!(await askConfirm({ title: 'KILL AUTO', body: 'KILL AUTO: switch auto to OFF and sell every position it bought. Continue?', confirmLabel: 'Kill auto and sell' }))) return;
+        // R11-7: the confirm names the auto mode and how many open positions the auto journal counts
+        if (!(await askConfirm({ title: 'KILL AUTO', body: killAutoConfirmText(shown ? { mode: shown.mode, openAutoPositions: shown.stats?.open, statsMode: shown.stats?.mode } : null), confirmLabel: 'Kill auto and sell' }))) return;
         void post('/api/auto/kill', { exitAll: true, reason: 'operator kill from panel' });
       }}
       onResume={() => post('/api/auto/resume', { clearHalt: true })}

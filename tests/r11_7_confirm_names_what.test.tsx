@@ -50,4 +50,14 @@ describe('R11-7: PANIC and KILL AUTO confirms name what they sell', () => {
     await click(document.querySelector('[data-testid="confirm-cancel"]'));
   });
 
+  it('KILL AUTO names the auto mode and the open count, and that manual positions stay', async () => {
+    await renderApp();
+    await flush(5);
+    await click(document.querySelector('[data-testid="auto-kill"]'));
+    const body = dialogBody();
+    expect(body).toMatch(/Auto mode now: PAPER/);
+    expect(body).toMatch(/counts 2 open positions it bought/);
+    expect(body).toMatch(/opened by hand are NOT sold/);
+    await click(document.querySelector('[data-testid="confirm-cancel"]'));
+  });
 });

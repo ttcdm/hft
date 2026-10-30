@@ -285,8 +285,11 @@ export function asAutoStatus(x: unknown): AutoStatusData | null {
 export interface AutoStatusRead { status: AutoStatusData | null; at: number | null; error: string | null }
 export const AUTO_STATUS_STALE_MS = 15_000;
 
-export function useAutoStatusRead(): AutoStatusRead {
+/** `reload` reads the status at once (R12-7: after a save whose outcome is not known). */
+export function useAutoStatusRead(): AutoStatusRead & { reload: () => void } {
   const [read, setRead] = useState<AutoStatusRead>({ status: null, at: null, error: null });
+  const reloadRef = React.useRef<() => void>(() => {});
+  const reload = useCallback(() => reloadRef.current(), []);
   useEffect(() => {
     let alive = true;
     const load = async () => {
@@ -302,12 +305,13 @@ export function useAutoStatusRead(): AutoStatusRead {
         if (alive) setRead((p) => ({ ...p, error: `server not reachable (${e?.message || 'network error'})` }));
       }
     };
+    reloadRef.current = () => { void load(); };
     load();
     const t = setInterval(load, 4000);
     const off = onAuthenticated(load); // UI-5
-    return () => { alive = false; clearInterval(t); off(); };
+    return () => { alive = false; reloadRef.current = () => {}; clearInterval(t); off(); };
   }, []);
-  return read;
+  return { ...read, reload };
 }
 
 export function useAutoStatus(): AutoStatusData | null {
@@ -344,6 +348,7 @@ export function AutoPanel({ killSwitch }: { killSwitch?: boolean | null } = {}) 
   useEffect(() => { setLocal(null); }, [status]);
   const [error, setError] = useState<string | null>(null);
   const [killReport, setKillReport] = useState<KillReport | null>(null);
+  const reloadStatus = read.reload;
   const post = useCallback(async (path: string, body: unknown) => {
     setBusy(true);
     setError(null);
@@ -351,14 +356,20 @@ export function AutoPanel({ killSwitch }: { killSwitch?: boolean | null } = {}) 
       const r = await authFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       const j = await r.json().catch(() => null);
       if (path === '/api/auto/kill') setKillReport(killReportFor(j));
-      // R31: a refusal (400/403/409/429) carries its reason in the body; show it instead of dropping it
-      if (!r.ok) setError(`${j?.error || j?.message || 'Request refused'} (HTTP ${r.status})`);
+      // R31: a refusal (400/403/409/429) carries its reason in the body; show it instead of dropping it.
+      // R12-7: a non-2xx with no reason in it (a proxy's bodiless or HTML 502/504) is not a refusal from the server: the request may
+      // have been applied. Say the outcome is unknown and read the status again.
+      const reason = j && typeof j === 'object' ? (j.error || j.message) : null;
+      if (!r.ok && reason) setError(`${reason} (HTTP ${r.status})`);
+      else if (!r.ok) { setError(`No readable answer from the server (HTTP ${r.status}): the change may or may not have been applied. Reading the status again; check it before you retry.`); reloadStatus(); }
       const next = asAutoStatus(j?.status);
       if (next && shown?.stats) setLocal({ ...next, stats: shown.stats });
     } catch (e: any) {
-      setError(`Could not reach the server (${e?.message || 'network error'}). Nothing was changed as far as the panel knows; check the status above.`);
+      // the request may have reached the server before the connection failed (R12-7)
+      setError(`Could not reach the server (${e?.message || 'network error'}). The change may or may not have been applied; reading the status again, check it before you retry.`);
+      reloadStatus();
     } finally { setBusy(false); }
-  }, [shown]);
+  }, [shown, reloadStatus]);
   return (
     <AutoPanelView status={shown} busy={busy} error={error} killReport={killReport} code={code} onCode={setCode} staleText={autoStatusStaleText(read, Date.now())} killSwitch={killSwitch !== undefined ? killSwitch : tradingMode.killSwitch}
       onMode={(m) => post('/api/auto/mode', { mode: m, confirmationCode: m === 'DEVNET_LIVE' ? code : undefined })}

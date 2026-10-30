@@ -117,8 +117,10 @@ const verdictAge = (w: WatchRow): { text: string; expired: boolean } => {
 /** R11-11: a launch's price and curve are stale once its last feed trade is older than the coordinator's mark limit, or none was seen. */
 const launchStale = (ageMs: number | null | undefined): boolean => ageMs === null || (typeof ageMs === 'number' && ageMs > MARK_STALE_MS);
 
-export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }: {
+export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs, unreadable = false }: {
   ageMs?: number | null;
+  /** R12-11: the last reply could not be read; the rows below (if any) are from the last good read */
+  unreadable?: boolean;
   board: BoardData | null; tab: 'launches' | 'watching' | 'holding'; onTab: (t: 'launches' | 'watching' | 'holding') => void;
   onSelect?: (mint: string) => void; selected?: string | null;
 }) {
@@ -144,7 +146,12 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
           </span>
         )}
       </div>
-      {!board && <div className="p-6 text-sm text-slate-500">Loading… (sign in as operator to read the board)</div>}
+      {unreadable && (
+        <div data-testid="board-unreadable" role="status" className="px-4 py-2 text-xs text-amber-200 bg-amber-950/40 border-b border-amber-500/40">
+          Board reply unreadable: the server answered with data the board cannot read.{board ? ' The rows below are from the last good read.' : ' Nothing is shown rather than a guess.'}
+        </div>
+      )}
+      {!board && !unreadable && <div className="p-6 text-sm text-slate-500">Loading… (sign in as operator to read the board)</div>}
       {board && tab === 'launches' && (
         <div className={tableBox}><table className={tableCls}>
           <thead><tr><th className={headLeft}>Token</th><th className={head}>Price (SOL)</th><th className={head}>Curve</th><th className={head} title="Share of the tokens OFF the bonding curve held by the 10 largest holders. The holder gate uses share of total supply, a different figure.">Top10 % (off-curve)</th><th className={head}>Creator %</th><th className={head} title="Time since the launch entered the watch window; — when it is not being watched">Age</th></tr></thead>
@@ -220,8 +227,22 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
   );
 }
 
+const isObj = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v);
+/**
+ * R12-11: a malformed /api/board (a string where a list goes, a row without its metrics) turned the board into a column of raw JS
+ * errors. A reply is used only when it has the shape the board renders; otherwise the board says the reply is unreadable.
+ */
+export function isBoardData(v: unknown): v is BoardData {
+  if (!isObj(v) || !isObj(v.wallet) || typeof v.executionMode !== 'string') return false;
+  if (!Array.isArray(v.launches) || !Array.isArray(v.watching) || !Array.isArray(v.holding)) return false;
+  return v.launches.every((l: unknown) => isObj(l) && typeof l.mint === 'string')
+    && v.watching.every((w: unknown) => isObj(w) && typeof w.mint === 'string' && typeof w.state === 'string' && isObj(w.metrics))
+    && v.holding.every((h: unknown) => isObj(h) && typeof h.id === 'string' && typeof h.mint === 'string');
+}
+
 export function TokenBoard({ onSelect, selected }: { onSelect?: (mint: string) => void; selected?: string | null }) {
   const [board, setBoard] = useState<BoardData | null>(null);
+  const [unreadable, setUnreadable] = useState(false);
   const [tab, setTab] = useState<'launches' | 'watching' | 'holding'>('launches');
   const [lastOkAt, setLastOkAt] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -230,7 +251,10 @@ export function TokenBoard({ onSelect, selected }: { onSelect?: (mint: string) =
     const load = async () => {
       try {
         const r = await authFetch('/api/board');
-        if (r.ok && alive) { setBoard(await r.json()); setLastOkAt(Date.now()); }
+        if (!r.ok || !alive) return;
+        const j = await r.json().catch(() => null);
+        if (!alive) return;
+        if (isBoardData(j)) { setBoard(j); setLastOkAt(Date.now()); setUnreadable(false); } else setUnreadable(true);
       } catch { /* offline: keep the last board; its age keeps growing and shows */ }
     };
     load();
@@ -242,7 +266,7 @@ export function TokenBoard({ onSelect, selected }: { onSelect?: (mint: string) =
   return (
     <>
       {board && <WalletStrip wallet={board.wallet} mode={board.executionMode} />}
-      <TokenBoardView board={board} tab={tab} onTab={setTab} onSelect={onSelect} selected={selected} ageMs={lastOkAt === null ? null : Math.max(0, now - lastOkAt)} />
+      <TokenBoardView board={board} tab={tab} onTab={setTab} onSelect={onSelect} selected={selected} ageMs={lastOkAt === null ? null : Math.max(0, now - lastOkAt)} unreadable={unreadable} />
     </>
   );
 }

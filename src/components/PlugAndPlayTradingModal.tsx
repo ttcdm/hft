@@ -153,20 +153,28 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
       appliedSeq.current = seq;
       const next: ReadProblems = { diag: null, positions: null, events: null };
 
+      // R12-11: a 200 whose body is not what the panel reads (bad JSON, a null or missing list, a list of non-objects) is "reply
+      // unreadable", never an empty list or a PAPER answer. The last good data stays, marked as from an earlier read.
+      const UNREADABLE = 'reply unreadable';
+      const body = async (r: Response): Promise<any> => r.json().catch(() => null);
+      const rows = (v: unknown): any[] | null => (Array.isArray(v) && v.every((x) => x && typeof x === 'object' && !Array.isArray(x)) ? v : null);
+
       if (diagRes.ok) {
-        const dJson = await diagRes.json();
-        setSystemAudit(dJson.systemAudit);
-        setRiskControls(dJson.riskControls);
+        const dJson = await body(diagRes);
+        if (dJson && typeof dJson.systemAudit === 'object' && dJson.systemAudit !== null) {
+          setSystemAudit(dJson.systemAudit);
+          setRiskControls(dJson.riskControls && typeof dJson.riskControls === 'object' ? dJson.riskControls : null);
+        } else next.diag = `${UNREADABLE} (no systemAudit)`;
       } else next.diag = `HTTP ${diagRes.status}`;
 
       if (posRes.ok) {
-        const pJson = await posRes.json();
-        setPositions(pJson.positions || []);
+        const list = rows((await body(posRes))?.positions);
+        if (list) setPositions(list); else next.positions = `${UNREADABLE} (no positions list)`;
       } else next.positions = `HTTP ${posRes.status}`;
 
       if (evRes.ok) {
-        const eJson = await evRes.json();
-        setEvents(eJson.events || []);
+        const list = rows((await body(evRes))?.events);
+        if (list) setEvents(list); else next.events = `${UNREADABLE} (no events list)`;
       } else next.events = `HTTP ${evRes.status}`;
       setReadProblem(next);
     } catch (err: any) {
@@ -500,7 +508,8 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                 : 'border-transparent text-slate-400 hover:text-slate-200'
             }`}
           >
-            Open Positions ({positions.filter((p) => p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED').length})
+            {/* R12-11 / R9-6: an unread list has no count; "(0)" would read as nothing open */}
+            Open Positions ({readProblem.positions && positions.length === 0 ? '?' : positions.filter((p) => p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED').length})
           </button>
           <button
             onClick={() => setActiveTab('RISK_LOGS')}

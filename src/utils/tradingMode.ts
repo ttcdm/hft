@@ -28,6 +28,23 @@ export interface TradingModeInfo {
   ageMs: number | null;
   /** UI report fix 7: true when the server's kill switch is on (every order is refused); null when unknown or stale */
   killSwitch: boolean | null;
+  /** R12-11: why the mode is unknown although the server answered (its reply could not be read); absent otherwise */
+  problem?: string;
+}
+
+/**
+ * R12-11: a reply whose mode fields are there but of the wrong type (null, a number) is unreadable, never PAPER: `mode: null,
+ * isLiveArmed: null` used to read as PAPER in the top bar. A field the server leaves out keeps its old meaning (not armed).
+ */
+function auditProblem(audit: unknown): string | null {
+  if (!audit || typeof audit !== 'object' || Array.isArray(audit)) return 'the server reply is unreadable (no systemAudit object)';
+  const a = audit as Record<string, unknown>;
+  const bad = [
+    'mode' in a && typeof a.mode !== 'string' ? 'mode' : null,
+    'isLiveArmed' in a && typeof a.isLiveArmed !== 'boolean' ? 'isLiveArmed' : null,
+    'killSwitchActive' in a && typeof a.killSwitchActive !== 'boolean' ? 'killSwitchActive' : null,
+  ].filter((x): x is string => x !== null);
+  return bad.length ? `the server reply is unreadable (${bad.join(', ')} not readable)` : null;
 }
 
 export const MODE_STALE_MS = 15_000;
@@ -46,6 +63,8 @@ export function describeTradingMode(audit: SystemAuditLite | null | undefined, f
     return { known: false, stale: false, live: false, label: 'MODE UNKNOWN', cluster: null, readOnly: false, rpcHost: null, ageMs: null, killSwitch: null };
   }
   const ageMs = Math.max(0, now - fetchedAt);
+  const problem = auditProblem(audit);
+  if (problem) return { known: false, stale: false, live: false, label: 'MODE UNKNOWN', cluster: null, readOnly: false, rpcHost: null, ageMs, killSwitch: null, problem };
   const stale = ageMs > MODE_STALE_MS;
   const armed = audit.isLiveArmed === true;
   const mode = String(audit.mode ?? '').toUpperCase();
@@ -65,7 +84,7 @@ async function poll(): Promise<void> {
     const r = await authFetch('/api/diagnostics/system');
     if (!r.ok) return;
     const j = await r.json();
-    if (j?.systemAudit) {
+    if (j && typeof j === 'object' && 'systemAudit' in j) {
       latest = { audit: j.systemAudit, at: Date.now() };
       subscribers.forEach((fn) => fn());
     }

@@ -176,6 +176,14 @@ async function run(info: { url: string; genesisHash: string }) {
         const r = await holderLookup.lookup(w.publicKey.toBase58());
         if (r.funder) watchWindow.setFunder(w.publicKey.toBase58(), r.funder, Date.now(), { alsoFundedBy: r.alsoFundedBy, verified: !r.partial });
         else rec(`${symbol} market setup: funder of holder ${i + 1} read`, false, `${r.reason}${r.reason === 'ERROR' ? ` ${r.error}` : ''}`);
+        // R13-4: the second hop too (the funder's own funding, the local faucet's airdrop), as the app's watch window now asks for it;
+        // a hop never looked up makes the holder UNKNOWN, and (R13-3) UNKNOWN counts against the creator cap
+        for (const src of r.funder ? [r.funder, ...(r.alsoFundedBy ?? [])] : []) {
+          const h = await holderLookup.lookup(src);
+          if (h.funder) watchWindow.setFunder(src, h.funder, Date.now(), { alsoFundedBy: h.alsoFundedBy, verified: !h.partial });
+          else if (h.reason !== 'ERROR') watchWindow.setNoFunder(src);
+          else rec(`${symbol} market setup: second hop of holder ${i + 1} read`, false, h.error);
+        }
       }
       return c;
     };

@@ -164,9 +164,12 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
     : lastRead?.ok
       ? `The breaker opened after failed wallet-balance reads; the latest read succeeded ${sec(now - lastRead.at)} ago, so resetting the kill switch closes it. `
       : `The breaker opened after failed wallet-balance reads and the latest read ${lastRead ? `failed ${sec(now - lastRead.at)} ago` : 'has not happened'}; it stays open until a read succeeds and the kill switch is reset. `;
+  // R11-2: after KILL AUTO this row said OK "no auto kill trigger set" while auto was killed. The auto kill latch is its own fact: auto stays
+  // OFF until an operator sets a mode, whatever the risk kill switch says.
+  const autoKillNote = auto.killed ? `AUTO KILLED: ${auto.killReason ?? 'no reason saved'}; auto stays OFF until an operator sets a mode. ` : '';
   checks.push({
-    id: 'killswitch', label: 'Kill switch / circuit breaker', status: riskEngine.isKillSwitchActive() ? 'FAIL' : breakerOpen ? 'FAIL' : 'OK',
-    value: `kill switch ${riskEngine.isKillSwitchActive() ? 'ON' : 'off'}, breaker ${riskEngine.getCircuitBreakerState()}`, detail: `${breakerNote}${triggerNote}`,
+    id: 'killswitch', label: 'Kill switch / circuit breaker', status: riskEngine.isKillSwitchActive() ? 'FAIL' : breakerOpen ? 'FAIL' : auto.killed ? 'WARN' : 'OK',
+    value: `kill switch ${riskEngine.isKillSwitchActive() ? 'ON' : 'off'}, breaker ${riskEngine.getCircuitBreakerState()}${auto.killed ? ', auto KILLED' : ''}`, detail: `${breakerNote}${autoKillNote}${triggerNote}`,
   });
 
   const feedOk = feed.status === 'ACTIVE';

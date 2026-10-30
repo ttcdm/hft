@@ -12,7 +12,7 @@
 import { probeLatency } from '../utils/probeBadge';
 import { sellConfirmText } from '../utils/sellConfirm';
 import { journalEventDetail } from '../utils/exitWatch';
-import { ARMED_MESSAGE, PANIC_CONFIRM_TEXT, armRefusalText, panicOutcome } from '../utils/tradingCopy';
+import { ARMED_MESSAGE, armRefusalText, panicConfirmText, panicOutcome } from '../utils/tradingCopy';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { askConfirm, confirmLiveClick, confirmSell } from './ConfirmDialog';
 import React, { useState, useEffect } from 'react';
@@ -325,7 +325,9 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
 
   const handlePanicLiquidate = async () => {
     // R10-11: an in-page dialog, where Enter cannot accept (window.confirm took Enter as yes)
-    if (!(await askConfirm({ title: 'PANIC LIQUIDATE', body: PANIC_CONFIRM_TEXT, confirmLabel: 'Close everything now' }))) return;
+    // R11-7: the confirm names what this screen read as open (count, tokens, modes) and the trading mode
+    const body = panicConfirmText(readProblem.positions ? null : positions, tradingMode.label);
+    if (!(await askConfirm({ title: 'PANIC LIQUIDATE', body, confirmLabel: 'Close everything now' }))) return;
     try {
       setIsLoading(true);
       const res = await authFetch('/api/wallet/panic-liquidate', { method: 'POST' });

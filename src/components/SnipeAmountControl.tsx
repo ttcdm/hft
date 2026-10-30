@@ -1,5 +1,5 @@
 import React from 'react';
-import { useSnipeAmount, formatUsdEquivalent, type SnipeAmountState } from '../utils/snipeAmount';
+import { useSnipeAmount, formatUsdEquivalent, paperCeilingNote, type SnipeAmountState } from '../utils/snipeAmount';
 
 /** S181: the one snipe amount field. Shown wherever a manual snipe button lives; they all read the same saved value. */
 export function SnipeAmountView({ state, compact = false }: { state: Pick<SnipeAmountState, 'text' | 'setText' | 'limits' | 'parsed'>; compact?: boolean }) {
@@ -19,6 +19,11 @@ export function SnipeAmountView({ state, compact = false }: { state: Pick<SnipeA
       <span className="text-slate-400" data-testid="snipe-amount-usd">{parsed.ok ? formatUsdEquivalent(parsed.sol, limits.solPriceUsd) : ''}</span>
       {!compact && <span className="text-slate-600">min {limits.minSol} / max {limits.maxSol} SOL</span>}
       {!parsed.ok && <span className="text-rose-400" data-testid="snipe-amount-error">{parsed.reason}</span>}
+      {(() => {
+        // R12-9: the PAPER ceiling the server enforces now, below MAX_POSITION_SIZE_SOL
+        const note = paperCeilingNote(parsed.ok ? parsed.sol : null, limits);
+        return note && (note.over || !compact) ? <span data-testid="snipe-amount-paper-ceiling" className={note.over ? 'text-amber-300' : 'text-slate-500'}>{note.text}</span> : null;
+      })()}
     </div>
   );
 }

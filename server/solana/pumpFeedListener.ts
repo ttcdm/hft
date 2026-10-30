@@ -5,6 +5,7 @@ import { PUMP_FUN_PROGRAM_ID } from './programs';
 import { Logger } from '../middleware/enterprise';
 import { executionCoordinator } from '../execution/coordinator';
 import { createTradingConnection } from './rpcConnection';
+import { isClusterMismatch } from './clusterGuard';
 import { curveVelocityEvaluator } from '../signals/curveVelocityEvaluator';
 import { creatorRiskScorer } from '../signals/creatorRiskScorer';
 
@@ -119,6 +120,10 @@ export interface PumpCreateEvent {
 
 export interface PumpFeedListenerTelemetry {
   status: 'ACTIVE' | 'CONNECTING' | 'RECONNECTING' | 'DISCONNECTED' | 'ERROR';
+  /** R14-11: why the feed is ERROR because its RPC is on another cluster (logs are dropped), else null. */
+  clusterMismatch: string | null;
+  /** R14-11: logs dropped because the RPC is on another cluster. */
+  clusterRefused: number;
   subscriptionId: number | null;
   eventsReceived: number;
   /** S185: logs whose handler threw (counted, then skipped), and the slowest handler seen. A feed that cannot keep up shows here. */
@@ -571,6 +576,9 @@ export class PumpFeedListener extends EventEmitter {
         PUMP_FUN_PROGRAM_ID,
         (logs: Logs, ctx: Context) => {
           this.eventsReceived++;
+          // R14-11: an RPC the cluster check found on another cluster (a mainnet node whose URL does not say so) feeds no launch or trade
+          // into the watch window, the board or PAPER fills; the feed reports ERROR (getTelemetry, isActive) until the check passes again.
+          if (this.clusterMismatch()) { this.clusterRefused++; return; }
           this.delivered();
           this.logsConfirmed = true; // a log on it is the best confirmation there is
           if (this.gapReason === 'ENDPOINT_SWITCH' || this.gapReason === 'NO_DELIVERY') this.closeGap(); // the new subscription is delivering
@@ -903,7 +911,17 @@ export class PumpFeedListener extends EventEmitter {
   }
 
   public isActive(): boolean {
-    return this.status === 'ACTIVE' && this.subscriptionId !== null;
+    return this.status === 'ACTIVE' && this.subscriptionId !== null && !this.clusterMismatch();
+  }
+
+  /** R14-11: logs dropped because the RPC is on another cluster. */
+  private clusterRefused = 0;
+
+  /** R14-11: the coordinator's cluster check (its heartbeat re-reads the genesis hash) says the RPC this feed follows is on another cluster. */
+  private clusterMismatch(): string | null {
+    let problem: string | null;
+    try { problem = executionCoordinator.getClusterStatus().problem; } catch { return null; }
+    return isClusterMismatch(problem) ? problem : null;
   }
 
   public getLastEventTimestamp(): number {
@@ -912,8 +930,11 @@ export class PumpFeedListener extends EventEmitter {
 
   public getTelemetry(): PumpFeedListenerTelemetry {
     const now = Date.now();
+    const mismatch = this.clusterMismatch();
     return {
-      status: this.status,
+      status: mismatch ? 'ERROR' : this.status,
+      clusterMismatch: mismatch,
+      clusterRefused: this.clusterRefused,
       subscriptionId: this.subscriptionId,
       eventsReceived: this.eventsReceived,
       handlerErrors: this.handlerErrors,

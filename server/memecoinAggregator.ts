@@ -19,6 +19,7 @@ import { curveVelocityEvaluator } from './signals/curveVelocityEvaluator';
 import { checkSnipeAmountSol } from './execution/snipeAmount';
 import { lossTriggerHits, LOSS_TRIGGER_ACK_SETTING, LOSS_TRIGGER_TRADES } from './auto/killSwitch';
 import { Logger } from './middleware/enterprise';
+import { isClusterMismatch } from './solana/clusterGuard';
 
 const INITIAL_POOLS: MemecoinPool[] = [
   {
@@ -173,6 +174,8 @@ export class MemecoinAggregatorService extends EventEmitter {
    */
   public async verifyPoolAuthorities(now = Date.now()): Promise<number> {
     if (this.authorityInflight || now < this.authorityBackoffUntil) return 0;
+    // R14-11: an RPC on another cluster would "verify" authorities from that cluster's accounts
+    if (isClusterMismatch(executionCoordinator.getClusterStatus().problem)) return 0;
     const due = this.pools
       .filter((p) => p.authoritiesVerified === false && (this.authorityRetryAt.get(p.contractAddress) ?? 0) <= now)
       .slice(0, 100);
@@ -590,8 +593,12 @@ export class MemecoinAggregatorService extends EventEmitter {
     // R5-40: the curve read below comes first in this path. On an RPC the
     // heartbeat found on another cluster (a new ledger behind the same URL) that read fails as a lagging slot or a missing curve, which
     // hid the real reason the coordinator gave before (CLUSTER_GUARD). Refuse with it here, before anything is read.
+    // R14-11: PAPER and SHADOW too, once the RPC is known to be on another cluster: their fills and verdicts would be another cluster's data.
+    const clusterProblem = executionCoordinator.getClusterStatus().problem;
+    if (executionMode !== 'LIVE' && isClusterMismatch(clusterProblem)) {
+      return { success: false, message: `CLUSTER_GUARD: the RPC is on another cluster (${String(clusterProblem).replace(/^CLUSTER_GUARD: /, '')}); PAPER and SHADOW do not trade on its data; nothing was read`, txHash: '' };
+    }
     if (executionMode === 'LIVE') {
-      const clusterProblem = executionCoordinator.getClusterStatus().problem;
       if (clusterProblem) return { success: false, message: `CLUSTER_GUARD: the RPC is not on the allowed cluster (${clusterProblem.replace(/^CLUSTER_GUARD: /, '')}); nothing was read or sent`, txHash: '' };
     }
     // C3: LIVE needs a fresh SOL/USD price (fail closed). PAPER may use the last known one, but not none.

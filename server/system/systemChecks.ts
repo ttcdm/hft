@@ -174,7 +174,9 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
 
   const feedOk = feed.status === 'ACTIVE';
   const feedAge = feed.lastEventAgeMs >= 0 ? feed.lastEventAgeMs : null;
-  checks.push({
+  // R14-11: a feed whose RPC is on another cluster drops every log; say so instead of "a quiet devnet is normal"
+  if (feed.clusterMismatch) checks.push({ id: 'feed', label: 'Pump.fun event feed', status: 'FAIL', value: `ERROR: RPC on another cluster, ${feed.clusterRefused} log(s) dropped`, detail: `${feed.clusterMismatch}. Launches and trades from this RPC are not watched, shown or paper-filled until the cluster check passes.` });
+  else checks.push({
     id: 'feed', label: 'Pump.fun event feed', status: !feedOk ? 'WARN' : feedAge === null ? 'WARN' : feedAge > 120_000 ? 'WARN' : 'OK',
     value: `${feed.status}, last event ${ago(feedAge)}`, detail: `${feed.eventsReceived} logs received, ${feed.eventsParsed} creates and ${feed.tradesParsed} trades parsed. A quiet devnet is normal; on mainnet this is a warning.`,
   });

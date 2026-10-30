@@ -53,6 +53,9 @@ export default function App() {
   const [killRead, setKillRead] = useState<KillStateRead>({ value: null, at: null, failed: false });
   const [killStale, setKillStale] = useState(true);
   const isHalted = shownKillState(killRead, killStale);
+  // R12-2: a kill-switch POST whose answer was lost or refused. Its alert says the state is not known and leaves at the first good read
+  // of the state after the failure (the header then shows what the server holds); it never tells the operator to retry.
+  const [killUnconfirmed, setKillUnconfirmed] = useState<{ at: number; why: string } | null>(null);
   // R9-1: when the switch was last seen turning on (by this button or the poll), so a double tap does not resume trading.
   // R13-5: an unknown read does not reset it; only the server saying OFF does.
   const haltedSince = useRef<number | null>(null);
@@ -164,7 +167,12 @@ export default function App() {
   const [acknowledgedServerAlerts, setAcknowledgedServerAlerts] = useState<Set<string>>(new Set());
   const serverAlerts = serverAlertEvents(readServerAlerts(checksPoll.data), hiddenServerAlerts, acknowledgedServerAlerts);
   const unreadable = isOperatorAuthenticated && checksPoll.error ? [alertsUnreadableEvent(checksPoll.error, checksPoll.at ?? Date.now())] : [];
-  const shownAlerts = [...killSwitchStateAlert(isHalted, haltedSinceAt, { lastKnown: killRead.at === null ? null : killRead.value, lastAt: killRead.at, failed: killRead.failed || (killRead.at !== null && killStale) }), ...unreadable, ...serverAlerts, ...alerts];
+  const unconfirmedAlert: AlertEvent[] = killUnconfirmed ? [{
+    id: 'state-kill-unconfirmed', timestamp: killUnconfirmed.at, timeStr: new Date(killUnconfirmed.at).toLocaleTimeString(), level: 'CRITICAL',
+    title: 'KILL SWITCH NOT CONFIRMED', acknowledged: false, sticky: true,
+    message: `The server did not confirm the kill switch (${killUnconfirmed.why}). It may or may not have changed: do not assume trading is halted, and do not press again until the header shows the server's state (this alert leaves when it does). Sign in as operator if you are not.`,
+  }] : [];
+  const shownAlerts = [...unconfirmedAlert, ...killSwitchStateAlert(isHalted, haltedSinceAt, { lastKnown: killRead.at === null ? null : killRead.value, lastAt: killRead.at, failed: killRead.failed || (killRead.at !== null && killStale) }), ...unreadable, ...serverAlerts, ...alerts];
   const seenServerAlerts = useRef<Set<string>>(new Set());
   useEffect(() => {
     for (const a of serverAlerts) {
@@ -245,6 +253,11 @@ export default function App() {
     return () => { clearInterval(t); clearInterval(age); };
   }, [readKillState]);
 
+  useEffect(() => {
+    if (killUnconfirmed && killRead.at !== null && !killRead.failed && killRead.at >= killUnconfirmed.at) setKillUnconfirmed(null);
+  }, [killRead, killUnconfirmed]);
+  const [killPending, setKillPending] = useState(false);
+
   // Emergency kill switch: the server decides. The UI only shows "halted" after the server confirmed it.
   const killInFlight = useRef(false);
   const toggleKillSwitch = async () => {
@@ -255,6 +268,7 @@ export default function App() {
     const press = await killSwitchPress(isHalted === true, haltedSince.current, Date.now(), (text) => askConfirm({ title: 'RESUME TRADING', body: text, confirmLabel: 'Resume trading' }));
     if (press.action === 'IGNORE') { killInFlight.current = false; return; }
     const nextHalted = press.activate;
+    setKillPending(true);
     try {
       const res = await authFetch('/api/execution/kill-switch', {
         method: 'POST',
@@ -283,13 +297,11 @@ export default function App() {
         );
       }
     } catch (err: any) {
-      triggerAlert(
-        'CRITICAL',
-        'KILL SWITCH NOT CONFIRMED',
-        `The server did not confirm the kill switch (${err?.message || 'request failed'}). Assume trading is NOT halted; sign in as operator and retry.`
-      );
+      setKillUnconfirmed({ at: Date.now(), why: `${nextHalted ? 'engage' : 'resume'}: ${err?.message || 'request failed'}` });
+      void readKillState(); // settle it now, not at the next tick
     } finally {
       killInFlight.current = false;
+      setKillPending(false);
     }
   };
 
@@ -301,6 +313,7 @@ export default function App() {
       <Header
         kpis={kpis}
         isHalted={isHalted}
+        killPending={killPending}
         onToggleKillSwitch={toggleKillSwitch}
         onOpenAiDiagnostics={() => setIsAiDiagnosticsOpen(true)}
         onOpenSystemChecks={() => setIsSystemChecksOpen(true)}

@@ -6,7 +6,7 @@ import { executionCoordinator, isRecoveredPosition, LIVE_BUY_FILLED } from '../e
 import { CapitalSizer } from '../capital/capitalSizer';
 import { memecoinAggregator } from '../memecoinAggregator';
 import { solPriceService } from '../market/solPriceService';
-import { executionConfig } from '../solana/executionConfig';
+import { executionConfig, ECONOMIC_TIP_CAP_FRACTION } from '../solana/executionConfig';
 import { checkSnipeAmountSol, SNIPE_AMOUNT_MIN_SOL } from '../execution/snipeAmount';
 import { allowedCluster, assertClusterAllowed } from '../solana/clusterGuard';
 import { Logger } from '../middleware/enterprise';
@@ -58,6 +58,20 @@ export const PAPER_SESSION_BUDGETS = {
   maxLossFraction: 0.15,
   maxDurationMs: 4 * 60 * 60 * 1000,
 } as const;
+
+/**
+ * R14-6: what one DEVNET_LIVE buy may take from the wallet at most, as the session cap counts it afterwards: the order plus its slippage
+ * headroom (the curve buy's max SOL cost), the Jito tip (capped at ECONOMIC_TIP_CAP_FRACTION of the order, at least 10 000 lamports; 0 when
+ * Jito is off), a network and priority fee allowance (BUY_FEE_ALLOWANCE_LAMPORTS, the non-tip part of the risk engine's execution-cost cap),
+ * and the token-account and first-buy accumulator rent. The pre-check compares spent + this with the cap, so a buy that passes cannot carry
+ * the counted spend over it.
+ */
+export const BUY_FEE_ALLOWANCE_LAMPORTS = 50_000;
+export function worstCaseAutoBuySol(orderSol: number, slippagePct: number, jitoEnabled: boolean): number {
+  const tipSol = jitoEnabled ? Math.max(orderSol * ECONOMIC_TIP_CAP_FRACTION, 10_000 / 1e9) : 0;
+  const rentSol = (CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS + PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS) / 1e9;
+  return orderSol * (1 + Math.max(0, slippagePct) / 100) + tipSol + BUY_FEE_ALLOWANCE_LAMPORTS / 1e9 + rentSol;
+}
 
 export interface SessionBudgets {
   maxBuys: number;
@@ -379,6 +393,11 @@ export class AutoSnipeController extends EventEmitter {
       budgets,
     };
   }
+  /** R14-6: the worst case of the next DEVNET_LIVE buy at the order size in force (`worstCaseAutoBuySol`). */
+  private worstCaseNextBuySol(slippagePct: number): number {
+    return worstCaseAutoBuySol(this.orderSol(), slippagePct, executionCoordinator.getJitoTransport().isEnabled());
+  }
+
   /** R14-4: the refusal when the saved DEVNET_LIVE session could not be read. */
   private static sessionUnreadableError(error: string): string {
     return `DEVNET_LIVE is refused: SESSION_UNREADABLE: the saved DEVNET_LIVE session spend could not be read (${error}). Its budget may be partly used, so a new session is not started over it. Try again; if it keeps failing, check the database.`;
@@ -612,8 +631,10 @@ export class AutoSnipeController extends EventEmitter {
       const liveBudgets: SessionBudgets = this.budgetOverride ? { ...SESSION_BUDGETS, ...this.budgetOverride } : { ...SESSION_BUDGETS };
       const cont = this.continuedLiveSession(liveBudgets, Date.now());
       if (cont && 'unreadable' in cont) return { ok: false, mode: this.mode, error: AutoSnipeController.sessionUnreadableError(cont.unreadable) };
-      if (cont && (cont.buys >= liveBudgets.maxBuys || cont.spentSol + this.orderSol() > liveBudgets.maxSpendSol + 1e-9)) {
-        return { ok: false, mode: this.mode, error: `DEVNET_LIVE is refused: SESSION_BUDGET_USED: the DEVNET_LIVE session started ${new Date(cont.startedAt).toISOString()} has ${cont.buys} buy(s) and ${cont.spentSol.toFixed(6)} SOL spent of ${liveBudgets.maxBuys} buys / ${liveBudgets.maxSpendSol} SOL; it ends at ${new Date(cont.startedAt + SESSION_BUDGETS.maxDurationMs).toISOString()}. Setting the mode again does not reset it.` };
+      // R14-6: the next buy is counted at its worst case (order, slippage, tip, fees and rent), as the cap counts it afterwards
+      const nextBuySol = this.worstCaseNextBuySol(memecoinAggregator.getConfig().maxSlippagePct || 6.0);
+      if (cont && (cont.buys >= liveBudgets.maxBuys || cont.spentSol + nextBuySol > liveBudgets.maxSpendSol + 1e-9)) {
+        return { ok: false, mode: this.mode, error: `DEVNET_LIVE is refused: SESSION_BUDGET_USED: the DEVNET_LIVE session started ${new Date(cont.startedAt).toISOString()} has ${cont.buys} buy(s) and ${cont.spentSol.toFixed(6)} SOL spent of ${liveBudgets.maxBuys} buys / ${liveBudgets.maxSpendSol} SOL, and the next buy may take up to ${nextBuySol.toFixed(6)} SOL; it ends at ${new Date(cont.startedAt + SESSION_BUDGETS.maxDurationMs).toISOString()}. Setting the mode again does not reset it.` };
       }
       try {
         await assertClusterAllowed(executionCoordinator.getConnection());
@@ -1146,9 +1167,10 @@ export class AutoSnipeController extends EventEmitter {
     // DEVNET_LIVE only: the cap is a real-SOL cap (0.02), a paper $5 order (~0.033 SOL) would never fit it.
     if (this.session && mode === 'DEVNET_LIVE') {
       this.settleUnresolvedSpend();
-      const plannedSol = this.orderSol();
-      if (this.session.spentSol + plannedSol > this.session.budgets.maxSpendSol) {
-        return rec('REJECTED', 'budget', `would exceed the session spend limit (${this.session.spentSol.toFixed(4)} + ${plannedSol.toFixed(4)} > ${this.session.budgets.maxSpendSol} SOL)`);
+      // R14-6: the order at its worst case (slippage, tip, fees and rent), since that is what the spend counts once the buy lands
+      const plannedSol = this.worstCaseNextBuySol(c.slippagePct ?? 6.0);
+      if (this.session.spentSol + plannedSol > this.session.budgets.maxSpendSol + 1e-9) {
+        return rec('REJECTED', 'budget', `would exceed the session spend limit (${this.session.spentSol.toFixed(4)} + ${plannedSol.toFixed(4)} worst case for a ${this.orderSol()} SOL order with slippage, tip, fees and rent > ${this.session.budgets.maxSpendSol} SOL)`);
       }
     }
 

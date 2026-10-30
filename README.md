@@ -99,7 +99,7 @@ Key environment variables. [`docs/ENV.md`](docs/ENV.md) lists every variable the
 - `JITO_BLOCK_ENGINE_URL`: leave unset on devnet/localnet (there is no devnet block engine; devnet and localnet send plain transactions). `DEFAULT_JITO_TIP_SOL` is the fallback tip (default `0.00018`, capped at 15% of trade notional); the tip floor is `MIN_JITO_TIP_SOL` (default `0.00015`), and the coordinator forces the tip to 0 while Jito is off.
 - `AUTO_SNIPE_ENABLED=true`: required before the auto-snipe pipeline will run at all (default off; the controller then still starts in mode OFF).
 - `AUTO_MANAGE_RECOVERED=true`: let the exit ladder manage positions rebuilt after a restart. Default off: recovered positions only get the hard stop.
-- `PAPER_BANKROLL_SOL` (default `0.07`), `PAPER_STRICT_GATES=1` (paper rejects unverified safety checks like LIVE), `CAPITAL_TIER` (`MICRO_10` or `INSTITUTIONAL`).
+- `PAPER_BANKROLL_SOL` (default `0.07`), `PAPER_STRICT_GATES=1` (paper rejects unverified safety checks like LIVE; without it, paper still refuses a buy whose holder read was made and failed or timed out, and fills a buy whose curve could not be read at all on the flat model, marked unverified), `CAPITAL_TIER` (`MICRO_10` or `INSTITUTIONAL`).
 - `DEMO_MODE=true`: loads fake callers and synthetic social data; never use it for anything but a demo. LIVE cannot be armed while it is on.
 - `APEX_ENV_FILE`: if set (even to an empty string) it replaces `.env`, so scripts and tests that spawn the server never read the real one. `APEX_DISABLE_EXTERNAL_FEEDS=true` stops outbound market feeds (used by smoke).
 - `GEMINI_API_KEY`: optional, for AI diagnostics.

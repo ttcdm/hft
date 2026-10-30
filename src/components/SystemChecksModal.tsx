@@ -17,7 +17,11 @@ const ageText = (ms: number) => `${Math.max(0, Math.round(ms / 1000))}s`;
  * Pure view: renders what the server returned (or the reason it did not). R11-1: when the latest read failed (`error`), the rows of the
  * last good read are not current, so each one says UNKNOWN, greyed, with what it said and how old that is. Never a stale OK.
  */
-export function SystemChecksView({ data, error, at, now = Date.now() }: { data: SystemChecksData | null; error?: string | null; at?: number | null; now?: number }) {
+export function SystemChecksView({ data: raw, error: readError, at, now = Date.now() }: { data: SystemChecksData | null; error?: string | null; at?: number | null; now?: number }) {
+  // R12-11: a reply without a checks list cannot be shown as checks; say so instead of rendering nothing or throwing
+  const shapeOk = !raw || Array.isArray(raw.checks);
+  const data = shapeOk ? raw : null;
+  const error = readError ?? (shapeOk ? null : 'Reply unreadable: it has no list of checks.');
   const unknown = !!error;
   const age = at != null ? ageText(now - at) : null;
   return (
@@ -31,12 +35,13 @@ export function SystemChecksView({ data, error, at, now = Date.now() }: { data: 
           </p>
           <ul className={`divide-y divide-[#1E293B] border border-[#1E293B] rounded-lg ${unknown ? 'opacity-60' : ''}`}>
             {data.checks.map((c) => {
-              const status: SystemCheckRow['status'] = unknown ? 'UNKNOWN' : c.status;
+              // R12-11: a row whose status is missing or not one of the four is UNKNOWN, and a null value says so
+              const status: SystemCheckRow['status'] = unknown || !(c?.status in TONE) ? 'UNKNOWN' : c.status;
               return (
                 <li key={c.id} data-testid={`check-${c.id}`} className="p-2.5 flex items-start gap-3">
                   <span data-testid="check-status" className={`shrink-0 w-16 text-center text-[10px] font-bold rounded px-1 py-0.5 ${TONE[status]}`}>{status}</span>
                   <div className="min-w-0">
-                    <div className="text-slate-200"><span className="text-slate-400">{c.label}:</span> {c.value}</div>
+                    <div className="text-slate-200"><span className="text-slate-400">{c.label ?? c.id}:</span> {c.value ?? '(unreadable)'}</div>
                     {unknown && <div className="text-[10px] text-amber-300/90" data-testid="check-last-read">not current: last read {age ? `${age} ago` : 'earlier'}: {c.status}</div>}
                     <div className="text-[10px] text-slate-500 break-words">{c.detail}</div>
                   </div>

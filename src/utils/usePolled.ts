@@ -20,6 +20,8 @@ export function usePolled<T>(path: string, everyMs: number, enabled = true): Pol
         const j = await r.json().catch(() => null);
         if (!alive) return;
         if (!r.ok) setState((s) => ({ ...s, error: `${j?.error || 'Request refused'} (HTTP ${r.status})` }));
+        // R12-11: a 200 whose body is not JSON is an unreadable reply, not "no data yet" (which read as "Reading the server…" forever)
+        else if (j === null) setState((s) => ({ ...s, error: `Reply unreadable (HTTP ${r.status}, not JSON)` }));
         else setState({ data: j as T, error: null, at: Date.now() });
       } catch (e: any) {
         if (alive) setState((s) => ({ ...s, error: `Could not reach the server (${e?.message || 'network error'})` }));

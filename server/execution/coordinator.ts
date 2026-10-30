@@ -3287,6 +3287,8 @@ export class ExecutionCoordinator {
     }
     this.inFlightBuyMints.add(req.mint);
     const stopSeqAtGate = this.emergencyStopSeq; // late buy: a panic or kill after this point sells what this buy opens
+    let buySendStarted = false; // R14-10: set just before the order goes to the send path
+    let buySignature: string | null = null;
     let buySettled!: () => void;
     this.liveBuysInFlight.set(req.mint, new Promise<void>((r) => { buySettled = r; })); // waitForBuysInFlight awaits it
 
@@ -3384,6 +3386,9 @@ export class ExecutionCoordinator {
       });
 
       // 5 & 6. Submit transaction with bounded idempotent retry & RPC fallback
+      // R14-10: from here a throw may follow a send, so the exception path below treats an unreadable ledger as "possibly landed"
+      buySendStarted = true;
+      buySignature = this.signatureOf(v0Tx);
       const subRes = await this.submitAndConfirmWithRetry({
         tx: v0Tx,
         orderId: clientOrderId,
@@ -3604,7 +3609,23 @@ export class ExecutionCoordinator {
       Logger.error(`LIVE trade exception: ${err.message}`);
       // P1.5 (R1-6, R1-80): an exception after the PENDING row was written (the transaction may have been sent) must not leave that row
       // PENDING and unwatched: it becomes RECONCILIATION_REQUIRED, which orphan recovery re-reads and adopts if the buy landed.
-      const pending = workstationDb.loadTransactions(`ord-${correlationId}`).filter((t) => t.direction === 'BUY' && t.reconciliationState === 'PENDING');
+      // R14-10: loadTransactions answers [] on a failed read, which made a buy that may have landed a clean CHAIN_ERROR (auto counted no
+      // spend, and nothing watched it). The PENDING rows are read where a failed read is null, and null after the send began is unknown.
+      const pendingRead = workstationDb.loadTransactionsInStates(['PENDING']);
+      if (pendingRead === null && buySendStarted) {
+        if (buySignature) this.lateBuyWatch.set(buySignature, stopSeqAtGate);
+        this.scheduleOrphanRecovery(); // it reads PENDING rows as well as RECONCILIATION_REQUIRED ones once the ledger reads again
+        this.raiseOperatorAlert('BUY_OUTCOME_UNKNOWN', `A LIVE buy of ${req.symbol || req.mint}${buySignature ? ` (${buySignature.slice(0, 8)})` : ''} threw after its send began (${String(err.message).slice(0, 80)}) and the transactions table could not be read to find its row. It may have landed: orphan recovery keeps checking, and the startup wallet scan adopts the tokens if it did. Do not retry the buy by hand.`, buySignature ?? `buy-${correlationId}`);
+        return {
+          success: false,
+          lifecycleState: 'RECONCILIATION_REQUIRED',
+          executionMode: 'LIVE',
+          ...(buySignature ? { txSignature: buySignature } : {}),
+          error: `UNCONFIRMED: ${err.message}. The transaction may have been sent and the ledger could not be read; it is being watched, do not retry the buy.`,
+          correlationId,
+        };
+      }
+      const pending = (pendingRead ?? []).filter((t) => t.orderId === `ord-${correlationId}` && t.direction === 'BUY');
       if (pending.length > 0) {
         for (const t of pending) {
           workstationDb.saveTransaction({ ...t, reconciliationState: 'RECONCILIATION_REQUIRED', error: `UNCONFIRMED: exception after the send was prepared: ${err.message}` });

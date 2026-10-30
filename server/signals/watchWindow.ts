@@ -78,6 +78,8 @@ export const READY_MIN_SIGNALS = HOT_MIN_SIGNALS - 1;
 /** The built-in default; the gate itself reads the one shared threshold (S187), so HOT and the execution gate never diverge. */
 export const HOT_MIN_SCORE = CONFLUENCE_DEFAULT_THRESHOLD;
 const CREATOR_CLUSTER = 'cluster:creator';
+/** R13-2: the one key every buyer that is not independent shares in velocity and flow (no funder known, none found, or a history not read in full). */
+const UNATTRIBUTED_BUYERS = 'cluster:unattributed';
 const MAX_FUNDERS_KEPT = 20_000;
 
 export type WatchState = 'WATCHING' | 'HOT' | 'READY' | 'DEAD';
@@ -153,6 +155,8 @@ interface Candidate {
   /** B3: sellers whose funder lookup was asked for and has not answered yet, and sellers whose funder could not be read. */
   sellersPending: Set<string>;
   sellersUnreadable: Set<string>;
+  /** R13-2: buyers whose funder lookup was asked for (and accepted) and has not answered yet. They hold HOT and READY, as pending sellers do. */
+  buyersPending: Set<string>;
   /** Wallets whose funder was asked for on this mint's behalf. */
   requested: Set<string>;
   /** R13-4: SOL sources of those wallets whose own funder was asked for (the second hop), at most WATCH_FUNDER_HOP_MAX. */
@@ -309,6 +313,7 @@ export class WatchWindow extends EventEmitter {
   public setFunderUnreadable(wallet: string): void {
     for (const c of this.active.values()) {
       if (c.sellersPending.delete(wallet)) { c.sellersUnreadable.add(wallet); this.sellerFunderStats.unreadable++; }
+      c.buyersPending.delete(wallet); // R13-2: it stays an unknown funder (unattributed in velocity and flow, coverage below 1)
     }
   }
 
@@ -316,6 +321,7 @@ export class WatchWindow extends EventEmitter {
     for (const c of this.active.values()) {
       c.sellersPending.delete(wallet);
       c.sellersUnreadable.delete(wallet);
+      c.buyersPending.delete(wallet);
     }
   }
 
@@ -379,7 +385,7 @@ export class WatchWindow extends EventEmitter {
     this.active.set(mint, {
       mint, creator, insiders: new Set([creator, ...alsoInsiders].filter((w): w is string => !!w)), registeredAt: now, firstTradeAt: null, buyVolumeByWallet: new Map(),
       sellVolumeSol: 0, tradeCount: 0, creatorSold: false, flow: [], sellers: new Set(), sellersPending: new Set(), sellersUnreadable: new Set(),
-      requested: new Set(), hopRequested: new Set(), seen: new Set(),
+      buyersPending: new Set(), requested: new Set(), hopRequested: new Set(), seen: new Set(),
     });
     return true;
   }
@@ -401,7 +407,11 @@ export class WatchWindow extends EventEmitter {
   private askFunder(c: Candidate, wallet: string): void {
     if (c.requested.has(wallet) || this.funderKnown(c, wallet)) return;
     c.requested.add(wallet);
-    this.requestFunder?.(wallet, c.mint);
+    if (!this.requestFunder) return;
+    // R13-2: an accepted lookup is pending until it answers (setFunder / setNoFunder) or fails for good (setFunderUnreadable). A cached
+    // answer arrives inside this call, so the wallet is marked pending first and the answer clears it.
+    c.buyersPending.add(wallet);
+    if (this.requestFunder(wallet, c.mint) === false) c.buyersPending.delete(wallet);
   }
 
   /**
@@ -489,6 +499,19 @@ export class WatchWindow extends EventEmitter {
     const buyVolume = [...c.buyVolumeByWallet.values()].reduce((a, b) => a + b, 0);
     const clusterOf = this.clusterKeys(c);
 
+    // R13-2: the R8-2 one-buyer rule in velocity and flow too. A wallet in a cluster with no independent wallet in it is UNATTRIBUTED_BUYERS
+    // when its funder lookup found no source or did not read its whole history, or when a lookup is wired and it has no answer (asked and
+    // failed, or outside the funder sample; a pending one holds the verdict, see evaluate). All of them together are one buyer, so
+    // self-funded, long-history or unread sybils cannot carry the distinct-buyer floors. In velocity their sells net against that one key;
+    // in flow a seller keeps its own key (the pessimistic side: more selling clusters).
+    // A window with no lookup wired (a replay of recordings without funder history, such as the HF corpus) cannot tell an unknown wallet
+    // from an independent one; it still counts such a wallet apart, as before, so those replays overstate velocity and flow against live.
+    const independentClusters = new Set<string>();
+    for (const f of c.flow) if (this.isVerified(f.wallet)) independentClusters.add(clusterOf(f.wallet));
+    const hasFact = (w: string): boolean => !!this.funderFor(w) || this.noFunder.has(w);
+    const keyOf = (wallet: string, key: string): string =>
+      key === CREATOR_CLUSTER || independentClusters.has(key) || (!this.requestFunder && !hasFact(wallet)) ? key : UNATTRIBUTED_BUYERS;
+
     // P4.1 (R1-55): the creator cluster's trades are not demand. Flow, velocity and net inflow count the organic trades only.
     const buckets: number[] = [];
     const organic: Array<{ at: number; sol: number; key: string }> = [];
@@ -500,8 +523,8 @@ export class WatchWindow extends EventEmitter {
         if (f.buy) creatorClusterBuySol += f.sol; else creatorClusterSellSol -= f.sol;
         continue;
       }
-      organic.push({ at: f.at, sol: f.sol, key });
-      if (f.buy) { buyCount++; buyClusters.add(key); } else { sellCount++; sellClusters.add(key); }
+      organic.push({ at: f.at, sol: f.sol, key: keyOf(f.wallet, key) });
+      if (f.buy) { buyCount++; buyClusters.add(keyOf(f.wallet, key)); } else { sellCount++; sellClusters.add(key); }
       const idx = Math.max(0, Math.floor((f.at - (first ?? f.at)) / WATCH_BUCKET_MS));
       while (buckets.length <= idx) buckets.push(0);
       buckets[idx] += f.sol;
@@ -636,6 +659,9 @@ export class WatchWindow extends EventEmitter {
     }
     // B3: no HOT or READY while a seller's lookup may still answer "creator cluster"; at the window end the launch is judged without it
     if (c.sellersPending.size > 0 && m.elapsedMs < this.opts.maxMs) return hold(`holding: waiting for the funder of ${c.sellersPending.size} seller(s)`);
+    // R13-2: likewise a buyer's: its buys may be the creator cluster's, which are not demand
+    const buyersPending = [...c.buyersPending].filter((w) => c.buyVolumeByWallet.has(w)).length;
+    if (buyersPending > 0 && m.elapsedMs < this.opts.maxMs) return hold(`holding: waiting for the funder of ${buyersPending} buyer(s)`);
     this.sellerFunderStats.pendingAtWindowEnd += c.sellersPending.size; // only non-zero at the window end, where this evaluation releases
     const unread = c.sellersPending.size + c.sellersUnreadable.size;
     const unreadText = unread > 0 ? `; ${unread} seller funder(s) unread, buyers signal not counted` : '';

@@ -2,7 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
-import { Logger, redactUrl } from './enterprise';
+import { Logger, redactUrl, isEmergencyRoute } from './enterprise';
 
 export interface OperatorSession {
   token: string;
@@ -294,15 +294,78 @@ export function isPublicApiRoute(method: string, pathname: string): boolean {
   return PUBLIC_API_ALLOWLIST.some((r) => r.method === m && (r.path === '*' || r.path === p));
 }
 
+/**
+ * R14-12: operator tokens guessed on the header path. Only POST /api/auth/login had a failure limit; the general /api bucket allows about 30
+ * requests a second per peer, so a weak hand-set token could be guessed through any route. Per TCP peer address (like LOGIN_RATE_LIMIT), only a
+ * request that PRESENTS a token that is not a valid session counts: valid tokens and requests with no token never do. Once a peer has used up
+ * `maxFailures` (refilled at `refillPerSec`), its token-bearing requests are answered 429 TOKEN_GUESS_LIMITED WITHOUT checking the token, valid
+ * or not, until a failure has refilled: answering a valid token during the lock would still tell a guesser when it was right. The emergency
+ * routes (EMERGENCY_ROUTES: kill switch, panic, auto kill) always check the token, so the operator can always stop trading; their failures
+ * still count. The UI drops a refused token at the first 401, so a stale tab does not keep a peer locked.
+ */
+export const FAILED_TOKEN_LIMIT = { maxFailures: 10, refillPerSec: 10 / 60 } as const;
+
+export class FailedTokenLimiter {
+  private buckets = new Map<string, { tokens: number; at: number }>();
+  constructor(private readonly opts: { maxFailures: number; refillPerSec: number } = FAILED_TOKEN_LIMIT) {}
+
+  private bucket(peer: string, now: number): { tokens: number; at: number } {
+    let b = this.buckets.get(peer);
+    if (!b) b = { tokens: this.opts.maxFailures, at: now };
+    b.tokens = Math.min(this.opts.maxFailures, b.tokens + ((now - b.at) / 1000) * this.opts.refillPerSec);
+    b.at = now;
+    if (b.tokens >= this.opts.maxFailures) this.buckets.delete(peer); // a full bucket is the same as none: the map holds only recent guessers
+    else this.buckets.set(peer, b);
+    return b;
+  }
+
+  /** Seconds until the peer may present a token again; 0 when it may now. */
+  public lockedForSec(peer: string, now = Date.now()): number {
+    const b = this.bucket(peer, now);
+    return b.tokens >= 1 ? 0 : Math.max(1, Math.ceil((1 - b.tokens) / this.opts.refillPerSec));
+  }
+
+  public recordFailure(peer: string, now = Date.now()): void {
+    const b = this.bucket(peer, now);
+    b.tokens = Math.max(0, b.tokens - 1);
+    this.buckets.set(peer, b);
+  }
+
+  public peerCount(): number {
+    return this.buckets.size;
+  }
+}
+
+export const failedTokenLimiter = new FailedTokenLimiter();
+
 // Deny-by-default gate for every /api route. Mount it with app.use(apiAuthGate) before any route.
 export function apiAuthGate(req: Request, res: Response, next: NextFunction) {
   const pathname = normalizeApiPath(req.originalUrl || req.url || '');
   if (!pathname.startsWith('/api')) return next();
   if (isPublicApiRoute(req.method, pathname)) return next();
   const token = extractOperatorToken(req);
+  // R14-12: a peer that has guessed too many tokens gets no answer about the next one (emergency routes excepted, see FAILED_TOKEN_LIMIT)
+  const peer = req.socket?.remoteAddress || 'unknown-peer';
+  const emergency = isEmergencyRoute(req);
+  if (token && !emergency) {
+    const waitSec = failedTokenLimiter.lockedForSec(peer);
+    if (waitSec > 0) {
+      res.setHeader('Retry-After', String(waitSec));
+      return res.status(429).json({
+        success: false,
+        error: {
+          code: 'TOKEN_GUESS_LIMITED',
+          message: `Too many invalid operator tokens from this address; tokens are not checked for ${waitSec} s. The kill switch, panic and auto kill routes still accept a valid token.`,
+          correlationId: (req as any).correlationId || crypto.randomUUID(),
+          timestamp: new Date().toISOString(),
+        },
+      });
+    }
+  }
   // T3: any valid session may read (GET/HEAD); everything else needs the OPERATOR role, whether or not the route adds requireOperatorAuth.
   const readOnly = req.method === 'GET' || req.method === 'HEAD';
   if (!token || !(readOnly ? authManager.validateToken(token) : authManager.isOperatorToken(token))) {
+    if (token && !authManager.validateToken(token)) failedTokenLimiter.recordFailure(peer); // R14-12: a guess, not a READONLY session's POST
     Logger.warn(`Unauthenticated API request blocked: ${req.method} ${pathname} from ${req.ip}`);
     return sendUnauthorized(req, res);
   }

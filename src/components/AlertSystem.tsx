@@ -13,7 +13,7 @@ import { orderAlerts } from '../utils/operatorAlerts';
  * hold the auto emergency control under it for good. It is now docked in the page flow (sticky to the bottom of the screen, on the left,
  * with its own space at the end of the page, so scrolling always uncovers what is under it), and it can be minimized to its one-line
  * bar whatever it holds. A server CRITICAL that reports a past event (POSITION_GONE, SELL_ADOPTED, ...) used to stay until a restart;
- * it has an Acknowledge button that clears it on the server.
+ * it has an Acknowledge button that clears it on the server. R12-13: CRITICAL alerts are also in an assertive live region.
  */
 export const ALERT_TTL_MS: Record<AlertEvent['level'], number | null> = { INFO: 8_000, WARNING: 20_000, CRITICAL: null };
 
@@ -42,13 +42,22 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
 }) => {
   const [expanded, setExpanded] = useState(false);
   const [minimized, setMinimized] = useState(false);
-  if (alerts.length === 0) return null;
+  // R12-13: CRITICAL alerts are announced to assistive tech. The live region is on the page before any alert arrives (a region added
+  // together with its text is often not read) and stays when the dock is minimized; it changes only when the set of CRITICALs does.
+  const liveRegion = (
+    <div role="alert" aria-live="assertive" aria-atomic="true" className="sr-only" data-testid="alerts-live-critical">
+      {orderAlerts(alerts.filter((a) => a.level === 'CRITICAL')).map((a) => `${a.title}: ${a.message}`).join(' ')}
+    </div>
+  );
+  if (alerts.length === 0) return liveRegion;
   const ordered = orderAlerts(alerts);
   const shown = minimized ? [] : expanded ? ordered : ordered.slice(0, COLLAPSED_ALERTS);
   const hidden = alerts.length - shown.length;
   const critical = alerts.filter((a) => a.level === 'CRITICAL').length;
 
   return (
+    <>
+    {liveRegion}
     <div
       id="alerts-notification-panel"
       data-testid="alerts-dock"
@@ -149,5 +158,6 @@ export const AlertSystem: React.FC<AlertSystemProps> = ({
       ))}
       </div>
     </div>
+    </>
   );
 };

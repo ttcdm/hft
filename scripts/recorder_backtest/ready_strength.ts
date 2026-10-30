@@ -1,6 +1,7 @@
 import '../hermeticEnv';
 import fs from 'fs';
 import { replayLaunch, type ReplayedLaunch } from '../../server/backtest/replay';
+import { recorderConfig } from '../../server/backtest/recorderConfig';
 import { HOT_MIN_SIGNALS, READY_MIN_SIGNALS } from '../../server/signals/watchWindow';
 import { getConfluenceThreshold } from '../../server/signals/confluenceThreshold';
 import { openRecorded } from './recorded';
@@ -61,7 +62,10 @@ async function main() {
   const funders = source.funders();
   const fallbackUsd = source.medianSolUsd();
   const rows: ReplayedLaunch[] = [];
-  for (const rec of source.launches()) rows.push(replayLaunch(rec, funders, fallbackUsd, { minScore, readyGate: false }));
+  // R13-12: the recorder's restart and feed-gap markers cut the launches they fall in, with the window and trade cap the app uses
+  const rc = recorderConfig();
+  const cut = { markers: source.markers(), recordedForMs: rc.mintMs, recordedMaxTrades: rc.maxTradesPerMint };
+  for (const rec of source.launches()) rows.push(replayLaunch(rec, funders, fallbackUsd, { minScore, readyGate: false, ...cut }));
   source.close();
   const res = { source: 'own recordings (not the 39-day corpus)', input: { recorded: recordedPath, kind: source.kind }, minScore, launches: rows.length, ...summarizeReadyStrength(rows) };
   const out = opt('out', '');

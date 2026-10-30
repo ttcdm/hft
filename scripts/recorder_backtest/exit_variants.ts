@@ -1,8 +1,9 @@
 import '../hermeticEnv';
 import fs from 'fs';
 import { replayLaunch, replayCostCase, tradeRow, REPLAY_DEFAULTS, type RecordedLaunch } from '../../server/backtest/replay';
+import { recorderConfig } from '../../server/backtest/recorderConfig';
 import { simulatePath, priceEntryParts, restoreStockEngine, STOCK_VARIANT, type CostCase, type TradeRow, type Variant } from '../../server/backtest/costModel';
-import { openRecorded, resolveSplit, type RecordedSource } from './recorded';
+import { cutAtRecordingGap, openRecorded, resolveSplit, type RecordedSource } from './recorded';
 
 /**
  * S228: exit-rule variants over the entries the real watch window + confluence gate produce at thresholds 70 / 60 / 50, run on the app's OWN
@@ -52,14 +53,19 @@ async function main() {
   const entered = new Map<number, Array<{ c: Item; rows: TradeRow[]; releasedAfterMs: number; base: number | null }>>(THRESH.map((t) => [t, []]));
   let n = 0;
   const funders = source.funders();
-  for (const rec of source.launches()) {
+  // R13-12: the recorder's restart and feed-gap markers cut the launches they fall in, with the window and trade cap the app uses
+  const rc = recorderConfig();
+  const markers = source.markers();
+  const cut = { markers, recordedForMs: rc.mintMs, recordedMaxTrades: rc.maxTradesPerMint };
+  for (const raw of source.launches()) {
+    const rec = cutAtRecordingGap(raw, markers, rc.mintMs).rec;
     const create = rec.events.find((e) => e.kind === 'CREATE');
     if (!create) continue;
     const item: Item = { rec, t0: create.ts };
     const rows = rowsOf(rec);
     for (const th of THRESH) {
       restoreStockEngine();
-      const r = replayLaunch(rec, funders, solUsd, { minScore: th });
+      const r = replayLaunch(raw, funders, solUsd, { minScore: th, ...cut });
       if (r.entered && r.releasedAfterMs !== null) entered.get(th)!.push({ c: item, rows, releasedAfterMs: r.releasedAfterMs, base: (r.outcome === 'CLOSED' ? r.netPnlSol : r.openNetPnlSol) ?? null });
     }
     if (++n % 2000 === 0) console.error(n);

@@ -205,7 +205,8 @@ describe('G A1/A2: startup reconciliation', () => {
     const sig = `a1tp1_${uid()}`;
     workstationDb.saveTransaction({ signature: sig, orderId: `o_${uid()}`, correlationId: 'c', mint, direction: 'SELL', submissionTransport: 'SOLANA_RPC', submissionTime: Date.now() - 5000, reconciliationState: 'PENDING', networkFeeLamports: 5000, jitoTipLamports: 0, executionMode: 'LIVE', exitReason: 'TAKE_PROFIT_1' } as any);
     conn.getSignatureStatuses = vi.fn(async () => ({ context: { slot: 1 }, value: [{ slot: 5, confirmations: null, err: null, confirmationStatus: 'finalized' }] }));
-    conn.getTransaction = vi.fn(async () => ({ slot: 5, blockTime: 1, meta: { err: null, fee: 5000 } }));
+    // R14-13: the sell landed after the position's buy (its block time is not before the entry), so it is this position's sell
+    conn.getTransaction = vi.fn(async () => ({ slot: 5, blockTime: Math.ceil(Date.now() / 1000), meta: { err: null, fee: 5000 } }));
     conn.getTokenAccountBalance = vi.fn(async () => ({ value: { amount: '670' } }));
     vi.spyOn(TradeReconciler, 'recoverInterruptedTransaction').mockResolvedValue({ recovered: true, type: 'SELL', mint, remainingTokensRaw: '670', tokensSoldRaw: '330', tokenBeforeRaw: '1000', solReceivedLamports: 40_000_000, blockTime: 1, slot: 5 } as any);
 

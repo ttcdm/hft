@@ -85,7 +85,8 @@ describe('R1 #1 / R5-3 / R7-18: startup reconciliation and unsettled sells', () 
     const sig = `r11bsell_${uid()}`;
     sellRow(sig, 'RECONCILIATION_REQUIRED');
     conn.getSignatureStatuses = vi.fn(async () => confirmed);
-    conn.getTransaction = vi.fn(async () => ({ slot: 5, blockTime: 1, meta: { err: null, fee: 5000 } }));
+    // R14-13: the sell landed after the position's buy (its block time is not before the entry), so it is this position's sell
+    conn.getTransaction = vi.fn(async () => ({ slot: 5, blockTime: Math.ceil(Date.now() / 1000), meta: { err: null, fee: 5000 } }));
     conn.getTokenAccountBalance = vi.fn(async () => ({ value: { amount: '0' } }));
     vi.spyOn(TradeReconciler, 'recoverInterruptedTransaction').mockResolvedValue({ recovered: true, type: 'SELL', mint, remainingTokensRaw: '0', tokensSoldRaw: '1000', tokenBeforeRaw: '1000', solReceivedLamports: 130_000_000, blockTime: 1, slot: 5 } as any);
     await coordinator.startupReconciliation();

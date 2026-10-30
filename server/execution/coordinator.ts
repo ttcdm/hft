@@ -207,6 +207,23 @@ export const UNREAD_SELL_FILL_TAG = 'SELL_FILL_UNREAD_ASSUMED_LOSS';
 export const LATE_BUY_EXIT_REASON = 'EMERGENCY_PANIC_LIQUIDATION';
 export const PROTECTIVE_EXIT_REASONS = /^(STOP_LOSS|TRAILING_STOP|EMERGENCY_PANIC_LIQUIDATION|MANUAL|Manual Close|Manual user order|Aggregator Close|Operator close)$/;
 
+/**
+ * R14-13: whether a SELL that landed in `sellSlot` (block time `sellBlockTime`, seconds) came after the buy of `pos`. The buy's slot decides
+ * when it is recorded: a later slot is AFTER, an earlier one BEFORE, the same slot UNKNOWN (the order inside a slot is not read). With no buy
+ * slot (a RECOVERED balance, an old row) the block time is compared with the entry time: at or after it is AFTER; anything else is
+ * UNKNOWN, never BEFORE, since the wall clock is not proof enough to drop a sell.
+ */
+export function sellOrderAgainstEntry(pos: Pick<NormalizedPosition, 'entrySlot' | 'entryTimestamp'>, sellSlot: number | undefined, sellBlockTime: number | null | undefined): 'AFTER' | 'BEFORE' | 'UNKNOWN' {
+  const entrySlot = pos.entrySlot ?? 0;
+  if (entrySlot > 0 && typeof sellSlot === 'number' && sellSlot > 0) {
+    if (sellSlot > entrySlot) return 'AFTER';
+    if (sellSlot < entrySlot) return 'BEFORE';
+    return 'UNKNOWN';
+  }
+  if (typeof sellBlockTime === 'number' && sellBlockTime > 0 && (pos.entryTimestamp ?? 0) > 0 && sellBlockTime * 1000 >= pos.entryTimestamp) return 'AFTER';
+  return 'UNKNOWN';
+}
+
 export class ExecutionCoordinator {
   private executionMode: ExecutionMode = 'PAPER';
   private isLiveTradingArmed: boolean = false;
@@ -1113,10 +1130,24 @@ export class ExecutionCoordinator {
                     this.sellIfLateBuyAdopted(adopted);
                     Logger.info(`Successfully recovered interrupted BUY position for ${recovery.mint} (${pTx.signature})`);
                   } else if (recovery.type === 'SELL') {
-                    const targetPos = workstationDb
+                    const openOfMint = workstationDb
                       .loadPositions()
                       .find((p) => p.mint === recovery.mint && p.executionMode === 'LIVE' && (p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED'));
-                    if (targetPos) {
+                    // R14-13: the ledger row carries no position id, so the mint alone cannot say which position a sell belongs to (an old
+                    // SELL row read PENDING after the reconciliation_state column was added would be booked onto today's position of the mint).
+                    // The chain decides: a sell that landed before this position's buy cannot have sold its tokens.
+                    const order = openOfMint ? sellOrderAgainstEntry(openOfMint, txDetails.slot, txDetails.blockTime) : null;
+                    const targetPos = order === 'AFTER' ? openOfMint : undefined;
+                    if (openOfMint && order === 'BEFORE') {
+                      pTx.reconciliationState = 'RECONCILED';
+                      pTx.error = `landed in slot ${txDetails.slot}, before the open position of this mint was bought (slot ${openOfMint.entrySlot}); not applied to it`;
+                      issues.push(`SELL ${pTx.signature.slice(0, 8)}... landed before the open ${openOfMint.symbol || recovery.mint} position was bought; not applied to it`);
+                      Logger.warn(`[R14-13] SELL ${pTx.signature} landed before position ${openOfMint.id} was bought; not applied`);
+                    } else if (openOfMint && order === 'UNKNOWN') {
+                      pTx.reconciliationState = 'RECONCILIATION_REQUIRED';
+                      mismatchesCount++;
+                      issues.push(`SELL ${pTx.signature.slice(0, 8)}... landed, but whether it came after the open ${openOfMint.symbol || recovery.mint} position's buy cannot be proven (no buy slot or block time); not applied`);
+                    } else if (targetPos) {
                       // R14-3: the sale is a share of the ROW, not of the wallet balance before it (tokens sent in from outside are not the
                       // position's): the basis removed is sold / row, and the row keeps row - sold. The wallet's balance after the sell only
                       // decides that nothing is left. Extra wallet tokens stay untracked (step 6 below adopts what this app once bought).
@@ -4828,6 +4859,9 @@ export class ExecutionCoordinator {
       for (const t of rows) {
         const pos = active.find((p) => p.mint === t.mint);
         if (!pos) continue;
+        // R14-13: a sell sent before this position was bought (or a row with no send time, from before that column) is not its sell; held
+        // as one, an old landed sell would be booked onto it by the next exit. Startup reconciliation settles such a row from the chain.
+        if (!(t.submissionTime > 0) || t.submissionTime < (pos.entryTimestamp ?? 0)) continue;
         const known = this.pendingSells.get(pos.id);
         if (known && known.ts >= t.submissionTime) continue; // keep the latest sell of the position
         this.pendingSells.set(pos.id, { signature: t.signature, ts: t.submissionTime, lastValidBlockHeight: t.lastValidBlockHeight, reason: t.exitReason });

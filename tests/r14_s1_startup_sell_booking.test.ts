@@ -125,6 +125,58 @@ describe('R14: startup reconciliation books a landed SELL once, from the row, on
     expect(row.realizedPnLSol).toBeCloseTo(-0.03, 9);
   });
 
+  it('R14-13: an old SELL that landed before the open position of its mint was bought is not booked onto it', async () => {
+    const id = `r1413_${uid()}`;
+    livePosition(id, { entrySlot: SELL_SLOT + 100 }); // today's position of the mint, bought after the old sell landed
+    const sig = `r1413old_${uid()}`;
+    sellRow(sig, { submissionTime: 0 }); // a row from before reconciliation_state existed reads PENDING (and has no submission time)
+    conn.getSignatureStatuses = vi.fn(async () => confirmed);
+    conn.getTransaction = vi.fn(async () => ({ slot: SELL_SLOT, blockTime: Math.floor(Date.now() / 1000) - 86_400, meta: { err: null, fee: 5000 } }));
+    conn.getTokenAccountBalance = vi.fn(async () => ({ context: { slot: SELL_SLOT + 200 }, value: { amount: '1000' } }));
+    landedSell({ sold: '330', before: '1000', after: '670', received: 40_000_000 });
+    await coordinator.startupReconciliation();
+    const row = rowOf(id);
+    expect(row.status).toBe('OPEN');
+    expect(row.tokenQuantityRaw).toBe('1000');
+    expect(row.costBasisLamports).toBe(100_000_000);
+    expect(row.realizedPnLSol).toBe(0);
+    expect(row.exitStage ?? 0).toBe(0);
+    expect(stateOf(sig)).toBe('RECONCILED'); // settled as not this position's, so it is not replayed on every pass
+    expect(workstationDb.loadTransactions().find((t) => t.signature === sig)?.error).toMatch(/before the open position/);
+  });
+
+  it('R14-13: when the order of the sell and the open position\'s buy cannot be proven, the sell is not booked (RECONCILIATION_REQUIRED)', async () => {
+    const id = `r1413u_${uid()}`;
+    livePosition(id, { entrySlot: 0 }); // no recorded buy slot
+    const sig = `r1413unk_${uid()}`;
+    sellRow(sig);
+    conn.getSignatureStatuses = vi.fn(async () => confirmed);
+    conn.getTransaction = vi.fn(async () => ({ slot: SELL_SLOT, blockTime: null, meta: { err: null, fee: 5000 } })); // and no block time
+    conn.getTokenAccountBalance = vi.fn(async () => ({ context: { slot: SELL_SLOT + 10 }, value: { amount: '670' } }));
+    landedSell({ sold: '330', before: '1000', after: '670', received: 40_000_000 });
+    const res = await coordinator.startupReconciliation();
+    const row = rowOf(id);
+    expect(row.tokenQuantityRaw).toBe('1000');
+    expect(row.realizedPnLSol).toBe(0);
+    expect(stateOf(sig)).toBe('RECONCILIATION_REQUIRED');
+    expect(res.status).toBe('RECONCILIATION_MISMATCH');
+  });
+
+  it('R14-13: a pending SELL row sent before the open position was bought is not seeded as that position\'s pending sell', () => {
+    const id = `r1413s_${uid()}`;
+    livePosition(id, { entryTimestamp: Date.now() - 60_000 });
+    const old = `r1413seed_${uid()}`;
+    sellRow(old, { submissionTime: Date.now() - 3_600_000 }); // an hour before today's buy
+    const legacy = `r1413zero_${uid()}`;
+    sellRow(legacy, { submissionTime: 0 }); // no submission time at all
+    (coordinator as any).seedPendingSellsFromLedger();
+    expect((coordinator as any).pendingSells.has(id)).toBe(false);
+    const mine = `r1413mine_${uid()}`;
+    sellRow(mine, { submissionTime: Date.now() - 30_000 }); // and its own sell, sent after the buy, still is
+    (coordinator as any).seedPendingSellsFromLedger();
+    expect((coordinator as any).pendingSells.get(id)?.signature).toBe(mine);
+  });
+
   it('R14-1: a pending sell that step 4 finds reverted on chain is dropped too', async () => {
     const id = `r141r_${uid()}`;
     livePosition(id);

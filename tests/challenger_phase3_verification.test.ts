@@ -20,6 +20,7 @@ import { workstationDb, WorkstationDatabase } from '../server/db/database';
 import { HardenedRiskEngine } from '../server/risk/riskEngine';
 import { EligibilityFilter } from '../server/signals/eligibilityFilter';
 import fs from 'fs';
+import { withIndependentOwners } from './helpers/independentHolders';
 import path from 'path';
 
 /** A small LIVE buy that passes every gate except the daily-loss ones. */
@@ -157,11 +158,14 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
         }),
       } as unknown as Connection;
 
+      // R13-3: the two other holders are known independent (an unknown holder would count against the creator cap)
+      const known = withIndependentOwners(mockConnection);
       const dist = await fetchTokenHolderDistribution(
-        mockConnection,
+        known.conn,
         mint,
         creator,
-        bondingCurve
+        bondingCurve,
+        known.ww
       );
 
       expect(dist.creatorBalance).toBe(0n);
@@ -214,11 +218,13 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
         }),
       } as unknown as Connection;
 
+      const known = withIndependentOwners(mockConnection); // R13-3: holder A is known independent
       const dist = await fetchTokenHolderDistribution(
-        mockConnection,
+        known.conn,
         mint,
         creator,
-        bondingCurve
+        bondingCurve,
+        known.ww
       );
 
       expect(dist.bondingCurveBalance).toBe(990000000000000n);

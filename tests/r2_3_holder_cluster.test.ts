@@ -56,12 +56,12 @@ describe('R2-3: the holder gate sums the creator\'s funder cluster', () => {
     expect(gate(d).creator).toBe('FAIL');
   });
 
-  it('the same 40 wallets with no funder data: all unknown, counted together as one top-10 holder (36%), and LIVE refuses on concentration', async () => {
+  it('the same 40 wallets with no funder data: all unknown, counted together as one top-10 holder (36%) and (R13-3) against the creator cap, and LIVE refuses on both', async () => {
     const creator = pk();
     const d = await fetchTokenHolderDistribution(conn(Array.from({ length: 40 }, () => ({ owner: pk(), pct: 1.8 }))), pk(), creator, undefined, new WatchWindow({ publicFunders: [] }));
-    expect(d.devHoldingPct).toBe(0);
+    expect(d.devHoldingPct).toBeCloseTo(36, 6); // R13-3: was 0, the unknown holders were left out of the creator's share
     expect(d.top10HoldersPct).toBeCloseTo(36, 6); // was 18: ten of them
-    expect(gate(d).top10).toBe('FAIL');
+    expect(gate(d)).toEqual({ creator: 'FAIL', top10: 'FAIL' });
   });
 
   it('long-history (partly read) owners are unknown, not independent', async () => {

@@ -141,8 +141,8 @@ export class EligibilityFilter {
       threshold: `< ${MAX_DEV_PCT}%`,
       reason: hasDevData
         ? devStatus === 'PASS'
-          ? `Creator holds ${token.devHoldingPct!.toFixed(1)}%, within safe tolerance.`
-          : `Creator holds excessive supply (${token.devHoldingPct!.toFixed(1)}%). High rug risk.`
+          ? `Creator holds at most ${token.devHoldingPct!.toFixed(1)}% (its own accounts, its funder cluster and every holder not known to be independent), within safe tolerance.`
+          : `Creator may hold excessive supply (${token.devHoldingPct!.toFixed(1)}%: its own accounts, its funder cluster and every holder not known to be independent). High rug risk.`
         : isLiveMode
         ? 'Creator holding percentage is unknown. Fail-closed rejection on live trading.'
         : 'Creator holding unverified in simulated execution.',

@@ -7,8 +7,8 @@ import { WatchWindow } from '../server/signals/watchWindow';
 /**
  * Devnet run 2026-10-27 (fresh scratch), step (a): QuickNode's plan refuses getMultipleAccounts over 5 keys (HTTP 413), and R2-3 read the
  * owners of up to 20 large holders in ONE call, so every coin with more than 5 large holders had all of them UNKNOWN. The owners are now
- * read GET_MULTIPLE_ACCOUNTS_MAX_KEYS at a time. A failed read never raises the creator figure: unreadable holders are UNKNOWN (one
- * top-10 entry), never the creator's. Real fetchTokenHolderDistribution; the RPC is a fake with QuickNode's limit.
+ * read GET_MULTIPLE_ACCOUNTS_MAX_KEYS at a time. Unreadable holders are UNKNOWN: one top-10 entry, and (R13-3) counted against the
+ * creator cap. Real fetchTokenHolderDistribution; the RPC is a fake with QuickNode's limit.
  */
 const SUPPLY = 1_000_000_000_000_000n;
 const pk = () => Keypair.generate().publicKey;
@@ -34,7 +34,7 @@ function quicknodeLike(holders: Array<{ address?: PublicKey; owner: PublicKey; p
   };
 }
 
-describe('holder-owner reads fit the RPC plan, and a failed read never makes up a creator figure', () => {
+describe('holder-owner reads fit the RPC plan, and a failed read is never taken as independent', () => {
   it('12 large holders on a 5-key plan: read in batches of at most 5, every owner known, the creator-owned account counted as the creator\'s', async () => {
     const creator = pk();
     const ww = new WatchWindow({ publicFunders: [] });
@@ -51,14 +51,16 @@ describe('holder-owner reads fit the RPC plan, and a failed read never makes up 
     expect(GET_MULTIPLE_ACCOUNTS_MAX_KEYS).toBe(5);
   });
 
-  it('every owner read failing: the creator figure is the creator\'s own token account only (never more); the rest is one unknown top-10 entry', async () => {
+  it('every owner read failing: every unread holder is unknown, one top-10 entry, and (R13-3) counted against the creator cap', async () => {
     const creator = pk();
     const mint = pk();
     const creatorAta = PumpCurveService.getAssociatedTokenAddress(mint, creator, TOKEN_PROGRAM_ID);
     const others = Array.from({ length: 12 }, pk);
     const f = quicknodeLike([{ address: creatorAta, owner: creator, pct: 3 }, { owner: creator, pct: 8 }, ...others.map((owner) => ({ owner, pct: 1 }))], { allFail: true });
     const d = await fetchTokenHolderDistribution(f.conn, mint, creator, undefined, new WatchWindow({ publicFunders: [] }));
-    expect(d.devHoldingPct).toBeCloseTo(3, 6); // the 8% the creator owns elsewhere is not visible without the owner read: UNKNOWN, not the creator's
+    // R13-3: the 8% the creator owns elsewhere is not visible without the owner read; it and the 12 x 1% are UNKNOWN, and any of them may be
+    // the creator's, so they count against the creator cap (was 3: the creator's own token account only)
+    expect(d.devHoldingPct).toBeCloseTo(3 + 8 + 12, 6);
     expect(d.unknownHolderBalance).toBe(amt(8) + amt(1) * 12n);
     expect(d.top10HoldersPct).toBeCloseTo(20, 6);
   });

@@ -21,6 +21,7 @@ import { HardenedRiskEngine } from '../server/risk/riskEngine';
 import { EligibilityFilter } from '../server/signals/eligibilityFilter';
 import fs from 'fs';
 import path from 'path';
+import { withIndependentOwners } from './helpers/independentHolders';
 
 describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () => {
   const CANONICAL_FEE_RECIPIENT = new PublicKey('62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV');
@@ -69,11 +70,13 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
         }),
       } as unknown as Connection;
 
+      const known = withIndependentOwners(mockConnection); // R13-3: the other holders are known independent
       const dist: TokenHolderDistribution = await fetchTokenHolderDistribution(
-        mockConnection,
+        known.conn,
         mint,
         creator,
-        bondingCurve
+        bondingCurve,
+        known.ww
       );
 
       expect(dist.mint).toBe(mint.toBase58());
@@ -160,7 +163,8 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
         getTokenSupply: async () => ({ value: { amount: '1000000000000000', decimals: 6, uiAmount: 1000000000 }, context: { slot: 1 } }),
       } as unknown as Connection;
 
-      const dist = await PumpCurveService.fetchTokenHolderDistribution(mockConn, mint, creator, bondingCurve);
+      const known = withIndependentOwners(mockConn); // R13-3: the other holders are known independent
+      const dist = await PumpCurveService.fetchTokenHolderDistribution(known.conn, mint, creator, bondingCurve, known.ww);
       expect(dist.devHoldingPct).toBe(0.9); // C1: share of total supply
       expect(dist.devHoldingPct).toBeLessThanOrEqual(10.0);
       expect(dist.top10HoldersPct).toBeLessThanOrEqual(40.0);

@@ -4,6 +4,7 @@ import { fetchTokenHolderDistribution, PumpCurveService } from '../server/solana
 import { EligibilityFilter } from '../server/signals/eligibilityFilter';
 import { MAX_TOP10_HOLDERS_PCT, MAX_CREATOR_HOLDING_PCT } from '../server/solana/executionConfig';
 import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
+import { withIndependentOwners } from './helpers/independentHolders';
 
 const SUPPLY = 1_000_000_000n;
 const mint = Keypair.generate().publicKey;
@@ -12,7 +13,12 @@ const [curve] = PumpCurveService.getBondingCurveAddress(mint);
 const curveAta = PumpCurveService.getAssociatedTokenAddress(mint, curve, TOKEN_PROGRAM_ID);
 const creatorAta = PumpCurveService.getAssociatedTokenAddress(mint, creator, TOKEN_PROGRAM_ID);
 
-// Hand-built getTokenLargestAccounts fixtures. Amounts are in % of total supply.
+// Hand-built getTokenLargestAccounts fixtures. Amounts are in % of total supply. R13-3: the other holders' owners are read and known as
+// independent (an unknown holder would count against the creator cap).
+function holderFetch(rows: Array<[PublicKey, number]>) {
+  const { conn: c, ww } = withIndependentOwners(conn(rows));
+  return fetchTokenHolderDistribution(c, mint, creator, curve, ww);
+}
 function conn(rows: Array<[PublicKey, number]>) {
   return {
     getTokenLargestAccounts: async () => ({
@@ -25,7 +31,7 @@ const holders = (n: number, pct: number): Array<[PublicKey, number]> =>
   Array.from({ length: n }, () => [Keypair.generate().publicKey, pct]);
 
 async function gate(rows: Array<[PublicKey, number]>) {
-  const d = await fetchTokenHolderDistribution(conn(rows), mint, creator, curve);
+  const d = await holderFetch(rows);
   const report = EligibilityFilter.evaluate(
     { mint: mint.toBase58(), symbol: 'T', name: 'T', top10HoldersPct: d.top10HoldersPct, devHoldingPct: d.devHoldingPct } as any,
     'PAPER'
@@ -67,10 +73,10 @@ describe('C1: holder concentration is a share of TOTAL supply', () => {
   });
 
   it('creator holding above the cap is rejected by the real filter; below it passes', async () => {
-    const heavy = await fetchTokenHolderDistribution(conn([[curveAta, 50], [creatorAta, 8], ...holders(10, 1)]), mint, creator, curve);
+    const heavy = await holderFetch([[curveAta, 50], [creatorAta, 8], ...holders(10, 1)]);
     const report = EligibilityFilter.evaluate({ mint: mint.toBase58(), symbol: 'T', name: 'T', top10HoldersPct: heavy.top10HoldersPct, devHoldingPct: heavy.devHoldingPct } as any, 'PAPER');
     expect(report.checks.find((c) => c.ruleId === 'MAX_CREATOR_EXPOSURE')!.passed).toBe(false);
-    const ok = await fetchTokenHolderDistribution(conn([[curveAta, 50], [creatorAta, 4], ...holders(10, 1)]), mint, creator, curve);
+    const ok = await holderFetch([[curveAta, 50], [creatorAta, 4], ...holders(10, 1)]);
     const r2 = EligibilityFilter.evaluate({ mint: mint.toBase58(), symbol: 'T', name: 'T', top10HoldersPct: ok.top10HoldersPct, devHoldingPct: ok.devHoldingPct } as any, 'PAPER');
     expect(r2.checks.find((c) => c.ruleId === 'MAX_CREATOR_EXPOSURE')!.passed).toBe(true);
   });

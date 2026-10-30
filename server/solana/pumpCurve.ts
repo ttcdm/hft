@@ -421,10 +421,10 @@ export interface TokenHolderDistribution {
   creatorBalance: bigint;
   /** R2-3: large holders whose owner the funder lookups tie to the creator (CREATOR_CLUSTER, or a non-ATA account of the creator). In devHoldingPct. */
   creatorClusterBalance: bigint;
-  /** R2-3: large holders whose owner or funding is not known (UNKNOWN). Counted together as one holder in top10HoldersPct. */
+  /** R2-3: large holders whose owner or funding is not known (UNKNOWN). Counted together as one holder in top10HoldersPct, and (R13-3) in devHoldingPct. */
   unknownHolderBalance: bigint;
   top10HoldersPct: number;
-  /** The creator's own accounts plus its funder cluster (R2-3), as a share of total supply. */
+  /** The creator's own accounts plus its funder cluster (R2-3) plus every UNKNOWN holder (R13-3), as a share of total supply: the most the creator can hold. */
   devHoldingPct: number;
   topHolders: Array<{ address: string; amount: bigint; pct: number; owner?: string | null; holderClass?: HolderClass | 'CREATOR_ATA' }>;
 }
@@ -464,7 +464,7 @@ async function tokenAccountOwners(connection: Connection, accounts: PublicKey[])
  * lookups' knowledge (`holderFunders`, default the watch window, see server/signals/holderCluster.ts). Holdings the creator's funder cluster
  * owns count in devHoldingPct with the creator's own. Fail closed for LIVE: a holder whose owner or funding is unknown is never taken as
  * independent; all unknown holders together count as ONE holder in the top-10 figure (so 40 unknown wallets at 1.8% read as 36% of the top
- * 20 accounts, not 18%).
+ * 20 accounts, not 18%), and (R13-3) their holdings count in devHoldingPct, since any of them may be the creator's.
  */
 export async function fetchTokenHolderDistribution(
   connection: Connection,
@@ -594,7 +594,9 @@ export async function fetchTokenHolderDistribution(
     totalSupply > 0n ? Number(((Number(amt) / Number(totalSupply)) * 100).toFixed(2)) : 0;
   const top10HoldersPct = pctOfTotal(top10Amount);
 
-  const devHoldingPct = pctOfTotal(creatorBalance + creatorClusterBalance);
+  // R13-3: an UNKNOWN holder may be the creator's (a wallet the creator sent tokens to that never traded is never looked up), so its holding
+  // counts against the creator cap too. Fail closed: devHoldingPct is the most the creator can be holding, not what is proven.
+  const devHoldingPct = pctOfTotal(creatorBalance + creatorClusterBalance + unknownHolderBalance);
 
   const topHolders = nonCurveAccounts.map((acc) => {
     const amountBig = BigInt(acc.amount);

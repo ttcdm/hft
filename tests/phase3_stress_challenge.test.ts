@@ -19,6 +19,7 @@ import { workstationDb, WorkstationDatabase } from '../server/db/database';
 import { HardenedRiskEngine } from '../server/risk/riskEngine';
 import { EligibilityFilter } from '../server/signals/eligibilityFilter';
 import fs from 'fs';
+import { withIndependentOwners } from './helpers/independentHolders';
 import path from 'path';
 
 describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
@@ -132,7 +133,8 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
         }),
       } as unknown as Connection;
 
-      const dist = await fetchTokenHolderDistribution(mockConn, mint, creator, bondingCurve);
+      const known = withIndependentOwners(mockConn); // R13-3: the other holders are known independent
+      const dist = await fetchTokenHolderDistribution(known.conn, mint, creator, bondingCurve, known.ww);
       expect(dist.devHoldingPct).toBe(15.0);
       // C1: creator excluded; 9 * 5M = 45M / 300M = 15.0%
       expect(dist.top10HoldersPct).toBe(15.0);
@@ -187,7 +189,8 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
         }),
       } as unknown as Connection;
 
-      const dist = await fetchTokenHolderDistribution(mockConn, mint, creator, bondingCurve);
+      const known = withIndependentOwners(mockConn); // R13-3: the other holders are known independent
+      const dist = await fetchTokenHolderDistribution(known.conn, mint, creator, bondingCurve, known.ww);
       expect(dist.devHoldingPct).toBe(2.0);
       expect(dist.top10HoldersPct).toBe(48.0);
 
@@ -245,7 +248,8 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
         },
       } as unknown as Connection;
 
-      const dist = await fetchTokenHolderDistribution(mockConn, mint, creator, bondingCurve);
+      const known = withIndependentOwners(mockConn); // R13-3: the other holders are known independent
+      const dist = await fetchTokenHolderDistribution(known.conn, mint, creator, bondingCurve, known.ww);
       expect(dist.creatorBalance).toBe(15000000000000n);
       expect(dist.devHoldingPct).toBe(1.5);
     });

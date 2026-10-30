@@ -1754,6 +1754,7 @@ export class ExecutionCoordinator {
     if (isReadOnly()) {
       // S185: read-only never arms, and never claims to have changed mode; disarming has nothing to undo.
       this.isLiveTradingArmed = false;
+      this.liveDisarmSeq++; // R14-7
       this.executionMode = 'PAPER';
       return { success: false, message: 'READ_ONLY: APEX_READ_ONLY=true. This server watches and paper trades only; live trading cannot be armed.', reasons: ['APEX_READ_ONLY=true'] };
     }
@@ -1797,6 +1798,7 @@ export class ExecutionCoordinator {
       return { success: true, message: 'Live trading armed successfully. Transactions will be broadcast on Solana.' };
     } else {
       this.isLiveTradingArmed = false;
+      this.liveDisarmSeq++; // R14-7: a BUY already in the send path stops resending
       this.executionMode = 'PAPER';
       Logger.info('Live trading disarmed. Switched to PAPER mode.');
       return { success: true, message: 'Trading disarmed. System is operating in PAPER mode.' };
@@ -1999,16 +2001,24 @@ export class ExecutionCoordinator {
   }
 
   /**
-   * R1 #8, R3-28: why a signed BUY must not be sent (or resent) now: the kill switch is on, trading is halted, or (first send only) the
-   * send deadline set from the signal and market-data ages has passed. null when it may go. Never asked for a SELL: a protective exit is
-   * never held by the kill switch.
+   * R1 #8, R3-28, R14-7: why a signed BUY must not be sent, or resent, now: the kill switch is on, trading is halted, the send deadline set from
+   * the signal and market-data ages has passed (every send, resends included: a rebroadcast is a fresh chance for a stale entry to land), LIVE
+   * was disarmed since the order went to the send path (`disarmSeqAtSend`, the liveDisarmSeq it read then; a re-arm does not undo it), or a
+   * start lock is lost (another process may own the database or key now). null when it may go. Never asked for a SELL: a protective exit is
+   * never held by any of these.
    */
-  private buySendRefusal(notAfter?: number): string | null {
+  private buySendRefusal(notAfter?: number, disarmSeqAtSend?: number): string | null {
     if (riskEngine.isKillSwitchActive()) return 'the kill switch was activated';
     if (this.haltReason) return `trading was halted (${this.haltReason})`;
-    if (typeof notAfter === 'number' && Date.now() > notAfter) return `the signal or its market data is past the risk engine's age limit (send deadline ${new Date(notAfter).toISOString()})`;
+    if (typeof disarmSeqAtSend === 'number' && this.liveDisarmSeq !== disarmSeqAtSend) return 'live trading was disarmed';
+    const lostLock = this.lostStartLock();
+    if (lostLock) return `this process lost its start lock ${lostLock} (another process may own this database or key now)`;
+    if (typeof notAfter === 'number' && !(Date.now() <= notAfter)) return `the signal or its market data is past the risk engine's age limit (send deadline ${new Date(notAfter).toISOString()})`;
     return null;
   }
+
+  /** R14-7: counts every disarm (armLiveTrading(false), and the read-only refusal), so a BUY in flight can tell that one happened since its send began. */
+  private liveDisarmSeq = 0;
 
   // Idempotent, bounded Jito retry loop with pre-checks and zero-double-fill RPC fallback (R0.6)
   /**
@@ -2122,7 +2132,7 @@ export class ExecutionCoordinator {
     jitoTipLamports: number;
     /** SELL only: the exit reason, stored on the transaction row (see exitStageAfterFill). */
     exitReason?: string;
-    /** BUY only (R3-28): wall-clock ms after which the first send is refused (the signal or market data would be stale). */
+    /** BUY only (R3-28, R14-7): wall-clock ms after which no send or resend goes out (the signal or market data would be stale). */
     buyNotAfter?: number;
   }): Promise<{
     success: boolean;
@@ -2136,6 +2146,7 @@ export class ExecutionCoordinator {
     unconfirmed?: boolean;
   }> {
     const { tx, orderId, correlationId, side, mint, mintPubkey, owner, tokenProgram, preSnapshot, jitoTipLamports } = params;
+    const disarmSeqAtSend = this.liveDisarmSeq; // R14-7: a disarm from here on stops this BUY's sends and resends
     assertNotReadOnly(`sending a ${side} order`); // S185: the one place every signed buy and sell is submitted from
     const cfg = executionConfig.getConfig();
 
@@ -2217,7 +2228,7 @@ export class ExecutionCoordinator {
 
       // R1 #8: a kill or halt between signing and this send (or between two resends) stops the BUY here; a SELL is never held
       if (side === 'BUY') {
-        const refused = this.buySendRefusal(lastSignature || lastBundleId ? undefined : params.buyNotAfter);
+        const refused = this.buySendRefusal(params.buyNotAfter, disarmSeqAtSend);
         if (refused) return this.revokedBuyResult(refused, params, lastSignature, lastBundleId, 'JITO');
       }
 
@@ -2337,7 +2348,7 @@ export class ExecutionCoordinator {
 
       // R1 #8: the last look before the RPC send of a BUY (after the genesis check, any Jito probe and the Jito attempts)
       if (side === 'BUY') {
-        const refused = this.buySendRefusal(lastSignature || lastBundleId ? undefined : params.buyNotAfter);
+        const refused = this.buySendRefusal(params.buyNotAfter, disarmSeqAtSend);
         if (refused) return this.revokedBuyResult(refused, params, lastSignature, lastBundleId, 'SOLANA_RPC');
       }
 
@@ -2389,8 +2400,9 @@ export class ExecutionCoordinator {
       const rpcConfirm = await traced('tx.confirm', () => this.rpcTransport.confirm(rpcSubmit.signature, cfg.rpcFallbackTimeoutMs || 15000, undefined, {
         rebroadcast: tx,
         lastValidBlockHeight: txBuilder.lastValidBlockHeightOf((tx as any)?.message?.recentBlockhash),
-        // R1 #8: a kill or halt during the watch stops the resends of a BUY (the watch itself goes on); a SELL keeps every resend
-        ...(side === 'BUY' ? { stopResends: () => this.buySendRefusal() } : {}),
+        // R1 #8, R14-7: a kill, halt, disarm, lost start lock or passed send deadline during the watch stops the resends of a BUY (the watch
+        // itself goes on); a SELL keeps every resend
+        ...(side === 'BUY' ? { stopResends: () => this.buySendRefusal(params.buyNotAfter, disarmSeqAtSend) } : {}),
       }), { 'apex.transport': 'SOLANA_RPC', 'apex.side': side });
       if (rpcConfirm.confirmed) {
         return {

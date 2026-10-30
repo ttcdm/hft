@@ -38,7 +38,7 @@ There are five different stops. Only stopping the process stops the exits too.
 | Halt (set by the DEVNET_LIVE wallet audit; no operator route sets it) | yes | take-profit and stale exits only | OFF | yes (saved in the database) |
 | Stop the process | yes | yes, all of them | n/a | n/a |
 
-Disarming LIVE, the kill switch and the halt do not stop a LIVE stop-loss, trailing stop, manual close or panic sell. A LIVE sell needs a READY signer, not read-only mode, a non-mainnet `ALLOWED_CLUSTER` and a matching genesis hash; it does not need LIVE to be armed.
+Disarming LIVE, the kill switch and the halt do not stop a LIVE stop-loss, trailing stop, manual close or panic sell. They do stop a LIVE buy that is already being sent: from the disarm, kill or halt on (and likewise once the buy's send deadline has passed or the server has lost its instance lock) the signed buy is not resent through Jito, the RPC fallback or the RPC watch's rebroadcasts. A send that already went out may still land; it is reported unconfirmed and watched, orphan recovery adopts it if it lands, and the late-buy rule sells it after a panic or kill. A LIVE sell needs a READY signer, not read-only mode, a non-mainnet `ALLOWED_CLUSTER` and a matching genesis hash; it does not need LIVE to be armed.
 
 Older notes name a `/api/live/disarm` route: it does not exist (404). To disarm LIVE without the kill switch, send `POST /api/execution/arm` with `{"arm":false}`.
 

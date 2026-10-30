@@ -41,6 +41,20 @@ const short = (m: string) => `${m.slice(0, 4)}…${m.slice(-4)}`;
 const cell = 'px-3 py-2 text-right font-mono tabular-nums';
 const headLeft = 'px-3 py-2 text-left text-[10px] uppercase tracking-wider text-slate-500 font-semibold';
 const head = 'px-3 py-2 text-right text-[10px] uppercase tracking-wider text-slate-500 font-semibold';
+// R11-11: at 390 px the section's overflow-hidden cut the AGE and NEXT EXIT columns off; each table now scrolls sideways in its own box
+const tableBox = 'overflow-x-auto';
+const tableCls = 'w-full text-xs whitespace-nowrap';
+
+/** R11-11: rows were mouse-only (<tr onClick>). The token cell is a real button: Tab reaches it, Enter and Space press it. */
+function RowSelect({ mint, label, onSelect, selected, children }: { mint: string; label: string; onSelect?: (mint: string) => void; selected?: boolean; children: React.ReactNode }) {
+  return (
+    <button type="button" data-testid="board-row-select" aria-label={`Show the curve for ${label}`} aria-pressed={!!selected}
+      onClick={(e) => { e.stopPropagation(); onSelect?.(mint); }}
+      className="text-left rounded focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400">
+      {children}
+    </button>
+  );
+}
 
 export function WalletStrip({ wallet, mode }: { wallet: BoardData['wallet']; mode: string }) {
   const item = (label: string, value: string, testId: string, age?: { text: string; warn: boolean }) => (
@@ -103,13 +117,13 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
       </div>
       {!board && <div className="p-6 text-sm text-slate-500">Loading… (sign in as operator to read the board)</div>}
       {board && tab === 'launches' && (
-        <table className="w-full text-xs">
+        <div className={tableBox}><table className={tableCls}>
           <thead><tr><th className={headLeft}>Token</th><th className={head}>Price (SOL)</th><th className={head}>Curve</th><th className={head} title="Share of the tokens OFF the bonding curve held by the 10 largest holders. The holder gate uses share of total supply, a different figure.">Top10 % (off-curve)</th><th className={head}>Creator %</th><th className={head} title="Time since the launch entered the watch window; — when it is not being watched">Age</th></tr></thead>
           <tbody>
             {board.launches.length === 0 && <tr><td colSpan={6} className="p-6 text-center text-slate-500">No launches seen yet. The board fills from the Pump.fun create-event stream.</td></tr>}
             {board.launches.map((l) => (
               <tr key={l.mint} onClick={() => onSelect?.(l.mint)} className={`border-t border-slate-800/60 cursor-pointer hover:bg-slate-900 ${selected === l.mint ? 'bg-slate-900' : ''}`}>
-                <td className="px-3 py-2 text-left"><span className="font-bold text-slate-100" title={displayName(l.name)}>{dollarSymbol(l.symbol)}</span> <span className="text-slate-500 font-mono">{short(l.mint)}</span></td>
+                <td className="px-3 py-2 text-left"><RowSelect mint={l.mint} label={`${dollarSymbol(l.symbol)} ${short(l.mint)}`} onSelect={onSelect} selected={selected === l.mint}><span className="font-bold text-slate-100" title={displayName(l.name)}>{dollarSymbol(l.symbol)}</span> <span className="text-slate-500 font-mono">{short(l.mint)}</span></RowSelect></td>
                 <td className={cell}>{fmtPrice(l.priceSol)}</td>
                 <td className={cell}>{fmt(l.curveProgressPct, 1, '%')}</td>
                 <td className={cell}>{fmt(l.top10HoldersPct, 1, '%')}</td>
@@ -118,16 +132,16 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
       )}
       {board && tab === 'watching' && (
-        <table className="w-full text-xs">
+        <div className={tableBox}><table className={tableCls}>
           <thead><tr><th className={headLeft}>Token</th><th className={head}>State</th><th className={head}>Net inflow</th><th className={head}>Buyers</th><th className={head}>Buy:sell</th><th className={head}>Top buyer</th><th className={head}>Creator sold</th></tr></thead>
           <tbody>
             {board.watching.length === 0 && <tr><td colSpan={7} className="p-6 text-center text-slate-500">Nothing in the watch window.</td></tr>}
             {board.watching.map((w) => (
               <tr key={w.mint} onClick={() => onSelect?.(w.mint)} className="border-t border-slate-800/60 cursor-pointer hover:bg-slate-900" title={w.reason ?? ''}>
-                <td className="px-3 py-2 text-left font-mono text-slate-300">{short(w.mint)}</td>
+                <td className="px-3 py-2 text-left font-mono text-slate-300"><RowSelect mint={w.mint} label={w.mint} onSelect={onSelect} selected={selected === w.mint}>{short(w.mint)}</RowSelect></td>
                 <td className={cell}><span className={`px-1.5 py-0.5 rounded font-bold ${STATE_STYLE[w.state]}`}>{w.state}</span></td>
                 <td className={cell}>{w.metrics.tradeCount === 0 ? DASH : `${fmt(w.metrics.cumulativeNetInflowSol, 3)} SOL`}</td>
                 <td className={cell}>{w.metrics.rawUniqueBuyers === 0 ? DASH : `${w.metrics.uniqueBuyers}${w.metrics.funderCoverage < 1 ? '?' : ''}`}</td>
@@ -137,16 +151,16 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
       )}
       {board && tab === 'holding' && (
-        <table className="w-full text-xs">
+        <div className={tableBox}><table className={tableCls}>
           <thead><tr><th className={headLeft}>Position</th><th className={head}>Entry</th><th className={head}>Mark (age)</th><th className={head} title="At the curve spot price; exit fee, price impact and tip are not taken off">PnL at mark (SOL, before exit costs)</th><th className={head}>Next exit</th></tr></thead>
           <tbody>
             {board.holding.length === 0 && <tr><td colSpan={5} className="p-6 text-center text-slate-500">No open positions.</td></tr>}
             {board.holding.map((h) => (
               <tr key={h.id} onClick={() => onSelect?.(h.mint)} className="border-t border-slate-800/60 cursor-pointer hover:bg-slate-900">
-                <td className="px-3 py-2 text-left"><span className="font-bold text-slate-100">{dollarSymbol(h.symbol)}</span> <span className="text-slate-500">{h.mode}</span></td>
+                <td className="px-3 py-2 text-left"><RowSelect mint={h.mint} label={`${dollarSymbol(h.symbol)} (${h.mode})`} onSelect={onSelect} selected={selected === h.mint}><span className="font-bold text-slate-100">{dollarSymbol(h.symbol)}</span> <span className="text-slate-500">{h.mode}</span></RowSelect></td>
                 <td className={cell}>{fmtPrice(h.entryPriceSol)}</td>
                 <td className={cell}>
                   {fmtPrice(h.markPriceSol)}
@@ -158,7 +172,7 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
       )}
     </section>
   );

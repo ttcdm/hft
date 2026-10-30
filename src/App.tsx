@@ -20,7 +20,7 @@ import { CurvePanel } from './components/CurvePanel';
 import { AutoPanel } from './components/AutoPanel';
 import { usePolled } from './utils/usePolled';
 import { readServerAlerts, serverAlertEvents, alertsUnreadableEvent, killSwitchStateAlert, acknowledgeServerAlert } from './utils/operatorAlerts';
-import { killSwitchPress } from './utils/killSwitchPress';
+import { killSwitchPress, shownKillState, killStateIsStale, KILL_STATE_TIMEOUT_MS, type KillStateRead } from './utils/killSwitchPress';
 import { exitAlerts, type WatchedPosition } from './utils/exitWatch';
 import { PanelErrorBoundary } from './components/ErrorBoundaries';
 import { ConfirmHost, askConfirm } from './components/ConfirmDialog';
@@ -48,14 +48,18 @@ export function makeEmptyKpis(startingEquity: number): PerformanceKPIs {
 
 export default function App() {
   // Master Kill Switch State
-  // R10-2: null until the server has answered (and again when it cannot be read): never a guessed "not engaged"
-  const [isHalted, setIsHalted] = useState<boolean | null>(null);
+  // R10-2: null until the server has answered (and again when it cannot be read): never a guessed "not engaged".
+  // R12-1: also null when the last good read is older than KILL_STATE_MAX_AGE_MS (a hung poll), see readKillState below.
+  const [killRead, setKillRead] = useState<KillStateRead>({ value: null, at: null, failed: false });
+  const [killStale, setKillStale] = useState(true);
+  const isHalted = shownKillState(killRead, killStale);
   // R9-1: when the switch was last seen turning on (by this button or the poll), so a double tap does not resume trading.
+  // R13-5: an unknown read does not reset it; only the server saying OFF does.
   const haltedSince = useRef<number | null>(null);
   const [haltedSinceAt, setHaltedSinceAt] = useState<number | null>(null);
   useEffect(() => {
     if (isHalted && haltedSince.current === null) haltedSince.current = Date.now();
-    if (!isHalted) haltedSince.current = null;
+    if (isHalted === false) haltedSince.current = null;
     setHaltedSinceAt(haltedSince.current);
   }, [isHalted]);
   const [selectedMint, setSelectedMint] = useState<string | null>(null);
@@ -207,21 +211,39 @@ export default function App() {
 
   // R25: the header must show the server's kill-switch state, not a local guess: a panic liquidation, the RPC auto-trip, another
   // tab or a reload all change it without this component knowing.
-  useEffect(() => {
-    let alive = true;
-    const load = async () => {
-      try {
-        const r = await authFetch('/api/diagnostics/system');
-        if (!alive) return;
-        if (!r.ok) { setIsHalted(null); return; } // R10-2: logged out or refused: the state is unknown
-        const j = await r.json();
-        if (alive) setIsHalted(typeof j?.systemAudit?.killSwitchActive === 'boolean' ? j.systemAudit.killSwitchActive : null);
-      } catch { if (alive) setIsHalted(null); }
-    };
-    load();
-    const t = setInterval(load, 5000);
-    return () => { alive = false; clearInterval(t); };
+  // R12-1: each read is aborted after KILL_STATE_TIMEOUT_MS, and only the newest read (or a confirmed press) may set the state, so a
+  // slow answer to an older read cannot overwrite a newer one. A 1 s check turns the header UNKNOWN once the last good read is too old.
+  const killSeq = useRef(0);
+  const killReadRef = useRef(killRead);
+  killReadRef.current = killRead;
+  const mounted = useRef(true);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  const setKnownKillState = useCallback((value: boolean) => {
+    killSeq.current++; // a read already out was sent before this answer: it must not overwrite it
+    setKillRead({ value, at: Date.now(), failed: false });
+    setKillStale(false);
   }, []);
+  const readKillState = useCallback(async () => {
+    const seq = ++killSeq.current;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), KILL_STATE_TIMEOUT_MS);
+    const failed = () => { if (mounted.current && seq === killSeq.current) setKillRead((p) => ({ ...p, failed: true })); };
+    try {
+      const r = await authFetch('/api/diagnostics/system', { signal: ctl.signal });
+      if (!r.ok) { failed(); return; } // R10-2: logged out or refused: the state is unknown
+      const j = await r.json();
+      const v = j?.systemAudit?.killSwitchActive;
+      if (!mounted.current || seq !== killSeq.current) return;
+      if (typeof v === 'boolean') { setKillRead({ value: v, at: Date.now(), failed: false }); setKillStale(false); }
+      else failed();
+    } catch { failed(); } finally { clearTimeout(timer); }
+  }, []);
+  useEffect(() => {
+    void readKillState();
+    const t = setInterval(() => void readKillState(), 5000);
+    const age = setInterval(() => setKillStale(killStateIsStale(killReadRef.current, Date.now())), 1000);
+    return () => { clearInterval(t); clearInterval(age); };
+  }, [readKillState]);
 
   // Emergency kill switch: the server decides. The UI only shows "halted" after the server confirmed it.
   const killInFlight = useRef(false);
@@ -244,7 +266,7 @@ export default function App() {
         throw new Error(body.error || `server answered HTTP ${res.status}`);
       }
       if (nextHalted) haltedSince.current = Date.now();
-      setIsHalted(nextHalted);
+      setKnownKillState(nextHalted);
       hftAudio.playKillSwitch(); // R33: after the server confirmed, not before
       // R10-1: the ENGAGED alert comes from the state (killSwitchStateAlert below), so a reset here or in another tab removes it
       if (!nextHalted) {

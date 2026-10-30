@@ -12,7 +12,7 @@ describe('L6: the header kill switch calls the server', () => {
   });
 
   it('only shows "halted" after the server confirmed it, and says so loudly when it did not', () => {
-    expect(fn.indexOf('setIsHalted(nextHalted)')).toBeGreaterThan(fn.indexOf('killSwitchActive !== nextHalted'));
+    expect(fn.indexOf('setKnownKillState(nextHalted)')).toBeGreaterThan(fn.indexOf('killSwitchActive !== nextHalted'));
     expect(fn).toMatch(/KILL SWITCH NOT CONFIRMED/);
   });
 

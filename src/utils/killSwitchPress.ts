@@ -29,3 +29,22 @@ export async function killSwitchPress(
   if (haltedSinceMs !== null && nowMs - haltedSinceMs < RESUME_GUARD_MS) return { action: 'IGNORE', reason: 'DOUBLE_PRESS' };
   return (await confirmResume(RESUME_CONFIRM_TEXT)) ? { action: 'RESUME', activate: false } : { action: 'IGNORE', reason: 'NOT_CONFIRMED' };
 }
+
+/**
+ * R12-1: the header's read of the server's kill switch. A read that does not answer within KILL_STATE_TIMEOUT_MS is aborted and counts as
+ * failed, and a last good read older than KILL_STATE_MAX_AGE_MS is not shown as current: either way the header says UNKNOWN, never the
+ * old state. `value` and `at` keep the last good answer (R13-5 still needs to know the switch was last seen ON).
+ */
+export const KILL_STATE_TIMEOUT_MS = 4_000;
+export const KILL_STATE_MAX_AGE_MS = 10_000;
+
+export interface KillStateRead { value: boolean | null; at: number | null; failed: boolean }
+
+export function killStateIsStale(read: KillStateRead, nowMs: number): boolean {
+  return read.at === null || nowMs - read.at > KILL_STATE_MAX_AGE_MS;
+}
+
+/** The state the header shows: the server's answer, or null (UNKNOWN) when the latest read failed or the last good one is too old. */
+export function shownKillState(read: KillStateRead, stale: boolean): boolean | null {
+  return read.failed || stale || read.at === null ? null : read.value;
+}

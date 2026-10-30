@@ -63,7 +63,7 @@ import {
   SniperBotConfig,
   MemecoinPlatform,
 } from '../types';
-import { engineClient } from '../services/engineClient';
+import { engineClient, useWsStreaming } from '../services/engineClient';
 import { fmtRank, fmtSmall, fmtUsdPrice } from '../utils/numFormat';
 import { sellConfirmText, sellDoneTitle } from '../utils/sellConfirm';
 import { hftAudio } from '../utils/audio';
@@ -264,7 +264,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     }
   };
 
-  const [isWsLive, setIsWsLive] = useState(engineClient.isWsConnected());
+  const isWsLive = useWsStreaming(); // R9-7: open, authenticated, online and not quiet, re-checked every second
   const [signalsRead, setSignalsRead] = useState<'pending' | 'ok' | 'failed'>('pending');
 
   // Deduplicate pools by CA and ID to guarantee unique React keys
@@ -311,7 +311,6 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
     // Subscribe to real-time WebSocket push updates
     const unsubSnapshot = engineClient.onMemecoinSnapshot((data) => {
-      setIsWsLive(true);
       if (data.pools) setPools(deduplicatePools(data.pools));
       if (data.positions) setPositions(data.positions);
       if (data.config) setSniperConfig(data.config);
@@ -325,7 +324,6 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     });
 
     const interval = setInterval(() => {
-      setIsWsLive(engineClient.isWsConnected());
       refreshData();
     }, 5000);
 

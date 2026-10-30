@@ -48,7 +48,7 @@ import {
   PumpFunCaller,
   PumpFunHotCalloutsResponse,
 } from '../types';
-import { engineClient } from '../services/engineClient';
+import { engineClient, useWsStreaming } from '../services/engineClient';
 import { hftAudio } from '../utils/audio';
 import { DecimalBox } from './DecimalBox';
 import { DialogFrame } from './DialogFrame';
@@ -214,7 +214,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   const [snipingCalloutId, setSnipingCalloutId] = useState<string | null>(null);
   const [selectedCallerModal, setSelectedCallerModal] = useState<PumpFunCaller | null>(null);
 
-  const [isWsLive, setIsWsLive] = useState(engineClient.isWsConnected());
+  const isWsLive = useWsStreaming(); // R9-7: open, authenticated, online and not quiet, re-checked every second
 
   // Fetch callouts from backend (which polls real pump.fun & DexScreener)
   const fetchData = async () => {
@@ -243,7 +243,6 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
 
     // Real-time WebSocket subscriptions
     const unsubHotCallouts = engineClient.onPumpHotCallouts((data) => {
-      setIsWsLive(true);
       if (data.callouts) setCallouts(data.callouts);
       if (data.leaderboard) setLeaderboard(data.leaderboard);
       if (data.status) {
@@ -273,7 +272,6 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
 
     // Gentle polling fallback in case WS is interrupted
     const interval = setInterval(() => {
-      setIsWsLive(engineClient.isWsConnected());
       fetchData();
     }, 6000);
 

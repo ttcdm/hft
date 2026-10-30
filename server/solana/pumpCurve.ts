@@ -640,6 +640,18 @@ export async function fetchTokenHolderDistribution(
 export const RPC_SLOT_SKEW_TOLERANCE = 8;
 /** R4-9: the time one slot stands for when a read a few slots behind is stamped (Solana's target slot time). */
 export const SLOT_TIME_ESTIMATE_MS = 400;
+/**
+ * R13-11: a node behind the read's minContextSlot floor answers JSON-RPC -32016 ("Minimum context slot has not been reached") and web3.js
+ * throws, so every mark in that window had no price. The curve read is tried once more after this long (a slot; a load-balanced RPC may
+ * route it to a node that has caught up). Still behind: the read fails as before (RPC_ERROR), never read below the floor.
+ */
+export const MIN_CONTEXT_SLOT_RETRY_DELAY_MS = 400;
+
+/** R13-11: the RPC refused a read because its node has not reached the requested minContextSlot (JSON-RPC -32016). */
+export function isMinContextSlotNotReached(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown } | null;
+  return e?.code === -32016 || /-32016|minimum context slot has not been reached/i.test(String(e?.message ?? err));
+}
 
 export class PumpCurveService {
   public static cachedGlobal: any = null;
@@ -783,7 +795,21 @@ export class PumpCurveService {
 
       // R4-9: read with the context slot, never from a state older than one already seen on this connection
       const minContextSlot = this.minContextSlotFor(connection);
-      const read = await connection.getMultipleAccountsInfoAndContext(accountsToFetch, minContextSlot ? { minContextSlot } : undefined);
+      const readAccounts = () => connection.getMultipleAccountsInfoAndContext(accountsToFetch, minContextSlot ? { minContextSlot } : undefined);
+      let read: Awaited<ReturnType<typeof readAccounts>>;
+      try {
+        read = await readAccounts();
+      } catch (err) {
+        // R13-11: a node behind the floor: one more try a slot later, then the error stands
+        if (!minContextSlot || !isMinContextSlotNotReached(err)) throw err;
+        await new Promise((r) => setTimeout(r, MIN_CONTEXT_SLOT_RETRY_DELAY_MS));
+        try {
+          read = await readAccounts();
+        } catch (again: any) {
+          if (!isMinContextSlotNotReached(again)) throw again;
+          throw new Error(`MIN_CONTEXT_SLOT_NOT_REACHED: the RPC node is behind slot ${minContextSlot}, also on one retry ${MIN_CONTEXT_SLOT_RETRY_DELAY_MS} ms later (${again?.message || again})`, { cause: again });
+        }
+      }
       const accountInfos = read.value;
       const marketDataSlot: number | undefined = read.context?.slot;
       const highestSeen = this.slotSeen.get(connection as object)?.slot;

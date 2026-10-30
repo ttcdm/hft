@@ -14,9 +14,12 @@ const SUPPLY = 1_000_000_000_000_000n;
 const pk = () => Keypair.generate().publicKey;
 const ownerData = (owner: PublicKey) => { const d = Buffer.alloc(165); d.set(pk().toBuffer(), 0); d.set(owner.toBuffer(), 32); return d; };
 const amt = (pct: number) => (SUPPLY * BigInt(Math.round(pct * 100))) / 10_000n;
+const CURVE = pk();
 
 function quicknodeLike(holders: Array<{ address?: PublicKey; owner: PublicKey; pct: number }>, opts: { allFail?: boolean } = {}) {
-  const accounts = holders.map((h) => ({ address: h.address ?? pk(), owner: h.owner, amount: amt(h.pct) })).sort((a, b) => (a.amount < b.amount ? 1 : -1));
+  const accounts = holders.map((h) => ({ address: h.address ?? pk(), owner: h.owner, amount: amt(h.pct) }));
+  accounts.push({ address: CURVE, owner: CURVE, amount: SUPPLY - accounts.reduce((s, a) => s + a.amount, 0n) }); // R13-1: the curve holds the rest
+  accounts.sort((a, b) => (a.amount < b.amount ? 1 : -1));
   const calls: number[] = [];
   return {
     calls,
@@ -42,7 +45,7 @@ describe('holder-owner reads fit the RPC plan, and a failed read is never taken 
     others.forEach((o, i) => ww.setFunder(o.toBase58(), `independent-funder-${i}`));
     others.forEach((_, i) => ww.setNoFunder(`independent-funder-${i}`)); // R13-4: the second hop was looked up too
     const f = quicknodeLike([{ owner: creator, pct: 8 }, ...others.map((owner) => ({ owner, pct: 1 }))]); // the creator's 8% sits in a non-ATA account
-    const d = await fetchTokenHolderDistribution(f.conn, pk(), creator, undefined, ww);
+    const d = await fetchTokenHolderDistribution(f.conn, pk(), creator, CURVE, ww);
     expect(f.calls.every((n) => n <= 5)).toBe(true);
     expect(f.calls.reduce((a, b) => a + b, 0)).toBe(12);
     expect(d.unknownHolderBalance).toBe(0n);
@@ -57,7 +60,7 @@ describe('holder-owner reads fit the RPC plan, and a failed read is never taken 
     const creatorAta = PumpCurveService.getAssociatedTokenAddress(mint, creator, TOKEN_PROGRAM_ID);
     const others = Array.from({ length: 12 }, pk);
     const f = quicknodeLike([{ address: creatorAta, owner: creator, pct: 3 }, { owner: creator, pct: 8 }, ...others.map((owner) => ({ owner, pct: 1 }))], { allFail: true });
-    const d = await fetchTokenHolderDistribution(f.conn, mint, creator, undefined, new WatchWindow({ publicFunders: [] }));
+    const d = await fetchTokenHolderDistribution(f.conn, mint, creator, CURVE, new WatchWindow({ publicFunders: [] }));
     // R13-3: the 8% the creator owns elsewhere is not visible without the owner read; it and the 12 x 1% are UNKNOWN, and any of them may be
     // the creator's, so they count against the creator cap (was 3: the creator's own token account only)
     expect(d.devHoldingPct).toBeCloseTo(3 + 8 + 12, 6);

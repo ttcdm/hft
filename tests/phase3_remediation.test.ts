@@ -40,9 +40,9 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
       const creatorAta = PumpCurveService.getAssociatedTokenAddress(mint, creator, TOKEN_PROGRAM_ID);
 
       const mockHolders = [
-        // Bonding curve holds 700,000,000 tokens (70% of 1B supply)
-        { address: bondingCurveAta, amount: '700000000000000', decimals: 6, uiAmount: 700000000 },
-        // Creator ATA holds 24,000,000 tokens (8% of 300M circulating)
+        // Bonding curve holds 920,000,000 tokens (92% of 1B supply; R13-1: the accounts add up to the supply, nothing is unseen)
+        { address: bondingCurveAta, amount: '920000000000000', decimals: 6, uiAmount: 920000000 },
+        // Creator ATA holds 24,000,000 tokens (2.4% of the total supply)
         { address: creatorAta, amount: '24000000000000', decimals: 6, uiAmount: 24000000 },
         // Top holders 2 through 10 hold 9 x 6,000,000 = 54,000,000 tokens
         ...Array.from({ length: 9 }, (_, _i) => ({
@@ -80,8 +80,8 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
       );
 
       expect(dist.mint).toBe(mint.toBase58());
-      expect(dist.bondingCurveBalance).toBe(700000000000000n);
-      expect(dist.nonBondingCirculatingSupply).toBe(300000000000000n);
+      expect(dist.bondingCurveBalance).toBe(920000000000000n);
+      expect(dist.nonBondingCirculatingSupply).toBe(80000000000000n);
       expect(dist.creatorBalance).toBe(24000000000000n);
 
       // C1: creator holds 24M / 1B total supply = 2.4%
@@ -148,7 +148,7 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
       const creatorAta = PumpCurveService.getAssociatedTokenAddress(mint, creator, TOKEN_PROGRAM_ID);
 
       const mockHolders = [
-        { address: bondingCurveAta, amount: '700000000000000', decimals: 6, uiAmount: 700000000 },
+        { address: bondingCurveAta, amount: '946000000000000', decimals: 6, uiAmount: 946000000 }, // R13-1: the rest of the supply
         { address: creatorAta, amount: '9000000000000', decimals: 6, uiAmount: 9000000 }, // 3%
         ...Array.from({ length: 9 }, () => ({
           address: Keypair.generate().publicKey,

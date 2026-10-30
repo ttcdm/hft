@@ -139,9 +139,9 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
 
       const bondingCurveAta = PumpCurveService.getAssociatedTokenAddress(mint, bondingCurve, TOKEN_PROGRAM_ID);
 
-      // Largest accounts contain bonding curve and other holders, but NO creator ATA
+      // Largest accounts contain bonding curve and other holders, but NO creator ATA (R13-1: they add up to the supply, nothing unseen)
       const mockHolders = [
-        { address: bondingCurveAta, amount: '800000000000000', decimals: 6, uiAmount: 800000000 },
+        { address: bondingCurveAta, amount: '900000000000000', decimals: 6, uiAmount: 900000000 },
         { address: Keypair.generate().publicKey, amount: '50000000000000', decimals: 6, uiAmount: 50000000 },
         { address: Keypair.generate().publicKey, amount: '50000000000000', decimals: 6, uiAmount: 50000000 },
       ];
@@ -208,6 +208,8 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
         { address: bondingCurveAta, amount: '990000000000000', decimals: 6, uiAmount: 990000000 },
         { address: creatorAta, amount: '500000000000', decimals: 6, uiAmount: 500000 },
         { address: Keypair.generate().publicKey, amount: '1500000000000', decimals: 6, uiAmount: 1500000 },
+        // R13-1: the accounts add up to the supply (the rest of the 10M circulating, 8M, sits with one more holder), so nothing is unseen
+        { address: Keypair.generate().publicKey, amount: '8000000000000', decimals: 6, uiAmount: 8000000 },
       ];
 
       const mockConnection = {
@@ -234,8 +236,8 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
       // C1: share of TOTAL supply (1B tokens): 500,000 / 1,000,000,000 = 0.05%
       expect(dist.devHoldingPct).toBe(0.05);
 
-      // C1: creator excluded from top 10; remaining 1.5M of 1B total = 0.15%
-      expect(dist.top10HoldersPct).toBe(0.15);
+      // C1: creator excluded from top 10; remaining 1.5M + 8M of 1B total = 0.95%
+      expect(dist.top10HoldersPct).toBe(0.95);
     });
 
     it('B01-ADV.5: Token-2022 bonding curve ATA is correctly recognized and excluded from circulating supply', async () => {

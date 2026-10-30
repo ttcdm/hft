@@ -14,6 +14,7 @@ import { replay, wallet } from './fixtures/watch';
  */
 const SUPPLY = 1_000_000_000_000_000n;
 const pk = () => Keypair.generate().publicKey;
+const CURVE = pk();
 const sys = (source: string, destination: string) => ({ transaction: { message: { instructions: [{ program: 'system', parsed: { type: 'transfer', info: { source, destination, lamports: 5_000_000 } } }] } } });
 
 /** History RPC: one transaction per wallet, a transfer from `funderOf(wallet)` (none when null). */
@@ -33,6 +34,7 @@ function historyConn(funderOf: (w: string) => string | null) {
 /** Holder RPC: the given holders as the largest accounts, with their owners. */
 function holderConn(holders: Array<{ owner: PublicKey; pct: number }>) {
   const accounts = holders.map((h) => ({ address: pk(), owner: h.owner, amount: (SUPPLY * BigInt(Math.round(h.pct * 100))) / 10_000n }));
+  accounts.push({ address: CURVE, owner: CURVE, amount: SUPPLY - accounts.reduce((s, a) => s + a.amount, 0n) }); // the curve holds the rest
   const ownerData = (owner: PublicKey) => { const d = Buffer.alloc(165); d.set(pk().toBuffer(), 0); d.set(owner.toBuffer(), 32); return d; };
   return {
     getTokenLargestAccounts: async () => ({ value: accounts.map((a) => ({ address: a.address, amount: a.amount.toString() })) }),
@@ -56,7 +58,7 @@ describe('R13-4: the holder gate\'s second hop is looked up in production, and a
 
     await vi.waitFor(() => expect(ww.funderFacts(hop)).not.toBeNull());
     expect(h.asked).toEqual([holder.toBase58(), hop]);
-    const d = await fetchTokenHolderDistribution(holderConn([{ owner: holder, pct: 6 }]), new PublicKey(mint), new PublicKey(creator), undefined, ww);
+    const d = await fetchTokenHolderDistribution(holderConn([{ owner: holder, pct: 6 }]), new PublicKey(mint), new PublicKey(creator), CURVE, ww);
     expect(d.topHolders[0].holderClass).toBe('CREATOR_CLUSTER');
     expect(d.devHoldingPct).toBeCloseTo(6, 6); // was 0: the hop was never looked up, so the holder read INDEPENDENT
   });

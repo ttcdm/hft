@@ -20,6 +20,9 @@ function holderFetch(rows: Array<[PublicKey, number]>) {
   return fetchTokenHolderDistribution(c, mint, creator, curve, ww);
 }
 function conn(rows: Array<[PublicKey, number]>) {
+  // R13-1: the curve holds whatever the rows leave of the supply, so nothing is held outside the listed accounts
+  const rest = 100 - rows.reduce((s, [, pct]) => s + pct, 0);
+  rows = rows.map(([a, pct]) => [a, a.equals(curveAta) ? pct + rest : pct]);
   return {
     getTokenLargestAccounts: async () => ({
       value: rows.map(([address, pct]) => ({ address, amount: String((SUPPLY * BigInt(Math.round(pct * 100))) / 10000n) })),

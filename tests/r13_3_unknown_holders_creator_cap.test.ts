@@ -12,10 +12,12 @@ import { WatchWindow } from '../server/signals/watchWindow';
  */
 const SUPPLY = 1_000_000_000_000_000n;
 const pk = () => Keypair.generate().publicKey;
+const CURVE = pk();
 const ownerData = (owner: PublicKey) => { const d = Buffer.alloc(165); d.set(pk().toBuffer(), 0); d.set(owner.toBuffer(), 32); return d; };
 
 function conn(holders: Array<{ owner: PublicKey; pct: number }>) {
   const accounts = holders.map((h) => ({ address: pk(), owner: h.owner, amount: (SUPPLY * BigInt(Math.round(h.pct * 100))) / 10_000n }));
+  accounts.push({ address: CURVE, owner: CURVE, amount: SUPPLY - accounts.reduce((s, a) => s + a.amount, 0n) }); // the curve holds the rest
   return {
     getTokenLargestAccounts: async () => ({ value: accounts.map((a) => ({ address: a.address, amount: a.amount.toString() })) }),
     getTokenSupply: async () => ({ value: { amount: SUPPLY.toString() } }),
@@ -31,7 +33,7 @@ const live = (d: { devHoldingPct: number; top10HoldersPct: number }) => {
 describe('R13-3: unknown holders count against the creator cap', () => {
   it('4 x 4.5% in wallets that never traded (never looked up): 18% counts as the creator\'s, and LIVE refuses on creator exposure', async () => {
     const quiet = Array.from({ length: 4 }, pk);
-    const d = await fetchTokenHolderDistribution(conn(quiet.map((owner) => ({ owner, pct: 4.5 }))), pk(), pk(), undefined, new WatchWindow({ publicFunders: [] }));
+    const d = await fetchTokenHolderDistribution(conn(quiet.map((owner) => ({ owner, pct: 4.5 }))), pk(), pk(), CURVE, new WatchWindow({ publicFunders: [] }));
     expect(d.unknownHolderBalance).toBe((SUPPLY * 450n) / 10_000n * 4n);
     expect(d.top10HoldersPct).toBeCloseTo(18, 6);
     expect(d.devHoldingPct).toBeCloseTo(18, 6); // was 0
@@ -42,7 +44,7 @@ describe('R13-3: unknown holders count against the creator cap', () => {
     const ww = new WatchWindow({ publicFunders: [] });
     const quiet = Array.from({ length: 4 }, pk);
     quiet.forEach((o, i) => { ww.setFunder(o.toBase58(), `funder-${i}`); ww.setNoFunder(`funder-${i}`); });
-    const d = await fetchTokenHolderDistribution(conn(quiet.map((owner) => ({ owner, pct: 4.5 }))), pk(), pk(), undefined, ww);
+    const d = await fetchTokenHolderDistribution(conn(quiet.map((owner) => ({ owner, pct: 4.5 }))), pk(), pk(), CURVE, ww);
     expect(d.devHoldingPct).toBe(0);
     expect(live(d)).toBe('PASS');
   });

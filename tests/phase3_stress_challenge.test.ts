@@ -222,9 +222,9 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
       const bondingCurveAta = PumpCurveService.getAssociatedTokenAddress(mint, bondingCurve, TOKEN_PROGRAM_ID);
       const creatorAta = PumpCurveService.getAssociatedTokenAddress(mint, creator, TOKEN_PROGRAM_ID);
 
-      // 20 largest accounts do not include creator
+      // 20 largest accounts do not include creator (R13-1: the curve holds the rest, so with the creator ATA nothing is unseen)
       const largestAccounts = [
-        { address: bondingCurveAta, amount: '700000000000000', decimals: 6, uiAmount: 700000000 },
+        { address: bondingCurveAta, amount: '795000000000000', decimals: 6, uiAmount: 795000000 },
         ...Array.from({ length: 19 }, () => ({
           address: Keypair.generate().publicKey,
           amount: '10000000000000', // 10M each

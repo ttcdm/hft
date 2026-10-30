@@ -151,7 +151,7 @@ export function ConfluenceThresholdEditor({ confluence, onSave, busy }: { conflu
 
 /**
  * R6-4: what KILL AUTO did, from the POST /api/auto/kill reply. "Sell what it bought" is reported as done only when every sell was;
- * a refused or failed one is counted and named, since those positions are still open.
+ * a refused or failed one is counted and named, since those positions are still open. R12-5: it also says manual positions stay open.
  */
 export interface KillReport { ok: boolean; text: string }
 export function killReportFor(j: any): KillReport | null {
@@ -166,15 +166,19 @@ export function killReportFor(j: any): KillReport | null {
   const closed = typeof j.closed === 'number' ? j.closed : 0;
   const stillOpen = hasStillOpen ? j.stillOpen : 0;
   const ok = failed.length === 0 && stillOpen === 0 && j.success !== false;
+  // R12-5: KILL AUTO sells only what auto bought. The reply's `manualOpen` (when the server sends it) counts the positions opened by hand.
+  const manual = typeof j.manualOpen === 'number'
+    ? j.manualOpen > 0 ? ` ${j.manualOpen} position(s) you opened by hand stay open: KILL AUTO does not sell them (close them from Plug & Play, or PANIC sells everything).` : ' No position opened by hand is open.'
+    : ' Manual positions are not sold by KILL AUTO: close them from Plug & Play.';
   if (ok) {
-    if (closed === 0 && (!hasAttempted || j.attempted === 0)) return { ok: true, text: 'Auto is OFF. It had no open position to sell.' };
-    return { ok: true, text: hasAttempted ? `Auto is OFF. Sold ${closed} of ${j.attempted} position(s) it bought.` : `Auto is OFF. Sold ${closed} position(s) it bought; none is still open.` };
+    if (closed === 0 && (!hasAttempted || j.attempted === 0)) return { ok: true, text: `Auto is OFF. It had no open position to sell.${manual}` };
+    return { ok: true, text: (hasAttempted ? `Auto is OFF. Sold ${closed} of ${j.attempted} position(s) it bought.` : `Auto is OFF. Sold ${closed} position(s) it bought; none is still open.`) + manual };
   }
   const names = failed.map((f) => `${f.symbol ?? (f.mint ? `${f.mint.slice(0, 6)}...` : '?')} (${f.error ?? 'refused'})`).join('; ');
   const sold = hasAttempted ? `only ${closed} of ${j.attempted} position(s) were sold` : `${closed} position(s) were sold`;
   const open = hasStillOpen ? ` ${stillOpen} auto position(s) are still open.` : '';
   const why = failed.length ? `; ${failed.length} refused or failed and are STILL OPEN: ${names}.` : '; some are STILL OPEN.';
-  return { ok: false, text: `Auto is OFF, but ${sold}${why}${open} Close them by hand.` };
+  return { ok: false, text: `Auto is OFF, but ${sold}${why}${open} Close them by hand.${manual}` };
 }
 
 /**

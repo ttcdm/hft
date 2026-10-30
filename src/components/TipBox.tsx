@@ -24,9 +24,11 @@ export function parseTipText(text: string): TipCheck {
 export const tipInUseText = (v: number | null): string =>
   v === null ? 'auto: no tip is sent; the server picks a dynamic tip for each order' : `${v} SOL is sent with each snipe (the server keeps it within its floor and ceiling)`;
 
-export function TipBox({ value, onValue, testId, ariaLabel, className }: { value: number | null; onValue: (v: number | null) => void; testId: string; ariaLabel: string; className?: string }) {
+export function TipBox({ value, onValue, onProblem, testId, ariaLabel, className }: { value: number | null; onValue: (v: number | null) => void; onProblem?: (reason: string | null) => void; testId: string; ariaLabel: string; className?: string }) {
   const [text, setText] = useState(value === null ? '' : String(value));
   const parsed = parseTipText(text);
+  const problem = parsed.ok ? null : parsed.reason;
+  useEffect(() => { onProblem?.(problem); }, [problem]); // only when the problem changes
   // a value changed elsewhere (a save's answer) replaces the text unless the text already says it
   useEffect(() => { setText((t) => { const p = parseTipText(t); return p.ok && p.value === value ? t : value === null ? '' : String(value); }); }, [value]);
   return (

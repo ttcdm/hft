@@ -208,6 +208,11 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   });
 
   const rulesDirty = useRef(false); // true from the first edit until the server confirms a save
+  // R11-9: the boxes check AutoSnipeRulesSchema's ranges (server/execution/tradeInputs.ts) and Save is refused while one is out of range
+  const [ruleProblems, setRuleProblems] = useState<Record<string, string | null>>({});
+  const ruleProblem = (k: string) => (reason: string | null) => setRuleProblems((p) => (p[k] === reason ? p : { ...p, [k]: reason }));
+  const anyRuleProblem = Object.values(ruleProblems).some((r) => r !== null);
+  const [rulesSaveResult, setRulesSaveResult] = useState<{ ok: boolean; text: string } | null>(null);
   const editRules = (patch: Partial<typeof rules>) => {
     rulesDirty.current = true;
     setRules((r) => ({ ...r, ...patch }));
@@ -347,14 +352,22 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   };
 
   const handleSaveRules = async () => {
+    if (anyRuleProblem) return; // R11-9: a box out of the server's range is not sent
     hftAudio.playClick();
     const res = await engineClient.updatePumpFunRules(rules);
     if (res?.status === 'OK') {
       rulesDirty.current = false;
       if (res.rules) setRules(res.rules);
+      setRulesSaveResult({ ok: true, text: 'Saved in server memory until the next restart.' });
       onAlertTrigger?.('INFO', 'AUTO-SNIPE RULES SAVED', 'Saved in server memory until the next restart.');
     } else {
-      onAlertTrigger?.('WARNING', 'AUTO-SNIPE RULES NOT SAVED', `The server did not confirm the save${res?.error ? `: ${res.error}` : ''}; your edits are still on screen.`);
+      // R11-9: the refusal is shown under the form, and the boxes go back to the rules the server still holds (they kept the refused
+      // value while the server kept the old one)
+      const why = res?.error || res?.message || 'the server did not confirm the save';
+      rulesDirty.current = false;
+      await fetchData();
+      setRulesSaveResult({ ok: false, text: `NOT SAVED: ${why}. The boxes show the rules the server still uses.` });
+      onAlertTrigger?.('WARNING', 'AUTO-SNIPE RULES NOT SAVED', `The server refused the save: ${why}. The boxes show the rules it still uses.`);
     }
   };
 
@@ -1113,12 +1126,17 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
 
             <button
               onClick={handleSaveRules}
-              className="px-4 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-mono font-bold transition flex items-center space-x-1.5 shadow-md shadow-cyan-950"
+              disabled={anyRuleProblem}
+              title={anyRuleProblem ? 'A rule is out of the range the server accepts; fix it first.' : undefined}
+              className="px-4 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-xs font-mono font-bold transition flex items-center space-x-1.5 shadow-md shadow-cyan-950"
             >
               <Check className="w-3.5 h-3.5" />
               <span>Save Strategy Rules</span>
             </button>
           </div>
+          {rulesSaveResult && (
+            <p data-testid="rules-save-result" role="status" className={`text-[11px] font-mono ${rulesSaveResult.ok ? 'text-emerald-300' : 'text-rose-300'}`}>{rulesSaveResult.text}</p>
+          )}
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 text-xs font-mono">
             {/* Rule 1: Min Caller 2x Win Rate */}
@@ -1126,7 +1144,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Min Caller 2x+ Win Rate (%)
               </label>
-              <DecimalBox testId="rule-minCallerWinRate2x" ariaLabel="Min caller 2x+ win rate (%)" value={rules.minCallerWinRate2x} onValue={(n) => editRules({ minCallerWinRate2x: n })}
+              <DecimalBox testId="rule-minCallerWinRate2x" min={0} max={100} onProblem={ruleProblem('minCallerWinRate2x')} ariaLabel="Min caller 2x+ win rate (%)" value={rules.minCallerWinRate2x} onValue={(n) => editRules({ minCallerWinRate2x: n })}
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1139,7 +1157,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Min Average Multiple (e.g. 4.0x)
               </label>
-              <DecimalBox testId="rule-minAvgMultiple" ariaLabel="Min average multiple" value={rules.minAvgMultiple} onValue={(n) => editRules({ minAvgMultiple: n })}
+              <DecimalBox testId="rule-minAvgMultiple" min={0} max={1000} onProblem={ruleProblem('minAvgMultiple')} ariaLabel="Min average multiple" value={rules.minAvgMultiple} onValue={(n) => editRules({ minAvgMultiple: n })}
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1152,7 +1170,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Max Entry Multiple (Chasing Guard)
               </label>
-              <DecimalBox testId="rule-maxEntryMultiple" ariaLabel="Max entry multiple" value={rules.maxEntryMultiple} onValue={(n) => editRules({ maxEntryMultiple: n })}
+              <DecimalBox testId="rule-maxEntryMultiple" min={1} max={100} onProblem={ruleProblem('maxEntryMultiple')} ariaLabel="Max entry multiple" value={rules.maxEntryMultiple} onValue={(n) => editRules({ maxEntryMultiple: n })}
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1165,7 +1183,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Max Elapsed Callout Time (Seconds)
               </label>
-              <DecimalBox testId="rule-maxElapsedSeconds" ariaLabel="Max elapsed callout time (seconds)" value={rules.maxElapsedSeconds} onValue={(n) => editRules({ maxElapsedSeconds: n })} integer
+              <DecimalBox testId="rule-maxElapsedSeconds" min={1} max={3600} onProblem={ruleProblem('maxElapsedSeconds')} ariaLabel="Max elapsed callout time (seconds)" value={rules.maxElapsedSeconds} onValue={(n) => editRules({ maxElapsedSeconds: n })} integer
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1199,7 +1217,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                 Jito Priority Tip (SOL)
               </label>
               <TipBox testId="rule-jitoPriorityTipSol" ariaLabel="Jito priority tip (SOL)" value={typeof rules.jitoPriorityTipSol === 'number' ? rules.jitoPriorityTipSol : null}
-                onValue={(n) => editRules({ jitoPriorityTipSol: n ?? undefined })}
+                onValue={(n) => editRules({ jitoPriorityTipSol: n ?? undefined })} onProblem={ruleProblem('jitoPriorityTipSol')}
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">

@@ -83,20 +83,30 @@ export function orderAlerts(alerts: AlertEvent[]): AlertEvent[] {
  */
 export const KILL_SWITCH_ALERT_ID = 'state-kill-switch';
 export interface KillStateUnknown { lastKnown: boolean | null; failed: boolean; lastAt?: number | null }
-export function killSwitchStateAlert(on: boolean | null, since: number | null, unknown?: KillStateUnknown): AlertEvent[] {
+/**
+ * R11-4: what the kill switch leaves open, from the open-position count (ACTIVE: open or partly closed), or null when it could not be read.
+ * The switch never sells; the text no longer tells the operator to close positions when none is open (for example right after PANIC).
+ */
+export function killSwitchOpenText(open: number | null | undefined): string {
+  if (open === 0) return 'No position is open.';
+  if (typeof open === 'number' && open > 0) return `${open} open position${open === 1 ? ' is' : 's are'} NOT sold: close ${open === 1 ? 'it' : 'them'} from the Plug & Play panel (protective exits keep running).`;
+  return 'The kill switch does not sell open positions; the position list could not be read, so check the Plug & Play panel.';
+}
+
+export function killSwitchStateAlert(on: boolean | null, since: number | null, unknown?: KillStateUnknown, openPositions?: number | null): AlertEvent[] {
   const at = since ?? Date.now();
   const base = { id: KILL_SWITCH_ALERT_ID, timestamp: at, timeStr: new Date(at).toLocaleTimeString(), acknowledged: false, sticky: true } as const;
   if (on === true) {
     return [{
       ...base, level: 'CRITICAL', title: 'KILL SWITCH ENGAGED',
-      message: 'The server refuses new orders and has disarmed LIVE trading. Open positions are NOT sold: close them from the Plug & Play panel.',
+      message: `The server refuses new orders and has disarmed LIVE trading. ${killSwitchOpenText(openPositions)}`,
     }];
   }
   if (on === false || !unknown) return [];
   if (unknown.lastKnown === true) {
     return [{
       ...base, level: 'CRITICAL', title: 'KILL SWITCH ENGAGED (state not confirmed)',
-      message: 'The kill switch was ON at the last good read, but its current state cannot be read. Treat trading as halted, and do not press RESUME until the header shows the state again.',
+      message: `The kill switch was ON at the last good read, but its current state cannot be read. Treat trading as halted, and do not press RESUME until the header shows the state again. ${killSwitchOpenText(openPositions)}`,
     }];
   }
   if (!unknown.failed && unknown.lastKnown === null) return [];

@@ -53,6 +53,8 @@ export default function App() {
   const [killRead, setKillRead] = useState<KillStateRead>({ value: null, at: null, failed: false });
   const [killStale, setKillStale] = useState(true);
   const isHalted = shownKillState(killRead, killStale);
+  // R11-4: open positions (ACTIVE), read with the exit watch below; null when not read
+  const [openPositions, setOpenPositions] = useState<number | null>(null);
   // R12-2: a kill-switch POST whose answer was lost or refused. Its alert says the state is not known and leaves at the first good read
   // of the state after the failure (the header then shows what the server holds); it never tells the operator to retry.
   const [killUnconfirmed, setKillUnconfirmed] = useState<{ at: number; why: string } | null>(null);
@@ -172,7 +174,7 @@ export default function App() {
     title: 'KILL SWITCH NOT CONFIRMED', acknowledged: false, sticky: true,
     message: `The server did not confirm the kill switch (${killUnconfirmed.why}). It may or may not have changed: do not assume trading is halted, and do not press again until the header shows the server's state (this alert leaves when it does). Sign in as operator if you are not.`,
   }] : [];
-  const shownAlerts = [...unconfirmedAlert, ...killSwitchStateAlert(isHalted, haltedSinceAt, { lastKnown: killRead.at === null ? null : killRead.value, lastAt: killRead.at, failed: killRead.failed || (killRead.at !== null && killStale) }), ...unreadable, ...serverAlerts, ...alerts];
+  const shownAlerts = [...unconfirmedAlert, ...killSwitchStateAlert(isHalted, haltedSinceAt, { lastKnown: killRead.at === null ? null : killRead.value, lastAt: killRead.at, failed: killRead.failed || (killRead.at !== null && killStale) }, openPositions), ...unreadable, ...serverAlerts, ...alerts];
   const seenServerAlerts = useRef<Set<string>>(new Set());
   useEffect(() => {
     for (const a of serverAlerts) {
@@ -183,15 +185,21 @@ export default function App() {
   });
 
   // R10-4: an exit the bot makes by itself (take-profit, stop-loss, trailing, stale) is announced, with what it sold and the PnL
+  // R11-4: the same read gives the kill-switch alert its open-position count (null: not read, or the last read failed).
   const watchedOpen = useRef<WatchedPosition[] | null>(null);
   useEffect(() => {
-    if (!isOperatorAuthenticated) { watchedOpen.current = null; return; }
+    if (!isOperatorAuthenticated) { watchedOpen.current = null; setOpenPositions(null); return; }
     let alive = true;
     const load = async () => {
       try {
         const r = await authFetch('/api/workstation/positions?status=ACTIVE');
-        if (!r.ok || !alive) return;
-        const open: WatchedPosition[] = (await r.json())?.positions ?? [];
+        if (!alive) return;
+        if (!r.ok) { setOpenPositions(null); return; }
+        const list = (await r.json())?.positions;
+        if (!alive) return;
+        if (!Array.isArray(list)) { setOpenPositions(null); return; }
+        const open: WatchedPosition[] = list;
+        setOpenPositions(open.length);
         const before = watchedOpen.current;
         watchedOpen.current = open;
         if (!before) return; // the first read is the baseline
@@ -204,11 +212,12 @@ export default function App() {
           if (ra.ok) all = (await ra.json())?.positions ?? open;
         }
         if (alive) for (const a of exitAlerts(before, open, all)) triggerAlert(a.level, a.title, a.message);
-      } catch { /* the next read retries; the baseline stays */ }
+      } catch { if (alive) setOpenPositions(null); /* the next read retries; the baseline stays */ }
     };
     load();
     const t = setInterval(load, 5000);
-    return () => { alive = false; clearInterval(t); };
+    const off = onKillStateMayHaveChanged(() => void load()); // R11-4: after PANIC the count is read at once
+    return () => { alive = false; clearInterval(t); off(); };
   }, [isOperatorAuthenticated, triggerAlert]);
 
   // Q36: a refused WebSocket command is shown, not dropped.

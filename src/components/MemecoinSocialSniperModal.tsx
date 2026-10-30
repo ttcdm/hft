@@ -65,7 +65,8 @@ import {
 } from '../types';
 import { engineClient, useWsStreaming } from '../services/engineClient';
 import { fmtRank, fmtSmall, fmtUsdPrice } from '../utils/numFormat';
-import { sellConfirmText, sellDoneTitle } from '../utils/sellConfirm';
+import { sellConfirmText } from '../utils/sellConfirm';
+import { closeOutcomeTitle } from '../utils/closeOutcome';
 import { hftAudio } from '../utils/audio';
 import { PumpFunHotCalloutsView } from './PumpFunHotCalloutsView';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
@@ -405,11 +406,10 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     hftAudio.playOrderFill();
     const res = await engineClient.closeSniperPosition(posId, sellPct);
     if (res?.result?.success) {
-      onAlertTrigger?.(
-        'INFO',
-        sellDoneTitle(sellPct),
-        res.result.message
-      );
+      // R13-8: the title follows what the close did (R6-9 outcome), not just the percentage asked for
+      const r = res.result;
+      const done = closeOutcomeTitle({ success: true, status: r.status, outcome: r.outcome }, sellPct);
+      onAlertTrigger?.(done.severity, done.title, r.message);
       refreshData();
     } else {
       // R29: a refused close used to vanish silently

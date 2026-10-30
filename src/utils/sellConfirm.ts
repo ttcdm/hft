@@ -3,7 +3,7 @@ import { fmtSmall } from './numFormat';
 /**
  * R9-5: Close (Plug & Play), Take 50% and Dump 100% (Sniper holdings) sold on one click, with no quantity, price or confirm, while the
  * buy buttons and PANIC ask first. Each now asks with what it is about to sell. The price is the last mark, not the fill: a sale is at
- * the market.
+ * the market. The title after a sell is closeOutcomeTitle (closeOutcome.ts).
  */
 export interface SellConfirmInput {
   name: string;
@@ -22,9 +22,4 @@ export function sellConfirmText(p: SellConfirmInput): string {
   const value = p.valueText ? ` The holding is worth ${p.valueText} at the last mark; the sale fills at the market, not at that price.` : ' The sale fills at the market.';
   const after = p.sellPct >= 100 ? '' : ' The rest stays open.';
   return `SELL ${p.sellPct}% of ${p.name}? ${mode}: ${qty}.${value}${after}`;
-}
-
-/** The alert title after a sell: a partial is never "POSITION CLOSED". */
-export function sellDoneTitle(sellPct: number): string {
-  return sellPct >= 100 ? 'CLOSE DONE' : `SOLD ${sellPct}% (position still open)`;
 }

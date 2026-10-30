@@ -56,3 +56,17 @@ export function closeOutcomeText(r: CloseResultLike, sellPct: number, name = 'th
   if (r.status === 'PARTIALLY_CLOSED') return { text: `Sold ${sellPct}% of ${name}, realized ${sol(r.pnlSol)}.${left}`, tone: 'info' };
   return { text: `Closed ${sellPct}% of ${name}, realized ${sol(r.pnlSol)}.`, tone: 'info' };
 }
+
+/**
+ * R13-8: the alert title for a close's result, from the same outcome as closeOutcomeText. The Sniper "Dump 100%" titled every result
+ * "CLOSE DONE" (INFO), also when it only adopted an earlier partial with tokens left, or sold nothing on an empty wallet.
+ */
+export function closeOutcomeTitle(r: Pick<CloseResultLike, 'success' | 'status' | 'outcome'>, sellPct: number): { title: string; severity: 'INFO' | 'WARNING' } {
+  if (!r.success) return { title: 'CLOSE NOT DONE', severity: 'WARNING' };
+  if (r.outcome === 'ASSUMED_LOSS_EMPTY_WALLET') return { title: 'NOTHING SOLD: assumed loss booked', severity: 'WARNING' };
+  if (r.outcome === 'ADOPTED_EARLIER_SELL' && r.status === 'PARTIALLY_CLOSED') return { title: 'NO NEW SELL: earlier partial adopted (position still open)', severity: 'WARNING' };
+  if (r.outcome === 'ADOPTED_EARLIER_SELL') return { title: 'NO NEW SELL: earlier sell adopted', severity: 'WARNING' };
+  if (r.outcome === 'ADOPTED_EARLIER_SELL_FILL_UNREAD') return { title: 'NO NEW SELL: fill unread, assumed loss booked', severity: 'WARNING' };
+  if (r.status === 'PARTIALLY_CLOSED') return { title: `SOLD ${sellPct}% (position still open)`, severity: sellPct >= 100 ? 'WARNING' : 'INFO' };
+  return sellPct >= 100 ? { title: 'CLOSE DONE', severity: 'INFO' } : { title: `SOLD ${sellPct}% (position still open)`, severity: 'INFO' };
+}

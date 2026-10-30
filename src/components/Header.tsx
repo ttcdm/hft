@@ -285,7 +285,9 @@ export const Header: React.FC<HeaderProps> = ({
           <span className="text-[10px] opacity-70">today</span>
           <span data-testid="pill-realized" className={`font-bold tracking-tight ${pillStale ? '' : USD_TONE[usdTone(profitSummary?.realizedUsd)]}`}>{signedUsd(profitSummary?.realizedUsd)}</span>
           <span className="text-[10px] opacity-70">open at mark</span>
-          <span data-testid="pill-open" className={`font-bold tracking-tight ${pillStale ? '' : USD_TONE[usdTone(profitSummary?.unrealizedUsd)]}`}>{signedUsd(profitSummary?.unrealizedUsd)}</span>
+          {/* R10-5: an open figure built on a stale mark is amber and says how many marks are stale */}
+          <span data-testid="pill-open" className={`font-bold tracking-tight ${pillStale ? '' : profitSummary?.staleMarks ? 'text-amber-300' : USD_TONE[usdTone(profitSummary?.unrealizedUsd)]}`}>{signedUsd(profitSummary?.unrealizedUsd)}</span>
+          {profitSummary?.staleMarks ? <span data-testid="pill-mark-stale" className="text-[10px] font-bold text-amber-300">{profitSummary.staleMarks} STALE mark{profitSummary.staleMarks === 1 ? '' : 's'}</span> : null}
           <span className="text-[10px] opacity-70">({profitSummary?.openCount ?? '—'})</span>
           <PillStaleNote at={profitAt} failed={profitFailed} now={nowTick} />
         </button>

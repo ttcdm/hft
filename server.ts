@@ -29,7 +29,7 @@ import { computeLatency } from './server/system/latencyStats';
 import { buildDiagnosticsContext } from './server/system/aiContext';
 import { pumpFunService, pumpBootMode } from './server/pumpfunService';
 import { pumpFeedListener } from './server/solana/pumpFeedListener';
-import { autoSnipeController } from './server/auto/controller';
+import { autoSnipeController, AUTO_ALERT_CODES } from './server/auto/controller';
 import { watchWindow } from './server/signals/watchWindow';
 import { FunderLookup, wireFunderLookup } from './server/signals/funderLookup';
 import { buildBoard } from './server/board';
@@ -1205,7 +1205,8 @@ app.get('/api/system/checks', requireOperatorAuth, (req, res) => {
 // restart. The operator acknowledges one here, by code and position, once it has been looked at. Any other code is refused (409): it
 // clears by itself when its condition does. 404 when no such alert is open.
 app.post('/api/system/alerts/acknowledge', requireOperatorAuth, validateTradeBody(AlertAcknowledgeSchema), (req, res) => {
-  const r = executionCoordinator.acknowledgeOperatorAlert(req.body.code, req.body.positionId);
+  // R14-9: the auto controller's own alerts (AUTO_ALERT_CODES) are acknowledged there
+  const r = AUTO_ALERT_CODES.includes(req.body.code) ? autoSnipeController.acknowledgeOperatorAlert(req.body.code) : executionCoordinator.acknowledgeOperatorAlert(req.body.code, req.body.positionId);
   if (!r.acknowledged) return res.status(/^NOT_FOUND/.test(r.error ?? '') ? 404 : 409).json({ success: false, error: r.error });
   res.json({ success: true, ...buildSystemChecks() });
 });

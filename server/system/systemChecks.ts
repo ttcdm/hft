@@ -1,6 +1,6 @@
 import { executionCoordinator, ACKNOWLEDGEABLE_ALERT_CODES } from '../execution/coordinator';
 import type { OperatorAlert } from '../core/types';
-import { autoSnipeController } from '../auto/controller';
+import { autoSnipeController, AUTO_ALERT_CODES } from '../auto/controller';
 import { pumpFeedListener } from '../solana/pumpFeedListener';
 import { workstationDb, WorkstationDatabase } from '../db/database';
 import { riskEngine } from '../risk/riskEngine';
@@ -62,6 +62,7 @@ export const OPERATOR_ALERT_LEVELS: Record<string, OperatorAlertLevel> = {
   PAPER_MARKS_UNAVAILABLE: 'WARNING',
   DISK_SPACE_LOW: 'WARNING',
   LATE_BUY_SOLD: 'INFO',
+  AUTO_CANDIDATE_FAILED: 'WARNING', // R14-9: raised by the auto controller
 };
 /**
  * R9-12: split the mark alerts that no longer apply: a POSITION_MARK_UNAVAILABLE whose position is not open. (PAPER_MARKS_UNAVAILABLE needs
@@ -78,7 +79,7 @@ const LEVEL_RANK: Record<OperatorAlertLevel, number> = { CRITICAL: 0, WARNING: 1
 /** Every open alert with its level, CRITICAL first, newest first within a level. */
 export function operatorAlertViews(alerts: OperatorAlert[]): OperatorAlertView[] {
   return alerts
-    .map((a) => ({ ...a, level: operatorAlertLevel(a.code), acknowledgeable: ACKNOWLEDGEABLE_ALERT_CODES.includes(a.code) }))
+    .map((a) => ({ ...a, level: operatorAlertLevel(a.code), acknowledgeable: ACKNOWLEDGEABLE_ALERT_CODES.includes(a.code) || AUTO_ALERT_CODES.includes(a.code) }))
     .sort((a, b) => LEVEL_RANK[a.level] - LEVEL_RANK[b.level] || b.lastSeenAt - a.lastSeenAt);
 }
 
@@ -193,7 +194,8 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
 
   // R9-12: a mark alert is about a position the exit pass prices; the pass clears it only while the position is open, so after a close it
   // stayed for good. A mark alert for a position that is no longer open is moot: it is left out of the marks row and the alert list.
-  const { current: alerts, moot: mootMarkAlerts } = splitMootMarkAlerts(diag.operatorAlerts ?? [], workstationDb.loadPositions(undefined, 'ACTIVE'));
+  // R14-9: the auto controller's own alerts (AUTO_CANDIDATE_FAILED) are listed with the coordinator's
+  const { current: alerts, moot: mootMarkAlerts } = splitMootMarkAlerts([...(diag.operatorAlerts ?? []), ...autoSnipeController.getOperatorAlerts()], workstationDb.loadPositions(undefined, 'ACTIVE'));
   const markAlerts = alerts.filter((a) => a.code === 'POSITION_MARK_UNAVAILABLE' || a.code === 'PAPER_MARKS_UNAVAILABLE');
   const mootNote = mootMarkAlerts.length ? ` ${mootMarkAlerts.length} mark alert(s) for positions no longer open are not counted.` : '';
   checks.push({

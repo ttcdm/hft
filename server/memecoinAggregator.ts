@@ -18,6 +18,7 @@ import { getConfluenceThreshold } from './signals/confluenceThreshold';
 import { curveVelocityEvaluator } from './signals/curveVelocityEvaluator';
 import { checkSnipeAmountSol } from './execution/snipeAmount';
 import { lossTriggerHits, LOSS_TRIGGER_ACK_SETTING, LOSS_TRIGGER_TRADES } from './auto/killSwitch';
+import { Logger } from './middleware/enterprise';
 
 const INITIAL_POOLS: MemecoinPool[] = [
   {
@@ -248,7 +249,10 @@ export class MemecoinAggregatorService extends EventEmitter {
           });
           break;
         }
-      } catch {}
+      } catch (e: any) {
+        // R14-9: submitCandidate journals and raises its own failures; this is the loop itself (the imports, the callout read)
+        Logger.error(`[AUTO] aggregator candidate loop failed: ${e?.message || e}`);
+      }
     }, 5000);
   }
 

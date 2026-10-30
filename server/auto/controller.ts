@@ -10,7 +10,7 @@ import { executionConfig, ECONOMIC_TIP_CAP_FRACTION } from '../solana/executionC
 import { checkSnipeAmountSol, SNIPE_AMOUNT_MIN_SOL } from '../execution/snipeAmount';
 import { allowedCluster, assertClusterAllowed } from '../solana/clusterGuard';
 import { Logger } from '../middleware/enterprise';
-import type { SignalProvenance } from '../core/types';
+import type { SignalProvenance, OperatorAlert } from '../core/types';
 import { computeJournalStats, autoEvidencePnl, type JournalStatsReport } from './journalStats';
 import { evaluateKillTriggers, auditWalletChange, LOSS_TRIGGER_ACK_SETTING, LOSS_TRIGGER_TRADES as LOSS_TRIGGER_TRADES_ALL, type KillTrigger } from './killSwitch';
 import { riskEngine, PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS } from '../risk/riskEngine';
@@ -94,6 +94,11 @@ export interface AutoCandidate {
   jitoTipSol?: number;
   enforceConfluence?: boolean;
 }
+
+/** R14-9: an auto candidate threw before it was decided; acknowledged by the operator. */
+export const AUTO_CANDIDATE_FAILED = 'AUTO_CANDIDATE_FAILED';
+/** The alert codes the auto controller owns (raised, listed and acknowledged here, not on the coordinator). */
+export const AUTO_ALERT_CODES: readonly string[] = [AUTO_CANDIDATE_FAILED];
 
 export type AutoOutcome = 'DROPPED' | 'WOULD_BUY' | 'BOUGHT' | 'REJECTED';
 
@@ -1048,7 +1053,7 @@ export class AutoSnipeController extends EventEmitter {
         amountUsd: cfg.defaultSnipeAmountUsd || 5.0,
         slippagePct: cfg.maxSlippagePct || 6.0,
         jitoTipSol: cfg.jitoTipSol,
-      }).catch(() => undefined);
+      }); // R14-9: submitCandidate never rejects; a failure is journaled and raised there
     };
     ww.on('release', this.watchListener);
   }
@@ -1085,8 +1090,54 @@ export class AutoSnipeController extends EventEmitter {
    * The single door into auto trading. Returns the decision it journaled.
    */
   /** S209: the root span of an auto candidate's trace; everything below it (watch verdict, gates, risk, build, sign, submit, confirm, reconcile) nests inside. */
-  public submitCandidate(c: AutoCandidate): Promise<AutoDecision> {
-    return traced('auto.candidate', () => this.submitCandidateUntraced(c), { 'apex.source': c.source, 'apex.mode': this.mode });
+  public async submitCandidate(c: AutoCandidate): Promise<AutoDecision> {
+    try {
+      return await traced('auto.candidate', () => this.submitCandidateUntraced(c), { 'apex.source': c.source, 'apex.mode': this.mode });
+    } catch (e: any) {
+      return this.candidateFailed(c, e);
+    }
+  }
+
+  /**
+   * R14-9: a candidate whose handling threw (a DB read that failed, say) used to vanish: every caller dropped the rejection with
+   * `.catch(() => undefined)`. It is logged, journaled as a REJECTED row and raised as AUTO_CANDIDATE_FAILED (one alert, counting
+   * failures, until the operator acknowledges it), and the caller gets that decision.
+   */
+  private candidateFailed(c: AutoCandidate, e: any): AutoDecision {
+    const msg = String(e?.message ?? e);
+    Logger.error(`[AUTO] candidate ${c.mint} (${c.source}) failed: ${msg}`);
+    const now = Date.now();
+    const open = this.alerts.find((a) => a.code === AUTO_CANDIDATE_FAILED && !a.cleared);
+    const count = (open ? Number(/^(\d+) /.exec(open.message)?.[1] ?? 1) : 0) + 1;
+    const message = `${count} auto candidate(s) failed with an error and were not bought; last ${c.symbol ?? c.mint.slice(0, 8)} from ${c.source}: ${msg}. See the decision journal (stage auto, CANDIDATE_ERROR).`;
+    if (open) { open.message = message; open.lastSeenAt = now; } else {
+      this.alerts.push({ code: AUTO_CANDIDATE_FAILED, message, raisedAt: now, lastSeenAt: now, cleared: false });
+      Logger.error(`[OPERATOR ALERT] ${AUTO_CANDIDATE_FAILED}: ${message}`);
+    }
+    const fallback: AutoDecision = { ts: now, mode: this.mode, mint: c.mint, symbol: c.symbol, source: c.source, outcome: 'REJECTED', stage: 'auto', reason: `CANDIDATE_ERROR: ${msg}` };
+    try {
+      return this.record(c, 'REJECTED', 'auto', `CANDIDATE_ERROR: ${msg}`);
+    } catch (e2: any) {
+      Logger.error(`[AUTO] the CANDIDATE_ERROR row for ${c.mint} could not be journaled: ${e2?.message || e2}`);
+      return fallback;
+    }
+  }
+
+  /** R14-9: alerts the auto controller raises itself (AUTO_ALERT_CODES); System checks lists them with the coordinator's. */
+  private alerts: OperatorAlert[] = [];
+
+  public getOperatorAlerts(): OperatorAlert[] {
+    return this.alerts.filter((a) => !a.cleared).map((a) => ({ ...a }));
+  }
+
+  /** R14-9: the operator has looked at an auto alert (POST /api/system/alerts/acknowledge with its code). */
+  public acknowledgeOperatorAlert(code: string): { acknowledged: boolean; error?: string } {
+    const open = this.alerts.filter((a) => a.code === code && !a.cleared);
+    if (open.length === 0) return { acknowledged: false, error: `NOT_FOUND: no open ${code} alert` };
+    for (const a of open) a.cleared = true;
+    this.alerts = this.alerts.filter((a) => !a.cleared);
+    Logger.warn(`[OPERATOR ALERT] ${code} acknowledged by the operator`);
+    return { acknowledged: true };
   }
 
   private async submitCandidateUntraced(c: AutoCandidate): Promise<AutoDecision> {
@@ -1378,7 +1429,7 @@ export class AutoSnipeController extends EventEmitter {
       }
       if (p.notBefore > now) { waitMs = Math.min(waitMs ?? Infinity, p.notBefore - now); continue; }
       this.pendingReleases.delete(key);
-      void this.submitCandidate(p.candidate).catch(() => undefined);
+      void this.submitCandidate(p.candidate); // R14-9: never rejects; a failure is journaled and raised there
       return;
     }
     if (waitMs !== null && !this.retryTimer) {

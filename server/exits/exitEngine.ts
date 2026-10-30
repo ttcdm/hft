@@ -48,7 +48,11 @@ export class ExitEngine {
 
   /**
    * Evaluates exit conditions for an active position based on:
-   * 1. Profit percentage: ((currentPrice - entryPrice) / entryPrice) * 100
+   * 1. Profit percentage: ((currentPrice - entryPrice) / entryPrice) * 100. R14-8: both prices are fee-free, so every threshold below is a
+   *    move of the curve's price: the mark is the spot price (virtual SOL / virtual tokens), and the entry is what reached the curve per
+   *    token (the pump fee left out; ExecutionCoordinator and PaperExecutionEngine store it that way). A -20% stop is the spot 20% below the
+   *    price the curve charged before its fee, not -20% of the SOL spent: the fees each way, the tip and the rent come on top in the PnL
+   *    (about -28% realized at 0.005 SOL, R8-7). The backtest replay sets its triggers from the trade print before fees (R6-29), the same basis.
    * 2. High-Water Mark: max(highWaterMarkSol, currentPriceSol)
    * 3. Monotonic trailing stop: ratchets to max(HWM * 0.85, entry * 1.03) once profit >= +15%
    * 4. 3-stage take-profit ladder. Every sell percentage is a share of what the position holds at that moment (closePosition, the

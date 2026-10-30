@@ -25,7 +25,7 @@ export interface PaperOrderRequest {
 
 export interface CurveBuyQuote {
   tokenAmountRaw: string;
-  /** SOL per token actually paid, fees included. */
+  /** SOL per token actually paid, fees included (the fill price reported). The position's entry price leaves the fees out (R14-8). */
   executionPriceSol: number;
   /** Curve spot price before the order. */
   spotPriceSol: number;
@@ -94,18 +94,23 @@ export class PaperExecutionEngine {
     let tokensReceived: number;
     const tokenDecimals = req.tokenDecimals || 6;
     let tokenQtyRaw: string;
+    // R14-8: the exit engine compares the entry with the fee-free spot mark, so the entry price leaves the pump fee out, as LIVE does
+    let entryPriceSol: number;
     if (q) {
       // Q7: the curve's own numbers. The fee is inside the SOL spent (the curve is entered with amount / (1 + fee)).
       impactBps = q.estimatedPriceImpactBps;
       fillPriceSol = q.executionPriceSol;
       tokenQtyRaw = q.tokenAmountRaw;
       tokensReceived = Number(BigInt(q.tokenAmountRaw)) / Math.pow(10, tokenDecimals);
+      const curveNetSol = req.amountSol - (q.protocolFeeLamports + q.creatorFeeLamports) / 1e9; // what reached the curve
+      entryPriceSol = curveNetSol > 0 && tokensReceived > 0 ? curveNetSol / tokensReceived : fillPriceSol;
     } else {
       // MODEL: size against pool liquidity, and the flat 1% protocol fee on the SOL spent
       impactBps = Math.min(req.slippageBps, PaperExecutionEngine.estimateImpactBps(req.amountSol, req.liquidityUsd, req.solPriceUsd));
       fillPriceSol = req.currentPriceSol * (1 + impactBps / 10000);
       tokensReceived = (req.amountSol - req.amountSol * 0.01) / fillPriceSol;
       tokenQtyRaw = BigInt(Math.floor(tokensReceived * Math.pow(10, tokenDecimals))).toString();
+      entryPriceSol = fillPriceSol; // the model takes its fee out of the tokens, so this price is already fee-free
     }
     const pricing: PaperPricing = q ? 'CURVE_QUOTE' : 'MODEL';
 
@@ -124,8 +129,8 @@ export class PaperExecutionEngine {
       tokenQuantityRaw: tokenQtyRaw,
       // Cost basis is everything paid to enter: the SOL spent (fee included) plus network fee and tip.
       costBasisLamports: Math.round(req.amountSol * 1e9) + networkFeeLamports + jitoTipLamports,
-      entryPriceSol: fillPriceSol,
-      // Marked at the curve's spot price when quoted (the order's own fees and impact show as the immediate loss they are)
+      entryPriceSol,
+      // Marked at the curve's spot price when quoted (the order's own fees and impact show as the immediate loss they are, in the PnL)
       currentPriceSol: q ? q.spotPriceSol : fillPriceSol,
       currentValueSol: tokensReceived * (q ? q.spotPriceSol : fillPriceSol),
       unrealizedPnLSol: tokensReceived * (q ? q.spotPriceSol : fillPriceSol) - (req.amountSol * 1e9 + networkFeeLamports + jitoTipLamports) / 1e9,

@@ -34,7 +34,8 @@ describe('Q1: recovery prices the entry like the live reconcile', () => {
     const r = await TradeReconciler.recoverInterruptedTransaction(connection, fixture.signature, WALLET);
     const pos = (ExecutionCoordinator.prototype as any).positionFromRecoveredBuy.call({}, { signature: fixture.signature, mint: r.mint, jitoTipLamports: 0, executionMode: 'LIVE' }, r, fixture.slot, WALLET);
     const tokens = Number(r.tokenQuantityRaw) / 1e6;
-    expect(pos.entryPriceSol).toBeCloseTo(0.01 / tokens, 15);
+    // R14-8: the fee-free curve price, what the bonding curve account received (9,876,542 of the 0.01 SOL; the rest was the 1.25% fee)
+    expect(pos.entryPriceSol).toBeCloseTo(0.009876542 / tokens, 15);
     expect(pos.costBasisLamports).toBe(12_902_540); // cost basis stays all-in
     expect(pos.walletPubkey).toBe(WALLET.toBase58()); // R4-2: bound to the wallet whose fill was read
     const d = ExitEngine.evaluate({ entryPriceSol: pos.entryPriceSol, currentPriceSol: 1.045e-9, entryTimestamp: Date.now() - 1000 });

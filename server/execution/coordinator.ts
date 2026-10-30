@@ -1400,7 +1400,10 @@ export class ExecutionCoordinator {
     });
   }
 
-  /** Position for a buy rebuilt from confirmed on-chain data. Entry price is the curve price paid; cost basis is the whole wallet delta. */
+  /**
+   * Position for a buy rebuilt from confirmed on-chain data. Entry price is the fee-free curve price (R14-8: what the bonding curve account
+   * received per token, the mark's basis; the curve spend with its fee only when that cannot be read); cost basis is the whole wallet delta.
+   */
   private positionFromRecoveredBuy(
     pTx: { signature: string; mint: string; jitoTipLamports: number; executionMode: ExecutionMode },
     recovery: Awaited<ReturnType<typeof TradeReconciler.recoverInterruptedTransaction>>,
@@ -1409,7 +1412,7 @@ export class ExecutionCoordinator {
   ): NormalizedPosition {
     const tokenQty = Number(recovery.tokenQuantityRaw) / Math.pow(10, recovery.tokenDecimals ?? 6);
     const spent = recovery.solSpentLamports ?? 0;
-    const curveSpend = recovery.curveSpendLamports ?? spent;
+    const curveSpend = recovery.curveNetLamports ?? recovery.curveSpendLamports ?? spent;
     const effectivePrice = curveSpend > 0 && tokenQty > 0 ? curveSpend / 1e9 / tokenQty : 0;
     return {
       id: pTx.signature,
@@ -3515,6 +3518,10 @@ export class ExecutionCoordinator {
       // 8. Reconciled Successfully: Persist verified OPEN position
       riskEngine.recordTradeSuccess(req.mint);
 
+      // R14-8: the exit engine compares the entry with a fee-free spot mark, so the entry is the fee-free price too: what reached the curve
+      // per token, read from the curve account's own change; failing that, the curve price less the quote's fee share (the same fee tier).
+      const quoteFeeShare = quote.expectedSolAmountLamports > 0 ? (quote.protocolFeeLamports + quote.creatorFeeLamports) / quote.expectedSolAmountLamports : 0;
+      const entryPriceSol = reconciliation.feeFreeFillPriceSol ?? reconciliation.effectiveFillPriceSol * (1 - Math.min(Math.max(quoteFeeShare, 0), 0.1));
       const livePosition: NormalizedPosition = {
         id: subRes.signature,
         mint: req.mint,
@@ -3524,8 +3531,8 @@ export class ExecutionCoordinator {
         baseTokenProgram: marketState.baseTokenProgram.toBase58(),
         tokenQuantityRaw: reconciliation.actualTokensReceivedRaw,
         costBasisLamports: reconciliation.actualSolSpentLamports,
-        entryPriceSol: reconciliation.effectiveFillPriceSol,
-        currentPriceSol: reconciliation.effectiveFillPriceSol,
+        entryPriceSol,
+        currentPriceSol: entryPriceSol,
         currentValueSol: reconciliation.actualSolSpentLamports / 1e9,
         unrealizedPnLSol: 0,
         unrealizedPnLPct: 0,

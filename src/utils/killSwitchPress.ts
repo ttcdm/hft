@@ -6,13 +6,30 @@
  * - a press while the switch is shown OFF engages it (the intended state, true);
  * - a press on RESUME within RESUME_GUARD_MS of the switch turning on is ignored (a double tap of the emergency stop);
  * - any other press on RESUME asks the operator to confirm first, like PANIC and KILL AUTO do (R10-11: in the in-page dialog, where
- *   Enter cannot accept).
+ *   Enter cannot accept). R12-3: the confirm says what auto will do, from `readAutoMode`.
  */
+import type { AutoMode } from '../components/AutoPanel';
+
 export const RESUME_GUARD_MS = 2000;
 
-export const RESUME_CONFIRM_TEXT =
-  'RESUME TRADING?\n\nThis turns the kill switch OFF. The server accepts new orders again, and an open circuit breaker is closed if the ' +
-  'latest wallet-balance read succeeded. Auto stays OFF and LIVE stays disarmed until you turn them on.';
+/**
+ * R12-3: what auto does once the switch is off, from its mode as GET /api/auto/status reads it at the press (null: not read). Auto can be
+ * set to SHADOW or PAPER while the switch is on, so "Auto stays OFF" was only true for OFF.
+ */
+export function autoAfterResumeText(mode: AutoMode | null): string {
+  switch (mode) {
+    case 'OFF': return 'Auto stays OFF until you set a mode.';
+    case 'SHADOW': return 'Auto is in SHADOW: it keeps journaling "would buy" and sends nothing.';
+    case 'PAPER': return 'Auto is in PAPER: it starts paper buys again as soon as the switch is off.';
+    case 'DEVNET_LIVE': return 'Auto is in DEVNET_LIVE: it sends real devnet buys again once LIVE is armed.';
+    default: return 'Auto\'s mode could not be read: check the Auto panel. If auto is on, it buys again as soon as the switch is off.';
+  }
+}
+
+export function resumeConfirmText(autoMode: AutoMode | null): string {
+  return 'RESUME TRADING?\n\nThis turns the kill switch OFF. The server accepts new orders again, and an open circuit breaker is closed if the ' +
+    `latest wallet-balance read succeeded. ${autoAfterResumeText(autoMode)} LIVE stays disarmed until you arm it.`;
+}
 
 export type KillSwitchPress =
   | { action: 'ENGAGE'; activate: true }
@@ -24,10 +41,12 @@ export async function killSwitchPress(
   haltedSinceMs: number | null,
   nowMs: number,
   confirmResume: (text: string) => Promise<boolean>,
+  readAutoMode: () => Promise<AutoMode | null> = async () => null,
 ): Promise<KillSwitchPress> {
   if (!shownHalted) return { action: 'ENGAGE', activate: true };
   if (haltedSinceMs !== null && nowMs - haltedSinceMs < RESUME_GUARD_MS) return { action: 'IGNORE', reason: 'DOUBLE_PRESS' };
-  return (await confirmResume(RESUME_CONFIRM_TEXT)) ? { action: 'RESUME', activate: false } : { action: 'IGNORE', reason: 'NOT_CONFIRMED' };
+  const mode = await readAutoMode().catch(() => null);
+  return (await confirmResume(resumeConfirmText(mode))) ? { action: 'RESUME', activate: false } : { action: 'IGNORE', reason: 'NOT_CONFIRMED' };
 }
 
 /**

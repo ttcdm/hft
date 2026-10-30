@@ -17,10 +17,10 @@ import { AuthModal } from './components/AuthModal';
 import { engineClient, getOperatorSessionToken, authFetch, onKillStateMayHaveChanged } from './services/engineClient';
 import { TokenBoard } from './components/TokenBoard';
 import { CurvePanel } from './components/CurvePanel';
-import { AutoPanel } from './components/AutoPanel';
+import { AutoPanel, asAutoStatus, type AutoMode } from './components/AutoPanel';
 import { usePolled } from './utils/usePolled';
 import { readServerAlerts, serverAlertEvents, alertsUnreadableEvent, killSwitchStateAlert, acknowledgeServerAlert } from './utils/operatorAlerts';
-import { killSwitchPress, shownKillState, killStateIsStale, KILL_STATE_TIMEOUT_MS, type KillStateRead } from './utils/killSwitchPress';
+import { killSwitchPress, autoAfterResumeText, shownKillState, killStateIsStale, KILL_STATE_TIMEOUT_MS, type KillStateRead } from './utils/killSwitchPress';
 import { exitAlerts, type WatchedPosition } from './utils/exitWatch';
 import { PanelErrorBoundary } from './components/ErrorBoundaries';
 import { ConfirmHost, askConfirm } from './components/ConfirmDialog';
@@ -268,6 +268,16 @@ export default function App() {
   }, [killRead, killUnconfirmed]);
   const [killPending, setKillPending] = useState(false);
 
+  // R12-3: auto's mode as the server holds it now, for the RESUME confirm and reply (null: not read within KILL_STATE_TIMEOUT_MS)
+  const readAutoMode = async (): Promise<AutoMode | null> => {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), KILL_STATE_TIMEOUT_MS);
+    try {
+      const r = await authFetch('/api/auto/status', { signal: ctl.signal });
+      return r.ok ? asAutoStatus(await r.json())?.mode ?? null : null;
+    } catch { return null; } finally { clearTimeout(timer); }
+  };
+
   // Emergency kill switch: the server decides. The UI only shows "halted" after the server confirmed it.
   const killInFlight = useRef(false);
   const toggleKillSwitch = async () => {
@@ -275,7 +285,7 @@ export default function App() {
     // R9-1: send the intended state. RESUME needs a confirm, and a RESUME press right after the switch turned on is ignored.
     // R10-11: the RESUME confirm is the in-page dialog (Enter cannot accept); a press while it is open is not sent
     killInFlight.current = true;
-    const press = await killSwitchPress(isHalted === true, haltedSince.current, Date.now(), (text) => askConfirm({ title: 'RESUME TRADING', body: text, confirmLabel: 'Resume trading' }));
+    const press = await killSwitchPress(isHalted === true, haltedSince.current, Date.now(), (text) => askConfirm({ title: 'RESUME TRADING', body: text, confirmLabel: 'Resume trading' }), readAutoMode);
     if (press.action === 'IGNORE') { killInFlight.current = false; return; }
     const nextHalted = press.activate;
     setKillPending(true);
@@ -298,12 +308,13 @@ export default function App() {
         const blockers: string[] = [];
         if (body.circuitBreaker === 'OPEN') blockers.push(`the circuit breaker is still OPEN${body.circuitBreakerReset?.reason ? ` (${body.circuitBreakerReset.reason})` : ''}`);
         if (body.haltReason) blockers.push(`all trading is still halted (${body.haltReason})`);
+        const autoText = autoAfterResumeText(await readAutoMode()); // R12-3: what auto does now, read after the reset
         triggerAlert(
           blockers.length ? 'WARNING' : 'INFO',
           'KILL SWITCH RESET',
           blockers.length
-            ? `The kill switch is off, but new orders are still refused: ${blockers.join('; ')}. LIVE trading stays disarmed until you arm it.`
-            : 'The kill switch is off. LIVE trading stays disarmed until you arm it.'
+            ? `The kill switch is off, but new orders are still refused: ${blockers.join('; ')}. ${autoText} LIVE trading stays disarmed until you arm it.`
+            : `The kill switch is off. ${autoText} LIVE trading stays disarmed until you arm it.`
         );
       }
     } catch (err: any) {

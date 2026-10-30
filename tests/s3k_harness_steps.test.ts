@@ -7,6 +7,7 @@ import {
   type HarnessSteps,
   type SessionSpendDeps, type KillRestartDeps, type ChildApp, type ChainKit,
 } from '../scripts/devnet_e2e_steps';
+import { worstCaseAutoBuySol } from '../server/auto/controller';
 
 /**
  * 3K: the devnet harness steps (m) for 3B and (o) for 3E. The real step functions; the app (auto controller, coordinator, child servers) and
@@ -100,6 +101,21 @@ describe('3K (m): a 5-buy DEVNET_LIVE session, spentSol against the wallet (3B)'
     expect(line(r.recs, "spentSol equals the wallet's drop")?.ok).toBe(true);
     expect(f.watch.getVerdict).toBe(f.origVerdict);
     expect(f.state).toMatchObject({ gating: true, mode: 'OFF', budgets: { maxBuys: 5, maxSpendSol: 0.02 }, order: 0.005, cleaned: 1, closes: 5 });
+  });
+  it('R14-6: the session budget is n times the app\'s own worst case per buy, and n shrinks to what fits the 3 x MAX_POSITION cap', async () => {
+    const r = recorder();
+    const f = fakeSessionApp();
+    const perBuy = worstCaseAutoBuySol(0.008, 6, false);
+    const budgets: Array<{ maxBuys: number; maxSpendSol: number }> = [];
+    const realSet = f.deps.auto.setBudget.bind(f.deps.auto);
+    f.deps.auto.setBudget = (b) => { budgets.push(b); return realSet(b); };
+    await sessionSpendMatchesWallet({ ...r, coordinator: f.coordinator }, { ...f.deps, worstCaseBuySol: (o) => worstCaseAutoBuySol(o, 6, false), maxSessionSpendSol: () => 0.06 });
+    const first = budgets[0];
+    expect(first.maxSpendSol).toBeGreaterThanOrEqual(first.maxBuys * perBuy - 1e-9);
+    expect(first.maxSpendSol).toBeLessThanOrEqual(0.06);
+    expect(first.maxBuys).toBe(Math.floor(0.06 / perBuy));
+    expect(r.recs.filter((x) => x.step.includes('BOUGHT'))).toHaveLength(first.maxBuys);
+    expect(fails(r.recs), JSON.stringify(r.recs, null, 1)).toEqual([]);
   });
   it('earlier losing harness trades in the reused scratch DB (R8-8): the step acknowledges the loss triggers first, through the operator route, and every line passes', async () => {
     const r = recorder();

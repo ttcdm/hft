@@ -790,7 +790,7 @@ async function sessionSpendStep(steps: import('./devnet_e2e_steps').HarnessSteps
   if (!(await S.hasBudget(steps, L, bal, SESSION_SPEND_NEED_SOL, 'DEVNET_SESSION_SPEND'))) return;
   const { PUMP_SDK } = await import('@pump-fun/pump-sdk');
   const { watchWindow } = await import('../server/signals/watchWindow');
-  const { autoSnipeController } = await import('../server/auto/controller');
+  const { autoSnipeController, worstCaseAutoBuySol, AutoSnipeController } = await import('../server/auto/controller');
   const { memecoinAggregator } = await import('../server/memecoinAggregator');
   const kit = S.makeChainKit({ conn: d.conn, web3: d.web3, sdk: PUMP_SDK, curve: d.PumpCurveService, builder: d.txBuilder, keyDir: tempWalletDir });
   const coins = S.stepCoins(steps, L, kit, d.kp);
@@ -804,6 +804,9 @@ async function sessionSpendStep(steps: import('./devnet_e2e_steps').HarnessSteps
     openLive: () => d.workstationDb.loadPositions('LIVE', 'ACTIVE'),
     makeCoins: (n) => coins.make(n),
     cleanupCoins: () => coins.cleanup(),
+    // R14-6: the app's own worst case (its candidate slippage default, Jito as configured) and its session cap
+    worstCaseBuySol: (o) => worstCaseAutoBuySol(o, 6.0, d.coordinator.getJitoTransport().isEnabled()),
+    maxSessionSpendSol: () => AutoSnipeController.maxSessionSpendSol(),
   });
   const b1 = await bal().catch(() => null);
   if (b0 !== null && b1 !== null) console.log(`INFO  (m) cost the harness wallet ${(b0 - b1).toFixed(5)} SOL`);

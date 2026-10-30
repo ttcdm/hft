@@ -135,13 +135,21 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   // R9-6: why each list could not be read (null once it was read). The lists start empty, so without this a 401 read as "No positions
   // opened yet" / "No events logged yet" / "Public Key: None".
   const [readProblem, setReadProblem] = useState<ReadProblems>(UNREAD);
+  // R11-6: reads overlap (the 3 s poll, Refresh, the re-read after a close). A read that started earlier and lands later used to put the
+  // old rows back (a closed row came back as PARTIALLY_CLOSED until a reload). Each read takes a number; a read older than the newest
+  // one applied is dropped.
+  const readSeq = useRef(0);
+  const appliedSeq = useRef(0);
   const fetchSystemData = async () => {
+    const seq = ++readSeq.current;
     try {
       const [diagRes, posRes, evRes] = await Promise.all([
         authFetch('/api/diagnostics/system'),
         authFetch('/api/workstation/positions'),
         authFetch('/api/workstation/events?limit=25'),
       ]);
+      if (seq < appliedSeq.current) return;
+      appliedSeq.current = seq;
       const next: ReadProblems = { diag: null, positions: null, events: null };
 
       if (diagRes.ok) {
@@ -162,6 +170,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
       setReadProblem(next);
     } catch (err: any) {
       console.error('Failed to fetch system data:', err);
+      if (seq < appliedSeq.current) return;
       const why = `server not reachable (${err?.message || 'network error'})`;
       setReadProblem({ diag: why, positions: why, events: why });
     }
@@ -305,21 +314,29 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
     const held = target && /^\d+$/.test(String(target.tokenQuantityRaw ?? '')) ? Number(target.tokenQuantityRaw) / Math.pow(10, target.tokenDecimals ?? 6) : null;
     const ask = sellConfirmText({ name: target?.symbol ? `$${target.symbol}` : 'this position', sellPct: 100, mode: target?.executionMode, tokensHeld: held, valueText: target ? fmtSol(target.currentValueSol) : null });
     if (!(await confirmSell(ask))) return;
+    const name = target?.symbol ? `$${target.symbol}` : 'the position';
     try {
       const res = await authFetch('/api/wallet/close-position', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ positionId: posId, sellPct: 100 }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Close position failed');
-      await fetchSystemData();
-      // R6-9: say what the close did: a sale, an adopted earlier sell (maybe partial), or an assumed loss on an empty wallet
-      const pos = positions.find((p) => p.id === posId);
-      const said = closeOutcomeText({ success: true, pnlSol: Number(data.data?.realizedPnLSol ?? 0), status: data.data?.status, outcome: data.data?.outcome }, 100, pos?.symbol ? `$${pos.symbol}` : 'the position');
+      const data = await res.json().catch(() => null);
+      // R6-9 / R11-5: say what the close did (a sale, an adopted earlier sell, an assumed loss) or why it did not, in the shared words.
+      // R11-6: shown as soon as the reply is in, before the re-read, and the row takes the status the close returned so it does not
+      // sit as PARTIALLY_CLOSED with a live Close button until the next read lands.
+      const d = data?.data;
+      const said = res.ok && data?.success !== false
+        ? closeOutcomeText({ success: true, pnlSol: Number(d?.realizedPnLSol ?? 0), status: d?.status, outcome: d?.outcome, remainingTokensRaw: d?.remainingTokensRaw }, 100, name)
+        : closeOutcomeText({ success: false, pnlSol: 0, error: data?.error || data?.message || `HTTP ${res.status} with no reason` }, 100, name);
       setStatusMessage({ text: said.text, type: said.tone === 'info' ? 'info' : 'error' });
+      if (res.ok && typeof d?.status === 'string') {
+        appliedSeq.current = readSeq.current; // any read already out started before this close: drop it
+        setPositions((list) => list.map((p) => (p.id === posId ? { ...p, status: d.status } : p)));
+      }
+      await fetchSystemData();
     } catch (err: any) {
-      setStatusMessage({ text: err.message || 'Failed to close position', type: 'error' });
+      setStatusMessage({ text: closeOutcomeText({ success: false, pnlSol: 0, error: `the server could not be reached (${err?.message || 'network error'})` }, 100, name).text, type: 'error' });
     }
   };
 

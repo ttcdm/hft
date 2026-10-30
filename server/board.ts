@@ -5,6 +5,9 @@ import { memecoinAggregator } from './memecoinAggregator';
 import { watchWindow } from './signals/watchWindow';
 import { ExitEngine } from './exits/exitEngine';
 import { solPriceService } from './market/solPriceService';
+import { onChainPoolStats } from './market/poolStats';
+import { getConfluenceThreshold } from './signals/confluenceThreshold';
+import { readyGate } from './signals/watchWindow';
 import type { NormalizedPosition } from './core/types';
 
 /**
@@ -50,7 +53,8 @@ export function buildBoard(now = Date.now()) {
   // R6-10: every WS launch carried the fixed text "Just now (WS)". The watch window knows how long it has watched each launch, which
   // starts at the create event; a launch it is not watching has no measured age here.
   const watchedAge = new Map<string, string>();
-  for (const r of snap.released) watchedAge.set(r.metrics.mint, `over ${Math.round(r.metrics.elapsedMs / 1000)}s (released)`);
+  // R11-10: a released row's age counts from its release (it used to freeze at "over 121s (released)")
+  for (const r of snap.released) watchedAge.set(r.metrics.mint, r.releasedAt ? `released ${Math.round(Math.max(0, now - r.releasedAt) / 1000)}s ago` : 'released');
   for (const w of snap.watching) watchedAge.set(w.metrics.mint, `${Math.round(w.metrics.elapsedMs / 1000)}s`);
   const launchAge = (mint: string, text: string | undefined): string | null => (text && text !== 'Just now (WS)' ? text : watchedAge.get(mint) ?? null);
 
@@ -70,11 +74,22 @@ export function buildBoard(now = Date.now()) {
       mintRevoked: p.authoritiesVerified === false ? null : p.isMintRevoked,
       freezeRevoked: p.authoritiesVerified === false ? null : p.isFreezeRevoked,
       createdAgo: launchAge(p.contractAddress, p.createdAgo),
+      /** R11-11: age of the last feed trade the price and curve figures come from; null when no trade was seen (create-event figures). */
+      priceAgeMs: (() => { const at = onChainPoolStats.lastTradeAt(p.contractAddress); return at === null ? null : Math.max(0, now - at); })(),
     }));
 
+  // R11-10: a verdict's reason keeps the threshold in force when it was released; the gate reads the live one. Each released row also
+  // carries its score, the live threshold, the READY gate's answer and how old the release is (it can be bought only while younger
+  // than the risk engine's signal age limit).
+  const threshold = getConfluenceThreshold();
+  const signalLimitMs = riskEngine.getLimits().maxSignalAgeMs;
   const watching = [
     ...snap.watching.map((w) => ({ mint: w.metrics.mint, state: 'WATCHING' as const, reason: null as string | null, metrics: w.metrics })),
-    ...snap.released.map((r) => ({ mint: r.metrics.mint, state: r.state, reason: r.reason, metrics: r.metrics })),
+    ...snap.released.map((r) => ({
+      mint: r.metrics.mint, state: r.state, reason: r.reason, metrics: r.metrics,
+      score: r.score, threshold, readyGate: r.state === 'READY' ? readyGate(r.metrics) : null,
+      releasedAgeMs: r.releasedAt ? Math.max(0, now - r.releasedAt) : null, signalLimitMs,
+    })),
   ];
 
   const holding = workstationDb

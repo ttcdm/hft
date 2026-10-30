@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { authFetch } from '../services/engineClient';
 import { onAuthenticated } from '../utils/authEvents';
-import { ageText } from '../utils/freshness';
+import { ageText, MARK_STALE_MS } from '../utils/freshness';
 import { fmtSignedSol, signTone } from '../utils/numFormat';
 import { dollarSymbol, displayName } from '../utils/displayName';
 
@@ -18,6 +18,8 @@ export interface BoardData {
   launches: Array<{
     mint: string; symbol: string; name: string; priceSol: number | null; priceUsd: number | null; curveProgressPct: number | null;
     top10HoldersPct: number | null; creatorHoldingPct: number | null; mintRevoked: boolean | null; freezeRevoked: boolean | null; createdAgo: string | null;
+    /** R11-11: age of the last feed trade the price and curve are from; null when none was seen. Absent on an older server. */
+    priceAgeMs?: number | null;
   }>;
   watching: Array<{
     mint: string; state: 'WATCHING' | 'HOT' | 'READY' | 'DEAD'; reason: string | null;
@@ -87,6 +89,8 @@ const STATE_STYLE: Record<string, string> = {
 };
 
 export const BOARD_STALE_MS = 10_000;
+/** R11-11: a launch's price and curve are stale once its last feed trade is older than the coordinator's mark limit, or none was seen. */
+const launchStale = (ageMs: number | null | undefined): boolean => ageMs === null || (typeof ageMs === 'number' && ageMs > MARK_STALE_MS);
 
 export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }: {
   ageMs?: number | null;
@@ -124,8 +128,16 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
             {board.launches.map((l) => (
               <tr key={l.mint} onClick={() => onSelect?.(l.mint)} className={`border-t border-slate-800/60 cursor-pointer hover:bg-slate-900 ${selected === l.mint ? 'bg-slate-900' : ''}`}>
                 <td className="px-3 py-2 text-left"><RowSelect mint={l.mint} label={`${dollarSymbol(l.symbol)} ${short(l.mint)}`} onSelect={onSelect} selected={selected === l.mint}><span className="font-bold text-slate-100" title={displayName(l.name)}>{dollarSymbol(l.symbol)}</span> <span className="text-slate-500 font-mono">{short(l.mint)}</span></RowSelect></td>
-                <td className={cell}>{fmtPrice(l.priceSol)}</td>
-                <td className={cell}>{fmt(l.curveProgressPct, 1, '%')}</td>
+                {/* R10-5 / R11-11: the price and curve are from the last feed trade; say how old, and mark them STALE past the mark limit */}
+                <td className={cell}>
+                  {fmtPrice(l.priceSol)}
+                  {l.priceAgeMs !== undefined && (
+                    <span data-testid="launch-price-age" className={`block text-[10px] ${launchStale(l.priceAgeMs) ? 'text-amber-300' : 'text-slate-500'}`}>
+                      {l.priceAgeMs === null ? 'no trade seen (create figures)' : `last trade ${ageText(l.priceAgeMs)}${launchStale(l.priceAgeMs) ? ' (STALE)' : ''}`}
+                    </span>
+                  )}
+                </td>
+                <td data-testid="launch-curve" className={`${cell} ${launchStale(l.priceAgeMs) ? 'text-amber-300' : ''}`}>{fmt(l.curveProgressPct, 1, '%')}</td>
                 <td className={cell}>{fmt(l.top10HoldersPct, 1, '%')}</td>
                 <td className={cell}>{fmt(l.creatorHoldingPct, 1, '%')}</td>
                 <td className={cell}>{l.createdAgo ?? DASH}</td>

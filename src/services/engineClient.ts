@@ -320,7 +320,8 @@ class EngineClient {
     return { status: 'ERROR', signals: [] };
   }
 
-  public async snipeSocialSignal(signalId: string, amountSol: number, jitoTipSol: number = 0.005, slippagePct: number = 8.0, confirmLive = false) {
+  // R11-8: no tip given means none is sent (the server's dynamic tip policy decides); a 0.005 default here was a hidden tip
+  public async snipeSocialSignal(signalId: string, amountSol: number, jitoTipSol?: number, slippagePct: number = 8.0, confirmLive = false) {
     try {
       const res = await authFetch('/api/social/signals/snipe', {
         method: 'POST',

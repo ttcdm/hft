@@ -1744,6 +1744,17 @@ export class ExecutionCoordinator {
     return (open.length * CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS) / 1e9;
   }
 
+  /**
+   * B12 / R12-9: the PAPER order ceiling the paper path enforces, 10% of the spendable paper bankroll (the real wallet balance when one
+   * was read, else PAPER_BANKROLL_SOL, less the 0.015 SOL reserve and what is reserved in flight). Screens read it from
+   * /api/snipe/limits: they said 0.02 SOL (MAX_POSITION_SIZE_SOL) while this refused anything above about 0.0055.
+   */
+  public paperOrderCeiling(): { balanceSol: number; spendableSol: number; ceilingSol: number } {
+    const paperBalanceSol = this.realWalletBalanceSol !== null ? this.realWalletBalanceSol : executionConfig.getConfig().paperBankrollSol;
+    const spendableSol = CapitalSizer.calculateSpendableBankroll(paperBalanceSol, 0.015, this.inFlightReservedSol);
+    return { balanceSol: paperBalanceSol, spendableSol, ceilingSol: Number((spendableSol * 0.10).toFixed(6)) };
+  }
+
   public getSpendableBankrollSol(): number {
     const raw = this.realWalletBalanceSol ?? 0;
     return CapitalSizer.calculateSpendableBankroll(raw, 0.015, this.inFlightReservedSol);
@@ -2641,9 +2652,7 @@ export class ExecutionCoordinator {
 
     // Pre-trade capital sizing check: ensure order does not exceed 10% of spendable bankroll (B12)
     // C5: the configured paper bankroll (default 0.07 SOL), never an invented 1.0
-    const paperBalanceSol = this.realWalletBalanceSol !== null ? this.realWalletBalanceSol : executionConfig.getConfig().paperBankrollSol;
-    const paperSpendable = CapitalSizer.calculateSpendableBankroll(paperBalanceSol, 0.015, this.inFlightReservedSol);
-    const maxPaperOrderSol = Number((paperSpendable * 0.10).toFixed(6));
+    const { balanceSol: paperBalanceSol, spendableSol: paperSpendable, ceilingSol: maxPaperOrderSol } = this.paperOrderCeiling();
     if (paperSpendable > 0 && req.amountSol > maxPaperOrderSol + 0.000001) {
       return { rejection: {
         success: false,

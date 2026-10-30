@@ -1296,7 +1296,9 @@ function withOperatorAmount<T extends { amountSol?: number }>(body: T): T & { op
 }
 
 app.get('/api/snipe/limits', requireOperatorAuth, (req, res) => {
-  res.json({ success: true, ...getSnipeLimits(solPriceService.lastKnownPrice()) });
+  // R12-9: the PAPER order ceiling the paper path enforces (10% of the spendable paper bankroll); null when nothing is spendable
+  const paper = executionCoordinator.paperOrderCeiling();
+  res.json({ success: true, ...getSnipeLimits(solPriceService.lastKnownPrice()), paperCeilingSol: paper.spendableSol > 0 ? paper.ceilingSol : null });
 });
 
 app.post('/api/auto/budget', requireOperatorAuth, validateTradeBody(AutoBudgetSchema), (req, res) => {

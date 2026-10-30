@@ -351,13 +351,16 @@ export class AutoSnipeController extends EventEmitter {
 
   /**
    * A31/A71: the DEVNET_LIVE session to continue, if one started less than SESSION_BUDGETS.maxDurationMs ago: the one in memory, else the
-   * saved one. null when none is running (a new session starts). A saved value that cannot be read is treated as a full session (fail closed).
+   * saved one. null when none is running (a new session starts). A saved value that is malformed is treated as a full session (fail closed).
+   * R14-4: a read that FAILED (`{ unreadable }`) is not "no session": setMode refuses DEVNET_LIVE on it, and nothing is saved over the row.
    */
-  private continuedLiveSession(budgets: SessionBudgets, now: number): AutoSession | null {
+  private continuedLiveSession(budgets: SessionBudgets, now: number): AutoSession | null | { unreadable: string } {
     const fresh = (startedAt: number) => now - startedAt < SESSION_BUDGETS.maxDurationMs;
     // The saved row is the record (it is written on every change); the in-memory object is reused when it is that same session, so the
     // worst-case figures waiting in unsettledBuys still settle against it.
-    const saved = workstationDb.getSetting<Record<string, unknown>>(SETTING_LIVE_SESSION);
+    const read = workstationDb.readSetting<Record<string, unknown>>(SETTING_LIVE_SESSION);
+    if (!read.ok) return { unreadable: read.error };
+    const saved = read.value;
     if (!saved || typeof saved !== 'object') return null;
     const startedAt = Number(saved.startedAt);
     if (Number.isFinite(startedAt) && !fresh(startedAt)) return null;
@@ -376,6 +379,11 @@ export class AutoSnipeController extends EventEmitter {
       budgets,
     };
   }
+  /** R14-4: the refusal when the saved DEVNET_LIVE session could not be read. */
+  private static sessionUnreadableError(error: string): string {
+    return `DEVNET_LIVE is refused: SESSION_UNREADABLE: the saved DEVNET_LIVE session spend could not be read (${error}). Its budget may be partly used, so a new session is not started over it. Try again; if it keeps failing, check the database.`;
+  }
+
   private spendCap(): { cap: number; kind: 'PAPER' | 'REAL'; note: string } {
     if (this.session && this.sessionKind === 'PAPER') {
       const cap = AutoSnipeController.maxPaperSessionSpendSol();
@@ -463,7 +471,9 @@ export class AutoSnipeController extends EventEmitter {
     }
     // 3E: a kill saved by the last run keeps auto OFF and killed, whatever mode is saved (a kill that saved OFF but crashed mid-way, or an
     // older build that saved the mode only at the end of the kill). Only an operator setting a mode again clears it.
-    const savedKill = workstationDb.getSetting<{ reason?: unknown; ts?: unknown }>(SETTING_KILL);
+    // R14-4: a failed read is not "no kill": auto stays OFF and killed, with the read error as the reason, until an operator sets a mode.
+    const killRead = workstationDb.readSetting<{ reason?: unknown; ts?: unknown }>(SETTING_KILL);
+    const savedKill = killRead.ok ? killRead.value : { reason: `the saved auto kill could not be read (${killRead.error}); treated as killed` };
     if (savedKill && typeof savedKill === 'object') {
       this.killed = true;
       this.killReason = typeof savedKill.reason === 'string' && savedKill.reason ? savedKill.reason : 'kill before the restart (no reason saved)';
@@ -601,6 +611,7 @@ export class AutoSnipeController extends EventEmitter {
       // A31/A71: a session that has used its budget is not restarted by setting the mode again; it ends when its time is up.
       const liveBudgets: SessionBudgets = this.budgetOverride ? { ...SESSION_BUDGETS, ...this.budgetOverride } : { ...SESSION_BUDGETS };
       const cont = this.continuedLiveSession(liveBudgets, Date.now());
+      if (cont && 'unreadable' in cont) return { ok: false, mode: this.mode, error: AutoSnipeController.sessionUnreadableError(cont.unreadable) };
       if (cont && (cont.buys >= liveBudgets.maxBuys || cont.spentSol + this.orderSol() > liveBudgets.maxSpendSol + 1e-9)) {
         return { ok: false, mode: this.mode, error: `DEVNET_LIVE is refused: SESSION_BUDGET_USED: the DEVNET_LIVE session started ${new Date(cont.startedAt).toISOString()} has ${cont.buys} buy(s) and ${cont.spentSol.toFixed(6)} SOL spent of ${liveBudgets.maxBuys} buys / ${liveBudgets.maxSpendSol} SOL; it ends at ${new Date(cont.startedAt + SESSION_BUDGETS.maxDurationMs).toISOString()}. Setting the mode again does not reset it.` };
       }
@@ -618,6 +629,10 @@ export class AutoSnipeController extends EventEmitter {
         return { ok: false, mode: this.mode, error: `LOSS_TRIGGERS_NEED_ACK: ${pending.map((h) => `${h.code} (${h.message})`).join('; ')}, over the last auto trades across sessions. Check them, then acknowledge with POST /api/auto/resume {ackLossTriggers:true}; trades closed before that no longer count.` };
       }
     }
+    // R14-4: read the DEVNET_LIVE session again after the awaits above, before anything changes; a failed read refuses here, so a fresh
+    // 0 SOL session is never saved over the real one.
+    const continued = next === 'DEVNET_LIVE' ? this.continuedLiveSession(this.budgetOverride ? { ...SESSION_BUDGETS, ...this.budgetOverride } : { ...SESSION_BUDGETS }, Date.now()) : null;
+    if (continued && 'unreadable' in continued) return { ok: false, mode: this.mode, error: AutoSnipeController.sessionUnreadableError(continued.unreadable) };
     this.killed = false;
     this.killReason = null;
     workstationDb.setSetting(SETTING_KILL, null); // 3E: an operator setting a mode again is what clears a kill, here and after a restart
@@ -640,7 +655,6 @@ export class AutoSnipeController extends EventEmitter {
       // S181: the operator's saved budget (buys and spend) replaces the defaults; loss and time limits stay fixed.
       const budgets: SessionBudgets = this.budgetOverride ? { ...base, ...this.budgetOverride } : base;
       const now = Date.now();
-      const continued = next === 'DEVNET_LIVE' ? this.continuedLiveSession(budgets, now) : null;
       if (continued) {
         // A31/A71: same session (it started less than 4 h ago): its spend, buys and positions carry on; only the budgets in force are re-read.
         continued.budgets = budgets;

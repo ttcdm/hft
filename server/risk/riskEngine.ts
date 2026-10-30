@@ -153,9 +153,20 @@ export class HardenedRiskEngine {
     return workstationDb.setSetting(DAILY_LOSS_LATCH_SETTING, Object.fromEntries(this.dailyLossLatch));
   }
 
-  /** R3-3: bring back the latches saved by the last run. A malformed entry is skipped with a warning; nothing is latched from nothing. */
+  /**
+   * R3-3: bring back the latches saved by the last run. A malformed entry is latched from now (fail closed); nothing is latched from nothing.
+   * R14-4: a read that FAILED is not "nothing saved": both modes are latched until an operator clears them.
+   */
   private restoreDailyLossLatch(): void {
-    const saved = workstationDb.getSetting<Record<string, unknown>>(DAILY_LOSS_LATCH_SETTING);
+    const read = workstationDb.readSetting<Record<string, unknown>>(DAILY_LOSS_LATCH_SETTING);
+    if (!read.ok) {
+      for (const mode of ['LIVE', 'PAPER'] as ExecutionMode[]) {
+        this.dailyLossLatch.set(mode, { at: Date.now(), message: `the saved daily-loss latch could not be read (${read.error}); latched until an operator clears it` });
+      }
+      Logger.error(`Daily loss latch could not be read at boot (${read.error}); LIVE and PAPER buys stay latched until an operator clears them`);
+      return;
+    }
+    const saved = read.value;
     if (!saved || typeof saved !== 'object') return;
     for (const mode of ['LIVE', 'PAPER'] as ExecutionMode[]) {
       const v = saved[mode] as { at?: unknown; message?: unknown } | undefined;

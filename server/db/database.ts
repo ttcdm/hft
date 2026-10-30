@@ -304,14 +304,28 @@ export class WorkstationDatabase {
     Logger.info(`SQLite persistence initialized at ${this.dbPath}`);
   }
 
-  /** S222: a small operator setting that survives a restart (the confluence threshold and the auto mode). null when unset or unreadable. */
+  /**
+   * S222: a small operator setting that survives a restart (the confluence threshold and the auto mode). null when unset or unreadable.
+   * R14-4: a setting whose absence and a failed read must be told apart (a saved session spend, a latch) uses `readSetting` instead.
+   */
   public getSetting<T = unknown>(key: string): T | null {
+    const r = this.readSetting<T>(key);
+    return r.ok ? r.value : null;
+  }
+
+  /**
+   * R14-4: a setting, with "no row" (`ok: true, value: null`) told apart from "the read failed" (`ok: false`): a busy database past its
+   * timeout, a broken file, a row that is not JSON. A caller that guards money (the DEVNET_LIVE session spend, the daily-loss latch, the
+   * auto kill) refuses or stays latched on `ok: false`; taking it for "nothing saved" reset those to their defaults.
+   */
+  public readSetting<T = unknown>(key: string): { ok: true; value: T | null } | { ok: false; error: string } {
     try {
       const row = this.db.prepare(`SELECT value_json FROM app_settings WHERE key = ?`).get(key) as { value_json: string } | undefined;
-      return row ? (JSON.parse(row.value_json) as T) : null;
+      return { ok: true, value: row ? (JSON.parse(row.value_json) as T) : null };
     } catch (err: any) {
-      Logger.warn(`Setting ${key} could not be read: ${err.message}`);
-      return null;
+      const error = String(err?.message ?? err);
+      Logger.warn(`Setting ${key} could not be read: ${error}`);
+      return { ok: false, error };
     }
   }
 

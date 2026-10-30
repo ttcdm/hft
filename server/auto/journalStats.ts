@@ -14,7 +14,10 @@ export interface DecisionRow {
 
 export interface JournalStats {
   seen: number;
+  /** REJECTED and DROPPED rows by stage; R12-5: KILL_TRIGGER rows (an auto trigger that dropped the session) under 'kill trigger'. */
   rejectedByStage: Record<string, number>;
+  /** R12-5: KILL_TRIGGER rows (the session was dropped to SHADOW by an auto trigger). */
+  killTriggers: number;
   wouldBuy: number;
   bought: number;
   open: number;
@@ -59,12 +62,15 @@ export interface PositionFacts {
  */
 export function computeJournalStats(rows: DecisionRow[], position: (id: string) => PositionFacts | undefined, unresolvedOutcome = 'SENT_UNRESOLVED'): JournalStats {
   const rejectedByStage: Record<string, number> = {};
-  let seen = 0, wouldBuy = 0, bought = 0, fees = 0;
+  let seen = 0, wouldBuy = 0, bought = 0, fees = 0, killTriggers = 0;
   const boughtIds = new Set<string>();
   for (const r of rows) {
     if (r.outcome === 'QUEUED') seen++;
     else if (r.outcome === 'REJECTED' || r.outcome === 'DROPPED') rejectedByStage[r.stage] = (rejectedByStage[r.stage] ?? 0) + 1;
-    else if (r.outcome === 'WOULD_BUY') wouldBuy++;
+    else if (r.outcome === 'KILL_TRIGGER') {
+      killTriggers++;
+      rejectedByStage['kill trigger'] = (rejectedByStage['kill trigger'] ?? 0) + 1;
+    } else if (r.outcome === 'WOULD_BUY') wouldBuy++;
     else if (r.outcome === 'BOUGHT') {
       bought++;
       fees += Number(r.inputs?.feesSol ?? 0);
@@ -86,7 +92,7 @@ export function computeJournalStats(rows: DecisionRow[], position: (id: string) 
       open++;
     }
   }
-  return { seen, rejectedByStage, wouldBuy, bought, open, closed, netPnlSol: net, feesPaidSol: fees, winRate: closed > 0 ? wins / closed : null };
+  return { seen, rejectedByStage, killTriggers, wouldBuy, bought, open, closed, netPnlSol: net, feesPaidSol: fees, winRate: closed > 0 ? wins / closed : null };
 }
 
 /**

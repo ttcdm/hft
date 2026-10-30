@@ -1331,11 +1331,18 @@ app.post('/api/auto/kill', requireOperatorAuth, validateTradeBody(AutoKillSchema
   // R6-4: auto is OFF either way, but "sell what it bought" succeeded only if every sell did and nothing auto bought is still open; a
   // refused or failed sell, or a position still open, is success:false
   const notSold = [...result.refused, ...result.failed];
+  // R13-14: stillOpen is counted without exitAll too, so a kill that sold nothing never answers success with auto positions open
   const success = notSold.length === 0 && result.stillOpen === 0;
   const partial = !success && result.closed > 0;
+  // R12-5: KILL AUTO sells only what auto bought; say how many positions opened by hand stay open
+  const manualNote = result.manualOpen > 0 ? `${result.manualOpen} position(s) you opened by hand are still open; KILL AUTO does not sell them (close them from the Plug & Play panel, or PANIC sells everything).` : null;
+  const error = success ? null : req.body.exitAll
+    ? `Auto is OFF, but ${notSold.length} of ${result.attempted} position(s) were NOT sold${notSold.length ? `: ${notSold.map((f) => `${f.symbol} (${f.error})`).join('; ')}` : ''}; ${result.stillOpen} auto position(s) are still open. Close them by hand.`
+    : `Auto is OFF. Nothing was sold (exitAll was not asked for); ${result.stillOpen} auto position(s) are still open, under their exits.`;
   res.json({
     success, partial, ...result,
-    ...(success ? {} : { error: `Auto is OFF, but ${notSold.length} of ${result.attempted} position(s) were NOT sold${notSold.length ? `: ${notSold.map((f) => `${f.symbol} (${f.error})`).join('; ')}` : ''}; ${result.stillOpen} auto position(s) are still open. Close them by hand.` }),
+    ...(error ? { error } : {}),
+    ...(manualNote ? { note: manualNote } : {}),
     status: autoSnipeController.getStatus(),
   });
 }));

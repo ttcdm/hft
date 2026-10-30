@@ -119,8 +119,10 @@ export interface AutoKillResult {
   refused: Array<{ positionId: string; mint: string; symbol: string; error: string }>;
   /** Sent and failed, or threw. */
   failed: Array<{ positionId: string; mint: string; symbol: string; error: string }>;
-  /** Auto-owned positions still ACTIVE after the sells; 0 when exitAll was not asked for (nothing was sold, nothing was counted). */
+  /** Auto-owned positions still ACTIVE after the sells. R13-14: counted with or without exitAll (it said 0 without, while they stayed open). */
   stillOpen: number;
+  /** R12-5: ACTIVE positions auto does not own (opened by hand). KILL AUTO never sells them; the reply says they are still open. */
+  manualOpen: number;
 }
 
 export interface AutoDecision {
@@ -798,15 +800,18 @@ export class AutoSnipeController extends EventEmitter {
         }
       }
     }
-    // R6-4: say what is still open, so "success" never reads as "all sold"
-    const stillOpen = opts.exitAll ? workstationDb.loadPositions(undefined, 'ACTIVE').filter((p) => AutoSnipeController.isAutoOwned(owned, p)).length : 0;
+    // R6-4: say what is still open, so "success" never reads as "all sold". R13-14: counted without exitAll too. R12-5: and the positions
+    // opened by hand, which KILL AUTO never sells.
+    const activeAfter = workstationDb.loadPositions(undefined, 'ACTIVE');
+    const stillOpen = activeAfter.filter((p) => AutoSnipeController.isAutoOwned(owned, p)).length;
+    const manualOpen = activeAfter.length - stillOpen;
     const notSold = [...refused, ...failed];
-    Logger.warn(`[AUTO] kill: ${this.killReason}; closed ${closed} of ${attempted} position(s), ${refused.length} refused, ${failed.length} failed, ${stillOpen} auto position(s) still open${notSold.length ? `; NOT closed: ${notSold.map((f) => `${f.symbol} (${f.error})`).join(', ')}` : ''}`);
+    Logger.warn(`[AUTO] kill: ${this.killReason}; closed ${closed} of ${attempted} position(s), ${refused.length} refused, ${failed.length} failed, ${stillOpen} auto position(s) and ${manualOpen} manual position(s) still open${notSold.length ? `; NOT closed: ${notSold.map((f) => `${f.symbol} (${f.error})`).join(', ')}` : ''}`);
     if (refused.length + failed.length > 0) {
       workstationDb.logDecision({ autoMode: 'OFF', mint: '-', stage: 'exit', outcome: 'INFO', reason: `kill: ${refused.length} sell(s) refused and ${failed.length} failed; ${stillOpen} auto position(s) still open`, inputs: { refused, failed } });
     }
     this.emit('mode', { mode: this.mode, reason: this.killReason });
-    return { mode: this.mode, closed, attempted, refused, failed, stillOpen };
+    return { mode: this.mode, closed, attempted, refused, failed, stillOpen, manualOpen };
   }
 
   // ---- G3: kill switch ---------------------------------------------------------------------------------------

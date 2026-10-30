@@ -1193,6 +1193,7 @@ export class ExecutionCoordinator {
             pTx.reconciliationState = 'TIMED_OUT'; // a row written before lastValidBlockHeight was stored
             workstationDb.saveTransaction(pTx);
           }
+          this.forgetSettledPendingSell(pTx); // R14-1: after the row's write, so a write that throws leaves the pending sell in place
         } catch (err: any) {
           // R5-5: a failed read is unknown, not fine. The row stays as it is, the pass is a mismatch and is tried again.
           Logger.warn(`Failed to reconcile pending transaction ${pTx.signature}: ${err.message}`);
@@ -4830,6 +4831,19 @@ export class ExecutionCoordinator {
     } catch (err: any) {
       this.pendingSellSeedFailed = true;
       Logger.warn(`[P2.2] could not seed pending sells from the ledger: ${err.message}`);
+    }
+  }
+
+  /**
+   * R14-1: a SELL row that startup reconciliation settled (booked RECONCILED, REVERTED, TIMED_OUT) is no longer a pending sell. start() seeds
+   * pendingSells from the PENDING rows before the pass runs; left in place, the entry made the next exit take the booked sell for one whose
+   * fill was never booked (its signature is LANDED and the booked row now matches the wallet), so it was subtracted and its PnL booked again.
+   * A row still PENDING or RECONCILIATION_REQUIRED keeps its entry: its outcome is still unknown.
+   */
+  private forgetSettledPendingSell(pTx: PersistedTransaction): void {
+    if (pTx.direction !== 'SELL' || pTx.reconciliationState === 'PENDING' || pTx.reconciliationState === 'RECONCILIATION_REQUIRED') return;
+    for (const [positionId, p] of this.pendingSells) {
+      if (p.signature === pTx.signature) this.pendingSells.delete(positionId);
     }
   }
 

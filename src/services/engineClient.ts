@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import {
   PumpFunHotCallout,
   PumpFunCaller,
@@ -542,3 +543,22 @@ class EngineClient {
 }
 
 export const engineClient = new EngineClient();
+
+/**
+ * R9-7 (Tracker half): the one place a screen reads "is the live stream up". It re-checks on every socket change (open, close, auth, a data
+ * frame, offline) and once a second, so a socket that goes quiet past WS_QUIET_MS or a browser that goes offline stops reading as live
+ * within about a second. A screen that kept its own flag set it true on any frame (and on the cached frame replayed on subscribe) and
+ * re-checked only on its 5 to 6 s poll.
+ */
+export const WS_LIVE_CHECK_MS = 1_000;
+export function useWsStreaming(): boolean {
+  const [live, setLive] = useState(() => engineClient.isWsConnected());
+  useEffect(() => {
+    const check = () => setLive(engineClient.isWsConnected());
+    const off = engineClient.onWsStateChange(check);
+    const t = setInterval(check, WS_LIVE_CHECK_MS);
+    check();
+    return () => { off(); clearInterval(t); };
+  }, []);
+  return live;
+}

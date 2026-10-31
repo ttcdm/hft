@@ -162,21 +162,38 @@ function rewriteHeld(lockPath: string, info: LockInfo): void {
  * process open). A lock that is no longer ours on disk (deleted by hand, or taken over) is not rewritten; it is dropped from `held`.
  */
 export function heartbeatHeldLocks(now: number = Date.now()): void {
-  for (const [lockPath, info] of held) {
-    try {
-      if (!isOwnLock(readLock(lockPath))) {
-        held.delete(lockPath);
-        console.error(`[INSTANCE LOCK] ${lockPath} is no longer held by this process (removed or taken over); its heartbeat stopped`);
-        continue;
-      }
-      const next = { ...info, heartbeatAt: now };
-      rewriteHeld(lockPath, next);
-      held.set(lockPath, next);
-    } catch (e: any) {
-      console.error(`[INSTANCE LOCK] heartbeat of ${lockPath} failed: ${e?.message ?? e}`);
+  for (const lockPath of [...held.keys()]) heartbeatOne(lockPath, now);
+}
+
+/**
+ * One heartbeat of a held lock: re-read it, drop it from `held` when it is no longer ours, else rewrite `heartbeatAt`. True when the
+ * heartbeat was written. A failed rewrite (a slow or failing mount) only logs, and the held entry keeps its last confirmed heartbeatAt, which
+ * isLockHeld then ages (R13-10).
+ */
+function heartbeatOne(lockPath: string, now: number): boolean {
+  const info = held.get(lockPath);
+  if (!info) return false;
+  try {
+    if (!isOwnLock(readLock(lockPath))) {
+      held.delete(lockPath);
+      console.error(`[INSTANCE LOCK] ${lockPath} is no longer held by this process (removed or taken over); its heartbeat stopped`);
+      return false;
     }
+    const next = { ...info, heartbeatAt: now };
+    rewriteHeld(lockPath, next);
+    held.set(lockPath, next);
+    return true;
+  } catch (e: any) {
+    console.error(`[INSTANCE LOCK] heartbeat of ${lockPath} failed: ${e?.message ?? e}`);
+    return false;
   }
 }
+
+/**
+ * R13-10: the age of this process's last confirmed heartbeat past which its hold is not trusted without a fresh one. One heartbeat interval
+ * short of LOCK_HEARTBEAT_STALE_MS (when another boot may take the lock over), so this process stops signing before anyone can take it.
+ */
+export const LOCK_HELD_CONFIRM_MS = LOCK_HEARTBEAT_STALE_MS - LOCK_HEARTBEAT_MS;
 
 function hookExit(): void {
   if (!heartbeatTimer) {
@@ -289,9 +306,17 @@ export function updateHeldLock(lockPath: string, extra: Partial<Omit<LockInfo, '
   held.set(lockPath, next);
 }
 
-/** True while this process holds `lockPath` (taken by acquireLock, not released, not found removed or taken over by the heartbeat). */
-export function isLockHeld(lockPath: string): boolean {
-  return held.has(lockPath);
+/**
+ * True while this process holds `lockPath`: taken by acquireLock, not released, not found removed or taken over by the heartbeat, and
+ * R13-10: its heartbeat confirmed within LOCK_HELD_CONFIRM_MS. A heartbeat older than that (its rewrite kept failing, or the timer was
+ * starved) is confirmed on disk now; if that fails, or the file is no longer ours, the lock counts as lost, since another boot may take
+ * a lock whose heartbeat is LOCK_HEARTBEAT_STALE_MS old.
+ */
+export function isLockHeld(lockPath: string, now: number = Date.now()): boolean {
+  const info = held.get(lockPath);
+  if (!info) return false;
+  if (typeof info.heartbeatAt === 'number' && now - info.heartbeatAt < LOCK_HELD_CONFIRM_MS) return true;
+  return heartbeatOne(lockPath, now);
 }
 
 export function releaseLock(lockPath: string): void {

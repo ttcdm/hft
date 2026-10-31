@@ -67,6 +67,8 @@ interface HeaderProps {
   /** R10-2: null when the server's kill-switch state is not known (not read yet, logged out, or the read failed) */
   isHalted: boolean | null;
   onToggleKillSwitch: () => void;
+  /** R12-2: a kill-switch request is out; the button says so and takes no press until it is answered */
+  killPending?: boolean;
   onOpenAiDiagnostics: () => void;
   onOpenSystemChecks: () => void;
   onOpenAutoPipeline: () => void;
@@ -88,6 +90,7 @@ export const Header: React.FC<HeaderProps> = ({
   kpis,
   isHalted,
   onToggleKillSwitch,
+  killPending = false,
   onOpenAiDiagnostics,
   onOpenSystemChecks,
   onOpenAutoPipeline,
@@ -282,7 +285,9 @@ export const Header: React.FC<HeaderProps> = ({
           <span className="text-[10px] opacity-70">today</span>
           <span data-testid="pill-realized" className={`font-bold tracking-tight ${pillStale ? '' : USD_TONE[usdTone(profitSummary?.realizedUsd)]}`}>{signedUsd(profitSummary?.realizedUsd)}</span>
           <span className="text-[10px] opacity-70">open at mark</span>
-          <span data-testid="pill-open" className={`font-bold tracking-tight ${pillStale ? '' : USD_TONE[usdTone(profitSummary?.unrealizedUsd)]}`}>{signedUsd(profitSummary?.unrealizedUsd)}</span>
+          {/* R10-5: an open figure built on a stale mark is amber and says how many marks are stale */}
+          <span data-testid="pill-open" className={`font-bold tracking-tight ${pillStale ? '' : profitSummary?.staleMarks ? 'text-amber-300' : USD_TONE[usdTone(profitSummary?.unrealizedUsd)]}`}>{signedUsd(profitSummary?.unrealizedUsd)}</span>
+          {profitSummary?.staleMarks ? <span data-testid="pill-mark-stale" className="text-[10px] font-bold text-amber-300">{profitSummary.staleMarks} STALE mark{profitSummary.staleMarks === 1 ? '' : 's'}</span> : null}
           <span className="text-[10px] opacity-70">({profitSummary?.openCount ?? '—'})</span>
           <PillStaleNote at={profitAt} failed={profitFailed} now={nowTick} />
         </button>
@@ -439,6 +444,8 @@ export const Header: React.FC<HeaderProps> = ({
         <button
           id="btn-emergency-kill-switch"
           onClick={onToggleKillSwitch}
+          disabled={killPending}
+          aria-busy={killPending}
           className={`flex-shrink-0 whitespace-nowrap px-2.5 sm:px-3 py-1 rounded-lg border text-xs font-black font-mono tracking-wider transition flex items-center space-x-1 ${
             isHalted
               ? 'bg-emerald-500/15 hover:bg-emerald-500/25 border-emerald-500/50 text-emerald-400 shadow-lg shadow-emerald-500/15'
@@ -466,6 +473,7 @@ export const Header: React.FC<HeaderProps> = ({
               <span className="sm:hidden">KILL</span>
             </>
           )}
+          {killPending && <span className="text-[9px] font-bold text-slate-300" data-testid="kill-pending">(sending…)</span>}
         </button>
       </div>
     </header>

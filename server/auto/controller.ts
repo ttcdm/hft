@@ -6,11 +6,11 @@ import { executionCoordinator, isRecoveredPosition, LIVE_BUY_FILLED } from '../e
 import { CapitalSizer } from '../capital/capitalSizer';
 import { memecoinAggregator } from '../memecoinAggregator';
 import { solPriceService } from '../market/solPriceService';
-import { executionConfig } from '../solana/executionConfig';
+import { executionConfig, ECONOMIC_TIP_CAP_FRACTION } from '../solana/executionConfig';
 import { checkSnipeAmountSol, SNIPE_AMOUNT_MIN_SOL } from '../execution/snipeAmount';
 import { allowedCluster, assertClusterAllowed } from '../solana/clusterGuard';
 import { Logger } from '../middleware/enterprise';
-import type { SignalProvenance } from '../core/types';
+import type { SignalProvenance, OperatorAlert } from '../core/types';
 import { computeJournalStats, autoEvidencePnl, type JournalStatsReport } from './journalStats';
 import { evaluateKillTriggers, auditWalletChange, LOSS_TRIGGER_ACK_SETTING, LOSS_TRIGGER_TRADES as LOSS_TRIGGER_TRADES_ALL, type KillTrigger } from './killSwitch';
 import { riskEngine, PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS } from '../risk/riskEngine';
@@ -59,6 +59,23 @@ export const PAPER_SESSION_BUDGETS = {
   maxDurationMs: 4 * 60 * 60 * 1000,
 } as const;
 
+/**
+ * R14-6: what one DEVNET_LIVE buy may take from the wallet at most, as the session cap counts it afterwards: the order plus its slippage
+ * headroom (the curve buy's max SOL cost), the Jito tip (capped at ECONOMIC_TIP_CAP_FRACTION of the order, at least 10 000 lamports; 0 when
+ * Jito is off), a network and priority fee allowance (BUY_FEE_ALLOWANCE_LAMPORTS, the non-tip part of the risk engine's execution-cost cap),
+ * and the token-account and first-buy accumulator rent. The pre-check compares spent + this with the cap, so a buy that passes cannot carry
+ * the counted spend over it.
+ */
+export const BUY_FEE_ALLOWANCE_LAMPORTS = 50_000;
+export function worstCaseAutoBuySol(orderSol: number, slippagePct: number, jitoEnabled: boolean): number {
+  const tipSol = jitoEnabled ? Math.max(orderSol * ECONOMIC_TIP_CAP_FRACTION, 10_000 / 1e9) : 0;
+  const rentSol = (CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS + PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS) / 1e9;
+  return orderSol * (1 + Math.max(0, slippagePct) / 100) + tipSol + BUY_FEE_ALLOWANCE_LAMPORTS / 1e9 + rentSol;
+}
+
+/** 3B / R14-5: an auto buy counted at its worst case until its LIVE_BUY_FILLED row says what it took. */
+interface UnsettledBuy { session: AutoSession; mint: string; sinceTs: number; countedSol: number }
+
 export interface SessionBudgets {
   maxBuys: number;
   maxSpendSol: number;
@@ -77,6 +94,11 @@ export interface AutoCandidate {
   jitoTipSol?: number;
   enforceConfluence?: boolean;
 }
+
+/** R14-9: an auto candidate threw before it was decided; acknowledged by the operator. */
+export const AUTO_CANDIDATE_FAILED = 'AUTO_CANDIDATE_FAILED';
+/** The alert codes the auto controller owns (raised, listed and acknowledged here, not on the coordinator). */
+export const AUTO_ALERT_CODES: readonly string[] = [AUTO_CANDIDATE_FAILED];
 
 export type AutoOutcome = 'DROPPED' | 'WOULD_BUY' | 'BOUGHT' | 'REJECTED';
 
@@ -97,8 +119,10 @@ export interface AutoKillResult {
   refused: Array<{ positionId: string; mint: string; symbol: string; error: string }>;
   /** Sent and failed, or threw. */
   failed: Array<{ positionId: string; mint: string; symbol: string; error: string }>;
-  /** Auto-owned positions still ACTIVE after the sells; 0 when exitAll was not asked for (nothing was sold, nothing was counted). */
+  /** Auto-owned positions still ACTIVE after the sells. R13-14: counted with or without exitAll (it said 0 without, while they stayed open). */
   stillOpen: number;
+  /** R12-5: ACTIVE positions auto does not own (opened by hand). KILL AUTO never sells them; the reply says they are still open. */
+  manualOpen: number;
 }
 
 export interface AutoDecision {
@@ -147,6 +171,13 @@ export interface AutoStatus {
   confluence: ConfluenceThresholdInfo;
   /** S189: set while a PAPER session waits in SHADOW for readiness to stay green; it then comes back by itself. */
   autoRestore: { greenForMs: number; needMs: number } | null;
+  /** R12-3: the risk-engine kill switch, read now (it is not auto's own kill: see `killed`). */
+  killSwitchActive: boolean;
+  /**
+   * R12-3: why auto buys nothing in the mode it is in, when something outside auto refuses them: KILL_SWITCH_ACTIVE (the risk kill switch
+   * is on; SHADOW still journals would-buys) or TRADING_HALTED. null when nothing outside auto blocks buys. The panel shows it next to the mode.
+   */
+  buysRefusedBy: { code: 'KILL_SWITCH_ACTIVE' | 'TRADING_HALTED'; message: string } | null;
 }
 
 const MAX_DECISIONS = 500;
@@ -345,19 +376,25 @@ export class AutoSnipeController extends EventEmitter {
   /** A31/A71: save the DEVNET_LIVE session's spend. Called on every change; a failed write is logged (the in-memory figure still holds). */
   private saveLiveSession(s: AutoSession | null): void {
     if (!s || s !== this.liveSession) return;
-    const ok = workstationDb.setSetting(SETTING_LIVE_SESSION, { startedAt: s.startedAt, startingBankrollSol: s.startingBankrollSol, buys: s.buys, spentSol: s.spentSol, positionIds: s.positionIds });
+    // R14-5: the buys counted at their worst case (in flight, or sent and unresolved) are saved with the spend, so a restart counts them and
+    // can still settle them against the LIVE_BUY_FILLED row recovery journals.
+    const unsettled = [...this.reservedBuys, ...this.unsettledBuys].filter((u) => u.session === s).map((u) => ({ mint: u.mint, sinceTs: u.sinceTs, countedSol: u.countedSol }));
+    const ok = workstationDb.setSetting(SETTING_LIVE_SESSION, { startedAt: s.startedAt, startingBankrollSol: s.startingBankrollSol, buys: s.buys, spentSol: s.spentSol, positionIds: s.positionIds, unsettled });
     if (!ok) Logger.error(`[AUTO] the DEVNET_LIVE session spend (${s.spentSol} SOL) could not be saved; a restart would not know it`);
   }
 
   /**
    * A31/A71: the DEVNET_LIVE session to continue, if one started less than SESSION_BUDGETS.maxDurationMs ago: the one in memory, else the
-   * saved one. null when none is running (a new session starts). A saved value that cannot be read is treated as a full session (fail closed).
+   * saved one. null when none is running (a new session starts). A saved value that is malformed is treated as a full session (fail closed).
+   * R14-4: a read that FAILED (`{ unreadable }`) is not "no session": setMode refuses DEVNET_LIVE on it, and nothing is saved over the row.
    */
-  private continuedLiveSession(budgets: SessionBudgets, now: number): AutoSession | null {
+  private continuedLiveSession(budgets: SessionBudgets, now: number): AutoSession | null | { unreadable: string } {
     const fresh = (startedAt: number) => now - startedAt < SESSION_BUDGETS.maxDurationMs;
     // The saved row is the record (it is written on every change); the in-memory object is reused when it is that same session, so the
     // worst-case figures waiting in unsettledBuys still settle against it.
-    const saved = workstationDb.getSetting<Record<string, unknown>>(SETTING_LIVE_SESSION);
+    const read = workstationDb.readSetting<Record<string, unknown>>(SETTING_LIVE_SESSION);
+    if (!read.ok) return { unreadable: read.error };
+    const saved = read.value;
     if (!saved || typeof saved !== 'object') return null;
     const startedAt = Number(saved.startedAt);
     if (Number.isFinite(startedAt) && !fresh(startedAt)) return null;
@@ -367,7 +404,7 @@ export class AutoSnipeController extends EventEmitter {
       Logger.warn('[AUTO] the saved DEVNET_LIVE session could not be read; its budget is treated as used until its time would be up');
       return { startedAt: now, startingBankrollSol: 0, buys: budgets.maxBuys, spentSol: budgets.maxSpendSol, positionIds: [], budgets };
     }
-    return {
+    const restored: AutoSession = {
       startedAt,
       startingBankrollSol: num(saved.startingBankrollSol, 0),
       buys: num(saved.buys, budgets.maxBuys),
@@ -375,7 +412,27 @@ export class AutoSnipeController extends EventEmitter {
       positionIds: Array.isArray(saved.positionIds) ? saved.positionIds.filter((x): x is string => typeof x === 'string') : [],
       budgets,
     };
+    // R14-5: buys the last run counted at their worst case (one in flight at a crash among them) are already in spentSol; they settle
+    // against this session object once recovery journals what they really took. A malformed entry stays counted at its worst case.
+    this.unsettledBuys = this.unsettledBuys.filter((u) => u.session === this.session);
+    for (const u of Array.isArray(saved.unsettled) ? saved.unsettled : []) {
+      const e = u as { mint?: unknown; sinceTs?: unknown; countedSol?: unknown };
+      if (typeof e.mint === 'string' && typeof e.sinceTs === 'number' && typeof e.countedSol === 'number' && Number.isFinite(e.countedSol)) {
+        this.unsettledBuys.push({ session: restored, mint: e.mint, sinceTs: e.sinceTs, countedSol: e.countedSol });
+      }
+    }
+    return restored;
   }
+  /** R14-6: the worst case of the next DEVNET_LIVE buy at the order size in force (`worstCaseAutoBuySol`). */
+  private worstCaseNextBuySol(slippagePct: number): number {
+    return worstCaseAutoBuySol(this.orderSol(), slippagePct, executionCoordinator.getJitoTransport().isEnabled());
+  }
+
+  /** R14-4: the refusal when the saved DEVNET_LIVE session could not be read. */
+  private static sessionUnreadableError(error: string): string {
+    return `DEVNET_LIVE is refused: SESSION_UNREADABLE: the saved DEVNET_LIVE session spend could not be read (${error}). Its budget may be partly used, so a new session is not started over it. Try again; if it keeps failing, check the database.`;
+  }
+
   private spendCap(): { cap: number; kind: 'PAPER' | 'REAL'; note: string } {
     if (this.session && this.sessionKind === 'PAPER') {
       const cap = AutoSnipeController.maxPaperSessionSpendSol();
@@ -463,7 +520,9 @@ export class AutoSnipeController extends EventEmitter {
     }
     // 3E: a kill saved by the last run keeps auto OFF and killed, whatever mode is saved (a kill that saved OFF but crashed mid-way, or an
     // older build that saved the mode only at the end of the kill). Only an operator setting a mode again clears it.
-    const savedKill = workstationDb.getSetting<{ reason?: unknown; ts?: unknown }>(SETTING_KILL);
+    // R14-4: a failed read is not "no kill": auto stays OFF and killed, with the read error as the reason, until an operator sets a mode.
+    const killRead = workstationDb.readSetting<{ reason?: unknown; ts?: unknown }>(SETTING_KILL);
+    const savedKill = killRead.ok ? killRead.value : { reason: `the saved auto kill could not be read (${killRead.error}); treated as killed` };
     if (savedKill && typeof savedKill === 'object') {
       this.killed = true;
       this.killReason = typeof savedKill.reason === 'string' && savedKill.reason ? savedKill.reason : 'kill before the restart (no reason saved)';
@@ -523,7 +582,20 @@ export class AutoSnipeController extends EventEmitter {
       orderLimits: { minSol: SNIPE_AMOUNT_MIN_SOL, maxSol: executionConfig.getConfig().maxPositionSizeSol },
       confluence: confluenceThresholdInfo(),
       autoRestore: this.autoRestore ? { greenForMs: this.autoRestore.greenSince === null ? 0 : Date.now() - this.autoRestore.greenSince, needMs: READINESS_RESTORE_GREEN_MS } : null,
+      killSwitchActive: riskEngine.isKillSwitchActive(),
+      buysRefusedBy: this.buysRefusedBy(),
     };
+  }
+
+  /** R12-3: see AutoStatus.buysRefusedBy. */
+  private buysRefusedBy(): AutoStatus['buysRefusedBy'] {
+    if (this.mode === 'OFF') return null;
+    if (riskEngine.isKillSwitchActive()) {
+      return { code: 'KILL_SWITCH_ACTIVE', message: `auto is ${this.mode}, but the kill switch is ON: every buy is refused${this.mode === 'SHADOW' ? ' (SHADOW still journals what it would buy)' : ''} until the kill switch is reset. Resetting it does not change the auto mode.` };
+    }
+    const halt = executionCoordinator.getHaltReason();
+    if (halt) return { code: 'TRADING_HALTED', message: `auto is ${this.mode}, but all trading is halted (${halt}): every buy is refused until the halt is cleared` };
+    return null;
   }
 
   /** Drop to SHADOW when any session budget has run out. Called before every decision and status read. */
@@ -572,11 +644,20 @@ export class AutoSnipeController extends EventEmitter {
       await this.waitInflight('setMode(OFF)');
       this.session = null;
       this.downgradeReason = null;
+      // R12-4: the triggers say why the session that just ended was dropped; with auto OFF they no longer apply (System checks kept
+      // showing READINESS_RED). A new PAPER or DEVNET_LIVE session re-checks the loss evidence itself (pendingLossTriggers).
+      this.triggers = [];
+      this.redSince.clear();
       this.emit('mode', { mode: this.mode });
       return { ok: true, mode: this.mode };
     }
     if (process.env.AUTO_SNIPE_ENABLED !== 'true') {
       return { ok: false, mode: this.mode, error: 'AUTO_SNIPE_ENABLED is not true: auto trading stays OFF' };
+    }
+    // R12-3: a mode that buys is not set under the risk kill switch, so resetting the switch never starts buying by itself. SHADOW buys
+    // nothing and is allowed; its status says buys are refused by the kill switch (buysRefusedBy).
+    if ((next === 'PAPER' || next === 'DEVNET_LIVE') && riskEngine.isKillSwitchActive()) {
+      return { ok: false, mode: this.mode, error: `KILL_SWITCH_ACTIVE: ${next} is refused while the kill switch is ON. Look at why it was engaged, reset it (RESUME), then set ${next}. SHADOW is allowed meanwhile.` };
     }
     // Q29: never swap the session under a buy in flight; its spend and position belong to the session it started in
     await this.waitInflight('setMode');
@@ -601,8 +682,11 @@ export class AutoSnipeController extends EventEmitter {
       // A31/A71: a session that has used its budget is not restarted by setting the mode again; it ends when its time is up.
       const liveBudgets: SessionBudgets = this.budgetOverride ? { ...SESSION_BUDGETS, ...this.budgetOverride } : { ...SESSION_BUDGETS };
       const cont = this.continuedLiveSession(liveBudgets, Date.now());
-      if (cont && (cont.buys >= liveBudgets.maxBuys || cont.spentSol + this.orderSol() > liveBudgets.maxSpendSol + 1e-9)) {
-        return { ok: false, mode: this.mode, error: `DEVNET_LIVE is refused: SESSION_BUDGET_USED: the DEVNET_LIVE session started ${new Date(cont.startedAt).toISOString()} has ${cont.buys} buy(s) and ${cont.spentSol.toFixed(6)} SOL spent of ${liveBudgets.maxBuys} buys / ${liveBudgets.maxSpendSol} SOL; it ends at ${new Date(cont.startedAt + SESSION_BUDGETS.maxDurationMs).toISOString()}. Setting the mode again does not reset it.` };
+      if (cont && 'unreadable' in cont) return { ok: false, mode: this.mode, error: AutoSnipeController.sessionUnreadableError(cont.unreadable) };
+      // R14-6: the next buy is counted at its worst case (order, slippage, tip, fees and rent), as the cap counts it afterwards
+      const nextBuySol = this.worstCaseNextBuySol(memecoinAggregator.getConfig().maxSlippagePct || 6.0);
+      if (cont && (cont.buys >= liveBudgets.maxBuys || cont.spentSol + nextBuySol > liveBudgets.maxSpendSol + 1e-9)) {
+        return { ok: false, mode: this.mode, error: `DEVNET_LIVE is refused: SESSION_BUDGET_USED: the DEVNET_LIVE session started ${new Date(cont.startedAt).toISOString()} has ${cont.buys} buy(s) and ${cont.spentSol.toFixed(6)} SOL spent of ${liveBudgets.maxBuys} buys / ${liveBudgets.maxSpendSol} SOL, and the next buy may take up to ${nextBuySol.toFixed(6)} SOL; it ends at ${new Date(cont.startedAt + SESSION_BUDGETS.maxDurationMs).toISOString()}. Setting the mode again does not reset it.` };
       }
       try {
         await assertClusterAllowed(executionCoordinator.getConnection());
@@ -618,6 +702,10 @@ export class AutoSnipeController extends EventEmitter {
         return { ok: false, mode: this.mode, error: `LOSS_TRIGGERS_NEED_ACK: ${pending.map((h) => `${h.code} (${h.message})`).join('; ')}, over the last auto trades across sessions. Check them, then acknowledge with POST /api/auto/resume {ackLossTriggers:true}; trades closed before that no longer count.` };
       }
     }
+    // R14-4: read the DEVNET_LIVE session again after the awaits above, before anything changes; a failed read refuses here, so a fresh
+    // 0 SOL session is never saved over the real one.
+    const continued = next === 'DEVNET_LIVE' ? this.continuedLiveSession(this.budgetOverride ? { ...SESSION_BUDGETS, ...this.budgetOverride } : { ...SESSION_BUDGETS }, Date.now()) : null;
+    if (continued && 'unreadable' in continued) return { ok: false, mode: this.mode, error: AutoSnipeController.sessionUnreadableError(continued.unreadable) };
     this.killed = false;
     this.killReason = null;
     workstationDb.setSetting(SETTING_KILL, null); // 3E: an operator setting a mode again is what clears a kill, here and after a restart
@@ -640,7 +728,6 @@ export class AutoSnipeController extends EventEmitter {
       // S181: the operator's saved budget (buys and spend) replaces the defaults; loss and time limits stay fixed.
       const budgets: SessionBudgets = this.budgetOverride ? { ...base, ...this.budgetOverride } : base;
       const now = Date.now();
-      const continued = next === 'DEVNET_LIVE' ? this.continuedLiveSession(budgets, now) : null;
       if (continued) {
         // A31/A71: same session (it started less than 4 h ago): its spend, buys and positions carry on; only the budgets in force are re-read.
         continued.budgets = budgets;
@@ -713,15 +800,18 @@ export class AutoSnipeController extends EventEmitter {
         }
       }
     }
-    // R6-4: say what is still open, so "success" never reads as "all sold"
-    const stillOpen = opts.exitAll ? workstationDb.loadPositions(undefined, 'ACTIVE').filter((p) => AutoSnipeController.isAutoOwned(owned, p)).length : 0;
+    // R6-4: say what is still open, so "success" never reads as "all sold". R13-14: counted without exitAll too. R12-5: and the positions
+    // opened by hand, which KILL AUTO never sells.
+    const activeAfter = workstationDb.loadPositions(undefined, 'ACTIVE');
+    const stillOpen = activeAfter.filter((p) => AutoSnipeController.isAutoOwned(owned, p)).length;
+    const manualOpen = activeAfter.length - stillOpen;
     const notSold = [...refused, ...failed];
-    Logger.warn(`[AUTO] kill: ${this.killReason}; closed ${closed} of ${attempted} position(s), ${refused.length} refused, ${failed.length} failed, ${stillOpen} auto position(s) still open${notSold.length ? `; NOT closed: ${notSold.map((f) => `${f.symbol} (${f.error})`).join(', ')}` : ''}`);
+    Logger.warn(`[AUTO] kill: ${this.killReason}; closed ${closed} of ${attempted} position(s), ${refused.length} refused, ${failed.length} failed, ${stillOpen} auto position(s) and ${manualOpen} manual position(s) still open${notSold.length ? `; NOT closed: ${notSold.map((f) => `${f.symbol} (${f.error})`).join(', ')}` : ''}`);
     if (refused.length + failed.length > 0) {
       workstationDb.logDecision({ autoMode: 'OFF', mint: '-', stage: 'exit', outcome: 'INFO', reason: `kill: ${refused.length} sell(s) refused and ${failed.length} failed; ${stillOpen} auto position(s) still open`, inputs: { refused, failed } });
     }
     this.emit('mode', { mode: this.mode, reason: this.killReason });
-    return { mode: this.mode, closed, attempted, refused, failed, stillOpen };
+    return { mode: this.mode, closed, attempted, refused, failed, stillOpen, manualOpen };
   }
 
   // ---- G3: kill switch ---------------------------------------------------------------------------------------
@@ -764,7 +854,8 @@ export class AutoSnipeController extends EventEmitter {
     const hits = evaluateKillTriggers(ctx);
     if (hits.length === 0) return [];
 
-    const reason = `kill switch: ${hits.map((h) => `${h.code} (${h.message})`).join('; ')}`;
+    // R12-4: an auto trigger, not the risk kill switch (which this does not set); it read "Dropped to SHADOW: kill switch: READINESS_RED"
+    const reason = `auto trigger: ${hits.map((h) => `${h.code} (${h.message})`).join('; ')}`;
     const from = this.mode;
     this.triggers = hits;
     this.mode = 'SHADOW';
@@ -997,7 +1088,7 @@ export class AutoSnipeController extends EventEmitter {
         amountUsd: cfg.defaultSnipeAmountUsd || 5.0,
         slippagePct: cfg.maxSlippagePct || 6.0,
         jitoTipSol: cfg.jitoTipSol,
-      }).catch(() => undefined);
+      }); // R14-9: submitCandidate never rejects; a failure is journaled and raised there
     };
     ww.on('release', this.watchListener);
   }
@@ -1034,8 +1125,54 @@ export class AutoSnipeController extends EventEmitter {
    * The single door into auto trading. Returns the decision it journaled.
    */
   /** S209: the root span of an auto candidate's trace; everything below it (watch verdict, gates, risk, build, sign, submit, confirm, reconcile) nests inside. */
-  public submitCandidate(c: AutoCandidate): Promise<AutoDecision> {
-    return traced('auto.candidate', () => this.submitCandidateUntraced(c), { 'apex.source': c.source, 'apex.mode': this.mode });
+  public async submitCandidate(c: AutoCandidate): Promise<AutoDecision> {
+    try {
+      return await traced('auto.candidate', () => this.submitCandidateUntraced(c), { 'apex.source': c.source, 'apex.mode': this.mode });
+    } catch (e: any) {
+      return this.candidateFailed(c, e);
+    }
+  }
+
+  /**
+   * R14-9: a candidate whose handling threw (a DB read that failed, say) used to vanish: every caller dropped the rejection with
+   * `.catch(() => undefined)`. It is logged, journaled as a REJECTED row and raised as AUTO_CANDIDATE_FAILED (one alert, counting
+   * failures, until the operator acknowledges it), and the caller gets that decision.
+   */
+  private candidateFailed(c: AutoCandidate, e: any): AutoDecision {
+    const msg = String(e?.message ?? e);
+    Logger.error(`[AUTO] candidate ${c.mint} (${c.source}) failed: ${msg}`);
+    const now = Date.now();
+    const open = this.alerts.find((a) => a.code === AUTO_CANDIDATE_FAILED && !a.cleared);
+    const count = (open ? Number(/^(\d+) /.exec(open.message)?.[1] ?? 1) : 0) + 1;
+    const message = `${count} auto candidate(s) failed with an error and were not bought; last ${c.symbol ?? c.mint.slice(0, 8)} from ${c.source}: ${msg}. See the decision journal (stage auto, CANDIDATE_ERROR).`;
+    if (open) { open.message = message; open.lastSeenAt = now; } else {
+      this.alerts.push({ code: AUTO_CANDIDATE_FAILED, message, raisedAt: now, lastSeenAt: now, cleared: false });
+      Logger.error(`[OPERATOR ALERT] ${AUTO_CANDIDATE_FAILED}: ${message}`);
+    }
+    const fallback: AutoDecision = { ts: now, mode: this.mode, mint: c.mint, symbol: c.symbol, source: c.source, outcome: 'REJECTED', stage: 'auto', reason: `CANDIDATE_ERROR: ${msg}` };
+    try {
+      return this.record(c, 'REJECTED', 'auto', `CANDIDATE_ERROR: ${msg}`);
+    } catch (e2: any) {
+      Logger.error(`[AUTO] the CANDIDATE_ERROR row for ${c.mint} could not be journaled: ${e2?.message || e2}`);
+      return fallback;
+    }
+  }
+
+  /** R14-9: alerts the auto controller raises itself (AUTO_ALERT_CODES); System checks lists them with the coordinator's. */
+  private alerts: OperatorAlert[] = [];
+
+  public getOperatorAlerts(): OperatorAlert[] {
+    return this.alerts.filter((a) => !a.cleared).map((a) => ({ ...a }));
+  }
+
+  /** R14-9: the operator has looked at an auto alert (POST /api/system/alerts/acknowledge with its code). */
+  public acknowledgeOperatorAlert(code: string): { acknowledged: boolean; error?: string } {
+    const open = this.alerts.filter((a) => a.code === code && !a.cleared);
+    if (open.length === 0) return { acknowledged: false, error: `NOT_FOUND: no open ${code} alert` };
+    for (const a of open) a.cleared = true;
+    this.alerts = this.alerts.filter((a) => !a.cleared);
+    Logger.warn(`[OPERATOR ALERT] ${code} acknowledged by the operator`);
+    return { acknowledged: true };
   }
 
   private async submitCandidateUntraced(c: AutoCandidate): Promise<AutoDecision> {
@@ -1132,9 +1269,10 @@ export class AutoSnipeController extends EventEmitter {
     // DEVNET_LIVE only: the cap is a real-SOL cap (0.02), a paper $5 order (~0.033 SOL) would never fit it.
     if (this.session && mode === 'DEVNET_LIVE') {
       this.settleUnresolvedSpend();
-      const plannedSol = this.orderSol();
-      if (this.session.spentSol + plannedSol > this.session.budgets.maxSpendSol) {
-        return rec('REJECTED', 'budget', `would exceed the session spend limit (${this.session.spentSol.toFixed(4)} + ${plannedSol.toFixed(4)} > ${this.session.budgets.maxSpendSol} SOL)`);
+      // R14-6: the order at its worst case (slippage, tip, fees and rent), since that is what the spend counts once the buy lands
+      const plannedSol = this.worstCaseNextBuySol(c.slippagePct ?? 6.0);
+      if (this.session.spentSol + plannedSol > this.session.budgets.maxSpendSol + 1e-9) {
+        return rec('REJECTED', 'budget', `would exceed the session spend limit (${this.session.spentSol.toFixed(4)} + ${plannedSol.toFixed(4)} worst case for a ${this.orderSol()} SOL order with slippage, tip, fees and rent > ${this.session.budgets.maxSpendSol} SOL)`);
       }
     }
 
@@ -1148,6 +1286,7 @@ export class AutoSnipeController extends EventEmitter {
     const startSession = this.session;
     const startTs = Date.now();
     let retryable = false;
+    let reservation: UnsettledBuy | null = null;
     try {
       const shadow = startMode === 'SHADOW';
       const solUsd = solPriceService.lastKnownPrice();
@@ -1180,15 +1319,25 @@ export class AutoSnipeController extends EventEmitter {
       } else if (this.orderSolOverride !== null) {
         params.amountSolOverride = this.orderSolOverride; // S183: PAPER and SHADOW use the operator's size too
       }
+      // R14-5: a DEVNET_LIVE buy is counted at its worst case and SAVED before it is sent. Counting it only after executeSnipe returned lost
+      // a buy that landed just before a crash, and the restart handed out a full budget on top of it. The reservation is swapped for the
+      // real figure (a fill), kept until recovery settles it (unresolved, or a throw), or released (refused before any send).
+      if (startMode === 'DEVNET_LIVE' && startSession) {
+        reservation = { session: startSession, mint: c.mint, sinceTs: startTs, countedSol: worstCaseAutoBuySol(startOrderSol, params.slippagePct ?? 0, executionCoordinator.getJitoTransport().isEnabled()) };
+        startSession.spentSol += reservation.countedSol;
+        this.reservedBuys.push(reservation);
+        this.saveLiveSession(startSession);
+      }
       const res = await traced('snipe.execute', () => memecoinAggregator.executeSnipe(params), { 'apex.dryRun': shadow });
       if (!res.success) {
         // R6: a buy that was sent and may have landed (unconfirmed, or landed with an unreadable fill) spent real SOL the cap must count.
         if (startSession && !shadow && /^(UNCONFIRMED|RECONCILIATION FAILED)/.test(res.message)) {
-          // 3B (R1-127): counted at its worst case (slippage headroom, token-account and first-buy accumulator rent) until orphan recovery
-          // journals what it really took; settleUnresolvedSpend then swaps in that figure.
-          const countedSol = startOrderSol * (1 + (params.slippagePct ?? 0) / 100) + (CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS + PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS) / 1e9;
-          startSession.spentSol += countedSol;
-          if (startMode === 'DEVNET_LIVE') this.unsettledBuys.push({ session: startSession, mint: c.mint, sinceTs: startTs, countedSol });
+          // 3B (R1-127): counted at its worst case until orphan recovery journals what it really took; settleUnresolvedSpend then swaps in
+          // that figure. DEVNET_LIVE: the reservation made before the send is that count (R14-5).
+          const countedSol = reservation ? reservation.countedSol : startOrderSol * (1 + (params.slippagePct ?? 0) / 100) + (CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS + PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS) / 1e9;
+          if (reservation) this.settleReservation(reservation, 'UNSETTLED');
+          else startSession.spentSol += countedSol;
+          reservation = null;
           this.saveLiveSession(startSession);
           workstationDb.logDecision({ autoMode: startMode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'budget', outcome: 'INFO', reason: `counted ${countedSol.toFixed(6)} SOL against the session cap: the buy was sent and may have landed`, inputs: watchInputs });
         }
@@ -1196,6 +1345,8 @@ export class AutoSnipeController extends EventEmitter {
         if (!shadow && res.txHash && /^(UNCONFIRMED|RECONCILIATION FAILED)/.test(res.message)) {
           workstationDb.logDecision({ autoMode: startMode, mint: c.mint, symbol: c.symbol, source: c.source, stage: 'execute', outcome: AUTO_SENT_UNRESOLVED, reason: `auto buy sent and unresolved: ${res.message}`, positionId: res.txHash, inputs: { ...watchInputs, signature: res.txHash } });
         }
+        // Anything else was refused or failed before a send that could land (the existing rule above): the reservation is released.
+        if (reservation) { this.settleReservation(reservation, 'RELEASE'); reservation = null; this.saveLiveSession(startSession); }
         retryable = RETRYABLE_REJECTION.test(res.message || '');
         return rec('REJECTED', classifyRejection(res.message), res.message, { mode: startMode, inputs: { confluenceScore: res.confluenceScore, dryRun: shadow, retryable } });
       }
@@ -1206,6 +1357,7 @@ export class AutoSnipeController extends EventEmitter {
         // token-account and accumulator rent). Without that row (the position was not saved; recovery journals it later) the order, fees
         // and both rents are counted, which is never less than the buy took.
         const journaled = startMode === 'DEVNET_LIVE' ? this.journaledBuySpendSol(c.mint, startTs, res.positionId) : null;
+        if (reservation) { this.settleReservation(reservation, 'RELEASE'); reservation = null; } // R14-5: replaced by what the buy took
         startSession.spentSol += journaled ?? (res.amountSol ?? 0) + (res.feesPaidLamports ?? 0) / 1e9
           + (startMode === 'DEVNET_LIVE' ? (CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS + PUMP_USER_VOLUME_ACCUMULATOR_RENT_LAMPORTS) / 1e9 : 0);
         if (res.positionId) startSession.positionIds.push(res.positionId);
@@ -1225,6 +1377,8 @@ export class AutoSnipeController extends EventEmitter {
       this.enforceBudgets();
       return d;
     } catch (e: any) {
+      // R14-5: a throw may come after the send; the reservation stays counted until recovery journals the buy (or for the session).
+      if (reservation) { this.settleReservation(reservation, 'UNSETTLED'); this.saveLiveSession(startSession); }
       return rec('REJECTED', 'execute', `ERROR: ${e?.message || e}`, { mode: startMode });
     } finally {
       if (!retryable) this.attempted.add(key);
@@ -1237,7 +1391,16 @@ export class AutoSnipeController extends EventEmitter {
   }
 
   /** 3B: auto buys counted at their worst case because they returned unresolved; settled once orphan recovery journals the real spend. */
-  private unsettledBuys: Array<{ session: AutoSession; mint: string; sinceTs: number; countedSol: number }> = [];
+  private unsettledBuys: UnsettledBuy[] = [];
+  /** R14-5: DEVNET_LIVE buys counted (and saved) at their worst case before the send, until executeSnipe returns. */
+  private reservedBuys: UnsettledBuy[] = [];
+
+  /** R14-5: end a pre-send reservation: RELEASE takes its count back out of the spend; UNSETTLED keeps it, to settle later. */
+  private settleReservation(r: UnsettledBuy, how: 'RELEASE' | 'UNSETTLED'): void {
+    this.reservedBuys = this.reservedBuys.filter((x) => x !== r);
+    if (how === 'RELEASE') r.session.spentSol = Math.max(0, r.session.spentSol - r.countedSol);
+    else this.unsettledBuys.push(r);
+  }
 
   /** 3B: SOL the LIVE buy of `mint` took from the wallet, from its LIVE_BUY_FILLED row journaled at or after `sinceTs`. null without one. */
   private journaledBuySpendSol(mint: string, sinceTs: number, positionId?: string): number | null {
@@ -1301,7 +1464,7 @@ export class AutoSnipeController extends EventEmitter {
       }
       if (p.notBefore > now) { waitMs = Math.min(waitMs ?? Infinity, p.notBefore - now); continue; }
       this.pendingReleases.delete(key);
-      void this.submitCandidate(p.candidate).catch(() => undefined);
+      void this.submitCandidate(p.candidate); // R14-9: never rejects; a failure is journaled and raised there
       return;
     }
     if (waitMs !== null && !this.retryTimer) {

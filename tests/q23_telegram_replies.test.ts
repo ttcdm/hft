@@ -20,9 +20,10 @@ describe('Q23: Telegram replies tell the truth', () => {
     expect(r.actionTaken).toBe('PANIC_SELL_PARTIAL');
   });
   it('a clean /panic_sell says COMPLETE', async () => {
-    const rows = [{ id: 'a', symbol: 'AAA' }] as any[];
-    vi.spyOn(workstationDb, 'loadPositions').mockImplementation(() => rows.splice(0) as any); // first read lists it, the re-read finds it gone
-    vi.spyOn(executionCoordinator, 'closePosition').mockResolvedValue({ success: true, pnlSol: 0 } as any);
+    // listed until it is closed, gone after (R12-5/R13-14: the auto kill inside the panic now reads the open positions too)
+    let closed = false;
+    vi.spyOn(workstationDb, 'loadPositions').mockImplementation(() => (closed ? [] : [{ id: 'a', symbol: 'AAA' }]) as any);
+    vi.spyOn(executionCoordinator, 'closePosition').mockImplementation(async () => { closed = true; return { success: true, pnlSol: 0 } as any; });
     const r = await socialScanner.processTelegramCommand('/panic_sell');
     expect(r.reply).toMatch(/COMPLETE/);
     expect(r.actionTaken).toBe('PANIC_SELL_EXECUTED');

@@ -11,6 +11,7 @@
  * gates, and in LIVE it needs `confirmLive`. Explorer and market links are always offered on this screen, because the callouts come from the mainnet
  * pump.fun list (the call passes `true` for "token is mainnet data"); this build trades devnet and localnet only.
  */
+import { dollarSymbol, displayName, displaySymbol } from '../utils/displayName';
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { ageText } from '../utils/freshness';
 import { SnipeAmountControl } from './SnipeAmountControl';
@@ -48,9 +49,10 @@ import {
   PumpFunCaller,
   PumpFunHotCalloutsResponse,
 } from '../types';
-import { engineClient } from '../services/engineClient';
+import { engineClient, useWsStreaming } from '../services/engineClient';
 import { hftAudio } from '../utils/audio';
 import { DecimalBox } from './DecimalBox';
+import { TipBox } from './TipBox';
 import { DialogFrame } from './DialogFrame';
 import { confirmLiveClick } from './ConfirmDialog';
 import {
@@ -191,17 +193,26 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
     lastUpdated: null,
   });
 
-  const [rules, setRules] = useState({
+  // R11-8: jitoPriorityTipSol is absent until the operator sets one (the server's rules carry no tip by default: its dynamic policy
+  // decides). The box shows "auto" then, and the snipe sends no tip; it used to show the literal "undefined".
+  const [rules, setRules] = useState<{
+    minCallerWinRate2x: number; minAvgMultiple: number; autoSnipeOnConfluence: boolean; maxEntryMultiple: number; maxElapsedSeconds: number;
+    snipeAmountUsd: number; jitoPriorityTipSol?: number;
+  }>({
     minCallerWinRate2x: 40.0,
     minAvgMultiple: 4.0,
     autoSnipeOnConfluence: true,
     maxEntryMultiple: 1.35,
     maxElapsedSeconds: 60,
     snipeAmountUsd: capitalTier === 'MICRO_10' ? 5.0 : 25.0,
-    jitoPriorityTipSol: 0.00018,
   });
 
   const rulesDirty = useRef(false); // true from the first edit until the server confirms a save
+  // R11-9: the boxes check AutoSnipeRulesSchema's ranges (server/execution/tradeInputs.ts) and Save is refused while one is out of range
+  const [ruleProblems, setRuleProblems] = useState<Record<string, string | null>>({});
+  const ruleProblem = (k: string) => (reason: string | null) => setRuleProblems((p) => (p[k] === reason ? p : { ...p, [k]: reason }));
+  const anyRuleProblem = Object.values(ruleProblems).some((r) => r !== null);
+  const [rulesSaveResult, setRulesSaveResult] = useState<{ ok: boolean; text: string } | null>(null);
   const editRules = (patch: Partial<typeof rules>) => {
     rulesDirty.current = true;
     setRules((r) => ({ ...r, ...patch }));
@@ -214,7 +225,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   const [snipingCalloutId, setSnipingCalloutId] = useState<string | null>(null);
   const [selectedCallerModal, setSelectedCallerModal] = useState<PumpFunCaller | null>(null);
 
-  const [isWsLive, setIsWsLive] = useState(engineClient.isWsConnected());
+  const isWsLive = useWsStreaming(); // R9-7: open, authenticated, online and not quiet, re-checked every second
 
   // Fetch callouts from backend (which polls real pump.fun & DexScreener)
   const fetchData = async () => {
@@ -243,7 +254,6 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
 
     // Real-time WebSocket subscriptions
     const unsubHotCallouts = engineClient.onPumpHotCallouts((data) => {
-      setIsWsLive(true);
       if (data.callouts) setCallouts(data.callouts);
       if (data.leaderboard) setLeaderboard(data.leaderboard);
       if (data.status) {
@@ -264,8 +274,8 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
         );
         onAlertTrigger?.(
           'INFO',
-          `⚡ AUTONOMOUS CALLOUT SNIPED: $${data.callout.token.symbol}`,
-          data.tradeRes?.message || `Snipe request handled for $${data.callout.token.symbol}`
+          `⚡ AUTONOMOUS CALLOUT SNIPED: ${dollarSymbol(data.callout.token.symbol)}`,
+          data.tradeRes?.message || `Snipe request handled for ${dollarSymbol(data.callout.token.symbol)}`
         );
         onRefreshParent?.();
       }
@@ -273,7 +283,6 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
 
     // Gentle polling fallback in case WS is interrupted
     const interval = setInterval(() => {
-      setIsWsLive(engineClient.isWsConnected());
       fetchData();
     }, 6000);
 
@@ -309,7 +318,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
     }
     const amountSol = snipeAmount.parsed.sol;
     // Q10b: while LIVE is armed this click sends a real transaction; say so and ask first
-    const warning = liveClickWarning(tradingMode, `Sniping $${callout.token.symbol} for ${formatSol(amountSol)}`);
+    const warning = liveClickWarning(tradingMode, `Sniping ${dollarSymbol(callout.token.symbol)} for ${formatSol(amountSol)}`);
     if (warning && !(await confirmLiveClick(warning))) return;
     setSnipingCalloutId(callout.id);
     hftAudio.playOrderFill();
@@ -325,7 +334,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
     if (res?.status === 'OK' && res?.result?.success) {
       onAlertTrigger?.(
         'INFO',
-        `⚡ HOT CALLOUT SNIPED: $${callout.token.symbol}`,
+        `⚡ HOT CALLOUT SNIPED: ${dollarSymbol(callout.token.symbol)}`,
         `${tradingMode.live ? 'Sent' : 'PAPER fill of'} ${formatSol(amountSol)} on Pump.fun (${tradingMode.label}). Caller: @${callout.caller.userId} (Avg: ${callout.caller.avgMultiple}x)`
       );
       setCallouts((prev) =>
@@ -343,14 +352,22 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
   };
 
   const handleSaveRules = async () => {
+    if (anyRuleProblem) return; // R11-9: a box out of the server's range is not sent
     hftAudio.playClick();
     const res = await engineClient.updatePumpFunRules(rules);
     if (res?.status === 'OK') {
       rulesDirty.current = false;
       if (res.rules) setRules(res.rules);
+      setRulesSaveResult({ ok: true, text: 'Saved in server memory until the next restart.' });
       onAlertTrigger?.('INFO', 'AUTO-SNIPE RULES SAVED', 'Saved in server memory until the next restart.');
     } else {
-      onAlertTrigger?.('WARNING', 'AUTO-SNIPE RULES NOT SAVED', `The server did not confirm the save${res?.error ? `: ${res.error}` : ''}; your edits are still on screen.`);
+      // R11-9: the refusal is shown under the form, and the boxes go back to the rules the server still holds (they kept the refused
+      // value while the server kept the old one)
+      const why = res?.error || res?.message || 'the server did not confirm the save';
+      rulesDirty.current = false;
+      await fetchData();
+      setRulesSaveResult({ ok: false, text: `NOT SAVED: ${why}. The boxes show the rules the server still uses.` });
+      onAlertTrigger?.('WARNING', 'AUTO-SNIPE RULES NOT SAVED', `The server refused the save: ${why}. The boxes show the rules it still uses.`);
     }
   };
 
@@ -709,14 +726,14 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                     <div className="grid grid-cols-1 lg:grid-cols-12 gap-3 items-center">
                       {/* TOKEN IDENTITY (Cols 1-4) */}
                       <div className="lg:col-span-4 flex items-start space-x-3">
-                        <TokenImage uri={c.token.imageUri} symbol={c.token.symbol} />
+                        <TokenImage uri={c.token.imageUri} symbol={displaySymbol(c.token.symbol)} />
                         <div className="min-w-0 flex-1">
                           <div className="flex items-center space-x-2">
                             <span className="font-extrabold text-white text-sm tracking-wide font-sans">
-                              ${c.token.symbol}
+                              {dollarSymbol(c.token.symbol)}
                             </span>
                             <span className="text-xs text-slate-400 truncate max-w-[120px]">
-                              {c.token.name}
+                              {displayName(c.token.name)}
                             </span>
                           </div>
 
@@ -797,7 +814,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                                       ? 'text-sky-300 bg-sky-500/20 border border-sky-500/40 hover:bg-sky-500/30'
                                       : 'text-slate-400 hover:text-sky-400 hover:bg-slate-800'
                                   }`}
-                                  title={hasOfficial ? `𝕏 handle supplied by the token creator (unverified): ${twitterUrl}` : `Search $${c.token.symbol} on 𝕏`}
+                                  title={hasOfficial ? `𝕏 handle supplied by the token creator (unverified): ${twitterUrl}` : `Search ${dollarSymbol(c.token.symbol)} on 𝕏`}
                                 >
                                   <span className="font-bold">𝕏</span>
                                   {hasOfficial && <span className="text-[8px] uppercase">creator-supplied</span>}
@@ -945,7 +962,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                           </div>
                         ) : (
                           <div className="text-center text-[10px] font-mono text-slate-500">
-                            {calloutSendNote(rules.jitoPriorityTipSol)}
+                            {typeof rules.jitoPriorityTipSol === 'number' ? calloutSendNote(rules.jitoPriorityTipSol) : 'Sent over the normal RPC path. Jito tip: auto (the server picks it), paid only if the server has Jito configured (devnet: never).'}
                           </div>
                         )}
                       </div>
@@ -1078,7 +1095,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                             key={`top-${top.calloutId || top.symbol}-${tIdx}`}
                             className="px-1.5 py-0.5 rounded bg-emerald-950/60 border border-emerald-500/40 text-[10px] font-mono text-emerald-300 flex items-center space-x-1"
                           >
-                            <span className="font-bold">${top.symbol}</span>
+                            <span className="font-bold">{dollarSymbol(top.symbol)}</span>
                             <span className="text-amber-300 font-black">{top.multiple}x</span>
                           </span>
                         ))}
@@ -1109,12 +1126,17 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
 
             <button
               onClick={handleSaveRules}
-              className="px-4 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-mono font-bold transition flex items-center space-x-1.5 shadow-md shadow-cyan-950"
+              disabled={anyRuleProblem}
+              title={anyRuleProblem ? 'A rule is out of the range the server accepts; fix it first.' : undefined}
+              className="px-4 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 disabled:opacity-50 text-white text-xs font-mono font-bold transition flex items-center space-x-1.5 shadow-md shadow-cyan-950"
             >
               <Check className="w-3.5 h-3.5" />
               <span>Save Strategy Rules</span>
             </button>
           </div>
+          {rulesSaveResult && (
+            <p data-testid="rules-save-result" role="status" className={`text-[11px] font-mono ${rulesSaveResult.ok ? 'text-emerald-300' : 'text-rose-300'}`}>{rulesSaveResult.text}</p>
+          )}
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 text-xs font-mono">
             {/* Rule 1: Min Caller 2x Win Rate */}
@@ -1122,7 +1144,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Min Caller 2x+ Win Rate (%)
               </label>
-              <DecimalBox testId="rule-minCallerWinRate2x" ariaLabel="Min caller 2x+ win rate (%)" value={rules.minCallerWinRate2x} onValue={(n) => editRules({ minCallerWinRate2x: n })}
+              <DecimalBox testId="rule-minCallerWinRate2x" min={0} max={100} onProblem={ruleProblem('minCallerWinRate2x')} ariaLabel="Min caller 2x+ win rate (%)" value={rules.minCallerWinRate2x} onValue={(n) => editRules({ minCallerWinRate2x: n })}
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1135,7 +1157,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Min Average Multiple (e.g. 4.0x)
               </label>
-              <DecimalBox testId="rule-minAvgMultiple" ariaLabel="Min average multiple" value={rules.minAvgMultiple} onValue={(n) => editRules({ minAvgMultiple: n })}
+              <DecimalBox testId="rule-minAvgMultiple" min={0} max={1000} onProblem={ruleProblem('minAvgMultiple')} ariaLabel="Min average multiple" value={rules.minAvgMultiple} onValue={(n) => editRules({ minAvgMultiple: n })}
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1148,7 +1170,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Max Entry Multiple (Chasing Guard)
               </label>
-              <DecimalBox testId="rule-maxEntryMultiple" ariaLabel="Max entry multiple" value={rules.maxEntryMultiple} onValue={(n) => editRules({ maxEntryMultiple: n })}
+              <DecimalBox testId="rule-maxEntryMultiple" min={1} max={100} onProblem={ruleProblem('maxEntryMultiple')} ariaLabel="Max entry multiple" value={rules.maxEntryMultiple} onValue={(n) => editRules({ maxEntryMultiple: n })}
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1161,7 +1183,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Max Elapsed Callout Time (Seconds)
               </label>
-              <DecimalBox testId="rule-maxElapsedSeconds" ariaLabel="Max elapsed callout time (seconds)" value={rules.maxElapsedSeconds} onValue={(n) => editRules({ maxElapsedSeconds: n })} integer
+              <DecimalBox testId="rule-maxElapsedSeconds" min={1} max={3600} onProblem={ruleProblem('maxElapsedSeconds')} ariaLabel="Max elapsed callout time (seconds)" value={rules.maxElapsedSeconds} onValue={(n) => editRules({ maxElapsedSeconds: n })} integer
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1194,7 +1216,8 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
               <label className="text-slate-300 font-bold block">
                 Jito Priority Tip (SOL)
               </label>
-              <DecimalBox testId="rule-jitoPriorityTipSol" ariaLabel="Jito priority tip (SOL)" value={rules.jitoPriorityTipSol} onValue={(n) => editRules({ jitoPriorityTipSol: n })}
+              <TipBox testId="rule-jitoPriorityTipSol" ariaLabel="Jito priority tip (SOL)" value={typeof rules.jitoPriorityTipSol === 'number' ? rules.jitoPriorityTipSol : null}
+                onValue={(n) => editRules({ jitoPriorityTipSol: n ?? undefined })} onProblem={ruleProblem('jitoPriorityTipSol')}
                 className="w-full px-3 py-1.5 bg-[#0F1524] border border-[#1E293B] rounded text-white font-bold outline-none focus:border-cyan-500"
               />
               <span className="text-[10px] text-slate-500 block">
@@ -1293,7 +1316,7 @@ export const PumpFunHotCalloutsView: React.FC<PumpFunHotCalloutsViewProps> = ({
                     className="p-2 rounded bg-[#0E1424] border border-[#1E293B] flex items-center justify-between text-xs font-mono"
                   >
                     <div className="flex items-center space-x-2">
-                      <span className="font-bold text-white">${c.symbol}</span>
+                      <span className="font-bold text-white">{dollarSymbol(c.symbol)}</span>
                       <span className="text-slate-500 truncate max-w-[140px]">{c.coinMint}</span>
                     </div>
                     <div className="flex items-center space-x-2">

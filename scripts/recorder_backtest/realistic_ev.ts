@@ -1,7 +1,7 @@
 import '../hermeticEnv';
 import fs from 'fs';
 import path from 'path';
-import { openRecorded, recordedToLaunch, resolveSplit } from './recorded';
+import { cutAtRecordingGap, openRecorded, recordedToLaunch, resolveSplit } from './recorded';
 import { runStudy, parseOptions, writeStudyFiles, fmtPct, DAY_MS, type StudyLaunch } from '../hfcorpus/ev_study';
 
 /**
@@ -29,7 +29,10 @@ async function main() {
   const outDir = opt('out-dir', '/tmp/recorded_realistic_ev');
   fs.mkdirSync(outDir, { recursive: true });
   function* launches(): Generator<StudyLaunch> {
-    for (const rec of source.launches()) {
+    // R13-12: a recorder restart or feed gap inside a launch cuts it, as the in-app replay does
+    const markers = source.markers();
+    for (const raw of source.launches()) {
+      const { rec } = cutAtRecordingGap(raw, markers);
       const l = recordedToLaunch(rec);
       if (l) yield { rec, t0: l.t0, trades: l.trades };
     }

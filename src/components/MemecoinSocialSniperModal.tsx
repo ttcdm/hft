@@ -11,6 +11,7 @@
  * `docs/ARCHITECTURE.md`. While LIVE is armed the server refuses a snipe that does not carry `confirmLive`, and this screen only sends it
  * after the operator accepts the warning. Some switches here are stored but change nothing (KNOWN_RISKS.md section 6).
  */
+import { dollarSymbol, displayName, displaySymbol } from '../utils/displayName';
 import { signalFeedBadge } from '../utils/signalBadge';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { usePolled } from '../utils/usePolled';
@@ -22,7 +23,7 @@ import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { SnipeAmountControl } from './SnipeAmountControl';
 import { mainnetLinksAvailable, isMainnetDataProvenance, sanitizeXProfileUrl, sanitizeTelegramUrl, formatPctChange } from '../utils/tokenLinks';
 import { authorityBadge, authorityTone, holderPct } from '../utils/authorityBadge';
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Send,
   Radio,
@@ -63,16 +64,18 @@ import {
   SniperBotConfig,
   MemecoinPlatform,
 } from '../types';
-import { engineClient } from '../services/engineClient';
+import { engineClient, useWsStreaming } from '../services/engineClient';
 import { fmtRank, fmtSmall, fmtUsdPrice } from '../utils/numFormat';
-import { sellConfirmText, sellDoneTitle } from '../utils/sellConfirm';
+import { sellConfirmText } from '../utils/sellConfirm';
+import { closeOutcomeTitle } from '../utils/closeOutcome';
 import { hftAudio } from '../utils/audio';
 import { PumpFunHotCalloutsView } from './PumpFunHotCalloutsView';
+import { TipBox } from './TipBox';
 import { TokenInlineExternalLinks, TokenExternalLinksModal } from './TokenExternalLinksView';
 import { BELOW_HEADER_TOP } from '../utils/headerOffset';
-import { DecimalBox } from './DecimalBox';
 import { DialogFrame, KILL_SWITCH_ID } from './DialogFrame';
-import { confirmLiveClick, confirmSell } from './ConfirmDialog';
+import { askConfirm, confirmLiveClick, confirmSell } from './ConfirmDialog';
+import { CONSOLE_PANIC_CONFIRM_TEXT, isConsoleEmergencyCommand } from '../utils/tradingCopy';
 
 /**
  * P1.4 (N-12): the sniper tab's header. The auto mode shown is the auto controller's own (GET /api/auto/status), read-only: the
@@ -172,7 +175,6 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     isAutoSnipeEnabled: false,
     defaultSnipeAmountUsd: capitalTier === 'MICRO_10' ? 5.0 : 50.0,
     maxSlippagePct: 8.0,
-    jitoTipSol: 0.005,
     takeProfitPct: 50.0,
     stopLossPct: 20.0,
     trailingStopEnabled: true,
@@ -182,6 +184,11 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     telegramChatId: '',
     telegramWebhookActive: true,
   });
+
+  // R11-8: the tip lives apart from sniperConfig. The server config has no tip (C6: absent means its dynamic policy decides), so every
+  // config load put `undefined` in the box and overwrote a typed tip. null is "auto": nothing is sent. A typed tip is kept until changed.
+  const [jitoTip, setJitoTip] = useState<number | null>(null);
+  const tipParam = jitoTip === null ? {} : { jitoTipSol: jitoTip };
 
   // Filters & UI states
   const [selectedPlatform, setSelectedPlatform] = useState<string>('ALL');
@@ -264,7 +271,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     }
   };
 
-  const [isWsLive, setIsWsLive] = useState(engineClient.isWsConnected());
+  const isWsLive = useWsStreaming(); // R9-7: open, authenticated, online and not quiet, re-checked every second
   const [signalsRead, setSignalsRead] = useState<'pending' | 'ok' | 'failed'>('pending');
 
   // Deduplicate pools by CA and ID to guarantee unique React keys
@@ -311,7 +318,6 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
     // Subscribe to real-time WebSocket push updates
     const unsubSnapshot = engineClient.onMemecoinSnapshot((data) => {
-      setIsWsLive(true);
       if (data.pools) setPools(deduplicatePools(data.pools));
       if (data.positions) setPositions(data.positions);
       if (data.config) setSniperConfig(data.config);
@@ -319,13 +325,12 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
 
     const unsubTrade = engineClient.onSniperTrade((data) => {
       if (data?.position) {
-        onAlertTrigger?.('INFO', '⚡ SNIPER TRADE EXECUTED', data.message || `Snipe filled for ${data.position.tokenTicker}`);
+        onAlertTrigger?.('INFO', '⚡ SNIPER TRADE EXECUTED', data.message || `Snipe filled for ${dollarSymbol(data.position.tokenTicker)}`);
         refreshData();
       }
     });
 
     const interval = setInterval(() => {
-      setIsWsLive(engineClient.isWsConnected());
       refreshData();
     }, 5000);
 
@@ -348,15 +353,15 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     if (!snipeAmount.parsed.ok) { onAlertTrigger?.('WARNING', 'SNIPE NOT SENT', snipeAmount.parsed.reason); return; }
     const amount = snipeAmount.parsed.sol;
     // Q10b: while LIVE is armed this click sends a real transaction; say so and ask first
-    const warning = liveClickWarning(tradingMode, `Sniping ${sig.tokenTicker} for ${formatSol(amount)}`);
+    const warning = liveClickWarning(tradingMode, `Sniping ${dollarSymbol(sig.tokenTicker)} for ${formatSol(amount)}`);
     if (warning && !(await confirmLiveClick(warning))) return;
     hftAudio.playOrderFill();
-    const res = await engineClient.snipeSocialSignal(sig.id, amount, sniperConfig.jitoTipSol, sniperConfig.maxSlippagePct, tradingMode.live);
+    const res = await engineClient.snipeSocialSignal(sig.id, amount, jitoTip ?? undefined, sniperConfig.maxSlippagePct, tradingMode.live);
     
     if (res?.tradeResult?.success) {
       onAlertTrigger?.(
         'INFO',
-        `SNIPED ${sig.tokenTicker}`,
+        `SNIPED ${dollarSymbol(sig.tokenTicker)}`,
         `${/^PAPER/i.test(String(res.tradeResult.txHash ?? '')) ? 'Paper fill' : 'Sent'} for ${formatSol(amount)} on ${sig.chain}${res.tradeResult.txHash ? ` (${String(res.tradeResult.txHash).slice(0, 14)}...)` : ''}. CA: ${sig.contractAddress.slice(0, 10)}...`
       );
       // Update signal status locally
@@ -378,15 +383,15 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   const handleSnipePool = async (pool: MemecoinPool) => {
     if (!snipeAmount.parsed.ok) { onAlertTrigger?.('WARNING', 'SNIPE NOT SENT', snipeAmount.parsed.reason); return; }
     const amount = snipeAmount.parsed.sol;
-    const warning = liveClickWarning(tradingMode, `Sniping $${pool.symbol} for ${formatSol(amount)}`);
+    const warning = liveClickWarning(tradingMode, `Sniping ${dollarSymbol(pool.symbol)} for ${formatSol(amount)}`);
     if (warning && !(await confirmLiveClick(warning))) return;
     hftAudio.playOrderFill();
-    const res = await engineClient.executeMemecoinSnipe(buildPoolSnipeRequest(pool, amount, sniperConfig), tradingMode.live);
+    const res = await engineClient.executeMemecoinSnipe(buildPoolSnipeRequest(pool, amount, { maxSlippagePct: sniperConfig.maxSlippagePct, jitoTipSol: jitoTip ?? undefined }), tradingMode.live);
     const r = res?.result ?? res?.tradeResult;
     if (r?.success) {
       onAlertTrigger?.(
         'INFO',
-        `SNIPED $${pool.symbol}`,
+        `SNIPED ${dollarSymbol(pool.symbol)}`,
         `${/^PAPER/i.test(String(r.txHash ?? '')) ? 'Paper fill' : 'Sent'} for ${formatSol(amount)} on ${pool.chain}${r.txHash ? ` (${String(r.txHash).slice(0, 14)}...)` : ''}. CA: ${pool.contractAddress.slice(0, 10)}...`
       );
       refreshData();
@@ -400,18 +405,17 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
     // R9-5: a sell asks first, with what it sells
     const pos = positions.find((p) => p.id === posId);
     const ask = sellConfirmText({
-      name: pos ? (pos.tokenTicker.startsWith('$') ? pos.tokenTicker : `$${pos.tokenTicker}`) : 'this position', sellPct, mode: pos?.executionMode,
+      name: pos ? dollarSymbol(pos.tokenTicker) : 'this position', sellPct, mode: pos?.executionMode,
       tokensHeld: pos?.quantityTokens, valueText: pos && Number.isFinite(pos.currentValueUsd) ? `$${pos.currentValueUsd.toFixed(2)}` : null,
     });
     if (!(await confirmSell(ask))) return;
     hftAudio.playOrderFill();
     const res = await engineClient.closeSniperPosition(posId, sellPct);
     if (res?.result?.success) {
-      onAlertTrigger?.(
-        'INFO',
-        sellDoneTitle(sellPct),
-        res.result.message
-      );
+      // R13-8: the title follows what the close did (R6-9 outcome), not just the percentage asked for
+      const r = res.result;
+      const done = closeOutcomeTitle({ success: true, status: r.status, outcome: r.outcome }, sellPct);
+      onAlertTrigger?.(done.severity, done.title, r.message);
       refreshData();
     } else {
       // R29: a refused close used to vanish silently
@@ -420,9 +424,24 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
   };
 
   // Send terminal message
+  // R13-7: /panic_sell and /dump_all run the full emergency stop on the server; they ask first in the in-page confirm (Enter cannot
+  // accept it), and while one is being confirmed or is out, another Enter does not send a second one.
+  const consolePanicBusy = useRef(false);
   const handleSendTerminal = async () => {
     if (!terminalInput.trim()) return;
     const text = terminalInput.trim();
+    if (isConsoleEmergencyCommand(text)) {
+      if (consolePanicBusy.current) return;
+      consolePanicBusy.current = true;
+      try {
+        if (!(await askConfirm({ title: 'EMERGENCY STOP', body: CONSOLE_PANIC_CONFIRM_TEXT(text), confirmLabel: 'Run the emergency stop' }))) return;
+        await sendTerminal(text);
+      } finally { consolePanicBusy.current = false; }
+      return;
+    }
+    await sendTerminal(text);
+  };
+  const sendTerminal = async (text: string) => {
     const nowStr = new Date().toLocaleTimeString();
     
     setTerminalHistory((prev) => [...prev, { sender: 'USER', text, time: nowStr }]);
@@ -452,7 +471,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
       const res = await engineClient.executeMemecoinSnipe({
         contractAddress: manualSnipeCa.trim(),
         amountSol: snipeAmount.parsed.sol,
-        jitoTipSol: sniperConfig.jitoTipSol,
+        ...tipParam,
         slippagePct: sniperConfig.maxSlippagePct,
       }, tradingMode.live);
 
@@ -762,8 +781,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                         <div className="flex flex-wrap items-center gap-3">
                           <div className="flex items-center space-x-1.5">
                             <span className="text-slate-400">Token:</span>
-                            <span className="font-bold text-cyan-300 text-sm">{sig.tokenTicker}</span>
-                            <span className="text-slate-500">({sig.tokenName})</span>
+                            <span className="font-bold text-cyan-300 text-sm">{dollarSymbol(sig.tokenTicker)}</span>
+                            <span className="text-slate-500 truncate max-w-[220px]">({displayName(sig.tokenName)})</span>
                           </div>
 
                           <div className="flex items-center space-x-1 bg-[#141B2D] px-2 py-1 rounded border border-[#1E293B]">
@@ -840,7 +859,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                   ? `Token X link (creator-supplied, unverified): ${sanitizeXProfileUrl(sig.socials?.twitter)}`
                                   : sig.source === 'X_TWITTER'
                                   ? `View Author @${sig.authorHandle} on X`
-                                  : `Search $${sig.tokenTicker} on X.com`
+                                  : `Search ${dollarSymbol(sig.tokenTicker)} on X.com`
                               }
                             >
                               <span className="font-bold text-[11px]">𝕏</span>
@@ -976,8 +995,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                               <span className="text-slate-500 font-bold" title="Trending rank from the feed; — when it gives none">{fmtRank(pool.trendingRank)}</span>
                               <div>
                                 <div className="font-bold text-white text-sm flex items-center space-x-1">
-                                  <span>${pool.symbol}</span>
-                                  <span className="text-slate-400 text-xs font-normal">({pool.name})</span>
+                                  <span>{dollarSymbol(pool.symbol)}</span>
+                                  <span className="text-slate-400 text-xs font-normal truncate max-w-[220px]">({displayName(pool.name)})</span>
                                 </div>
                                 <div className="text-[10px] text-slate-400 flex items-center space-x-1">
                                   <span data-testid="pool-mint" title={pool.contractAddress} className="font-mono text-slate-300">{pool.contractAddress.slice(0, 8)}...{pool.contractAddress.slice(-6)}</span>
@@ -991,8 +1010,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                 </div>
                                 <TokenInlineExternalLinks
                                   mintOrCa={pool.contractAddress}
-                                  symbol={pool.symbol}
-                                  name={pool.name}
+                                  symbol={displaySymbol(pool.symbol)}
+                                  name={displayName(pool.name)}
                                   chain={pool.chain}
                                   platform={pool.platform}
                                   mainnetToken={pool.id.startsWith('pool-callout-')}
@@ -1001,8 +1020,8 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                     setSelectedExternalToken({
                                       mainnetToken: pool.id.startsWith('pool-callout-'),
                                       mintOrCa: pool.contractAddress,
-                                      symbol: pool.symbol,
-                                      name: pool.name,
+                                      symbol: displaySymbol(pool.symbol),
+                                      name: displayName(pool.name),
                                       chain: pool.chain,
                                       platform: pool.platform,
                                       priceUsd: pool.priceUsd,
@@ -1130,7 +1149,7 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                     <label className="block text-slate-400 text-[10px] mb-1" data-testid="jito-tip-label">
                       {jitoUseText(jitoStatus).tipLabel}
                     </label>
-                    <DecimalBox testId="sniper-jito-tip" ariaLabel="Jito tip (SOL)" value={sniperConfig.jitoTipSol} onValue={(n) => setSniperConfig({ ...sniperConfig, jitoTipSol: n })}
+                    <TipBox testId="sniper-jito-tip" ariaLabel="Jito tip (SOL)" value={jitoTip} onValue={setJitoTip}
                       className="w-full bg-[#141B2D] border border-[#1E293B] rounded p-2 text-white font-mono outline-none focus:border-cyan-400"
                     />
                   </div>
@@ -1259,9 +1278,9 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                   <td className="p-3 font-bold text-white min-w-[240px]">
                                     <div className="flex flex-col space-y-1">
                                       <div className="flex items-center space-x-1.5">
-                                        <span className="text-white text-sm font-bold tracking-wide">${pos.tokenTicker}</span>
+                                        <span className="text-white text-sm font-bold tracking-wide">{dollarSymbol(pos.tokenTicker)}</span>
                                         {pos.tokenName && (
-                                          <span className="text-slate-400 text-xs font-normal">({pos.tokenName})</span>
+                                          <span className="text-slate-400 text-xs font-normal truncate max-w-[220px]">({displayName(pos.tokenName)})</span>
                                         )}
                                         <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-800/80 text-cyan-300 border border-slate-700">
                                           {pos.chain}
@@ -1286,15 +1305,15 @@ export const MemecoinSocialSniperModal: React.FC<MemecoinSocialSniperModalProps>
                                       {/* External Website Direct Launchers (DexScreener, Pump.fun, Birdeye, Solscan, Photon) */}
                                       <TokenInlineExternalLinks
                                         mintOrCa={pos.contractAddress}
-                                        symbol={pos.tokenTicker}
-                                        name={pos.tokenName}
+                                        symbol={displaySymbol(pos.tokenTicker)}
+                                        name={displayName(pos.tokenName)}
                                         chain={pos.chain}
                                         platform={pos.platform}
                                         onOpenModal={() =>
                                           setSelectedExternalToken({
                                             mintOrCa: pos.contractAddress,
-                                            symbol: pos.tokenTicker,
-                                            name: pos.tokenName,
+                                            symbol: displaySymbol(pos.tokenTicker),
+                                            name: displayName(pos.tokenName),
                                             chain: pos.chain,
                                             platform: pos.platform,
                                             priceUsd: pos.currentPriceUsd,

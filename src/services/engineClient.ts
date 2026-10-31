@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react';
 import {
   PumpFunHotCallout,
   PumpFunCaller,
@@ -19,7 +20,9 @@ export function setOperatorSessionToken(token: string) {
     }
   }
   try {
-    engineClient.authenticate();
+    // R12-8: clearing the token ends the socket's session too (it reconnects unauthenticated); a new token authenticates the open socket
+    if (cachedSessionToken) engineClient.authenticate();
+    else engineClient.dropSession();
   } catch {}
 }
 
@@ -44,7 +47,36 @@ export function isAuthRequired(): boolean {
   return authRequired;
 }
 
+/**
+ * R11-3: requests that can turn the kill switch on or off. When one of them is answered (or fails, since it may still have been applied),
+ * KILL_STATE_EVENT fires and the header and auto panel read the kill state at once instead of showing the old one until their next poll.
+ * The Memecoin console's webhook is here because `/panic_sell` and `/dump_all` run the emergency stop.
+ */
+export const KILL_STATE_EVENT = 'apex:kill-state-changed';
+const KILL_STATE_ROUTES = ['/api/wallet/panic-liquidate', '/api/execution/kill-switch', '/api/auto/kill', '/api/auto/resume', '/api/telegram/webhook'];
+
+export function onKillStateMayHaveChanged(fn: () => void): () => void {
+  if (typeof window === 'undefined') return () => {};
+  window.addEventListener(KILL_STATE_EVENT, fn);
+  return () => window.removeEventListener(KILL_STATE_EVENT, fn);
+}
+
+function announceKillStateMayHaveChanged(urlText: string, init?: RequestInit): void {
+  if ((init?.method || 'GET').toUpperCase() !== 'POST' || typeof window === 'undefined') return;
+  const path = urlText.replace(/^https?:\/\/[^/]+/, '').split('?')[0];
+  if (KILL_STATE_ROUTES.includes(path)) window.dispatchEvent(new CustomEvent(KILL_STATE_EVENT));
+}
+
 export async function authFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  try {
+    return await authFetchInner(input, init);
+  } finally {
+    const urlText = typeof input === 'string' ? input : input instanceof URL ? input.pathname : (input as Request).url;
+    announceKillStateMayHaveChanged(urlText, init);
+  }
+}
+
+async function authFetchInner(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const token = await getOperatorSessionToken();
   const urlText = typeof input === 'string' ? input : input instanceof URL ? input.pathname : (input as Request).url;
   if (authRequired && !token && !urlText.includes('/api/auth')) {
@@ -67,6 +99,7 @@ export async function authFetch(input: RequestInfo | URL, init?: RequestInit): P
         authRequired = true;
       }
       cachedSessionToken = null;
+      engineClient.dropSession(); // R12-8: the refused token's socket session ends with it
     } catch {}
   }
   return res;
@@ -87,11 +120,17 @@ export type SniperTradeCallback = (data: any) => void;
 
 export const WS_QUIET_MS = 30_000;
 
+/** R12-8: frames that say nothing about the stream being alive: the server's auth prompts and refusals. */
+const NOT_STREAM_FRAMES = new Set(['AUTH_REQUIRED', 'AUTH_ERROR']);
+
 class EngineClient {
   private ws: WebSocket | null = null;
   private isConnected: boolean = false;
-  /** R9-7: when the socket last delivered a message. Offline, a socket can stay "open" long after nothing arrives. */
+  /** R12-8: the server said AUTHENTICATED on this socket (reset on close and when the session is dropped) */
+  private isAuthenticated = false;
+  /** R9-7: when the socket last delivered a data message. Offline, a socket can stay "open" long after nothing arrives. */
   private lastMessageAt = 0;
+  private wsStateCallbacks: Set<() => void> = new Set();
   private pumpCalloutCallbacks: Set<PumpHotCalloutsCallback> = new Set();
   private calloutSnipedCallbacks: Set<CalloutSnipedCallback> = new Set();
   private memecoinSnapshotCallbacks: Set<MemecoinSnapshotCallback> = new Set();
@@ -102,6 +141,32 @@ class EngineClient {
 
   constructor() {
     this.connectWs();
+    // R9-7: offline, the socket can stay "open" for a long time; say it is down at once, and reconnect when the browser is back
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('offline', () => { this.isConnected = false; this.isAuthenticated = false; this.lastMessageAt = 0; this.notifyWsState(); });
+      window.addEventListener('online', () => { try { this.ws?.close(); } catch {} });
+    }
+  }
+
+  private notifyWsState() {
+    this.wsStateCallbacks.forEach((cb) => { try { cb(); } catch {} });
+  }
+
+  /** R12-8 / R9-7: called whenever the socket's live state may have changed (open, close, auth, a data frame, offline). */
+  public onWsStateChange(cb: () => void): () => void {
+    this.wsStateCallbacks.add(cb);
+    return () => { this.wsStateCallbacks.delete(cb); };
+  }
+
+  /**
+   * R12-8: end the socket's operator session (Clear Token, or a 401 that purged the token). The socket is closed, so the server forgets
+   * its token; it reconnects unauthenticated and authenticates again only once a new token is entered.
+   */
+  public dropSession() {
+    this.isAuthenticated = false;
+    this.lastMessageAt = 0;
+    try { this.ws?.close(); } catch {}
+    this.notifyWsState();
   }
 
   private connectWs() {
@@ -121,9 +186,12 @@ class EngineClient {
       };
 
       this.ws.onmessage = (event) => {
-        this.lastMessageAt = Date.now();
         try {
           const msg = JSON.parse(event.data);
+          // R12-8: only data frames count as the stream being alive; an AUTH_ERROR (refused token) or AUTH_REQUIRED does not
+          if (msg?.type === 'AUTHENTICATED' || msg?.type === 'AUTH_SUCCESS') this.isAuthenticated = true;
+          if (msg?.type === 'AUTH_ERROR' && msg.error === 'INVALID_OPERATOR_TOKEN') this.isAuthenticated = false; // server.ts: AUTH refused
+          if (msg && typeof msg.type === 'string' && !NOT_STREAM_FRAMES.has(msg.type)) { this.lastMessageAt = Date.now(); this.notifyWsState(); }
           if (msg.type === 'PUMP_HOT_CALLOUTS' && msg.data) {
             this.lastPumpCalloutsData = msg.data;
             this.pumpCalloutCallbacks.forEach((cb) => cb(msg.data));
@@ -161,11 +229,14 @@ class EngineClient {
 
       this.ws.onclose = () => {
         this.isConnected = false;
+        this.isAuthenticated = false;
+        this.notifyWsState();
         setTimeout(() => this.connectWs(), 3000);
       };
 
       this.ws.onerror = () => {
         this.isConnected = false;
+        this.notifyWsState();
       };
     } catch {
       this.isConnected = false;
@@ -206,9 +277,13 @@ class EngineClient {
     return () => this.sniperTradeCallbacks.delete(cb);
   }
 
-  /** R9-7: "streaming" means open AND a message arrived in the last WS_QUIET_MS, so a dead link stops reading as live. */
+  /**
+   * R9-7: "streaming" means open AND a data message arrived in the last WS_QUIET_MS, so a dead link stops reading as live. R12-8: and the
+   * socket is authenticated, and the browser is online.
+   */
   public isWsConnected(now = Date.now()): boolean {
-    return this.isConnected && now - this.lastMessageAt < WS_QUIET_MS;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return false;
+    return this.isConnected && this.isAuthenticated && now - this.lastMessageAt < WS_QUIET_MS;
   }
 
   public wsSnipePumpCallout(calloutId: string, amountUsd: number = 5.0, jitoTipSol: number = 0.005, slippagePct: number = 6.0, confirmLive = false) {
@@ -245,7 +320,8 @@ class EngineClient {
     return { status: 'ERROR', signals: [] };
   }
 
-  public async snipeSocialSignal(signalId: string, amountSol: number, jitoTipSol: number = 0.005, slippagePct: number = 8.0, confirmLive = false) {
+  // R11-8: no tip given means none is sent (the server's dynamic tip policy decides); a 0.005 default here was a hidden tip
+  public async snipeSocialSignal(signalId: string, amountSol: number, jitoTipSol?: number, slippagePct: number = 8.0, confirmLive = false) {
     try {
       const res = await authFetch('/api/social/signals/snipe', {
         method: 'POST',
@@ -468,3 +544,22 @@ class EngineClient {
 }
 
 export const engineClient = new EngineClient();
+
+/**
+ * R9-7 (Tracker half): the one place a screen reads "is the live stream up". It re-checks on every socket change (open, close, auth, a data
+ * frame, offline) and once a second, so a socket that goes quiet past WS_QUIET_MS or a browser that goes offline stops reading as live
+ * within about a second. A screen that kept its own flag set it true on any frame (and on the cached frame replayed on subscribe) and
+ * re-checked only on its 5 to 6 s poll.
+ */
+export const WS_LIVE_CHECK_MS = 1_000;
+export function useWsStreaming(): boolean {
+  const [live, setLive] = useState(() => engineClient.isWsConnected());
+  useEffect(() => {
+    const check = () => setLive(engineClient.isWsConnected());
+    const off = engineClient.onWsStateChange(check);
+    const t = setInterval(check, WS_LIVE_CHECK_MS);
+    check();
+    return () => { off(); clearInterval(t); };
+  }, []);
+  return live;
+}

@@ -9,7 +9,10 @@
  *
  * What it must never do: pass an UNKNOWN in LIVE. `evaluate(token, 'LIVE')` fails every rule whose status is UNKNOWN; only PAPER lets an
  * UNKNOWN through, and the report then records it so the fill can be marked unverified. A change here that makes UNKNOWN pass in LIVE is a
- * safety regression.
+ * safety regression. R12-10: the two holder rules (creator cap and top-10) also fail an UNKNOWN in PAPER when the holder facts were asked of
+ * the chain (`holderFactsAsked`: the curve was read, so the holder read was made and failed or timed out), so PAPER does not fill a real
+ * token LIVE would refuse for lack of holder data. A PAPER buy whose curve could not be read at all is filled on the flat model and
+ * recorded unverified, as before.
  *
  * Called by: `ExecutionCoordinator` (`evaluatePaperBuy` and the LIVE path of `executeTrade`). The watch window and the auto
  * controller do not call it; they rely on the coordinator's verdict.
@@ -35,6 +38,8 @@ export interface TokenRawData {
   token2022Safe?: boolean | null;
   devHoldingPct?: number | null;
   top10HoldersPct?: number | null;
+  /** R12-10: the holder facts were asked of the chain (the caller read the curve and then the holders). An UNKNOWN holder rule then fails in PAPER too. */
+  holderFactsAsked?: boolean;
   liquidityUsd?: number;
   volume5mUsd?: number;
   bondingCurveProgress?: number;
@@ -70,6 +75,8 @@ export class EligibilityFilter {
    */
   public static evaluate(token: TokenRawData, isLiveModeOrExecutionMode: ExecutionMode | boolean = false): TokenEligibilityReport {
     const isLiveMode = isLiveModeOrExecutionMode === 'LIVE' || isLiveModeOrExecutionMode === true;
+    // R12-10: holder facts that were asked for and not read are refused in every mode (PAPER fills only what LIVE would buy)
+    const holderStrict = isLiveMode || token.holderFactsAsked === true;
     const checks: EligibilityCheckResult[] = [];
     const now = Date.now();
 
@@ -127,7 +134,7 @@ export class EligibilityFilter {
         ? 'PASS'
         : 'FAIL'
       : 'UNKNOWN';
-    const devPassed = devStatus === 'PASS' ? true : devStatus === 'FAIL' ? false : !isLiveMode;
+    const devPassed = devStatus === 'PASS' ? true : devStatus === 'FAIL' ? false : !holderStrict;
     checks.push({
       ruleId: 'MAX_CREATOR_EXPOSURE',
       ruleName: 'Creator Holding Concentration',
@@ -135,16 +142,18 @@ export class EligibilityFilter {
       status: devStatus,
       observedValue: hasDevData
         ? `${token.devHoldingPct!.toFixed(1)}%`
-        : isLiveMode
+        : holderStrict
         ? 'Unknown (Fail-closed)'
         : 'Unverified (Paper)',
       threshold: `< ${MAX_DEV_PCT}%`,
       reason: hasDevData
         ? devStatus === 'PASS'
-          ? `Creator holds ${token.devHoldingPct!.toFixed(1)}%, within safe tolerance.`
-          : `Creator holds excessive supply (${token.devHoldingPct!.toFixed(1)}%). High rug risk.`
+          ? `Creator holds at most ${token.devHoldingPct!.toFixed(1)}% (its own accounts, its funder cluster and every holder not known to be independent), within safe tolerance.`
+          : `Creator may hold excessive supply (${token.devHoldingPct!.toFixed(1)}%: its own accounts, its funder cluster and every holder not known to be independent). High rug risk.`
         : isLiveMode
         ? 'Creator holding percentage is unknown. Fail-closed rejection on live trading.'
+        : holderStrict
+        ? 'Creator holding percentage could not be read. Fail-closed rejection in PAPER too (PAPER fills only what LIVE would buy).'
         : 'Creator holding unverified in simulated execution.',
       source: 'SOLANA_RPC',
       timestamp: now,
@@ -158,7 +167,7 @@ export class EligibilityFilter {
         ? 'PASS'
         : 'FAIL'
       : 'UNKNOWN';
-    const top10Passed = top10Status === 'PASS' ? true : top10Status === 'FAIL' ? false : !isLiveMode;
+    const top10Passed = top10Status === 'PASS' ? true : top10Status === 'FAIL' ? false : !holderStrict;
     checks.push({
       ruleId: 'TOP_10_CONCENTRATION',
       ruleName: 'Top 10 Holders Concentration',
@@ -166,7 +175,7 @@ export class EligibilityFilter {
       status: top10Status,
       observedValue: hasTop10Data
         ? `${token.top10HoldersPct!.toFixed(1)}%`
-        : isLiveMode
+        : holderStrict
         ? 'Unknown (Fail-closed)'
         : 'Unverified (Paper)',
       threshold: `< ${MAX_TOP10_PCT}%`,
@@ -176,6 +185,8 @@ export class EligibilityFilter {
           : `Top 10 holders control ${token.top10HoldersPct!.toFixed(1)}% of supply. High cartel dump risk.`
         : isLiveMode
         ? 'Top 10 holder distribution is unknown. Fail-closed rejection on live trading.'
+        : holderStrict
+        ? 'Top 10 holder distribution could not be read. Fail-closed rejection in PAPER too (PAPER fills only what LIVE would buy).'
         : 'Top 10 holder distribution unverified in simulated execution.',
       source: 'SOLANA_RPC',
       timestamp: now,

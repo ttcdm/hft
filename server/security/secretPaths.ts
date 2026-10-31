@@ -71,9 +71,17 @@ export function configuredSecretFiles(root: string = process.cwd(), env: NodeJS.
 const pathKey = (p: string) => p.replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase();
 
 /** R2-8: true when the absolute path is one of `secretFiles`, or one of them plus a `-` or `.` suffix (a database's -wal, -shm and .lock files). */
-function isConfiguredSecret(absPath: string, secretFiles: string[]): boolean {
+export function isConfiguredSecret(absPath: string, secretFiles: string[]): boolean {
   const k = pathKey(absPath);
   return secretFiles.some((f) => { const fk = pathKey(f); return k === fk || (k.startsWith(fk) && /^[-.]/.test(k.slice(fk.length))); });
+}
+
+/**
+ * R13-9: the release packager's filter. `isShippable` checks names only, so `SIGNER_KEYPAIR_PATH=./trader.json` (an untracked file that is not
+ * gitignored) went into release.zip. This also refuses the configured key, database (with its -wal, -shm and .lock files) and env file by path.
+ */
+export function isShippableFrom(relPath: string, root: string, secretFiles: string[]): boolean {
+  return isShippable(relPath) && !isConfiguredSecret(path.resolve(root, relPath), secretFiles);
 }
 
 /** Lines for `.dockerignore`, generated from the same lists so the two cannot drift. */

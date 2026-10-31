@@ -19,6 +19,7 @@ import { workstationDb, WorkstationDatabase } from '../server/db/database';
 import { HardenedRiskEngine } from '../server/risk/riskEngine';
 import { EligibilityFilter } from '../server/signals/eligibilityFilter';
 import fs from 'fs';
+import { withIndependentOwners } from './helpers/independentHolders';
 import path from 'path';
 
 describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
@@ -132,7 +133,8 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
         }),
       } as unknown as Connection;
 
-      const dist = await fetchTokenHolderDistribution(mockConn, mint, creator, bondingCurve);
+      const known = withIndependentOwners(mockConn); // R13-3: the other holders are known independent
+      const dist = await fetchTokenHolderDistribution(known.conn, mint, creator, bondingCurve, known.ww);
       expect(dist.devHoldingPct).toBe(15.0);
       // C1: creator excluded; 9 * 5M = 45M / 300M = 15.0%
       expect(dist.top10HoldersPct).toBe(15.0);
@@ -187,7 +189,8 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
         }),
       } as unknown as Connection;
 
-      const dist = await fetchTokenHolderDistribution(mockConn, mint, creator, bondingCurve);
+      const known = withIndependentOwners(mockConn); // R13-3: the other holders are known independent
+      const dist = await fetchTokenHolderDistribution(known.conn, mint, creator, bondingCurve, known.ww);
       expect(dist.devHoldingPct).toBe(2.0);
       expect(dist.top10HoldersPct).toBe(48.0);
 
@@ -219,9 +222,9 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
       const bondingCurveAta = PumpCurveService.getAssociatedTokenAddress(mint, bondingCurve, TOKEN_PROGRAM_ID);
       const creatorAta = PumpCurveService.getAssociatedTokenAddress(mint, creator, TOKEN_PROGRAM_ID);
 
-      // 20 largest accounts do not include creator
+      // 20 largest accounts do not include creator (R13-1: the curve holds the rest, so with the creator ATA nothing is unseen)
       const largestAccounts = [
-        { address: bondingCurveAta, amount: '700000000000000', decimals: 6, uiAmount: 700000000 },
+        { address: bondingCurveAta, amount: '795000000000000', decimals: 6, uiAmount: 795000000 },
         ...Array.from({ length: 19 }, () => ({
           address: Keypair.generate().publicKey,
           amount: '10000000000000', // 10M each
@@ -245,7 +248,8 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
         },
       } as unknown as Connection;
 
-      const dist = await fetchTokenHolderDistribution(mockConn, mint, creator, bondingCurve);
+      const known = withIndependentOwners(mockConn); // R13-3: the other holders are known independent
+      const dist = await fetchTokenHolderDistribution(known.conn, mint, creator, bondingCurve, known.ww);
       expect(dist.creatorBalance).toBe(15000000000000n);
       expect(dist.devHoldingPct).toBe(1.5);
     });
@@ -464,8 +468,8 @@ describe('Phase 3 Challenger Empirical Stress & Boundary Test Suite', () => {
       const componentPath = path.join(process.cwd(), 'src/components/PumpFunHotCalloutsView.tsx');
       const fileContent = fs.readFileSync(componentPath, 'utf8');
 
-      // Verifies 0.00018 SOL is present
-      expect(fileContent).toContain('0.00018');
+      // R11-8: no client-side tip default at all (the box says "auto" and the server's dynamic tip decides), as tests/phase3_remediation
+      expect(fileContent).not.toMatch(/jitoPriorityTipSol: \d/);
       // Verifies old 0.005 default tip is not present
       expect(fileContent.includes('0.005')).toBe(false);
     });

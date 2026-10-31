@@ -7,6 +7,7 @@ import { workstationDb } from '../server/db/database';
 import { autoSnipeController } from '../server/auto/controller';
 import { createSimulatedBondingCurveState } from './e2e/helpers/simulatedStates';
 import { newPumpPool, setAutoMode, resetAuto } from './fixtures/auto';
+import { stubCleanHolderFacts } from './fixtures/holderFacts';
 
 /**
  * Q7: PAPER fills used the caller's price (a WS pool's came from the create event) and invented fees (1% in, 0.5% concession and 1% out).
@@ -48,6 +49,7 @@ describe('Q7: PAPER fills are priced from the curve', () => {
     const { mint, pool } = newPumpPool('NONE');
     pool.priceNative = 1e-9; // a create-event price far from the curve's: the old fill used this
     vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockImplementation(async (p: any) => curveFor(p.mint.toBase58()));
+    stubCleanHolderFacts(); // R12-10: PAPER refuses holder facts it asked for and could not read; this fake chain has no holder endpoints
 
     const res = await memecoinAggregator.executeSnipe({ contractAddress: mint, amountUsd: 0, amountSolOverride: 0.0055, platform: 'PUMP_FUN', provenance: 'REAL_ONCHAIN', slippagePct: 6 });
     expect(res.success, res.message).toBe(true);
@@ -56,10 +58,13 @@ describe('Q7: PAPER fills are priced from the curve', () => {
     expect(BigInt(pos.tokenQuantityRaw)).toBe(expectedTokens);
     const spot = Number(V_SOL) / Number(V_TOK) / 1000;
     expect(pos.currentPriceSol).toBeCloseTo(spot, 12); // marked at the curve's spot, not the pool's 1e-9
-    expect(pos.entryPriceSol).toBeCloseTo(0.0055 / (Number(expectedTokens) / 1e6), 12);
-    expect(pos.entryPriceSol).toBeGreaterThan(spot * 1.0124); // the 1.25% in fees alone put the price paid above spot
+    // R14-8: the entry price is fee-free (what reached the curve per token), the mark's basis; the fill reports the price paid with fees
+    const curveNet = Number(((5_500_000n - 1n) * 10000n) / (10000n + BigInt(PROTO + CREATOR)));
+    expect(pos.entryPriceSol).toBeCloseTo(curveNet / 1e9 / (Number(expectedTokens) / 1e6), 12);
+    expect(pos.entryPriceSol).toBeGreaterThan(spot); // the order's own price impact puts it above the spot before the buy
+    expect(pos.entryPriceSol).toBeLessThan(spot * 1.0124); // the 1.25% in fees is not in it
     expect(res.gates?.pricing).toBe('CURVE_QUOTE');
-    expect(res.quotePriceSol).toBeCloseTo(pos.entryPriceSol, 12);
+    expect(res.quotePriceSol).toBeCloseTo(0.0055 / (Number(expectedTokens) / 1e6), 12); // the price paid, fees included
     expect(res.fillPriceSol).toBeCloseTo(res.quotePriceSol!, 12); // a paper fill is the quote: no invented slippage breach
 
     const cost = pos.costBasisLamports;
@@ -87,6 +92,7 @@ describe('Q7: PAPER fills are priced from the curve', () => {
   it('a buy larger than the curve can quote is refused, not filled by the model', async () => {
     const { mint } = newPumpPool('NONE');
     vi.spyOn(PumpCurveService, 'fetchPumpMarketState').mockImplementation(async (p: any) => ({ ...curveFor(p.mint.toBase58()), virtualSolReserves: 1n, virtualTokenReserves: 1n }));
+    stubCleanHolderFacts(); // R12-10: PAPER refuses holder facts it asked for and could not read; this fake chain has no holder endpoints
     const res = await memecoinAggregator.executeSnipe({ contractAddress: mint, amountUsd: 0, amountSolOverride: 0.0055, platform: 'PUMP_FUN', provenance: 'REAL_ONCHAIN', slippagePct: 6 });
     expect(res.success).toBe(false);
     expect(res.message).toMatch(/PAPER_QUOTE_FAILED|quote/i);

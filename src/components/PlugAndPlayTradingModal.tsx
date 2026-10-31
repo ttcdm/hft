@@ -9,13 +9,14 @@
  * It must not hold or show key material, and it must not arm LIVE by itself: arming needs the operator to type the confirmation code, and
  * the server decides whether the prerequisites hold (`getLiveReadiness`). In read-only mode the server refuses to arm and to generate a key.
  */
+import { dollarSymbol, displayName } from '../utils/displayName';
 import { probeLatency } from '../utils/probeBadge';
 import { sellConfirmText } from '../utils/sellConfirm';
 import { journalEventDetail } from '../utils/exitWatch';
-import { ARMED_MESSAGE, PANIC_CONFIRM_TEXT, armRefusalText, panicOutcome } from '../utils/tradingCopy';
+import { ARMED_MESSAGE, armRefusalText, panicConfirmText, panicOutcome } from '../utils/tradingCopy';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { askConfirm, confirmLiveClick, confirmSell } from './ConfirmDialog';
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useSnipeAmount, formatSol } from '../utils/snipeAmount';
 import { SnipeAmountControl } from './SnipeAmountControl';
 import {
@@ -135,33 +136,50 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
   // R9-6: why each list could not be read (null once it was read). The lists start empty, so without this a 401 read as "No positions
   // opened yet" / "No events logged yet" / "Public Key: None".
   const [readProblem, setReadProblem] = useState<ReadProblems>(UNREAD);
+  // R11-6: reads overlap (the 3 s poll, Refresh, the re-read after a close). A read that started earlier and lands later used to put the
+  // old rows back (a closed row came back as PARTIALLY_CLOSED until a reload). Each read takes a number; a read older than the newest
+  // one applied is dropped.
+  const readSeq = useRef(0);
+  const appliedSeq = useRef(0);
   const fetchSystemData = async () => {
+    const seq = ++readSeq.current;
     try {
       const [diagRes, posRes, evRes] = await Promise.all([
         authFetch('/api/diagnostics/system'),
         authFetch('/api/workstation/positions'),
         authFetch('/api/workstation/events?limit=25'),
       ]);
+      if (seq < appliedSeq.current) return;
+      appliedSeq.current = seq;
       const next: ReadProblems = { diag: null, positions: null, events: null };
 
+      // R12-11: a 200 whose body is not what the panel reads (bad JSON, a null or missing list, a list of non-objects) is "reply
+      // unreadable", never an empty list or a PAPER answer. The last good data stays, marked as from an earlier read.
+      const UNREADABLE = 'reply unreadable';
+      const body = async (r: Response): Promise<any> => r.json().catch(() => null);
+      const rows = (v: unknown): any[] | null => (Array.isArray(v) && v.every((x) => x && typeof x === 'object' && !Array.isArray(x)) ? v : null);
+
       if (diagRes.ok) {
-        const dJson = await diagRes.json();
-        setSystemAudit(dJson.systemAudit);
-        setRiskControls(dJson.riskControls);
+        const dJson = await body(diagRes);
+        if (dJson && typeof dJson.systemAudit === 'object' && dJson.systemAudit !== null) {
+          setSystemAudit(dJson.systemAudit);
+          setRiskControls(dJson.riskControls && typeof dJson.riskControls === 'object' ? dJson.riskControls : null);
+        } else next.diag = `${UNREADABLE} (no systemAudit)`;
       } else next.diag = `HTTP ${diagRes.status}`;
 
       if (posRes.ok) {
-        const pJson = await posRes.json();
-        setPositions(pJson.positions || []);
+        const list = rows((await body(posRes))?.positions);
+        if (list) setPositions(list); else next.positions = `${UNREADABLE} (no positions list)`;
       } else next.positions = `HTTP ${posRes.status}`;
 
       if (evRes.ok) {
-        const eJson = await evRes.json();
-        setEvents(eJson.events || []);
+        const list = rows((await body(evRes))?.events);
+        if (list) setEvents(list); else next.events = `${UNREADABLE} (no events list)`;
       } else next.events = `HTTP ${evRes.status}`;
       setReadProblem(next);
     } catch (err: any) {
       console.error('Failed to fetch system data:', err);
+      if (seq < appliedSeq.current) return;
       const why = `server not reachable (${err?.message || 'network error'})`;
       setReadProblem({ diag: why, positions: why, events: why });
     }
@@ -303,30 +321,47 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
     // R9-5: a sell asks first, with what it sells
     const target = positions.find((p) => p.id === posId);
     const held = target && /^\d+$/.test(String(target.tokenQuantityRaw ?? '')) ? Number(target.tokenQuantityRaw) / Math.pow(10, target.tokenDecimals ?? 6) : null;
-    const ask = sellConfirmText({ name: target?.symbol ? `$${target.symbol}` : 'this position', sellPct: 100, mode: target?.executionMode, tokensHeld: held, valueText: target ? fmtSol(target.currentValueSol) : null });
+    const ask = sellConfirmText({ name: target?.symbol ? dollarSymbol(target.symbol) : 'this position', sellPct: 100, mode: target?.executionMode, tokensHeld: held, valueText: target ? fmtSol(target.currentValueSol) : null });
     if (!(await confirmSell(ask))) return;
+    const name = target?.symbol ? dollarSymbol(target.symbol) : 'the position';
     try {
       const res = await authFetch('/api/wallet/close-position', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ positionId: posId, sellPct: 100 }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Close position failed');
-      await fetchSystemData();
-      // R6-9: say what the close did: a sale, an adopted earlier sell (maybe partial), or an assumed loss on an empty wallet
-      const pos = positions.find((p) => p.id === posId);
-      const said = closeOutcomeText({ success: true, pnlSol: Number(data.data?.realizedPnLSol ?? 0), status: data.data?.status, outcome: data.data?.outcome }, 100, pos?.symbol ? `$${pos.symbol}` : 'the position');
+      const data = await res.json().catch(() => null);
+      // R6-9 / R11-5: say what the close did (a sale, an adopted earlier sell, an assumed loss) or why it did not, in the shared words.
+      // R11-6: shown as soon as the reply is in, before the re-read, and the row takes the status the close returned so it does not
+      // sit as PARTIALLY_CLOSED with a live Close button until the next read lands.
+      const d = data?.data;
+      const said = res.ok && data?.success !== false
+        ? closeOutcomeText({ success: true, pnlSol: Number(d?.realizedPnLSol ?? 0), status: d?.status, outcome: d?.outcome, remainingTokensRaw: d?.remainingTokensRaw }, 100, name)
+        : closeOutcomeText({ success: false, pnlSol: 0, error: data?.error || data?.message || `HTTP ${res.status} with no reason` }, 100, name);
       setStatusMessage({ text: said.text, type: said.tone === 'info' ? 'info' : 'error' });
+      if (res.ok && typeof d?.status === 'string') {
+        appliedSeq.current = readSeq.current; // any read already out started before this close: drop it
+        setPositions((list) => list.map((p) => (p.id === posId ? { ...p, status: d.status } : p)));
+      }
+      await fetchSystemData();
     } catch (err: any) {
-      setStatusMessage({ text: err.message || 'Failed to close position', type: 'error' });
+      setStatusMessage({ text: closeOutcomeText({ success: false, pnlSol: 0, error: `the server could not be reached (${err?.message || 'network error'})` }, 100, name).text, type: 'error' });
     }
   };
 
+  // R12-6: one PANIC at a time. A second confirmed PANIC sent during a slow first one answered "Attempted: 0" and its reply overwrote
+  // the first one's. The ref blocks a second press at once (state updates land a render later); the state disables and relabels the button.
+  const panicInFlight = useRef(false);
+  const [panicPending, setPanicPending] = useState(false);
   const handlePanicLiquidate = async () => {
+    if (panicInFlight.current) return;
     // R10-11: an in-page dialog, where Enter cannot accept (window.confirm took Enter as yes)
-    if (!(await askConfirm({ title: 'PANIC LIQUIDATE', body: PANIC_CONFIRM_TEXT, confirmLabel: 'Close everything now' }))) return;
+    // R11-7: the confirm names what this screen read as open (count, tokens, modes) and the trading mode
+    const body = panicConfirmText(readProblem.positions ? null : positions, tradingMode.label, (s) => dollarSymbol(s));
+    panicInFlight.current = true;
+    setPanicPending(true);
     try {
+      if (!(await askConfirm({ title: 'PANIC LIQUIDATE', body, confirmLabel: 'Close everything now' }))) return;
       setIsLoading(true);
       const res = await authFetch('/api/wallet/panic-liquidate', { method: 'POST' });
       const data = await res.json().catch(() => ({}));
@@ -337,6 +372,8 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
       setStatusMessage({ text: err.message || 'Panic liquidate failed', type: 'error' });
     } finally {
       setIsLoading(false);
+      panicInFlight.current = false;
+      setPanicPending(false);
     }
   };
 
@@ -471,7 +508,8 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                 : 'border-transparent text-slate-400 hover:text-slate-200'
             }`}
           >
-            Open Positions ({positions.filter((p) => p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED').length})
+            {/* R12-11 / R9-6: an unread list has no count; "(0)" would read as nothing open */}
+            Open Positions ({readProblem.positions && positions.length === 0 ? '?' : positions.filter((p) => p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED').length})
           </button>
           <button
             onClick={() => setActiveTab('RISK_LOGS')}
@@ -628,7 +666,7 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
                         .map((pos) => (
                           <tr key={pos.id}>
                             <td className="p-2.5 font-mono">
-                              <div className="font-bold text-white">${pos.symbol || pos.mint.slice(0, 6)}</div>
+                              <div className="font-bold text-white truncate max-w-[160px]" title={pos.name ? displayName(pos.name) : undefined}>{pos.symbol ? dollarSymbol(pos.symbol) : `$${String(pos.mint ?? '').slice(0, 6)}`}</div>
                               <span className="text-[10px] text-slate-400 truncate block max-w-[140px]">{pos.mint}</span>
                             </td>
                             <td className="p-2.5">
@@ -768,10 +806,13 @@ export const PlugAndPlayTradingModal: React.FC<PlugAndPlayTradingModalProps> = (
             <button
               onClick={handlePanicLiquidate}
               data-testid="pnp-panic"
-              className="px-3.5 py-2 rounded-lg bg-rose-950/60 hover:bg-rose-900/80 border border-rose-600/50 text-rose-300 font-bold text-xs flex items-center space-x-1.5"
+              disabled={panicPending}
+              aria-busy={panicPending}
+              title={panicPending ? 'A PANIC is being confirmed or is already out; its reply is shown when it comes back.' : undefined}
+              className="px-3.5 py-2 rounded-lg bg-rose-950/60 hover:bg-rose-900/80 disabled:opacity-60 border border-rose-600/50 text-rose-300 font-bold text-xs flex items-center space-x-1.5"
             >
               <AlertTriangle className="w-3.5 h-3.5" />
-              <span>PANIC LIQUIDATE</span>
+              <span>{panicPending ? 'PANIC IN PROGRESS…' : 'PANIC LIQUIDATE'}</span>
             </button>
 
             {/* Arm / Disarm Live Mode */}

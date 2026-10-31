@@ -1,9 +1,11 @@
 import React, { useEffect, useState } from 'react';
+import { dollarSymbol } from '../utils/displayName';
 import { useEscapeToClose } from '../utils/useEscapeToClose';
 import { X, TrendingUp } from 'lucide-react';
 import { usePolled } from '../utils/usePolled';
 import { parseThreshold, thresholdWarning } from '../utils/confluenceThreshold';
 import { DialogFrame } from './DialogFrame';
+import { authFetch } from '../services/engineClient';
 
 export interface ReplayedLaunchRow {
   mint: string; symbol: string; trades: number; verdict: string; verdictReason: string; releasedAfterMs: number | null; score: number | null;
@@ -73,7 +75,7 @@ const dur = (ms: number | null) => (ms === null ? '—' : ms < 60_000 ? `${Math.
  * S187: the what-if box. Replays the recorded launches at another confluence threshold; the shortcut buttons run 70, 50 and 40.
  * Nothing here changes the live threshold (that is the Auto panel); this only changes what the replay below uses.
  */
-export function ReplayThresholdBox({ value, onChange, inForce, replayedAt }: { value: string; onChange: (v: string) => void; inForce?: number; replayedAt?: number | null }) {
+export function ReplayThresholdBox({ value, onChange, inForce, replayedAt, onDragging }: { value: string; onChange: (v: string) => void; inForce?: number; replayedAt?: number | null; onDragging?: (held: boolean) => void }) {
   const p = parseThreshold(value);
   const warn = p.ok ? thresholdWarning(p.value) : null;
   // R9-11: an invalid value used to drop the slider to 0 while the result stayed at the last good value; the slider now stays there too
@@ -82,7 +84,8 @@ export function ReplayThresholdBox({ value, onChange, inForce, replayedAt }: { v
     <div className="mb-3 p-2 rounded border border-[#1E293B] bg-[#090D16]" data-testid="replay-threshold">
       <div className="text-slate-400 mb-1">What if the confluence buy threshold were… {inForce !== undefined && <span className="text-slate-600">(live: {inForce})</span>}</div>
       <div className="flex items-center gap-1.5 flex-wrap">
-        <input data-testid="replay-threshold-slider" type="range" min={0} max={100} step={1} value={sliderValue} onChange={(e) => onChange(e.target.value)} className="flex-1 min-w-[8rem]" aria-label="Replay threshold" />
+        <input data-testid="replay-threshold-slider" type="range" min={0} max={100} step={1} value={sliderValue} onChange={(e) => onChange(e.target.value)} className="flex-1 min-w-[8rem]" aria-label="Replay threshold"
+          onPointerDown={() => onDragging?.(true)} onPointerUp={() => onDragging?.(false)} onPointerCancel={() => onDragging?.(false)} onBlur={() => onDragging?.(false)} />
         <input data-testid="replay-threshold-box" type="text" inputMode="numeric" aria-label="Replay threshold (0 to 100)" value={value} onChange={(e) => onChange(e.target.value)} className="w-14 px-1.5 py-0.5 rounded bg-slate-900 border border-slate-700 text-[11px]" />
         {[70, 50, 40].map((n) => <button key={n} data-testid={`replay-threshold-${n}`} onClick={() => onChange(String(n))} className="px-2 py-0.5 rounded border border-slate-600 text-slate-300 hover:text-white">{n}</button>)}
       </div>
@@ -144,7 +147,7 @@ export function ReplayBacktestView({ data, error }: { data: ReplayResponse | nul
               <tbody>
                 {r.launches.slice(-TABLE_ROWS_SHOWN).reverse().map((l) => (
                   <tr key={l.mint} className="border-t border-[#1E293B] align-top">
-                    <td className="py-1 text-slate-300">${l.symbol}<div className="text-[10px] text-slate-500" title={l.mint}>{l.mint.slice(0, 6)}…{l.mint.slice(-4)} · {l.trades} trades</div></td>
+                    <td className="py-1 text-slate-300">{dollarSymbol(l.symbol)}<div className="text-[10px] text-slate-500" title={l.mint}>{l.mint.slice(0, 6)}…{l.mint.slice(-4)} · {l.trades} trades</div></td>
                     <td title={l.verdictReason}>{l.verdict}{l.releasedAfterMs !== null ? ` @${Math.round(l.releasedAfterMs / 1000)}s` : ''}</td>
                     <td>{l.score ?? '—'}</td>
                     <td>{l.entered ? `${l.outcome === 'OPEN_AT_END' ? 'open at end' : 'closed'}: ${l.exits.map((e) => e.reason).join(', ') || 'no exit yet'}` : (l.noEntryReason ?? '—')}</td>
@@ -185,6 +188,37 @@ export function ReplayBacktestView({ data, error }: { data: ReplayResponse | nul
 }
 
 export const REPLAY_DEBOUNCE_MS = 400;
+const REPLAY_POLL_MS = 30_000;
+
+/**
+ * R9-11 leftover: the replay at `path`, read now and every REPLAY_POLL_MS. A replay is a heavy server pass, so one still out when the
+ * path changes (a newer threshold) or the screen closes is aborted, and its answer is never shown.
+ */
+function useReplay(path: string, enabled: boolean): { data: ReplayResponse | null; error: string | null } {
+  const [state, setState] = useState<{ data: ReplayResponse | null; error: string | null }>({ data: null, error: null });
+  useEffect(() => {
+    if (!enabled) return;
+    let controller: AbortController | null = null;
+    const load = async () => {
+      controller?.abort();
+      const mine = new AbortController();
+      controller = mine;
+      try {
+        const r = await authFetch(path, { signal: mine.signal });
+        const j = await r.json().catch(() => null);
+        if (mine.signal.aborted) return;
+        if (!r.ok) setState((s) => ({ ...s, error: `${j?.error || 'Request refused'} (HTTP ${r.status})` }));
+        else setState({ data: j as ReplayResponse, error: null });
+      } catch (e: any) {
+        if (!mine.signal.aborted) setState((s) => ({ ...s, error: `Could not reach the server (${e?.message || 'network error'})` }));
+      }
+    };
+    void load();
+    const t = setInterval(() => void load(), REPLAY_POLL_MS);
+    return () => { clearInterval(t); controller?.abort(); };
+  }, [path, enabled]);
+  return state;
+}
 
 interface BacktestModalProps { isOpen: boolean; onClose: () => void }
 
@@ -194,16 +228,28 @@ export const BacktestModal: React.FC<BacktestModalProps> = ({ isOpen, onClose })
   // REPLAY_DEBOUNCE_MS (R9-11: every slider step fired its own replay). An invalid one keeps the last good replay.
   const [applied, setApplied] = useState<number | null>(null);
   const onThreshold = (v: string) => setThresholdText(v);
+  // R9-11 leftover: a slow drag (a step every ~400 ms) outpaced the debounce and replayed at every step. While the slider is held
+  // nothing is applied; the value is applied once it is let go (and has stayed put for REPLAY_DEBOUNCE_MS, as typing is).
+  const [dragging, setDragging] = useState(false);
+  // a pointer let go outside the slider still ends the drag
   useEffect(() => {
+    if (!dragging) return;
+    const end = () => setDragging(false);
+    window.addEventListener('pointerup', end);
+    window.addEventListener('pointercancel', end);
+    return () => { window.removeEventListener('pointerup', end); window.removeEventListener('pointercancel', end); };
+  }, [dragging]);
+  useEffect(() => {
+    if (dragging) return;
     const t = setTimeout(() => {
       if (thresholdText.trim() === '') { setApplied(null); return; } // R9-11: a cleared box shows the live value, so replay at it
       const p = parseThreshold(thresholdText);
       if (p.ok) setApplied(p.value);
     }, REPLAY_DEBOUNCE_MS);
     return () => clearTimeout(t);
-  }, [thresholdText]);
+  }, [thresholdText, dragging]);
   const path = applied === null ? '/api/backtest/replay' : `/api/backtest/replay?minScore=${applied}`;
-  const { data, error } = usePolled<ReplayResponse>(path, 30000, isOpen);
+  const { data, error } = useReplay(path, isOpen);
   const live = usePolled<{ confluence?: { value: number } }>('/api/auto/status', 10000, isOpen).data?.confluence?.value;
   useEscapeToClose(isOpen, onClose);
   if (!isOpen) return null;
@@ -215,7 +261,7 @@ export const BacktestModal: React.FC<BacktestModalProps> = ({ isOpen, onClose })
           <button onClick={onClose} className="text-slate-400 hover:text-white" aria-label="Close"><X className="w-4 h-4" /></button>
         </div>
         <p className="text-[10px] text-slate-500 mb-3">Runs the auto trader's own watch window, confluence gate and exit engine over launches this app recorded. Past launches only: it says nothing about the next one.</p>
-        <ReplayThresholdBox value={thresholdText === '' ? String(live ?? 70) : thresholdText} onChange={onThreshold} inForce={live} replayedAt={applied} />
+        <ReplayThresholdBox value={thresholdText === '' ? String(live ?? 70) : thresholdText} onChange={onThreshold} inForce={live} replayedAt={applied} onDragging={setDragging} />
         <ReplayBacktestView data={data} error={error} />
       </div>
     </DialogFrame>

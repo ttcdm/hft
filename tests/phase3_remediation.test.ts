@@ -21,6 +21,7 @@ import { HardenedRiskEngine } from '../server/risk/riskEngine';
 import { EligibilityFilter } from '../server/signals/eligibilityFilter';
 import fs from 'fs';
 import path from 'path';
+import { withIndependentOwners } from './helpers/independentHolders';
 
 describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () => {
   const CANONICAL_FEE_RECIPIENT = new PublicKey('62qc2CNXwrYqQScmEdiZFFAnJR262PxWEuNQtxfafNgV');
@@ -39,9 +40,9 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
       const creatorAta = PumpCurveService.getAssociatedTokenAddress(mint, creator, TOKEN_PROGRAM_ID);
 
       const mockHolders = [
-        // Bonding curve holds 700,000,000 tokens (70% of 1B supply)
-        { address: bondingCurveAta, amount: '700000000000000', decimals: 6, uiAmount: 700000000 },
-        // Creator ATA holds 24,000,000 tokens (8% of 300M circulating)
+        // Bonding curve holds 920,000,000 tokens (92% of 1B supply; R13-1: the accounts add up to the supply, nothing is unseen)
+        { address: bondingCurveAta, amount: '920000000000000', decimals: 6, uiAmount: 920000000 },
+        // Creator ATA holds 24,000,000 tokens (2.4% of the total supply)
         { address: creatorAta, amount: '24000000000000', decimals: 6, uiAmount: 24000000 },
         // Top holders 2 through 10 hold 9 x 6,000,000 = 54,000,000 tokens
         ...Array.from({ length: 9 }, (_, _i) => ({
@@ -69,16 +70,18 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
         }),
       } as unknown as Connection;
 
+      const known = withIndependentOwners(mockConnection); // R13-3: the other holders are known independent
       const dist: TokenHolderDistribution = await fetchTokenHolderDistribution(
-        mockConnection,
+        known.conn,
         mint,
         creator,
-        bondingCurve
+        bondingCurve,
+        known.ww
       );
 
       expect(dist.mint).toBe(mint.toBase58());
-      expect(dist.bondingCurveBalance).toBe(700000000000000n);
-      expect(dist.nonBondingCirculatingSupply).toBe(300000000000000n);
+      expect(dist.bondingCurveBalance).toBe(920000000000000n);
+      expect(dist.nonBondingCirculatingSupply).toBe(80000000000000n);
       expect(dist.creatorBalance).toBe(24000000000000n);
 
       // C1: creator holds 24M / 1B total supply = 2.4%
@@ -145,7 +148,7 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
       const creatorAta = PumpCurveService.getAssociatedTokenAddress(mint, creator, TOKEN_PROGRAM_ID);
 
       const mockHolders = [
-        { address: bondingCurveAta, amount: '700000000000000', decimals: 6, uiAmount: 700000000 },
+        { address: bondingCurveAta, amount: '946000000000000', decimals: 6, uiAmount: 946000000 }, // R13-1: the rest of the supply
         { address: creatorAta, amount: '9000000000000', decimals: 6, uiAmount: 9000000 }, // 3%
         ...Array.from({ length: 9 }, () => ({
           address: Keypair.generate().publicKey,
@@ -160,7 +163,8 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
         getTokenSupply: async () => ({ value: { amount: '1000000000000000', decimals: 6, uiAmount: 1000000000 }, context: { slot: 1 } }),
       } as unknown as Connection;
 
-      const dist = await PumpCurveService.fetchTokenHolderDistribution(mockConn, mint, creator, bondingCurve);
+      const known = withIndependentOwners(mockConn); // R13-3: the other holders are known independent
+      const dist = await PumpCurveService.fetchTokenHolderDistribution(known.conn, mint, creator, bondingCurve, known.ww);
       expect(dist.devHoldingPct).toBe(0.9); // C1: share of total supply
       expect(dist.devHoldingPct).toBeLessThanOrEqual(10.0);
       expect(dist.top10HoldersPct).toBeLessThanOrEqual(40.0);
@@ -301,12 +305,13 @@ describe('Phase 3 Master Remediation Suite (B01, B06, B07, B19, B20, B24)', () =
       expect(resolved.policyReason).toContain('DYNAMIC_NOTIONAL_SCALING');
     });
 
-    it('B24: UI PumpFunHotCalloutsView sets default Jito tip to 0.00018 SOL', () => {
+    it('B24: UI PumpFunHotCalloutsView sets no client-side Jito tip default (R11-8: the server\'s dynamic tip, shown as "auto")', () => {
       const componentPath = path.join(process.cwd(), 'src/components/PumpFunHotCalloutsView.tsx');
       const fileContent = fs.readFileSync(componentPath, 'utf8');
 
-      // Verifies default tip in initial state is 0.00018 SOL
-      expect(fileContent).toContain('jitoPriorityTipSol: 0.00018');
+      // R11-8: the 0.00018 initial value was never what was used (the first poll replaced it with the server's, which has no tip). The
+      // rules start with no tip, the box says "auto", and the server's dynamic policy (0.00018 SOL at the MICRO_10 size) decides.
+      expect(fileContent).not.toMatch(/jitoPriorityTipSol: \d/);
       // Verifies no hardcoded 0.005 SOL default remains in rules state
       expect(fileContent.includes('jitoPriorityTipSol: 0.005')).toBe(false);
     });

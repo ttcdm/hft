@@ -12,8 +12,10 @@ describe('L6: the header kill switch calls the server', () => {
   });
 
   it('only shows "halted" after the server confirmed it, and says so loudly when it did not', () => {
-    expect(fn.indexOf('setIsHalted(nextHalted)')).toBeGreaterThan(fn.indexOf('killSwitchActive !== nextHalted'));
-    expect(fn).toMatch(/KILL SWITCH NOT CONFIRMED/);
+    expect(fn.indexOf('setKnownKillState(nextHalted)')).toBeGreaterThan(fn.indexOf('killSwitchActive !== nextHalted'));
+    // R12-2: a failed press raises the NOT CONFIRMED alert (drawn from killUnconfirmed); tests/r12_2_kill_post_lost_reply.test.tsx clicks it
+    expect(fn).toMatch(/setKillUnconfirmed\(/);
+    expect(src).toMatch(/KILL SWITCH NOT CONFIRMED/);
   });
 
   it('no longer claims engine threads were halted or liquidation armed', () => {

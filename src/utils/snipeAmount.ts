@@ -3,7 +3,11 @@ import { authFetch } from '../services/engineClient';
 import { parseDecimalText, COMMA_DECIMAL_REASON } from './numberInput';
 
 /** S181: the one snipe size every manual snipe button uses, in SOL. Saved per browser; the server still judges every request. */
-export interface SnipeLimits { minSol: number; maxSol: number; defaultSol: number; solPriceUsd: number | null }
+export interface SnipeLimits {
+  minSol: number; maxSol: number; defaultSol: number; solPriceUsd: number | null;
+  /** R12-9: the PAPER order ceiling the server enforces now (10% of the spendable paper bankroll); null or absent when not known */
+  paperCeilingSol?: number | null;
+}
 
 export const SNIPE_AMOUNT_STORAGE_KEY = 'apex.snipeAmountSol';
 /** Used until the server's limits arrive: the same numbers as server/execution/snipeAmount.ts. */
@@ -20,6 +24,17 @@ export function parseSnipeAmount(text: string, limits: SnipeLimits): ParsedAmoun
   if (n < limits.minSol) return { ok: false, reason: `${n} SOL is below the ${limits.minSol} SOL minimum: the network fee and token account rent would eat the order.` };
   if (n > limits.maxSol + 1e-9) return { ok: false, reason: `${n} SOL is above the ${limits.maxSol} SOL maximum position size (MAX_POSITION_SIZE_SOL).` };
   return { ok: true, sol: n };
+}
+
+/**
+ * R12-9: every screen said 0.02 SOL (MAX_POSITION_SIZE_SOL) while the paper path refused anything above 10% of the spendable paper
+ * bankroll (0.0055 SOL at the default 0.07), so the default 0.01 could never pass in PAPER. The amount box now says so.
+ */
+export function paperCeilingNote(sol: number | null, limits: Pick<SnipeLimits, 'paperCeilingSol'>): { text: string; over: boolean } | null {
+  const c = limits.paperCeilingSol;
+  if (typeof c !== 'number') return null;
+  const over = sol !== null && sol > c + 1e-9;
+  return { text: over ? `${sol} SOL is above the PAPER order ceiling of ${c} SOL now (10% of the spendable paper bankroll): a PAPER snipe of it is refused.` : `PAPER orders are capped at ${c} SOL now (10% of the spendable paper bankroll).`, over };
 }
 
 /** "0.01 SOL"; never more than 6 decimals, no trailing zeros. */
@@ -64,7 +79,11 @@ async function loadLimits(): Promise<void> {
   try {
     const r = await authFetch('/api/snipe/limits');
     const j = await r.json().catch(() => null);
-    if (r.ok && j?.success) { limitsCache = { minSol: j.minSol, maxSol: j.maxSol, defaultSol: j.defaultSol, solPriceUsd: j.solPriceUsd ?? null }; limitSubs.forEach((fn) => fn()); }
+    if (r.ok && j?.success) {
+      const ceiling = typeof j.paperCeilingSol === 'number' && Number.isFinite(j.paperCeilingSol) && j.paperCeilingSol > 0 ? j.paperCeilingSol : null;
+      limitsCache = { minSol: j.minSol, maxSol: j.maxSol, defaultSol: j.defaultSol, solPriceUsd: j.solPriceUsd ?? null, paperCeilingSol: ceiling };
+      limitSubs.forEach((fn) => fn());
+    }
   } catch { /* keep the fallback limits; the server judges the request anyway */ } finally { limitsLoading = false; }
 }
 

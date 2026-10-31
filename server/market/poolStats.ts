@@ -101,6 +101,12 @@ export class OnChainPoolStats {
     return this.mints.has(mint);
   }
 
+  /** R11-11: when the last trade of `mint` was recorded (the time its price and curve figures are from); null with no trade seen. */
+  public lastTradeAt(mint: string): number | null {
+    const s = this.mints.get(mint);
+    return s && s.trades.length > 0 ? s.trades[s.trades.length - 1].at : null;
+  }
+
   /** Feed one decoded trade. False when the mint is not tracked or the trade was already counted. */
   public record(t: PumpTradeEvent, at = Date.now()): boolean {
     const s = this.mints.get(t.mint);

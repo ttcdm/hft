@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { Keypair } from '@solana/web3.js';
-import { WatchWindow, WATCH_FUNDER_SAMPLE_BUYERS } from '../server/signals/watchWindow';
+import { WatchWindow, WATCH_FUNDER_SAMPLE_BUYERS, WATCH_FUNDER_HOP_MAX } from '../server/signals/watchWindow';
 import { FunderLookup, wireFunderLookup, FUNDER_LOOKUP_CONCURRENCY, FUNDER_LOOKUP_MAX_PER_MINT, FUNDER_RETRY_DELAYS_MS } from '../server/signals/funderLookup';
 import { ConfluenceEngine, type ConfluenceFactorsInput } from '../server/signals/confluenceEngine';
 import { creatorRiskScorer, CREATOR_REPORT_TTL_MS, CREATOR_REPORT_GRACE_MS } from '../server/signals/creatorRiskScorer';
@@ -248,10 +248,13 @@ describe('P4.1 (R1-60): the funder queue and the coverage sample', () => {
     expect(mints.filter((m) => w.isWatching(m))).toEqual([mints[19]]);
 
     const watched = new Set(buyersOf[19]);
+    // R13-4: the watched buyers' funders are looked up too (the holder gate's second hop), up to WATCH_FUNDER_HOP_MAX per mint
+    const watchedHops = new Set(buyersOf[19].map((b) => funders.get(b)!));
     await vi.waitFor(() => expect(served.filter((x) => watched.has(x)).length).toBe(50));
+    await vi.waitFor(() => expect(served.filter((x) => watchedHops.has(x)).length).toBe(Math.min(50, WATCH_FUNDER_HOP_MAX)));
     await new Promise((r) => setTimeout(r, 20));
-    expect(served.slice(inFlightBeforeRelease).every((x) => watched.has(x))).toBe(true);
-    expect(served.length).toBe(inFlightBeforeRelease + 50);
+    expect(served.slice(inFlightBeforeRelease).every((x) => watched.has(x) || watchedHops.has(x))).toBe(true);
+    expect(served.length).toBe(inFlightBeforeRelease + 50 + Math.min(50, WATCH_FUNDER_HOP_MAX));
     expect(lookup.getStats().dropped).toBe(19 * 50 - inFlightBeforeRelease);
     expect(w.getSnapshot(T0 + 10_000).watching[0].metrics.funderCoverage).toBe(1);
   });
@@ -267,7 +270,9 @@ describe('P4.1 (R1-60): the funder queue and the coverage sample', () => {
     const small = Array.from({ length: n }, wallet);
     small.forEach((b) => funders.set(b, wallet()));
     run(w, mint, small.map((b, i): Step => [(i * 20) / n, b, 'buy', 0.05]));
-    await vi.waitFor(() => expect(served.length).toBe(WATCH_FUNDER_SAMPLE_BUYERS));
+    const smallSet = new Set(small);
+    // R13-4: the second-hop lookups (the buyers' funders) come on top and do not use up the per-mint bound
+    await vi.waitFor(() => expect(served.filter((x) => smallSet.has(x)).length).toBe(WATCH_FUNDER_SAMPLE_BUYERS));
     let m = w.evaluate(mint, T0 + 21_000)!.metrics;
     expect(m.rawUniqueBuyers).toBe(n);
     expect(m.funderCoverage).toBe(1);

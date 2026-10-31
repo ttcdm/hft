@@ -34,8 +34,20 @@ export interface BuyReconciliationResult {
   tokensReceivedHuman: number;
   actualNetworkFeeLamports: number;
   actualJitoTipLamports: number;
-  /** Price the curve charged per token: SOL that went to the curve (fees included) / tokens. Excludes rent, tip and network fees. This is what marks are comparable with, so it is the exit engine's entry price. */
+  /**
+   * Price the curve charged per token: SOL that went to the curve (the pump fee included) / tokens. Excludes rent, tip and network fees.
+   * R14-8: the fee makes it about 1.25% above a fee-free price, so it is NOT on the mark's basis; the exit engine's entry price is
+   * feeFreeFillPriceSol when the transaction shows it.
+   */
   effectiveFillPriceSol: number;
+  /**
+   * R14-8: SOL that reached the bonding curve account per token (its lamport change in this transaction): the price before the pump fee,
+   * on the same basis as the mark (virtual SOL / virtual tokens, no fee). The coordinator's entry price. Absent when the curve account is
+   * not in the transaction or its change does not fit (then the caller takes the fee off the quote's numbers).
+   */
+  feeFreeFillPriceSol?: number;
+  /** R14-8: the bonding curve account's lamport increase in this transaction (the curve's own input, fee-free). */
+  curveNetLamports?: number;
   /** Whole wallet SOL delta per token (rent, tip and fees included). The true cost; PnL accounting uses actualSolSpentLamports. */
   allInFillPriceSol?: number;
   /** SOL that went to the curve: wallet delta minus network fee, tip and token-account rent opened by this tx. */
@@ -88,6 +100,29 @@ export function otherNewAccountRent(
     if (pre === 0 && post > 0) total += post;
   }
   return total;
+}
+
+/**
+ * R14-8: the lamports the mint's bonding curve account (its PDA) gained in a buy transaction: the SOL the curve itself took, without the
+ * protocol and creator fees, which go to other accounts. undefined when the account is not among the keys, did not gain, or gained more
+ * than the curve spend (`curveSpendLamports`, fees included), which a buy of this wallet cannot do.
+ */
+export function bondingCurveLamportsIn(
+  keyAt: (i: number) => string | undefined,
+  count: number,
+  mint: PublicKey,
+  pre: readonly number[] | undefined,
+  post: readonly number[] | undefined,
+  curveSpendLamports: number,
+): number | undefined {
+  if (!pre || !post) return undefined;
+  const curve = PumpCurveService.getBondingCurveAddress(mint)[0].toBase58();
+  for (let i = 0; i < count; i++) {
+    if (keyAt(i) !== curve) continue;
+    const gained = (post[i] ?? 0) - (pre[i] ?? 0);
+    return gained > 0 && gained <= curveSpendLamports ? gained : undefined;
+  }
+  return undefined;
 }
 
 /** Static reconciliation of buys, sells and interrupted transactions against the chain. */
@@ -323,6 +358,8 @@ export class TradeReconciler {
       if (!(curveSpendLamports > 0)) curveSpendLamports = actualSolSpentLamports; // cannot split: fall back to the whole delta
       const effectiveFillPriceSol = (curveSpendLamports / 1e9) / tokensReceivedHuman;
       const allInFillPriceSol = (actualSolSpentLamports / 1e9) / tokensReceivedHuman;
+      const curveNetLamports = bondingCurveLamportsIn((i) => accountKeys.get(i)?.toBase58(), accountKeys.length, mint, tx.meta.preBalances, tx.meta.postBalances, curveSpendLamports);
+      const feeFreeFillPriceSol = curveNetLamports !== undefined ? (curveNetLamports / 1e9) / tokensReceivedHuman : undefined;
 
       Logger.info(`Reconciled BUY fill for ${mintStr}: ${tokensReceivedHuman.toFixed(4)} tokens for ${(actualSolSpentLamports / 1e9).toFixed(5)} SOL (effective price: ${effectiveFillPriceSol.toFixed(8)} SOL)`);
 
@@ -337,6 +374,7 @@ export class TradeReconciler {
         actualJitoTipLamports: expectedJitoTipLamports,
         effectiveFillPriceSol,
         allInFillPriceSol,
+        ...(feeFreeFillPriceSol !== undefined ? { feeFreeFillPriceSol, curveNetLamports } : {}),
         curveSpendLamports,
         tokenAccountRentLamports,
         otherNewAccountRentLamports,
@@ -531,6 +569,8 @@ export class TradeReconciler {
     networkFeeLamports?: number;
     /** BUY only: SOL that went to the curve (wallet delta minus fee, tip and rent of the token account this tx opened). */
     curveSpendLamports?: number;
+    /** R14-8 (BUY only): what the mint's bonding curve account gained, the curve's fee-free input (see bondingCurveLamportsIn). */
+    curveNetLamports?: number;
     tokenAccountRentLamports?: number;
     otherNewAccountRentLamports?: number;
     slot?: number;
@@ -641,6 +681,13 @@ export class TradeReconciler {
       }
       let curveSpendLamports = solSpentLamports - networkFeeLamports - expectedJitoTipLamports - tokenAccountRentLamports - otherNewAccountRentLamports;
       if (!(curveSpendLamports > 0)) curveSpendLamports = solSpentLamports;
+      let curveNetLamports: number | undefined;
+      if (type === 'BUY' && matchedMint) {
+        try {
+          const keys = txDetails.transaction.message.getAccountKeys();
+          curveNetLamports = bondingCurveLamportsIn((i) => keys.get(i)?.toBase58(), keys.length, new PublicKey(matchedMint), txDetails.meta?.preBalances, txDetails.meta?.postBalances, curveSpendLamports);
+        } catch { /* address-table keys not resolvable: the caller falls back to the curve spend */ }
+      }
 
       if (matchedMint && tokenDelta > 0n) {
         return {
@@ -660,6 +707,7 @@ export class TradeReconciler {
           solReceivedLamports,
           networkFeeLamports,
           curveSpendLamports,
+          ...(curveNetLamports !== undefined ? { curveNetLamports } : {}),
           tokenAccountRentLamports,
           otherNewAccountRentLamports,
           slot: txDetails.slot,

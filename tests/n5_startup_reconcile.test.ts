@@ -144,7 +144,8 @@ describe('N5-N9: startup reconciliation does not wedge readiness on states that 
     expect(workstationDb.loadTransactions().find((t) => t.signature === sig)!.reconciliationState).toBe('PENDING');
 
     // the next pass can read the transaction: the sell is applied with its realized PnL (0.12 SOL received against 0.1 cost)
-    conn.getTransaction = vi.fn(async () => ({ slot: 5, blockTime: 1, meta: { err: null, fee: 5000 } }));
+    // R14-13: it landed after the position's buy (its block time is not before the entry), so it is this position's sell
+    conn.getTransaction = vi.fn(async () => ({ slot: 5, blockTime: Math.ceil(Date.now() / 1000), meta: { err: null, fee: 5000 } }));
     vi.spyOn(TradeReconciler, 'recoverInterruptedTransaction').mockResolvedValue({ recovered: true, type: 'SELL', mint, remainingTokensRaw: '0', tokensSoldRaw: '1000', tokenBeforeRaw: '1000', solReceivedLamports: 120_000_000, blockTime: 1, slot: 5 } as any);
     const second = await coordinator.startupReconciliation({ fresh: true });
     const closed = workstationDb.loadPositions().find((p) => p.id === id)!;

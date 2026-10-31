@@ -144,6 +144,16 @@ export async function assertClusterAllowed(
   return { cluster, genesisHash };
 }
 
+/**
+ * R14-11: true when a cluster-check problem (`ExecutionCoordinator.getClusterStatus().problem`) says the RPC is DEFINITELY on another cluster:
+ * its genesis hash is not the allowed one, the database was stamped for another genesis, or a localnet RPC is not loopback. Such an RPC must
+ * not feed PAPER or SHADOW decisions either (a mainnet node whose URL does not say "mainnet" passes `resolveRpcUrl`). A genesis that could
+ * not be READ is not a mismatch: it is an unreachable RPC, which the read paths already handle as unhealthy.
+ */
+export function isClusterMismatch(problem: string | null | undefined): boolean {
+  return !!problem && /does not match allowed cluster|DB_CLUSTER_MISMATCH|localnet requires a loopback/.test(problem);
+}
+
 /** S208: how long a passed genesis check is trusted for the same Connection object. */
 export const GENESIS_CHECK_TTL_MS = 60_000;
 

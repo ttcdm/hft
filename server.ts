@@ -29,7 +29,7 @@ import { computeLatency } from './server/system/latencyStats';
 import { buildDiagnosticsContext } from './server/system/aiContext';
 import { pumpFunService, pumpBootMode } from './server/pumpfunService';
 import { pumpFeedListener } from './server/solana/pumpFeedListener';
-import { autoSnipeController } from './server/auto/controller';
+import { autoSnipeController, AUTO_ALERT_CODES } from './server/auto/controller';
 import { watchWindow } from './server/signals/watchWindow';
 import { FunderLookup, wireFunderLookup } from './server/signals/funderLookup';
 import { buildBoard } from './server/board';
@@ -1205,7 +1205,8 @@ app.get('/api/system/checks', requireOperatorAuth, (req, res) => {
 // restart. The operator acknowledges one here, by code and position, once it has been looked at. Any other code is refused (409): it
 // clears by itself when its condition does. 404 when no such alert is open.
 app.post('/api/system/alerts/acknowledge', requireOperatorAuth, validateTradeBody(AlertAcknowledgeSchema), (req, res) => {
-  const r = executionCoordinator.acknowledgeOperatorAlert(req.body.code, req.body.positionId);
+  // R14-9: the auto controller's own alerts (AUTO_ALERT_CODES) are acknowledged there
+  const r = AUTO_ALERT_CODES.includes(req.body.code) ? autoSnipeController.acknowledgeOperatorAlert(req.body.code) : executionCoordinator.acknowledgeOperatorAlert(req.body.code, req.body.positionId);
   if (!r.acknowledged) return res.status(/^NOT_FOUND/.test(r.error ?? '') ? 404 : 409).json({ success: false, error: r.error });
   res.json({ success: true, ...buildSystemChecks() });
 });
@@ -1295,7 +1296,9 @@ function withOperatorAmount<T extends { amountSol?: number }>(body: T): T & { op
 }
 
 app.get('/api/snipe/limits', requireOperatorAuth, (req, res) => {
-  res.json({ success: true, ...getSnipeLimits(solPriceService.lastKnownPrice()) });
+  // R12-9: the PAPER order ceiling the paper path enforces (10% of the spendable paper bankroll); null when nothing is spendable
+  const paper = executionCoordinator.paperOrderCeiling();
+  res.json({ success: true, ...getSnipeLimits(solPriceService.lastKnownPrice()), paperCeilingSol: paper.spendableSol > 0 ? paper.ceilingSol : null });
 });
 
 app.post('/api/auto/budget', requireOperatorAuth, validateTradeBody(AutoBudgetSchema), (req, res) => {
@@ -1330,11 +1333,18 @@ app.post('/api/auto/kill', requireOperatorAuth, validateTradeBody(AutoKillSchema
   // R6-4: auto is OFF either way, but "sell what it bought" succeeded only if every sell did and nothing auto bought is still open; a
   // refused or failed sell, or a position still open, is success:false
   const notSold = [...result.refused, ...result.failed];
+  // R13-14: stillOpen is counted without exitAll too, so a kill that sold nothing never answers success with auto positions open
   const success = notSold.length === 0 && result.stillOpen === 0;
   const partial = !success && result.closed > 0;
+  // R12-5: KILL AUTO sells only what auto bought; say how many positions opened by hand stay open
+  const manualNote = result.manualOpen > 0 ? `${result.manualOpen} position(s) you opened by hand are still open; KILL AUTO does not sell them (close them from the Plug & Play panel, or PANIC sells everything).` : null;
+  const error = success ? null : req.body.exitAll
+    ? `Auto is OFF, but ${notSold.length} of ${result.attempted} position(s) were NOT sold${notSold.length ? `: ${notSold.map((f) => `${f.symbol} (${f.error})`).join('; ')}` : ''}; ${result.stillOpen} auto position(s) are still open. Close them by hand.`
+    : `Auto is OFF. Nothing was sold (exitAll was not asked for); ${result.stillOpen} auto position(s) are still open, under their exits.`;
   res.json({
     success, partial, ...result,
-    ...(success ? {} : { error: `Auto is OFF, but ${notSold.length} of ${result.attempted} position(s) were NOT sold${notSold.length ? `: ${notSold.map((f) => `${f.symbol} (${f.error})`).join('; ')}` : ''}; ${result.stillOpen} auto position(s) are still open. Close them by hand.` }),
+    ...(error ? { error } : {}),
+    ...(manualNote ? { note: manualNote } : {}),
     status: autoSnipeController.getStatus(),
   });
 }));

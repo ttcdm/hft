@@ -20,6 +20,7 @@ import { workstationDb, WorkstationDatabase } from '../server/db/database';
 import { HardenedRiskEngine } from '../server/risk/riskEngine';
 import { EligibilityFilter } from '../server/signals/eligibilityFilter';
 import fs from 'fs';
+import { withIndependentOwners } from './helpers/independentHolders';
 import path from 'path';
 
 /** A small LIVE buy that passes every gate except the daily-loss ones. */
@@ -138,9 +139,9 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
 
       const bondingCurveAta = PumpCurveService.getAssociatedTokenAddress(mint, bondingCurve, TOKEN_PROGRAM_ID);
 
-      // Largest accounts contain bonding curve and other holders, but NO creator ATA
+      // Largest accounts contain bonding curve and other holders, but NO creator ATA (R13-1: they add up to the supply, nothing unseen)
       const mockHolders = [
-        { address: bondingCurveAta, amount: '800000000000000', decimals: 6, uiAmount: 800000000 },
+        { address: bondingCurveAta, amount: '900000000000000', decimals: 6, uiAmount: 900000000 },
         { address: Keypair.generate().publicKey, amount: '50000000000000', decimals: 6, uiAmount: 50000000 },
         { address: Keypair.generate().publicKey, amount: '50000000000000', decimals: 6, uiAmount: 50000000 },
       ];
@@ -157,11 +158,14 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
         }),
       } as unknown as Connection;
 
+      // R13-3: the two other holders are known independent (an unknown holder would count against the creator cap)
+      const known = withIndependentOwners(mockConnection);
       const dist = await fetchTokenHolderDistribution(
-        mockConnection,
+        known.conn,
         mint,
         creator,
-        bondingCurve
+        bondingCurve,
+        known.ww
       );
 
       expect(dist.creatorBalance).toBe(0n);
@@ -204,6 +208,8 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
         { address: bondingCurveAta, amount: '990000000000000', decimals: 6, uiAmount: 990000000 },
         { address: creatorAta, amount: '500000000000', decimals: 6, uiAmount: 500000 },
         { address: Keypair.generate().publicKey, amount: '1500000000000', decimals: 6, uiAmount: 1500000 },
+        // R13-1: the accounts add up to the supply (the rest of the 10M circulating, 8M, sits with one more holder), so nothing is unseen
+        { address: Keypair.generate().publicKey, amount: '8000000000000', decimals: 6, uiAmount: 8000000 },
       ];
 
       const mockConnection = {
@@ -214,11 +220,13 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
         }),
       } as unknown as Connection;
 
+      const known = withIndependentOwners(mockConnection); // R13-3: holder A is known independent
       const dist = await fetchTokenHolderDistribution(
-        mockConnection,
+        known.conn,
         mint,
         creator,
-        bondingCurve
+        bondingCurve,
+        known.ww
       );
 
       expect(dist.bondingCurveBalance).toBe(990000000000000n);
@@ -228,8 +236,8 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
       // C1: share of TOTAL supply (1B tokens): 500,000 / 1,000,000,000 = 0.05%
       expect(dist.devHoldingPct).toBe(0.05);
 
-      // C1: creator excluded from top 10; remaining 1.5M of 1B total = 0.15%
-      expect(dist.top10HoldersPct).toBe(0.15);
+      // C1: creator excluded from top 10; remaining 1.5M + 8M of 1B total = 0.95%
+      expect(dist.top10HoldersPct).toBe(0.95);
     });
 
     it('B01-ADV.5: Token-2022 bonding curve ATA is correctly recognized and excluded from circulating supply', async () => {
@@ -425,8 +433,9 @@ describe('Challenger Phase 3 Empirical Verification Suite (B01, B06, B07, B19, B
       const filePath = path.join(process.cwd(), 'src/components/PumpFunHotCalloutsView.tsx');
       const content = fs.readFileSync(filePath, 'utf8');
 
-      // Rule default
-      expect(content).toContain('jitoPriorityTipSol: 0.00018');
+      // R11-8: no client-side rule default (it was never used: the first poll replaced it); the box shows "auto" and the server's
+      // dynamic policy decides (0.00018 SOL at the MICRO_10 size, asserted above)
+      expect(content).not.toMatch(/jitoPriorityTipSol: \d/);
       // No remaining 0.005 SOL default
       expect(content.includes('jitoPriorityTipSol: 0.005')).toBe(false);
     });

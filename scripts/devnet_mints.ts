@@ -173,5 +173,6 @@ export function harnessEligibilityInput(
         : undefined,
     devHoldingPct: holderDist ? holderDist.devHoldingPct : null,
     top10HoldersPct: holderDist ? holderDist.top10HoldersPct : null,
+    holderFactsAsked: true, // R12-10, as the coordinator
   };
 }

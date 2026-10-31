@@ -1,6 +1,6 @@
 import { executionCoordinator, ACKNOWLEDGEABLE_ALERT_CODES } from '../execution/coordinator';
 import type { OperatorAlert } from '../core/types';
-import { autoSnipeController } from '../auto/controller';
+import { autoSnipeController, AUTO_ALERT_CODES } from '../auto/controller';
 import { pumpFeedListener } from '../solana/pumpFeedListener';
 import { workstationDb, WorkstationDatabase } from '../db/database';
 import { riskEngine } from '../risk/riskEngine';
@@ -50,6 +50,8 @@ export const OPERATOR_ALERT_LEVELS: Record<string, OperatorAlertLevel> = {
   LEDGER_WRITE_FAILED: 'CRITICAL',
   LATE_BUY_NOT_SOLD: 'CRITICAL',
   UNTRACKED_TOKEN_BALANCE: 'CRITICAL',
+  TOKENS_LEFT_AFTER_EXIT: 'CRITICAL', // R14-2/R13-16: a full exit left tokens in the wallet; acknowledged by the operator
+  BUY_OUTCOME_UNKNOWN: 'CRITICAL', // R14-10: a LIVE buy threw after its send began with the ledger unreadable; acknowledged by the operator
   // raised by other batches (C1, C2, D): listed here so they stay CRITICAL by name, not only by the unknown-code default
   RPC_AUTH_REJECTED: 'CRITICAL',
   EXIT_LOOP_FAILING: 'CRITICAL',
@@ -62,6 +64,7 @@ export const OPERATOR_ALERT_LEVELS: Record<string, OperatorAlertLevel> = {
   PAPER_MARKS_UNAVAILABLE: 'WARNING',
   DISK_SPACE_LOW: 'WARNING',
   LATE_BUY_SOLD: 'INFO',
+  AUTO_CANDIDATE_FAILED: 'WARNING', // R14-9: raised by the auto controller
 };
 /**
  * R9-12: split the mark alerts that no longer apply: a POSITION_MARK_UNAVAILABLE whose position is not open. (PAPER_MARKS_UNAVAILABLE needs
@@ -78,7 +81,7 @@ const LEVEL_RANK: Record<OperatorAlertLevel, number> = { CRITICAL: 0, WARNING: 1
 /** Every open alert with its level, CRITICAL first, newest first within a level. */
 export function operatorAlertViews(alerts: OperatorAlert[]): OperatorAlertView[] {
   return alerts
-    .map((a) => ({ ...a, level: operatorAlertLevel(a.code), acknowledgeable: ACKNOWLEDGEABLE_ALERT_CODES.includes(a.code) }))
+    .map((a) => ({ ...a, level: operatorAlertLevel(a.code), acknowledgeable: ACKNOWLEDGEABLE_ALERT_CODES.includes(a.code) || AUTO_ALERT_CODES.includes(a.code) }))
     .sort((a, b) => LEVEL_RANK[a.level] - LEVEL_RANK[b.level] || b.lastSeenAt - a.lastSeenAt);
 }
 
@@ -163,14 +166,19 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
     : lastRead?.ok
       ? `The breaker opened after failed wallet-balance reads; the latest read succeeded ${sec(now - lastRead.at)} ago, so resetting the kill switch closes it. `
       : `The breaker opened after failed wallet-balance reads and the latest read ${lastRead ? `failed ${sec(now - lastRead.at)} ago` : 'has not happened'}; it stays open until a read succeeds and the kill switch is reset. `;
+  // R11-2: after KILL AUTO this row said OK "no auto kill trigger set" while auto was killed. The auto kill latch is its own fact: auto stays
+  // OFF until an operator sets a mode, whatever the risk kill switch says.
+  const autoKillNote = auto.killed ? `AUTO KILLED: ${auto.killReason ?? 'no reason saved'}; auto stays OFF until an operator sets a mode. ` : '';
   checks.push({
-    id: 'killswitch', label: 'Kill switch / circuit breaker', status: riskEngine.isKillSwitchActive() ? 'FAIL' : breakerOpen ? 'FAIL' : 'OK',
-    value: `kill switch ${riskEngine.isKillSwitchActive() ? 'ON' : 'off'}, breaker ${riskEngine.getCircuitBreakerState()}`, detail: `${breakerNote}${triggerNote}`,
+    id: 'killswitch', label: 'Kill switch / circuit breaker', status: riskEngine.isKillSwitchActive() ? 'FAIL' : breakerOpen ? 'FAIL' : auto.killed ? 'WARN' : 'OK',
+    value: `kill switch ${riskEngine.isKillSwitchActive() ? 'ON' : 'off'}, breaker ${riskEngine.getCircuitBreakerState()}${auto.killed ? ', auto KILLED' : ''}`, detail: `${breakerNote}${autoKillNote}${triggerNote}`,
   });
 
   const feedOk = feed.status === 'ACTIVE';
   const feedAge = feed.lastEventAgeMs >= 0 ? feed.lastEventAgeMs : null;
-  checks.push({
+  // R14-11: a feed whose RPC is on another cluster drops every log; say so instead of "a quiet devnet is normal"
+  if (feed.clusterMismatch) checks.push({ id: 'feed', label: 'Pump.fun event feed', status: 'FAIL', value: `ERROR: RPC on another cluster, ${feed.clusterRefused} log(s) dropped`, detail: `${feed.clusterMismatch}. Launches and trades from this RPC are not watched, shown or paper-filled until the cluster check passes.` });
+  else checks.push({
     id: 'feed', label: 'Pump.fun event feed', status: !feedOk ? 'WARN' : feedAge === null ? 'WARN' : feedAge > 120_000 ? 'WARN' : 'OK',
     value: `${feed.status}, last event ${ago(feedAge)}`, detail: `${feed.eventsReceived} logs received, ${feed.eventsParsed} creates and ${feed.tradesParsed} trades parsed. A quiet devnet is normal; on mainnet this is a warning.`,
   });
@@ -193,7 +201,8 @@ export function buildSystemChecks(now: number = Date.now()): SystemChecksResult 
 
   // R9-12: a mark alert is about a position the exit pass prices; the pass clears it only while the position is open, so after a close it
   // stayed for good. A mark alert for a position that is no longer open is moot: it is left out of the marks row and the alert list.
-  const { current: alerts, moot: mootMarkAlerts } = splitMootMarkAlerts(diag.operatorAlerts ?? [], workstationDb.loadPositions(undefined, 'ACTIVE'));
+  // R14-9: the auto controller's own alerts (AUTO_CANDIDATE_FAILED) are listed with the coordinator's
+  const { current: alerts, moot: mootMarkAlerts } = splitMootMarkAlerts([...(diag.operatorAlerts ?? []), ...autoSnipeController.getOperatorAlerts()], workstationDb.loadPositions(undefined, 'ACTIVE'));
   const markAlerts = alerts.filter((a) => a.code === 'POSITION_MARK_UNAVAILABLE' || a.code === 'PAPER_MARKS_UNAVAILABLE');
   const mootNote = mootMarkAlerts.length ? ` ${mootMarkAlerts.length} mark alert(s) for positions no longer open are not counted.` : '';
   checks.push({

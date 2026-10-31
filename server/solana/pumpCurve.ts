@@ -421,10 +421,14 @@ export interface TokenHolderDistribution {
   creatorBalance: bigint;
   /** R2-3: large holders whose owner the funder lookups tie to the creator (CREATOR_CLUSTER, or a non-ATA account of the creator). In devHoldingPct. */
   creatorClusterBalance: bigint;
-  /** R2-3: large holders whose owner or funding is not known (UNKNOWN). Counted together as one holder in top10HoldersPct. */
+  /** R2-3: large holders whose owner or funding is not known (UNKNOWN). Counted together as one holder in top10HoldersPct, and (R13-3) in devHoldingPct. */
   unknownHolderBalance: bigint;
+  /** R13-1: supply held outside the accounts getTokenLargestAccounts returned (at most 20), and outside the creator ATA read on its own. Treated
+   *  as UNKNOWN: in the unknown top-10 entry and in devHoldingPct. */
+  unseenBalance: bigint;
   top10HoldersPct: number;
-  /** The creator's own accounts plus its funder cluster (R2-3), as a share of total supply. */
+  /** The creator's own accounts plus its funder cluster (R2-3) plus every UNKNOWN (R13-3) and unseen (R13-1) holding, as a share of total supply:
+   *  the most the creator can hold. */
   devHoldingPct: number;
   topHolders: Array<{ address: string; amount: bigint; pct: number; owner?: string | null; holderClass?: HolderClass | 'CREATOR_ATA' }>;
 }
@@ -464,7 +468,8 @@ async function tokenAccountOwners(connection: Connection, accounts: PublicKey[])
  * lookups' knowledge (`holderFunders`, default the watch window, see server/signals/holderCluster.ts). Holdings the creator's funder cluster
  * owns count in devHoldingPct with the creator's own. Fail closed for LIVE: a holder whose owner or funding is unknown is never taken as
  * independent; all unknown holders together count as ONE holder in the top-10 figure (so 40 unknown wallets at 1.8% read as 36% of the top
- * 20 accounts, not 18%).
+ * 20 accounts, not 18%), and (R13-3) their holdings count in devHoldingPct, since any of them may be the creator's. R13-1: the supply outside the
+ * (at most 20) largest accounts is unseen and counts the same way; the token supply must be readable (HOLDER_SUPPLY_UNREADABLE otherwise).
  */
 export async function fetchTokenHolderDistribution(
   connection: Connection,
@@ -511,17 +516,15 @@ export async function fetchTokenHolderDistribution(
     (acc) => !bondingCurveAddresses.has(acc.address.toBase58())
   );
 
-  // Determine total supply and non-bonding circulating supply
-  let totalSupply = 0n;
+  // Determine total supply and non-bonding circulating supply. R13-1: the supply must be read, because the holders the 20-account list
+  // leaves out are measured against it; without it they cannot be bounded, so the holder facts are unreadable (the caller's UNKNOWN).
+  let totalSupply: bigint;
   try {
-    if (typeof (connection as any).getTokenSupply === 'function') {
-      const supplyRes = await (connection as any).getTokenSupply(mint);
-      if (supplyRes?.value?.amount) {
-        totalSupply = BigInt(supplyRes.value.amount);
-      }
-    }
-  } catch {
-    // If getTokenSupply RPC call fails or is unmocked
+    const supplyRes = await (connection as any).getTokenSupply(mint);
+    if (supplyRes?.value?.amount === undefined || supplyRes?.value?.amount === null) throw new Error('no amount in the reply');
+    totalSupply = BigInt(supplyRes.value.amount);
+  } catch (err: any) {
+    throw new Error(`HOLDER_SUPPLY_UNREADABLE: the token supply of ${mint.toBase58()} could not be read (${err?.message || err}), so the holders outside the ${largestAccounts.length} largest accounts cannot be bounded`, { cause: err });
   }
 
   if (totalSupply === 0n) {
@@ -536,7 +539,7 @@ export async function fetchTokenHolderDistribution(
   }
 
   // Calculate creator holding
-  let creatorBalance = 0n;
+  let creatorBalance = 0n, creatorOffList = 0n;
   const creatorAddrsForExclusion = new Set<string>();
   if (creator) {
     const creatorAddresses = creatorAddrsForExclusion;
@@ -563,6 +566,7 @@ export async function fetchTokenHolderDistribution(
         const balRes = await connection.getTokenAccountBalance(creatorAtaSpl);
         if (balRes?.value?.amount) {
           creatorBalance = BigInt(balRes.value.amount);
+          creatorOffList = creatorBalance; // part of the supply the list did not show
         }
       } catch {
         // Creator has no balance or ATA not initialized -> 0
@@ -586,15 +590,24 @@ export async function fetchTokenHolderDistribution(
     else independent.push(amt);
   }
 
+  // R13-1: getTokenLargestAccounts returns at most 20 accounts, so a creator who splits a holding over wallets below the 20th-largest holder
+  // was invisible (100 wallets of 0.2% read as 0%). The supply the list does not show is held by holders nobody classified: it counts as
+  // UNKNOWN, against the creator cap and in the unknown top-10 entry.
+  const visibleBalance = largestAccounts.reduce((sum, acc) => sum + BigInt(acc.amount), 0n) + creatorOffList;
+  const unseenBalance = totalSupply > visibleBalance ? totalSupply - visibleBalance : 0n;
+  const unattributed = unknownHolderBalance + unseenBalance;
+
   // C1: concentration is a share of TOTAL supply. The bonding curve and the creator's cluster are excluded from the top-10 list (they are
-  // scored via devHoldingPct). R2-3: the unknown holders are one entry in it, summed.
-  const entries = [...independent, ...(unknownHolderBalance > 0n ? [unknownHolderBalance] : [])].sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
+  // scored via devHoldingPct). R2-3: the unknown holders (R13-1: and the unseen ones) are one entry in it, summed.
+  const entries = [...independent, ...(unattributed > 0n ? [unattributed] : [])].sort((a, b) => (a < b ? 1 : a > b ? -1 : 0));
   const top10Amount = entries.slice(0, 10).reduce((sum, v) => sum + v, 0n);
   const pctOfTotal = (amt: bigint) =>
     totalSupply > 0n ? Number(((Number(amt) / Number(totalSupply)) * 100).toFixed(2)) : 0;
   const top10HoldersPct = pctOfTotal(top10Amount);
 
-  const devHoldingPct = pctOfTotal(creatorBalance + creatorClusterBalance);
+  // R13-3: an UNKNOWN holder may be the creator's (a wallet the creator sent tokens to that never traded is never looked up), so its holding
+  // counts against the creator cap too. Fail closed: devHoldingPct is the most the creator can be holding, not what is proven.
+  const devHoldingPct = pctOfTotal(creatorBalance + creatorClusterBalance + unattributed);
 
   const topHolders = nonCurveAccounts.map((acc) => {
     const amountBig = BigInt(acc.amount);
@@ -612,6 +625,7 @@ export async function fetchTokenHolderDistribution(
     creatorBalance,
     creatorClusterBalance,
     unknownHolderBalance,
+    unseenBalance,
     top10HoldersPct,
     devHoldingPct,
     topHolders,
@@ -626,6 +640,18 @@ export async function fetchTokenHolderDistribution(
 export const RPC_SLOT_SKEW_TOLERANCE = 8;
 /** R4-9: the time one slot stands for when a read a few slots behind is stamped (Solana's target slot time). */
 export const SLOT_TIME_ESTIMATE_MS = 400;
+/**
+ * R13-11: a node behind the read's minContextSlot floor answers JSON-RPC -32016 ("Minimum context slot has not been reached") and web3.js
+ * throws, so every mark in that window had no price. The curve read is tried once more after this long (a slot; a load-balanced RPC may
+ * route it to a node that has caught up). Still behind: the read fails as before (RPC_ERROR), never read below the floor.
+ */
+export const MIN_CONTEXT_SLOT_RETRY_DELAY_MS = 400;
+
+/** R13-11: the RPC refused a read because its node has not reached the requested minContextSlot (JSON-RPC -32016). */
+export function isMinContextSlotNotReached(err: unknown): boolean {
+  const e = err as { code?: unknown; message?: unknown } | null;
+  return e?.code === -32016 || /-32016|minimum context slot has not been reached/i.test(String(e?.message ?? err));
+}
 
 export class PumpCurveService {
   public static cachedGlobal: any = null;
@@ -769,7 +795,21 @@ export class PumpCurveService {
 
       // R4-9: read with the context slot, never from a state older than one already seen on this connection
       const minContextSlot = this.minContextSlotFor(connection);
-      const read = await connection.getMultipleAccountsInfoAndContext(accountsToFetch, minContextSlot ? { minContextSlot } : undefined);
+      const readAccounts = () => connection.getMultipleAccountsInfoAndContext(accountsToFetch, minContextSlot ? { minContextSlot } : undefined);
+      let read: Awaited<ReturnType<typeof readAccounts>>;
+      try {
+        read = await readAccounts();
+      } catch (err) {
+        // R13-11: a node behind the floor: one more try a slot later, then the error stands
+        if (!minContextSlot || !isMinContextSlotNotReached(err)) throw err;
+        await new Promise((r) => setTimeout(r, MIN_CONTEXT_SLOT_RETRY_DELAY_MS));
+        try {
+          read = await readAccounts();
+        } catch (again: any) {
+          if (!isMinContextSlotNotReached(again)) throw again;
+          throw new Error(`MIN_CONTEXT_SLOT_NOT_REACHED: the RPC node is behind slot ${minContextSlot}, also on one retry ${MIN_CONTEXT_SLOT_RETRY_DELAY_MS} ms later (${again?.message || again})`, { cause: again });
+        }
+      }
       const accountInfos = read.value;
       const marketDataSlot: number | undefined = read.context?.slot;
       const highestSeen = this.slotSeen.get(connection as object)?.slot;

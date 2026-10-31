@@ -88,7 +88,7 @@ describe('S189 a PAPER session downgraded only by a flapping readiness check com
     expect(st.downgradeReason).toBeNull();
     expect(st.autoRestore).toBeNull();
     const reasons = log.mock.calls.map((c) => String((c[0] as any).reason));
-    expect(reasons.some((r) => /kill switch: READINESS_RED/.test(r))).toBe(true); // the downgrade
+    expect(reasons.some((r) => /auto trigger: READINESS_RED/.test(r))).toBe(true); // the downgrade (R12-4: not labelled "kill switch")
     expect(reasons.some((r) => /PAPER restored: readiness has been green/.test(r))).toBe(true); // the restore
   });
   it('a red reading during the wait restarts the green window', async () => {

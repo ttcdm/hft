@@ -2,7 +2,7 @@ import '../hermeticEnv';
 import fs from 'fs';
 import { ExitEngine } from '../../server/exits/exitEngine';
 import { stateAt } from '../../server/backtest/costModel';
-import { openRecorded, recordedToLaunch, resolveSplit, type Launch } from './recorded';
+import { cutAtRecordingGap, openRecorded, recordedToLaunch, resolveSplit, type Launch } from './recorded';
 
 /**
  * S228: prices the rule "buy at the 30-minute mark if the curve is at least X% done" on the app's OWN launch recordings. A separate copy of the logic in
@@ -89,11 +89,15 @@ async function main() {
   const acc: Record<string, Acc> = {};
   const add = (key: string, o: Out) => { const a = (acc[key] ??= { entries: 0, wins: 0, openAtEnd: 0, net: 0 }); a.entries++; a.net += o.net; if (o.net > 0) a.wins++; if (o.open) a.openAtEnd++; };
   // 5C: noTradeAfterEntry launches are entered and priced; the three skip counts are the launches that cannot be
-  const counts = { launches: 0, tradedBeforeCp: 0, noTradeAfterEntry: 0, recordingTooShort: 0, curveCompleteBeforeEntry: 0, endUnknown: 0 };
-  for (const rec of source.launches()) {
+  const counts = { launches: 0, recordingGap: 0, tradedBeforeCp: 0, noTradeAfterEntry: 0, recordingTooShort: 0, curveCompleteBeforeEntry: 0, endUnknown: 0 };
+  // R13-12: a recorder restart or feed gap inside a launch cuts it, as the in-app replay does (covered only to its last row before the marker)
+  const markers = source.markers();
+  for (const raw of source.launches()) {
+    const { rec, gap } = cutAtRecordingGap(raw, markers);
     const c = recordedToLaunch(rec);
     if (!c) continue;
     counts.launches++;
+    if (gap) counts.recordingGap++;
     const k = considerLaunch(c, rec, cpMin);
     if ('skip' in k) {
       if (k.skip !== 'NO_TRADE_BEFORE_CP') counts.tradedBeforeCp++;

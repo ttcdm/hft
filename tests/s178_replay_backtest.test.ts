@@ -203,7 +203,8 @@ describe('S187: the what-if threshold changes which replayed launches are bought
   it('the same recording replayed at 0 and at 100 differs only through the confluence gate, and says which threshold refused it', () => {
     const db = freshDb();
     const buyers = Array.from({ length: 30 }, wallet);
-    record(buyers.map((b, i) => ({ at: 1000 + i * 1000, user: b, isBuy: true, sol: 0.7 })), db, buyers.map((w) => [w, null] as [string, null]));
+    // R13-2: buyers with a funder of their own each (independent); 30 self-funded wallets would be one buyer in velocity and flow
+    record(buyers.map((b, i) => ({ at: 1000 + i * 1000, user: b, isBuy: true, sol: 0.7 })), db, buyers.map((w) => [w, `funder-${w}`] as [string, string]));
     const { launches, funders } = db.loadLaunchRecording();
     const open = replayLaunch(launches[0], funders, 150, { minScore: 0, entryDelayMs: 0 });
     const strict = replayLaunch(launches[0], funders, 150, { minScore: 100, entryDelayMs: 0 });

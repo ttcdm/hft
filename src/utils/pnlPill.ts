@@ -1,3 +1,5 @@
+import { markIsStale } from './freshness';
+
 /** Q35: the header pill. Signed dollar amounts from what /api/wallet/state really returns; null (no SOL price yet) is a dash. */
 export interface PillState {
   realizedUsd: number | null;
@@ -5,6 +7,8 @@ export interface PillState {
   openCount: number;
   /** R6-2: real LIVE positions still open while the server is not in LIVE (after a disarm); absent when there are none. */
   live?: { openCount: number; unrealizedUsd: number | null; realizedUsd: number | null } | null;
+  /** R10-5: open positions in the reply whose mark is stale (older than MARK_STALE_MS, or never marked): the open figure uses an old mark. */
+  staleMarks?: number;
 }
 
 /** R10-6: a sign only when the shown cents are not zero; "$0.00" for zero (it used to read "+$0.00"). */
@@ -21,10 +25,13 @@ export function usdTone(v: number | null | undefined): 'up' | 'down' | 'flat' | 
   return t === '0.00' ? 'flat' : v > 0 ? 'up' : 'down';
 }
 
-export function readPillState(data: any): PillState | null {
+export function readPillState(data: any, now = Date.now()): PillState | null {
   if (!data || typeof data !== 'object') return null;
   const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  const open = Array.isArray(data.activePositions) ? data.activePositions.filter((p: any) => p && (p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED')) : [];
+  const staleMarks = open.filter((p: any) => markIsStale(num(p.lastMarkTimestamp), now)).length;
   return {
+    ...(staleMarks > 0 ? { staleMarks } : {}),
     realizedUsd: num(data.totalRealizedPnLUsd),
     unrealizedUsd: num(data.totalUnrealizedPnLUsd),
     openCount: num(data.activePositionsCount) ?? 0,

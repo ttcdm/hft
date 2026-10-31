@@ -1871,6 +1871,10 @@ export interface SessionSpendDeps {
   makeCoins(n: number): Promise<string[]>;
   /** Sells and refunds the creator and anything else the coins needed. Always called, in `finally`. */
   cleanupCoins(): Promise<void>;
+  /** R14-6: the app's own worst case for one auto buy of `orderSol` (`worstCaseAutoBuySol`), which its pre-check counts. Left out: order + 0.0035. */
+  worstCaseBuySol?(orderSol: number): number;
+  /** The session cap the app allows (AutoSnipeController.maxSessionSpendSol, 3 x MAX_POSITION_SIZE_SOL). Left out: no cap applied here. */
+  maxSessionSpendSol?(): number;
 }
 
 /**
@@ -1896,7 +1900,7 @@ export interface SessionSpendDeps {
  */
 export async function sessionSpendMatchesWallet(s: Pick<HarnessSteps, 'rec' | 'skip' | 'sleep' | 'coordinator'>, d: SessionSpendDeps, opts: { buys?: number; orderSol?: number } = {}): Promise<number> {
   const L = '(m) 3B: DEVNET_LIVE session spend';
-  const n = opts.buys ?? 5;
+  let n = opts.buys ?? 5;
   const TOLERANCE_SOL = 0.0002;
   const skip = (step: string, detail: string) => (s.skip ? s.skip(step, detail) : console.log(`SKIP  ${step}: ${detail}`));
   const prevAuto = process.env.AUTO_SNIPE_ENABLED;
@@ -1918,7 +1922,17 @@ export async function sessionSpendMatchesWallet(s: Pick<HarnessSteps, 'rec' | 's
     // (EXPECTED_EDGE_BELOW_EXECUTION_COST), and five buys with rent must fit the 3 x MAX_POSITION_SIZE_SOL session cap (0.06 by default)
     const order = opts.orderSol ?? 0.008;
     // the order plus fee, the token account's rent and a margin, per buy (budget first: the order size must fit inside it)
-    const budget = d.auto.setBudget({ maxBuys: n, maxSpendSol: Number((n * (order + 0.0035)).toFixed(4)) });
+    // R14-6: the app's pre-check counts each buy at its worst case (order, slippage, fees and both rents), so the budget is n of those,
+    // rounded up, and n is cut to what fits the app's session cap (with an INFO line), never the budget pushed over the cap
+    const perBuy = d.worstCaseBuySol ? d.worstCaseBuySol(order) : order + 0.0035;
+    const cap = d.maxSessionSpendSol?.();
+    if (cap !== undefined && n * perBuy > cap) {
+      const fit = Math.max(1, Math.floor(cap / perBuy));
+      console.log(`INFO  ${L}: ${n} buys at the app's worst case of ${perBuy.toFixed(6)} SOL each do not fit the ${cap} SOL session cap; running ${fit}`);
+      n = fit;
+    }
+    const spend = Math.ceil(n * perBuy * 1e6) / 1e6;
+    const budget = d.auto.setBudget({ maxBuys: n, maxSpendSol: cap !== undefined ? Math.min(spend, cap) : spend });
     if (!budget.ok) { s.rec(`${L}: session budget of ${n} buys`, false, budget.reason ?? 'refused'); return lastTradeAt; }
     const sized = d.auto.setOrderSol(order);
     if (!sized.ok) { s.rec(`${L}: auto order size ${order} SOL`, false, sized.reason ?? 'refused'); return lastTradeAt; }

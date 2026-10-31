@@ -44,7 +44,7 @@ export type CloseOutcome = 'ADOPTED_EARLIER_SELL' | 'ADOPTED_EARLIER_SELL_FILL_U
  * POST /api/system/alerts/acknowledge once it has been looked at. Every other alert clears when its condition does, and cannot be
  * acknowledged away while it still holds.
  */
-export const ACKNOWLEDGEABLE_ALERT_CODES: readonly string[] = ['POSITION_GONE', 'POSITION_BALANCE_MISSING', 'SELL_ADOPTED', 'LEDGER_WRITE_FAILED'];
+export const ACKNOWLEDGEABLE_ALERT_CODES: readonly string[] = ['POSITION_GONE', 'POSITION_BALANCE_MISSING', 'SELL_ADOPTED', 'LEDGER_WRITE_FAILED', 'TOKENS_LEFT_AFTER_EXIT', 'BUY_OUTCOME_UNKNOWN'];
 /** C4: if a direct read still fails after this long, raise an operator alert. */
 export const MARK_ALERT_AFTER_MS = 60_000;
 export const MARK_RETRY_BASE_MS = 60_000;
@@ -206,6 +206,23 @@ export const UNREAD_SELL_FILL_TAG = 'SELL_FILL_UNREAD_ASSUMED_LOSS';
 /** Late buy: the close reason of the sell of a buy that landed after a panic or kill (the panic's, emergencyStop.ts PANIC_CLOSE_REASON). */
 export const LATE_BUY_EXIT_REASON = 'EMERGENCY_PANIC_LIQUIDATION';
 export const PROTECTIVE_EXIT_REASONS = /^(STOP_LOSS|TRAILING_STOP|EMERGENCY_PANIC_LIQUIDATION|MANUAL|Manual Close|Manual user order|Aggregator Close|Operator close)$/;
+
+/**
+ * R14-13: whether a SELL that landed in `sellSlot` (block time `sellBlockTime`, seconds) came after the buy of `pos`. The buy's slot decides
+ * when it is recorded: a later slot is AFTER, an earlier one BEFORE, the same slot UNKNOWN (the order inside a slot is not read). With no buy
+ * slot (a RECOVERED balance, an old row) the block time is compared with the entry time: at or after it is AFTER; anything else is
+ * UNKNOWN, never BEFORE, since the wall clock is not proof enough to drop a sell.
+ */
+export function sellOrderAgainstEntry(pos: Pick<NormalizedPosition, 'entrySlot' | 'entryTimestamp'>, sellSlot: number | undefined, sellBlockTime: number | null | undefined): 'AFTER' | 'BEFORE' | 'UNKNOWN' {
+  const entrySlot = pos.entrySlot ?? 0;
+  if (entrySlot > 0 && typeof sellSlot === 'number' && sellSlot > 0) {
+    if (sellSlot > entrySlot) return 'AFTER';
+    if (sellSlot < entrySlot) return 'BEFORE';
+    return 'UNKNOWN';
+  }
+  if (typeof sellBlockTime === 'number' && sellBlockTime > 0 && (pos.entryTimestamp ?? 0) > 0 && sellBlockTime * 1000 >= pos.entryTimestamp) return 'AFTER';
+  return 'UNKNOWN';
+}
 
 export class ExecutionCoordinator {
   private executionMode: ExecutionMode = 'PAPER';
@@ -1113,14 +1130,33 @@ export class ExecutionCoordinator {
                     this.sellIfLateBuyAdopted(adopted);
                     Logger.info(`Successfully recovered interrupted BUY position for ${recovery.mint} (${pTx.signature})`);
                   } else if (recovery.type === 'SELL') {
-                    const targetPos = workstationDb
+                    const openOfMint = workstationDb
                       .loadPositions()
                       .find((p) => p.mint === recovery.mint && p.executionMode === 'LIVE' && (p.status === 'OPEN' || p.status === 'PARTIALLY_CLOSED'));
-                    if (targetPos) {
-                      const remainingTokens = BigInt(recovery.remainingTokensRaw ?? '0');
+                    // R14-13: the ledger row carries no position id, so the mint alone cannot say which position a sell belongs to (an old
+                    // SELL row read PENDING after the reconciliation_state column was added would be booked onto today's position of the mint).
+                    // The chain decides: a sell that landed before this position's buy cannot have sold its tokens.
+                    const order = openOfMint ? sellOrderAgainstEntry(openOfMint, txDetails.slot, txDetails.blockTime) : null;
+                    const targetPos = order === 'AFTER' ? openOfMint : undefined;
+                    if (openOfMint && order === 'BEFORE') {
+                      pTx.reconciliationState = 'RECONCILED';
+                      pTx.error = `landed in slot ${txDetails.slot}, before the open position of this mint was bought (slot ${openOfMint.entrySlot}); not applied to it`;
+                      issues.push(`SELL ${pTx.signature.slice(0, 8)}... landed before the open ${openOfMint.symbol || recovery.mint} position was bought; not applied to it`);
+                      Logger.warn(`[R14-13] SELL ${pTx.signature} landed before position ${openOfMint.id} was bought; not applied`);
+                    } else if (openOfMint && order === 'UNKNOWN') {
+                      pTx.reconciliationState = 'RECONCILIATION_REQUIRED';
+                      mismatchesCount++;
+                      issues.push(`SELL ${pTx.signature.slice(0, 8)}... landed, but whether it came after the open ${openOfMint.symbol || recovery.mint} position's buy cannot be proven (no buy slot or block time); not applied`);
+                    } else if (targetPos) {
+                      // R14-3: the sale is a share of the ROW, not of the wallet balance before it (tokens sent in from outside are not the
+                      // position's): the basis removed is sold / row, and the row keeps row - sold. The wallet's balance after the sell only
+                      // decides that nothing is left. Extra wallet tokens stay untracked (step 6 below adopts what this app once bought).
+                      const rowTokens = BigInt(targetPos.tokenQuantityRaw);
                       const tokensSold = BigInt(recovery.tokensSoldRaw ?? '0');
-                      const totalTokensBefore = BigInt(recovery.tokenBeforeRaw ?? targetPos.tokenQuantityRaw);
-                      const sellFraction = totalTokensBefore > 0n ? Number(tokensSold) / Number(totalTokensBefore) : 1;
+                      const walletAfter = BigInt(recovery.remainingTokensRaw ?? '0');
+                      const remainingTokens = walletAfter <= 0n || tokensSold >= rowTokens ? 0n : rowTokens - tokensSold;
+                      // closing the row books its whole basis against the proceeds (tokens the row claimed beyond the wallet are a loss, not free)
+                      const sellFraction = remainingTokens > 0n ? Number(tokensSold) / Number(rowTokens) : 1;
                       const costPortionLamports = Math.round(targetPos.costBasisLamports * sellFraction);
                       const netProceedsLamports = recovery.solReceivedLamports ?? 0;
                       const realizedPnLSol = (netProceedsLamports - costPortionLamports) / 1e9;
@@ -1193,6 +1229,7 @@ export class ExecutionCoordinator {
             pTx.reconciliationState = 'TIMED_OUT'; // a row written before lastValidBlockHeight was stored
             workstationDb.saveTransaction(pTx);
           }
+          this.forgetSettledPendingSell(pTx); // R14-1: after the row's write, so a write that throws leaves the pending sell in place
         } catch (err: any) {
           // R5-5: a failed read is unknown, not fine. The row stays as it is, the pass is a mismatch and is tried again.
           Logger.warn(`Failed to reconcile pending transaction ${pTx.signature}: ${err.message}`);
@@ -1363,7 +1400,10 @@ export class ExecutionCoordinator {
     });
   }
 
-  /** Position for a buy rebuilt from confirmed on-chain data. Entry price is the curve price paid; cost basis is the whole wallet delta. */
+  /**
+   * Position for a buy rebuilt from confirmed on-chain data. Entry price is the fee-free curve price (R14-8: what the bonding curve account
+   * received per token, the mark's basis; the curve spend with its fee only when that cannot be read); cost basis is the whole wallet delta.
+   */
   private positionFromRecoveredBuy(
     pTx: { signature: string; mint: string; jitoTipLamports: number; executionMode: ExecutionMode },
     recovery: Awaited<ReturnType<typeof TradeReconciler.recoverInterruptedTransaction>>,
@@ -1372,7 +1412,7 @@ export class ExecutionCoordinator {
   ): NormalizedPosition {
     const tokenQty = Number(recovery.tokenQuantityRaw) / Math.pow(10, recovery.tokenDecimals ?? 6);
     const spent = recovery.solSpentLamports ?? 0;
-    const curveSpend = recovery.curveSpendLamports ?? spent;
+    const curveSpend = recovery.curveNetLamports ?? recovery.curveSpendLamports ?? spent;
     const effectivePrice = curveSpend > 0 && tokenQty > 0 ? curveSpend / 1e9 / tokenQty : 0;
     return {
       id: pTx.signature,
@@ -1704,6 +1744,17 @@ export class ExecutionCoordinator {
     return (open.length * CapitalSizer.SPL_TOKEN_ACCOUNT_RENT_LAMPORTS) / 1e9;
   }
 
+  /**
+   * B12 / R12-9: the PAPER order ceiling the paper path enforces, 10% of the spendable paper bankroll (the real wallet balance when one
+   * was read, else PAPER_BANKROLL_SOL, less the 0.015 SOL reserve and what is reserved in flight). Screens read it from
+   * /api/snipe/limits: they said 0.02 SOL (MAX_POSITION_SIZE_SOL) while this refused anything above about 0.0055.
+   */
+  public paperOrderCeiling(): { balanceSol: number; spendableSol: number; ceilingSol: number } {
+    const paperBalanceSol = this.realWalletBalanceSol !== null ? this.realWalletBalanceSol : executionConfig.getConfig().paperBankrollSol;
+    const spendableSol = CapitalSizer.calculateSpendableBankroll(paperBalanceSol, 0.015, this.inFlightReservedSol);
+    return { balanceSol: paperBalanceSol, spendableSol, ceilingSol: Number((spendableSol * 0.10).toFixed(6)) };
+  }
+
   public getSpendableBankrollSol(): number {
     const raw = this.realWalletBalanceSol ?? 0;
     return CapitalSizer.calculateSpendableBankroll(raw, 0.015, this.inFlightReservedSol);
@@ -1717,6 +1768,7 @@ export class ExecutionCoordinator {
     if (isReadOnly()) {
       // S185: read-only never arms, and never claims to have changed mode; disarming has nothing to undo.
       this.isLiveTradingArmed = false;
+      this.liveDisarmSeq++; // R14-7
       this.executionMode = 'PAPER';
       return { success: false, message: 'READ_ONLY: APEX_READ_ONLY=true. This server watches and paper trades only; live trading cannot be armed.', reasons: ['APEX_READ_ONLY=true'] };
     }
@@ -1760,6 +1812,7 @@ export class ExecutionCoordinator {
       return { success: true, message: 'Live trading armed successfully. Transactions will be broadcast on Solana.' };
     } else {
       this.isLiveTradingArmed = false;
+      this.liveDisarmSeq++; // R14-7: a BUY already in the send path stops resending
       this.executionMode = 'PAPER';
       Logger.info('Live trading disarmed. Switched to PAPER mode.');
       return { success: true, message: 'Trading disarmed. System is operating in PAPER mode.' };
@@ -1962,16 +2015,24 @@ export class ExecutionCoordinator {
   }
 
   /**
-   * R1 #8, R3-28: why a signed BUY must not be sent (or resent) now: the kill switch is on, trading is halted, or (first send only) the
-   * send deadline set from the signal and market-data ages has passed. null when it may go. Never asked for a SELL: a protective exit is
-   * never held by the kill switch.
+   * R1 #8, R3-28, R14-7: why a signed BUY must not be sent, or resent, now: the kill switch is on, trading is halted, the send deadline set from
+   * the signal and market-data ages has passed (every send, resends included: a rebroadcast is a fresh chance for a stale entry to land), LIVE
+   * was disarmed since the order went to the send path (`disarmSeqAtSend`, the liveDisarmSeq it read then; a re-arm does not undo it), or a
+   * start lock is lost (another process may own the database or key now). null when it may go. Never asked for a SELL: a protective exit is
+   * never held by any of these.
    */
-  private buySendRefusal(notAfter?: number): string | null {
+  private buySendRefusal(notAfter?: number, disarmSeqAtSend?: number): string | null {
     if (riskEngine.isKillSwitchActive()) return 'the kill switch was activated';
     if (this.haltReason) return `trading was halted (${this.haltReason})`;
-    if (typeof notAfter === 'number' && Date.now() > notAfter) return `the signal or its market data is past the risk engine's age limit (send deadline ${new Date(notAfter).toISOString()})`;
+    if (typeof disarmSeqAtSend === 'number' && this.liveDisarmSeq !== disarmSeqAtSend) return 'live trading was disarmed';
+    const lostLock = this.lostStartLock();
+    if (lostLock) return `this process lost its start lock ${lostLock} (another process may own this database or key now)`;
+    if (typeof notAfter === 'number' && !(Date.now() <= notAfter)) return `the signal or its market data is past the risk engine's age limit (send deadline ${new Date(notAfter).toISOString()})`;
     return null;
   }
+
+  /** R14-7: counts every disarm (armLiveTrading(false), and the read-only refusal), so a BUY in flight can tell that one happened since its send began. */
+  private liveDisarmSeq = 0;
 
   // Idempotent, bounded Jito retry loop with pre-checks and zero-double-fill RPC fallback (R0.6)
   /**
@@ -2085,7 +2146,7 @@ export class ExecutionCoordinator {
     jitoTipLamports: number;
     /** SELL only: the exit reason, stored on the transaction row (see exitStageAfterFill). */
     exitReason?: string;
-    /** BUY only (R3-28): wall-clock ms after which the first send is refused (the signal or market data would be stale). */
+    /** BUY only (R3-28, R14-7): wall-clock ms after which no send or resend goes out (the signal or market data would be stale). */
     buyNotAfter?: number;
   }): Promise<{
     success: boolean;
@@ -2099,6 +2160,7 @@ export class ExecutionCoordinator {
     unconfirmed?: boolean;
   }> {
     const { tx, orderId, correlationId, side, mint, mintPubkey, owner, tokenProgram, preSnapshot, jitoTipLamports } = params;
+    const disarmSeqAtSend = this.liveDisarmSeq; // R14-7: a disarm from here on stops this BUY's sends and resends
     assertNotReadOnly(`sending a ${side} order`); // S185: the one place every signed buy and sell is submitted from
     const cfg = executionConfig.getConfig();
 
@@ -2180,7 +2242,7 @@ export class ExecutionCoordinator {
 
       // R1 #8: a kill or halt between signing and this send (or between two resends) stops the BUY here; a SELL is never held
       if (side === 'BUY') {
-        const refused = this.buySendRefusal(lastSignature || lastBundleId ? undefined : params.buyNotAfter);
+        const refused = this.buySendRefusal(params.buyNotAfter, disarmSeqAtSend);
         if (refused) return this.revokedBuyResult(refused, params, lastSignature, lastBundleId, 'JITO');
       }
 
@@ -2300,7 +2362,7 @@ export class ExecutionCoordinator {
 
       // R1 #8: the last look before the RPC send of a BUY (after the genesis check, any Jito probe and the Jito attempts)
       if (side === 'BUY') {
-        const refused = this.buySendRefusal(lastSignature || lastBundleId ? undefined : params.buyNotAfter);
+        const refused = this.buySendRefusal(params.buyNotAfter, disarmSeqAtSend);
         if (refused) return this.revokedBuyResult(refused, params, lastSignature, lastBundleId, 'SOLANA_RPC');
       }
 
@@ -2352,8 +2414,9 @@ export class ExecutionCoordinator {
       const rpcConfirm = await traced('tx.confirm', () => this.rpcTransport.confirm(rpcSubmit.signature, cfg.rpcFallbackTimeoutMs || 15000, undefined, {
         rebroadcast: tx,
         lastValidBlockHeight: txBuilder.lastValidBlockHeightOf((tx as any)?.message?.recentBlockhash),
-        // R1 #8: a kill or halt during the watch stops the resends of a BUY (the watch itself goes on); a SELL keeps every resend
-        ...(side === 'BUY' ? { stopResends: () => this.buySendRefusal() } : {}),
+        // R1 #8, R14-7: a kill, halt, disarm, lost start lock or passed send deadline during the watch stops the resends of a BUY (the watch
+        // itself goes on); a SELL keeps every resend
+        ...(side === 'BUY' ? { stopResends: () => this.buySendRefusal(params.buyNotAfter, disarmSeqAtSend) } : {}),
       }), { 'apex.transport': 'SOLANA_RPC', 'apex.side': side });
       if (rpcConfirm.confirmed) {
         return {
@@ -2475,6 +2538,7 @@ export class ExecutionCoordinator {
           : undefined,
       devHoldingPct: holderDist ? holderDist.devHoldingPct : null,
       top10HoldersPct: holderDist ? holderDist.top10HoldersPct : null,
+      holderFactsAsked: true, // R12-10: the curve was read and the holders were asked for; unread holder facts fail in PAPER too
     };
   }
 
@@ -2588,9 +2652,7 @@ export class ExecutionCoordinator {
 
     // Pre-trade capital sizing check: ensure order does not exceed 10% of spendable bankroll (B12)
     // C5: the configured paper bankroll (default 0.07 SOL), never an invented 1.0
-    const paperBalanceSol = this.realWalletBalanceSol !== null ? this.realWalletBalanceSol : executionConfig.getConfig().paperBankrollSol;
-    const paperSpendable = CapitalSizer.calculateSpendableBankroll(paperBalanceSol, 0.015, this.inFlightReservedSol);
-    const maxPaperOrderSol = Number((paperSpendable * 0.10).toFixed(6));
+    const { balanceSol: paperBalanceSol, spendableSol: paperSpendable, ceilingSol: maxPaperOrderSol } = this.paperOrderCeiling();
     if (paperSpendable > 0 && req.amountSol > maxPaperOrderSol + 0.000001) {
       return { rejection: {
         success: false,
@@ -3238,6 +3300,8 @@ export class ExecutionCoordinator {
     }
     this.inFlightBuyMints.add(req.mint);
     const stopSeqAtGate = this.emergencyStopSeq; // late buy: a panic or kill after this point sells what this buy opens
+    let buySendStarted = false; // R14-10: set just before the order goes to the send path
+    let buySignature: string | null = null;
     let buySettled!: () => void;
     this.liveBuysInFlight.set(req.mint, new Promise<void>((r) => { buySettled = r; })); // waitForBuysInFlight awaits it
 
@@ -3335,6 +3399,9 @@ export class ExecutionCoordinator {
       });
 
       // 5 & 6. Submit transaction with bounded idempotent retry & RPC fallback
+      // R14-10: from here a throw may follow a send, so the exception path below treats an unreadable ledger as "possibly landed"
+      buySendStarted = true;
+      buySignature = this.signatureOf(v0Tx);
       const subRes = await this.submitAndConfirmWithRetry({
         tx: v0Tx,
         orderId: clientOrderId,
@@ -3461,6 +3528,10 @@ export class ExecutionCoordinator {
       // 8. Reconciled Successfully: Persist verified OPEN position
       riskEngine.recordTradeSuccess(req.mint);
 
+      // R14-8: the exit engine compares the entry with a fee-free spot mark, so the entry is the fee-free price too: what reached the curve
+      // per token, read from the curve account's own change; failing that, the curve price less the quote's fee share (the same fee tier).
+      const quoteFeeShare = quote.expectedSolAmountLamports > 0 ? (quote.protocolFeeLamports + quote.creatorFeeLamports) / quote.expectedSolAmountLamports : 0;
+      const entryPriceSol = reconciliation.feeFreeFillPriceSol ?? reconciliation.effectiveFillPriceSol * (1 - Math.min(Math.max(quoteFeeShare, 0), 0.1));
       const livePosition: NormalizedPosition = {
         id: subRes.signature,
         mint: req.mint,
@@ -3470,8 +3541,8 @@ export class ExecutionCoordinator {
         baseTokenProgram: marketState.baseTokenProgram.toBase58(),
         tokenQuantityRaw: reconciliation.actualTokensReceivedRaw,
         costBasisLamports: reconciliation.actualSolSpentLamports,
-        entryPriceSol: reconciliation.effectiveFillPriceSol,
-        currentPriceSol: reconciliation.effectiveFillPriceSol,
+        entryPriceSol,
+        currentPriceSol: entryPriceSol,
         currentValueSol: reconciliation.actualSolSpentLamports / 1e9,
         unrealizedPnLSol: 0,
         unrealizedPnLPct: 0,
@@ -3555,7 +3626,23 @@ export class ExecutionCoordinator {
       Logger.error(`LIVE trade exception: ${err.message}`);
       // P1.5 (R1-6, R1-80): an exception after the PENDING row was written (the transaction may have been sent) must not leave that row
       // PENDING and unwatched: it becomes RECONCILIATION_REQUIRED, which orphan recovery re-reads and adopts if the buy landed.
-      const pending = workstationDb.loadTransactions(`ord-${correlationId}`).filter((t) => t.direction === 'BUY' && t.reconciliationState === 'PENDING');
+      // R14-10: loadTransactions answers [] on a failed read, which made a buy that may have landed a clean CHAIN_ERROR (auto counted no
+      // spend, and nothing watched it). The PENDING rows are read where a failed read is null, and null after the send began is unknown.
+      const pendingRead = workstationDb.loadTransactionsInStates(['PENDING']);
+      if (pendingRead === null && buySendStarted) {
+        if (buySignature) this.lateBuyWatch.set(buySignature, stopSeqAtGate);
+        this.scheduleOrphanRecovery(); // it reads PENDING rows as well as RECONCILIATION_REQUIRED ones once the ledger reads again
+        this.raiseOperatorAlert('BUY_OUTCOME_UNKNOWN', `A LIVE buy of ${req.symbol || req.mint}${buySignature ? ` (${buySignature.slice(0, 8)})` : ''} threw after its send began (${String(err.message).slice(0, 80)}) and the transactions table could not be read to find its row. It may have landed: orphan recovery keeps checking, and the startup wallet scan adopts the tokens if it did. Do not retry the buy by hand.`, buySignature ?? `buy-${correlationId}`);
+        return {
+          success: false,
+          lifecycleState: 'RECONCILIATION_REQUIRED',
+          executionMode: 'LIVE',
+          ...(buySignature ? { txSignature: buySignature } : {}),
+          error: `UNCONFIRMED: ${err.message}. The transaction may have been sent and the ledger could not be read; it is being watched, do not retry the buy.`,
+          correlationId,
+        };
+      }
+      const pending = (pendingRead ?? []).filter((t) => t.orderId === `ord-${correlationId}` && t.direction === 'BUY');
       if (pending.length > 0) {
         for (const t of pending) {
           workstationDb.saveTransaction({ ...t, reconciliationState: 'RECONCILIATION_REQUIRED', error: `UNCONFIRMED: exception after the send was prepared: ${err.message}` });
@@ -4044,9 +4131,11 @@ export class ExecutionCoordinator {
             onChain = totalTokensRaw - sold; // what the row keeps; tokens sent in from outside stay untracked
             this.raiseOperatorAlert('SELL_LANDED_WALLET_TOPPED_UP', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed, but the wallet holds at least as many tokens as before it (tokens were sent in). Booked from the transaction: ${sold} sold.`, positionId);
           } else if (sellBps >= 10_000) {
-            // a full exit sells what the wallet holds (clamped below), so it cannot double-sell a partial; the earlier sell's fill stays unbooked
+            // R13-16: a full exit sells the row's recorded quantity (clamped below only when the wallet holds less, which it does not here), so
+            // it closes the position whatever the earlier sell took; tokens it sells beyond the position's are ones sent in from outside. The
+            // earlier sell's fill stays unbooked.
             this.pendingSells.delete(positionId);
-            this.raiseOperatorAlert('SELL_LANDED_UNBOOKED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed but its fill could not be read and the wallet was topped up since; the full exit sells what the wallet holds. Realized PnL of the earlier sell is not recorded.`, positionId);
+            this.raiseOperatorAlert('SELL_LANDED_UNBOOKED', `A sell of ${target.symbol || target.mint} (${pendingSell.signature.slice(0, 8)}) landed but its fill could not be read and the wallet was topped up since; the full exit sells the position's recorded quantity. Realized PnL of the earlier sell is not recorded.`, positionId);
           } else {
             return { success: false, pnlSol: 0, error: `SELL_PENDING_VERIFICATION: sell ${pendingSell.signature.slice(0, 8)} landed but the amount it sold cannot be read yet; not selling again` };
           }
@@ -4418,16 +4507,26 @@ export class ExecutionCoordinator {
       filled.lastUpdatedTimestamp = Date.now();
       filled.exitStage = exitStageAfterFill(reason, filled.exitStage); // in the same write as the fill (R1-91)
 
-      if (sellRecon.isFullyClosed || sellBps >= 10_000) {
+      // R14-2: the row keeps its own quantity less what the chain says was sold. remainingTokensRaw is the WALLET's balance after the sell,
+      // which also counts tokens sent in from outside, so a partial that took it grew the row past what it ever held.
+      const soldRaw = BigInt(sellRecon.actualTokensSoldRaw || '0');
+      const rowLeftRaw = totalTokensRaw - (soldRaw > 0n ? soldRaw : 0n);
+      if (sellRecon.isFullyClosed || sellBps >= 10_000 || rowLeftRaw <= 0n) {
         filled.status = 'CLOSED';
         filled.tokenQuantityRaw = '0';
         filled.costBasisLamports = 0;
       } else {
         filled.status = 'PARTIALLY_CLOSED';
-        filled.tokenQuantityRaw = sellRecon.remainingTokensRaw;
+        filled.tokenQuantityRaw = rowLeftRaw.toString();
         filled.costBasisLamports = Math.round(filled.costBasisLamports * (1 - fraction));
       }
       target.status = filled.status;
+      // R13-16: the position is closed but the wallet still holds some of the token (sent in from outside, or a row that said less than the
+      // wallet). No position watches those tokens now, so say so instead of closing in silence.
+      const walletLeftRaw = BigInt(sellRecon.remainingTokensRaw || '0');
+      const leftoverAlert = filled.status === 'CLOSED' && walletLeftRaw > 0n
+        ? `${target.symbol || target.mint}: the position is closed, but the wallet still holds ${walletLeftRaw} raw of it after the sell (${subRes.signature.slice(0, 8)}). No position covers those tokens, so no stop-loss watches them. Run Reconcile to adopt them for exit monitoring (only a mint this app bought is adopted), or sell them by hand.`
+        : null;
 
       try {
         // S258: the position and its RECONCILED ledger row are one write, so a crash between them cannot leave a booked sell PENDING
@@ -4438,6 +4537,7 @@ export class ExecutionCoordinator {
         return { success: false, pnlSol: 0, error: `SELL_BOOKING_FAILED: ${err?.message ?? err}; the landed sell ${subRes.signature.slice(0, 8)} is booked on the next pass` };
       }
       this.pendingSells.delete(positionId); // R4-7: booked
+      if (leftoverAlert) this.raiseOperatorAlert('TOKENS_LEFT_AFTER_EXIT', leftoverAlert, `leftover-${target.mint}`);
       await this.syncRealWalletBalance();
 
       return {
@@ -4822,6 +4922,9 @@ export class ExecutionCoordinator {
       for (const t of rows) {
         const pos = active.find((p) => p.mint === t.mint);
         if (!pos) continue;
+        // R14-13: a sell sent before this position was bought (or a row with no send time, from before that column) is not its sell; held
+        // as one, an old landed sell would be booked onto it by the next exit. Startup reconciliation settles such a row from the chain.
+        if (!(t.submissionTime > 0) || t.submissionTime < (pos.entryTimestamp ?? 0)) continue;
         const known = this.pendingSells.get(pos.id);
         if (known && known.ts >= t.submissionTime) continue; // keep the latest sell of the position
         this.pendingSells.set(pos.id, { signature: t.signature, ts: t.submissionTime, lastValidBlockHeight: t.lastValidBlockHeight, reason: t.exitReason });
@@ -4830,6 +4933,19 @@ export class ExecutionCoordinator {
     } catch (err: any) {
       this.pendingSellSeedFailed = true;
       Logger.warn(`[P2.2] could not seed pending sells from the ledger: ${err.message}`);
+    }
+  }
+
+  /**
+   * R14-1: a SELL row that startup reconciliation settled (booked RECONCILED, REVERTED, TIMED_OUT) is no longer a pending sell. start() seeds
+   * pendingSells from the PENDING rows before the pass runs; left in place, the entry made the next exit take the booked sell for one whose
+   * fill was never booked (its signature is LANDED and the booked row now matches the wallet), so it was subtracted and its PnL booked again.
+   * A row still PENDING or RECONCILIATION_REQUIRED keeps its entry: its outcome is still unknown.
+   */
+  private forgetSettledPendingSell(pTx: PersistedTransaction): void {
+    if (pTx.direction !== 'SELL' || pTx.reconciliationState === 'PENDING' || pTx.reconciliationState === 'RECONCILIATION_REQUIRED') return;
+    for (const [positionId, p] of this.pendingSells) {
+      if (p.signature === pTx.signature) this.pendingSells.delete(positionId);
     }
   }
 

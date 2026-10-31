@@ -1,8 +1,9 @@
 import React, { useEffect, useState } from 'react';
 import { authFetch } from '../services/engineClient';
 import { onAuthenticated } from '../utils/authEvents';
-import { ageText } from '../utils/freshness';
+import { ageText, MARK_STALE_MS } from '../utils/freshness';
 import { fmtSignedSol, signTone } from '../utils/numFormat';
+import { dollarSymbol, displayName } from '../utils/displayName';
 
 /** H1: the home page. Launches / Watching / Holding, all from GET /api/board. Unknown values render "—", never a number. */
 export interface BoardData {
@@ -17,6 +18,8 @@ export interface BoardData {
   launches: Array<{
     mint: string; symbol: string; name: string; priceSol: number | null; priceUsd: number | null; curveProgressPct: number | null;
     top10HoldersPct: number | null; creatorHoldingPct: number | null; mintRevoked: boolean | null; freezeRevoked: boolean | null; createdAgo: string | null;
+    /** R11-11: age of the last feed trade the price and curve are from; null when none was seen. Absent on an older server. */
+    priceAgeMs?: number | null;
   }>;
   watching: Array<{
     mint: string; state: 'WATCHING' | 'HOT' | 'READY' | 'DEAD'; reason: string | null;
@@ -25,6 +28,9 @@ export interface BoardData {
       buySellRatio: number | null; largestBuyerShare: number | null; creatorSold: boolean; passingSignals: number; tradeCount: number;
       netInflowPer10s: number[];
     };
+    /** R11-10: released rows only (absent on an older server): the score at release, the threshold in force now, the READY gate's
+     * answer (null for HOT and DEAD), how old the release is, and the age past which it can no longer be bought. */
+    score?: number | null; threshold?: number; readyGate?: { pass: boolean; reason: string } | null; releasedAgeMs?: number | null; signalLimitMs?: number;
   }>;
   holding: Array<{
     id: string; mint: string; symbol: string; mode: string; entryPriceSol: number | null; markPriceSol: number | null; markAgeMs: number | null; markStale?: boolean;
@@ -40,6 +46,20 @@ const short = (m: string) => `${m.slice(0, 4)}…${m.slice(-4)}`;
 const cell = 'px-3 py-2 text-right font-mono tabular-nums';
 const headLeft = 'px-3 py-2 text-left text-[10px] uppercase tracking-wider text-slate-500 font-semibold';
 const head = 'px-3 py-2 text-right text-[10px] uppercase tracking-wider text-slate-500 font-semibold';
+// R11-11: at 390 px the section's overflow-hidden cut the AGE and NEXT EXIT columns off; each table now scrolls sideways in its own box
+const tableBox = 'overflow-x-auto';
+const tableCls = 'w-full text-xs whitespace-nowrap';
+
+/** R11-11: rows were mouse-only (<tr onClick>). The token cell is a real button: Tab reaches it, Enter and Space press it. */
+function RowSelect({ mint, label, onSelect, selected, children }: { mint: string; label: string; onSelect?: (mint: string) => void; selected?: boolean; children: React.ReactNode }) {
+  return (
+    <button type="button" data-testid="board-row-select" aria-label={`Show the curve for ${label}`} aria-pressed={!!selected}
+      onClick={(e) => { e.stopPropagation(); onSelect?.(mint); }}
+      className="text-left rounded focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400">
+      {children}
+    </button>
+  );
+}
 
 export function WalletStrip({ wallet, mode }: { wallet: BoardData['wallet']; mode: string }) {
   const item = (label: string, value: string, testId: string, age?: { text: string; warn: boolean }) => (
@@ -73,8 +93,34 @@ const STATE_STYLE: Record<string, string> = {
 
 export const BOARD_STALE_MS = 10_000;
 
-export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }: {
+type WatchRow = BoardData['watching'][number];
+/** R11-10: the reason as released, with the threshold in force now beside the one it was released under when they differ. */
+export function liveVerdictReason(w: Pick<WatchRow, 'reason' | 'threshold'>): string {
+  if (!w.reason) return DASH;
+  if (typeof w.threshold !== 'number') return w.reason;
+  return w.reason.replace(/\(threshold (\d+(?:\.\d+)?)\)/, (all, at) => (Number(at) === w.threshold ? all : `(threshold ${at} at release, ${w.threshold} now)`));
+}
+/** R11-10: READY is green only when the READY gate would let it through; a refused READY reads so. */
+const verdictChip = (w: WatchRow): { text: string; style: string } =>
+  w.state === 'READY' && w.readyGate && !w.readyGate.pass ? { text: 'READY (gate refuses)', style: 'bg-amber-900/50 text-amber-200' } : { text: w.state, style: STATE_STYLE[w.state] };
+const verdictGate = (w: WatchRow): string =>
+  w.state === 'READY' ? (w.readyGate ? (w.readyGate.pass ? 'READY gate passes' : `REFUSED: ${w.readyGate.reason}`) : DASH)
+  : w.state === 'HOT' && typeof w.score === 'number' && typeof w.threshold === 'number'
+    ? (w.score >= w.threshold ? 'score at release clears the threshold now' : 'score at release is BELOW the threshold now')
+    : DASH;
+const verdictAge = (w: WatchRow): { text: string; expired: boolean } => {
+  if (w.state === 'WATCHING' || w.releasedAgeMs === undefined) return { text: DASH, expired: false };
+  if (w.releasedAgeMs === null) return { text: 'release time unknown', expired: true };
+  const expired = typeof w.signalLimitMs === 'number' && w.releasedAgeMs > w.signalLimitMs;
+  return { text: `released ${ageText(w.releasedAgeMs)}${expired ? ` (signal expired after ${Math.round((w.signalLimitMs as number) / 1000)}s: no longer buyable)` : ''}`, expired };
+};
+/** R11-11: a launch's price and curve are stale once its last feed trade is older than the coordinator's mark limit, or none was seen. */
+const launchStale = (ageMs: number | null | undefined): boolean => ageMs === null || (typeof ageMs === 'number' && ageMs > MARK_STALE_MS);
+
+export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs, unreadable = false }: {
   ageMs?: number | null;
+  /** R12-11: the last reply could not be read; the rows below (if any) are from the last good read */
+  unreadable?: boolean;
   board: BoardData | null; tab: 'launches' | 'watching' | 'holding'; onTab: (t: 'launches' | 'watching' | 'holding') => void;
   onSelect?: (mint: string) => void; selected?: string | null;
 }) {
@@ -100,52 +146,70 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
           </span>
         )}
       </div>
-      {!board && <div className="p-6 text-sm text-slate-500">Loading… (sign in as operator to read the board)</div>}
+      {unreadable && (
+        <div data-testid="board-unreadable" role="status" className="px-4 py-2 text-xs text-amber-200 bg-amber-950/40 border-b border-amber-500/40">
+          Board reply unreadable: the server answered with data the board cannot read.{board ? ' The rows below are from the last good read.' : ' Nothing is shown rather than a guess.'}
+        </div>
+      )}
+      {!board && !unreadable && <div className="p-6 text-sm text-slate-500">Loading… (sign in as operator to read the board)</div>}
       {board && tab === 'launches' && (
-        <table className="w-full text-xs">
+        <div className={tableBox}><table className={tableCls}>
           <thead><tr><th className={headLeft}>Token</th><th className={head}>Price (SOL)</th><th className={head}>Curve</th><th className={head} title="Share of the tokens OFF the bonding curve held by the 10 largest holders. The holder gate uses share of total supply, a different figure.">Top10 % (off-curve)</th><th className={head}>Creator %</th><th className={head} title="Time since the launch entered the watch window; — when it is not being watched">Age</th></tr></thead>
           <tbody>
             {board.launches.length === 0 && <tr><td colSpan={6} className="p-6 text-center text-slate-500">No launches seen yet. The board fills from the Pump.fun create-event stream.</td></tr>}
             {board.launches.map((l) => (
               <tr key={l.mint} onClick={() => onSelect?.(l.mint)} className={`border-t border-slate-800/60 cursor-pointer hover:bg-slate-900 ${selected === l.mint ? 'bg-slate-900' : ''}`}>
-                <td className="px-3 py-2 text-left"><span className="font-bold text-slate-100">${l.symbol}</span> <span className="text-slate-500 font-mono">{short(l.mint)}</span></td>
-                <td className={cell}>{fmtPrice(l.priceSol)}</td>
-                <td className={cell}>{fmt(l.curveProgressPct, 1, '%')}</td>
+                <td className="px-3 py-2 text-left"><RowSelect mint={l.mint} label={`${dollarSymbol(l.symbol)} ${short(l.mint)}`} onSelect={onSelect} selected={selected === l.mint}><span className="font-bold text-slate-100" title={displayName(l.name)}>{dollarSymbol(l.symbol)}</span> <span className="text-slate-500 font-mono">{short(l.mint)}</span></RowSelect></td>
+                {/* R10-5 / R11-11: the price and curve are from the last feed trade; say how old, and mark them STALE past the mark limit */}
+                <td className={cell}>
+                  {fmtPrice(l.priceSol)}
+                  {l.priceAgeMs !== undefined && (
+                    <span data-testid="launch-price-age" className={`block text-[10px] ${launchStale(l.priceAgeMs) ? 'text-amber-300' : 'text-slate-500'}`}>
+                      {l.priceAgeMs === null ? 'no trade seen (create figures)' : `last trade ${ageText(l.priceAgeMs)}${launchStale(l.priceAgeMs) ? ' (STALE)' : ''}`}
+                    </span>
+                  )}
+                </td>
+                <td data-testid="launch-curve" className={`${cell} ${launchStale(l.priceAgeMs) ? 'text-amber-300' : ''}`}>{fmt(l.curveProgressPct, 1, '%')}</td>
                 <td className={cell}>{fmt(l.top10HoldersPct, 1, '%')}</td>
                 <td className={cell}>{fmt(l.creatorHoldingPct, 1, '%')}</td>
                 <td className={cell}>{l.createdAgo ?? DASH}</td>
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
       )}
       {board && tab === 'watching' && (
-        <table className="w-full text-xs">
-          <thead><tr><th className={headLeft}>Token</th><th className={head}>State</th><th className={head}>Net inflow</th><th className={head}>Buyers</th><th className={head}>Buy:sell</th><th className={head}>Top buyer</th><th className={head}>Creator sold</th></tr></thead>
+        <div className={tableBox}><table className={tableCls}>
+          <thead><tr><th className={headLeft}>Token</th><th className={head}>State</th><th className={head} title="Score at release / the confluence threshold in force now">Score / threshold</th><th className={headLeft}>Gate</th><th className={head}>Released</th><th className={head}>Net inflow</th><th className={head}>Buyers</th><th className={head}>Buy:sell</th><th className={head}>Top buyer</th><th className={head}>Creator sold</th><th className={headLeft}>Reason</th></tr></thead>
           <tbody>
-            {board.watching.length === 0 && <tr><td colSpan={7} className="p-6 text-center text-slate-500">Nothing in the watch window.</td></tr>}
+            {board.watching.length === 0 && <tr><td colSpan={11} className="p-6 text-center text-slate-500">Nothing in the watch window.</td></tr>}
             {board.watching.map((w) => (
-              <tr key={w.mint} onClick={() => onSelect?.(w.mint)} className="border-t border-slate-800/60 cursor-pointer hover:bg-slate-900" title={w.reason ?? ''}>
-                <td className="px-3 py-2 text-left font-mono text-slate-300">{short(w.mint)}</td>
-                <td className={cell}><span className={`px-1.5 py-0.5 rounded font-bold ${STATE_STYLE[w.state]}`}>{w.state}</span></td>
+              <tr key={w.mint} onClick={() => onSelect?.(w.mint)} className="border-t border-slate-800/60 cursor-pointer hover:bg-slate-900">
+                <td className="px-3 py-2 text-left font-mono text-slate-300"><RowSelect mint={w.mint} label={w.mint} onSelect={onSelect} selected={selected === w.mint}>{short(w.mint)}</RowSelect></td>
+                <td className={cell}><span className={`px-1.5 py-0.5 rounded font-bold ${verdictChip(w).style}`}>{verdictChip(w).text}</span></td>
+                <td data-testid="verdict-score" className={cell}>{w.state === 'WATCHING' || w.threshold === undefined ? DASH : `${w.score ?? 'no score'} / ${w.threshold}`}</td>
+                <td data-testid="verdict-gate" className={`px-3 py-2 text-left ${w.readyGate && !w.readyGate.pass ? 'text-amber-300' : 'text-slate-300'}`}>{verdictGate(w)}</td>
+                <td data-testid="verdict-age" className={`${cell} ${verdictAge(w).expired ? 'text-amber-300' : ''}`}>{verdictAge(w).text}</td>
                 <td className={cell}>{w.metrics.tradeCount === 0 ? DASH : `${fmt(w.metrics.cumulativeNetInflowSol, 3)} SOL`}</td>
                 <td className={cell}>{w.metrics.rawUniqueBuyers === 0 ? DASH : `${w.metrics.uniqueBuyers}${w.metrics.funderCoverage < 1 ? '?' : ''}`}</td>
                 <td className={cell}>{fmt(w.metrics.buySellRatio, 2)}</td>
                 <td className={cell}>{w.metrics.largestBuyerShare === null ? DASH : `${(w.metrics.largestBuyerShare * 100).toFixed(1)}%`}</td>
                 <td className={cell}>{w.metrics.tradeCount === 0 ? DASH : w.metrics.creatorSold ? 'YES' : 'no'}</td>
+                {/* R11-10: the reason is text in the row (it was a row tooltip only, which a keyboard cannot reach) */}
+                <td data-testid="verdict-reason" className="px-3 py-2 text-left text-slate-400 whitespace-normal min-w-[16rem]">{liveVerdictReason(w)}</td>
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
       )}
       {board && tab === 'holding' && (
-        <table className="w-full text-xs">
+        <div className={tableBox}><table className={tableCls}>
           <thead><tr><th className={headLeft}>Position</th><th className={head}>Entry</th><th className={head}>Mark (age)</th><th className={head} title="At the curve spot price; exit fee, price impact and tip are not taken off">PnL at mark (SOL, before exit costs)</th><th className={head}>Next exit</th></tr></thead>
           <tbody>
             {board.holding.length === 0 && <tr><td colSpan={5} className="p-6 text-center text-slate-500">No open positions.</td></tr>}
             {board.holding.map((h) => (
               <tr key={h.id} onClick={() => onSelect?.(h.mint)} className="border-t border-slate-800/60 cursor-pointer hover:bg-slate-900">
-                <td className="px-3 py-2 text-left"><span className="font-bold text-slate-100">${h.symbol}</span> <span className="text-slate-500">{h.mode}</span></td>
+                <td className="px-3 py-2 text-left"><RowSelect mint={h.mint} label={`${dollarSymbol(h.symbol)} (${h.mode})`} onSelect={onSelect} selected={selected === h.mint}><span className="font-bold text-slate-100">{dollarSymbol(h.symbol)}</span> <span className="text-slate-500">{h.mode}</span></RowSelect></td>
                 <td className={cell}>{fmtPrice(h.entryPriceSol)}</td>
                 <td className={cell}>
                   {fmtPrice(h.markPriceSol)}
@@ -157,14 +221,28 @@ export function TokenBoardView({ board, tab, onTab, onSelect, selected, ageMs }:
               </tr>
             ))}
           </tbody>
-        </table>
+        </table></div>
       )}
     </section>
   );
 }
 
+const isObj = (v: unknown): v is Record<string, any> => !!v && typeof v === 'object' && !Array.isArray(v);
+/**
+ * R12-11: a malformed /api/board (a string where a list goes, a row without its metrics) turned the board into a column of raw JS
+ * errors. A reply is used only when it has the shape the board renders; otherwise the board says the reply is unreadable.
+ */
+export function isBoardData(v: unknown): v is BoardData {
+  if (!isObj(v) || !isObj(v.wallet) || typeof v.executionMode !== 'string') return false;
+  if (!Array.isArray(v.launches) || !Array.isArray(v.watching) || !Array.isArray(v.holding)) return false;
+  return v.launches.every((l: unknown) => isObj(l) && typeof l.mint === 'string')
+    && v.watching.every((w: unknown) => isObj(w) && typeof w.mint === 'string' && typeof w.state === 'string' && isObj(w.metrics))
+    && v.holding.every((h: unknown) => isObj(h) && typeof h.id === 'string' && typeof h.mint === 'string');
+}
+
 export function TokenBoard({ onSelect, selected }: { onSelect?: (mint: string) => void; selected?: string | null }) {
   const [board, setBoard] = useState<BoardData | null>(null);
+  const [unreadable, setUnreadable] = useState(false);
   const [tab, setTab] = useState<'launches' | 'watching' | 'holding'>('launches');
   const [lastOkAt, setLastOkAt] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -173,7 +251,10 @@ export function TokenBoard({ onSelect, selected }: { onSelect?: (mint: string) =
     const load = async () => {
       try {
         const r = await authFetch('/api/board');
-        if (r.ok && alive) { setBoard(await r.json()); setLastOkAt(Date.now()); }
+        if (!r.ok || !alive) return;
+        const j = await r.json().catch(() => null);
+        if (!alive) return;
+        if (isBoardData(j)) { setBoard(j); setLastOkAt(Date.now()); setUnreadable(false); } else setUnreadable(true);
       } catch { /* offline: keep the last board; its age keeps growing and shows */ }
     };
     load();
@@ -185,7 +266,7 @@ export function TokenBoard({ onSelect, selected }: { onSelect?: (mint: string) =
   return (
     <>
       {board && <WalletStrip wallet={board.wallet} mode={board.executionMode} />}
-      <TokenBoardView board={board} tab={tab} onTab={setTab} onSelect={onSelect} selected={selected} ageMs={lastOkAt === null ? null : Math.max(0, now - lastOkAt)} />
+      <TokenBoardView board={board} tab={tab} onTab={setTab} onSelect={onSelect} selected={selected} ageMs={lastOkAt === null ? null : Math.max(0, now - lastOkAt)} unreadable={unreadable} />
     </>
   );
 }

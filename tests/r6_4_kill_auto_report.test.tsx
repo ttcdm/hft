@@ -40,7 +40,7 @@ describe('R6-4: a kill that leaves positions open says so', () => {
     const bad = killReportFor({ success: false, partial: true, attempted: 3, closed: 1, failed: [{ symbol: 'AAA', error: 'RPC down' }, { symbol: 'BBB', error: 'boom' }] })!;
     expect(bad.ok).toBe(false);
     expect(bad.text).toMatch(/only 1 of 3 position\(s\) were sold; 2 refused or failed and are STILL OPEN: AAA \(RPC down\); BBB \(boom\)/);
-    expect(killReportFor({ success: true, attempted: 2, closed: 2, failed: [] })).toEqual({ ok: true, text: 'Auto is OFF. Sold 2 of 2 position(s) it bought.' });
+    expect(killReportFor({ success: true, attempted: 2, closed: 2, failed: [] })).toEqual({ ok: true, text: 'Auto is OFF. Sold 2 of 2 position(s) it bought. Manual positions are not sold by KILL AUTO: close them from Plug & Play.' });
     expect(killReportFor({ success: true, attempted: 0, closed: 0, failed: [] })!.ok).toBe(true);
     // a reply from a server that does not count attempts is not read as a success
     expect(killReportFor({ success: true, closed: 0 })).toBeNull();
@@ -58,7 +58,7 @@ describe('R6-4: the KILL AUTO report reads the { closed, refused, failed, stillO
     const open = killReportFor({ success: true, mode: 'OFF', closed: 0, refused: [], failed: [], stillOpen: 2 })!;
     expect(open.ok).toBe(false);
     expect(open.text).toMatch(/2 auto position\(s\) are still open/);
-    expect(killReportFor({ success: true, mode: 'OFF', closed: 2, refused: [], failed: [], stillOpen: 0 })).toEqual({ ok: true, text: 'Auto is OFF. Sold 2 position(s) it bought; none is still open.' });
-    expect(killReportFor({ success: true, mode: 'OFF', closed: 0, refused: [], failed: [], stillOpen: 0 })!.text).toBe('Auto is OFF. It had no open position to sell.');
+    expect(killReportFor({ success: true, mode: 'OFF', closed: 2, refused: [], failed: [], stillOpen: 0 })).toEqual({ ok: true, text: 'Auto is OFF. Sold 2 position(s) it bought; none is still open. Manual positions are not sold by KILL AUTO: close them from Plug & Play.' });
+    expect(killReportFor({ success: true, mode: 'OFF', closed: 0, refused: [], failed: [], stillOpen: 0 })!.text).toBe('Auto is OFF. It had no open position to sell. Manual positions are not sold by KILL AUTO: close them from Plug & Play.');
   });
 });

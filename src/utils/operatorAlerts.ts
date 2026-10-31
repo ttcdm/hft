@@ -77,15 +77,43 @@ export function orderAlerts(alerts: AlertEvent[]): AlertEvent[] {
 /**
  * R10-1: the "KILL SWITCH ENGAGED" alert is drawn from the server's kill-switch state, not pushed once by the click. It is there while the
  * server says the switch is on (in every tab, through the poll) and gone as soon as it says off; it cannot be dismissed while it holds.
+ * R13-5: a failed or too-old read (`on` null) no longer removes it. When the switch was last seen ON the CRITICAL stays, saying the state
+ * is not confirmed; when it was last seen OFF (or never read) and the read now fails, a sticky STATE UNKNOWN alert says so. Before the
+ * first answer there is nothing to say yet.
  */
 export const KILL_SWITCH_ALERT_ID = 'state-kill-switch';
-export function killSwitchStateAlert(on: boolean | null, since: number | null): AlertEvent[] {
-  if (on !== true) return [];
+export interface KillStateUnknown { lastKnown: boolean | null; failed: boolean; lastAt?: number | null }
+/**
+ * R11-4: what the kill switch leaves open, from the open-position count (ACTIVE: open or partly closed), or null when it could not be read.
+ * The switch never sells; the text no longer tells the operator to close positions when none is open (for example right after PANIC).
+ */
+export function killSwitchOpenText(open: number | null | undefined): string {
+  if (open === 0) return 'No position is open.';
+  if (typeof open === 'number' && open > 0) return `${open} open position${open === 1 ? ' is' : 's are'} NOT sold: close ${open === 1 ? 'it' : 'them'} from the Plug & Play panel (protective exits keep running).`;
+  return 'The kill switch does not sell open positions; the position list could not be read, so check the Plug & Play panel.';
+}
+
+export function killSwitchStateAlert(on: boolean | null, since: number | null, unknown?: KillStateUnknown, openPositions?: number | null): AlertEvent[] {
   const at = since ?? Date.now();
+  const base = { id: KILL_SWITCH_ALERT_ID, timestamp: at, timeStr: new Date(at).toLocaleTimeString(), acknowledged: false, sticky: true } as const;
+  if (on === true) {
+    return [{
+      ...base, level: 'CRITICAL', title: 'KILL SWITCH ENGAGED',
+      message: `The server refuses new orders and has disarmed LIVE trading. ${killSwitchOpenText(openPositions)}`,
+    }];
+  }
+  if (on === false || !unknown) return [];
+  if (unknown.lastKnown === true) {
+    return [{
+      ...base, level: 'CRITICAL', title: 'KILL SWITCH ENGAGED (state not confirmed)',
+      message: `The kill switch was ON at the last good read, but its current state cannot be read. Treat trading as halted, and do not press RESUME until the header shows the state again. ${killSwitchOpenText(openPositions)}`,
+    }];
+  }
+  if (!unknown.failed && unknown.lastKnown === null) return [];
+  const seen = unknown.lastAt ?? at;
   return [{
-    id: KILL_SWITCH_ALERT_ID, timestamp: at, timeStr: new Date(at).toLocaleTimeString(), level: 'CRITICAL', title: 'KILL SWITCH ENGAGED',
-    message: 'The server refuses new orders and has disarmed LIVE trading. Open positions are NOT sold: close them from the Plug & Play panel.',
-    acknowledged: false, sticky: true,
+    ...base, timestamp: seen, timeStr: new Date(seen).toLocaleTimeString(), level: 'WARNING', title: 'KILL SWITCH STATE UNKNOWN',
+    message: `The server's kill-switch state cannot be read (not signed in, or not reachable)${unknown.lastAt ? `; it was OFF at the last good read, ${new Date(unknown.lastAt).toLocaleTimeString()}` : ''}. A switch engaged from another tab, by a panic or by the RPC auto-trip would not show here until it can.`,
   }];
 }
 

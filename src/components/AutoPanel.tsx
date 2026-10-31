@@ -6,6 +6,7 @@ import { onAuthenticated } from '../utils/authEvents';
 import { useTradingMode } from '../utils/tradingMode';
 import { parseDecimalText, COMMA_DECIMAL_REASON } from '../utils/numberInput';
 import { askConfirm } from './ConfirmDialog';
+import { killAutoConfirmText } from '../utils/tradingCopy';
 
 /** H3: the auto-snipe controller panel. Every number is read from GET /api/auto/status (controller state + decision journal). */
 export type AutoMode = 'OFF' | 'SHADOW' | 'PAPER' | 'DEVNET_LIVE';
@@ -151,7 +152,7 @@ export function ConfluenceThresholdEditor({ confluence, onSave, busy }: { conflu
 
 /**
  * R6-4: what KILL AUTO did, from the POST /api/auto/kill reply. "Sell what it bought" is reported as done only when every sell was;
- * a refused or failed one is counted and named, since those positions are still open.
+ * a refused or failed one is counted and named, since those positions are still open. R12-5: it also says manual positions stay open.
  */
 export interface KillReport { ok: boolean; text: string }
 export function killReportFor(j: any): KillReport | null {
@@ -166,15 +167,19 @@ export function killReportFor(j: any): KillReport | null {
   const closed = typeof j.closed === 'number' ? j.closed : 0;
   const stillOpen = hasStillOpen ? j.stillOpen : 0;
   const ok = failed.length === 0 && stillOpen === 0 && j.success !== false;
+  // R12-5: KILL AUTO sells only what auto bought. The reply's `manualOpen` (when the server sends it) counts the positions opened by hand.
+  const manual = typeof j.manualOpen === 'number'
+    ? j.manualOpen > 0 ? ` ${j.manualOpen} position(s) you opened by hand stay open: KILL AUTO does not sell them (close them from Plug & Play, or PANIC sells everything).` : ' No position opened by hand is open.'
+    : ' Manual positions are not sold by KILL AUTO: close them from Plug & Play.';
   if (ok) {
-    if (closed === 0 && (!hasAttempted || j.attempted === 0)) return { ok: true, text: 'Auto is OFF. It had no open position to sell.' };
-    return { ok: true, text: hasAttempted ? `Auto is OFF. Sold ${closed} of ${j.attempted} position(s) it bought.` : `Auto is OFF. Sold ${closed} position(s) it bought; none is still open.` };
+    if (closed === 0 && (!hasAttempted || j.attempted === 0)) return { ok: true, text: `Auto is OFF. It had no open position to sell.${manual}` };
+    return { ok: true, text: (hasAttempted ? `Auto is OFF. Sold ${closed} of ${j.attempted} position(s) it bought.` : `Auto is OFF. Sold ${closed} position(s) it bought; none is still open.`) + manual };
   }
   const names = failed.map((f) => `${f.symbol ?? (f.mint ? `${f.mint.slice(0, 6)}...` : '?')} (${f.error ?? 'refused'})`).join('; ');
   const sold = hasAttempted ? `only ${closed} of ${j.attempted} position(s) were sold` : `${closed} position(s) were sold`;
   const open = hasStillOpen ? ` ${stillOpen} auto position(s) are still open.` : '';
   const why = failed.length ? `; ${failed.length} refused or failed and are STILL OPEN: ${names}.` : '; some are STILL OPEN.';
-  return { ok: false, text: `Auto is OFF, but ${sold}${why}${open} Close them by hand.` };
+  return { ok: false, text: `Auto is OFF, but ${sold}${why}${open} Close them by hand.${manual}` };
 }
 
 /**
@@ -285,8 +290,11 @@ export function asAutoStatus(x: unknown): AutoStatusData | null {
 export interface AutoStatusRead { status: AutoStatusData | null; at: number | null; error: string | null }
 export const AUTO_STATUS_STALE_MS = 15_000;
 
-export function useAutoStatusRead(): AutoStatusRead {
+/** `reload` reads the status at once (R12-7: after a save whose outcome is not known). */
+export function useAutoStatusRead(): AutoStatusRead & { reload: () => void } {
   const [read, setRead] = useState<AutoStatusRead>({ status: null, at: null, error: null });
+  const reloadRef = React.useRef<() => void>(() => {});
+  const reload = useCallback(() => reloadRef.current(), []);
   useEffect(() => {
     let alive = true;
     const load = async () => {
@@ -302,12 +310,13 @@ export function useAutoStatusRead(): AutoStatusRead {
         if (alive) setRead((p) => ({ ...p, error: `server not reachable (${e?.message || 'network error'})` }));
       }
     };
+    reloadRef.current = () => { void load(); };
     load();
     const t = setInterval(load, 4000);
     const off = onAuthenticated(load); // UI-5
-    return () => { alive = false; clearInterval(t); off(); };
+    return () => { alive = false; reloadRef.current = () => {}; clearInterval(t); off(); };
   }, []);
-  return read;
+  return { ...read, reload };
 }
 
 export function useAutoStatus(): AutoStatusData | null {
@@ -329,7 +338,11 @@ export function AutoHeaderBadge() {
   return <AutoModeBadge mode={r.status?.mode ?? null} halted={!!r.status?.haltReason} />;
 }
 
-export function AutoPanel() {
+/**
+ * `killSwitch`: the kill-switch state the header shows (App passes it, R11-3), so the panel and the header say the same thing and both
+ * re-read it right after a PANIC or KILL reply. Without it the panel falls back to the shared mode poller.
+ */
+export function AutoPanel({ killSwitch }: { killSwitch?: boolean | null } = {}) {
   const read = useAutoStatusRead();
   const tradingMode = useTradingMode();
   const status = read.status;
@@ -340,6 +353,7 @@ export function AutoPanel() {
   useEffect(() => { setLocal(null); }, [status]);
   const [error, setError] = useState<string | null>(null);
   const [killReport, setKillReport] = useState<KillReport | null>(null);
+  const reloadStatus = read.reload;
   const post = useCallback(async (path: string, body: unknown) => {
     setBusy(true);
     setError(null);
@@ -347,20 +361,27 @@ export function AutoPanel() {
       const r = await authFetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
       const j = await r.json().catch(() => null);
       if (path === '/api/auto/kill') setKillReport(killReportFor(j));
-      // R31: a refusal (400/403/409/429) carries its reason in the body; show it instead of dropping it
-      if (!r.ok) setError(`${j?.error || j?.message || 'Request refused'} (HTTP ${r.status})`);
+      // R31: a refusal (400/403/409/429) carries its reason in the body; show it instead of dropping it.
+      // R12-7: a non-2xx with no reason in it (a proxy's bodiless or HTML 502/504) is not a refusal from the server: the request may
+      // have been applied. Say the outcome is unknown and read the status again.
+      const reason = j && typeof j === 'object' ? (j.error || j.message) : null;
+      if (!r.ok && reason) setError(`${reason} (HTTP ${r.status})`);
+      else if (!r.ok) { setError(`No readable answer from the server (HTTP ${r.status}): the change may or may not have been applied. Reading the status again; check it before you retry.`); reloadStatus(); }
       const next = asAutoStatus(j?.status);
       if (next && shown?.stats) setLocal({ ...next, stats: shown.stats });
     } catch (e: any) {
-      setError(`Could not reach the server (${e?.message || 'network error'}). Nothing was changed as far as the panel knows; check the status above.`);
+      // the request may have reached the server before the connection failed (R12-7)
+      setError(`Could not reach the server (${e?.message || 'network error'}). The change may or may not have been applied; reading the status again, check it before you retry.`);
+      reloadStatus();
     } finally { setBusy(false); }
-  }, [shown]);
+  }, [shown, reloadStatus]);
   return (
-    <AutoPanelView status={shown} busy={busy} error={error} killReport={killReport} code={code} onCode={setCode} staleText={autoStatusStaleText(read, Date.now())} killSwitch={tradingMode.killSwitch}
+    <AutoPanelView status={shown} busy={busy} error={error} killReport={killReport} code={code} onCode={setCode} staleText={autoStatusStaleText(read, Date.now())} killSwitch={killSwitch !== undefined ? killSwitch : tradingMode.killSwitch}
       onMode={(m) => post('/api/auto/mode', { mode: m, confirmationCode: m === 'DEVNET_LIVE' ? code : undefined })}
       onKill={async () => {
         // Q45: KILL sells every position the auto trader opened, so it asks first. R10-11: in a dialog Enter cannot accept.
-        if (!(await askConfirm({ title: 'KILL AUTO', body: 'KILL AUTO: switch auto to OFF and sell every position it bought. Continue?', confirmLabel: 'Kill auto and sell' }))) return;
+        // R11-7: the confirm names the auto mode and how many open positions the auto journal counts
+        if (!(await askConfirm({ title: 'KILL AUTO', body: killAutoConfirmText(shown ? { mode: shown.mode, openAutoPositions: shown.stats?.open, statsMode: shown.stats?.mode } : null), confirmLabel: 'Kill auto and sell' }))) return;
         void post('/api/auto/kill', { exitAll: true, reason: 'operator kill from panel' });
       }}
       onResume={() => post('/api/auto/resume', { clearHalt: true })}

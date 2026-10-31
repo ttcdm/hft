@@ -77,7 +77,7 @@ describe('H3: every stats number traces to a journal row', () => {
     ];
     // R6-3: net PnL is the position ledger's realized PnL, not the journaled deltas (a PAPER exit writes none)
     const s = computeJournalStats(rows, (id) => (id === 'a' ? { status: 'CLOSED', realizedPnLSol: 0.0015 } : { status: 'OPEN' }));
-    expect(s).toEqual({ seen: 3, rejectedByStage: { watch: 1 }, wouldBuy: 0, bought: 2, open: 1, closed: 1, netPnlSol: expect.closeTo(0.0015, 9), feesPaidSol: expect.closeTo(0.001, 9), winRate: 1 });
+    expect(s).toEqual({ seen: 3, rejectedByStage: { watch: 1 }, killTriggers: 0, wouldBuy: 0, bought: 2, open: 1, closed: 1, netPnlSol: expect.closeTo(0.0015, 9), feesPaidSol: expect.closeTo(0.001, 9), winRate: 1 });
   });
 
   it('a real paper session: a bought and closed candidate shows up in the controller stats, matching the decision rows', async () => {
